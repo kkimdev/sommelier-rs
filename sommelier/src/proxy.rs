@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::connection::WaylandConnection;
 use crate::protocols;
-use crate::state::Context;
+use crate::state::{Context, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{ProtocolError, WireMessage};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -31,6 +31,17 @@ type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 enum Direction {
     ClientToHost,
     HostToClient,
+}
+
+fn translated_sender_id(
+    shadow_table: &ShadowTable,
+    direction: Direction,
+    sender_id: u32,
+) -> Option<u32> {
+    match direction {
+        Direction::ClientToHost => shadow_table.get_host_id(sender_id),
+        Direction::HostToClient => shadow_table.get_guest_id(sender_id),
+    }
 }
 
 struct SommelierHandler {
@@ -237,6 +248,11 @@ impl Client {
                 Direction::ClientToHost => Some(sender_id),
                 Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
             };
+            // Destructors remove their shadow-table entry during dispatch.
+            // Preserve the translated sender first so the forwarded request
+            // still uses the valid host ID without emitting a false warning.
+            let target_sender_id =
+                translated_sender_id(&self.ctx.shadow_table, direction, sender_id);
 
             let interface = match direction {
                 Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id).cloned(),
@@ -297,12 +313,7 @@ impl Client {
 
                     // Patch ID in the forwarded message
                     if let Some(gid) = guest_id {
-                        let target_id = match direction {
-                            Direction::ClientToHost => self.ctx.shadow_table.get_host_id(gid),
-                            Direction::HostToClient => Some(gid),
-                        };
-
-                        if let Some(tid) = target_id {
+                        if let Some(tid) = target_sender_id {
                             if data.len() >= 4 {
                                 data[0..4].copy_from_slice(&tid.to_ne_bytes());
                             }
@@ -418,6 +429,26 @@ impl Client {
         conn.read_buf.drain(..offset);
 
         success
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translated_sender_survives_destructor_mapping_removal() {
+        let mut shadow_table = ShadowTable::new();
+        shadow_table.map_id(47, 68);
+
+        let client_to_host = translated_sender_id(&shadow_table, Direction::ClientToHost, 47);
+        let host_to_client = translated_sender_id(&shadow_table, Direction::HostToClient, 68);
+        shadow_table.remove_id(47);
+
+        assert_eq!(client_to_host, Some(68));
+        assert_eq!(host_to_client, Some(47));
+        assert_eq!(shadow_table.get_host_id(47), None);
+        assert_eq!(shadow_table.get_guest_id(68), None);
     }
 }
 

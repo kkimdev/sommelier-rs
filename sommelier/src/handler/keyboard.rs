@@ -39,6 +39,7 @@ const WL_KEY_RELEASED: u32 = 0;
 pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
 
 /// `wl_keyboard.keymap` format value for XKB (Wayland spec §wl_keyboard.keymap_format).
+const WL_KEYMAP_FORMAT_NO_KEYMAP: u32 = 0;
 const WL_KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
 // Opcodes are taken directly from the XML protocol definition:
@@ -60,7 +61,7 @@ const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
 /// A read-only view of a shared-memory fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
-/// - `from_fd`: calls `mmap(MAP_SHARED, PROT_READ)` and stores the pointer + length.
+/// - `from_fd`: calls `mmap(MAP_PRIVATE, PROT_READ)` and stores the pointer + length.
 /// - `as_bytes`: constructs a slice; valid because the mapping covers exactly `len` bytes.
 /// - `Drop`: calls `munmap`; the pointer and length are never mutated after construction.
 struct MmapView {
@@ -69,7 +70,7 @@ struct MmapView {
 }
 
 impl MmapView {
-    /// Map `len` bytes from `fd` at offset 0 as read-only shared memory.
+    /// Map `len` bytes from `fd` at offset 0 as a private read-only view.
     /// Returns `None` if `len` is zero or if `mmap` fails.
     fn from_fd(fd: std::os::unix::io::RawFd, len: usize) -> Option<Self> {
         use nix::sys::mman::{mmap, MapFlags, ProtFlags};
@@ -80,7 +81,15 @@ impl MmapView {
         // retain it. The returned pointer owns the mapping until munmap.
         let ptr = unsafe {
             let borrowed = BorrowedFd::borrow_raw(fd);
-            mmap(None, nonzero_len, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, borrowed, 0).ok()?
+            mmap(
+                None,
+                nonzero_len,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                borrowed,
+                0,
+            )
+            .ok()?
         };
         Some(Self { ptr, len })
     }
@@ -110,7 +119,9 @@ impl Drop for MmapView {
 /// `ack_key` responses to the host via `zcr_extended_keyboard_v1`.
 pub struct KeyboardHandler {
     context: xkb::Context,
-    keymap: Option<xkb::Keymap>,
+    /// Parsed keymap for each host keyboard. Keymap updates and failures are
+    /// scoped to their sender so one seat cannot invalidate another seat.
+    keymaps: std::collections::HashMap<HostId, xkb::Keymap>,
     /// XKB state for each host keyboard. A client can bind keyboards from
     /// multiple seats, whose modifier and layout-group state must not leak.
     states: std::collections::HashMap<HostId, xkb::State>,
@@ -158,7 +169,7 @@ impl KeyboardHandler {
     pub fn new() -> Self {
         Self {
             context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-            keymap: None,
+            keymaps: std::collections::HashMap::new(),
             states: std::collections::HashMap::new(),
             modifiers: std::collections::HashMap::new(),
             dropped_keys: std::collections::HashMap::new(),
@@ -173,6 +184,8 @@ impl KeyboardHandler {
 
     fn clear_host_keyboard_state(ctx: &mut Context, host_keyboard_id: HostId) {
         ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
+        ctx.keyboard_backspace_repeat_cancelled
+            .remove(&host_keyboard_id);
         ctx.keyboard_event_times.remove(&host_keyboard_id);
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
         ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
@@ -212,9 +225,17 @@ impl KeyboardHandler {
         match state {
             WL_KEY_PRESSED => {
                 pressed_keys.insert(key);
+                if key == EVDEV_KEY_BACKSPACE {
+                    ctx.keyboard_backspace_repeat_cancelled
+                        .remove(&host_keyboard_id);
+                }
             }
             WL_KEY_RELEASED => {
                 pressed_keys.remove(&key);
+                if key == EVDEV_KEY_BACKSPACE {
+                    ctx.keyboard_backspace_repeat_cancelled
+                        .remove(&host_keyboard_id);
+                }
             }
             _ => {}
         }
@@ -223,12 +244,14 @@ impl KeyboardHandler {
         }
     }
 
-    fn clear_pressed_backspace(ctx: &mut Context, host_keyboard_id: HostId) {
-        if let Some(pressed_keys) = ctx.keyboard_pressed_keys.get_mut(&host_keyboard_id) {
-            pressed_keys.remove(&EVDEV_KEY_BACKSPACE);
-            if pressed_keys.is_empty() {
-                ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
-            }
+    fn cancel_backspace_repeat(ctx: &mut Context, host_keyboard_id: HostId) {
+        if ctx
+            .keyboard_pressed_keys
+            .get(&host_keyboard_id)
+            .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE))
+        {
+            ctx.keyboard_backspace_repeat_cancelled
+                .insert(host_keyboard_id);
         }
     }
 
@@ -250,6 +273,8 @@ impl KeyboardHandler {
         }
 
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
+        ctx.keyboard_backspace_repeat_cancelled
+            .remove(&host_keyboard_id);
         if pressed_keys.is_empty() {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
             ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
@@ -312,6 +337,13 @@ impl KeyboardHandler {
         if let Some(state) = self.states.get_mut(&host_keyboard_id) {
             state.update_mask(0, 0, 0, 0, 0, 0);
         }
+    }
+
+    fn clear_host_keyboard_keymap(&mut self, host_keyboard_id: HostId) {
+        self.keymaps.remove(&host_keyboard_id);
+        self.states.remove(&host_keyboard_id);
+        self.modifiers.remove(&host_keyboard_id);
+        self.dropped_keys.remove(&host_keyboard_id);
     }
 
     /// Ensure the `zcr_extended_keyboard_v1` object is bound for this keyboard.
@@ -413,15 +445,22 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         fd: std::os::unix::io::RawFd,
         size: u32,
     ) -> Action {
-        // Only handle XKB_V1 format keymaps.
-        if format != WL_KEYMAP_FORMAT_XKB_V1 {
+        let host_keyboard_id = HostId::from_event_sender(ctx);
+        if format == WL_KEYMAP_FORMAT_NO_KEYMAP {
+            self.clear_host_keyboard_keymap(host_keyboard_id);
             return Action::Forward;
         }
-        let host_keyboard_id = HostId::from_event_sender(ctx);
+        // Only handle XKB_V1 format keymaps.
+        if format != WL_KEYMAP_FORMAT_XKB_V1 {
+            log::warn!("on_keymap: unsupported keymap format {}, ignoring", format);
+            self.clear_host_keyboard_keymap(host_keyboard_id);
+            return Action::Forward;
+        }
 
         // A zero-size keymap is malformed; mmap(len=0) is UB per POSIX.
         if size == 0 {
             log::warn!("on_keymap: received zero-size keymap from host, ignoring");
+            self.clear_host_keyboard_keymap(host_keyboard_id);
             return Action::Forward;
         }
 
@@ -429,24 +468,22 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // 64-bit Linux (the only supported target for sommelier).
         let Some(mapping) = MmapView::from_fd(fd, size as usize) else {
             log::error!("on_keymap: mmap failed for fd={}, size={}", fd, size);
+            self.clear_host_keyboard_keymap(host_keyboard_id);
             return Action::Forward;
         };
         let slice = mapping.as_bytes();
 
-        // Per the Wayland spec, wl_keyboard.keymap.size always includes exactly
-        // one trailing NUL terminator. Strip it unconditionally so that XKB
-        // receives clean text. If the host sends a malformed keymap without the
-        // terminator this will still be safe (the XKB parser will reject it
-        // rather than reading out-of-bounds — we clamped to `size` bytes above).
-        //
-        // We use a debug_assert (not a hard error) because a missing terminator
-        // is a host protocol violation, not a local invariant failure; the proxy
-        // should degrade gracefully rather than crash.
-        debug_assert!(
-            !slice.is_empty() && slice[slice.len() - 1] == 0,
-            "on_keymap: keymap data is missing the trailing NUL required by the Wayland spec"
-        );
-        let len = (size as usize).saturating_sub(1);
+        // Per the Wayland spec, wl_keyboard.keymap.size includes a trailing NUL.
+        // A malformed host event must not panic the proxy or leave stale XKB
+        // state active for this keyboard.
+        if slice.last() != Some(&0) {
+            log::error!(
+                "on_keymap: keymap data is missing the trailing NUL required by the Wayland spec"
+            );
+            self.clear_host_keyboard_keymap(host_keyboard_id);
+            return Action::Forward;
+        }
+        let len = slice.len() - 1;
 
         match std::str::from_utf8(&slice[..len]) {
             Err(e) => {
@@ -456,10 +493,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 // is None creates a split where future code reading `keymap`
                 // operates on stale data with no active XKB state to validate
                 // against.
-                self.keymap = None;
-                self.states.remove(&host_keyboard_id);
-                self.modifiers.remove(&host_keyboard_id);
-                self.dropped_keys.remove(&host_keyboard_id);
+                self.clear_host_keyboard_keymap(host_keyboard_id);
             }
             Ok(s) => match xkb::Keymap::new_from_string(
                 &self.context,
@@ -475,16 +509,13 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     // Clear keymap, state, and drop set together for the same
                     // consistency reason as the UTF-8 error case above: all
                     // three must remain in sync.
-                    self.keymap = None;
-                    self.states.remove(&host_keyboard_id);
-                    self.modifiers.remove(&host_keyboard_id);
-                    self.dropped_keys.remove(&host_keyboard_id);
+                    self.clear_host_keyboard_keymap(host_keyboard_id);
                 }
                 Some(keymap) => {
                     self.states
                         .insert(host_keyboard_id, xkb::State::new(&keymap));
                     self.modifiers.remove(&host_keyboard_id);
-                    self.keymap = Some(keymap);
+                    self.keymaps.insert(host_keyboard_id, keymap);
                     // Clear stale drop state: a key dropped under the old
                     // keymap may map to a different keysym under the new one,
                     // and a forgotten drop entry would cause a stuck key.
@@ -676,7 +707,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                             .insert(key);
                     }
                 } else {
-                    Self::clear_pressed_backspace(ctx, host_keyboard_id);
+                    Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
@@ -817,13 +848,20 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     fn on_release(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         log::info!(">>> wl_keyboard.on_release: guest_id={}", guest_id);
+        let guest_seat = ctx.keyboard_to_seat.remove(&guest_id);
         // Translate guest ID → host ID. Returns None for unknown keyboards
         // (e.g. keyboards that never received an on_enter event).
-        let Some(host_keyboard_id) = ctx.shadow_table.host_id_of(GuestId::from_request_sender(ctx)) else {
+        let Some(host_keyboard_id) = ctx
+            .shadow_table
+            .host_id_of(GuestId::from_request_sender(ctx))
+        else {
+            if let Some(guest_seat) = guest_seat {
+                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+            }
             return Action::Forward;
         };
-        // Clear per-keyboard state: dropped keys, XKB state, and modifiers.
-        // Both must be reset so that a re-created keyboard starts from a clean
+        // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
+        // All must be reset so that a re-created keyboard starts from a clean
         // slate and doesn't inherit stale state from the previous session.
         //
         // dropped_keys: a key dropped under the old session would cause its
@@ -831,10 +869,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // modifiers: if the new keyboard receives a key event before the first
         //   wl_keyboard.modifiers, the accelerator check would use stale modifier
         //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
-        self.dropped_keys.remove(&host_keyboard_id);
-        self.states.remove(&host_keyboard_id);
-        self.modifiers.remove(&host_keyboard_id);
-        let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
+        self.clear_host_keyboard_keymap(host_keyboard_id);
         Self::clear_host_keyboard_state(ctx, host_keyboard_id);
         if let Some(guest_seat) = guest_seat {
             crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
@@ -898,7 +933,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             WL_KEY_PRESSED => {
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
                 if key != EVDEV_KEY_BACKSPACE {
-                    Self::clear_pressed_backspace(ctx, host_keyboard_id);
+                    Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
@@ -960,7 +995,12 @@ mod tests {
         // size = string bytes + 1 NUL terminator, matching what a real host sends.
         let size = keymap_str.len() as u32 + 1;
         handler.on_keymap(ctx, 1, fd.as_raw_fd(), size);
-        assert!(handler.keymap.is_some(), "keymap should be loaded");
+        assert!(
+            handler
+                .keymaps
+                .contains_key(&HostId::from_event_sender(ctx)),
+            "keymap should be loaded for the sending keyboard"
+        );
         keymap
     }
 
@@ -1207,7 +1247,7 @@ mod tests {
 
         handler.on_keymap(&mut ctx, 1, fd.as_raw_fd(), keymap_bytes.len() as u32 + 1);
         assert!(
-            handler.keymap.is_some(),
+            handler.keymaps.contains_key(&HostId(0)),
             "keymap must load via mmap even when fd cursor is at EOF"
         );
         assert!(
@@ -1229,6 +1269,7 @@ mod tests {
         let host_extended_id: u32 = 50;
 
         ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+        ctx.keyboard_to_seat.insert(guest_keyboard_id, 7);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
         ctx.extended_keyboard_to_keyboard
@@ -1248,6 +1289,10 @@ mod tests {
             !ctx.extended_keyboard_to_keyboard
                 .contains_key(&HostId(host_extended_id)),
             "reverse extended keyboard map must be cleared after release"
+        );
+        assert!(
+            !ctx.keyboard_to_seat.contains_key(&guest_keyboard_id),
+            "guest keyboard-to-seat routing must be cleared after release"
         );
 
         // destroy message must have been queued to the host.
@@ -1303,23 +1348,107 @@ mod tests {
         // fd=0 (stdin) won't be mmap'd because the size check fires first.
         let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, 0, 0 /* size=0 */);
         assert_eq!(action, Action::Forward, "zero-size keymap must forward, not panic");
-        assert!(handler.keymap.is_none(), "keymap must not be set after zero-size event");
+        assert!(
+            !handler.keymaps.contains_key(&HostId(0)),
+            "keymap must not be set after zero-size event"
+        );
     }
 
     #[test]
-    fn on_keymap_ignores_unknown_format() {
+    fn no_keymap_format_leaves_no_keyboard_state() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new(false, false);
         // Format 0 = WL_KEYMAP_FORMAT_NO_KEYMAP; forward without loading.
         let action = handler.on_keymap(&mut ctx, 0 /* format=no_keymap */, 0, 100);
         assert_eq!(action, Action::Forward);
-        assert!(handler.keymap.is_none());
+        assert!(!handler.keymaps.contains_key(&HostId(0)));
+    }
+
+    #[test]
+    fn unsupported_keymap_format_clears_previous_keyboard_state() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        load_test_keymap(&mut handler, &mut ctx);
+
+        assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
+        assert!(!handler.keymaps.contains_key(&HostId(0)));
+        assert!(!handler.states.contains_key(&HostId(0)));
+    }
+
+    #[test]
+    fn keymap_without_trailing_nul_is_rejected_without_panicking() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        load_test_keymap(&mut handler, &mut ctx);
+
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+        let name = CString::new("test-keymap-missing-nul").unwrap();
+        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
+        let malformed = b"xkb_keymap";
+        nix::unistd::write(&fd, malformed).expect("write failed");
+
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                WL_KEYMAP_FORMAT_XKB_V1,
+                fd.as_raw_fd(),
+                malformed.len() as u32,
+            ),
+            Action::Forward
+        );
+        assert!(!handler.keymaps.contains_key(&HostId(0)));
+        assert!(!handler.states.contains_key(&HostId(0)));
+    }
+
+    #[test]
+    fn no_keymap_event_clears_previous_keyboard_state() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        ctx.last_sender_id = 5;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let ctrl_mask = 1 << keymap.mod_get_index("Control");
+        handler.on_modifiers(&mut ctx, 1, ctrl_mask, 0, 0, 0);
+        handler
+            .dropped_keys
+            .entry(HostId(5))
+            .or_default()
+            .insert(30);
+
+        assert_eq!(handler.on_keymap(&mut ctx, 0, 0, 0), Action::Forward);
+        assert!(!handler.keymaps.contains_key(&HostId(5)));
+        assert!(!handler.states.contains_key(&HostId(5)));
+        assert!(!handler.modifiers.contains_key(&HostId(5)));
+        assert!(!handler.dropped_keys.contains_key(&HostId(5)));
+    }
+
+    #[test]
+    fn no_keymap_event_does_not_clear_another_keyboard() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+        ctx.last_sender_id = 6;
+        load_test_keymap(&mut handler, &mut ctx);
+
+        ctx.last_sender_id = 5;
+        assert_eq!(handler.on_keymap(&mut ctx, 0, 0, 0), Action::Forward);
+        assert!(!handler.keymaps.contains_key(&HostId(5)));
+        assert!(!handler.states.contains_key(&HostId(5)));
+        assert!(
+            handler.keymaps.contains_key(&HostId(6)),
+            "one keyboard's NO_KEYMAP event must preserve another keyboard's keymap"
+        );
+        assert!(
+            handler.states.contains_key(&HostId(6)),
+            "one keyboard's NO_KEYMAP event must preserve another keyboard's XKB state"
+        );
     }
 
     /// Regression: on_keymap must log an error and not crash when the
     /// keymap data is not valid UTF-8, or when xkbcommon rejects the
     /// string. In both cases the handler must degrade gracefully:
-    /// keymap stays None, state stays None, Action::Forward is returned.
+    /// keymap stays absent, state stays absent, Action::Forward is returned.
     #[test]
     fn on_keymap_logs_error_on_invalid_utf8() {
         let mut handler = KeyboardHandler::new();
@@ -1337,7 +1466,10 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, fd.as_raw_fd(), bad_bytes.len() as u32);
         assert_eq!(action, Action::Forward, "invalid UTF-8 must still forward");
-        assert!(handler.keymap.is_none(), "keymap must remain None on parse error");
+        assert!(
+            !handler.keymaps.contains_key(&HostId(0)),
+            "keymap must remain absent on parse error"
+        );
         assert!(
             !handler.states.contains_key(&HostId(0)),
             "state must remain absent on parse error"
@@ -1361,7 +1493,10 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, fd.as_raw_fd(), garbage.len() as u32);
         assert_eq!(action, Action::Forward, "invalid XKB string must still forward");
-        assert!(handler.keymap.is_none(), "keymap must remain None on XKB compile error");
+        assert!(
+            !handler.keymaps.contains_key(&HostId(0)),
+            "keymap must remain absent on XKB compile error"
+        );
         assert!(
             !handler.states.contains_key(&HostId(0)),
             "state must remain absent on XKB compile error"
@@ -1477,6 +1612,62 @@ mod tests {
         assert_eq!(
             handler.on_key(&mut ctx, 2, 501, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
             Action::Forward
+        );
+    }
+
+    #[test]
+    fn non_backspace_press_cancels_repeat_without_losing_physical_backspace() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.keyboard_pressed_keys
+            .entry(HostId(100))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        ctx.text_inputs
+            .get_mut(&40)
+            .unwrap()
+            .empty_preedit_repeat_active = true;
+
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 500, 30, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert!(
+            ctx.keyboard_pressed_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE),
+            "pressing another key must not falsify the physical Backspace state"
+        );
+        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler::on_confirm_preedit(
+                &mut crate::handler::text_input::ExtendedTextInputV1Handler,
+                &mut ctx,
+                0,
+            ),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "a cancelled repeat must not rearm while Backspace remains physically held"
+        );
+
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 501, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED,),
+            Action::Forward
+        );
+        assert!(
+            !ctx.keyboard_pressed_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE),
+            "Backspace release must remove only the released physical key"
+        );
+        assert!(
+            !ctx.keyboard_backspace_repeat_cancelled
+                .contains(&HostId(100)),
+            "Backspace release must clear repeat cancellation"
         );
     }
 
@@ -1794,6 +1985,20 @@ mod tests {
     }
 
     #[test]
+    fn on_release_before_host_mapping_cleans_guest_seat_routing() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        ctx.keyboard_to_seat.insert(5, 7);
+        ctx.last_sender_id = 5;
+
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert!(
+            !ctx.keyboard_to_seat.contains_key(&5),
+            "release before the first host event must not leave a stale keyboard route"
+        );
+    }
+
+    #[test]
     fn keyboard_enter_invalidates_stale_text_input_before_new_enable() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -1866,11 +2071,10 @@ mod tests {
             handler.on_key(&mut ctx, 2, 10, 30, WL_KEY_PRESSED),
             Action::Forward
         );
-        assert!(
-            !ctx.keyboard_pressed_keys
-                .get(&HostId(10))
-                .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE))
-        );
+        assert!(ctx.keyboard_pressed_keys[&HostId(10)].contains(&EVDEV_KEY_BACKSPACE));
+        assert!(ctx
+            .keyboard_backspace_repeat_cancelled
+            .contains(&HostId(10)));
         assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
 
         ctx.text_inputs
@@ -1882,9 +2086,7 @@ mod tests {
             handler.on_key(&mut ctx, 3, 11, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
             Action::Drop
         );
-        assert!(
-            ctx.keyboard_pressed_keys[&HostId(10)].contains(&EVDEV_KEY_BACKSPACE)
-        );
+        assert!(ctx.keyboard_pressed_keys[&HostId(10)].contains(&EVDEV_KEY_BACKSPACE));
         assert_eq!(
             handler.on_key(&mut ctx, 4, 12, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
             Action::Drop

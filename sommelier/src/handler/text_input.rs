@@ -102,6 +102,39 @@ fn convert_delete_range(index: i32, length: u32) -> Option<(u32, u32)> {
     Some((start.unsigned_abs() as u32, end as u32))
 }
 
+fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
+    static KEYCODES: std::sync::OnceLock<std::collections::HashMap<u32, u32>> =
+        std::sync::OnceLock::new();
+    KEYCODES
+        .get_or_init(|| {
+            let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+            let Some(keymap) = xkbcommon::xkb::Keymap::new_from_names(
+                &context,
+                "",
+                "",
+                "",
+                "",
+                None,
+                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+            ) else {
+                log::error!("Could not initialize the fallback XKB keysym map");
+                return std::collections::HashMap::new();
+            };
+
+            let mut keycodes = std::collections::HashMap::new();
+            for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
+                for keysym in keymap.key_get_syms_by_level(keycode_raw.into(), 0, 0) {
+                    // Preserve the old linear scan's choice of the lowest
+                    // keycode when a keysym has aliases.
+                    keycodes.entry(keysym.raw()).or_insert(keycode_raw - 8);
+                }
+            }
+            keycodes
+        })
+        .get(&sym)
+        .copied()
+}
+
 pub(crate) fn backspace_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
     ctx.text_inputs
         .values()
@@ -109,19 +142,24 @@ pub(crate) fn backspace_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -
 }
 
 pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
-    ctx.keyboard_to_seat.iter().any(|(&guest_keyboard_id, &seat)| {
-        seat == guest_seat
-            && ctx
-                .shadow_table
-                .host_id_of(GuestId(guest_keyboard_id))
-                .is_some_and(|host_keyboard_id| {
-                    ctx.keyboard_pressed_keys
-                        .get(&host_keyboard_id)
-                        .is_some_and(|keys| {
-                            keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-                        })
-                })
-    })
+    ctx.keyboard_to_seat
+        .iter()
+        .any(|(&guest_keyboard_id, &seat)| {
+            seat == guest_seat
+                && ctx
+                    .shadow_table
+                    .host_id_of(GuestId(guest_keyboard_id))
+                    .is_some_and(|host_keyboard_id| {
+                        !ctx.keyboard_backspace_repeat_cancelled
+                            .contains(&host_keyboard_id)
+                            && ctx
+                                .keyboard_pressed_keys
+                                .get(&host_keyboard_id)
+                                .is_some_and(|keys| {
+                                    keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                                })
+                    })
+        })
 }
 
 fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, Option<HostId>)> {
@@ -132,8 +170,7 @@ fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, Option<Host
         .map(|(&guest_keyboard_id, _)| {
             (
                 guest_keyboard_id,
-                ctx.shadow_table
-                    .host_id_of(GuestId(guest_keyboard_id)),
+                ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id)),
             )
         })
         .collect();
@@ -143,11 +180,14 @@ fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, Option<Host
         .iter()
         .find(|(_, host_keyboard_id)| {
             host_keyboard_id.is_some_and(|host_keyboard_id| {
-                ctx.keyboard_pressed_keys
-                    .get(&host_keyboard_id)
-                    .is_some_and(|keys| {
-                        keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-                    })
+                !ctx.keyboard_backspace_repeat_cancelled
+                    .contains(&host_keyboard_id)
+                    && ctx
+                        .keyboard_pressed_keys
+                        .get(&host_keyboard_id)
+                        .is_some_and(|keys| {
+                            keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                        })
             })
         })
         .copied()
@@ -170,9 +210,7 @@ fn synthesize_backspace_key_pair(ctx: &mut Context, guest_seat: u32) -> bool {
         let forwarded = ctx
             .keyboard_forwarded_keys
             .get(&host_keyboard_id)
-            .is_some_and(|keys| {
-                keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
-            });
+            .is_some_and(|keys| keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE));
         if !forwarded {
             ctx.keyboard_ime_suppressed_keys
                 .entry(host_keyboard_id)
@@ -456,36 +494,10 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             state
         );
 
-        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-        let found_keycode = xkbcommon::xkb::Keymap::new_from_names(
-            &context,
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .and_then(|keymap| {
-            for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
-                let keycode = keycode_raw.into();
-                let syms = keymap.key_get_syms_by_level(keycode, 0, 0);
-                if syms.iter().any(|s| s.raw() == sym) {
-                    return Some(keycode_raw - 8);
-                }
-            }
-            None
-        });
-
-        if let Some(keycode) = found_keycode {
+        if let Some(keycode) = keysym_to_evdev_keycode(sym) {
             let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
-            let keyboard_id = guest_seat.and_then(|seat| {
-                ctx.keyboard_to_seat
-                    .iter()
-                    .find_map(|(&keyboard, &keyboard_seat)| {
-                        (keyboard_seat == seat).then_some(keyboard)
-                    })
-            });
+            let keyboard_id = guest_seat
+                .and_then(|seat| keyboard_for_seat(ctx, seat).map(|(keyboard, _)| keyboard));
             if let Some(keyboard_id) = keyboard_id {
                 log::debug!(
                     "  -> forwarding wl_keyboard.key: keyboard_id={}, serial={}, time={}, keycode={}, state={}",
@@ -2251,6 +2263,49 @@ mod tests {
         let time = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
         assert_eq!(serial, 123);
         assert_eq!(time, 456);
+    }
+
+    #[test]
+    fn fallback_keysym_lookup_is_stable_and_reusable() {
+        assert_eq!(
+            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_BackSpace),
+            Some(crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+        );
+        assert_eq!(
+            keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_BackSpace),
+            Some(crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+        );
+        assert_eq!(keysym_to_evdev_keycode(u32::MAX), None);
+    }
+
+    #[test]
+    fn on_keysym_selects_guest_keyboard_deterministically() {
+        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
+        for (guest_keyboard, host_keyboard) in [(999, 888), (100, 777)] {
+            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            ctx.shadow_table
+                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
+        }
+        ctx.last_sender_id = host_v1_id;
+
+        assert_eq!(
+            TextInputV1Handler.on_keysym(
+                &mut ctx,
+                123,
+                456,
+                xkbcommon::xkb::keysyms::KEY_BackSpace,
+                1,
+                0,
+            ),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            msg_sender(&ctx.host_to_client_queue, 0),
+            100,
+            "keysym routing must not depend on HashMap iteration order"
+        );
     }
 
     #[test]

@@ -385,6 +385,10 @@ pub struct Context {
     /// `wl_keyboard.key` and ChromeOS `peek_key` events update this map, so
     /// IME-consumed keys remain observable without leaking state across seats.
     pub keyboard_pressed_keys: HashMap<HostId, HashSet<u32>>,
+    /// Host keyboards whose held Backspace repeat was cancelled by a newer
+    /// non-Backspace press. Physical key state remains intact until release,
+    /// while empty IME confirmations must not rearm the cancelled repeat.
+    pub keyboard_backspace_repeat_cancelled: HashSet<HostId>,
     /// Most recent compositor-relative event time for each host keyboard.
     /// Synthetic compatibility events must use this same time domain.
     pub keyboard_event_times: HashMap<HostId, u32>,
@@ -472,6 +476,7 @@ impl Context {
             keyboard_to_extended_keyboard: HashMap::new(),
             extended_keyboard_to_keyboard: HashMap::new(),
             keyboard_pressed_keys: HashMap::new(),
+            keyboard_backspace_repeat_cancelled: HashSet::new(),
             keyboard_event_times: HashMap::new(),
             keyboard_ime_suppressed_keys: HashMap::new(),
             keyboard_forwarded_keys: HashMap::new(),
