@@ -27,6 +27,10 @@ use crate::state::{Context, HostId};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
+fn keyboard_extension_version(host_version: u32) -> u32 {
+    host_version.min(2)
+}
+
 pub struct RegistryHandler;
 
 impl wl_registry::WlRegistryHandler for RegistryHandler {
@@ -133,7 +137,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         } else if interface == "zcr_keyboard_extension_v1" {
             // Bind zcr_keyboard_extension_v1 internally. This is a ChromeOS-
             // specific protocol that enables the ack-key mechanism for
-            // controlling host accelerator processing. Not exposed to the guest.
+            // controlling host accelerator processing. Version 2 additionally
+            // reports physical keys consumed by IME via peek_key.
             let host_id = ctx.shadow_table.allocate_host_id();
             ctx.host_keyboard_extension_id = Some(HostId::from_allocated(host_id));
             // The host does not send events to the keyboard_extension factory; no
@@ -143,14 +148,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let mut builder = MessageBuilder::new();
             builder.write_u32(name);
             builder.write_string(interface);
-            // Bind at v1: we only need ack_key. peek_key (added in v2) is
-            // intentionally not used.
-            builder.write_u32(1);
+            let bound_version = keyboard_extension_version(version);
+            builder.write_u32(bound_version);
             builder.write_u32(host_id);
 
             let full_msg = builder.build_message(registry_host_id, wl_registry::REQ_BIND as u16);
             ctx.client_to_host_queue.push((full_msg, Vec::new()));
-            log::debug!("Bound zcr_keyboard_extension_v1 (host_id={})", host_id);
+            log::debug!(
+                "Bound zcr_keyboard_extension_v1 v{} (host_id={})",
+                bound_version,
+                host_id
+            );
 
             return Action::Drop;
         } else if interface == "zaura_shell" {
@@ -267,5 +275,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
 
         Action::Drop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyboard_extension_version;
+
+    #[test]
+    fn keyboard_extension_uses_peek_key_without_exceeding_host_version() {
+        assert_eq!(keyboard_extension_version(1), 1);
+        assert_eq!(keyboard_extension_version(2), 2);
+        assert_eq!(keyboard_extension_version(99), 2);
     }
 }

@@ -35,6 +35,9 @@ use xkbcommon::xkb;
 const WL_KEY_PRESSED: u32 = 1;
 const WL_KEY_RELEASED: u32 = 0;
 
+/// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
+pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
+
 /// `wl_keyboard.keymap` format value for XKB (Wayland spec §wl_keyboard.keymap_format).
 const WL_KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
@@ -406,6 +409,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     "  -> text_input {}: active_surface = {}",
                     guest_text_input_id, guest_surface_id
                 );
+                crate::handler::text_input::invalidate_for_keyboard_focus(state);
                 state.active_surface = Some(guest_surface_id);
 
                 // Send zwp_text_input_v3.enter (opcode 0).
@@ -444,6 +448,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         };
         log::info!("  -> seat_id={}: removing active_surface", guest_seat_id);
         ctx.active_surface_for_seat.remove(&guest_seat_id);
+        ctx.peek_pressed_keys.clear();
 
         let mut text_inputs_to_update = Vec::new();
         // Find the v3 text input for this seat.
@@ -454,6 +459,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     guest_text_input_id
                 );
                 state.active_surface = None;
+                crate::handler::text_input::invalidate_for_keyboard_focus(state);
 
                 // Send zwp_text_input_v3.leave (opcode 1).
                 let mut builder = MessageBuilder::new();
@@ -488,7 +494,17 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             ">>> wl_keyboard.on_key: host_kb={:?}, guest_kb={}, serial={}, key={}, state={}",
             host_keyboard_id, guest_keyboard_id, serial, key, state
         );
-        let mut action = Action::Forward;
+        let suppress_redundant_backspace = key == EVDEV_KEY_BACKSPACE
+            && ctx
+                .text_inputs
+                .values()
+                .any(|text_input| text_input.empty_preedit_repeat_active);
+        let mut action = if suppress_redundant_backspace {
+            log::debug!("  -> dropping host Backspace already handled by repeat fallback");
+            Action::Drop
+        } else {
+            Action::Forward
+        };
         let mut handled = true; // Default: guest handles the key.
 
         // WL_KEY_PRESSED = 1, WL_KEY_RELEASED = 0.
@@ -518,6 +534,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 // to avoid stuck-key state in the guest.
                 if self.dropped_keys.remove(&key) {
                     action = Action::Drop;
+                }
+                if key == EVDEV_KEY_BACKSPACE {
+                    crate::handler::text_input::end_backspace_repeat(ctx);
                 }
             }
             other => {
@@ -614,6 +633,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
         self.dropped_keys.clear();
         self.modifiers = 0;
+        ctx.peek_pressed_keys.clear();
         if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
             // zcr_extended_keyboard_v1.destroy — no payload (8-byte header only).
             let msg = crate::wire::MessageBuilder::new()
@@ -637,33 +657,47 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 /// the factory object, so all event callbacks are empty stubs.
 impl crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::ZcrKeyboardExtensionV1Handler for KeyboardHandler {}
 
-/// `zcr_extended_keyboard_v1` handler — sommelier only sends requests to this
-/// interface (i.e. `ack_key`, `destroy`). The v1 protocol has no host events.
-///
-/// `on_peek_key` is a v2 addition; it is not requested here but is stubbed
-/// with a `log::warn!` so that a v2 compositor is immediately visible in logs
-/// rather than silently discarded, making future version upgrades easier to detect.
+/// `zcr_extended_keyboard_v1` handler. Version 2's `peek_key` reports physical
+/// press/release state even when the host IME consumes the corresponding key
+/// and therefore omits the normal `wl_keyboard.key` event.
 impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler for KeyboardHandler {
     fn on_peek_key(
         &mut self,
-        _ctx: &mut crate::state::Context,
-        _serial: u32,
-        _time: u32,
-        _key: u32,
-        _state: u32,
+        ctx: &mut crate::state::Context,
+        serial: u32,
+        time: u32,
+        key: u32,
+        state: u32,
     ) -> crate::wire::Action {
-        log::warn!(
-            "zcr_extended_keyboard_v1: received peek_key (v2 event); \
-             sommelier is bound at v1 and does not handle peek_key. \
-             Consider upgrading to v2 if the host compositor requires it."
+        log::trace!(
+            ">>> zcr_extended_keyboard_v1.peek_key: serial={}, time={}, key={}, state={}",
+            serial,
+            time,
+            key,
+            state
         );
-        crate::wire::Action::Forward
+        match state {
+            WL_KEY_PRESSED => {
+                ctx.peek_pressed_keys.insert(key);
+            }
+            WL_KEY_RELEASED => {
+                ctx.peek_pressed_keys.remove(&key);
+                if key == EVDEV_KEY_BACKSPACE {
+                    crate::handler::text_input::end_backspace_repeat(ctx);
+                }
+            }
+            other => {
+                log::warn!("peek_key: received unknown key state {}, ignoring", other);
+            }
+        }
+        crate::wire::Action::Drop
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use std::os::unix::io::AsRawFd;
 
@@ -1054,6 +1088,18 @@ mod tests {
     }
 
     #[test]
+    fn peek_key_tracks_ime_consumed_physical_key_state() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+
+        assert_eq!(handler.on_peek_key(&mut ctx, 10, 20, 14, 1), Action::Drop);
+        assert!(ctx.peek_pressed_keys.contains(&14));
+
+        assert_eq!(handler.on_peek_key(&mut ctx, 11, 21, 14, 0), Action::Drop);
+        assert!(!ctx.peek_pressed_keys.contains(&14));
+    }
+
+    #[test]
     fn opcode_encoding_get_extended_keyboard_is_zero() {
         // Regression: get_extended_keyboard uses opcode 0. Verify the wire
         // message encodes it correctly (not accidentally a non-zero opcode).
@@ -1259,5 +1305,80 @@ mod tests {
             "no destroy message should be queued for an unknown keyboard"
         );
     }
-}
 
+    #[test]
+    fn keyboard_enter_invalidates_stale_text_input_before_new_enable() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(5, 10);
+        ctx.keyboard_to_seat.insert(5, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.text_inputs.insert(
+            40,
+            crate::state::TextInputState {
+                host_v1_id: 50,
+                host_ext_id: None,
+                guest_seat: 7,
+                active_surface: Some(21),
+                pending_enabled: true,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: Some(("stale".to_string(), 5, 5)),
+                committed_surrounding_text: Some(("stale".to_string(), 5, 5)),
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: "한".to_string(),
+                guest_commit_serial: 9,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: vec![(3, 0)],
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: true,
+                host_activated: true,
+            },
+        );
+        ctx.last_sender_id = 10;
+
+        assert_eq!(handler.on_enter(&mut ctx, 1, 30, &[]), Action::Forward);
+
+        let state = &ctx.text_inputs[&40];
+        assert_eq!(state.active_surface, Some(20));
+        assert!(!state.pending_enabled);
+        assert!(!state.committed_enabled);
+        assert!(!state.host_activated);
+        assert!(state.committed_surrounding_text.is_none());
+        assert!(state.current_preedit.is_empty());
+        assert!(state.pending_deletes.is_empty());
+        assert_eq!(state.guest_commit_serial, 9);
+
+        let deactivate = ctx.client_to_host_queue.iter().find(|(message, _)| {
+            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 50
+                && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) == 1
+        });
+        assert!(deactivate.is_some());
+        assert!(ctx.host_to_client_queue.iter().any(|(message, _)| {
+            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 40
+                && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) == 0
+        }));
+
+        ctx.text_inputs
+            .get_mut(&40)
+            .unwrap()
+            .empty_preedit_repeat_active = true;
+        ctx.last_sender_id = 10;
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 10, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 11, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+    }
+}
