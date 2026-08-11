@@ -339,9 +339,9 @@ pub struct TextInputState {
     /// `commit_string` event.
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
-    /// The host IME just reduced a non-empty preedit to empty. Empty
-    /// confirm_preedit events may represent continued Backspace auto-repeat
-    /// until the physical key is released or a new composition starts.
+    /// The proxy has entered the IME-consumed Backspace repeat path. This can
+    /// be armed by physical key state or by a non-empty-to-empty preedit
+    /// transition when Exo consumes the key event entirely.
     pub empty_preedit_repeat_active: bool,
     pub host_activated: bool,
 }

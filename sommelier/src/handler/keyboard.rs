@@ -514,6 +514,12 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // pattern and `other` fires only for values not matched above.
         match state {
             WL_KEY_PRESSED => {
+                if key == EVDEV_KEY_BACKSPACE {
+                    ctx.peek_pressed_keys.insert(EVDEV_KEY_BACKSPACE);
+                } else {
+                    ctx.peek_pressed_keys.remove(&EVDEV_KEY_BACKSPACE);
+                    crate::handler::text_input::end_backspace_repeat(ctx);
+                }
                 // Key pressed: check if this is a host accelerator.
                 if self.is_host_accelerator(&ctx.accelerators, key) {
                     log::debug!("  -> accelerator key, dropping");
@@ -536,6 +542,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     action = Action::Drop;
                 }
                 if key == EVDEV_KEY_BACKSPACE {
+                    ctx.peek_pressed_keys.remove(&EVDEV_KEY_BACKSPACE);
                     crate::handler::text_input::end_backspace_repeat(ctx);
                 }
             }
@@ -679,6 +686,10 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         match state {
             WL_KEY_PRESSED => {
                 ctx.peek_pressed_keys.insert(key);
+                if key != EVDEV_KEY_BACKSPACE {
+                    ctx.peek_pressed_keys.remove(&EVDEV_KEY_BACKSPACE);
+                    crate::handler::text_input::end_backspace_repeat(ctx);
+                }
             }
             WL_KEY_RELEASED => {
                 ctx.peek_pressed_keys.remove(&key);
@@ -1366,19 +1377,34 @@ mod tests {
                 && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) == 0
         }));
 
+        ctx.peek_pressed_keys.insert(EVDEV_KEY_BACKSPACE);
         ctx.text_inputs
             .get_mut(&40)
             .unwrap()
             .empty_preedit_repeat_active = true;
         ctx.last_sender_id = 10;
         assert_eq!(
-            handler.on_key(&mut ctx, 2, 10, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
-            Action::Drop
+            handler.on_key(&mut ctx, 2, 10, 30, WL_KEY_PRESSED),
+            Action::Forward
         );
+        assert!(!ctx.peek_pressed_keys.contains(&EVDEV_KEY_BACKSPACE));
+        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+
+        ctx.text_inputs
+            .get_mut(&40)
+            .unwrap()
+            .empty_preedit_repeat_active = true;
+        ctx.last_sender_id = 10;
         assert_eq!(
-            handler.on_key(&mut ctx, 3, 11, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            handler.on_key(&mut ctx, 3, 11, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
             Action::Drop
         );
+        assert!(ctx.peek_pressed_keys.contains(&EVDEV_KEY_BACKSPACE));
+        assert_eq!(
+            handler.on_key(&mut ctx, 4, 12, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert!(!ctx.peek_pressed_keys.contains(&EVDEV_KEY_BACKSPACE));
         assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
     }
 }

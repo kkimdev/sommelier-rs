@@ -740,13 +740,17 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         if preedit_text.is_empty() {
             if backspace_pressed || state.empty_preedit_repeat_active {
                 let guest_seat = state.guest_seat;
+                state.empty_preedit_repeat_active = true;
                 if synthesize_backspace_key_pair(ctx, guest_seat) {
                     log::debug!(
                         "Translating empty confirm_preedit during held Backspace to synthetic key pair"
                     );
+                } else if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                    state.empty_preedit_repeat_active = false;
                 }
                 return Action::Drop;
             }
+            state.empty_preedit_repeat_active = false;
             log::debug!(
                 "Ignoring confirm_preedit without an active preedit for guest {}",
                 guest_id
@@ -1614,6 +1618,63 @@ mod tests {
     }
 
     #[test]
+    fn input_mode_switch_boundary_clears_stale_repeat_before_empty_confirmation() {
+        let (mut ctx, _, guest_id) = setup_v1_ctx();
+        ctx.keyboard_to_seat.insert(40, 0);
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_surrounding_text = Some(("english".to_string(), 7, 7));
+            state.pending_surrounding_text = state.committed_surrounding_text.clone();
+            state.empty_preedit_repeat_active = true;
+        }
+        end_backspace_repeat(&mut ctx);
+        ctx.last_sender_id = 30;
+        let mut handler = ExtendedTextInputV1Handler;
+
+        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "a routine empty confirmation must not become a synthetic Backspace"
+        );
+        assert_eq!(
+            ctx.text_inputs[&guest_id].committed_surrounding_text,
+            Some(("english".to_string(), 7, 7))
+        );
+    }
+
+    #[test]
+    fn held_backspace_repeats_over_committed_korean_without_preedit() {
+        let (mut ctx, _, guest_id) = setup_v1_ctx();
+        ctx.keyboard_to_seat.insert(40, 0);
+        ctx.peek_pressed_keys
+            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        ctx.text_inputs
+            .get_mut(&guest_id)
+            .unwrap()
+            .committed_surrounding_text = Some(("가나다라".to_string(), 12, 12));
+        ctx.last_sender_id = 30;
+        let mut handler = ExtendedTextInputV1Handler;
+
+        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
+        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
+        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 6);
+        assert!(ctx.text_inputs[&guest_id].empty_preedit_repeat_active);
+        for message in &ctx.host_to_client_queue {
+            assert_eq!(
+                msg_sender(std::slice::from_ref(message), 0),
+                40,
+                "each repeat must target the active guest keyboard"
+            );
+            assert_eq!(
+                msg_opcode(std::slice::from_ref(message), 0),
+                3,
+                "each repeat must be a wl_keyboard.key event"
+            );
+        }
+    }
+
+    #[test]
     fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 40;
@@ -1667,6 +1728,8 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 2);
 
         end_backspace_repeat(&mut ctx);
+        ctx.peek_pressed_keys
+            .remove(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
         ctx.host_to_client_queue.clear();
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
@@ -1674,9 +1737,14 @@ mod tests {
 
     #[test]
     fn held_backspace_fallback_requires_guest_keyboard_for_seat() {
-        let (mut ctx, _, _) = setup_v1_ctx();
+        let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = 30;
-        ctx.peek_pressed_keys.insert(14);
+        ctx.peek_pressed_keys
+            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        ctx.text_inputs
+            .get_mut(&guest_id)
+            .unwrap()
+            .empty_preedit_repeat_active = true;
         let mut handler = ExtendedTextInputV1Handler;
 
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
