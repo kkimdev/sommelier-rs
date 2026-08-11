@@ -71,16 +71,42 @@ struct MmapView {
 
 impl MmapView {
     /// Map `len` bytes from `fd` at offset 0 as a private read-only view.
-    /// Returns `None` if `len` is zero or if `mmap` fails.
+    /// Returns `None` if `len` is zero, a regular fd is shorter than `len`, or
+    /// if `mmap` fails. Checking regular-file length before mapping prevents a
+    /// malformed keymap event from producing a mapping that SIGBUSes when read.
+    /// virtwl virtual fds intentionally report no regular-file size and are
+    /// validated by the virtwl-backed mmap operation itself.
     fn from_fd(fd: std::os::unix::io::RawFd, len: usize) -> Option<Self> {
         use nix::sys::mman::{mmap, MapFlags, ProtFlags};
+        use nix::sys::stat::{fstat, SFlag};
         use std::os::unix::io::BorrowedFd;
 
         let nonzero_len = std::num::NonZeroUsize::new(len)?;
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let (file_size, file_mode) = match fstat(borrowed) {
+            Ok(stat) => (stat.st_size, stat.st_mode),
+            Err(error) => {
+                log::error!("on_keymap: fstat failed for fd={}: {}", fd, error);
+                return None;
+            }
+        };
+        let is_regular_file = SFlag::from_bits_truncate(file_mode).contains(SFlag::S_IFREG);
+        if file_size < 0
+            || (is_regular_file && u64::try_from(file_size).ok()? < len as u64)
+        {
+            log::error!(
+                "on_keymap: fd={} ({:?}) is shorter than keymap size (mode={:#o}, fd_size={}, requested={})",
+                fd,
+                std::fs::read_link(format!("/proc/self/fd/{fd}")).ok(),
+                file_mode,
+                file_size,
+                len
+            );
+            return None;
+        }
         // Safety: fd is valid for the duration of this call; mmap does not
         // retain it. The returned pointer owns the mapping until munmap.
         let ptr = unsafe {
-            let borrowed = BorrowedFd::borrow_raw(fd);
             mmap(
                 None,
                 nonzero_len,
@@ -225,10 +251,6 @@ impl KeyboardHandler {
         match state {
             WL_KEY_PRESSED => {
                 pressed_keys.insert(key);
-                if key == EVDEV_KEY_BACKSPACE {
-                    ctx.keyboard_backspace_repeat_cancelled
-                        .remove(&host_keyboard_id);
-                }
             }
             WL_KEY_RELEASED => {
                 pressed_keys.remove(&key);
@@ -1402,6 +1424,38 @@ mod tests {
     }
 
     #[test]
+    fn keymap_size_larger_than_fd_is_rejected_without_sigbus() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        load_test_keymap(&mut handler, &mut ctx);
+
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+        let name = CString::new("test-keymap-short-fd").unwrap();
+        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
+        let bytes = b"\0";
+        nix::unistd::write(&fd, bytes).expect("write failed");
+
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                WL_KEYMAP_FORMAT_XKB_V1,
+                fd.as_raw_fd(),
+                (bytes.len() + 1) as u32,
+            ),
+            Action::Forward
+        );
+        assert!(
+            !handler.keymaps.contains_key(&HostId(0)),
+            "a short keymap fd must not leave stale keymap state"
+        );
+        assert!(
+            !handler.states.contains_key(&HostId(0)),
+            "a short keymap fd must not leave stale XKB state"
+        );
+    }
+
+    #[test]
     fn no_keymap_event_clears_previous_keyboard_state() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new(false, false);
@@ -1668,6 +1722,59 @@ mod tests {
             !ctx.keyboard_backspace_repeat_cancelled
                 .contains(&HostId(100)),
             "Backspace release must clear repeat cancellation"
+        );
+    }
+
+    #[test]
+    fn backspace_auto_repeat_press_does_not_rearm_cancelled_repeat() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.keyboard_pressed_keys
+            .entry(HostId(100))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        ctx.text_inputs
+            .get_mut(&40)
+            .unwrap()
+            .empty_preedit_repeat_active = true;
+
+        // A newer key cancels the IME repeat while the physical Backspace
+        // remains held.
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 500, 30, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert!(ctx
+            .keyboard_backspace_repeat_cancelled
+            .contains(&HostId(100)));
+
+        // Wayland represents key auto-repeat as additional pressed events.
+        // They must not clear the cancellation until the physical release.
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 501, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert!(
+            ctx.keyboard_backspace_repeat_cancelled
+                .contains(&HostId(100)),
+            "a repeated Backspace press must not rearm a cancelled IME repeat"
+        );
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler::on_confirm_preedit(
+                &mut crate::handler::text_input::ExtendedTextInputV1Handler,
+                &mut ctx,
+                0,
+            ),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "a repeated Backspace press must not synthesize another key pair"
         );
     }
 
