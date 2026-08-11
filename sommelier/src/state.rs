@@ -377,9 +377,23 @@ pub struct Context {
     /// client→host request handler reads `ctx.last_sender_id` (a guest ID) and
     /// uses it to look up a host-keyed map.
     pub keyboard_to_extended_keyboard: HashMap<HostId, HostId>,
-    /// Physical keys currently held according to keyboard-extension v2
-    /// `peek_key` events, including keys consumed by the host IME.
-    pub peek_pressed_keys: HashSet<u32>,
+    /// Reverse lookup for keyboard-extension v2 events. `peek_key` is sent by
+    /// the extended-keyboard object, while the physical-key state belongs to
+    /// the corresponding host `wl_keyboard`.
+    pub extended_keyboard_to_keyboard: HashMap<HostId, HostId>,
+    /// Physical keys currently held for each host keyboard. Both normal
+    /// `wl_keyboard.key` and ChromeOS `peek_key` events update this map, so
+    /// IME-consumed keys remain observable without leaking state across seats.
+    pub keyboard_pressed_keys: HashMap<HostId, HashSet<u32>>,
+    /// Most recent compositor-relative event time for each host keyboard.
+    /// Synthetic compatibility events must use this same time domain.
+    pub keyboard_event_times: HashMap<HostId, u32>,
+    /// Backspace key releases that must be consumed because a synthetic press
+    /// and release pair was already delivered to the guest.
+    pub keyboard_ime_suppressed_keys: HashMap<HostId, HashSet<u32>>,
+    /// Keys whose physical press was forwarded to the guest and therefore
+    /// still require a real release event.
+    pub keyboard_forwarded_keys: HashMap<HostId, HashSet<u32>>,
     /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
     pub accelerators: Vec<crate::accelerator::Accelerator>,
     pub supported_formats: HashSet<u32>,
@@ -456,7 +470,11 @@ impl Context {
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
             keyboard_to_extended_keyboard: HashMap::new(),
-            peek_pressed_keys: HashSet::new(),
+            extended_keyboard_to_keyboard: HashMap::new(),
+            keyboard_pressed_keys: HashMap::new(),
+            keyboard_event_times: HashMap::new(),
+            keyboard_ime_suppressed_keys: HashMap::new(),
+            keyboard_forwarded_keys: HashMap::new(),
             accelerators,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),

@@ -21,7 +21,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::Context;
+use crate::state::{Context, GuestId, HostId};
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
@@ -102,22 +102,84 @@ fn convert_delete_range(index: i32, length: u32) -> Option<(u32, u32)> {
     Some((start.unsigned_abs() as u32, end as u32))
 }
 
-fn synthesize_backspace_key_pair(ctx: &mut Context, guest_seat: u32) -> bool {
-    let Some(guest_keyboard_id) = ctx
+pub(crate) fn backspace_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
+    ctx.text_inputs
+        .values()
+        .any(|state| state.guest_seat == guest_seat && state.empty_preedit_repeat_active)
+}
+
+pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
+    ctx.keyboard_to_seat.iter().any(|(&guest_keyboard_id, &seat)| {
+        seat == guest_seat
+            && ctx
+                .shadow_table
+                .host_id_of(GuestId(guest_keyboard_id))
+                .is_some_and(|host_keyboard_id| {
+                    ctx.keyboard_pressed_keys
+                        .get(&host_keyboard_id)
+                        .is_some_and(|keys| {
+                            keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                        })
+                })
+    })
+}
+
+fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, Option<HostId>)> {
+    let mut candidates: Vec<_> = ctx
         .keyboard_to_seat
         .iter()
-        .find_map(|(&keyboard, &seat)| (seat == guest_seat).then_some(keyboard))
-    else {
+        .filter(|(_, seat)| **seat == guest_seat)
+        .map(|(&guest_keyboard_id, _)| {
+            (
+                guest_keyboard_id,
+                ctx.shadow_table
+                    .host_id_of(GuestId(guest_keyboard_id)),
+            )
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|(guest_keyboard_id, _)| *guest_keyboard_id);
+
+    candidates
+        .iter()
+        .find(|(_, host_keyboard_id)| {
+            host_keyboard_id.is_some_and(|host_keyboard_id| {
+                ctx.keyboard_pressed_keys
+                    .get(&host_keyboard_id)
+                    .is_some_and(|keys| {
+                        keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                    })
+            })
+        })
+        .copied()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn synthesize_backspace_key_pair(ctx: &mut Context, guest_seat: u32) -> bool {
+    let Some((guest_keyboard_id, host_keyboard_id)) = keyboard_for_seat(ctx, guest_seat) else {
         log::warn!(
             "Cannot synthesize held Backspace: no guest keyboard for seat {}",
             guest_seat
         );
         return false;
     };
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32;
+    let time = host_keyboard_id
+        .and_then(|host_keyboard_id| ctx.keyboard_event_times.get(&host_keyboard_id))
+        .copied()
+        .unwrap_or(0);
+    if let Some(host_keyboard_id) = host_keyboard_id {
+        let forwarded = ctx
+            .keyboard_forwarded_keys
+            .get(&host_keyboard_id)
+            .is_some_and(|keys| {
+                keys.contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+            });
+        if !forwarded {
+            ctx.keyboard_ime_suppressed_keys
+                .entry(host_keyboard_id)
+                .or_default()
+                .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        }
+    }
     for state in [1, 0] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
         let mut builder = MessageBuilder::new();
@@ -718,29 +780,35 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
     }
     fn on_confirm_preedit(&mut self, ctx: &mut Context, _selection_behavior: u32) -> Action {
         let host_ext_id = ctx.last_sender_id;
-        let backspace_pressed = ctx
-            .peek_pressed_keys
-            .contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
         log::trace!(
             ">>> on_confirm_preedit: host_ext_id={}, selection_behavior={}",
             host_ext_id,
             _selection_behavior
         );
-        let Some((&guest_id, state)) = ctx
+        let Some(guest_id) = ctx
             .text_inputs
-            .iter_mut()
+            .iter()
             .find(|(_, s)| s.host_ext_id == Some(host_ext_id))
+            .map(|(&guest_id, _)| guest_id)
         else {
+            return Action::Drop;
+        };
+        let Some(state) = ctx.text_inputs.get(&guest_id) else {
             return Action::Drop;
         };
         if !state.host_activated {
             return Action::Drop;
         }
+        let guest_seat = state.guest_seat;
         let preedit_text = state.current_preedit.clone();
+        let repeat_active = state.empty_preedit_repeat_active;
+        let backspace_pressed = backspace_pressed_for_seat(ctx, guest_seat);
         if preedit_text.is_empty() {
-            if backspace_pressed || state.empty_preedit_repeat_active {
-                let guest_seat = state.guest_seat;
-                state.empty_preedit_repeat_active = true;
+            if backspace_pressed || repeat_active {
+                ctx.text_inputs
+                    .get_mut(&guest_id)
+                    .expect("text input disappeared while confirming preedit")
+                    .empty_preedit_repeat_active = true;
                 if synthesize_backspace_key_pair(ctx, guest_seat) {
                     log::debug!(
                         "Translating empty confirm_preedit during held Backspace to synthetic key pair"
@@ -750,7 +818,10 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 }
                 return Action::Drop;
             }
-            state.empty_preedit_repeat_active = false;
+            ctx.text_inputs
+                .get_mut(&guest_id)
+                .expect("text input disappeared while confirming preedit")
+                .empty_preedit_repeat_active = false;
             log::debug!(
                 "Ignoring confirm_preedit without an active preedit for guest {}",
                 guest_id
@@ -762,6 +833,10 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             preedit_text,
             guest_id
         );
+        let state = ctx
+            .text_inputs
+            .get_mut(&guest_id)
+            .expect("text input disappeared while confirming preedit");
         let done_serial = state.guest_commit_serial;
         state.current_preedit.clear();
         state.empty_preedit_repeat_active = false;
@@ -945,9 +1020,11 @@ pub(crate) fn invalidate_for_keyboard_focus(state: &mut crate::state::TextInputS
     state.empty_preedit_repeat_active = false;
 }
 
-pub(crate) fn end_backspace_repeat(ctx: &mut Context) {
+pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) {
     for state in ctx.text_inputs.values_mut() {
-        state.empty_preedit_repeat_active = false;
+        if state.guest_seat == guest_seat {
+            state.empty_preedit_repeat_active = false;
+        }
     }
 }
 
@@ -1627,7 +1704,7 @@ mod tests {
             state.pending_surrounding_text = state.committed_surrounding_text.clone();
             state.empty_preedit_repeat_active = true;
         }
-        end_backspace_repeat(&mut ctx);
+        end_backspace_repeat_for_seat(&mut ctx, 0);
         ctx.last_sender_id = 30;
         let mut handler = ExtendedTextInputV1Handler;
 
@@ -1645,8 +1722,12 @@ mod tests {
     #[test]
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
+        let host_keyboard_id = 41;
+        ctx.shadow_table.map_id(40, host_keyboard_id);
         ctx.keyboard_to_seat.insert(40, 0);
-        ctx.peek_pressed_keys
+        ctx.keyboard_pressed_keys
+            .entry(HostId(host_keyboard_id))
+            .or_default()
             .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
         ctx.text_inputs
             .get_mut(&guest_id)
@@ -1727,9 +1808,7 @@ mod tests {
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 2);
 
-        end_backspace_repeat(&mut ctx);
-        ctx.peek_pressed_keys
-            .remove(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        end_backspace_repeat_for_seat(&mut ctx, 0);
         ctx.host_to_client_queue.clear();
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
@@ -1739,8 +1818,6 @@ mod tests {
     fn held_backspace_fallback_requires_guest_keyboard_for_seat() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = 30;
-        ctx.peek_pressed_keys
-            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
         ctx.text_inputs
             .get_mut(&guest_id)
             .unwrap()
