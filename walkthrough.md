@@ -569,3 +569,31 @@ adds the virtwl systemd user service. All eleven local commits were rebased
 onto that upstream branch without conflicts. The serialized Rust workspace
 matrix remains green: 308 Sommelier tests, 12 sample-GUI tests, 5 codegen
 tests, plus check, strict Clippy, formatting, and diff checks.
+
+## 2026-08-14 — GitHub Actions and Nix packaging
+
+The personal fork is configured around the sole `virtwl` branch. GitHub-hosted
+Ubuntu 24.04 runners now build x86_64 and aarch64 in both CI and tagged
+release workflows. Release jobs verify the Cargo version, collect both
+architecture artifacts, and publish a single checksum file after the matrix
+completes. Build jobs have read-only contents permissions; only the release
+job can write releases. Dependabot is enabled for Cargo and GitHub Actions.
+
+Repository settings were verified: Actions are enabled with read-only default
+workflow permissions, vulnerability alerts and automated security fixes are
+enabled, and merged branches are deleted automatically. No self-hosted runner
+is registered; the workflow uses GitHub-hosted runners by design.
+
+`actionlint` passes. The Nix flake evaluates for both supported systems, the
+verified upstream binary derivation builds, and the source derivation builds
+after serializing only its compositor test binary in the Nix check hook. The
+first Nix attempt exposed workspace test-process FD/codegen races; the final
+derivation avoids those package-check races while the full three-package test
+matrix remains in CI. The binary derivation stays on upstream `virtwl-v0.2.0`
+until a personal `virtwl-v0.2.1` release supplies new hashes.
+
+The final monorepo `bun run verify` completed with 2473 passing assertions and
+the same 10 unrelated baseline failures: nested Biome roots, a missing Slidev
+path, root hygiene/prohibited-file/absolute-path findings, and pre-existing
+shebang or executable-bit findings. None points to the Sommelier or Nix
+changes.

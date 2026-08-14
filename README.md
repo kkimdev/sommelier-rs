@@ -1,4 +1,4 @@
-# Sommelier-rs: crosvm's Compainion Wayland Proxy
+# Sommelier-rs: crosvm's Companion Wayland Proxy
 
 This project is a rust rewrite of the [Sommelier](https://chromium.googlesource.com/chromiumos/platform2/+/main/vm_tools/sommelier/) Wayland proxy. Its goal is to allow unmodified GUI applications running inside a virtual machine to display windows seamlessly onto the Host machine's desktop, complete with native window management and clipboard sharing. Supporting X is an explicit no-goal for this project.
 
@@ -8,18 +8,18 @@ When referring to this project, please use "sommelier-rs" to avoid confusion wit
 
 **This is the `virtwl` branch, it only works when running on a [virtio_wl](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/refs/heads/chromeos-5.4/drivers/virtio/virtio_wl.c) enabled guest kernel.** virtio_wl is not part of mainline Linux kernel, and thus not supported on most distribution kernels. Examples of distribution kernels that support virtio_wl includes ChromiumOS's guest kernel such as the kernel running in Crostini / Baguette.
 
-1. Download the newest version with "virtwl" in its name from [GitHub Releases](https://github.com/google/sommelier-rs/releases) according to your CPU architecture.
+1. Download the newest version with "virtwl" in its name from [GitHub Releases](https://github.com/kkimdev/sommelier-rs/releases) according to your CPU architecture.
 
    For x86_64
 
    ```bash
-   wget -O sommelier-rs-v0.2.0 https://github.com/google/sommelier-rs/releases/download/virtwl-v0.2.0/sommelier_rs_virtwl-v0.2.0-x86_64
+   wget -O sommelier-rs-v0.2.1 https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.2.1/sommelier_rs_virtwl-v0.2.1-x86_64
    ```
 
    For arm64 / aarch64
 
    ```bash
-   wget -O sommelier-rs-v0.2.0 https://github.com/google/sommelier-rs/releases/download/virtwl-v0.2.0/sommelier_rs_virtwl-v0.2.0-aarch64
+   wget -O sommelier-rs-v0.2.1 https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.2.1/sommelier_rs_virtwl-v0.2.1-aarch64
    ```
 
 2. (If you are running migrating from sommelier, e.g. in ChromeOS guests)
@@ -33,13 +33,13 @@ When referring to this project, please use "sommelier-rs" to avoid confusion wit
 3. Give sommelier-rs permission to run
 
    ```bash
-   chmod +x sommelier-rs-v0.2.0
+   chmod +x sommelier-rs-v0.2.1
    ```
 
 4. Run sommelier-rs
 
    ```bash
-   ./sommelier-rs-v0.2.0 --virtio-wl /dev/wl0 wayland-0
+   ./sommelier-rs-v0.2.1 --virtio-wl /dev/wl0 wayland-0
    ```
 
 5. Run your favourite Wayland app in a separate terminal, it should automatically find and use sommelier-rs to display its windows
@@ -90,7 +90,21 @@ To build, run and develop yourself, follow these steps:
 
 ## Developer Documentation
 
-Refer to the `main` branch for developer documentation. This `virtwl` branch's main addition are located in `sommelier/src/virtwl.rs` and `sommelier/src/virtwl_channel.rs`.
+Refer to the `virtwl` branch for developer documentation. Its main additions
+are located in `sommelier/src/virtwl.rs` and `sommelier/src/virtwl_channel.rs`.
+
+### Maintainer release
+
+Releases are built by GitHub-hosted `ubuntu-24.04` runners for x86_64 and
+aarch64. Push a tag whose version matches `sommelier/Cargo.toml`:
+
+```bash
+git tag virtwl-v0.2.1
+git push personal virtwl-v0.2.1
+```
+
+The workflow publishes both binaries and a `SHA256SUMS` file to the GitHub
+Release after both architecture builds pass.
 
 ## Other Notes
 

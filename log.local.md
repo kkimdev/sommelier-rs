@@ -2368,3 +2368,32 @@ Next action: inspect the current diff and ChromiumOS damage/transform/lifecycle 
   codegen 5 passed; workspace check, strict Clippy, formatting, and
   `git diff --check` passed.
 - The personal fork's `virtwl` ref is the only intended publish target.
+
+## 2026-08-14 — GitHub Actions and Nix release packaging
+
+- Prepared GitHub-hosted `ubuntu-24.04` workflows for the personal
+  `virtwl` branch. CI now builds x86_64 and aarch64, runs the serialized
+  regression suite, formatting, and strict Clippy. Release builds use the
+  `virtwl-v*` tag convention, verify the Cargo version, publish both
+  architectures, and generate one `SHA256SUMS` file without matrix upload
+  races.
+- Added weekly Cargo and GitHub Actions Dependabot configuration and updated
+  the README's personal release links and maintainer tag instructions.
+- GitHub settings verified/applied: default branch `virtwl`, Actions enabled
+  with read-only default workflow permissions, vulnerability alerts and
+  automated security fixes enabled, and automatic branch deletion after merge.
+  The repository has no self-hosted runners; workflows intentionally use
+  GitHub-hosted runners.
+- `actionlint` passes. Nix `flake check --all-systems --no-build`, the existing
+  upstream binary package build, and the source package build pass. The source
+  package now runs the compositor test binary serially in Nix to avoid the
+  workspace FD-test race; the full CI matrix remains responsible for GUI and
+  code-generator tests.
+- GitHub workflow, README, Dependabot, and Nix changes remain uncommitted and
+  unpushed pending the explicit `/commit` workflow. The Nix binary package
+  remains pinned to Google's verified `virtwl-v0.2.0` release until the
+  personal `virtwl-v0.2.1` release exists and its hashes can be recorded.
+- Final monorepo `bun run verify` completed with 2473 passes and the same 10
+  unrelated baseline failures (nested Biome roots, missing Slidev path, root
+  hygiene/prohibited-file/absolute-path findings, and existing shebang or
+  executable-bit findings). None references the Sommelier or Nix changes.

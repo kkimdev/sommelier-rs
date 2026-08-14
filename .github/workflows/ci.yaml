@@ -6,12 +6,16 @@ on:
   pull_request:
     branches: ["virtwl"]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -22,8 +26,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install deps
-        run: sudo apt-get update && sudo apt-get -y install libxkbcommon-dev libgbm-dev libdrm-dev libexpat1-dev
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install x86_64 dependencies
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libdrm-dev \
+            libexpat1-dev \
+            libgbm-dev \
+            libxkbcommon-dev \
+            pkg-config
 
       - name: Install aarch64 dependencies
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -37,15 +54,30 @@ jobs:
           Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-security        
           Components: main universe restricted multiverse
           EOF
-          rustup target add aarch64-unknown-linux-gnu
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libxkbcommon-dev:arm64 libgbm-dev:arm64 libdrm-dev:arm64 libexpat1-dev:arm64
+          sudo apt-get install --yes \
+            gcc-aarch64-linux-gnu \
+            libdrm-dev:arm64 \
+            libexpat1-dev:arm64 \
+            libgbm-dev:arm64 \
+            libxkbcommon-dev:arm64 \
+            pkg-config
 
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --verbose --target ${{ matrix.target }}
+          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '1' || '0' }}
+          PKG_CONFIG_LIBDIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' || '/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' }}
+        run: cargo build --verbose --target "${{ matrix.target }}"
 
       - name: Run tests (x86_64 only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --verbose --target ${{ matrix.target }}
+        run: cargo test --workspace --all-targets --verbose --target "${{ matrix.target }}" -- --test-threads=1
+
+      - name: Check formatting (x86_64 only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+
+      - name: Check lints (x86_64 only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
