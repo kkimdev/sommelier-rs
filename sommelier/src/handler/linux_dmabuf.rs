@@ -576,6 +576,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 unsafe { libc::close(p.fd) };
             }
         }
+        ctx.pending_native_buffer_sizes.remove(&id);
         Action::Forward
     }
 
@@ -682,6 +683,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             return Action::Drop;
         }
 
+        // The non-immediate create request reports its wl_buffer through a
+        // later `created` event. Keep the dimensions under the guest params
+        // ID until that event supplies the host-created buffer ID.
+        ctx.pending_native_buffer_sizes
+            .insert(params_id, (width, height));
         self.process_params(ctx, params_id, width, height, format, |ctx, host_id| {
             let mut builder = MessageBuilder::new();
             builder.write_i32(width);
@@ -698,6 +704,29 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             );
         });
         Action::Drop
+    }
+
+    fn on_created(&mut self, ctx: &mut Context, buffer: u32) -> Action {
+        let host_params_id = ctx.last_sender_id;
+        if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
+            if let Some(dimensions) = ctx.pending_native_buffer_sizes.remove(&guest_params_id) {
+                // The generated dispatcher maps this host-created buffer to a
+                // fresh guest server ID immediately after the handler returns.
+                // Store the dimensions under the host ID for that short
+                // interval; compositor damage lookup resolves the guest ID
+                // back to this host ID.
+                ctx.native_buffer_sizes.insert(buffer, dimensions);
+            }
+        }
+        Action::Forward
+    }
+
+    fn on_failed(&mut self, ctx: &mut Context) -> Action {
+        let host_params_id = ctx.last_sender_id;
+        if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
+            ctx.pending_native_buffer_sizes.remove(&guest_params_id);
+        }
+        Action::Forward
     }
 
     fn on_create_immed(
@@ -760,6 +789,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         );
         ctx.shadow_table
             .set_host_version(host_buffer_id, buffer_version);
+        ctx.native_buffer_sizes.insert(buffer_id, (width, height));
 
         self.process_params(ctx, params_id, width, height, format, |ctx, host_id| {
             let mut builder = MessageBuilder::new();
@@ -790,7 +820,7 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::state::{Context, PendingParam};
-    use crate::wire::Action;
+    use crate::wire::{Action, WireMessage};
 
     #[test]
     fn forwards_device_id_when_no_local_allocator_exists() {
@@ -963,6 +993,142 @@ mod tests {
         unsafe {
             libc::close(pipe_fds[0]);
         }
+    }
+
+    #[test]
+    fn async_dmabuf_created_event_moves_dimensions_to_host_buffer() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let guest_params_id = 7;
+        let host_params_id = 8;
+        let host_buffer_id = 42;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(guest_params_id, host_params_id);
+        ctx.pending_params.insert(
+            guest_params_id,
+            vec![PendingParam {
+                fd: pipe_fds[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = guest_params_id;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.pending_native_buffer_sizes.get(&guest_params_id),
+            Some(&(16, 8)),
+            "async create must retain dimensions until the host emits created"
+        );
+        assert!(!ctx.native_buffer_sizes.contains_key(&host_buffer_id));
+
+        let payload = host_buffer_id.to_ne_bytes();
+        ctx.last_sender_id = host_params_id;
+        let mut message = WireMessage::new(
+            host_params_id,
+            crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
+            &payload,
+            &[],
+        );
+        let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
+            &mut message,
+            &mut handler,
+            &mut ctx,
+        )
+        .expect("created event should decode");
+        assert!(
+            result.is_some(),
+            "created must still be forwarded to the guest"
+        );
+        assert_eq!(ctx.pending_native_buffer_sizes.get(&guest_params_id), None);
+        assert_eq!(ctx.native_buffer_sizes.get(&host_buffer_id), Some(&(16, 8)));
+        let guest_buffer_id = ctx
+            .shadow_table
+            .get_guest_id(host_buffer_id)
+            .expect("generated created event must map the host buffer");
+        assert!(
+            !ctx.native_buffer_sizes.contains_key(&guest_buffer_id),
+            "dimensions are keyed by host ID until the host delete_id lifecycle completes"
+        );
+
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn async_dmabuf_failed_event_discards_pending_dimensions() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let guest_params_id = 7;
+        let host_params_id = 8;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(guest_params_id, host_params_id);
+        ctx.pending_params.insert(
+            guest_params_id,
+            vec![PendingParam {
+                fd: pipe_fds[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = guest_params_id;
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+        assert!(ctx
+            .pending_native_buffer_sizes
+            .contains_key(&guest_params_id));
+
+        ctx.last_sender_id = host_params_id;
+        let mut message = WireMessage::new(
+            host_params_id,
+            crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED,
+            &[],
+            &[],
+        );
+        let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
+            &mut message,
+            &mut handler,
+            &mut ctx,
+        )
+        .expect("failed event should decode");
+        assert!(
+            result.is_some(),
+            "failed must still be forwarded to the guest"
+        );
+        assert!(ctx.pending_native_buffer_sizes.is_empty());
+        assert!(ctx.native_buffer_sizes.is_empty());
+
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn destroying_async_params_discards_pending_dimensions() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_native_buffer_sizes.insert(7, (16, 8));
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(
+            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
+            Action::Forward
+        );
+        assert!(ctx.pending_native_buffer_sizes.is_empty());
     }
 
     #[test]

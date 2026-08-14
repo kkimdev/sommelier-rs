@@ -141,7 +141,7 @@ fn ioctl_resource_info(fd: RawFd, info: &mut VirtGpuResourceInfo) -> io::Result<
     let result = unsafe {
         libc::ioctl(
             fd,
-            DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS,
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS as _,
             std::ptr::from_mut(info),
         )
     };
@@ -156,7 +156,7 @@ fn ioctl_resource_info_probe(fd: RawFd, info: &mut VirtGpuResourceInfoProbe) -> 
     let result = unsafe {
         libc::ioctl(
             fd,
-            DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE as _,
             std::ptr::from_mut(info),
         )
     };
@@ -168,8 +168,13 @@ fn ioctl_resource_info_probe(fd: RawFd, info: &mut VirtGpuResourceInfoProbe) -> 
 }
 
 fn ioctl_getparam(fd: RawFd, getparam: &mut DrmVirtGpuGetParam) -> io::Result<()> {
-    let result =
-        unsafe { libc::ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, std::ptr::from_mut(getparam)) };
+    let result = unsafe {
+        libc::ioctl(
+            fd,
+            DRM_IOCTL_VIRTGPU_GETPARAM as _,
+            std::ptr::from_mut(getparam),
+        )
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -477,7 +482,7 @@ impl Allocator {
         let prime_result = unsafe {
             libc::ioctl(
                 self.device.as_fd().as_raw_fd(),
-                DRM_IOCTL_PRIME_FD_TO_HANDLE,
+                DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
                 std::ptr::from_mut(&mut prime),
             )
         };
@@ -508,7 +513,7 @@ impl Allocator {
         let _ = unsafe {
             libc::ioctl(
                 self.device.as_fd().as_raw_fd(),
-                DRM_IOCTL_GEM_CLOSE,
+                DRM_IOCTL_GEM_CLOSE as _,
                 std::ptr::from_mut(&mut close),
             )
         };

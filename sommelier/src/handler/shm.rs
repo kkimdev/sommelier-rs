@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::state::{BufferState, Context, DamageRect, PoolInner, PoolState};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
+use std::collections::HashSet;
+use std::io;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::ptr;
 use std::sync::{Arc, RwLock};
@@ -104,14 +107,14 @@ fn shm_format_from_drm(format: u32) -> Option<u32> {
 }
 
 fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
-    // The Rust bridge allocates a contiguous VirtWL buffer and copies both
-    // NV12 planes into it. A GBM BO may use implementation-defined plane
-    // offsets, while wl_shm exposes only one base offset and one stride, so
-    // advertising NV12 without VirtWL would produce a buffer whose UV plane
-    // cannot be described safely. Keep the capability conditional until a
-    // direct multi-plane GBM import path exists.
+    // NV12 is advertised only when the selected output path can describe both
+    // planes. VirtWL uses one contiguous allocation; the GBM direct path
+    // validates plane metadata and rejects separate dma-buf objects before
+    // exposing a buffer to the host compositor.
     (MANDATORY_SHM_FORMATS.contains(&format) || ctx.host_shm_formats.contains(&format))
-        && (format != WL_SHM_FORMAT_NV12 || ctx.virtwayland_channel.is_some())
+        && (format != WL_SHM_FORMAT_NV12
+            || ctx.virtwayland_channel.is_some()
+            || (ctx.gpu_accel && ctx.host_dmabuf_id.is_some() && ctx.allocator.is_some()))
 }
 
 /// Record a format advertised by the internal host wl_shm object and enqueue
@@ -197,37 +200,6 @@ fn format_bytes_per_pixel(format: u32) -> Option<usize> {
     }
 }
 
-/// Return the number of bytes occupied by the linear representation used by
-/// the SHM bridge. This matches ChromiumOS' `sl_shm_format_size`: NV12 has a
-/// full-height Y plane followed by a half-height UV plane, while all other
-/// formats are single-plane.
-pub(crate) fn required_buffer_size(
-    width: i32,
-    height: i32,
-    stride: usize,
-    format: u32,
-) -> Option<usize> {
-    if width <= 0 || height <= 0 || stride == 0 {
-        return None;
-    }
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    let bytes_per_pixel = format_bytes_per_pixel(format)?;
-    if stride < width.checked_mul(bytes_per_pixel)? {
-        return None;
-    }
-    if format == WL_SHM_FORMAT_NV12 {
-        if !width.is_multiple_of(2) || !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
-            return None;
-        }
-        stride
-            .checked_mul(height)?
-            .checked_add(stride.checked_mul(height / 2)?)
-    } else {
-        stride.checked_mul(height)
-    }
-}
-
 fn backing_fd_has_size(fd: RawFd, size: usize) -> bool {
     if fd < 0 {
         return false;
@@ -245,6 +217,20 @@ fn backing_fd_has_size(fd: RawFd, size: usize) -> bool {
         // not expose a meaningful st_size. mmap remains the final check.
         true
     }
+}
+
+fn same_dma_buf_object(first_fd: RawFd, second_fd: RawFd) -> bool {
+    if first_fd < 0 || second_fd < 0 {
+        return false;
+    }
+    let mut first = unsafe { std::mem::zeroed::<libc::stat>() };
+    let mut second = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(first_fd, &mut first) } != 0
+        || unsafe { libc::fstat(second_fd, &mut second) } != 0
+    {
+        return false;
+    }
+    first.st_dev == second.st_dev && first.st_ino == second.st_ino
 }
 
 fn valid_buffer_layout(
@@ -283,6 +269,335 @@ fn virtwl_allocation_size(size: usize) -> Option<u32> {
     u32::try_from(size).ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DmabufLayout {
+    stride0: usize,
+    stride1: usize,
+    offset0: usize,
+    offset1: usize,
+    span: usize,
+}
+
+struct HostBufferAllocation {
+    bo: Option<gbm::BufferObject<()>>,
+    fd: std::os::fd::OwnedFd,
+    /// An additional descriptor for plane 1 when the allocator returns
+    /// separate dma-buf objects (GBM may do this for multi-planar formats).
+    /// VirtWL's NV12 allocation is a single object, so this remains `None`
+    /// and the plane-0 descriptor is duplicated for both protocol planes.
+    plane1_fd: Option<std::os::fd::OwnedFd>,
+    stride0: u32,
+    modifier: u64,
+    offset0: u32,
+    total_size: u64,
+    plane1_offset: usize,
+    plane1_stride: usize,
+    direct_dmabuf: bool,
+    dmabuf_sync: bool,
+}
+
+/// Validate the metadata returned by a host dma-buf allocator and calculate
+/// the byte span that must be mapped in the guest.
+///
+/// The host may pad rows and place plane 1 after an implementation-defined
+/// gap.  Deriving the span from the returned offsets/strides keeps all mmap
+/// and copy bounds checks consistent with the metadata sent to the compositor.
+fn validate_dmabuf_layout(
+    format: u32,
+    width: i32,
+    height: i32,
+    strides: [u32; 3],
+    offsets: [u32; 3],
+) -> Option<DmabufLayout> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    if width == 0 || height == 0 || strides[0] == 0 {
+        return None;
+    }
+
+    let (plane0_bpp, plane_count) = if format == WL_SHM_FORMAT_NV12 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return None;
+        }
+        (1usize, 2usize)
+    } else if format == 0x3631_4752 {
+        (2usize, 1usize)
+    } else if matches!(
+        format,
+        0x3432_5258 | 0x3432_5241 | 0x3432_4258 | 0x3432_4241
+    ) {
+        (4usize, 1usize)
+    } else {
+        return None;
+    };
+    let stride0 = strides[0] as usize;
+    let offset0 = offsets[0] as usize;
+    let minimum0 = width.checked_mul(plane0_bpp)?;
+    if stride0 < minimum0 {
+        return None;
+    }
+    let plane0_end = offset0.checked_add(stride0.checked_mul(height)?)?;
+
+    if plane_count == 1 {
+        return Some(DmabufLayout {
+            stride0,
+            stride1: 0,
+            offset0,
+            offset1: 0,
+            span: plane0_end,
+        });
+    }
+
+    let stride1 = strides[1] as usize;
+    let offset1 = offsets[1] as usize;
+    let minimum1 = width;
+    // VirtWL and the GBM path use one contiguous dma-buf for NV12. Plane 1
+    // must begin after the complete Y plane; merely checking against
+    // `offset0` would allow overlapping planes and make the copy layout
+    // ambiguous.
+    if stride1 < minimum1 || !stride1.is_multiple_of(2) || offset1 < plane0_end {
+        return None;
+    }
+    let plane1_end = offset1.checked_add(stride1.checked_mul(height / 2)?)?;
+    Some(DmabufLayout {
+        stride0,
+        stride1,
+        offset0,
+        offset1,
+        span: plane0_end.max(plane1_end),
+    })
+}
+
+fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
+    if fd < 0 || layout.span <= layout.offset0 {
+        return None;
+    }
+    // `mmap` takes a signed length and an `off_t` offset. Avoid lossy casts
+    // even on a wider host where a malicious Wayland metadata value can fit
+    // in usize but not in either syscall argument.
+    if layout.span > isize::MAX as usize
+        || layout.span - layout.offset0 > isize::MAX as usize
+        || libc::off_t::try_from(layout.offset0).is_err()
+    {
+        return None;
+    }
+    // mmap(2) requires a page-aligned file offset. VirtWL/minigbm normally
+    // returns offset 0 for linear allocations; reject an incompatible layout
+    // rather than mapping the wrong bytes.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = usize::try_from(page_size).ok()?;
+    if page_size == 0 || !layout.offset0.is_multiple_of(page_size) {
+        return None;
+    }
+    let map_size = layout.span - layout.offset0;
+    let ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            map_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            libc::off_t::try_from(layout.offset0).ok()?,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        None
+    } else {
+        Some((ptr as *mut u8, map_size))
+    }
+}
+
+fn allocate_virtwl_dmabuf(
+    ctx: &Context,
+    width: i32,
+    height: i32,
+    format: u32,
+) -> io::Result<HostBufferAllocation> {
+    let Some(channel) = ctx
+        .virtwayland_channel
+        .as_ref()
+        .filter(|channel| channel.supports_dmabuf())
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VirtWL dma-buf allocation is unavailable",
+        ));
+    };
+    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
+    let (fd, metadata) = channel.allocate_dmabuf(
+        u32::try_from(width)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf width"))?,
+        u32::try_from(height)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf height"))?,
+        drm_format,
+    )?;
+    let layout = validate_dmabuf_layout(
+        drm_format,
+        width,
+        height,
+        metadata.strides,
+        metadata.offsets,
+    )
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid VirtWL dma-buf layout"))?;
+    let (plane1_offset, plane1_stride) = if drm_format == WL_SHM_FORMAT_NV12 {
+        (layout.offset1 - layout.offset0, layout.stride1)
+    } else {
+        (0, 0)
+    };
+    // Probe the exact mapping that the copy path will use while the allocation
+    // is still owned by this function.  A VirtWL driver may expose the ioctl
+    // but return metadata that cannot be mmaped (for example a non-page-aligned
+    // plane-0 offset); treat that as an allocation failure so the caller can
+    // fall back to ordinary VirtWL shared memory.
+    if let Some((mapped_ptr, mapped_size)) = map_dmabuf(
+        fd.as_raw_fd(),
+        DmabufLayout {
+            stride0: layout.stride0,
+            stride1: layout.stride1,
+            offset0: layout.offset0,
+            offset1: layout.offset1,
+            span: layout.span,
+        },
+    ) {
+        unsafe {
+            libc::munmap(mapped_ptr as *mut libc::c_void, mapped_size);
+        }
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VirtWL dma-buf cannot be mapped",
+        ));
+    }
+    let total_size = u64::try_from(layout.span).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VirtWL dma-buf size overflows u64",
+        )
+    })?;
+    Ok(HostBufferAllocation {
+        bo: None,
+        fd,
+        plane1_fd: None,
+        stride0: u32::try_from(layout.stride0).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VirtWL dma-buf stride overflows u32",
+            )
+        })?,
+        modifier: 0,
+        offset0: u32::try_from(layout.offset0).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VirtWL dma-buf offset overflows u32",
+            )
+        })?,
+        total_size,
+        plane1_offset,
+        plane1_stride,
+        direct_dmabuf: true,
+        dmabuf_sync: true,
+    })
+}
+
+fn allocate_gbm_buffer(
+    allocator: &Allocator,
+    width: i32,
+    height: i32,
+    format: u32,
+    direct_dmabuf: bool,
+) -> io::Result<HostBufferAllocation> {
+    let bo = allocator
+        .allocate(
+            u32::try_from(width)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid buffer width"))?,
+            u32::try_from(height).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid buffer height")
+            })?,
+            ShmHandler::wl_shm_format_to_drm_format(format),
+        )
+        .map_err(io::Error::other)?;
+    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
+    let stride0 = bo.stride_for_plane(0).map_err(io::Error::other)?;
+    if stride0 == 0 || stride0 > i32::MAX as u32 || !valid_shm_stride(format, width, stride0 as i32)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GBM returned an invalid SHM stride",
+        ));
+    }
+    let fd = bo.fd().map_err(io::Error::other)?;
+    let plane_count = bo.plane_count().map_err(io::Error::other)?;
+    let offset0 = bo.offset(0).map_err(io::Error::other)?;
+    let (plane1_fd, plane1_offset, plane1_stride) = if drm_format == WL_SHM_FORMAT_NV12 {
+        if plane_count != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("GBM returned {plane_count} planes for NV12, expected 2"),
+            ));
+        }
+        let stride1 = bo.stride_for_plane(1).map_err(io::Error::other)?;
+        let offset1 = bo.offset(1).map_err(io::Error::other)?;
+        if stride1 < u32::try_from(width).unwrap_or(u32::MAX)
+            || !stride1.is_multiple_of(2)
+            || offset1 < offset0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GBM returned invalid NV12 plane-1 metadata",
+            ));
+        }
+        let plane1_fd = bo.fd_for_plane(1).map_err(io::Error::other)?;
+        if !same_dma_buf_object(fd.as_raw_fd(), plane1_fd.as_raw_fd()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "GBM NV12 planes use separate dma-buf objects",
+            ));
+        }
+        (Some(plane1_fd), offset1 - offset0, stride1)
+    } else {
+        if plane_count != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("GBM returned {plane_count} planes for single-plane format"),
+            ));
+        }
+        (None, 0, 0)
+    };
+    // The modifier is part of the host import contract. Treat an allocator
+    // query failure as an allocation failure instead of silently labelling an
+    // unknown/tiled BO as LINEAR (modifier 0).
+    let modifier = bo.modifier().map(u64::from).map_err(io::Error::other)?;
+    let offset1 = offset0.checked_add(plane1_offset).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GBM plane-1 offset arithmetic overflows",
+        )
+    })?;
+    let layout = validate_dmabuf_layout(
+        drm_format,
+        width,
+        height,
+        [stride0, plane1_stride, 0],
+        [offset0, offset1, 0],
+    )
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid GBM buffer layout"))?;
+    let total_size = u64::try_from(layout.span)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid GBM buffer size"))?;
+    Ok(HostBufferAllocation {
+        bo: Some(bo),
+        fd,
+        plane1_fd,
+        stride0,
+        modifier,
+        offset0,
+        total_size,
+        plane1_offset: plane1_offset as usize,
+        plane1_stride: plane1_stride as usize,
+        direct_dmabuf,
+        dmabuf_sync: false,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct PlaneCopy {
     src_offset: usize,
@@ -307,6 +622,11 @@ pub(crate) struct ShmCopyLayout {
     pub(crate) width: usize,
     pub(crate) src_stride: usize,
     pub(crate) dst_stride: usize,
+    /// Offset and stride of plane 1 in the destination mapping.  For
+    /// single-plane formats these remain zero.  NV12 must use the allocator's
+    /// returned values instead of assuming plane 1 follows `height * stride`.
+    pub(crate) dst_plane1_offset: usize,
+    pub(crate) dst_plane1_stride: usize,
     pub(crate) height: usize,
 }
 
@@ -380,9 +700,18 @@ pub(crate) fn copy_shm_damage(
         width,
         src_stride,
         dst_stride,
+        dst_plane1_offset,
+        dst_plane1_stride,
         height,
     } = layout;
-    if width == 0 || height == 0 || format_bytes_per_pixel(format).is_none() {
+    if src_ptr.is_null()
+        || src_ptr as *const libc::c_void == libc::MAP_FAILED
+        || dst_ptr.is_null()
+        || dst_ptr as *mut libc::c_void == libc::MAP_FAILED
+        || width == 0
+        || height == 0
+        || format_bytes_per_pixel(format).is_none()
+    {
         return false;
     }
 
@@ -416,14 +745,27 @@ pub(crate) fn copy_shm_damage(
                             Some(value) => value,
                             None => return false,
                         },
-                        match height.checked_mul(dst_stride) {
-                            Some(value) => value,
-                            None => return false,
+                        if dst_plane1_stride == 0 {
+                            match height.checked_mul(dst_stride) {
+                                Some(value) => value,
+                                None => return false,
+                            }
+                        } else {
+                            dst_plane1_offset
                         },
                     )
                 } else {
                     (bytes_per_pixel, offset, 0usize)
                 };
+            let plane_dst_stride = if format == WL_SHM_FORMAT_NV12 && plane == 1 {
+                if dst_plane1_stride == 0 {
+                    dst_stride
+                } else {
+                    dst_plane1_stride
+                }
+            } else {
+                dst_stride
+            };
             let rows = y1.saturating_sub(y0);
             let Some(row_bytes) = x1
                 .checked_sub(x0)
@@ -443,7 +785,7 @@ pub(crate) fn copy_shm_damage(
             else {
                 return false;
             };
-            let Some(y_offset) = y0.checked_mul(dst_stride) else {
+            let Some(y_offset) = y0.checked_mul(plane_dst_stride) else {
                 return false;
             };
             let Some(dst_offset) = plane_dst_offset
@@ -456,7 +798,7 @@ pub(crate) fn copy_shm_damage(
                 src_offset,
                 dst_offset,
                 src_stride,
-                dst_stride,
+                dst_stride: plane_dst_stride,
                 rows,
                 row_bytes,
             };
@@ -523,15 +865,82 @@ fn release_temporary_host_pool(ctx: &mut Context, host_pool_id: u32) {
     ctx.shadow_table.remove_host_interface(host_pool_id);
 }
 
-fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
+fn rollback_queued_host_messages(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, queue_start: usize) {
+    if queue_start > queue.len() {
+        return;
+    }
+    for (_, fds) in queue.drain(queue_start..) {
+        for fd in fds {
+            if fd >= 0 {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+}
+
+fn unmap_destination(ptr: *mut u8, size: usize) {
+    if !ptr.is_null() && ptr as *mut libc::c_void != libc::MAP_FAILED {
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
+    }
+}
+
+fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) -> bool {
+    let queued = queue_message(
+        &mut ctx.client_to_host_queue,
+        params_id,
+        crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::REQ_DESTROY,
+        MessageBuilder::new(),
+        Vec::new(),
+    );
+    if queued {
+        // Keep the numeric ID reserved until the host's wl_display.delete_id
+        // acknowledgement arrives. The destroy request is ordered after all
+        // already-queued params requests.
+        ctx.shadow_table.mark_pending_destroy_host(params_id);
+    } else {
+        // An empty destroy request should never exceed the wire limit. If a
+        // future wire implementation rejects it, do not leave a local ID
+        // reservation behind after the host params object is unreachable.
+        ctx.shadow_table.remove_host_interface(params_id);
+        ctx.fatal_protocol_error = true;
+    }
+    queued
+}
+
+fn cleanup_direct_dmabuf_failure(
+    ctx: &mut Context,
+    params_id: u32,
+    params_queued: bool,
+    dest_ptr: *mut u8,
+    dest_size: usize,
+) {
+    unmap_destination(dest_ptr, dest_size);
+    if params_queued {
+        let _ = queue_host_params_destroy(ctx, params_id);
+    } else {
+        ctx.shadow_table.remove_host_interface(params_id);
+    }
+}
+
+fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool {
     let builder = MessageBuilder::new();
-    queue_message(
+    let queued = queue_message(
         &mut ctx.client_to_host_queue,
         host_id,
         0,
         builder,
         Vec::new(),
     );
+    if !queued {
+        // This is a fixed-size destructor request, so failure indicates a
+        // broken wire builder rather than a recoverable client error. Tear
+        // down the connection instead of pretending the host object was
+        // retired and allowing its ID to be reused.
+        ctx.fatal_protocol_error = true;
+    }
+    queued
 }
 
 fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
@@ -546,10 +955,18 @@ fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
 }
 
 fn surface_references_buffer(ctx: &Context, guest_id: u32) -> bool {
-    ctx.surfaces.values().any(|surface| {
-        surface.current_buffer_id == Some(guest_id)
-            || surface.pending_buffer_id == Some(Some(guest_id))
-    })
+    !surfaces_referencing_buffer(ctx, guest_id).is_empty()
+}
+
+fn surfaces_referencing_buffer(ctx: &Context, guest_id: u32) -> HashSet<u32> {
+    ctx.surfaces
+        .iter()
+        .filter_map(|(&surface_id, surface)| {
+            (surface.current_buffer_id == Some(guest_id)
+                || surface.pending_buffer_id == Some(Some(guest_id)))
+            .then_some(surface_id)
+        })
+        .collect()
 }
 
 /// Drop deferred SHM buffers once the host has released them and no surface
@@ -579,6 +996,118 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
         }
         ctx.submitted_buffers.remove(&guest_id);
     }
+}
+
+/// Drop retired SHM buffers whose only reference was a pending attach that
+/// has since been replaced or cleared. Such a buffer was never committed, so
+/// the host compositor will not send `wl_buffer.release`; queue its
+/// destructor after the replacement request instead of waiting forever.
+fn collect_retired_buffers_without_release(
+    ctx: &mut Context,
+    allow_submitted: Option<&std::collections::HashSet<u32>>,
+) {
+    let referenced: std::collections::HashSet<u32> = ctx
+        .surfaces
+        .values()
+        .flat_map(|surface| {
+            surface
+                .current_buffer_id
+                .into_iter()
+                .chain(surface.pending_buffer_id.into_iter().flatten())
+        })
+        .collect();
+    let releasable: Vec<(u32, u32)> = ctx
+        .retired_buffers
+        .iter()
+        .filter_map(|(&guest_id, buffer)| {
+            (!buffer.host_released
+                && !referenced.contains(&guest_id)
+                && (!ctx.submitted_buffers.contains(&guest_id)
+                    || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
+            .then_some((guest_id, buffer.host_buffer_id))
+        })
+        .collect();
+    for (guest_id, host_id) in releasable {
+        ctx.retired_buffers.remove(&guest_id);
+        let _ = queue_host_buffer_destroy(ctx, host_id);
+        ctx.shadow_table.mark_pending_destroy(guest_id);
+        ctx.submitted_buffers.remove(&guest_id);
+    }
+}
+
+pub(crate) fn collect_uncommitted_retired_buffers(ctx: &mut Context) {
+    collect_retired_buffers_without_release(ctx, None);
+}
+
+/// Drop retired SHM buffers after their host surface was destroyed. The
+/// surface destructor is ordered before the buffer destructors, so even a
+/// buffer that had already been committed no longer has a host surface that
+/// can sample it.
+pub(crate) fn collect_retired_buffers_after_surface_destroy(
+    ctx: &mut Context,
+    destroyed_surface_buffers: &std::collections::HashSet<u32>,
+) {
+    collect_retired_buffers_without_release(ctx, Some(destroyed_surface_buffers));
+}
+
+/// Retire native dma-buf host objects after a host surface is destroyed.
+///
+/// A guest wl_buffer can be destroyed while its host surface still references
+/// it. In that case the host buffer is normally retired by its release event.
+/// Destroying the host surface first is also a valid lifetime edge: once the
+/// ordered surface destructor reaches the compositor, no remaining surface in
+/// this connection can sample the buffer. Queue the host buffer destructor
+/// after that surface destructor so a compositor that does not emit a
+/// separate wl_buffer.release on surface teardown cannot leave the mapping
+/// permanently deferred.
+fn collect_deferred_native_buffers_impl(
+    ctx: &mut Context,
+    allow_submitted: Option<&std::collections::HashSet<u32>>,
+) {
+    let referenced: std::collections::HashSet<u32> = ctx
+        .surfaces
+        .values()
+        .flat_map(|surface| {
+            surface
+                .current_buffer_id
+                .into_iter()
+                .chain(surface.pending_buffer_id.into_iter().flatten())
+        })
+        .collect();
+    let releasable: Vec<(u32, u32)> = ctx
+        .deferred_host_buffers
+        .iter()
+        .filter_map(|(&guest_id, &host_id)| {
+            (!referenced.contains(&guest_id)
+                && (!ctx.submitted_buffers.contains(&guest_id)
+                    || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
+            .then_some((guest_id, host_id))
+        })
+        .collect();
+    for (guest_id, host_id) in releasable {
+        ctx.deferred_host_buffers.remove(&guest_id);
+        ctx.released_host_buffers.remove(&guest_id);
+        ctx.submitted_buffers.remove(&guest_id);
+        let _ = queue_host_buffer_destroy(ctx, host_id);
+        ctx.shadow_table.mark_pending_destroy(guest_id);
+    }
+}
+
+/// Retire native buffers whose only reference was a pending attach that has
+/// been replaced or cleared. A submitted buffer remains deferred until its
+/// release event.
+pub(crate) fn collect_deferred_native_buffers(ctx: &mut Context) {
+    collect_deferred_native_buffers_impl(ctx, None);
+}
+
+/// Retire native buffers after the host surface destructor has been queued.
+/// This is the one path that may retire a submitted buffer without waiting
+/// for a separate release event.
+pub(crate) fn collect_deferred_native_buffers_after_surface_destroy(
+    ctx: &mut Context,
+    destroyed_surface_buffers: &std::collections::HashSet<u32>,
+) {
+    collect_deferred_native_buffers_impl(ctx, Some(destroyed_surface_buffers));
 }
 
 impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
@@ -730,102 +1259,322 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             ctx.virtwayland_channel.is_some()
         );
 
-        // Allocate buffer (GBM or VirtWayland)
-        let alloc_res = if let Some(channel) = &ctx.virtwayland_channel {
-            debug!("Allocating VirtWayland buffer: size={}", buffer_size);
-            let Some(allocation_size) = virtwl_allocation_size(buffer_size) else {
-                error!(
-                    "Rejecting SHM buffer size {}: virtwl allocation size exceeds u32",
-                    buffer_size
-                );
-                return Action::Drop;
-            };
-            match channel.allocate(allocation_size) {
-                Ok((fd, _alloc_size)) => {
-                    // virtwl allocation is a simple SHM-like buffer.
-                    // No modifier, offset 0.
-                    Some((None, stride as u32, fd, 0, 0, buffer_size as u64))
-                }
-                Err(e) => {
-                    error!("Failed to allocate VirtWayland buffer: {}", e);
-                    return Action::Drop;
+        // `--gpu-accel` changes only the output allocation.  Guest wl_shm is
+        // still accepted for applications that do not expose linux-dmabuf;
+        // those buffers use the VirtWL shared-memory allocation below.
+        let wants_dmabuf = ctx.gpu_accel && ctx.host_dmabuf_id.is_some();
+        let mut allocation = if wants_dmabuf {
+            match allocate_virtwl_dmabuf(ctx, width, height, format) {
+                Ok(allocation) => Some(allocation),
+                Err(error) => {
+                    debug!("VirtWL dma-buf allocation unavailable: {}", error);
+                    None
                 }
             }
         } else {
             None
         };
 
-        let (bo, bo_stride, dmabuf_fd_owned, _modifier, blob_offset, total_size) =
-            if let Some(res) = alloc_res {
-                res
-            } else if let Some(allocator) = &mut ctx.allocator {
-                // Fallback to GBM allocator
-                match allocator.allocate(
-                    width as u32,
-                    height as u32,
-                    Self::wl_shm_format_to_drm_format(format),
-                ) {
-                    Ok(bo) => {
-                        let bo_stride = bo.stride().unwrap_or(0);
-                        if bo_stride == 0 || bo_stride > i32::MAX as u32 {
-                            error!("GBM returned an invalid stride {}", bo_stride);
-                            return Action::Drop;
-                        }
-                        if !valid_shm_stride(format, width, bo_stride as i32) {
-                            error!(
-                                "GBM returned stride {} that cannot cover {}x{} format {:#010x}",
-                                bo_stride, width, height, format
-                            );
-                            return Action::Drop;
-                        }
-                        debug!(
-                            "Allocated GBM BO: width={}, height={}, stride={}, format={}",
-                            width, height, bo_stride, format
+        if allocation.is_none() {
+            if let Some(channel) = &ctx.virtwayland_channel {
+                debug!(
+                    "Allocating VirtWayland shared-memory buffer: size={}",
+                    buffer_size
+                );
+                let Some(allocation_size) = virtwl_allocation_size(buffer_size) else {
+                    error!(
+                        "Rejecting SHM buffer size {}: VirtWL allocation size exceeds u32",
+                        buffer_size
+                    );
+                    return Action::Drop;
+                };
+                let (fd, _alloc_size) = match channel.allocate(allocation_size) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        error!(
+                            "Failed to allocate VirtWayland shared-memory buffer: {}",
+                            error
                         );
-
-                        let fd = match bo.fd() {
-                            Ok(f) => f,
-                            Err(e) => {
-                                error!("Failed to get FD from BO: {}", e);
-                                return Action::Drop;
-                            }
-                        };
-
-                        // For GBM with LINEAR flag, modifier is likely 0 (LINEAR)
-                        // We can try to get it from BO if needed, but for now we default to 0
-                        // as that was the behavior and we want to be safe.
-                        // If we want to be correct:
-                        let modifier: u64 = match bo.modifier() {
-                            Ok(m) => m.into(),
-                            Err(_) => 0,
-                        };
-
-                        debug!("GBM BO modifier: {}", modifier);
-
-                        // FIX: Add offset and calculate size to match the 6-element tuple
-                        let offset = 0;
-                        let Some(total_size) =
-                            required_buffer_size(width, height, bo_stride as usize, format)
-                                .and_then(|size| u64::try_from(size).ok())
-                        else {
-                            error!("GBM buffer size/layout is invalid");
-                            return Action::Drop;
-                        };
-
-                        (Some(bo), bo_stride, fd, modifier, offset, total_size)
-                    }
-                    Err(e) => {
-                        error!("Failed to allocate GBM BO: {}", e);
                         return Action::Drop;
                     }
+                };
+                allocation = Some(HostBufferAllocation {
+                    bo: None,
+                    fd,
+                    plane1_fd: None,
+                    stride0: stride as u32,
+                    modifier: 0,
+                    offset0: 0,
+                    total_size: buffer_size as u64,
+                    plane1_offset: if format == WL_SHM_FORMAT_NV12 {
+                        (height as usize) * (stride as usize)
+                    } else {
+                        0
+                    },
+                    plane1_stride: if format == WL_SHM_FORMAT_NV12 {
+                        stride as usize
+                    } else {
+                        0
+                    },
+                    direct_dmabuf: false,
+                    dmabuf_sync: false,
+                });
+            } else if let Some(allocator) = &ctx.allocator {
+                // GBM output is valid only for the direct linux-dmabuf path.
+                // Sending a PRIME fd as a wl_shm pool would make the host
+                // compositor mmap an object with the wrong protocol contract.
+                if !wants_dmabuf {
+                    error!(
+                        "No VirtWL shared-memory channel is available; \
+                         refusing to send a GBM PRIME fd as wl_shm"
+                    );
+                    return Action::Drop;
                 }
+                allocation = Some(
+                    match allocate_gbm_buffer(allocator, width, height, format, true) {
+                        Ok(allocation) => allocation,
+                        Err(error) => {
+                            error!("Failed to allocate GBM dma-buf: {}", error);
+                            return Action::Drop;
+                        }
+                    },
+                );
             } else {
-                error!("No allocator (VirtGpu or GBM) available");
+                error!("No VirtWL or GBM allocator is available");
+                return Action::Drop;
+            }
+        }
+
+        let mut allocation = allocation.expect("SHM allocation must be present");
+        let bo = allocation.bo.take();
+        let bo_stride = allocation.stride0;
+        let dmabuf_fd_owned = allocation.fd;
+        let plane1_fd_owned = allocation.plane1_fd;
+        let modifier = allocation.modifier;
+        let blob_offset = allocation.offset0;
+        let total_size = allocation.total_size;
+        let plane1_offset = allocation.plane1_offset;
+        let plane1_stride = allocation.plane1_stride;
+        let direct_dmabuf = allocation.direct_dmabuf;
+        let dmabuf_sync = allocation.dmabuf_sync;
+
+        if direct_dmabuf {
+            let Some(host_dmabuf_id) = ctx.host_dmabuf_id else {
+                error!("GPU allocation succeeded without an internal dmabuf object");
                 return Action::Drop;
             };
+            let host_plane1_offset = match (blob_offset as usize).checked_add(plane1_offset) {
+                Some(offset) => offset,
+                None => {
+                    error!("VirtWL dma-buf plane-1 offset overflows usize");
+                    return Action::Drop;
+                }
+            };
+            let host_plane1_offset_u32 = match u32::try_from(host_plane1_offset) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    error!("VirtWL dma-buf plane-1 offset overflows u32");
+                    return Action::Drop;
+                }
+            };
+            let plane1_stride_u32 = match u32::try_from(plane1_stride) {
+                Ok(stride) => stride,
+                Err(_) => {
+                    error!("VirtWL dma-buf plane-1 stride overflows u32");
+                    return Action::Drop;
+                }
+            };
+            if format == WL_SHM_FORMAT_NV12
+                && (plane1_stride == 0 || host_plane1_offset < blob_offset as usize)
+            {
+                error!("VirtWL dma-buf returned invalid NV12 plane-1 metadata");
+                return Action::Drop;
+            }
+            let layout = DmabufLayout {
+                stride0: bo_stride as usize,
+                stride1: plane1_stride,
+                offset0: blob_offset as usize,
+                offset1: host_plane1_offset,
+                span: usize::try_from(total_size).unwrap_or(0),
+            };
+            let (dest_ptr, dest_size) = if bo.is_none() {
+                let Some((ptr, size)) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
+                    error!(
+                        "dma-buf cannot be safely mmaped (offset={}, size={})",
+                        blob_offset, total_size
+                    );
+                    return Action::Drop;
+                };
+                (ptr, size)
+            } else if format == WL_SHM_FORMAT_NV12 {
+                // GBM's map API does not guarantee that a multi-plane BO's UV
+                // plane is included in the mapped slice. A direct dma-buf
+                // mapping is therefore mandatory for NV12: falling back to
+                // `gbm.map_mut` would expose only the Y plane and make every
+                // commit defer forever without ever updating UV.
+                let Some(mapped) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
+                    error!("GBM NV12 dma-buf cannot be safely mmaped");
+                    return Action::Drop;
+                };
+                mapped
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
 
-        // Create WL_SHM buffer on host
-        if let Some(host_wl_shm_id) = ctx.host_shm_id {
+            let params_id = ctx.shadow_table.allocate_host_id();
+            let mut params_queued = false;
+            ctx.shadow_table.track_host_interface_with_version(
+                params_id,
+                "zwp_linux_buffer_params_v1".to_string(),
+                2,
+            );
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(params_id);
+            if !queue_message(
+                &mut ctx.client_to_host_queue,
+                host_dmabuf_id,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS,
+                builder,
+                Vec::new(),
+            ) {
+                cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                return Action::Drop;
+            }
+            params_queued = true;
+
+            let fd_to_send = match dmabuf_fd_owned.try_clone() {
+                Ok(fd) => fd.into_raw_fd(),
+                Err(error) => {
+                    error!("Failed to duplicate VirtWL dma-buf fd: {}", error);
+                    cleanup_direct_dmabuf_failure(
+                        ctx,
+                        params_id,
+                        params_queued,
+                        dest_ptr,
+                        dest_size,
+                    );
+                    return Action::Drop;
+                }
+            };
+            let mut add = MessageBuilder::new();
+            add.write_u32(0); // plane index
+            add.write_u32(blob_offset);
+            add.write_u32(bo_stride);
+            add.write_u32((modifier >> 32) as u32);
+            add.write_u32(modifier as u32);
+            if !queue_message(
+                &mut ctx.client_to_host_queue,
+                params_id,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::REQ_ADD,
+                add,
+                vec![fd_to_send],
+            ) {
+                cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                return Action::Drop;
+            }
+            if format == WL_SHM_FORMAT_NV12 {
+                let mut add_plane1 = MessageBuilder::new();
+                add_plane1.write_u32(1);
+                add_plane1.write_u32(host_plane1_offset_u32);
+                add_plane1.write_u32(plane1_stride_u32);
+                add_plane1.write_u32((modifier >> 32) as u32);
+                add_plane1.write_u32(modifier as u32);
+                let plane1_fd = match plane1_fd_owned
+                    .as_ref()
+                    .unwrap_or(&dmabuf_fd_owned)
+                    .try_clone()
+                {
+                    Ok(fd) => fd.into_raw_fd(),
+                    Err(error) => {
+                        error!("Failed to duplicate NV12 dma-buf fd: {}", error);
+                        cleanup_direct_dmabuf_failure(
+                            ctx,
+                            params_id,
+                            params_queued,
+                            dest_ptr,
+                            dest_size,
+                        );
+                        return Action::Drop;
+                    }
+                };
+                if !queue_message(
+                    &mut ctx.client_to_host_queue,
+                    params_id,
+                    crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::REQ_ADD,
+                    add_plane1,
+                    vec![plane1_fd],
+                ) {
+                    cleanup_direct_dmabuf_failure(
+                        ctx,
+                        params_id,
+                        params_queued,
+                        dest_ptr,
+                        dest_size,
+                    );
+                    return Action::Drop;
+                }
+            }
+
+            let host_buffer_id = ctx.shadow_table.allocate_host_id();
+            let mut create = MessageBuilder::new();
+            create.write_u32(host_buffer_id);
+            create.write_i32(width);
+            create.write_i32(height);
+            create.write_u32(Self::wl_shm_format_to_drm_format(format));
+            create.write_u32(0);
+            if !queue_message(
+                &mut ctx.client_to_host_queue,
+                params_id,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::REQ_CREATE_IMMED,
+                create,
+                Vec::new(),
+            ) {
+                cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                return Action::Drop;
+            }
+            // create_immed is processed before this destructor in the ordered
+            // host stream. Reserve the params ID until wl_display.delete_id
+            // acknowledges its destruction.
+            let _ = queue_host_params_destroy(ctx, params_id);
+
+            ctx.shadow_table.map_id(id, host_buffer_id);
+            ctx.shadow_table
+                .track_interface_with_version(id, "wl_buffer".to_string(), 1);
+            ctx.shadow_table.set_host_version(host_buffer_id, 1);
+            ctx.buffers.insert(
+                id,
+                BufferState {
+                    guest_buffer_id: id,
+                    pool: pool.clone(),
+                    offset,
+                    width,
+                    height,
+                    stride: stride as u32,
+                    format,
+                    host_buffer_id,
+                    bo,
+                    dmabuf_fd: Some(dmabuf_fd_owned),
+                    bo_stride,
+                    dmabuf_plane1_offset: plane1_offset,
+                    dmabuf_plane1_stride: plane1_stride,
+                    dmabuf_sync,
+                    dest_ptr,
+                    dest_size,
+                    needs_full_copy: true,
+                    host_released: false,
+                },
+            );
+            return Action::Drop;
+        }
+
+        // Create WL_SHM buffer on host. Check the capability before mapping
+        // the destination so a disappearing wl_shm global cannot leak a raw
+        // mmap that has no BufferState owner.
+        let Some(host_wl_shm_id) = ctx.host_shm_id else {
+            error!("wl_shm not available on host");
+            return Action::Drop;
+        };
+        {
             // Map the buffer for SHM synchronization
             if total_size == 0 || total_size > i32::MAX as u64 {
                 error!("SHM destination size is invalid: {}", total_size);
@@ -859,6 +1608,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 std::ptr::null_mut()
             };
 
+            let queue_start = ctx.client_to_host_queue.len();
             let host_pool_id = ctx.shadow_table.allocate_host_id();
             // The temporary host wl_shm_pool remains live until the queued
             // destroy request is processed by the compositor. Reserve its ID
@@ -878,11 +1628,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 Ok(f) => f.into_raw_fd(),
                 Err(e) => {
                     error!("Failed to dup FD: {}", e);
-                    if !dest_ptr.is_null() {
-                        unsafe {
-                            libc::munmap(dest_ptr as *mut libc::c_void, dest_size);
-                        }
-                    }
+                    unmap_destination(dest_ptr, dest_size);
                     release_temporary_host_pool(ctx, host_pool_id);
                     return Action::Drop;
                 }
@@ -896,11 +1642,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 builder,
                 vec![fd_to_send],
             ) {
-                if !dest_ptr.is_null() {
-                    unsafe {
-                        libc::munmap(dest_ptr as *mut libc::c_void, dest_size);
-                    }
-                }
+                unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
                 return Action::Drop;
             }
@@ -909,29 +1651,53 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             let host_buffer_id = ctx.shadow_table.allocate_host_id();
             let mut builder = MessageBuilder::new();
             builder.write_u32(host_buffer_id);
-            builder.write_i32(blob_offset); // offset
+            let Ok(blob_offset_i32) = i32::try_from(blob_offset) else {
+                error!("SHM destination offset exceeds the Wayland i32 range");
+                rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
+                unmap_destination(dest_ptr, dest_size);
+                release_temporary_host_pool(ctx, host_pool_id);
+                return Action::Drop;
+            };
+            builder.write_i32(blob_offset_i32); // offset
             builder.write_i32(width);
             builder.write_i32(height);
-            builder.write_i32(bo_stride as i32); // stride
+            let Ok(bo_stride_i32) = i32::try_from(bo_stride) else {
+                error!("SHM destination stride exceeds the Wayland i32 range");
+                rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
+                unmap_destination(dest_ptr, dest_size);
+                release_temporary_host_pool(ctx, host_pool_id);
+                return Action::Drop;
+            };
+            builder.write_i32(bo_stride_i32); // stride
             builder.write_u32(format); // format (SHM format, not DRM format)
 
-            queue_message(
+            if !queue_message(
                 &mut ctx.client_to_host_queue,
                 host_pool_id,
                 0,
                 builder,
                 Vec::new(),
-            );
+            ) {
+                rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
+                unmap_destination(dest_ptr, dest_size);
+                release_temporary_host_pool(ctx, host_pool_id);
+                return Action::Drop;
+            }
 
             // wl_shm_pool.destroy()
             let builder = MessageBuilder::new();
-            queue_message(
+            if !queue_message(
                 &mut ctx.client_to_host_queue,
                 host_pool_id,
                 1,
                 builder,
                 Vec::new(),
-            );
+            ) {
+                rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
+                unmap_destination(dest_ptr, dest_size);
+                release_temporary_host_pool(ctx, host_pool_id);
+                return Action::Drop;
+            }
 
             // The three requests are emitted in one ordered stream:
             // create_pool, create_buffer, destroy. Once queued, a later
@@ -961,15 +1727,15 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     bo,
                     dmabuf_fd: Some(dmabuf_fd_owned),
                     bo_stride, // Store bo_stride
+                    dmabuf_plane1_offset: plane1_offset,
+                    dmabuf_plane1_stride: plane1_stride,
+                    dmabuf_sync: false,
                     dest_ptr,
                     dest_size,
                     needs_full_copy: true,
                     host_released: false,
                 },
             );
-        } else {
-            error!("wl_shm not available on host");
-            return Action::Drop;
         }
 
         Action::Drop
@@ -1080,17 +1846,29 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 ctx.shadow_table.retire_guest_object(guest_id);
             } else {
                 if let Some(host_id) = host_id {
-                    queue_host_buffer_destroy(ctx, host_id);
+                    let _ = queue_host_buffer_destroy(ctx, host_id);
                 }
                 clear_surface_buffer_references(ctx, guest_id);
                 ctx.shadow_table.mark_pending_destroy(guest_id);
                 ctx.submitted_buffers.remove(&guest_id);
             }
         } else {
-            // Non-SHM wl_buffers have no local backing storage, so their
-            // host object can be destroyed and their mapping removed now.
-            if let Some(host_id) = host_id {
-                queue_host_buffer_destroy(ctx, host_id);
+            // Native linux-dmabuf buffers have no local mapping to retire, but
+            // the host compositor still owns the attached resource until it
+            // sends wl_buffer.release. Keep the mapping alive across a guest
+            // destroy just like the SHM path.
+            // A release may have arrived before the guest destroys the
+            // wl_buffer. In that case the host has already completed its use
+            // interval and no deferred lifetime signal remains to wait for.
+            let host_already_released = ctx.released_host_buffers.remove(&guest_id);
+            if still_referenced && !host_already_released {
+                if let Some(host_id) = host_id {
+                    ctx.deferred_host_buffers.insert(guest_id, host_id);
+                    ctx.shadow_table.retire_guest_object(guest_id);
+                    return Action::Drop;
+                }
+            } else if let Some(host_id) = host_id {
+                let _ = queue_host_buffer_destroy(ctx, host_id);
             }
             clear_surface_buffer_references(ctx, guest_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
@@ -1105,6 +1883,19 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             return Action::Drop;
         };
 
+        if let Some(deferred_host_id) = ctx.deferred_host_buffers.remove(&guest_id) {
+            // The guest object was destroyed before the host compositor
+            // released a native dma-buf. Now that the release is the lifetime
+            // signal, destroy the host proxy and retain its mapping until the
+            // corresponding wl_display.delete_id arrives.
+            ctx.released_host_buffers.remove(&guest_id);
+            let _ = queue_host_buffer_destroy(ctx, deferred_host_id);
+            ctx.shadow_table.mark_pending_destroy(guest_id);
+            ctx.submitted_buffers.remove(&guest_id);
+            clear_surface_buffer_references(ctx, guest_id);
+            return Action::Drop;
+        }
+
         if ctx.retired_buffers.contains_key(&guest_id) {
             // The guest object is already gone, so there is no valid object on
             // which to deliver the release event. It is nevertheless the
@@ -1115,7 +1906,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             // The host object remained alive specifically so this release
             // could arrive. It is now safe to destroy the host proxy and drop
             // the local backing.
-            queue_host_buffer_destroy(ctx, host_id);
+            let _ = queue_host_buffer_destroy(ctx, host_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
             ctx.submitted_buffers.remove(&guest_id);
             clear_surface_buffer_references(ctx, guest_id);
@@ -1130,6 +1921,12 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 
         if let Some(buffer) = ctx.buffers.get_mut(&guest_id) {
             buffer.host_released = true;
+        } else {
+            // Native linux-dmabuf buffers have no BufferState entry. Retain
+            // the compositor's release edge so a later guest wl_buffer.destroy
+            // can destroy the host proxy immediately even when a surface still
+            // stores the buffer as its current content.
+            ctx.released_host_buffers.insert(guest_id);
         }
         // A release is the compositor's lifetime signal. Once it arrives, the
         // backing storage may be reused or destroyed, even if the surface
@@ -1154,17 +1951,20 @@ impl ShmHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::map_dmabuf;
     use super::ShmHandler;
     use super::{
-        backing_fd_has_size, collect_retired_buffers, copy_shm_planes, guest_shm_format_available,
-        record_host_shm_drm_format, record_host_shm_format, register_guest_shm,
-        release_temporary_host_pool, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, virtwl_allocation_size, WL_SHM_FORMAT_NV12,
+        backing_fd_has_size, collect_retired_buffers, copy_shm_damage, copy_shm_planes,
+        guest_shm_format_available, record_host_shm_drm_format, record_host_shm_format,
+        register_guest_shm, release_temporary_host_pool, same_dma_buf_object, valid_buffer_layout,
+        valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout,
+        virtwl_allocation_size, DmabufLayout, WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
+    use crate::state::DamageRect;
     use crate::state::{BufferState, Context, PoolInner, PoolState};
     use crate::wire::Action;
     use std::os::fd::{AsRawFd, IntoRawFd};
@@ -1369,6 +2169,8 @@ mod tests {
                 width: 4,
                 src_stride: 4,
                 dst_stride: 4,
+                dst_plane1_offset: 0,
+                dst_plane1_stride: 0,
                 height: 4,
             },
         ));
@@ -1387,6 +2189,8 @@ mod tests {
                 width: 4,
                 src_stride: 4,
                 dst_stride: 4,
+                dst_plane1_offset: 0,
+                dst_plane1_stride: 0,
                 height: 4,
             },
         ));
@@ -1394,6 +2198,168 @@ mod tests {
             destination.iter().all(|byte| *byte == 0),
             "an invalid UV span must not leave the Y plane partially copied"
         );
+    }
+
+    #[test]
+    fn copy_rejects_null_or_failed_mappings_before_pointer_arithmetic() {
+        let mut destination = [0u8; 4];
+        let layout = super::ShmCopyLayout {
+            pool_size: 4,
+            dest_size: destination.len(),
+            format: 0,
+            offset: 0,
+            width: 1,
+            src_stride: 4,
+            dst_stride: 4,
+            dst_plane1_offset: 0,
+            dst_plane1_stride: 0,
+            height: 1,
+        };
+        let damage = [DamageRect::new(0, 0, 1, 1)];
+        assert!(!copy_shm_damage(
+            std::ptr::null(),
+            destination.as_mut_ptr(),
+            layout,
+            &damage
+        ));
+        assert!(!copy_shm_damage(
+            [0u8; 4].as_ptr(),
+            std::ptr::null_mut(),
+            layout,
+            &damage
+        ));
+        assert!(!copy_shm_damage(
+            libc::MAP_FAILED.cast(),
+            destination.as_mut_ptr(),
+            layout,
+            &damage
+        ));
+    }
+
+    #[test]
+    fn copies_nv12_plane_one_at_allocator_returned_offset() {
+        let mut source = [0u8; 24];
+        source[..16].fill(0x11);
+        source[16..].fill(0x22);
+        let mut destination = [0u8; 32];
+
+        assert!(copy_shm_planes(
+            source.as_ptr(),
+            destination.as_mut_ptr(),
+            super::ShmCopyLayout {
+                pool_size: source.len(),
+                dest_size: destination.len(),
+                format: WL_SHM_FORMAT_NV12,
+                offset: 0,
+                width: 4,
+                src_stride: 4,
+                dst_stride: 4,
+                dst_plane1_offset: 20,
+                dst_plane1_stride: 4,
+                height: 4,
+            },
+        ));
+        assert_eq!(&destination[..16], &[0x11; 16]);
+        assert_eq!(&destination[16..20], &[0; 4]);
+        assert_eq!(&destination[20..28], &[0x22; 8]);
+        assert_eq!(&destination[28..], &[0; 4]);
+    }
+
+    #[test]
+    fn copies_partial_nv12_damage_using_plane_one_stride() {
+        let mut source = [0u8; 24];
+        source[..16].fill(0x11);
+        source[16..20].fill(0x21);
+        source[20..24].fill(0x22);
+        let mut destination = [0xcc; 36];
+
+        assert!(copy_shm_damage(
+            source.as_ptr(),
+            destination.as_mut_ptr(),
+            super::ShmCopyLayout {
+                pool_size: source.len(),
+                dest_size: destination.len(),
+                format: WL_SHM_FORMAT_NV12,
+                offset: 0,
+                width: 4,
+                src_stride: 4,
+                dst_stride: 4,
+                dst_plane1_offset: 20,
+                dst_plane1_stride: 8,
+                height: 4,
+            },
+            &[DamageRect::new(0, 2, 4, 2)],
+        ));
+
+        // Only the damaged bottom half is changed.  The UV row must use its
+        // own eight-byte destination stride, not the four-byte Y stride.
+        assert_eq!(&destination[..8], &[0xcc; 8]);
+        assert_eq!(&destination[8..16], &[0x11; 8]);
+        assert_eq!(&destination[16..20], &[0xcc; 4]);
+        assert_eq!(&destination[20..28], &[0xcc; 8]);
+        assert_eq!(&destination[28..32], &[0x22; 4]);
+        assert_eq!(&destination[32..36], &[0xcc; 4]);
+    }
+
+    #[test]
+    fn validates_dmabuf_metadata_without_assuming_plane_one_for_single_plane() {
+        let layout = validate_dmabuf_layout(0x3432_5258, 64, 32, [512, 0, 0], [4096, 0, 0])
+            .expect("single-plane metadata with a non-zero plane-0 offset");
+        assert_eq!(layout.offset0, 4096);
+        assert_eq!(layout.offset1, 0);
+        assert_eq!(layout.stride1, 0);
+        assert_eq!(layout.span, 4096 + 512 * 32);
+
+        assert!(validate_dmabuf_layout(
+            WL_SHM_FORMAT_NV12,
+            64,
+            32,
+            [64, 64, 0],
+            [0, 64 * 32 + 4096, 0],
+        )
+        .is_some());
+        assert!(
+            validate_dmabuf_layout(WL_SHM_FORMAT_NV12, 64, 32, [64, 64, 0], [4096, 0, 0],)
+                .is_none()
+        );
+        assert!(
+            validate_dmabuf_layout(
+                WL_SHM_FORMAT_NV12,
+                64,
+                32,
+                [64, 64, 0],
+                [0, 64 * 16 - 64, 0],
+            )
+            .is_none(),
+            "NV12 plane metadata must not overlap the Y plane"
+        );
+    }
+
+    #[test]
+    fn rejects_unrepresentable_or_unaligned_dmabuf_mappings() {
+        let too_large = usize::try_from(isize::MAX).unwrap().saturating_add(1);
+        assert!(map_dmabuf(
+            0,
+            DmabufLayout {
+                stride0: 4,
+                stride1: 0,
+                offset0: 0,
+                offset1: 0,
+                span: too_large,
+            }
+        )
+        .is_none());
+        assert!(map_dmabuf(
+            0,
+            DmabufLayout {
+                stride0: 4,
+                stride1: 0,
+                offset0: 1,
+                offset1: 0,
+                span: 4097,
+            }
+        )
+        .is_none());
     }
 
     #[test]
@@ -1405,6 +2371,18 @@ mod tests {
         assert!(guest_shm_format_available(&ctx, 0));
         assert!(guest_shm_format_available(&ctx, 1));
         assert!(!guest_shm_format_available(&ctx, 0x3631_4752));
+    }
+
+    #[test]
+    fn nv12_is_not_advertised_without_a_real_output_allocator() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.host_dmabuf_id = Some(7);
+        ctx.allocator = None;
+        ctx.host_shm_formats.insert(WL_SHM_FORMAT_NV12);
+        assert!(
+            !guest_shm_format_available(&ctx, WL_SHM_FORMAT_NV12),
+            "advertising NV12 without VirtWL or GBM would make create_buffer fail"
+        );
     }
 
     #[test]
@@ -1447,6 +2425,26 @@ mod tests {
         assert!(!backing_fd_has_size(fd.as_raw_fd(), 4096));
         nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
         assert!(backing_fd_has_size(fd.as_raw_fd(), 4096));
+    }
+
+    #[test]
+    fn identifies_dup_fds_for_one_dma_buf_object() {
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+
+        let fd = memfd_create(
+            CString::new("sommelier-dmabuf-identity")
+                .unwrap()
+                .as_c_str(),
+            MFdFlags::empty(),
+        )
+        .expect("memfd_create");
+        let duplicate = fd.try_clone().expect("duplicate fd");
+        assert!(same_dma_buf_object(fd.as_raw_fd(), duplicate.as_raw_fd()));
+
+        let (pipe_read, pipe_write) = nix::unistd::pipe().expect("pipe");
+        assert!(!same_dma_buf_object(fd.as_raw_fd(), pipe_read.as_raw_fd()));
+        drop(pipe_write);
     }
 
     #[test]
@@ -1694,6 +2692,9 @@ mod tests {
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
+                dmabuf_plane1_offset: 0,
+                dmabuf_plane1_stride: 0,
+                dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,
@@ -1774,6 +2775,9 @@ mod tests {
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
+                dmabuf_plane1_offset: 0,
+                dmabuf_plane1_stride: 0,
+                dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,
@@ -1805,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn destroying_non_shm_buffer_clears_submitted_marker() {
+    fn destroying_submitted_non_shm_buffer_defers_until_release() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
@@ -1819,13 +2823,55 @@ mod tests {
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert!(
-            !ctx.submitted_buffers.contains(&guest_buffer),
-            "destroying a non-SHM buffer must not leave stale submitted state"
+            ctx.deferred_host_buffers.contains_key(&guest_buffer),
+            "a submitted native buffer must stay alive until host release"
         );
+        assert!(ctx.submitted_buffers.contains(&guest_buffer));
+        assert_eq!(ctx.client_to_host_queue.len(), 0);
+
+        ctx.last_sender_id = host_buffer;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            Action::Drop
+        );
+        assert!(!ctx.deferred_host_buffers.contains_key(&guest_buffer));
+        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer)
         );
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+    }
+
+    #[test]
+    fn native_release_before_guest_destroy_is_recorded() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_buffer = 20;
+        let host_buffer = 30;
+        ctx.shadow_table.map_id(guest_buffer, host_buffer);
+        ctx.shadow_table
+            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.submitted_buffers.insert(guest_buffer);
+
+        let mut handler = ShmHandler;
+        ctx.last_sender_id = host_buffer;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            Action::Forward
+        );
+        assert!(ctx.released_host_buffers.contains(&guest_buffer));
+        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
+
+        // The surface can still retain the released buffer as its current
+        // content. Destroying the guest object must use the recorded release
+        // edge instead of waiting for a second event that cannot arrive.
+        ctx.surfaces.entry(100).or_default().current_buffer_id = Some(guest_buffer);
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert!(ctx.deferred_host_buffers.is_empty());
+        assert!(ctx.released_host_buffers.is_empty());
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
     }
 
@@ -1855,6 +2901,9 @@ mod tests {
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
+                dmabuf_plane1_offset: 0,
+                dmabuf_plane1_stride: 0,
+                dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,

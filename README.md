@@ -90,7 +90,8 @@ The last positional argument is the guest display socket to create. The
 current Crostini setup uses `wayland-2`:
 
 ```bash
-./sommelier_rs_virtwl-v0.2.1-r1-x86_64 --virtio-wl /dev/wl0 wayland-2
+./sommelier_rs_virtwl-v0.2.1-r1-x86_64 \
+  --virtio-wl /dev/wl0 --gpu-accel wayland-2
 ```
 
 Use the aarch64 binary on arm64. Set the same display name for clients:
@@ -160,7 +161,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Run the proxy from the local build
-./target/release/sommelier --virtio-wl /dev/wl0 wayland-2
+./target/release/sommelier --virtio-wl /dev/wl0 --gpu-accel wayland-2
 ```
 
 The standalone IME GUI is useful for manual input and glyph verification:
@@ -220,8 +221,11 @@ The fork currently keeps `virtwl` as its only development branch.
 ## Scope and limitations
 
 - X11 proxying is out of scope; this project is Wayland-focused.
-- `--gpu-accel` is intentionally disabled in the VirtWL path until the
-  linux-dmabuf PRIME bridge is complete.
+- `--gpu-accel` enables the VirtWL linux-dmabuf PRIME bridge when the guest
+  kernel and host compositor provide it. Guest `wl_shm` pixels are copied into
+  the host-backed dma-buf; if allocation or mapping is unavailable, the proxy
+  falls back to its validated VirtWL shared-memory path. This is not
+  end-to-end zero-copy.
 - A compatible guest kernel and host compositor are required.
 - This is an independent fork, not an officially supported Google product or
   ChromiumOS component.

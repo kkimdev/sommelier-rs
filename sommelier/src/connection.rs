@@ -74,7 +74,13 @@ fn close_received_fds(fds: &[RawFd]) {
 fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     let mut fds = Vec::new();
     let control_start = msg.msg_control as usize;
-    let Some(control_end) = control_start.checked_add(msg.msg_controllen) else {
+    // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl. Keep
+    // pointer arithmetic in usize so this parser is portable across targets.
+    #[cfg(target_env = "musl")]
+    let control_len = msg.msg_controllen as usize;
+    #[cfg(not(target_env = "musl"))]
+    let control_len = msg.msg_controllen;
+    let Some(control_end) = control_start.checked_add(control_len) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SCM_RIGHTS control buffer address overflows",
@@ -82,7 +88,7 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     };
     let header_size = std::mem::size_of::<libc::cmsghdr>();
     let align = std::mem::size_of::<usize>();
-    let mut current = if msg.msg_controllen >= header_size && !msg.msg_control.is_null() {
+    let mut current = if control_len >= header_size && !msg.msg_control.is_null() {
         msg.msg_control.cast::<libc::cmsghdr>()
     } else {
         std::ptr::null_mut()
@@ -97,8 +103,7 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
                 "SCM_RIGHTS header lies outside the control buffer",
             ));
         };
-        if current_offset > msg.msg_controllen || msg.msg_controllen - current_offset < header_size
-        {
+        if current_offset > control_len || control_len - current_offset < header_size {
             close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -207,7 +212,19 @@ fn recv_unix_message(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    #[cfg(target_env = "musl")]
+    {
+        msg.msg_controllen = control.len().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SCM_RIGHTS control buffer is too large for the platform",
+            )
+        })?;
+    }
+    #[cfg(not(target_env = "musl"))]
+    {
+        msg.msg_controllen = control.len();
+    }
 
     let bytes = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if bytes < 0 {
@@ -435,7 +452,7 @@ mod tests {
         }
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = control.len();
+        msg.msg_controllen = control.len() as _;
         msg.msg_flags = libc::MSG_CTRUNC;
 
         let result = decode_unix_control_fds(&msg);

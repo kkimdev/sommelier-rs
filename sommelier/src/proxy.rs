@@ -82,7 +82,9 @@ fn pending_host_event_is_stale(
         .or(guest_interface)
         .is_some_and(|name| name == "wl_buffer")
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
-        && guest_id.is_some_and(|gid| ctx.retired_buffers.contains_key(&gid));
+        && guest_id.is_some_and(|gid| {
+            ctx.retired_buffers.contains_key(&gid) || ctx.deferred_host_buffers.contains_key(&gid)
+        });
     ctx.shadow_table.is_pending_destroy_host(sender_id) && !allows_deferred_buffer_release
 }
 
@@ -267,7 +269,12 @@ impl Client {
         } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
             // Silently drop events for internally-bound aura_shell objects.
             // We only use these interfaces to send requests (set_application_id
-            // via zaura_surface), never to receive events.
+            // via zaura_surface), never to receive events. Consume the
+            // payload first because handle_msgs rejects any unconsumed bytes
+            // after dispatch; otherwise a valid host layout_mode event would
+            // tear down the client connection even though it is intentionally
+            // hidden from the guest.
+            msg.offset = msg.payload.len();
             Ok(None)
         } else {
             Ok(None)
@@ -1080,6 +1087,21 @@ mod tests {
             protocols::wayland::wl_buffer::EVT_RELEASE,
             Some(11)
         ));
+
+        ctx.shadow_table.map_id(12, 22);
+        ctx.shadow_table
+            .track_interface_with_version(12, "wl_buffer".to_string(), 1);
+        // Match the production native-buffer destroy path: the guest
+        // interface is retired while the host-side interface remains
+        // available long enough to dispatch wl_buffer.release.
+        ctx.shadow_table.retire_guest_object(12);
+        ctx.deferred_host_buffers.insert(12, 22);
+        assert!(!pending_host_event_is_stale(
+            &ctx,
+            22,
+            protocols::wayland::wl_buffer::EVT_RELEASE,
+            Some(12)
+        ));
     }
 
     fn test_buffer_state() -> crate::state::BufferState {
@@ -1103,6 +1125,9 @@ mod tests {
             bo: None,
             dmabuf_fd: None,
             bo_stride: 4,
+            dmabuf_plane1_offset: 0,
+            dmabuf_plane1_stride: 0,
+            dmabuf_sync: false,
             dest_ptr: std::ptr::null_mut(),
             dest_size: 0,
             needs_full_copy: false,

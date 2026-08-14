@@ -632,6 +632,17 @@ pub struct BufferState {
     #[allow(dead_code)]
     pub dmabuf_fd: Option<OwnedFd>,
     pub bo_stride: u32,
+    /// Destination offset of the second plane in the mapped output buffer.
+    /// Zero means the format is single-plane; for NV12 this is the host
+    /// allocator's returned plane-1 offset relative to plane 0.
+    pub dmabuf_plane1_offset: usize,
+    /// Destination stride of the second plane.  Kept separate from
+    /// `bo_stride` because host dma-buf allocators may pad planes
+    /// independently.
+    pub dmabuf_plane1_stride: usize,
+    /// Whether the output descriptor requires VirtWL dma-buf begin/end
+    /// synchronization around CPU writes.
+    pub dmabuf_sync: bool,
     pub dest_ptr: *mut u8,
     pub dest_size: usize,
     /// Newly allocated host storage is uninitialized. The first committed
@@ -832,6 +843,23 @@ pub struct Context {
     /// wl_surface state. A destroyed buffer with this marker retains its
     /// local SHM backing until the surface switches away from it.
     pub submitted_buffers: HashSet<u32>,
+    /// Native linux-dmabuf buffers have no local SHM mapping, but their host
+    /// wl_buffer still must remain alive after the guest object is destroyed
+    /// until the compositor sends wl_buffer.release.
+    pub deferred_host_buffers: HashMap<u32, u32>,
+    /// Host release markers for native linux-dmabuf buffers that have no
+    /// BufferState entry. A released buffer may be destroyed even while a
+    /// surface still retains it as its current content.
+    pub released_host_buffers: HashSet<u32>,
+    /// Dimensions of guest-created linux-dmabuf buffers. Native buffers do
+    /// not need a local SHM `BufferState`, but the compositor bridge still
+    /// needs their dimensions to translate `damage_buffer` and full damage
+    /// rectangles correctly.
+    pub native_buffer_sizes: HashMap<u32, (i32, i32)>,
+    /// Dimensions waiting for the host's asynchronous linux-dmabuf `created`
+    /// event. The key is the guest params object ID; the event handler moves
+    /// the value to `native_buffer_sizes` under the host-created buffer ID.
+    pub pending_native_buffer_sizes: HashMap<u32, (i32, i32)>,
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
@@ -1027,6 +1055,10 @@ impl Context {
             buffers: HashMap::new(),
             retired_buffers: HashMap::new(),
             submitted_buffers: HashSet::new(),
+            deferred_host_buffers: HashMap::new(),
+            released_host_buffers: HashSet::new(),
+            native_buffer_sizes: HashMap::new(),
+            pending_native_buffer_sizes: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),

@@ -32,6 +32,14 @@ pub const VIRTWL_IOCTL_NEW_PIPE_WRITE: u32 = 3;
 pub const VIRTWL_IOCTL_NEW_DMABUF: u32 = 4;
 pub const VIRTWL_IOCTL_NEW_CTX_NAMED: u32 = 5;
 
+// Values from linux/dma-buf.h.  Keep them local instead of depending on a
+// userspace header: the VirtWL ioctl is part of the guest kernel ABI and the
+// static build intentionally does not link against libdrm headers.
+pub const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+pub const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
+pub const DMA_BUF_SYNC_START: u32 = 0 << 2;
+pub const DMA_BUF_SYNC_END: u32 = 1 << 2;
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AsBytes, FromBytes, FromZeroes)]
 pub struct virtwl_ioctl_new_dmabuf {

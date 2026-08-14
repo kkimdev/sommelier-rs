@@ -169,6 +169,9 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         let guest_id = ctx.shadow_table.get_guest_id(id).unwrap_or(0);
         if guest_id != 0 {
             ctx.shadow_table.remove_id(guest_id);
+            ctx.native_buffer_sizes.remove(&guest_id);
+            ctx.native_buffer_sizes.remove(&id);
+            ctx.pending_native_buffer_sizes.remove(&guest_id);
 
             // Forward the corrected delete_id event to the client
             let mut builder = MessageBuilder::new();

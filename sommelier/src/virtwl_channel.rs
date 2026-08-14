@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use crate::virtwl::{
-    virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send, virtwl_ioctl_txn,
+    virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send,
+    virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,
     VIRTWL_SEND_MAX_ALLOCS,
 };
 use std::collections::HashSet;
@@ -31,6 +32,18 @@ const DEFAULT_BUFFER_SIZE: usize = 4096;
 // payload must leave room for its FD array and length field. ChromiumOS uses
 // this exact bound in VirtWaylandChannel::max_send_size().
 const MAX_SEND_SIZE: usize = DEFAULT_BUFFER_SIZE - std::mem::size_of::<virtwl_ioctl_txn>();
+
+/// Layout returned by `VIRTWL_IOCTL_NEW_DMABUF`.
+///
+/// The offsets and strides are host-compositor metadata.  They must be used
+/// verbatim when constructing the host linux-dmabuf buffer; recomputing them
+/// from width/height is incorrect for multi-plane formats and for allocators
+/// that add padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtWaylandDmabufLayout {
+    pub strides: [u32; 3],
+    pub offsets: [u32; 3],
+}
 
 fn dmabuf_probe_supported(errno: Option<i32>) -> bool {
     // ChromiumOS treats ENOTTY as the one definitive indication that the
@@ -141,9 +154,13 @@ impl VirtWaylandChannel {
         let dmabuf_probe_result =
             unsafe { virtwl_ioctl_new(dev_file.as_raw_fd(), &mut dmabuf_probe) };
         let supports_dmabuf = match dmabuf_probe_result {
-            Ok(_) => {
+            Ok(_) if dmabuf_probe.fd >= 0 => {
                 close_returned_fd(dmabuf_probe.fd);
                 true
+            }
+            Ok(_) => {
+                log::debug!("virtwl dmabuf capability probe returned success without a valid fd");
+                false
             }
             Err(error) => {
                 // Some virtwl implementations allocate the descriptor before
@@ -198,6 +215,84 @@ impl VirtWaylandChannel {
         }
 
         Ok((unsafe { OwnedFd::from_raw_fd(fd) }, size))
+    }
+
+    /// Allocate a host-backed PRIME dma-buf and return the layout selected by
+    /// the host allocator.
+    ///
+    /// The returned descriptor is mapped into the guest by the VirtWL kernel
+    /// driver.  It can be sent to the host compositor as a linux-dmabuf plane
+    /// descriptor and can be CPU-accessed after a `sync` begin operation.
+    pub fn allocate_dmabuf(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> io::Result<(OwnedFd, VirtWaylandDmabufLayout)> {
+        if width == 0 || height == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VirtWL dma-buf dimensions must be non-zero",
+            ));
+        }
+
+        let mut new_dmabuf = crate::virtwl::virtwl_ioctl_new::new_dmabuf(width, height, format);
+        let ioctl_result =
+            unsafe { crate::virtwl::virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_dmabuf) };
+        if let Err(error) = ioctl_result {
+            close_returned_fd(new_dmabuf.fd);
+            return Err(io::Error::from(error));
+        }
+
+        let fd = new_dmabuf.fd;
+        if fd < 0 {
+            return Err(io::Error::other(
+                "Invalid fd returned from VIRTWL_IOCTL_NEW_DMABUF",
+            ));
+        }
+
+        let layout = new_dmabuf.get_dmabuf();
+        if layout.stride0 == 0 {
+            close_returned_fd(fd);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VirtWL dma-buf returned a zero plane-0 stride",
+            ));
+        }
+
+        Ok((
+            unsafe { OwnedFd::from_raw_fd(fd) },
+            VirtWaylandDmabufLayout {
+                strides: [layout.stride0, layout.stride1, layout.stride2],
+                offsets: [layout.offset0, layout.offset1, layout.offset2],
+            },
+        ))
+    }
+
+    /// Synchronize CPU access to a VirtWL dma-buf.
+    ///
+    /// VirtWL exposes the same begin/end read/write contract as
+    /// `DMA_BUF_IOCTL_SYNC`.  A failed begin or end must be surfaced to the
+    /// caller; silently copying after a failed begin can race the host
+    /// compositor and produce torn frames.
+    pub fn sync(&self, dmabuf_fd: RawFd, flags: u32) -> io::Result<()> {
+        if dmabuf_fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid VirtWL dma-buf descriptor",
+            ));
+        }
+        let valid_flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END;
+        if flags & !valid_flags != 0 || flags & (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid VirtWL dma-buf sync flags",
+            ));
+        }
+        let mut sync = crate::virtwl::virtwl_ioctl_dmabuf_sync { flags };
+        unsafe { virtwl_ioctl_dmabuf_sync(dmabuf_fd, &mut sync) }
+            .map(|_| ())
+            .map_err(io::Error::from)
     }
 
     pub fn create_pipe(&self, read: bool) -> io::Result<OwnedFd> {
@@ -397,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn dmabuf_layout_preserves_all_returned_planes() {
+        let layout = super::VirtWaylandDmabufLayout {
+            strides: [4096, 2048, 0],
+            offsets: [0, 4096 * 1080, 0],
+        };
+        assert_eq!(layout.strides, [4096, 2048, 0]);
+        assert_eq!(layout.offsets, [0, 4096 * 1080, 0]);
+    }
+
+    #[test]
     fn returned_ioctl_fd_is_closed_on_error_paths() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -442,9 +547,18 @@ mod tests {
     fn virtwl_fd_array_must_be_packed() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let invalid = [-1, pipe_fds[1]];
+        // Keep the descriptor out of the low-numbered range used by other
+        // tests. `owned_fds_from_txn` closes malformed arrays immediately;
+        // a parallel test must not be able to reuse the just-closed number
+        // before the assertion below checks it.
+        let returned_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        assert!(returned_fd >= 1000);
+        unsafe {
+            libc::close(pipe_fds[1]);
+        }
+        let invalid = [-1, returned_fd];
         assert!(owned_fds_from_txn(&invalid).is_err());
-        assert_eq!(unsafe { libc::fcntl(pipe_fds[1], libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
         unsafe {
             libc::close(pipe_fds[0]);
         }

@@ -63,13 +63,12 @@ struct Args {
     #[arg(long)]
     local_compositor: Option<String>,
 
-    /// Enable GPU acceleration (virtio-gpu).
+    /// Enable host GPU buffer allocation through VirtWL linux-dmabuf.
     ///
-    /// The GBM-to-host path is intentionally disabled until the proxy can
-    /// submit PRIME buffers through linux-dmabuf. Treating a PRIME fd as a
-    /// wl_shm pool fd is invalid and can make the host compositor mmap the
-    /// wrong object.
-    #[arg(long, hide = true, default_value_t = false)]
+    /// Guest wl_shm buffers are copied into host-backed PRIME buffers. If the
+    /// kernel does not expose VirtWL dma-buf allocation, the proxy falls back
+    /// to its validated shared-memory path.
+    #[arg(long, default_value_t = false)]
     gpu_accel: bool,
 
     /// Enable XDG Decoration support
@@ -99,17 +98,6 @@ async fn main() {
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
-    }
-
-    if virtio_wl.is_some() && gpu_accel {
-        log::error!("--virtio-wl and --gpu-accel cannot be used together");
-        return;
-    }
-    if gpu_accel {
-        log::error!(
-            "--gpu-accel is not available yet: PRIME buffers require a linux-dmabuf host path"
-        );
-        return;
     }
 
     // Need XDG_RUNTIME_DIR
