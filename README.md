@@ -6,7 +6,11 @@ When referring to this project, please use "sommelier-rs" to avoid confusion wit
 
 ## Quick Start
 
-**This is the `virtwl` branch, it only works when running on a [virtio_wl](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/refs/heads/chromeos-5.4/drivers/virtio/virtio_wl.c) enabled guest kernel.** virtio_wl is not part of mainline Linux kernel, and thus not supported on most distribution kernels. Examples of distribution kernels that support virtio_wl includes ChromiumOS's guest kernel such as the kernel running in Crostini / Baguette.
+**This is the `virtwl` branch, and it only works with a [virtio_wl](https://chromium.googlesource.com/chromiumos/third_party/kernel/+/refs/heads/chromeos-5.4/drivers/virtio/virtio_wl.c)-enabled guest kernel.** virtio_wl is not part of the mainline Linux kernel and is therefore not supported by most distribution kernels. Examples of kernels that support virtio_wl include the ChromiumOS guest kernel used by Crostini / Baguette.
+
+The current published binary is the `virtwl-v0.2.1-r1` prerelease. The `-r1`
+suffix identifies a rebuild; the underlying Cargo package version remains
+`0.2.1`.
 
 1. Download the newest version with "virtwl" in its name from [GitHub Releases](https://github.com/kkimdev/sommelier-rs/releases) according to your CPU architecture.
 
@@ -22,7 +26,7 @@ When referring to this project, please use "sommelier-rs" to avoid confusion wit
    wget -O sommelier-rs-v0.2.1-r1 https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v0.2.1-r1/sommelier_rs_virtwl-v0.2.1-r1-aarch64
    ```
 
-2. (If you are running migrating from sommelier, e.g. in ChromeOS guests)
+2. (If you are migrating from sommelier, e.g. in ChromeOS guests)
 
    Stop sommerlier's Wayland compositor guest interface (X interface will still be running).
 
@@ -96,7 +100,8 @@ are located in `sommelier/src/virtwl.rs` and `sommelier/src/virtwl_channel.rs`.
 ### Maintainer release
 
 Releases are built by GitHub-hosted `ubuntu-24.04` runners for x86_64 and
-aarch64. Push a tag whose version matches `sommelier/Cargo.toml`:
+aarch64. Push a tag whose base version matches `sommelier/Cargo.toml`;
+optional `-rN` suffixes are accepted for rebuilds:
 
 ```bash
 git tag virtwl-v0.2.1-r1
