@@ -362,7 +362,19 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 let is_destructor = req.msg_type.as_deref() == Some("destructor");
                 let destructor_cleanup = if is_destructor {
-                    quote! { ctx.shadow_table.mark_pending_destroy(msg.sender_id); }
+                    quote! {
+                        if ctx.shadow_table.is_guest_server_id(msg.sender_id) {
+                            // Server-created objects do not receive
+                            // wl_display.delete_id when the client destroys
+                            // them. The forwarded request already captured the
+                            // host sender ID, so release the translation now
+                            // and allow the host to reuse its ID in a later
+                            // ordered event.
+                            ctx.shadow_table.remove_id(msg.sender_id);
+                        } else {
+                            ctx.shadow_table.mark_pending_destroy(msg.sender_id);
+                        }
+                    }
                 } else {
                     quote! {}
                 };

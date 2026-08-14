@@ -238,4 +238,59 @@ mod tests {
             "a colliding host ID must not overwrite an existing mapping"
         );
     }
+
+    #[test]
+    fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(10, 80);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+        let host_offer_id = 0xff00_0000u32;
+        let mut handler = DataDeviceHandler;
+
+        let payload = host_offer_id.to_ne_bytes();
+        let mut first_offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let (first_event, _) =
+            wl_data_device::dispatch_event(&mut first_offer, &mut handler, &mut ctx)
+                .expect("first data_offer should decode")
+                .expect("first data_offer should be forwarded");
+        let first_guest_id = u32::from_ne_bytes(first_event[8..12].try_into().unwrap());
+        assert_eq!(
+            ctx.shadow_table.get_host_id(first_guest_id),
+            Some(host_offer_id)
+        );
+
+        let mut destroy = WireMessage::new(
+            first_guest_id,
+            crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
+            &[],
+            &[],
+        );
+        let (destroy_request, _) = crate::protocols::wayland::wl_data_offer::dispatch_request(
+            &mut destroy,
+            &mut handler,
+            &mut ctx,
+        )
+        .expect("data_offer.destroy should decode")
+        .expect("data_offer.destroy should be forwarded");
+        assert_eq!(
+            u32::from_ne_bytes(destroy_request[0..4].try_into().unwrap()),
+            host_offer_id
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(first_guest_id), None);
+        assert_eq!(ctx.shadow_table.get_guest_id(host_offer_id), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_guest(first_guest_id));
+
+        let mut replacement = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let (replacement_event, _) =
+            wl_data_device::dispatch_event(&mut replacement, &mut handler, &mut ctx)
+                .expect("reused server ID should decode")
+                .expect("replacement data_offer should be forwarded");
+        let replacement_guest_id = u32::from_ne_bytes(replacement_event[8..12].try_into().unwrap());
+        assert_ne!(replacement_guest_id, first_guest_id);
+        assert_eq!(
+            ctx.shadow_table.get_host_id(replacement_guest_id),
+            Some(host_offer_id)
+        );
+    }
 }

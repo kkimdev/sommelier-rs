@@ -295,6 +295,17 @@ impl ShadowTable {
             && !self.interfaces.contains_key(&guest_id)
     }
 
+    /// Return whether `guest_id` belongs to the range reserved for objects
+    /// created by the server.
+    ///
+    /// The client destroys these objects but never receives `delete_id` for
+    /// them: the server, not the client, owns their raw ID lifecycle. Their
+    /// proxy mappings must therefore be released when the destructor is
+    /// forwarded instead of waiting for an acknowledgement that cannot arrive.
+    pub fn is_guest_server_id(&self, guest_id: u32) -> bool {
+        guest_id >= Self::GUEST_SERVER_ID_START
+    }
+
     /// Return whether a raw host object ID can be accepted from a
     /// server-generated `new_id` event.
     ///
