@@ -255,9 +255,19 @@ impl App {
             self.has_focused = true;
         }
 
-        if self.auto_exit && self.started.elapsed() > Duration::from_secs(AUTO_EXIT_SECS) {
-            log::info!("Auto-exit timeout reached. Exiting application.");
-            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        if self.auto_exit {
+            let timeout = Duration::from_secs(AUTO_EXIT_SECS);
+            let elapsed = self.started.elapsed();
+            if elapsed >= timeout {
+                log::info!("Auto-exit timeout reached. Exiting application.");
+                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+            } else {
+                // A static window may receive no compositor input or resize
+                // events after its first frame. Schedule the exact timer
+                // deadline so smoke tests do not depend on incidental focus
+                // changes to evaluate the auto-exit condition again.
+                ui.ctx().request_repaint_after(timeout - elapsed);
+            }
         }
     }
 }
