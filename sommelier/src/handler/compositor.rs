@@ -687,6 +687,7 @@ impl WlSurfaceHandler for CompositorHandler {
             ctx.keyboard_pressed_keys.remove(&keyboard_id);
             ctx.keyboard_backspace_repeat_cancelled.remove(&keyboard_id);
             ctx.keyboard_event_times.remove(&keyboard_id);
+            ctx.keyboard_backspace_events.remove(&keyboard_id);
             ctx.keyboard_ime_suppressed_keys.remove(&keyboard_id);
             ctx.keyboard_forwarded_keys.remove(&keyboard_id);
             ctx.keyboard_keysym_forwarded_keys.remove(&keyboard_id);
@@ -3475,6 +3476,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,

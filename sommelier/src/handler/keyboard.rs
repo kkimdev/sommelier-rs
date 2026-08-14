@@ -207,6 +207,7 @@ impl KeyboardHandler {
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
         ctx.keyboard_event_times.remove(&host_keyboard_id);
+        ctx.keyboard_backspace_events.remove(&host_keyboard_id);
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
         ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
         ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
@@ -293,6 +294,7 @@ impl KeyboardHandler {
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
         ctx.keyboard_event_times.remove(&host_keyboard_id);
+        ctx.keyboard_backspace_events.remove(&host_keyboard_id);
         ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
         if pressed_keys.is_empty() {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
@@ -1014,7 +1016,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // NOT_HANDLED and must not be forwarded into the guest.
         let mut handled = false;
 
-        if matches!(state, WL_KEY_PRESSED | WL_KEY_REPEATED | WL_KEY_RELEASED) {
+        if matches!(state, WL_KEY_PRESSED | WL_KEY_RELEASED)
+            || (state == WL_KEY_REPEATED && forwarded_before)
+        {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
         }
 
@@ -1068,12 +1072,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         // remains paired with the release. A v10 repeated
                         // event is a real event and must be forwarded.
                         action = Action::Drop;
+                        handled = true;
                         log::debug!("  -> dropping duplicate press for key {}", key);
                     } else if repeated && !forwarded_before {
                         // A repeated event without a preceding forwarded
                         // press is malformed from the guest's perspective.
                         // Do not invent a press/release pair.
                         action = Action::Drop;
+                        handled = false;
                         log::warn!(
                             "  -> dropping repeated key {} without a forwarded press",
                             key
@@ -1083,8 +1089,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                             .entry(host_keyboard_id)
                             .or_default()
                             .insert(key);
+                        handled = true;
                     }
-                    handled = true;
                 }
                 // ChromiumOS sends an ack for every key event. For an
                 // accelerator press `handled` is false; for an IME-suppressed
@@ -1362,8 +1368,18 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             return crate::wire::Action::Drop;
         };
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
+        let pressed_before = ctx
+            .keyboard_pressed_keys
+            .get(&host_keyboard_id)
+            .is_some_and(|keys| keys.contains(&key));
         match state {
-            WL_KEY_PRESSED | WL_KEY_REPEATED => {
+            WL_KEY_PRESSED | WL_KEY_REPEATED
+                if state == WL_KEY_PRESSED || pressed_before =>
+            {
+                if key == EVDEV_KEY_BACKSPACE {
+                    ctx.keyboard_backspace_events
+                        .insert(host_keyboard_id, (serial, time));
+                }
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
                 if state == WL_KEY_PRESSED && key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
@@ -1372,7 +1388,16 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                     }
                 }
             }
+            WL_KEY_REPEATED => {
+                log::warn!(
+                    "peek_key: ignoring repeated key {} without a preceding press",
+                    key
+                );
+            }
             WL_KEY_RELEASED => {
+                if key == EVDEV_KEY_BACKSPACE {
+                    ctx.keyboard_backspace_events.remove(&host_keyboard_id);
+                }
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
                 // A key consumed by the host IME may have no corresponding
                 // wl_keyboard.key release. `peek_key` is the only release
@@ -1488,6 +1513,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,
@@ -1744,6 +1770,89 @@ mod tests {
                 u32::from_ne_bytes(msg[12..16].try_into().unwrap()),
                 1,
                 "duplicate and release events remain HANDLED by the guest"
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_without_press_does_not_create_key_state_or_claim_handled() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, 30, WL_KEY_REPEATED),
+            Action::Drop,
+            "a repeat without a forwarded press must not reach the guest"
+        );
+        assert!(
+            !ctx.keyboard_pressed_keys
+                .get(&HostId(5))
+                .is_some_and(|keys| keys.contains(&30)),
+            "a repeat-only event must not create physical pressed-key state"
+        );
+        assert!(
+            !ctx.keyboard_forwarded_keys
+                .get(&HostId(5))
+                .is_some_and(|keys| keys.contains(&30)),
+            "a repeat-only event must not create forwarded-key state"
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let (ack, _) = &ctx.client_to_host_queue[0];
+        assert_eq!(
+            u32::from_ne_bytes(ack[12..16].try_into().unwrap()),
+            0,
+            "a malformed repeat must be acked as NOT_HANDLED"
+        );
+    }
+
+    #[test]
+    fn press_repeat_release_keeps_key_state_and_ack_balanced() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, 30, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 101, 30, WL_KEY_REPEATED),
+            Action::Forward
+        );
+        assert!(
+            ctx.keyboard_pressed_keys[&HostId(5)].contains(&30),
+            "a valid repeat must preserve physical pressed-key state"
+        );
+        assert!(
+            ctx.keyboard_forwarded_keys[&HostId(5)].contains(&30),
+            "a valid repeat must preserve the outstanding forwarded press"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 102, 30, WL_KEY_RELEASED),
+            Action::Forward
+        );
+        assert!(
+            !ctx.keyboard_pressed_keys.contains_key(&HostId(5)),
+            "release must retire physical pressed-key state"
+        );
+        assert!(
+            !ctx.keyboard_forwarded_keys.contains_key(&HostId(5)),
+            "release must retire the outstanding forwarded press"
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        for (ack, _) in &ctx.client_to_host_queue {
+            assert_eq!(
+                u32::from_ne_bytes(ack[12..16].try_into().unwrap()),
+                1,
+                "each event in a valid press/repeat/release sequence is HANDLED"
             );
         }
     }
@@ -2268,6 +2377,45 @@ mod tests {
             ctx.keyboard_backspace_repeat_cancelled
                 .contains(&HostId(100)),
             "a repeated peek must not re-arm a cancelled IME fallback"
+        );
+    }
+
+    #[test]
+    fn repeated_peek_key_without_press_does_not_create_physical_state() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+
+        ctx.last_sender_id = 1000;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 11, 21, EVDEV_KEY_BACKSPACE, WL_KEY_REPEATED,),
+            Action::Drop
+        );
+        assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_backspace_events.contains_key(&HostId(100)));
+    }
+
+    #[test]
+    fn backspace_peek_identity_survives_unrelated_release() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+
+        ctx.last_sender_id = 1000;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 20, 200, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Drop
+        );
+
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_key(&mut ctx, 21, 210, 30, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.keyboard_backspace_events.get(&HostId(100)),
+            Some(&(20, 200)),
+            "an unrelated key event must not replace the Backspace peek identity"
         );
     }
 
@@ -3005,6 +3153,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,
@@ -3094,6 +3243,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,
@@ -3183,6 +3333,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,
@@ -3253,6 +3404,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,
@@ -3337,6 +3489,7 @@ mod tests {
                     surrounding_text_dirty: false,
                     content_hint: 0,
                     content_purpose: 0,
+                    committed_content_type: None,
                     content_type_dirty: false,
                     cursor_rect: None,
                     cursor_rect_dirty: false,
@@ -3403,6 +3556,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,

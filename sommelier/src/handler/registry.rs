@@ -437,6 +437,23 @@ fn record_registry_global_visibility(ctx: &mut Context, name: u32, visible: bool
         .insert(name, visible);
 }
 
+fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
+    if version < LINUX_DMABUF_CAPABILITY_VERSION {
+        return false;
+    }
+    if ctx.allocator.is_some() {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        ctx.synthetic_feedback_available_for_test
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn guest_bind_is_allowed(
     ctx: &Context,
     name: u32,
@@ -579,8 +596,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // A v3 host still has enough legacy format/modifier information
             // for our synthetic v4 feedback object. Advertise v4 to the
             // guest while clamping only the internal host bind to v3.
-            let can_synthesize_feedback =
-                version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_some();
+            let can_synthesize_feedback = can_synthesize_dmabuf_feedback(ctx, version);
             let client_version = if can_synthesize_feedback {
                 LINUX_DMABUF_VERSION
             } else {
@@ -1431,8 +1447,44 @@ mod tests {
     }
 
     #[test]
+    fn gpu_without_allocator_exposes_host_v3_without_feedback_barrier() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.allocator = None;
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
+
+        assert_eq!(
+            ctx.host_globals.get(&10),
+            Some(&HostGlobal {
+                interface: dmabuf,
+                version: 3,
+            })
+        );
+        assert!(ctx.pending_dmabuf_globals.is_empty());
+        assert!(ctx.dmabuf_capability_callbacks.is_empty());
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            1,
+            "only the internal v3 bind should be sent without feedback synthesis"
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        let global = &ctx.host_to_client_queue[0].0;
+        let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..], &[]);
+        assert_eq!(wire.read_u32().unwrap(), 10);
+        assert_eq!(wire.read_string().unwrap(), "zwp_linux_dmabuf_v1");
+        assert_eq!(wire.read_u32().unwrap(), 3);
+    }
+
+    #[test]
     fn synthetic_dmabuf_global_waits_for_completed_capabilities() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
@@ -1468,6 +1520,7 @@ mod tests {
     #[test]
     fn synthetic_dmabuf_global_stays_hidden_without_supported_formats() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
@@ -1974,6 +2027,7 @@ mod tests {
     #[test]
     fn global_remove_destroys_internal_dmabuf_factory() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table

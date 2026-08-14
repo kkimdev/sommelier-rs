@@ -130,6 +130,7 @@ mod tests {
                 surrounding_text_dirty: false,
                 content_hint: 0,
                 content_purpose: 0,
+                committed_content_type: None,
                 content_type_dirty: false,
                 cursor_rect: None,
                 cursor_rect_dirty: false,

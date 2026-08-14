@@ -262,7 +262,7 @@ mod tests {
 
     impl WlDisplayHandler for ProbeHandler {
         fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
-            ctx.synthetic_keyboard_serial = 99;
+            ctx.fatal_protocol_error = true;
             Action::Drop
         }
     }
@@ -278,8 +278,8 @@ mod tests {
             wl_display::dispatch_request(&mut msg, &mut handler, &mut ctx),
             Err(ProtocolError::InvalidObjectId(999))
         );
-        assert_eq!(
-            ctx.synthetic_keyboard_serial, 0,
+        assert!(
+            !ctx.fatal_protocol_error,
             "an invalid sender must not reach a mutating handler"
         );
     }
