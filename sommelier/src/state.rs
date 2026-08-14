@@ -72,6 +72,20 @@ impl HostId {
     }
 }
 
+/// Metadata for one global advertised by the host compositor.
+///
+/// Global names are unique, but interface names are not: a compositor may
+/// advertise multiple `wl_seat` or `wl_output` globals at the same time.
+/// Keeping the numeric name as the map key prevents a later global from
+/// overwriting the bind target for an earlier one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostGlobal {
+    /// Interface implemented by the global.
+    pub interface: String,
+    /// Maximum version exposed to the guest for this global.
+    pub version: u32,
+}
+
 // Each internally-bound interface stores its host ID in a dedicated
 // `ctx.host_*_id` field, and we register it with `track_host_interface`
 // so proxy.rs can dispatch inbound host events without any magic number hackery.
@@ -82,19 +96,45 @@ pub struct ShadowTable {
     host_to_guest: HashMap<u32, u32>,
     interfaces: HashMap<u32, String>,
     host_interfaces: HashMap<u32, String>,
+    guest_versions: HashMap<u32, u32>,
+    host_versions: HashMap<u32, u32>,
+    retired_host_ids: HashSet<u32>,
+    /// Host-only objects whose destructor was queued but whose host
+    /// `wl_display.delete_id` acknowledgement has not arrived yet.
+    pending_destroy_host_ids: HashSet<u32>,
+    /// Guest objects whose destructor request has reached the host but whose
+    /// host-side `wl_display.delete_id` has not arrived yet.
+    pending_destroy_guest_ids: HashSet<u32>,
     next_host_id: u32,
+    /// Wayland reserves the upper 8-bit ID range for IDs allocated by the
+    /// server and sent to the client in an event. Host and guest object
+    /// namespaces are independent, so host-generated `new_id` values must be
+    /// translated to a fresh ID in this range before they reach the guest.
+    next_guest_server_id: u32,
 }
 
 impl ShadowTable {
+    const GUEST_SERVER_ID_START: u32 = 0xff00_0000;
+    /// Test fixtures and legacy internal registrations that do not carry a
+    /// negotiated version remain permissive. Production-created objects are
+    /// registered with their actual version by the generated dispatcher.
+    const UNKNOWN_OBJECT_VERSION: u32 = u32::MAX;
+
     pub fn new() -> Self {
         Self {
             guest_to_host: HashMap::new(),
             host_to_guest: HashMap::new(),
             interfaces: HashMap::new(),
             host_interfaces: HashMap::new(),
+            guest_versions: HashMap::new(),
+            host_versions: HashMap::new(),
+            retired_host_ids: HashSet::new(),
+            pending_destroy_host_ids: HashSet::new(),
+            pending_destroy_guest_ids: HashSet::new(),
             // Start at 2 to mimic standard Wayland client behavior.
             // ID 1 is reserved for wl_display.
             next_host_id: 2,
+            next_guest_server_id: Self::GUEST_SERVER_ID_START,
         }
     }
 
@@ -127,6 +167,8 @@ impl ShadowTable {
             if id >= 2
                 && !self.host_to_guest.contains_key(&id)
                 && !self.host_interfaces.contains_key(&id)
+                && !self.retired_host_ids.contains(&id)
+                && !self.pending_destroy_host_ids.contains(&id)
             {
                 return id;
             }
@@ -135,29 +177,237 @@ impl ShadowTable {
         panic!("sommelier: host Wayland object ID space exhausted — this should never happen");
     }
 
-    pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
-        if let Some(old_host_id) = self.guest_to_host.insert(guest_id, host_id) {
-            if old_host_id != host_id {
-                self.host_to_guest.remove(&old_host_id);
+    /// Allocate an ID in Wayland's server-generated ID range.
+    ///
+    /// A host compositor is allowed to choose a different raw ID than the
+    /// guest-side proxy can expose. Returning the host ID verbatim can collide
+    /// with a guest-created object and makes later requests use the wrong
+    /// namespace. Keep a separate wrapping cursor for the server range and
+    /// reserve the chosen ID in the normal guest maps at the call site.
+    pub fn allocate_guest_server_id(&mut self) -> u32 {
+        // The range is exactly 0x0100_0000 IDs
+        // (0xff00_0000..=u32::MAX). Use a u64 loop counter so the inclusive
+        // bound itself cannot overflow.
+        for _ in 0u64..=0x00ff_ffff {
+            let id = self.next_guest_server_id;
+            self.next_guest_server_id = if id == u32::MAX {
+                Self::GUEST_SERVER_ID_START
+            } else {
+                id + 1
+            };
+
+            if id >= Self::GUEST_SERVER_ID_START
+                && !self.guest_to_host.contains_key(&id)
+                && !self.interfaces.contains_key(&id)
+            {
+                return id;
             }
         }
-        self.host_to_guest.insert(host_id, guest_id);
+        log::error!("sommelier: guest Wayland server ID space exhausted");
+        panic!("sommelier: guest Wayland server ID space exhausted — this should never happen");
+    }
+
+    pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
+        if let Some(old_host_id) = self.guest_to_host.insert(guest_id, host_id) {
+            if old_host_id != host_id && self.host_to_guest.get(&old_host_id) == Some(&guest_id) {
+                self.host_to_guest.remove(&old_host_id);
+                self.host_versions.remove(&old_host_id);
+            }
+        }
+        if let Some(old_guest_id) = self.host_to_guest.insert(host_id, guest_id) {
+            if old_guest_id != guest_id && self.guest_to_host.get(&old_guest_id) == Some(&host_id) {
+                self.guest_to_host.remove(&old_guest_id);
+                self.interfaces.remove(&old_guest_id);
+                self.guest_versions.remove(&old_guest_id);
+            }
+        }
     }
 
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
         self.guest_to_host.get(&guest_id).cloned()
     }
 
+    /// Check that a guest object has the interface required by a request
+    /// argument. Wayland object IDs are not interchangeable just because they
+    /// happen to be mapped; forwarding a `wl_surface` where a `wl_seat` is
+    /// expected would otherwise send a type-invalid request to the host.
+    pub fn guest_object_matches(&self, guest_id: u32, interface: &str) -> bool {
+        self.interfaces
+            .get(&guest_id)
+            .is_some_and(|actual| actual == interface)
+    }
+
+    /// Synthetic guest objects are intentionally not paired with a host
+    /// object. Their handlers consume requests locally (currently the SHM
+    /// shim and the v3 text-input manager), so the generated dispatcher must
+    /// let those requests reach the handler while rejecting every other
+    /// unmapped sender before it can mutate state.
+    pub fn is_local_only_guest_object(&self, guest_id: u32) -> bool {
+        matches!(
+            self.interfaces.get(&guest_id).map(String::as_str),
+            Some("wl_shm" | "wl_shm_pool" | "zwp_text_input_manager_v3")
+        )
+    }
+
+    /// Check the interface of a host object carried by an event. Host-created
+    /// objects are recorded in `host_interfaces`, while objects paired with a
+    /// guest object use the guest-side interface metadata.
+    pub fn host_object_matches(&self, host_id: u32, interface: &str) -> bool {
+        self.host_interfaces
+            .get(&host_id)
+            .is_some_and(|actual| actual == interface)
+            || self
+                .host_to_guest
+                .get(&host_id)
+                .and_then(|guest_id| self.interfaces.get(guest_id))
+                .is_some_and(|actual| actual == interface)
+    }
+
+    /// Return whether a guest request may allocate `guest_id`.
+    ///
+    /// Client-created IDs must be non-zero, must not reuse an existing object,
+    /// and must stay below Wayland's server-generated ID range. Keeping this
+    /// check in the shadow table lets generated protocol dispatchers validate
+    /// every `new_id` request before a handler can mutate state.
+    pub fn is_guest_id_available(&self, guest_id: u32) -> bool {
+        guest_id > 1
+            && guest_id < Self::GUEST_SERVER_ID_START
+            && !self.guest_to_host.contains_key(&guest_id)
+            && !self.interfaces.contains_key(&guest_id)
+    }
+
+    /// Return whether a raw host object ID can be accepted from a
+    /// server-generated `new_id` event.
+    ///
+    /// Host IDs share one namespace across guest-paired objects and internal
+    /// proxy objects. A reused ID would otherwise overwrite the reverse map
+    /// and route subsequent host events to the wrong guest object.
+    pub fn is_host_id_available(&self, host_id: u32) -> bool {
+        host_id > 1
+            && !self.host_to_guest.contains_key(&host_id)
+            && !self.host_interfaces.contains_key(&host_id)
+            && !self.retired_host_ids.contains(&host_id)
+            && !self.pending_destroy_host_ids.contains(&host_id)
+    }
+
     pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
         self.host_to_guest.get(&host_id).cloned()
     }
 
-    pub fn track_interface(&mut self, guest_id: u32, interface: String) {
-        self.interfaces.insert(guest_id, interface);
+    /// Return whether a host event sender belongs to an object that this
+    /// connection is currently tracking.
+    ///
+    /// Paired guest objects live in `host_to_guest`; objects that Sommelier
+    /// binds internally (for example the host `wl_shm` and keyboard-extension
+    /// objects) live in `host_interfaces`. An event from neither namespace is
+    /// stale or malformed and must not reach a handler, because handlers may
+    /// update proxy state before the generated forwarding code can discover
+    /// that the sender has no guest representation.
+    pub fn is_event_sender_known(&self, host_id: u32) -> bool {
+        self.host_to_guest.contains_key(&host_id) || self.host_interfaces.contains_key(&host_id)
     }
 
+    /// Mark a forwarded destructor as pending host deletion. Retain the
+    /// interface metadata so a subsequent request reaches the generated
+    /// dispatcher and is rejected explicitly, while retaining both numeric
+    /// maps until the host emits `wl_display.delete_id`.
+    pub fn mark_pending_destroy(&mut self, guest_id: u32) {
+        if self.guest_to_host.contains_key(&guest_id) {
+            self.pending_destroy_guest_ids.insert(guest_id);
+        }
+    }
+
+    /// Retire a host-only object after its destructor request has been queued.
+    ///
+    /// The dispatch metadata is removed immediately so stale events cannot
+    /// reach a handler, but the numeric ID remains reserved until the host
+    /// acknowledges the destructor with `wl_display.delete_id`.
+    pub fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
+        if self.host_to_guest.contains_key(&host_id) || !self.host_interfaces.contains_key(&host_id)
+        {
+            return false;
+        }
+        self.host_interfaces.remove(&host_id);
+        self.host_versions.remove(&host_id);
+        self.retired_host_ids.remove(&host_id);
+        self.pending_destroy_host_ids.insert(host_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_pending_destroy_host_only(&self, host_id: u32) -> bool {
+        self.pending_destroy_host_ids.contains(&host_id)
+    }
+
+    /// Consume a `wl_display.delete_id` for a host-only object.
+    ///
+    /// Host-only resources have no guest object ID to expose, so the display
+    /// handler uses this result to consume the acknowledgement without
+    /// forwarding an invalid `delete_id(0)` event to the guest.
+    pub fn consume_host_delete_id(&mut self, host_id: u32) -> bool {
+        self.pending_destroy_host_ids.remove(&host_id)
+    }
+
+    pub fn is_pending_destroy_guest(&self, guest_id: u32) -> bool {
+        self.pending_destroy_guest_ids.contains(&guest_id)
+    }
+
+    pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
+        self.host_to_guest
+            .get(&host_id)
+            .is_some_and(|guest_id| self.is_pending_destroy_guest(*guest_id))
+    }
+
+    pub fn track_interface(&mut self, guest_id: u32, interface: String) {
+        self.interfaces.insert(guest_id, interface);
+        self.guest_versions
+            .entry(guest_id)
+            .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+    }
+
+    pub fn track_interface_with_version(&mut self, guest_id: u32, interface: String, version: u32) {
+        self.interfaces.insert(guest_id, interface);
+        self.guest_versions.insert(guest_id, version);
+    }
+
+    #[allow(dead_code)]
     pub fn track_host_interface(&mut self, host_id: u32, interface: String) {
         self.host_interfaces.insert(host_id, interface);
+        self.host_versions
+            .entry(host_id)
+            .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+    }
+
+    pub fn track_host_interface_with_version(
+        &mut self,
+        host_id: u32,
+        interface: String,
+        version: u32,
+    ) {
+        self.host_interfaces.insert(host_id, interface);
+        self.host_versions.insert(host_id, version);
+    }
+
+    /// Set the negotiated version for a host object that is already paired
+    /// with a guest object. Keeping this separate from `host_interfaces`
+    /// avoids treating every paired object as an internal host-only object.
+    pub fn set_host_version(&mut self, host_id: u32, version: u32) {
+        self.host_versions.insert(host_id, version);
+    }
+
+    pub fn guest_object_version(&self, guest_id: u32) -> Option<u32> {
+        self.guest_versions.get(&guest_id).copied().or_else(|| {
+            self.guest_to_host
+                .get(&guest_id)
+                .and_then(|host_id| self.host_versions.get(host_id).copied())
+        })
+    }
+
+    pub fn host_object_version(&self, host_id: u32) -> Option<u32> {
+        self.host_versions.get(&host_id).copied().or_else(|| {
+            self.host_to_guest
+                .get(&host_id)
+                .and_then(|guest_id| self.guest_versions.get(guest_id).copied())
+        })
     }
 
     /// Remove a host-side interface registration.
@@ -174,6 +424,20 @@ impl ShadowTable {
     /// is the correct behavior. Exo does not send events after processing `destroy`.
     pub fn remove_host_interface(&mut self, host_id: u32) {
         self.host_interfaces.remove(&host_id);
+        self.host_versions.remove(&host_id);
+        self.retired_host_ids.remove(&host_id);
+        self.pending_destroy_host_ids.remove(&host_id);
+    }
+
+    /// Forget active dispatch metadata while reserving the host ID until
+    /// connection teardown. Use when a protocol has no destructor request but
+    /// its host-side proxy may still exist after the guest-facing global is
+    /// removed.
+    pub fn retire_host_interface(&mut self, host_id: u32) {
+        self.host_interfaces.remove(&host_id);
+        self.host_versions.remove(&host_id);
+        self.pending_destroy_host_ids.remove(&host_id);
+        self.retired_host_ids.insert(host_id);
     }
 
     pub fn get_interface(&self, guest_id: u32) -> Option<&String> {
@@ -197,11 +461,63 @@ impl ShadowTable {
     }
 
     pub fn remove_id(&mut self, guest_id: u32) {
+        self.pending_destroy_guest_ids.remove(&guest_id);
         if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
             self.host_to_guest.remove(&host_id);
             self.host_interfaces.remove(&host_id);
+            self.host_versions.remove(&host_id);
         }
         self.interfaces.remove(&guest_id);
+        self.guest_versions.remove(&guest_id);
+    }
+
+    /// Remove only the guest-side half of a mapping.
+    ///
+    /// Some host protocols (notably `zwp_text_input_v1`) have no wire-level
+    /// destructor. The guest-facing object can be destroyed while the
+    /// host-side proxy remains alive until the connection closes. Keeping the
+    /// host interface reservation prevents a later allocation from reusing
+    /// that ID and routing stale host events to a new object.
+    pub fn remove_guest_mapping(&mut self, guest_id: u32) {
+        let guest_interface = self.interfaces.remove(&guest_id);
+        self.guest_versions.remove(&guest_id);
+        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+            if self.host_to_guest.get(&host_id) == Some(&guest_id) {
+                self.host_to_guest.remove(&host_id);
+            }
+            // Production callers normally register the real host interface
+            // separately (a guest v3 text input is backed by a host v1
+            // object). If that registration is absent, retain the guest
+            // interface as a conservative reservation instead of allowing
+            // the host ID to be reused while queued host traffic is in flight.
+            if let (std::collections::hash_map::Entry::Vacant(entry), Some(interface)) =
+                (self.host_interfaces.entry(host_id), guest_interface)
+            {
+                entry.insert(interface);
+            }
+        }
+    }
+
+    /// Mark a guest object as destroyed while retaining both sides of its
+    /// mapping for a delayed host event (for example wl_buffer.release).
+    ///
+    /// Requests carrying this guest ID will fail the interface validation,
+    /// while events from the still-live host object can continue to resolve
+    /// back to the retired guest ID until [`remove_id`] is called. Preserve the
+    /// interface metadata on the host side as well: proxy dispatch needs an
+    /// interface name before it can invoke the event handler, and the guest
+    /// metadata is intentionally removed so a destroyed object cannot accept
+    /// another request.
+    pub fn retire_guest_object(&mut self, guest_id: u32) {
+        let interface = self.interfaces.remove(&guest_id);
+        self.guest_versions.remove(&guest_id);
+        if let (Some(host_id), Some(interface)) = (self.guest_to_host.get(&guest_id), interface) {
+            self.pending_destroy_guest_ids.insert(guest_id);
+            self.host_interfaces.entry(*host_id).or_insert(interface);
+            self.host_versions
+                .entry(*host_id)
+                .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+        }
     }
 
     #[allow(dead_code)]
@@ -225,6 +541,40 @@ impl Default for ShadowTable {
     }
 }
 
+impl Drop for Context {
+    fn drop(&mut self) {
+        // Raw FDs in these structures are owned by the proxy until the
+        // corresponding queued message is flushed. A protocol error or a
+        // disconnect can drop Context before proxy::handle_msgs drains them,
+        // so close every remaining descriptor here. De-duplicate defensively:
+        // a failed/partially handled request must never turn an accidental
+        // duplicate entry into a close of a subsequently reused descriptor.
+        let mut owned_fds = HashSet::new();
+        for (_, fds) in self.client_to_host_queue.drain(..) {
+            owned_fds.extend(fds);
+        }
+        for (_, fds) in self.host_to_client_queue.drain(..) {
+            owned_fds.extend(fds);
+        }
+        for params in self.pending_params.drain().map(|(_, params)| params) {
+            owned_fds.extend(params.into_iter().map(|param| param.fd));
+        }
+
+        for fd in owned_fds {
+            if fd >= 0 {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+
+        // Context is also dropped on synchronous protocol-error paths. Tokio
+        // JoinHandle::drop detaches a task, so explicitly abort every active
+        // clipboard pump instead of allowing it to outlive the connection.
+        for pump in self.clipboard_pumps.drain(..) {
+            pump.abort();
+        }
+    }
+}
+
 pub struct PoolInner {
     pub client_ptr: *mut libc::c_void,
     pub size: usize,
@@ -240,12 +590,20 @@ pub struct PoolState {
 
 impl Drop for PoolState {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.write() {
-            unsafe {
-                if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
-                    libc::munmap(inner.client_ptr, inner.size);
-                    inner.client_ptr = std::ptr::null_mut();
-                }
+        // `Drop` must release the mapping even when a worker panicked while
+        // holding the lock. `RwLock::write()` returns an error for a poisoned
+        // lock; treating that error as "nothing to clean up" leaks the entire
+        // SHM pool until process exit. `get_mut()` is safe here because `&mut
+        // self` proves that no other thread can access the lock during drop,
+        // and `PoisonError::get_mut()` still exposes the protected value.
+        let inner = match self.inner.get_mut() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        unsafe {
+            if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
+                libc::munmap(inner.client_ptr, inner.size);
+                inner.client_ptr = std::ptr::null_mut();
             }
         }
         unsafe {
@@ -257,13 +615,15 @@ impl Drop for PoolState {
 }
 
 pub struct BufferState {
+    /// Guest object ID that owns this state while the buffer is live. Retired
+    /// buffers keep this value after the guest object has been destroyed so
+    /// surface references can still be resolved for damage-only commits.
+    pub guest_buffer_id: u32,
     pub pool: Arc<PoolState>,
     pub offset: i32,
-    #[allow(dead_code)]
     pub width: i32,
     pub height: i32,
     pub stride: u32,
-    #[allow(dead_code)]
     pub format: u32,
     #[allow(dead_code)]
     pub host_buffer_id: u32,
@@ -274,6 +634,14 @@ pub struct BufferState {
     pub bo_stride: u32,
     pub dest_ptr: *mut u8,
     pub dest_size: usize,
+    /// Newly allocated host storage is uninitialized. The first committed
+    /// frame must therefore copy the complete guest buffer even if the client
+    /// omitted an explicit damage request.
+    pub needs_full_copy: bool,
+    /// The host compositor has sent wl_buffer.release while this guest
+    /// object is still alive. A later guest destroy can drop local backing
+    /// storage immediately when this is set.
+    pub host_released: bool,
 }
 
 unsafe impl Send for BufferState {}
@@ -290,8 +658,113 @@ impl Drop for BufferState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The crop/scale state associated with a `wp_viewport`.
+///
+/// `wl_fixed_t` values are kept in their raw signed 24.8 representation so
+/// damage conversion does not lose fractional source coordinates.  Viewport
+/// state is double-buffered by the wl_surface commit, not by the viewport
+/// object itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportState {
+    pub source: Option<(i32, i32, i32, i32)>,
+    pub destination: Option<(i32, i32)>,
+}
+
+impl ViewportState {
+    pub const fn new() -> Self {
+        Self {
+            source: None,
+            destination: None,
+        }
+    }
+
+    pub const fn is_identity(self) -> bool {
+        self.source.is_none() && self.destination.is_none()
+    }
+}
+
+impl Default for ViewportState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DamageRect {
+    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SurfaceState {
-    pub pending_buffer_id: Option<u32>,
+    /// Buffer selected by the most recent committed attach. A commit that
+    /// changes only damage still uses this buffer.
+    pub current_buffer_id: Option<u32>,
+    /// `Some(None)` represents an explicit `attach(NULL)`, while `None`
+    /// means that this commit has no attach request at all.
+    pub pending_buffer_id: Option<Option<u32>>,
+    /// Damage expressed in surface-local coordinates. It can only be copied
+    /// directly when the current buffer has the default transform and no
+    /// viewport; otherwise the compositor falls back to a complete copy.
+    pub pending_surface_damage: Vec<DamageRect>,
+    /// Damage expressed in buffer pixel coordinates.
+    pub pending_buffer_damage: Vec<DamageRect>,
+    /// Buffer scale/transform are double-buffered by wl_surface. Keeping the
+    /// state here lets the commit path decide whether a damage rectangle can
+    /// be mapped safely.
+    pub pending_buffer_scale: Option<i32>,
+    pub current_buffer_scale: i32,
+    pub pending_buffer_transform: Option<i32>,
+    pub current_buffer_transform: i32,
+    /// `wl_surface.offset` is also double-buffered. The SHM bridge does not
+    /// currently transform surface damage through a non-zero offset, so the
+    /// commit path conservatively performs a complete copy in that case.
+    pub pending_offset: Option<(i32, i32)>,
+    /// For wl_surface versions before 5, attach(x, y) carries the pending
+    /// buffer offset. Keep it separate from the v5+ offset request so a
+    /// zero-valued attach does not overwrite a real `wl_surface.offset`
+    /// request that appeared earlier in the same state batch.
+    pub pending_attach_offset: Option<(i32, i32)>,
+    pub current_offset: (i32, i32),
+    /// A viewport object exists for this surface. The object's state is
+    /// tracked separately because an unset viewport is an identity mapping.
+    pub viewport: Option<ViewportState>,
+    /// Pending viewport state applied by the next surface commit. `Some(None)`
+    /// represents destruction of the viewport object; `None` means unchanged.
+    pub pending_viewport: Option<Option<ViewportState>>,
+}
+
+impl Default for SurfaceState {
+    fn default() -> Self {
+        Self {
+            current_buffer_id: None,
+            pending_buffer_id: None,
+            pending_surface_damage: Vec::new(),
+            pending_buffer_damage: Vec::new(),
+            pending_buffer_scale: None,
+            current_buffer_scale: 1,
+            pending_buffer_transform: None,
+            current_buffer_transform: 0,
+            pending_offset: None,
+            pending_attach_offset: None,
+            current_offset: (0, 0),
+            viewport: None,
+            pending_viewport: None,
+        }
+    }
 }
 
 pub struct PendingParam {
@@ -350,22 +823,69 @@ pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
     pub buffers: HashMap<u32, BufferState>,
+    /// Buffers whose guest wl_buffer object was destroyed while a surface
+    /// could still reference them. They remain mapped until the host releases
+    /// the buffer, at which point the host object and backing storage can be
+    /// retired safely.
+    pub retired_buffers: HashMap<u32, BufferState>,
+    /// Guest buffer IDs that have been sent to the host in a committed
+    /// wl_surface state. A destroyed buffer with this marker retains its
+    /// local SHM backing until the surface switches away from it.
+    pub submitted_buffers: HashSet<u32>,
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
     pub active_surface_for_seat: HashMap<u32, u32>,
+    /// Current guest surface entered by each host keyboard. A seat can expose
+    /// multiple wl_keyboard objects; a leave from one object must not clear
+    /// the seat focus while another object is still entered on the same
+    /// surface.
+    pub keyboard_active_surfaces: HashMap<HostId, u32>,
     pub last_sender_id: u32,
     /// Pending messages to send from client→host (e.g. ack_key, bind requests).
     pub client_to_host_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
     /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
     pub host_to_client_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
+    /// A queued `wl_display.error` must be flushed before the client session
+    /// is torn down. This is set by fatal protocol validation paths.
+    pub fatal_protocol_error: bool,
     /// Monotonic serial source for synthetic keyboard events generated by
     /// compatibility fallbacks.
     pub synthetic_keyboard_serial: u32,
     pub allocator: Option<Allocator>,
     pub virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
     pub host_dmabuf_id: Option<u32>,
+    /// Global name that produced the currently bound internal dmabuf object.
+    pub host_dmabuf_global_name: Option<u32>,
     pub host_shm_id: Option<u32>,
+    /// Global name that produced the currently bound internal wl_shm object.
+    pub host_shm_global_name: Option<u32>,
+    /// Global names that produced the internal singleton bindings. These
+    /// names let registry removal reset exactly the binding that disappeared,
+    /// without tearing down a duplicate or a newer global generation.
+    pub host_text_input_manager_v1_global_name: Option<u32>,
+    pub host_text_input_extension_v1_global_name: Option<u32>,
+    pub host_keyboard_extension_global_name: Option<u32>,
+    pub host_zaura_shell_global_name: Option<u32>,
+    /// Formats observed from the host's SHM or dmabuf capability events that
+    /// the SHM bridge can actually copy. ARGB/XRGB are always available per
+    /// the wl_shm contract; optional formats are added only after the host
+    /// advertises them.
+    pub host_shm_formats: HashSet<u32>,
+    /// Formats already sent to each synthetic guest wl_shm object. Keeping
+    /// this per object prevents duplicate format events when host capability
+    /// events arrive after a guest bind.
+    pub shm_guest_formats: HashMap<u32, HashSet<u32>>,
+    /// Synthetic guest wl_shm objects whose host capability binding has been
+    /// removed. Wayland keeps an already-bound global object valid for
+    /// teardown, but requests sent to it after global removal are ignored.
+    /// Keep these IDs reserved and reject create_pool without allowing a
+    /// replacement host wl_shm binding to service the old object.
+    pub stale_shm_guest_objects: HashSet<u32>,
+    /// Synthetic wl_shm_pool children created before the host capability
+    /// binding disappeared. They remain destroyable, but must not resize
+    /// local mappings or create buffers through a replacement host binding.
+    pub stale_shm_pools: HashSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
     /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
@@ -398,10 +918,49 @@ pub struct Context {
     /// Keys whose physical press was forwarded to the guest and therefore
     /// still require a real release event.
     pub keyboard_forwarded_keys: HashMap<HostId, HashSet<u32>>,
+    /// Keys that were synthesized from a text-input-v1 `keysym` event.
+    ///
+    /// `keyboard_forwarded_keys` also contains ordinary physical presses, so
+    /// it cannot by itself tell whether a later keysym release belongs to a
+    /// synthetic press or is a duplicate of a real keyboard event. Keeping
+    /// this source marker prevents either path from stealing the other's
+    /// release.
+    pub keyboard_keysym_forwarded_keys: HashMap<HostId, HashSet<u32>>,
+    /// Effective keysym → evdev keycode mappings from each host keyboard's
+    /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
+    /// physical keycode, so the IME bridge uses this per-keyboard map when it
+    /// synthesizes a wl_keyboard event.
+    pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
     /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
     pub accelerators: Vec<crate::accelerator::Accelerator>,
     pub supported_formats: HashSet<u32>,
-    pub host_globals: HashMap<String, u32>,
+    /// Host globals visible to the guest, keyed by their unique numeric name.
+    pub host_globals: HashMap<u32, HostGlobal>,
+    /// Host globals consumed internally by the proxy and therefore never
+    /// advertised to the guest. Keeping their names lets global_remove clean
+    /// the corresponding host-only object without leaking a removal event.
+    pub hidden_host_globals: HashMap<u32, String>,
+    /// Global names already emitted by each host registry object. A single
+    /// Wayland client may create more than one wl_registry; the compositor
+    /// sends the complete global list to each one, so this must not be a
+    /// connection-wide set keyed only by global name.
+    pub registry_global_names: HashMap<u32, HashSet<u32>>,
+    /// Names removed from each registry. A subsequent global event for a
+    /// removed name represents a new advertisement generation.
+    pub registry_global_removed: HashMap<u32, HashSet<u32>>,
+    pub registry_global_generations: HashMap<u32, HashMap<u32, u64>>,
+    /// Whether each registry's current advertisement for a name was visible
+    /// to the guest. This is kept per registry/generation so a delayed
+    /// global_remove for an old hidden/visible generation cannot be classified
+    /// using replacement metadata.
+    pub registry_global_visibility: HashMap<u32, HashMap<u32, bool>>,
+    pub global_generations: HashMap<u32, u64>,
+    pub next_global_generation: u64,
+    /// Globals that have been removed from the host registry. Keep their
+    /// metadata until every registry has observed the removal so a second
+    /// registry can still receive its own global_remove event, while blocking
+    /// new binds in the meantime.
+    pub removed_host_globals: HashSet<u32>,
     pub pending_params: HashMap<u32, Vec<PendingParam>>,
     pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     pub gpu_accel: bool,
@@ -419,6 +978,14 @@ pub struct Context {
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
     /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
     pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
+    /// Tracks wp_viewport objects back to their associated wl_surface so
+    /// destroying a viewport restores the default damage coordinate mapping.
+    pub viewport_to_wl_surface: HashMap<u32, u32>,
+    /// Clipboard transfer tasks own the VirtWL/read and client/write
+    /// descriptors until the transfer reaches EOF. Keep their join handles
+    /// with the connection so a client disconnect can cancel the transfer
+    /// instead of leaving a detached task and two open descriptors behind.
+    pub(crate) clipboard_pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Context {
@@ -458,18 +1025,32 @@ impl Context {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
             buffers: HashMap::new(),
+            retired_buffers: HashMap::new(),
+            submitted_buffers: HashSet::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),
             active_surface_for_seat: HashMap::new(),
+            keyboard_active_surfaces: HashMap::new(),
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
+            fatal_protocol_error: false,
             synthetic_keyboard_serial: 0,
             allocator,
             virtwayland_channel: None,
             host_dmabuf_id: None,
+            host_dmabuf_global_name: None,
             host_shm_id: None,
+            host_shm_global_name: None,
+            host_text_input_manager_v1_global_name: None,
+            host_text_input_extension_v1_global_name: None,
+            host_keyboard_extension_global_name: None,
+            host_zaura_shell_global_name: None,
+            host_shm_formats: HashSet::new(),
+            shm_guest_formats: HashMap::new(),
+            stale_shm_guest_objects: HashSet::new(),
+            stale_shm_pools: HashSet::new(),
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
@@ -480,21 +1061,49 @@ impl Context {
             keyboard_event_times: HashMap::new(),
             keyboard_ime_suppressed_keys: HashMap::new(),
             keyboard_forwarded_keys: HashMap::new(),
+            keyboard_keysym_forwarded_keys: HashMap::new(),
+            keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
+            hidden_host_globals: HashMap::new(),
+            registry_global_names: HashMap::new(),
+            registry_global_removed: HashMap::new(),
+            registry_global_generations: HashMap::new(),
+            registry_global_visibility: HashMap::new(),
+            global_generations: HashMap::new(),
+            next_global_generation: 1,
+            removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
             feedback_index_maps: HashMap::new(),
             gpu_accel,
             xdg_decoration,
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
-            vm_identifier: std::env::var("SOMMELIER_VM_IDENTIFIER")
-                .unwrap_or_else(|_| "termina".to_string()),
+            vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             wl_surface_to_zaura_surface: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
+            viewport_to_wl_surface: HashMap::new(),
+            clipboard_pumps: Vec::new(),
         }
+    }
+
+    /// Cancel clipboard pumps when the client connection is going away.
+    ///
+    /// The asynchronous caller should await this method so Tokio runs each
+    /// cancelled future's destructor and closes its owned descriptors.
+    pub(crate) async fn stop_clipboard_pumps(&mut self) {
+        let pumps = std::mem::take(&mut self.clipboard_pumps);
+        for pump in pumps {
+            pump.abort();
+            let _ = pump.await;
+        }
+    }
+
+    /// Remove completed transfer handles while retaining active pumps.
+    pub(crate) fn reap_clipboard_pumps(&mut self) {
+        self.clipboard_pumps.retain(|pump| !pump.is_finished());
     }
 
     /// Test-only constructor that overrides `SOMMELIER_ACCELERATORS` after construction.
@@ -506,17 +1115,68 @@ impl Context {
     /// ensuring tests always run against a known accelerator configuration
     /// regardless of the environment.
     #[cfg(test)]
-    pub fn new_for_test(gpu_accel: bool, xdg_decoration: bool, accelerators: Vec<crate::accelerator::Accelerator>) -> Self {
+    pub fn new_for_test(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        accelerators: Vec<crate::accelerator::Accelerator>,
+    ) -> Self {
         let mut ctx = Self::new(gpu_accel, xdg_decoration);
         ctx.accelerators = accelerators;
         ctx
     }
+}
 
+/// Resolve the VM namespace used in ChromeOS application IDs.
+///
+/// An exported-but-empty environment variable is equivalent to an unset one.
+/// This mirrors ChromiumOS Sommelier's `strlen(vm_id) != 0` fallback and keeps
+/// generated IDs valid (`org.chromium.guest_os.termina.wayland.<app-id>`).
+fn resolve_vm_identifier(value: Option<String>) -> String {
+    value
+        .filter(|identifier| !identifier.is_empty())
+        .unwrap_or_else(|| "termina".to_string())
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self::new(false, false)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    #[tokio::test]
+    async fn stop_clipboard_pumps_aborts_and_closes_owned_fds() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let read_fd = unsafe { libc::fcntl(pipe_fds[0], libc::F_DUPFD_CLOEXEC, 1000) };
+        let write_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1001) };
+        assert!(read_fd >= 1000);
+        assert!(write_fd >= 1001);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        let write_owned = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        let pump = tokio::spawn(async move {
+            let mut input = tokio::fs::File::from_std(std::fs::File::from(read_owned));
+            let mut output = tokio::fs::File::from_std(std::fs::File::from(write_owned));
+            let _ = tokio::io::copy(&mut input, &mut output).await;
+        });
+
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.clipboard_pumps.push(pump);
+        ctx.stop_clipboard_pumps().await;
+
+        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
+    }
 
     #[test]
     fn allocate_host_id_skips_zero_and_one_after_wrap() {
@@ -539,7 +1199,11 @@ mod tests {
         // The second allocation happens after the counter has wrapped to 2.
         // It must also return a valid ID and must not collide with id1.
         let id2 = table.allocate_host_id();
-        assert!(id2 >= 2, "post-wrap allocation must skip reserved IDs, got {}", id2);
+        assert!(
+            id2 >= 2,
+            "post-wrap allocation must skip reserved IDs, got {}",
+            id2
+        );
         assert_ne!(id1, id2, "successive allocations must return distinct IDs");
     }
 
@@ -557,7 +1221,11 @@ mod tests {
         let mut table = ShadowTable::new();
         table.next_host_id = 0;
         let id = table.allocate_host_id();
-        assert!(id >= 2, "post-zero allocation must skip reserved IDs, got {}", id);
+        assert!(
+            id >= 2,
+            "post-zero allocation must skip reserved IDs, got {}",
+            id
+        );
     }
 
     /// Regression: allocate_host_id must not re-issue IDs already registered in
@@ -578,10 +1246,232 @@ mod tests {
 
         // The allocator must skip 2 and 3 (in host_interfaces) and return 4.
         let id = table.allocate_host_id();
-        assert_eq!(id, 4, "allocator must skip IDs registered in host_interfaces, got {}", id);
+        assert_eq!(
+            id, 4,
+            "allocator must skip IDs registered in host_interfaces, got {}",
+            id
+        );
         assert!(
             !table.host_interfaces.contains_key(&id) || id == 4,
             "returned ID must not be in host_interfaces"
+        );
+    }
+
+    #[test]
+    fn allocate_host_id_skips_retired_host_interfaces() {
+        let mut table = ShadowTable::new();
+        table.retire_host_interface(2);
+        assert_eq!(
+            table.allocate_host_id(),
+            3,
+            "IDs whose host proxy has no destructor must remain reserved"
+        );
+    }
+
+    #[test]
+    fn host_generated_ids_reject_retired_host_interfaces() {
+        let mut table = ShadowTable::new();
+        table.retire_host_interface(2);
+        assert!(
+            !table.is_host_id_available(2),
+            "host-generated objects must not reuse retired proxy IDs"
+        );
+    }
+
+    #[test]
+    fn allocate_guest_server_id_uses_wayland_server_range_and_skips_reserved_ids() {
+        let mut table = ShadowTable::new();
+        let first = table.allocate_guest_server_id();
+        assert_eq!(first, ShadowTable::GUEST_SERVER_ID_START);
+
+        // Both normal mappings and interface-only registrations reserve guest
+        // IDs. A generated host event must not overwrite either one.
+        table.map_id(first, 200);
+        let second = table.allocate_guest_server_id();
+        table.track_interface(second, "wl_data_offer".to_string());
+        let third = table.allocate_guest_server_id();
+
+        assert_eq!(second, first + 1);
+        assert_eq!(third, first + 2);
+        assert!(third >= ShadowTable::GUEST_SERVER_ID_START);
+    }
+
+    #[test]
+    fn allocate_guest_server_id_wraps_inside_server_range() {
+        let mut table = ShadowTable::new();
+        table.next_guest_server_id = u32::MAX;
+
+        let last = table.allocate_guest_server_id();
+        let first = table.allocate_guest_server_id();
+
+        assert_eq!(last, u32::MAX);
+        assert_eq!(first, ShadowTable::GUEST_SERVER_ID_START);
+    }
+
+    #[test]
+    fn guest_id_availability_rejects_reserved_and_reused_ids() {
+        let mut table = ShadowTable::new();
+        assert!(!table.is_guest_id_available(0));
+        assert!(!table.is_guest_id_available(1));
+        assert!(table.is_guest_id_available(2));
+        assert!(!table.is_guest_id_available(ShadowTable::GUEST_SERVER_ID_START));
+
+        table.map_id(2, 20);
+        assert!(!table.is_guest_id_available(2));
+        table.remove_id(2);
+        table.track_interface(3, "wl_surface".to_string());
+        assert!(!table.is_guest_id_available(3));
+    }
+
+    #[test]
+    fn host_id_availability_rejects_reserved_and_reused_ids() {
+        let mut table = ShadowTable::new();
+        assert!(!table.is_host_id_available(0));
+        assert!(!table.is_host_id_available(1));
+        assert!(table.is_host_id_available(2));
+
+        table.map_id(20, 30);
+        assert!(!table.is_host_id_available(30));
+        table.track_host_interface(31, "wl_shm".to_string());
+        assert!(!table.is_host_id_available(31));
+    }
+
+    #[test]
+    fn event_sender_is_known_for_paired_and_internal_objects_only() {
+        let mut table = ShadowTable::new();
+        assert!(!table.is_event_sender_known(90));
+
+        table.map_id(10, 20);
+        assert!(table.is_event_sender_known(20));
+        assert!(!table.is_event_sender_known(10));
+
+        table.track_host_interface(30, "wl_shm".to_string());
+        assert!(table.is_event_sender_known(30));
+        assert!(!table.is_event_sender_known(31));
+    }
+
+    #[test]
+    fn local_only_guest_objects_are_explicitly_allowlisted() {
+        let mut table = ShadowTable::new();
+        table.track_interface(20, "wl_shm".to_string());
+        table.track_interface(21, "zwp_text_input_manager_v3".to_string());
+        table.track_interface(22, "wl_shm_pool".to_string());
+        table.track_interface(23, "wl_surface".to_string());
+
+        assert!(table.is_local_only_guest_object(20));
+        assert!(table.is_local_only_guest_object(21));
+        assert!(table.is_local_only_guest_object(22));
+        assert!(!table.is_local_only_guest_object(23));
+        assert!(!table.is_local_only_guest_object(24));
+    }
+
+    #[test]
+    fn object_versions_are_tracked_on_both_sides_of_a_mapping() {
+        let mut table = ShadowTable::new();
+        table.map_id(20, 30);
+        table.track_interface_with_version(20, "wl_surface".to_string(), 4);
+        table.set_host_version(30, 4);
+
+        assert_eq!(table.guest_object_version(20), Some(4));
+        assert_eq!(table.host_object_version(30), Some(4));
+        assert_eq!(table.guest_object_version(99), None);
+
+        table.remove_id(20);
+        assert_eq!(table.guest_object_version(20), None);
+        assert_eq!(table.host_object_version(30), None);
+    }
+
+    #[test]
+    fn map_id_replaces_an_existing_host_mapping_without_leaving_a_dangling_guest() {
+        let mut table = ShadowTable::new();
+        table.map_id(10, 20);
+        table.track_interface(10, "wl_surface".to_string());
+        table.map_id(11, 20);
+
+        assert_eq!(table.get_guest_id(20), Some(11));
+        assert_eq!(table.get_host_id(10), None);
+        assert_eq!(table.get_interface(10), None);
+        assert_eq!(table.get_host_id(11), Some(20));
+    }
+
+    #[test]
+    fn remove_guest_mapping_reserves_host_id_without_host_registration() {
+        let mut table = ShadowTable::new();
+        table.map_id(20, 40);
+        table.track_interface(20, "zwp_text_input_v3".to_string());
+
+        table.remove_guest_mapping(20);
+
+        assert_eq!(table.get_host_id(20), None);
+        assert_eq!(
+            table.get_host_interface(40),
+            Some(&"zwp_text_input_v3".to_string())
+        );
+        assert_ne!(
+            table.allocate_host_id(),
+            40,
+            "a host object without a guest destructor must stay reserved"
+        );
+    }
+
+    #[test]
+    fn retired_guest_object_keeps_host_event_interface_metadata() {
+        let mut table = ShadowTable::new();
+        table.map_id(20, 40);
+        table.track_interface_with_version(20, "wl_buffer".to_string(), 1);
+        table.set_host_version(40, 1);
+
+        table.retire_guest_object(20);
+
+        assert_eq!(table.get_interface(20), None);
+        assert_eq!(
+            table.get_host_interface(40),
+            Some(&"wl_buffer".to_string()),
+            "a delayed wl_buffer.release must still be dispatchable after guest destroy"
+        );
+        assert!(table.is_event_sender_known(40));
+        assert_eq!(table.host_object_version(40), Some(1));
+        assert!(table.is_pending_destroy_guest(20));
+    }
+
+    #[test]
+    fn host_only_destructor_reservation_survives_until_delete_id() {
+        let mut table = ShadowTable::new();
+        table.track_host_interface_with_version(40, "zcr_extended_keyboard_v1".to_string(), 2);
+
+        // The destroy request has been queued, but the host has not processed
+        // it yet. The dispatch metadata is retired immediately while the
+        // numeric ID remains unavailable for reuse.
+        table.mark_pending_destroy_host(40);
+        assert!(table.is_pending_destroy_host_only(40));
+        assert!(!table.is_event_sender_known(40));
+        table.next_host_id = 40;
+        assert_eq!(
+            table.allocate_host_id(),
+            41,
+            "pending host-only IDs must not be reallocated"
+        );
+
+        // The host acknowledgement is the only point at which the reservation
+        // can be released.
+        assert!(table.consume_host_delete_id(40));
+        assert!(!table.is_pending_destroy_host_only(40));
+        table.next_host_id = 40;
+        assert_eq!(
+            table.allocate_host_id(),
+            40,
+            "the acknowledged ID may be reused after delete_id"
+        );
+        assert!(!table.consume_host_delete_id(40));
+    }
+
+    #[test]
+    fn empty_or_missing_vm_identifier_defaults_to_termina() {
+        assert_eq!(resolve_vm_identifier(None), "termina");
+        assert_eq!(resolve_vm_identifier(Some(String::new())), "termina");
+        assert_eq!(
+            resolve_vm_identifier(Some("penguin".to_string())),
+            "penguin"
         );
     }
 
@@ -612,10 +1502,128 @@ mod tests {
             );
         }
     }
-}
 
-impl Default for Context {
-    fn default() -> Self {
-        Self::new(false, false)
+    #[test]
+    fn context_drop_closes_queued_and_pending_fds() {
+        let mut pipes = [[-1; 2]; 3];
+        for pipe in &mut pipes {
+            let result = unsafe { libc::pipe(pipe.as_mut_ptr()) };
+            assert_eq!(result, 0, "pipe should be created");
+        }
+        let read_fds: Vec<_> = pipes.iter().map(|pipe| pipe[0]).collect();
+        let queued_fd = pipes[0][1];
+        let duplicate_queued_fd = pipes[1][1];
+        let pending_fd = pipes[2][1];
+        let owned_targets = [queued_fd, duplicate_queued_fd, pending_fd]
+            .into_iter()
+            .map(|fd| {
+                fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .expect("owned test descriptor should have a procfs target")
+            })
+            .collect::<Vec<_>>();
+
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The same descriptor appearing in two queues is not a normal path,
+        // but Drop must remain safe if an error path leaves duplicated
+        // bookkeeping behind.
+        ctx.client_to_host_queue.push((Vec::new(), vec![queued_fd]));
+        ctx.host_to_client_queue
+            .push((Vec::new(), vec![queued_fd, duplicate_queued_fd]));
+        ctx.pending_params.insert(
+            7,
+            vec![PendingParam {
+                fd: pending_fd,
+                plane_idx: 0,
+                offset: 0,
+                stride: 4,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        drop(ctx);
+
+        for (fd, target) in [queued_fd, duplicate_queued_fd, pending_fd]
+            .into_iter()
+            .zip(owned_targets)
+        {
+            let current = fs::read_link(format!("/proc/self/fd/{fd}"));
+            assert!(
+                current.as_ref().map_or(true, |current| current != &target),
+                "Context::drop must release fd {} (current target: {:?})",
+                fd,
+                current
+            );
+        }
+        for fd in read_fds {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
+    #[test]
+    fn poisoned_pool_lock_still_unmaps_pool_memory_on_drop() {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0);
+        let page_size = page_size as usize;
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let pool = PoolState {
+            client_fd: pipe_fds[0],
+            inner: RwLock::new(PoolInner {
+                client_ptr: mapped,
+                size: page_size,
+            }),
+        };
+
+        // Poison the lock while retaining the mapping in its protected value.
+        // PoolState::drop must clean it up instead of treating the poisoned
+        // write lock as an empty pool.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool.inner.write().expect("lock should initially work");
+            panic!("intentional pool lock poison");
+        }));
+
+        let mut residency = 0u8;
+        assert_eq!(
+            unsafe { libc::mincore(mapped, page_size, &mut residency) },
+            0,
+            "mapping should still exist before PoolState::drop"
+        );
+
+        drop(pool);
+        unsafe {
+            libc::close(pipe_fds[1]);
+        }
+
+        errno_reset();
+        assert_eq!(
+            unsafe { libc::mincore(mapped, page_size, &mut residency) },
+            -1,
+            "PoolState::drop must unmap a poisoned pool"
+        );
+        assert_eq!(errno_value(), libc::ENOMEM);
+    }
+
+    fn errno_reset() {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+    }
+
+    fn errno_value() -> i32 {
+        unsafe { *libc::__errno_location() }
     }
 }

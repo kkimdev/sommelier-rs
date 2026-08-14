@@ -14,16 +14,161 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::display::queue_protocol_error;
+use crate::handler::shm::{record_host_shm_drm_format, WL_SHM_FORMAT_NV12};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::state::{Context, PendingParam};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::{IntoRawFd, RawFd};
 
 pub struct LinuxDmabufHandler;
+
+fn queue_message(
+    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
+    sender_id: u32,
+    opcode: u16,
+    builder: MessageBuilder,
+    fds: Vec<RawFd>,
+) -> bool {
+    match builder.try_build_message(sender_id, opcode) {
+        Ok(message) => {
+            queue.push((message, fds));
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Dropping oversized linux-dmabuf message sender={} opcode={}: {}",
+                sender_id,
+                opcode,
+                error
+            );
+            for fd in fds {
+                if fd >= 0 {
+                    let _ = nix::unistd::close(fd);
+                }
+            }
+            false
+        }
+    }
+}
+
+fn is_supported_drm_format(format: u32) -> bool {
+    // Keep this list in sync with ChromiumOS
+    // `sl_drm_format_is_supported()`. These are the formats for which the
+    // proxy can safely import/copy a single-plane buffer (plus NV12 for the
+    // host feedback protocol).
+    matches!(
+        format,
+        WL_SHM_FORMAT_NV12 // DRM_FORMAT_NV12
+            | 0x3631_4752 // DRM_FORMAT_RGB565
+            | 0x3432_5258 // DRM_FORMAT_XRGB8888
+            | 0x3432_5241 // DRM_FORMAT_ARGB8888
+            | 0x3432_4258 // DRM_FORMAT_XBGR8888
+            | 0x3432_4241 // DRM_FORMAT_ABGR8888
+    )
+}
+
+fn guest_device_bytes(ctx: &Context, host_device: &[u8]) -> Option<Vec<u8>> {
+    let dev_t_size = std::mem::size_of::<libc::dev_t>();
+    if host_device.len() != dev_t_size {
+        log::warn!(
+            "Rejecting malformed dmabuf device ID: {} bytes (expected {})",
+            host_device.len(),
+            dev_t_size
+        );
+        return None;
+    }
+
+    // ChromiumOS rewrites the host dev_t to the device backing the local GBM
+    // allocator. A fixed renderD128 dev_t breaks on systems where the render
+    // node has a different minor number, so derive it from the actual fd.
+    let Some(allocator) = ctx.allocator.as_ref() else {
+        return Some(host_device.to_vec());
+    };
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let fd = allocator.device.as_fd().as_raw_fd();
+    if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&stat.st_rdev as *const libc::dev_t).cast::<u8>(),
+                std::mem::size_of::<libc::dev_t>(),
+            )
+        };
+        return Some(bytes.to_vec());
+    }
+
+    log::warn!(
+        "Failed to stat GBM device fd {}: {}; dropping device feedback",
+        fd,
+        std::io::Error::last_os_error()
+    );
+    None
+}
+
+fn format_table_fd_can_map(fd: RawFd, size: usize) -> bool {
+    if fd < 0 {
+        return false;
+    }
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return false;
+    }
+
+    // memfd and regular files expose a useful length that can be checked
+    // before mmap. virtwl and other shared-memory providers are not regular
+    // files and commonly report st_size=0 (or no meaningful size at all);
+    // mmap is the authoritative validation for those descriptors.
+    let is_regular = (stat.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFREG;
+    !is_regular
+        || (stat.st_size >= 0
+            && u64::try_from(stat.st_size)
+                .ok()
+                .is_some_and(|file_size| file_size >= size as u64))
+}
+
+fn dmabuf_plane_layout(format: u32, plane_idx: u32, width: i32, height: i32) -> Option<(u64, u64)> {
+    let width = u64::try_from(width).ok()?;
+    let height = u64::try_from(height).ok()?;
+    match format {
+        WL_SHM_FORMAT_NV12 if width % 2 == 0 && height % 2 == 0 && plane_idx < 2 => {
+            Some((width, if plane_idx == 0 { height } else { height / 2 }))
+        }
+        0x3631_4752 if plane_idx == 0 => Some((width.checked_mul(2)?, height)),
+        0x3432_5258 | 0x3432_5241 | 0x3432_4258 | 0x3432_4241 if plane_idx == 0 => {
+            Some((width.checked_mul(4)?, height))
+        }
+        _ => None,
+    }
+}
+
+fn valid_dmabuf_plane(param: &PendingParam, format: u32, width: i32, height: i32) -> bool {
+    let Some((minimum_row_bytes, rows)) =
+        dmabuf_plane_layout(format, param.plane_idx, width, height)
+    else {
+        return false;
+    };
+    let stride = u64::from(param.stride);
+    if stride < minimum_row_bytes {
+        return false;
+    }
+
+    // The host compositor will evaluate offset + stride * (rows - 1) +
+    // minimum_row_bytes while importing the plane. Check the same arithmetic
+    // here so malformed metadata cannot wrap into a small in-bounds span.
+    let Some(last_row_offset) = stride.checked_mul(rows.saturating_sub(1)) else {
+        return false;
+    };
+    u64::from(param.offset)
+        .checked_add(last_row_offset)
+        .and_then(|end| end.checked_add(minimum_row_bytes))
+        .is_some()
+}
 
 impl LinuxDmabufHandler {
     fn process_params(
@@ -57,19 +202,85 @@ impl LinuxDmabufHandler {
                 builder.write_u32(p.modifier_hi);
                 builder.write_u32(p.modifier_lo);
 
-                let mut full_msg = Vec::new();
-                full_msg.extend_from_slice(&host_id.to_ne_bytes());
-                let len = (builder.payload.len() + 8) as u32;
-                let word2 = (len << 16) | (zwp_linux_buffer_params_v1::REQ_ADD as u32);
-                full_msg.extend_from_slice(&word2.to_ne_bytes());
-                full_msg.extend_from_slice(&builder.payload);
-
-                ctx.client_to_host_queue.push((full_msg, vec![p.fd]));
+                queue_message(
+                    &mut ctx.client_to_host_queue,
+                    host_id,
+                    zwp_linux_buffer_params_v1::REQ_ADD,
+                    builder,
+                    vec![p.fd],
+                );
             }
 
             // Send CREATE
             send_create(ctx, host_id);
         }
+    }
+
+    fn discard_pending_params(ctx: &mut Context, params_id: u32) {
+        if let Some(params) = ctx.pending_params.remove(&params_id) {
+            for param in params {
+                unsafe {
+                    libc::close(param.fd);
+                }
+            }
+        }
+    }
+
+    fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> bool {
+        if width <= 0 || height <= 0 || !is_supported_drm_format(format) {
+            return false;
+        }
+
+        let Some(params) = ctx.pending_params.get(&params_id) else {
+            return false;
+        };
+        let expected_planes: u32 = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 }; // DRM_FORMAT_NV12
+        if params.len() != expected_planes as usize {
+            return false;
+        }
+
+        let mut seen_planes = std::collections::HashSet::new();
+        params.iter().all(|param| {
+            param.fd >= 0
+                && param.plane_idx < expected_planes
+                && seen_planes.insert(param.plane_idx)
+                && valid_dmabuf_plane(param, format, width, height)
+        })
+    }
+
+    fn params_error_code(
+        ctx: &Context,
+        params_id: u32,
+        width: i32,
+        height: i32,
+        format: u32,
+    ) -> u32 {
+        if width <= 0 || height <= 0 {
+            return 5; // invalid_dimensions
+        }
+        if !is_supported_drm_format(format) {
+            return 4; // invalid_format
+        }
+        let expected_planes = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 };
+        let Some(params) = ctx.pending_params.get(&params_id) else {
+            return 3; // incomplete
+        };
+        if params.len() != expected_planes {
+            return 3; // incomplete
+        }
+        let mut seen = std::collections::HashSet::new();
+        for param in params {
+            if param.plane_idx >= expected_planes as u32 {
+                return 1; // plane_idx
+            }
+            if !seen.insert(param.plane_idx) {
+                return 2; // plane_set
+            }
+            if !valid_dmabuf_plane(param, format, width, height) {
+                return 6; // out_of_bounds
+            }
+        }
+        3
     }
 }
 
@@ -79,7 +290,16 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
-        ctx.pending_params.insert(params_id, Vec::new());
+        if let Some(previous) = ctx.pending_params.insert(params_id, Vec::new()) {
+            // Reusing a params ID is a protocol violation, but closing stale
+            // duplicated plane FDs here keeps the connection from leaking
+            // resources before the compositor reports the error.
+            for param in previous {
+                unsafe {
+                    libc::close(param.fd);
+                }
+            }
+        }
         Action::Forward
     }
 
@@ -92,10 +312,14 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 
     fn on_format(&mut self, ctx: &mut Context, format: u32) -> Action {
+        if !is_supported_drm_format(format) {
+            return Action::Drop;
+        }
         ctx.supported_formats.insert(format);
 
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
+                record_host_shm_drm_format(ctx, format);
                 return Action::Drop;
             }
         }
@@ -119,29 +343,19 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
             "Host advertises format: {:#010x}, modifier: {:#018x}",
             format, modifier
         );
-        // We forward all modifiers to the guest.
-        // We also track them, though this set is currently unused.
+        if !is_supported_drm_format(format) {
+            return Action::Drop;
+        }
+        // We forward supported modifiers to the guest. The modifier itself is
+        // intentionally preserved; LINEAR (0) is a valid modifier.
         ctx.supported_formats.insert(format);
 
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
+                record_host_shm_drm_format(ctx, format);
                 return Action::Drop;
             }
         }
-        // if format == 0x34324241 || format == 0x34324258 {
-        //     return Action::Drop;
-        // }
-        // if modifier == 0 || modifier == 0x00ffffffffffffff {
-        //     return Action::Drop;
-        // }
-
-        // Force linear buffers (0) or invalid (0x00ffffffffffffff) to avoid
-        // garbled output from mismatched host tiling and guest linear rendering.
-        // guest driver does not support complicated hw-specific tiling
-        // if modifier != 0 && modifier != 0x00ffffffffffffff {
-        //     return Action::Drop;
-        // }
-
         Action::Forward
     }
 }
@@ -153,20 +367,20 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             None => return Action::Drop,
         };
 
-        // Hardcoded dev_t for /dev/dri/renderD128
-        let dev_id_bytes: [u8; 8] = [0x80, 0xE2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let Some(dev_id_bytes) = guest_device_bytes(ctx, _device) else {
+            return Action::Drop;
+        };
 
         let mut builder = MessageBuilder::new();
         builder.write_array(&dev_id_bytes);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&guest_id.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.host_to_client_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.host_to_client_queue,
+            guest_id,
+            zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
+            builder,
+            Vec::new(),
+        );
         Action::Drop
     }
 
@@ -176,20 +390,20 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             None => return Action::Drop,
         };
 
-        // Hardcoded dev_t for /dev/dri/renderD128
-        let dev_id_bytes: [u8; 8] = [0x80, 0xE2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let Some(dev_id_bytes) = guest_device_bytes(ctx, _device) else {
+            return Action::Drop;
+        };
 
         let mut builder = MessageBuilder::new();
         builder.write_array(&dev_id_bytes);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&guest_id.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.host_to_client_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.host_to_client_queue,
+            guest_id,
+            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
+            builder,
+            Vec::new(),
+        );
         Action::Drop
     }
 
@@ -198,13 +412,52 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             Some(id) => id,
             None => return Action::Drop,
         };
+        // A feedback object may resend its table. Do not let tranche events
+        // from the new sequence use indices from an older table if rewriting
+        // this one fails.
+        ctx.feedback_index_maps.remove(&guest_id);
 
+        if fd < 0 {
+            log::warn!("Rejecting dmabuf format table with invalid fd {}", fd);
+            return Action::Drop;
+        }
+
+        if size == 0 || !size.is_multiple_of(16) {
+            log::warn!("Rejecting malformed dmabuf format table size {}", size);
+            return Action::Drop;
+        }
+
+        let entry_count = (size / 16) as usize;
+        // Tranche indices are uint16 values. Refuse a table whose entries
+        // cannot be represented without wrapping an index during rewriting.
+        if entry_count > usize::from(u16::MAX) + 1 {
+            log::warn!(
+                "Rejecting dmabuf format table with too many entries: {}",
+                entry_count
+            );
+            return Action::Drop;
+        }
+
+        if !format_table_fd_can_map(fd, size as usize) {
+            log::warn!(
+                "Rejecting dmabuf format table fd {} that cannot provide {} bytes",
+                fd,
+                size
+            );
+            return Action::Drop;
+        }
+
+        // The protocol requires clients to map the table read-only/private.
+        // Keep the host table byte-for-byte intact: duplicate entries are
+        // meaningful because tranche indices can use them to express
+        // different preferences. Only the tranche index stream is filtered
+        // below, just like ChromiumOS Sommelier.
         let host_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 size as usize,
                 libc::PROT_READ,
-                libc::MAP_SHARED,
+                libc::MAP_PRIVATE,
                 fd,
                 0,
             )
@@ -214,95 +467,51 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             return Action::Drop;
         }
 
-        let entry_count = (size / 16) as usize;
         let host_entries =
             unsafe { std::slice::from_raw_parts(host_ptr as *const u32, entry_count * 4) };
 
-        let mut filtered_entries: Vec<u32> = Vec::new();
         let mut index_map = std::collections::HashMap::new();
-
-        let mut get_or_insert = |format: u32, mod_hi: u32, mod_lo: u32| -> u16 {
-            for (i, chunk) in filtered_entries.chunks(4).enumerate() {
-                if chunk[0] == format && chunk[2] == mod_hi && chunk[3] == mod_lo {
-                    return i as u16;
-                }
-            }
-            let idx = (filtered_entries.len() / 4) as u16;
-            filtered_entries.push(format);
-            filtered_entries.push(0);
-            filtered_entries.push(mod_hi);
-            filtered_entries.push(mod_lo);
-            idx
-        };
 
         for i in 0..entry_count {
             let format = host_entries[i * 4];
-            let mod_hi = host_entries[i * 4 + 2];
-            let mod_lo = host_entries[i * 4 + 3];
 
-            // // Hide AB24 (RGBA8888) and XB24 (RGBX8888) to prevent Chromium panics,
-            // // forcing it to fall back to AR24 (BGRA_8888).
-            // if format == 0x34324241 || format == 0x34324258 {
-            //     continue; // Skips adding to index_map, effectively dropping it from tranches
-            // }
-            let modifier: u64 = (mod_hi as u64) << 32 | mod_lo as u64;
-            // if modifier != 0 && modifier != 0x00ffffffffffffff {
-            //     continue;
-            // }
-
-            if modifier == 0 {
+            if !is_supported_drm_format(format) {
                 continue;
             }
-
-            // KEEP the host's true modifier! Do NOT force linear.
-            // This allows Chrome to see Tiled modifiers and successfully
-            // allocate buffers with the Texturing usage flag.
-            let new_idx = get_or_insert(format, mod_hi, mod_lo);
-
-            // Map the host's format index to our new index
-            index_map.insert(i as u16, new_idx);
+            // Preserve the host's original index, including duplicate
+            // format+modifier entries. Re-indexing or deduplicating changes
+            // the preference semantics of a tranche.
+            index_map.insert(i as u16, i as u16);
         }
         unsafe {
             libc::munmap(host_ptr, size as usize);
         }
-        ctx.feedback_index_maps.insert(guest_id, index_map);
-
-        let memfd_name = std::ffi::CString::new("sommelier-format-table").unwrap();
-        let new_fd = unsafe { libc::memfd_create(memfd_name.as_ptr(), libc::MFD_CLOEXEC) };
-        if new_fd < 0 {
-            return Action::Drop;
-        }
-
-        let new_size = (filtered_entries.len() * 4) as u32;
-        unsafe {
-            libc::ftruncate(new_fd, new_size as i64);
-            let new_ptr = libc::mmap(
-                std::ptr::null_mut(),
-                new_size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                new_fd,
-                0,
-            );
-            std::ptr::copy_nonoverlapping(
-                filtered_entries.as_ptr(),
-                new_ptr as *mut u32,
-                filtered_entries.len(),
-            );
-            libc::munmap(new_ptr, new_size as usize);
-        }
+        let new_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
+            Ok(fd) => fd.into_raw_fd(),
+            Err(error) => {
+                log::warn!(
+                    "Failed to duplicate dmabuf format table fd {}: {}",
+                    fd,
+                    error
+                );
+                return Action::Drop;
+            }
+        };
+        let new_size = size;
 
         let mut builder = MessageBuilder::new();
         builder.write_u32(new_size);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&guest_id.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.host_to_client_queue.push((full_msg, vec![new_fd]));
+        ctx.feedback_index_maps.insert(guest_id, index_map);
+        if !queue_message(
+            &mut ctx.host_to_client_queue,
+            guest_id,
+            zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
+            builder,
+            vec![new_fd],
+        ) {
+            ctx.feedback_index_maps.remove(&guest_id);
+        }
 
         Action::Drop
     }
@@ -318,6 +527,14 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             None => return Action::Drop,
         };
 
+        if !indices.len().is_multiple_of(2) {
+            log::warn!(
+                "Rejecting malformed dmabuf tranche format indices with odd length {}",
+                indices.len()
+            );
+            return Action::Drop;
+        }
+
         let mut new_indices = Vec::new();
         for i in 0..(indices.len() / 2) {
             let idx = u16::from_ne_bytes([indices[i * 2], indices[i * 2 + 1]]);
@@ -329,16 +546,25 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         let mut builder = MessageBuilder::new();
         builder.write_array(&new_indices);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&guest_id.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.host_to_client_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.host_to_client_queue,
+            guest_id,
+            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
+            builder,
+            Vec::new(),
+        );
 
         Action::Drop
+    }
+
+    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+        // This is a client→host request, so last_sender_id is the guest
+        // feedback ID. Looking it up as a host ID leaves the index map alive
+        // until the connection is torn down and can corrupt a later feedback
+        // object that reuses the ID.
+        let guest_id = ctx.last_sender_id;
+        ctx.feedback_index_maps.remove(&guest_id);
+        Action::Forward
     }
 }
 
@@ -363,6 +589,25 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         modifier_hi: u32,
         modifier_lo: u32,
     ) -> Action {
+        if fd < 0 {
+            error!("Ignoring dmabuf add with invalid fd {}", fd);
+            return Action::Drop;
+        }
+
+        let params_id = ctx.last_sender_id;
+        if plane_idx > 1 {
+            queue_protocol_error(ctx, params_id, 1, "dmabuf plane index out of bounds");
+            return Action::Drop;
+        }
+        if ctx
+            .pending_params
+            .get(&params_id)
+            .is_some_and(|params| params.iter().any(|param| param.plane_idx == plane_idx))
+        {
+            queue_protocol_error(ctx, params_id, 2, "dmabuf plane was already set");
+            return Action::Drop;
+        }
+
         let dup_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
             Ok(d) => d.into_raw_fd(),
             Err(e) => {
@@ -371,24 +616,28 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             }
         };
 
-        let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
-
-        // --- DEBUG PRINT ---
-        let format_hex = format!("{:x}", modifier);
-        let mod_str = if modifier == 0 {
-            "LINEAR".to_string()
-        } else if modifier == 0x00ffffffffffffff {
-            "INVALID (Implicit)".to_string()
+        // ChromiumOS fixes up plane-0 metadata for classic virtio-gpu PRIME
+        // resources. The guest may have supplied an implicit modifier or a
+        // shadow-buffer stride that differs from the host resource layout.
+        // Querying the local DRM device before buffering the duplicate keeps
+        // the forwarded ADD request importable by the host compositor while
+        // leaving non-virtio and unsupported-kernel paths unchanged.
+        let (stride, modifier_hi, modifier_lo) = if plane_idx == 0 {
+            if let Some(allocator) = ctx.allocator.as_ref() {
+                let guest_modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+                let fixup = allocator.fixup_dmabuf_plane0(fd, stride, guest_modifier);
+                (
+                    fixup.stride,
+                    (fixup.modifier >> 32) as u32,
+                    fixup.modifier as u32,
+                )
+            } else {
+                (stride, modifier_hi, modifier_lo)
+            }
         } else {
-            format!("EXPLICIT (0x{})", format_hex)
+            (stride, modifier_hi, modifier_lo)
         };
 
-        eprintln!(
-            "[PROXY] Client creating buffer -> Plane: {}, Stride: {}, Modifier: {}",
-            plane_idx, stride, mod_str
-        );
-
-        let params_id = ctx.last_sender_id;
         if let Some(list) = ctx.pending_params.get_mut(&params_id) {
             list.push(PendingParam {
                 fd: dup_fd,
@@ -416,29 +665,38 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         format: u32,
         flags: u32,
     ) -> Action {
-        self.process_params(
-            ctx,
-            ctx.last_sender_id,
-            width,
-            height,
-            format,
-            |ctx, host_id| {
-                let mut builder = MessageBuilder::new();
-                builder.write_i32(width);
-                builder.write_i32(height);
-                builder.write_u32(format);
-                builder.write_u32(flags);
+        let params_id = ctx.last_sender_id;
+        if !Self::valid_params(ctx, params_id, width, height, format) {
+            error!(
+                "Rejecting invalid dmabuf create: params={}, width={}, height={}, format={:#010x}",
+                params_id, width, height, format
+            );
+            let code = Self::params_error_code(ctx, params_id, width, height, format);
+            queue_protocol_error(
+                ctx,
+                params_id,
+                code,
+                "invalid linux-dmabuf buffer parameters",
+            );
+            Self::discard_pending_params(ctx, params_id);
+            return Action::Drop;
+        }
 
-                let mut full_msg = Vec::new();
-                full_msg.extend_from_slice(&host_id.to_ne_bytes());
-                let len = (builder.payload.len() + 8) as u32;
-                let word2 = (len << 16) | (zwp_linux_buffer_params_v1::REQ_CREATE as u32);
-                full_msg.extend_from_slice(&word2.to_ne_bytes());
-                full_msg.extend_from_slice(&builder.payload);
+        self.process_params(ctx, params_id, width, height, format, |ctx, host_id| {
+            let mut builder = MessageBuilder::new();
+            builder.write_i32(width);
+            builder.write_i32(height);
+            builder.write_u32(format);
+            builder.write_u32(flags);
 
-                ctx.client_to_host_queue.push((full_msg, Vec::new()));
-            },
-        );
+            queue_message(
+                &mut ctx.client_to_host_queue,
+                host_id,
+                zwp_linux_buffer_params_v1::REQ_CREATE,
+                builder,
+                Vec::new(),
+            );
+        });
         Action::Drop
     }
 
@@ -451,38 +709,427 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         format: u32,
         flags: u32,
     ) -> Action {
+        let params_id = ctx.last_sender_id;
+        // A params object is tracked as soon as create_params is decoded. If
+        // it is absent here, do not allocate/map a host wl_buffer: doing so
+        // leaves a dangling guest→host mapping even though no create request
+        // can be sent to the compositor.
+        if !ctx.pending_params.contains_key(&params_id) {
+            error!(
+                "Ignoring create_immed for untracked buffer params {}",
+                params_id
+            );
+            return Action::Drop;
+        }
+        if ctx.shadow_table.get_host_id(params_id).is_none() {
+            // Consume and close any duplicated plane FDs, but do not create a
+            // guest buffer mapping when the params object itself has no host
+            // counterpart.
+            self.process_params(ctx, params_id, width, height, format, |_, _| {});
+            return Action::Drop;
+        }
+        if !Self::valid_params(ctx, params_id, width, height, format) {
+            error!(
+                "Rejecting invalid dmabuf create_immed: params={}, width={}, height={}, format={:#010x}",
+                params_id, width, height, format
+            );
+            let code = Self::params_error_code(ctx, params_id, width, height, format);
+            queue_protocol_error(
+                ctx,
+                params_id,
+                code,
+                "invalid linux-dmabuf buffer parameters",
+            );
+            Self::discard_pending_params(ctx, params_id);
+            return Action::Drop;
+        }
+
         // We need to map buffer_id manually because we are dropping the request.
         // Codegen would map it if we forwarded.
         // buffer_id is new_id wl_buffer.
         let host_buffer_id = ctx.shadow_table.allocate_host_id();
+        let buffer_version = ctx
+            .shadow_table
+            .guest_object_version(params_id)
+            .unwrap_or(u32::MAX);
         ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface(buffer_id, "wl_buffer".to_string());
-
-        self.process_params(
-            ctx,
-            ctx.last_sender_id,
-            width,
-            height,
-            format,
-            |ctx, host_id| {
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(host_buffer_id);
-                builder.write_i32(width);
-                builder.write_i32(height);
-                builder.write_u32(format);
-                builder.write_u32(flags);
-
-                let mut full_msg = Vec::new();
-                full_msg.extend_from_slice(&host_id.to_ne_bytes());
-                let len = (builder.payload.len() + 8) as u32;
-                let word2 = (len << 16) | (zwp_linux_buffer_params_v1::REQ_CREATE_IMMED as u32);
-                full_msg.extend_from_slice(&word2.to_ne_bytes());
-                full_msg.extend_from_slice(&builder.payload);
-
-                ctx.client_to_host_queue.push((full_msg, Vec::new()));
-            },
+        ctx.shadow_table.track_interface_with_version(
+            buffer_id,
+            "wl_buffer".to_string(),
+            buffer_version,
         );
+        ctx.shadow_table
+            .set_host_version(host_buffer_id, buffer_version);
+
+        self.process_params(ctx, params_id, width, height, format, |ctx, host_id| {
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(host_buffer_id);
+            builder.write_i32(width);
+            builder.write_i32(height);
+            builder.write_u32(format);
+            builder.write_u32(flags);
+
+            queue_message(
+                &mut ctx.client_to_host_queue,
+                host_id,
+                zwp_linux_buffer_params_v1::REQ_CREATE_IMMED,
+                builder,
+                Vec::new(),
+            );
+        });
         Action::Drop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        format_table_fd_can_map, guest_device_bytes, is_supported_drm_format, LinuxDmabufHandler,
+    };
+    use crate::handler::shm::WL_SHM_FORMAT_NV12;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
+    use crate::state::{Context, PendingParam};
+    use crate::wire::Action;
+
+    #[test]
+    fn forwards_device_id_when_no_local_allocator_exists() {
+        let mut ctx = Context::new(false, false);
+        ctx.allocator = None;
+        let host_device = vec![1; std::mem::size_of::<libc::dev_t>()];
+        assert_eq!(guest_device_bytes(&ctx, &host_device), Some(host_device));
+    }
+
+    #[test]
+    fn rejects_malformed_device_id_before_forwarding() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.allocator = None;
+        let host_device = vec![1; std::mem::size_of::<libc::dev_t>() - 1];
+        assert_eq!(guest_device_bytes(&ctx, &host_device), None);
+
+        ctx.shadow_table.map_id(10, 20);
+        ctx.last_sender_id = 20;
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            ZwpLinuxDmabufFeedbackV1Handler::on_main_device(&mut handler, &mut ctx, &host_device,),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "malformed device IDs must not produce a guest event"
+        );
+    }
+
+    #[test]
+    fn supported_formats_match_chromiumos_format_table() {
+        assert!(is_supported_drm_format(WL_SHM_FORMAT_NV12)); // NV12
+        assert!(is_supported_drm_format(0x3631_4752)); // RGB565
+        assert!(is_supported_drm_format(0x3432_5258)); // XRGB8888
+        assert!(is_supported_drm_format(0x3432_5241)); // ARGB8888
+        assert!(is_supported_drm_format(0x3432_4258)); // XBGR8888
+        assert!(is_supported_drm_format(0x3432_4241)); // ABGR8888
+        assert!(!is_supported_drm_format(0xdead_beef));
+    }
+
+    #[test]
+    fn create_immed_without_tracked_params_does_not_map_buffer() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(7, 8);
+        ctx.last_sender_id = 7;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create_immed(&mut ctx, 90, 16, 16, 0x3432_5258, 0),
+            Action::Drop
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(90), None);
+        assert!(ctx.client_to_host_queue.is_empty());
+    }
+
+    #[test]
+    fn feedback_destroy_removes_format_index_mapping() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(10, 20);
+        ctx.feedback_index_maps
+            .insert(10, std::collections::HashMap::new());
+        // destroy is a guest request, therefore last_sender_id is the guest
+        // ID rather than the host ID.
+        ctx.last_sender_id = 10;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            ZwpLinuxDmabufFeedbackV1Handler::on_destroy(&mut handler, &mut ctx),
+            Action::Forward
+        );
+        assert!(!ctx.feedback_index_maps.contains_key(&10));
+    }
+
+    #[test]
+    fn invalid_dmabuf_fd_is_rejected_before_borrowing() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(7, Vec::new());
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(handler.on_add(&mut ctx, -1, 0, 0, 4, 0, 0), Action::Drop);
+        assert!(ctx.pending_params[&7].is_empty());
+    }
+
+    #[test]
+    fn invalid_plane_requests_queue_declared_protocol_errors() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(7, Vec::new());
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(
+            handler.on_add(&mut ctx, pipe_fds[1], 2, 0, 64, 0, 0),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            1
+        );
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let mut first_pipe = [-1; 2];
+        let mut second_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(
+            7,
+            vec![PendingParam {
+                fd: first_pipe[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_add(&mut ctx, second_pipe[1], 0, 4096, 64, 0, 0),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            2
+        );
+        unsafe {
+            libc::close(first_pipe[0]);
+            libc::close(first_pipe[1]);
+            libc::close(second_pipe[0]);
+            libc::close(second_pipe[1]);
+        }
+    }
+
+    #[test]
+    fn invalid_dmabuf_create_queues_dimensions_error() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(
+            7,
+            vec![PendingParam {
+                fd: pipe_fds[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create(&mut ctx, 0, 16, 0x3432_5258, 0),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            5
+        );
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn dmabuf_params_require_unique_planes_for_the_format() {
+        let mut first_pipe = [-1; 2];
+        let mut second_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(
+            7,
+            vec![
+                PendingParam {
+                    fd: first_pipe[1],
+                    plane_idx: 0,
+                    offset: 0,
+                    stride: 64,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+                PendingParam {
+                    fd: second_pipe[1],
+                    plane_idx: 0,
+                    offset: 4096,
+                    stride: 64,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+            ],
+        );
+        assert!(!LinuxDmabufHandler::valid_params(
+            &ctx,
+            7,
+            16,
+            16,
+            0x3432_5258
+        ));
+        drop(ctx);
+        unsafe {
+            libc::close(first_pipe[0]);
+            libc::close(second_pipe[0]);
+        }
+    }
+
+    #[test]
+    fn dmabuf_params_reject_stride_that_cannot_cover_one_row() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(
+            7,
+            vec![PendingParam {
+                fd: pipe_fds[1],
+                plane_idx: 0,
+                offset: 0,
+                // XRGB8888 needs four bytes per pixel.
+                stride: 4 * 3,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+
+        assert!(
+            !LinuxDmabufHandler::valid_params(&ctx, 7, 4, 4, 0x3432_5258),
+            "a dmabuf stride shorter than width × bytes-per-pixel must be rejected"
+        );
+        drop(ctx);
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn odd_tranche_index_array_is_rejected() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(10, 20);
+        ctx.feedback_index_maps
+            .insert(10, std::collections::HashMap::new());
+        ctx.last_sender_id = 20;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(handler.on_tranche_formats(&mut ctx, &[0]), Action::Drop);
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn non_regular_format_table_fds_are_validated_by_mmap() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+
+        // virtwl-backed descriptors do not expose a regular-file size. They
+        // must reach mmap rather than being rejected solely because st_size is
+        // zero. A pipe cannot actually be mapped, but this helper deliberately
+        // leaves that final check to mmap.
+        assert!(format_table_fd_can_map(pipe_fds[0], 4096));
+
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+
+    #[test]
+    fn format_table_rewrite_keeps_wayland_entry_width_and_modifier() {
+        let name = std::ffi::CString::new("sommelier-format-table-input").unwrap();
+        let input_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(input_fd >= 0);
+
+        // Each linux-dmabuf feedback entry is exactly four native-endian
+        // u32 words: format, padding, modifier_hi, modifier_lo. Include an
+        // unsupported entry and a duplicate supported entry to exercise both
+        // filtering and index de-duplication.
+        let entries = [
+            0x3432_5258u32,
+            0,
+            0x1122_3344,
+            0x5566_7788,
+            0xdead_beefu32,
+            0,
+            0,
+            0,
+            0x3432_5258u32,
+            0,
+            0x1122_3344,
+            0x5566_7788,
+        ];
+        let bytes: Vec<u8> = entries.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        assert_eq!(unsafe { libc::ftruncate(input_fd, bytes.len() as i64) }, 0);
+        assert_eq!(
+            unsafe { libc::pwrite(input_fd, bytes.as_ptr().cast(), bytes.len(), 0,) },
+            bytes.len() as isize
+        );
+
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(10, 20);
+        ctx.last_sender_id = 20;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(
+            handler.on_format_table(&mut ctx, input_fd, bytes.len() as u32),
+            Action::Drop
+        );
+        unsafe {
+            libc::close(input_fd);
+        }
+
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        let rewritten_fd = ctx.host_to_client_queue[0].1[0];
+        let mut rewritten = [0u8; 48];
+        assert_eq!(
+            unsafe {
+                libc::pread(
+                    rewritten_fd,
+                    rewritten.as_mut_ptr().cast(),
+                    rewritten.len(),
+                    0,
+                )
+            },
+            rewritten.len() as isize
+        );
+        let words: Vec<u32> = rewritten
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, entries);
+        assert_eq!(ctx.feedback_index_maps[&10].get(&0), Some(&0));
+        assert_eq!(ctx.feedback_index_maps[&10].get(&2), Some(&2));
+        assert!(!ctx.feedback_index_maps[&10].contains_key(&1));
     }
 }

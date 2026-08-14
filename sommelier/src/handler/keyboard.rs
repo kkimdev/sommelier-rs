@@ -32,8 +32,12 @@ use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
 
 /// `wl_keyboard.key` state values (Wayland spec §wl_keyboard.key).
-const WL_KEY_PRESSED: u32 = 1;
-const WL_KEY_RELEASED: u32 = 0;
+pub(crate) const WL_KEY_PRESSED: u32 = 1;
+pub(crate) const WL_KEY_RELEASED: u32 = 0;
+/// Since wl_keyboard version 10, compositors may emit repeated instead of
+/// pressed for compositor-driven key repetition. It has the same physical
+/// state as pressed but remains a distinct event on the wire.
+pub(crate) const WL_KEY_REPEATED: u32 = 2;
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
 pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
@@ -58,7 +62,7 @@ const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
 const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
 const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
 
-/// A read-only view of a shared-memory fd mapped into the process address space.
+/// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
 /// - `from_fd`: calls `mmap(MAP_PRIVATE, PROT_READ)` and stores the pointer + length.
@@ -81,6 +85,13 @@ impl MmapView {
         use nix::sys::stat::{fstat, SFlag};
         use std::os::unix::io::BorrowedFd;
 
+        // `BorrowedFd::borrow_raw` requires a valid non-negative descriptor.
+        // Check before constructing it so malformed protocol input cannot
+        // create an invalid borrowed lifetime or reach fstat/mmap with -1.
+        if fd < 0 {
+            log::error!("on_keymap: rejecting negative fd={}", fd);
+            return None;
+        }
         let nonzero_len = std::num::NonZeroUsize::new(len)?;
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let (file_size, file_mode) = match fstat(borrowed) {
@@ -91,9 +102,7 @@ impl MmapView {
             }
         };
         let is_regular_file = SFlag::from_bits_truncate(file_mode).contains(SFlag::S_IFREG);
-        if file_size < 0
-            || (is_regular_file && u64::try_from(file_size).ok()? < len as u64)
-        {
+        if file_size < 0 || (is_regular_file && u64::try_from(file_size).ok()? < len as u64) {
             log::error!(
                 "on_keymap: fd={} ({:?}) is shorter than keymap size (mode={:#o}, fd_size={}, requested={})",
                 fd,
@@ -111,6 +120,9 @@ impl MmapView {
                 None,
                 nonzero_len,
                 ProtFlags::PROT_READ,
+                // Wayland requires keymap files to be mapped privately.
+                // This also prevents a writable shared backing object from
+                // changing the keymap while XKB is parsing it.
                 MapFlags::MAP_PRIVATE,
                 borrowed,
                 0,
@@ -137,7 +149,11 @@ impl Drop for MmapView {
         // catches any future copy-paste of this code into a context where
         // that invariant might not hold.
         let res = unsafe { nix::sys::mman::munmap(self.ptr, self.len) };
-        debug_assert!(res.is_ok(), "munmap on a valid mmap mapping must not fail: {:?}", res);
+        debug_assert!(
+            res.is_ok(),
+            "munmap on a valid mmap mapping must not fail: {:?}",
+            res
+        );
     }
 }
 
@@ -169,28 +185,6 @@ pub struct KeyboardHandler {
     _not_sync: std::marker::PhantomData<*mut ()>,
 }
 
-// # Safety
-//
-// `xkb::Context`, `Keymap`, and `State` are not `Send`. `KeyboardHandler`
-// is only ever accessed from the single Tokio task that owns the `Client`;
-// Tokio requires `Send` for spawned futures, so we satisfy it manually.
-//
-// INVARIANT: This `Send` impl is valid ONLY because:
-//   1. `KeyboardHandler` is exclusively owned by one `Client` task.
-//   2. `Client` tasks are never migrated across OS threads. This is guaranteed
-//      by `#[tokio::main(flavor = "current_thread")]` in main.rs, which runs
-//      the entire async runtime on a single OS thread. See the SAFETY INVARIANT
-//      comment above that attribute in main.rs for the rationale.
-//   3. `Sync` is statically inhibited via `PhantomData<*mut ()>`, so no
-//      shared reference (`&KeyboardHandler`) can be sent across threads.
-//
-// *** AUDIT REQUIRED if any of the following changes: ***
-//   - The Tokio executor type in main.rs (the flavor MUST remain
-//     "current_thread"; switching to "multi_thread" makes this impl unsound)
-//   - The handler lifecycle (e.g., storing it in an Arc)
-//   - The field list of KeyboardHandler (e.g., adding a raw pointer)
-unsafe impl Send for KeyboardHandler {}
-
 impl KeyboardHandler {
     pub fn new() -> Self {
         Self {
@@ -215,6 +209,7 @@ impl KeyboardHandler {
         ctx.keyboard_event_times.remove(&host_keyboard_id);
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
         ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
+        ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
     }
 
     fn take_ime_suppressed_key_release(
@@ -236,7 +231,7 @@ impl KeyboardHandler {
         suppressed
     }
 
-    fn update_host_keyboard_key_state(
+    pub(crate) fn update_host_keyboard_key_state(
         ctx: &mut Context,
         host_keyboard_id: HostId,
         time: u32,
@@ -249,7 +244,7 @@ impl KeyboardHandler {
             .entry(host_keyboard_id)
             .or_default();
         match state {
-            WL_KEY_PRESSED => {
+            WL_KEY_PRESSED | WL_KEY_REPEATED => {
                 pressed_keys.insert(key);
             }
             WL_KEY_RELEASED => {
@@ -297,6 +292,8 @@ impl KeyboardHandler {
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
+        ctx.keyboard_event_times.remove(&host_keyboard_id);
+        ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
         if pressed_keys.is_empty() {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
             ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
@@ -322,7 +319,11 @@ impl KeyboardHandler {
         };
         let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
 
-        let xkb_keycode = xkb::Keycode::new(key + 8);
+        let Some(xkb_raw_keycode) = key.checked_add(8) else {
+            log::warn!("Ignoring overflowing evdev keycode {}", key);
+            return false;
+        };
+        let xkb_keycode = xkb::Keycode::new(xkb_raw_keycode);
         // Use key_get_one_sym so that the full XKB state (including active shift
         // level) is considered. key_get_syms_by_level at level 0 would always
         // return the unshifted symbol, causing <Shift>-modified accelerators to
@@ -368,6 +369,41 @@ impl KeyboardHandler {
         self.dropped_keys.remove(&host_keyboard_id);
     }
 
+    fn clear_host_keyboard_keymap_and_state(
+        &mut self,
+        ctx: &mut Context,
+        host_keyboard_id: HostId,
+    ) {
+        self.clear_host_keyboard_keymap(host_keyboard_id);
+        ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
+        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+    }
+
+    fn keysym_to_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::HashMap<u32, u32> {
+        let mut keycodes = std::collections::HashMap::new();
+        for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
+            if keycode_raw < 8 {
+                // XKB keycodes are evdev keycodes plus eight. Do not
+                // underflow on malformed/custom keymaps.
+                continue;
+            }
+            let keycode = xkb::Keycode::new(keycode_raw);
+            let layout_count = keymap.num_layouts_for_key(keycode);
+            for layout in 0..layout_count {
+                let level_count = keymap.num_levels_for_key(keycode, layout);
+                for level in 0..level_count {
+                    for keysym in keymap.key_get_syms_by_level(keycode, layout, level) {
+                        // A keysym event carries the effective symbol, which
+                        // may be shifted or from an alternate layout. Keep
+                        // the lowest physical keycode for aliases.
+                        keycodes.entry(keysym.raw()).or_insert(keycode_raw - 8);
+                    }
+                }
+            }
+        }
+        keycodes
+    }
+
     /// Ensure the `zcr_extended_keyboard_v1` object is bound for this keyboard.
     ///
     /// This is idempotent: if the extended keyboard is already bound for
@@ -390,14 +426,24 @@ impl KeyboardHandler {
     /// those keys. This mirrors the behavior of the C sommelier reference.
     pub(crate) fn ensure_extended_keyboard_bound(ctx: &mut Context, host_keyboard_id: HostId) {
         if let Some(extension_host_id) = ctx.host_keyboard_extension_id {
-            if !ctx.keyboard_to_extended_keyboard.contains_key(&host_keyboard_id) {
+            if !ctx
+                .keyboard_to_extended_keyboard
+                .contains_key(&host_keyboard_id)
+            {
                 let host_extended_id = HostId::from_allocated(ctx.shadow_table.allocate_host_id());
                 ctx.keyboard_to_extended_keyboard
                     .insert(host_keyboard_id, host_extended_id);
                 ctx.extended_keyboard_to_keyboard
                     .insert(host_extended_id, host_keyboard_id);
-                ctx.shadow_table
-                    .track_host_interface(host_extended_id.0, "zcr_extended_keyboard_v1".to_string());
+                let extended_version = ctx
+                    .shadow_table
+                    .host_object_version(extension_host_id.0)
+                    .unwrap_or(u32::MAX);
+                ctx.shadow_table.track_host_interface_with_version(
+                    host_extended_id.0,
+                    "zcr_extended_keyboard_v1".to_string(),
+                    extended_version,
+                );
 
                 // zcr_keyboard_extension_v1.get_extended_keyboard(new_id, keyboard)
                 // payload = [new_id(4)][keyboard(4)] = 8 bytes.
@@ -420,17 +466,15 @@ impl KeyboardHandler {
 
     /// Send zcr_extended_keyboard_v1.ack_key to the host.
     ///
-    /// If the protocol is available (`host_keyboard_extension_id` is set) but the
-    /// extended keyboard hasn't been bound for this keyboard ID yet, that indicates
-    /// a key event arrived before `on_enter` was processed. This should not happen
-    /// in normal Wayland flow (Exo always sends `on_enter` before `key`), so we
-    /// emit a warning to aid debugging if it ever occurs.
+    /// The manager global may disappear after a child has been created. The
+    /// child has its own protocol lifetime, so route acknowledgements from the
+    /// child mapping directly and do not require the manager binding to remain.
+    /// If no child has been bound for this keyboard, the key event arrived
+    /// before `on_enter` (or the host has no extension), so no acknowledgement
+    /// is sent.
     fn send_ack_key(ctx: &mut Context, host_keyboard_id: HostId, serial: u32, handled: bool) {
-        if ctx.host_keyboard_extension_id.is_none() {
-            // Protocol not available on this compositor; silently skip.
-            return;
-        }
-        let Some(&host_extended_id) = ctx.keyboard_to_extended_keyboard.get(&host_keyboard_id) else {
+        let Some(&host_extended_id) = ctx.keyboard_to_extended_keyboard.get(&host_keyboard_id)
+        else {
             log::warn!(
                 "ack_key: no extended keyboard bound for host_keyboard_id={}; \
                  key event arrived before on_enter? serial={}, handled={}",
@@ -469,20 +513,20 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ) -> Action {
         let host_keyboard_id = HostId::from_event_sender(ctx);
         if format == WL_KEYMAP_FORMAT_NO_KEYMAP {
-            self.clear_host_keyboard_keymap(host_keyboard_id);
+            self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         }
         // Only handle XKB_V1 format keymaps.
         if format != WL_KEYMAP_FORMAT_XKB_V1 {
             log::warn!("on_keymap: unsupported keymap format {}, ignoring", format);
-            self.clear_host_keyboard_keymap(host_keyboard_id);
+            self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         }
 
         // A zero-size keymap is malformed; mmap(len=0) is UB per POSIX.
         if size == 0 {
             log::warn!("on_keymap: received zero-size keymap from host, ignoring");
-            self.clear_host_keyboard_keymap(host_keyboard_id);
+            self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         }
 
@@ -490,7 +534,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // 64-bit Linux (the only supported target for sommelier).
         let Some(mapping) = MmapView::from_fd(fd, size as usize) else {
             log::error!("on_keymap: mmap failed for fd={}, size={}", fd, size);
-            self.clear_host_keyboard_keymap(host_keyboard_id);
+            self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         };
         let slice = mapping.as_bytes();
@@ -502,7 +546,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             log::error!(
                 "on_keymap: keymap data is missing the trailing NUL required by the Wayland spec"
             );
-            self.clear_host_keyboard_keymap(host_keyboard_id);
+            self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         }
         let len = slice.len() - 1;
@@ -515,7 +559,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 // is None creates a split where future code reading `keymap`
                 // operates on stale data with no active XKB state to validate
                 // against.
-                self.clear_host_keyboard_keymap(host_keyboard_id);
+                self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             }
             Ok(s) => match xkb::Keymap::new_from_string(
                 &self.context,
@@ -531,13 +575,24 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     // Clear keymap, state, and drop set together for the same
                     // consistency reason as the UTF-8 error case above: all
                     // three must remain in sync.
-                    self.clear_host_keyboard_keymap(host_keyboard_id);
+                    self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
                 }
                 Some(keymap) => {
+                    // Replacing the XKB keymap must not end the current
+                    // physical-key session. Wayland may resend a keymap while
+                    // keys are held; clearing the forwarded/pressed sets here
+                    // would make the later releases disappear and leave the
+                    // guest with stuck keys. Reset only XKB interpretation
+                    // state and accelerator drop bookkeeping.
+                    self.clear_host_keyboard_keymap(host_keyboard_id);
+                    ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
+                    let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
                     self.states
                         .insert(host_keyboard_id, xkb::State::new(&keymap));
                     self.modifiers.remove(&host_keyboard_id);
                     self.keymaps.insert(host_keyboard_id, keymap);
+                    ctx.keyboard_keysym_to_keycode
+                        .insert(host_keyboard_id, keysym_map);
                     // Clear stale drop state: a key dropped under the old
                     // keymap may map to a different keysym under the new one,
                     // and a forgotten drop entry would cause a stuck key.
@@ -560,31 +615,102 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ) -> Action {
         // on_enter is a host→client event: last_sender_id is the host keyboard ID.
         let host_keyboard_id = HostId::from_event_sender(ctx);
-        let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id).map(|g| g.0).unwrap_or(0);
+        let guest_keyboard_id = ctx
+            .shadow_table
+            .guest_id_of(host_keyboard_id)
+            .map(|g| g.0)
+            .unwrap_or(0);
         let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
+
+        // A surface keeps its numeric mapping until the host acknowledges the
+        // forwarded wl_surface.destroy with wl_display.delete_id. A queued
+        // keyboard.enter for that host ID can therefore still be translated,
+        // but it must not resurrect the destroyed surface as IME focus.
+        if guest_surface_id != 0 && ctx.shadow_table.is_pending_destroy_host(surface) {
+            log::debug!(
+                "Ignoring wl_keyboard.enter for pending-destroy surface {}",
+                guest_surface_id
+            );
+            return Action::Drop;
+        }
 
         // Lazily bind the extended keyboard object on first enter.
         // This sends zcr_keyboard_extension_v1.get_extended_keyboard to the
         // host, which enables ack mode (SetNeedKeyboardKeyAcks(true) in Exo).
         Self::ensure_extended_keyboard_bound(ctx, host_keyboard_id);
-        Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
-        self.dropped_keys.remove(&host_keyboard_id);
-        self.reset_host_keyboard_modifiers(host_keyboard_id);
 
         log::info!(
             ">>> wl_keyboard.on_enter: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
-            host_keyboard_id, guest_keyboard_id, surface, guest_surface_id
+            host_keyboard_id,
+            guest_keyboard_id,
+            surface,
+            guest_surface_id
         );
 
         if guest_surface_id == 0 {
+            Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
+            self.dropped_keys.remove(&host_keyboard_id);
+            self.reset_host_keyboard_modifiers(host_keyboard_id);
+            ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
             return Action::Forward;
         }
+        let duplicate_keyboard_focus = ctx
+            .keyboard_active_surfaces
+            .get(&host_keyboard_id)
+            .is_some_and(|focused_surface| *focused_surface == guest_surface_id);
+        if duplicate_keyboard_focus {
+            // The C reference suppresses an enter when the resource already
+            // owns this focus. Preserve physical pressed-key and XKB state as
+            // well; rebuilding it from an empty/partial keys array would make
+            // the later release unmatched.
+            log::debug!(
+                "  -> duplicate enter for keyboard {} surface {}, preserving key state",
+                host_keyboard_id.0,
+                guest_surface_id
+            );
+            // wl_keyboard.enter is a state notification, not a request that
+            // must be echoed. ChromiumOS suppresses a duplicate enter for an
+            // already-focused resource; forwarding it would make the guest
+            // restart its text-input transaction.
+            return Action::Drop;
+        }
+        Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
+        self.dropped_keys.remove(&host_keyboard_id);
+        self.reset_host_keyboard_modifiers(host_keyboard_id);
+        // Focus is owned by the individual wl_keyboard object. Keep this
+        // association even when the seat-level active surface is unchanged:
+        // another keyboard's delayed leave must not tear down this object's
+        // still-live focus.
+        ctx.keyboard_active_surfaces
+            .insert(host_keyboard_id, guest_surface_id);
         let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
-            log::warn!("  -> guest_kb {} not in keyboard_to_seat map", guest_keyboard_id);
+            log::warn!(
+                "  -> guest_kb {} not in keyboard_to_seat map",
+                guest_keyboard_id
+            );
             return Action::Forward;
         };
-        log::info!("  -> seat_id={}: setting active_surface={}", guest_seat_id, guest_surface_id);
-        ctx.active_surface_for_seat.insert(guest_seat_id, guest_surface_id);
+        let focus_changed =
+            ctx.active_surface_for_seat.get(&guest_seat_id) != Some(&guest_surface_id);
+        if !focus_changed {
+            // ChromiumOS's C proxy suppresses a duplicate enter for the
+            // already-focused surface. Re-emitting text-input-v3.enter here
+            // would invalidate the editor transaction and can make an IME
+            // lose an in-progress English/Korean composition.
+            log::debug!(
+                "  -> duplicate enter for seat {} surface {}, leaving IME focus intact",
+                guest_seat_id,
+                guest_surface_id
+            );
+            return Action::Drop;
+        }
+        log::info!(
+            "  -> seat_id={}: setting active_surface={}",
+            guest_seat_id,
+            guest_surface_id
+        );
+        ctx.active_surface_for_seat
+            .insert(guest_seat_id, guest_surface_id);
 
         let mut text_inputs_to_update = Vec::new();
         // Find the v3 text input for this seat.
@@ -592,7 +718,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             if state.guest_seat == guest_seat_id {
                 log::info!(
                     "  -> text_input {}: active_surface = {}",
-                    guest_text_input_id, guest_surface_id
+                    guest_text_input_id,
+                    guest_surface_id
                 );
                 crate::handler::text_input::invalidate_for_keyboard_focus(state);
                 state.active_surface = Some(guest_surface_id);
@@ -616,29 +743,193 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     fn on_leave(&mut self, ctx: &mut Context, _serial: u32, surface: u32) -> Action {
         // on_leave is a host→client event: last_sender_id is the host keyboard ID.
         let host_keyboard_id = HostId::from_event_sender(ctx);
-        let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id).map(|g| g.0).unwrap_or(0);
+        let guest_keyboard_id = ctx
+            .shadow_table
+            .guest_id_of(host_keyboard_id)
+            .map(|g| g.0)
+            .unwrap_or(0);
         let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
 
         log::info!(
             ">>> wl_keyboard.on_leave: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
-            host_keyboard_id, guest_keyboard_id, surface, guest_surface_id
+            host_keyboard_id,
+            guest_keyboard_id,
+            surface,
+            guest_surface_id
         );
 
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
+        let tracked_surface = ctx.keyboard_active_surfaces.get(&host_keyboard_id).copied();
+        if guest_surface_id == 0 {
+            // A missing surface mapping can mean either that the old surface
+            // was destroyed or that a delayed leave raced with a new enter.
+            // Preserve the keyboard/IME state when a live surface is already
+            // focused on this seat; otherwise retire the stale session.
+            let live_active_surface = guest_seat
+                .and_then(|seat| ctx.active_surface_for_seat.get(&seat))
+                .is_some_and(|surface| ctx.shadow_table.get_host_id(*surface).is_some());
+            if live_active_surface {
+                let this_keyboard_still_focused = tracked_surface.is_some_and(|tracked_surface| {
+                    guest_seat.and_then(|seat| ctx.active_surface_for_seat.get(&seat))
+                        == Some(&tracked_surface)
+                        && ctx.shadow_table.get_host_id(tracked_surface).is_some()
+                });
+                if this_keyboard_still_focused {
+                    // The leave names an older surface, but this same
+                    // wl_keyboard has already entered the current live one.
+                    // Keep its active-surface and physical-key state intact.
+                    log::debug!(
+                        "  -> ignoring stale unmapped leave for keyboard {} (tracked current surface {})",
+                        host_keyboard_id.0,
+                        tracked_surface.expect("checked above")
+                    );
+                    return Action::Forward;
+                }
+                // If another wl_keyboard object owns the live seat focus, an
+                // unmapped leave for this object belongs to a destroyed old
+                // surface. Retire this keyboard's physical/IME state even
+                // though the seat-level focus must remain on the other
+                // keyboard. Keeping it would let the Backspace fallback
+                // select this dead keyboard later.
+                let another_keyboard_is_focused = guest_seat.is_some_and(|seat| {
+                    ctx.keyboard_active_surfaces.iter().any(
+                        |(&other_keyboard_id, &other_surface)| {
+                            other_keyboard_id != host_keyboard_id
+                                && ctx
+                                    .shadow_table
+                                    .guest_id_of(other_keyboard_id)
+                                    .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
+                                    == Some(&seat)
+                                && ctx.active_surface_for_seat.get(&seat) == Some(&other_surface)
+                        },
+                    )
+                });
+                if another_keyboard_is_focused {
+                    ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
+                    Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+                    self.dropped_keys.remove(&host_keyboard_id);
+                    self.reset_host_keyboard_modifiers(host_keyboard_id);
+                }
+                log::debug!(
+                    "  -> ignoring unmapped stale leave for host keyboard {}",
+                    host_keyboard_id.0
+                );
+                ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
+                return Action::Forward;
+            }
+            ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
+            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+            self.dropped_keys.remove(&host_keyboard_id);
+            self.reset_host_keyboard_modifiers(host_keyboard_id);
+            if let Some(guest_seat) = guest_seat {
+                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                ctx.active_surface_for_seat.remove(&guest_seat);
+                let mut text_inputs_to_update = Vec::new();
+                for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
+                    if state.guest_seat == guest_seat {
+                        state.active_surface = None;
+                        crate::handler::text_input::invalidate_for_keyboard_focus(state);
+                        text_inputs_to_update.push(*guest_text_input_id);
+                    }
+                }
+                for guest_text_input_id in text_inputs_to_update {
+                    crate::handler::text_input::update_host_activation(ctx, guest_text_input_id);
+                }
+            }
+            return Action::Forward;
+        }
+        if tracked_surface.is_some_and(|tracked| tracked != guest_surface_id) {
+            // The same wl_keyboard can leave an old surface after a newer
+            // enter has already installed a different one. This leave belongs
+            // to the old focus and must not clear the current keyboard state.
+            log::debug!(
+                "  -> ignoring stale leave for keyboard {} surface {} (tracked={:?})",
+                host_keyboard_id.0,
+                guest_surface_id,
+                tracked_surface
+            );
+            return Action::Forward;
+        }
+        ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
+        let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
+            log::warn!(
+                "  -> guest_kb {} not in keyboard_to_seat map",
+                guest_keyboard_id
+            );
+            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+            self.dropped_keys.remove(&host_keyboard_id);
+            self.reset_host_keyboard_modifiers(host_keyboard_id);
+            return Action::Forward;
+        };
+        let leave_matches_active_surface =
+            ctx.active_surface_for_seat.get(&guest_seat_id) == Some(&guest_surface_id);
+        if !leave_matches_active_surface {
+            // A seat can have more than one wl_keyboard object. Ignore a
+            // stale leave for a surface that is no longer focused; otherwise
+            // an old keyboard would tear down the current IME focus. The
+            // leaving keyboard's own physical/XKB session is still stale,
+            // however, so retire that per-keyboard state before returning.
+            log::debug!(
+                "  -> ignoring stale leave for seat {} surface {} (active={:?})",
+                guest_seat_id,
+                guest_surface_id,
+                ctx.active_surface_for_seat.get(&guest_seat_id)
+            );
+            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+            self.dropped_keys.remove(&host_keyboard_id);
+            self.reset_host_keyboard_modifiers(host_keyboard_id);
+            return Action::Forward;
+        }
+
+        // Clear physical-key, accelerator, and modifier state only after the
+        // stale-leave check. A second wl_keyboard object can report a delayed
+        // leave for an old surface after another object has entered a new one;
+        // that event must not release the current keyboard's held keys.
         Self::clear_host_keyboard_state(ctx, host_keyboard_id);
         self.dropped_keys.remove(&host_keyboard_id);
         self.reset_host_keyboard_modifiers(host_keyboard_id);
+
+        // Only the leave for the currently focused surface may end the
+        // seat-scoped IME Backspace fallback. A stale leave from another
+        // wl_keyboard object must not interrupt a newer focus.
         if let Some(guest_seat) = guest_seat {
-            crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+            let another_keyboard_is_focused =
+                ctx.keyboard_active_surfaces
+                    .iter()
+                    .any(|(&other_keyboard_id, &other_surface)| {
+                        other_keyboard_id != host_keyboard_id
+                            && other_surface == guest_surface_id
+                            && ctx
+                                .shadow_table
+                                .guest_id_of(other_keyboard_id)
+                                .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
+                                == Some(&guest_seat)
+                    });
+            if !another_keyboard_is_focused {
+                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+            }
         }
 
-        if guest_surface_id == 0 {
+        let another_keyboard_is_focused =
+            ctx.keyboard_active_surfaces
+                .iter()
+                .any(|(&other_keyboard_id, &other_surface)| {
+                    other_keyboard_id != host_keyboard_id
+                        && other_surface == guest_surface_id
+                        && ctx
+                            .shadow_table
+                            .guest_id_of(other_keyboard_id)
+                            .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
+                            == Some(&guest_seat_id)
+                });
+        if another_keyboard_is_focused {
+            log::debug!(
+                "  -> keeping seat {} focused on surface {} for another keyboard",
+                guest_seat_id,
+                guest_surface_id
+            );
             return Action::Forward;
         }
-        let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
-            log::warn!("  -> guest_kb {} not in keyboard_to_seat map", guest_keyboard_id);
-            return Action::Forward;
-        };
         log::info!("  -> seat_id={}: removing active_surface", guest_seat_id);
         ctx.active_surface_for_seat.remove(&guest_seat_id);
 
@@ -681,16 +972,25 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ) -> Action {
         // on_key is a host→client event: last_sender_id is the host keyboard ID.
         let host_keyboard_id = HostId::from_event_sender(ctx);
-        let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id).map(|g| g.0).unwrap_or(0);
+        let guest_keyboard_id = ctx
+            .shadow_table
+            .guest_id_of(host_keyboard_id)
+            .map(|g| g.0)
+            .unwrap_or(0);
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
         log::trace!(
             ">>> wl_keyboard.on_key: host_kb={:?}, guest_kb={}, serial={}, key={}, state={}",
-            host_keyboard_id, guest_keyboard_id, serial, key, state
+            host_keyboard_id,
+            guest_keyboard_id,
+            serial,
+            key,
+            state
         );
         let repeat_active = key == EVDEV_KEY_BACKSPACE
-            && guest_seat.is_some_and(|seat| {
-                crate::handler::text_input::backspace_repeat_active_for_seat(ctx, seat)
-            });
+            && crate::handler::text_input::backspace_repeat_active_for_keyboard(
+                ctx,
+                host_keyboard_id,
+            );
         let forwarded_before = ctx
             .keyboard_forwarded_keys
             .get(&host_keyboard_id)
@@ -699,18 +999,22 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             .keyboard_ime_suppressed_keys
             .get(&host_keyboard_id)
             .is_some_and(|keys| keys.contains(&key));
-        let suppress_redundant_backspace =
-            key == EVDEV_KEY_BACKSPACE && (synthetic_suppressed_before
-                || (repeat_active && !forwarded_before));
+        let suppress_redundant_backspace = key == EVDEV_KEY_BACKSPACE
+            && (synthetic_suppressed_before || (repeat_active && !forwarded_before));
         let mut action = if suppress_redundant_backspace {
             log::debug!("  -> dropping host Backspace already handled by repeat fallback");
             Action::Drop
         } else {
             Action::Forward
         };
-        let mut handled = true; // Default: guest handles the key.
+        // `handled` is the value sent back to Exo in ack_key. It must describe
+        // whether this particular event was accepted by the guest-side proxy,
+        // not merely whether the event was a press. In particular, a physical
+        // release whose press was consumed by an accelerator or IME is
+        // NOT_HANDLED and must not be forwarded into the guest.
+        let mut handled = false;
 
-        if matches!(state, WL_KEY_PRESSED | WL_KEY_RELEASED) {
+        if matches!(state, WL_KEY_PRESSED | WL_KEY_REPEATED | WL_KEY_RELEASED) {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
         }
 
@@ -720,7 +1024,12 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // In Rust, integer match arms are unordered — each arm matches its exact
         // pattern and `other` fires only for values not matched above.
         match state {
-            WL_KEY_PRESSED => {
+            WL_KEY_PRESSED | WL_KEY_REPEATED => {
+                let repeated = state == WL_KEY_REPEATED;
+                let dropped_before = self
+                    .dropped_keys
+                    .get(&host_keyboard_id)
+                    .is_some_and(|keys| keys.contains(&key));
                 if key == EVDEV_KEY_BACKSPACE {
                     if suppress_redundant_backspace {
                         ctx.keyboard_ime_suppressed_keys
@@ -735,38 +1044,62 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     }
                 }
                 // Key pressed: check if this is a host accelerator.
-                if self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key) {
+                if dropped_before
+                    || self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key)
+                {
                     log::debug!("  -> accelerator key, dropping");
                     action = Action::Drop;
                     handled = false;
-                    self.dropped_keys
-                        .entry(host_keyboard_id)
-                        .or_default()
-                        .insert(key);
+                    // If a prior press was already forwarded (for example a
+                    // repeat whose modifier state changed), retain that
+                    // physical press so its eventual release still reaches
+                    // the guest. ChromiumOS's pressed-key set has the same
+                    // behavior.
+                    if !forwarded_before {
+                        self.dropped_keys
+                            .entry(host_keyboard_id)
+                            .or_default()
+                            .insert(key);
+                    }
                 } else if action == Action::Forward {
-                    ctx.keyboard_forwarded_keys
-                        .entry(host_keyboard_id)
-                        .or_default()
-                        .insert(key);
+                    if forwarded_before && !repeated {
+                        // Suppress duplicate pressed events while still
+                        // acknowledging them as handled; the original press
+                        // remains paired with the release. A v10 repeated
+                        // event is a real event and must be forwarded.
+                        action = Action::Drop;
+                        log::debug!("  -> dropping duplicate press for key {}", key);
+                    } else if repeated && !forwarded_before {
+                        // A repeated event without a preceding forwarded
+                        // press is malformed from the guest's perspective.
+                        // Do not invent a press/release pair.
+                        action = Action::Drop;
+                        log::warn!(
+                            "  -> dropping repeated key {} without a forwarded press",
+                            key
+                        );
+                    } else {
+                        ctx.keyboard_forwarded_keys
+                            .entry(host_keyboard_id)
+                            .or_default()
+                            .insert(key);
+                    }
+                    handled = true;
                 }
-                // Send ack_key only for press events, matching the C sommelier
-                // reference implementation. Exo places only press events into
-                // pending_key_acks_ and never expects an ack for a release;
-                // a release ack would target a non-existent serial and be
-                // silently ignored — but we avoid sending it for clarity and
-                // to match the C reference exactly.
+                // ChromiumOS sends an ack for every key event. For an
+                // accelerator press `handled` is false; for an IME-suppressed
+                // press it is also false because no guest event was emitted.
                 Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
             }
             WL_KEY_RELEASED => {
-                // Key released: if we dropped the press, drop the release too
-                // to avoid stuck-key state in the guest.
-                if self
+                // ChromiumOS forwards a release only when its corresponding
+                // press was forwarded. This prevents an unmatched release
+                // from reaching the guest after an accelerator or IME
+                // consumed the press.
+                let dropped_press = self
                     .dropped_keys
                     .get_mut(&host_keyboard_id)
-                    .is_some_and(|keys| keys.remove(&key))
-                {
-                    action = Action::Drop;
-                }
+                    .is_some_and(|keys| keys.remove(&key));
                 if self
                     .dropped_keys
                     .get(&host_keyboard_id)
@@ -774,14 +1107,46 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 {
                     self.dropped_keys.remove(&host_keyboard_id);
                 }
-                if Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key) {
-                    action = Action::Drop;
+                let ime_suppressed =
+                    Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key);
+                // A synthetic keysym press may be followed by the physical
+                // wl_keyboard release if the host emits both paths. Consume
+                // the source marker here so a later keysym release cannot
+                // generate a second guest release.
+                let keysym_synthetic = ctx
+                    .keyboard_keysym_forwarded_keys
+                    .get_mut(&host_keyboard_id)
+                    .is_some_and(|keys| keys.remove(&key));
+                if ctx
+                    .keyboard_keysym_forwarded_keys
+                    .get(&host_keyboard_id)
+                    .is_some_and(|keys| keys.is_empty())
+                {
+                    ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
                 }
-                if let Some(keys) = ctx.keyboard_forwarded_keys.get_mut(&host_keyboard_id) {
-                    keys.remove(&key);
-                    if keys.is_empty() {
-                        ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
-                    }
+                let forwarded_press = ctx
+                    .keyboard_forwarded_keys
+                    .get_mut(&host_keyboard_id)
+                    .is_some_and(|keys| keys.remove(&key));
+                if ctx
+                    .keyboard_forwarded_keys
+                    .get(&host_keyboard_id)
+                    .is_some_and(|keys| keys.is_empty())
+                {
+                    ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
+                }
+                handled = forwarded_press;
+                action = if forwarded_press && !dropped_press && !ime_suppressed {
+                    Action::Forward
+                } else {
+                    Action::Drop
+                };
+                Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
+                if dropped_press || ime_suppressed {
+                    log::debug!(
+                        "  -> dropping release for key {} (dropped_press={}, ime_suppressed={}, keysym_synthetic={})",
+                        key, dropped_press, ime_suppressed, keysym_synthetic
+                    );
                 }
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
@@ -791,6 +1156,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
             other => {
                 log::warn!("on_key: received unknown key state {}, ignoring", other);
+                action = Action::Drop;
             }
         }
 
@@ -854,7 +1220,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             log::debug!(
                 "on_modifiers: XKB state not yet initialised (keymap not received); \
                  modifier event ignored (depressed={:#x}, latched={:#x}, locked={:#x})",
-                mods_depressed, mods_latched, mods_locked
+                mods_depressed,
+                mods_latched,
+                mods_locked
             );
         }
         Action::Forward
@@ -891,12 +1259,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // modifiers: if the new keyboard receives a key event before the first
         //   wl_keyboard.modifiers, the accelerator check would use stale modifier
         //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
-        self.clear_host_keyboard_keymap(host_keyboard_id);
-        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-        if let Some(guest_seat) = guest_seat {
-            crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
-        }
-        if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
+        self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+        if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id)
+        {
             ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
             // zcr_extended_keyboard_v1.destroy — no payload (8-byte header only).
             let msg = crate::wire::MessageBuilder::new()
@@ -904,12 +1269,58 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             ctx.client_to_host_queue.push((msg, Vec::new()));
             // Unregister from the host dispatch table so stale peek_key events
             // (version ≥ 2) sent after destroy cannot be dispatched to a dead object.
-            ctx.shadow_table.remove_host_interface(host_extended_id.0);
+            ctx.shadow_table
+                .mark_pending_destroy_host(host_extended_id.0);
             log::debug!(
                 "Destroyed extended keyboard: host_extended_id={} for host_keyboard_id={}",
                 host_extended_id.0,
                 host_keyboard_id.0
             );
+        }
+        let released_surface = ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
+        if let (Some(guest_seat), Some(released_surface)) = (guest_seat, released_surface) {
+            let seat_focus_is_owned_by_released_keyboard =
+                ctx.active_surface_for_seat.get(&guest_seat) == Some(&released_surface);
+            let another_keyboard_has_same_focus =
+                ctx.keyboard_active_surfaces
+                    .iter()
+                    .any(|(&other_keyboard_id, &other_surface)| {
+                        other_surface == released_surface
+                            && ctx
+                                .shadow_table
+                                .guest_id_of(other_keyboard_id)
+                                .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
+                                == Some(&guest_seat)
+                    });
+            if seat_focus_is_owned_by_released_keyboard && !another_keyboard_has_same_focus {
+                ctx.active_surface_for_seat.remove(&guest_seat);
+                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+
+                let mut text_inputs_to_update = Vec::new();
+                for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
+                    if state.guest_seat == guest_seat {
+                        let previous_surface = state.active_surface.take();
+                        crate::handler::text_input::invalidate_for_keyboard_focus(state);
+
+                        if let Some(previous_surface) = previous_surface {
+                            let mut builder = MessageBuilder::new();
+                            builder.write_u32(previous_surface);
+                            ctx.host_to_client_queue
+                                .push((builder.build_message(*guest_text_input_id, 1), Vec::new()));
+                            text_inputs_to_update.push(*guest_text_input_id);
+                        } else if state.host_activated {
+                            // A stale local activation can exist even when no
+                            // guest focus was recorded. Reconcile it without
+                            // emitting a protocol leave for a surface we
+                            // cannot identify.
+                            text_inputs_to_update.push(*guest_text_input_id);
+                        }
+                    }
+                }
+                for guest_text_input_id in text_inputs_to_update {
+                    crate::handler::text_input::update_host_activation(ctx, guest_text_input_id);
+                }
+            }
         }
         Action::Forward
     }
@@ -952,9 +1363,9 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
         };
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
         match state {
-            WL_KEY_PRESSED => {
+            WL_KEY_PRESSED | WL_KEY_REPEATED => {
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
-                if key != EVDEV_KEY_BACKSPACE {
+                if state == WL_KEY_PRESSED && key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
@@ -963,6 +1374,11 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             }
             WL_KEY_RELEASED => {
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
+                // A key consumed by the host IME may have no corresponding
+                // wl_keyboard.key release. `peek_key` is the only release
+                // notification in that path, so retire the marker installed
+                // by a synthetic Backspace pair here.
+                Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key);
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
@@ -1054,12 +1470,7 @@ mod tests {
         None
     }
 
-    fn add_active_text_input(
-        ctx: &mut Context,
-        guest_id: u32,
-        guest_seat: u32,
-        host_ext_id: u32,
-    ) {
+    fn add_active_text_input(ctx: &mut Context, guest_id: u32, guest_seat: u32, host_ext_id: u32) {
         let host_v1_id = guest_id + 100;
         ctx.shadow_table.map_id(guest_id, host_v1_id);
         ctx.text_inputs.insert(
@@ -1100,10 +1511,8 @@ mod tests {
         host_extended_id: u32,
         guest_seat: u32,
     ) {
-        ctx.shadow_table
-            .map_id(guest_keyboard_id, host_keyboard_id);
-        ctx.keyboard_to_seat
-            .insert(guest_keyboard_id, guest_seat);
+        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+        ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
         ctx.extended_keyboard_to_keyboard
@@ -1132,7 +1541,8 @@ mod tests {
         // host_keyboard_extension_id must be Some to enable the protocol path.
         // Use non-reserved IDs (not 0 or 1, which are null/wl_display).
         ctx.host_keyboard_extension_id = Some(HostId(99));
-        ctx.keyboard_to_extended_keyboard.insert(HostId(5), HostId(50));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
         ctx.last_sender_id = 5;
 
         // Ctrl+A should be dropped (host accelerator)
@@ -1149,6 +1559,20 @@ mod tests {
         // Message: [sender_id(4)] [size_opcode(4)] [serial(4)] [handled(4)]
         let handled_val = u32::from_ne_bytes(msg[12..16].try_into().unwrap());
         assert_eq!(handled_val, 0, "accelerator should be acked as NOT_HANDLED");
+
+        // ChromiumOS also acknowledges the unmatched release as
+        // NOT_HANDLED, and does not forward it to the guest.
+        assert_eq!(
+            handler.on_key(&mut ctx, 43, 1, wl_key_a, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        let (release_ack, _) = &ctx.client_to_host_queue[1];
+        assert_eq!(
+            u32::from_ne_bytes(release_ack[12..16].try_into().unwrap()),
+            0,
+            "accelerator release should be acked as NOT_HANDLED"
+        );
     }
 
     #[test]
@@ -1170,7 +1594,8 @@ mod tests {
         handler.on_modifiers(&mut ctx, 0, ctrl_mask, 0, 0, 0);
 
         ctx.host_keyboard_extension_id = Some(HostId(99));
-        ctx.keyboard_to_extended_keyboard.insert(HostId(5), HostId(50));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
         ctx.last_sender_id = 5;
 
         // Ctrl+B is NOT in accelerators → forward to guest
@@ -1186,6 +1611,18 @@ mod tests {
         let (msg, _) = &ctx.client_to_host_queue[0];
         let handled_val = u32::from_ne_bytes(msg[12..16].try_into().unwrap());
         assert_eq!(handled_val, 1, "non-accelerator should be acked as HANDLED");
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 44, 1, wl_key_b, WL_KEY_RELEASED),
+            Action::Forward
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        let (release_ack, _) = &ctx.client_to_host_queue[1];
+        assert_eq!(
+            u32::from_ne_bytes(release_ack[12..16].try_into().unwrap()),
+            1,
+            "forwarded release should be acked as HANDLED"
+        );
     }
 
     #[test]
@@ -1206,7 +1643,8 @@ mod tests {
         handler.on_modifiers(&mut ctx, 0, ctrl_mask, 0, 0, 0);
 
         ctx.host_keyboard_extension_id = Some(HostId(99));
-        ctx.keyboard_to_extended_keyboard.insert(HostId(5), HostId(50));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
         ctx.last_sender_id = 5;
 
         // Press → Drop
@@ -1220,6 +1658,94 @@ mod tests {
         // Next press of same key after release should still be evaluated
         let action = handler.on_key(&mut ctx, 3, 0, wl_key_a, 1);
         assert_eq!(action, Action::Drop);
+    }
+
+    #[test]
+    fn ime_consumed_release_is_dropped_and_acked_not_handled() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
+        ctx.keyboard_ime_suppressed_keys
+            .entry(HostId(5))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+
+        // The IME fallback already emitted a synthetic press/release pair.
+        // The later physical release must not create a stray guest release.
+        assert_eq!(
+            handler.on_key(&mut ctx, 7, 100, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let (ack, _) = &ctx.client_to_host_queue[0];
+        assert_eq!(
+            u32::from_ne_bytes(ack[12..16].try_into().unwrap()),
+            0,
+            "IME-consumed release must be acked as NOT_HANDLED"
+        );
+        assert!(
+            !ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(5)),
+            "suppressed release bookkeeping must be consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn untracked_release_is_dropped_and_acked_not_handled() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 8, 100, 30, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let (ack, _) = &ctx.client_to_host_queue[0];
+        assert_eq!(
+            u32::from_ne_bytes(ack[12..16].try_into().unwrap()),
+            0,
+            "an unmatched release must not claim guest handling"
+        );
+    }
+
+    #[test]
+    fn duplicate_forwarded_press_is_dropped_but_release_remains_paired() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, 30, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 101, 30, WL_KEY_PRESSED),
+            Action::Drop,
+            "duplicate press must not be sent twice to the guest"
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 102, 30, WL_KEY_RELEASED),
+            Action::Forward,
+            "release must pair with the first forwarded press"
+        );
+
+        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        for (msg, _) in &ctx.client_to_host_queue {
+            assert_eq!(
+                u32::from_ne_bytes(msg[12..16].try_into().unwrap()),
+                1,
+                "duplicate and release events remain HANDLED by the guest"
+            );
+        }
     }
 
     /// Regression test: on_keymap must use mmap rather than read/seek because:
@@ -1255,8 +1781,7 @@ mod tests {
         use std::ffi::CString;
 
         let name = CString::new("test-keymap-norw").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty())
-            .expect("memfd_create failed");
+        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
         nix::unistd::write(&fd, keymap_bytes).expect("write failed");
         // Write the NUL terminator that on_keymap expects (wl_keyboard.keymap.size
         // always includes it). Without this, the mmap covers one byte beyond what
@@ -1275,6 +1800,77 @@ mod tests {
         assert!(
             handler.states.contains_key(&HostId(0)),
             "XKB state must be initialized after keymap load"
+        );
+        assert!(
+            ctx.keyboard_keysym_to_keycode
+                .get(&HostId(0))
+                .is_some_and(|mapping| mapping.contains_key(&xkb::keysyms::KEY_A)),
+            "the negotiated keymap must provide a keysym fallback map"
+        );
+        assert!(
+            ctx.keyboard_keysym_to_keycode[&HostId(0)][&xkb::keysyms::KEY_a]
+                == find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a must be mapped"),
+            "the map must expose the same evdev keycode as the negotiated XKB keymap"
+        );
+    }
+
+    #[test]
+    fn mmap_view_rejects_negative_fd_before_borrowing() {
+        assert!(
+            MmapView::from_fd(-1, 1).is_none(),
+            "negative descriptors must be rejected before BorrowedFd construction"
+        );
+    }
+
+    #[test]
+    fn keymap_mmap_is_private_not_shared() {
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+
+        let fd = memfd_create(
+            CString::new("test-keymap-private").unwrap().as_c_str(),
+            MFdFlags::empty(),
+        )
+        .expect("memfd_create failed");
+        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate failed");
+        let view = MmapView::from_fd(fd.as_raw_fd(), 4096).expect("mmap failed");
+        let address = view.ptr.as_ptr() as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("read smaps");
+        let mapping_header = smaps
+            .lines()
+            .position(|line| {
+                let mut fields = line.split_whitespace();
+                let Some(range) = fields.next() else {
+                    return false;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return false;
+                };
+                usize::from_str_radix(start, 16).ok().is_some_and(|start| {
+                    usize::from_str_radix(end, 16)
+                        .ok()
+                        .is_some_and(|end| address >= start && address < end)
+                })
+            })
+            .expect("mapping must appear in smaps");
+        let vm_flags = smaps
+            .lines()
+            .skip(mapping_header + 1)
+            .take_while(|line| {
+                let Some(range) = line.split_whitespace().next() else {
+                    return true;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return true;
+                };
+                !(usize::from_str_radix(start, 16).is_ok()
+                    && usize::from_str_radix(end, 16).is_ok())
+            })
+            .find_map(|line| line.strip_prefix("VmFlags:"))
+            .expect("mapping must have VmFlags");
+        assert!(
+            !vm_flags.split_whitespace().any(|flag| flag == "sh"),
+            "keymap must use MAP_PRIVATE, got shared mapping flags: {vm_flags}"
         );
     }
 
@@ -1304,7 +1900,8 @@ mod tests {
 
         // Map entry must be removed so re-binding is possible.
         assert!(
-            !ctx.keyboard_to_extended_keyboard.contains_key(&HostId(host_keyboard_id)),
+            !ctx.keyboard_to_extended_keyboard
+                .contains_key(&HostId(host_keyboard_id)),
             "extended keyboard map must be cleared after release"
         );
         assert!(
@@ -1323,7 +1920,10 @@ mod tests {
         // Message: [sender_id(4)] [size_opcode(4)]  — opcode 0, len 8.
         let sender = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
         let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
-        assert_eq!(sender, host_extended_id, "destroy must target host_extended_id");
+        assert_eq!(
+            sender, host_extended_id,
+            "destroy must target host_extended_id"
+        );
         assert_eq!(word2 >> 16, 8, "message length must be 8");
         assert_eq!(word2 & 0xFFFF, 0, "opcode must be 0 (destroy)");
     }
@@ -1349,12 +1949,24 @@ mod tests {
     #[test]
     fn is_host_accelerator_returns_false_without_xkb_state() {
         let handler = KeyboardHandler::new(); // no keymap loaded
-        let accelerators =
-            crate::accelerator::parse_accelerators("<Control>a").unwrap();
+        let accelerators = crate::accelerator::parse_accelerators("<Control>a").unwrap();
         // Must degrade gracefully, not panic.
         assert!(
             !handler.is_host_accelerator(HostId(0), &accelerators, 30),
             "should return false when XKB state is not initialised"
+        );
+    }
+
+    #[test]
+    fn overflowing_evdev_keycode_is_not_an_accelerator() {
+        let handler = KeyboardHandler::new();
+        assert!(
+            !handler.is_host_accelerator(
+                HostId(0),
+                &crate::accelerator::parse_accelerators("a").unwrap(),
+                u32::MAX,
+            ),
+            "keycode + XKB offset must be checked before arithmetic"
         );
     }
 
@@ -1369,7 +1981,11 @@ mod tests {
         // A zero-size keymap must be rejected gracefully (mmap(len=0) is UB).
         // fd=0 (stdin) won't be mmap'd because the size check fires first.
         let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, 0, 0 /* size=0 */);
-        assert_eq!(action, Action::Forward, "zero-size keymap must forward, not panic");
+        assert_eq!(
+            action,
+            Action::Forward,
+            "zero-size keymap must forward, not panic"
+        );
         assert!(
             !handler.keymaps.contains_key(&HostId(0)),
             "keymap must not be set after zero-size event"
@@ -1518,7 +2134,12 @@ mod tests {
         nix::unistd::write(&fd, bad_bytes).expect("write failed");
 
         use std::os::unix::io::AsRawFd;
-        let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, fd.as_raw_fd(), bad_bytes.len() as u32);
+        let action = handler.on_keymap(
+            &mut ctx,
+            1, /* XKB_V1 */
+            fd.as_raw_fd(),
+            bad_bytes.len() as u32,
+        );
         assert_eq!(action, Action::Forward, "invalid UTF-8 must still forward");
         assert!(
             !handler.keymaps.contains_key(&HostId(0)),
@@ -1545,8 +2166,17 @@ mod tests {
         nix::unistd::write(&fd, garbage).expect("write failed");
 
         use std::os::unix::io::AsRawFd;
-        let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, fd.as_raw_fd(), garbage.len() as u32);
-        assert_eq!(action, Action::Forward, "invalid XKB string must still forward");
+        let action = handler.on_keymap(
+            &mut ctx,
+            1, /* XKB_V1 */
+            fd.as_raw_fd(),
+            garbage.len() as u32,
+        );
+        assert_eq!(
+            action,
+            Action::Forward,
+            "invalid XKB string must still forward"
+        );
         assert!(
             !handler.keymaps.contains_key(&HostId(0)),
             "keymap must remain absent on XKB compile error"
@@ -1564,13 +2194,38 @@ mod tests {
         // must not panic or silently send a garbage ack. No queue entry expected.
         let mut ctx = Context::new(false, false);
         ctx.host_keyboard_extension_id = Some(HostId(99)); // protocol bound
-        // keyboard_to_extended_keyboard is empty (on_enter not yet received)
+                                                           // keyboard_to_extended_keyboard is empty (on_enter not yet received)
 
         KeyboardHandler::send_ack_key(&mut ctx, HostId(10), 1, true);
 
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "no ack_key must be queued when keyboard is not yet registered"
+        );
+    }
+
+    #[test]
+    fn send_ack_key_keeps_existing_child_alive_after_manager_global_remove() {
+        let mut ctx = Context::new(false, false);
+        // The manager global may disappear after the child was created. The
+        // child mapping and dispatch object have an independent lifetime, so
+        // ack_key must still be routed even though the manager field is gone.
+        ctx.host_keyboard_extension_id = None;
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(10), HostId(50));
+
+        KeyboardHandler::send_ack_key(&mut ctx, HostId(10), 7, true);
+
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            1,
+            "an existing extended-keyboard child must still receive ack_key"
+        );
+        let (message, _) = &ctx.client_to_host_queue[0];
+        assert_eq!(
+            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            50,
+            "ack_key must target the child object, not the retired manager"
         );
     }
 
@@ -1589,6 +2244,31 @@ mod tests {
 
         assert_eq!(handler.on_peek_key(&mut ctx, 11, 21, 14, 0), Action::Drop);
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
+    }
+
+    #[test]
+    fn repeated_peek_key_keeps_the_physical_key_down_without_rearming_ime_cancel() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+
+        ctx.last_sender_id = 1000;
+        handler.on_peek_key(&mut ctx, 10, 20, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED);
+        ctx.keyboard_backspace_repeat_cancelled.insert(HostId(100));
+
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 11, 21, EVDEV_KEY_BACKSPACE, WL_KEY_REPEATED,),
+            Action::Drop
+        );
+        assert!(
+            ctx.keyboard_pressed_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE),
+            "repeated peek must preserve the physical pressed-key state"
+        );
+        assert!(
+            ctx.keyboard_backspace_repeat_cancelled
+                .contains(&HostId(100)),
+            "a repeated peek must not re-arm a cancelled IME fallback"
+        );
     }
 
     #[test]
@@ -1676,6 +2356,10 @@ mod tests {
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
         ctx.keyboard_pressed_keys
+            .entry(HostId(100))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        ctx.keyboard_forwarded_keys
             .entry(HostId(100))
             .or_default()
             .insert(EVDEV_KEY_BACKSPACE);
@@ -1799,6 +2483,124 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_keyboard_enter_does_not_reset_ime_focus() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.active_surface_for_seat.insert(1, 20);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        {
+            let state = ctx.text_inputs.get_mut(&40).expect("text input");
+            state.active_surface = Some(20);
+            state.current_preedit = "한".to_string();
+            state.committed_enabled = true;
+            state.host_activated = true;
+        }
+        ctx.last_sender_id = 100;
+
+        assert_eq!(handler.on_enter(&mut ctx, 2, 200, &[]), Action::Drop);
+        assert_eq!(ctx.text_inputs[&40].active_surface, Some(20));
+        assert_eq!(ctx.text_inputs[&40].current_preedit, "한");
+        assert!(ctx.text_inputs[&40].host_activated);
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "duplicate enter must not emit a second text-input enter"
+        );
+    }
+
+    #[test]
+    fn duplicate_keyboard_enter_preserves_pressed_key_state() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.last_sender_id = 100;
+
+        assert_eq!(handler.on_enter(&mut ctx, 1, 200, &[]), Action::Forward);
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 10, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert!(ctx.keyboard_pressed_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE));
+
+        // A compositor may repeat enter for the same resource while the key is
+        // held. The empty keys array must not erase the physical state needed
+        // to pair the eventual release.
+        assert_eq!(handler.on_enter(&mut ctx, 3, 200, &[]), Action::Drop);
+        assert!(
+            ctx.keyboard_pressed_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE),
+            "duplicate enter must not clear held keys"
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 4, 11, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            Action::Forward
+        );
+    }
+
+    #[test]
+    fn leave_from_one_keyboard_keeps_same_surface_focused_for_another() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        ctx.shadow_table.map_id(20, 200);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 200, &[]), Action::Forward);
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_enter(&mut ctx, 2, 200, &[]), Action::Drop);
+        ctx.host_to_client_queue.clear();
+        assert_eq!(ctx.active_surface_for_seat.get(&1), Some(&20));
+
+        // The first keyboard leaves, but the second one still owns the same
+        // surface. Seat-level IME focus must remain active.
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_leave(&mut ctx, 3, 200), Action::Forward);
+        assert_eq!(ctx.active_surface_for_seat.get(&1), Some(&20));
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "the remaining keyboard must keep text-input focus"
+        );
+
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_leave(&mut ctx, 4, 200), Action::Forward);
+        assert!(!ctx.active_surface_for_seat.contains_key(&1));
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+    }
+
+    #[test]
+    fn invalid_keymap_clears_context_keyboard_state() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+        ctx.keyboard_pressed_keys
+            .entry(HostId(5))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        ctx.keyboard_backspace_repeat_cancelled.insert(HostId(5));
+        ctx.keyboard_event_times.insert(HostId(5), 123);
+        ctx.keyboard_ime_suppressed_keys
+            .entry(HostId(5))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        ctx.keyboard_forwarded_keys
+            .entry(HostId(5))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+
+        assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
+        assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_backspace_repeat_cancelled.contains(&HostId(5)));
+        assert!(!ctx.keyboard_event_times.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(5)));
+    }
+
+    #[test]
     fn accelerator_drop_state_does_not_cross_keyboards() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(
@@ -1822,8 +2624,8 @@ mod tests {
         ctx.last_sender_id = 6;
         assert_eq!(
             handler.on_key(&mut ctx, 2, 11, wl_key_a, WL_KEY_RELEASED),
-            Action::Forward,
-            "keyboard B must not inherit keyboard A's dropped press"
+            Action::Drop,
+            "keyboard B must not inherit keyboard A's dropped press; an untracked release is dropped"
         );
 
         ctx.last_sender_id = 5;
@@ -1878,7 +2680,11 @@ mod tests {
         let (msg, _) = &ctx.client_to_host_queue[0];
         let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
         let opcode = word2 & 0xFFFF;
-        assert_eq!(opcode, 0, "get_extended_keyboard must use opcode 0, got {}", opcode);
+        assert_eq!(
+            opcode, 0,
+            "get_extended_keyboard must use opcode 0, got {}",
+            opcode
+        );
     }
 
     /// Structural regression: dropped_keys must be cleared when the keyboard is released.
@@ -1902,7 +2708,8 @@ mod tests {
             find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found in keymap");
 
         ctx.host_keyboard_extension_id = Some(HostId(99));
-        ctx.keyboard_to_extended_keyboard.insert(HostId(10), HostId(50));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(10), HostId(50));
 
         // Press Ctrl+A (host accelerator) with host keyboard ID 10.
         let ctrl_mask = 1 << keymap.mod_get_index("Control");
@@ -1926,14 +2733,19 @@ mod tests {
             "dropped_keys must be cleared by on_release to avoid stuck-key on re-bind"
         );
 
-        // A release of the same key on the re-bound keyboard should now be forwarded,
-        // not silently dropped.
+        // A new press on the re-bound keyboard should now be evaluated with
+        // fresh state rather than inheriting the stale accelerator drop.
         ctx.last_sender_id = 10;
-        let release_action = handler.on_key(&mut ctx, 2, 0, wl_key_a, WL_KEY_RELEASED);
+        let press_action = handler.on_key(&mut ctx, 2, 0, wl_key_a, WL_KEY_PRESSED);
         assert_eq!(
-            release_action,
+            press_action,
             Action::Forward,
-            "release of key not in dropped_keys must be forwarded after re-bind"
+            "new press must be forwarded after re-bind"
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 0, wl_key_a, WL_KEY_RELEASED),
+            Action::Forward,
+            "release paired with the new forwarded press must be forwarded"
         );
     }
 
@@ -1982,7 +2794,11 @@ mod tests {
             "ZCR_EXTENDED_KEYBOARD_DESTROY constant out of sync with generated protocol"
         );
         assert_eq!(
-            ExtKbReq::AckKey { serial: 0, handled: 0 }.opcode(),
+            ExtKbReq::AckKey {
+                serial: 0,
+                handled: 0
+            }
+            .opcode(),
             ZCR_EXTENDED_KEYBOARD_ACK_KEY,
             "ZCR_EXTENDED_KEYBOARD_ACK_KEY constant out of sync with generated protocol"
         );
@@ -2014,7 +2830,8 @@ mod tests {
         let ctrl_mask = 1 << keymap.mod_get_index("Control");
         handler.on_modifiers(&mut ctx, 0, ctrl_mask, 0, 0, 0);
         ctx.host_keyboard_extension_id = Some(HostId(99));
-        ctx.keyboard_to_extended_keyboard.insert(HostId(5), HostId(50));
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(5), HostId(50));
         ctx.last_sender_id = 5;
         let action = handler.on_key(&mut ctx, 1, 0, wl_key_a, WL_KEY_PRESSED);
         assert_eq!(action, Action::Drop);
@@ -2043,6 +2860,41 @@ mod tests {
             Action::Drop,
             "accelerator must work after fresh modifiers arrive"
         );
+    }
+
+    #[test]
+    fn keymap_reload_preserves_forwarded_key_release_pairing() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new(false, false);
+        ctx.last_sender_id = 5;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let wl_key_a =
+            find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found in keymap");
+
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 0, wl_key_a, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert!(ctx.keyboard_forwarded_keys[&HostId(5)].contains(&wl_key_a));
+
+        // A compositor may resend the keymap while the key remains held.
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+        assert!(
+            ctx.keyboard_forwarded_keys[&HostId(5)].contains(&wl_key_a),
+            "keymap replacement must retain the outstanding forwarded press"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 0, wl_key_a, WL_KEY_RELEASED),
+            Action::Forward,
+            "the release matching a pre-reload press must still be forwarded"
+        );
+        assert!(!ctx
+            .keyboard_forwarded_keys
+            .get(&HostId(5))
+            .is_some_and(|keys| keys.contains(&wl_key_a)));
     }
 
     /// Regression: on_release must reset modifiers to 0 so a re-bound keyboard
@@ -2106,11 +2958,435 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_release_ends_focus_when_no_other_keyboard_owns_the_seat() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_seat = 7;
+        let host_seat = 70;
+        let guest_keyboard = 5;
+        let host_keyboard = 50;
+        let guest_surface = 21;
+        let host_surface = 210;
+        let guest_text_input = 40;
+        let host_text_input = 400;
+
+        ctx.shadow_table.map_id(guest_seat, host_seat);
+        ctx.shadow_table
+            .track_interface(guest_seat, "wl_seat".to_string());
+        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+        ctx.shadow_table
+            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+        ctx.shadow_table.map_id(guest_surface, host_surface);
+        ctx.shadow_table
+            .track_interface(guest_surface, "wl_surface".to_string());
+        ctx.shadow_table.map_id(guest_text_input, host_text_input);
+        ctx.shadow_table.track_interface_with_version(
+            guest_text_input,
+            "zwp_text_input_v3".to_string(),
+            1,
+        );
+        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboard_active_surfaces
+            .insert(HostId(host_keyboard), guest_surface);
+        ctx.active_surface_for_seat
+            .insert(guest_seat, guest_surface);
+        ctx.text_inputs.insert(
+            guest_text_input,
+            crate::state::TextInputState {
+                host_v1_id: 401,
+                host_ext_id: None,
+                guest_seat,
+                active_surface: Some(guest_surface),
+                pending_enabled: false,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: None,
+                committed_surrounding_text: None,
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: "한".to_string(),
+                guest_commit_serial: 1,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: Vec::new(),
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: false,
+                host_activated: true,
+            },
+        );
+
+        ctx.last_sender_id = guest_keyboard;
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert!(
+            !ctx.active_surface_for_seat.contains_key(&guest_seat),
+            "keyboard release must not leave a stale seat focus"
+        );
+        assert_eq!(
+            ctx.text_inputs[&guest_text_input].active_surface, None,
+            "keyboard release must send text-input leave when it owns seat focus"
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            1,
+            "keyboard release must queue exactly one v3 leave"
+        );
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            1,
+            "keyboard release must deactivate the host v1 input"
+        );
+    }
+
+    #[test]
+    fn keyboard_release_keeps_focus_owned_by_another_keyboard() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_seat = 7;
+        let guest_surface = 21;
+        let guest_keyboard = 5;
+        let host_keyboard = 50;
+        let other_guest_keyboard = 6;
+        let other_host_keyboard = 60;
+        let guest_text_input = 40;
+
+        ctx.shadow_table.map_id(guest_seat, 70);
+        ctx.shadow_table
+            .track_interface(guest_seat, "wl_seat".to_string());
+        ctx.shadow_table.map_id(guest_surface, 210);
+        ctx.shadow_table
+            .track_interface(guest_surface, "wl_surface".to_string());
+        for (guest_keyboard_id, host_keyboard_id) in [
+            (guest_keyboard, host_keyboard),
+            (other_guest_keyboard, other_host_keyboard),
+        ] {
+            ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+            ctx.shadow_table
+                .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
+            ctx.keyboard_active_surfaces
+                .insert(HostId(host_keyboard_id), guest_surface);
+        }
+        ctx.shadow_table.map_id(guest_text_input, 400);
+        ctx.shadow_table.track_interface_with_version(
+            guest_text_input,
+            "zwp_text_input_v3".to_string(),
+            1,
+        );
+        ctx.active_surface_for_seat
+            .insert(guest_seat, guest_surface);
+        ctx.text_inputs.insert(
+            guest_text_input,
+            crate::state::TextInputState {
+                host_v1_id: 401,
+                host_ext_id: None,
+                guest_seat,
+                active_surface: Some(guest_surface),
+                pending_enabled: false,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: None,
+                committed_surrounding_text: None,
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: "한".to_string(),
+                guest_commit_serial: 1,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: Vec::new(),
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: false,
+                host_activated: true,
+            },
+        );
+
+        ctx.last_sender_id = guest_keyboard;
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert_eq!(
+            ctx.active_surface_for_seat.get(&guest_seat),
+            Some(&guest_surface)
+        );
+        assert_eq!(
+            ctx.text_inputs[&guest_text_input].active_surface,
+            Some(guest_surface)
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert!(ctx
+            .keyboard_active_surfaces
+            .contains_key(&HostId(other_host_keyboard)));
+    }
+
+    #[test]
+    fn keyboard_release_does_not_cancel_another_keyboard_ime_repeat() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_seat = 7;
+        let guest_surface = 21;
+        let guest_keyboard = 5;
+        let host_keyboard = 50;
+        let other_guest_keyboard = 6;
+        let other_host_keyboard = 60;
+        let guest_text_input = 40;
+
+        ctx.shadow_table.map_id(guest_seat, 70);
+        ctx.shadow_table
+            .track_interface(guest_seat, "wl_seat".to_string());
+        ctx.shadow_table.map_id(guest_surface, 210);
+        ctx.shadow_table
+            .track_interface(guest_surface, "wl_surface".to_string());
+        for (guest_keyboard_id, host_keyboard_id) in [
+            (guest_keyboard, host_keyboard),
+            (other_guest_keyboard, other_host_keyboard),
+        ] {
+            ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+            ctx.shadow_table
+                .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
+            ctx.keyboard_active_surfaces
+                .insert(HostId(host_keyboard_id), guest_surface);
+        }
+        ctx.shadow_table.map_id(guest_text_input, 400);
+        ctx.shadow_table.track_interface_with_version(
+            guest_text_input,
+            "zwp_text_input_v3".to_string(),
+            1,
+        );
+        ctx.active_surface_for_seat
+            .insert(guest_seat, guest_surface);
+        ctx.keyboard_pressed_keys.insert(
+            HostId(other_host_keyboard),
+            [EVDEV_KEY_BACKSPACE].into_iter().collect(),
+        );
+        ctx.keyboard_backspace_repeat_cancelled
+            .insert(HostId(other_host_keyboard));
+        ctx.text_inputs.insert(
+            guest_text_input,
+            crate::state::TextInputState {
+                host_v1_id: 401,
+                host_ext_id: None,
+                guest_seat,
+                active_surface: Some(guest_surface),
+                pending_enabled: false,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: None,
+                committed_surrounding_text: None,
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: "한".to_string(),
+                guest_commit_serial: 1,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: Vec::new(),
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: true,
+                host_activated: true,
+            },
+        );
+
+        ctx.last_sender_id = guest_keyboard;
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert!(ctx
+            .keyboard_pressed_keys
+            .get(&HostId(other_host_keyboard))
+            .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE)));
+        assert!(ctx
+            .keyboard_backspace_repeat_cancelled
+            .contains(&HostId(other_host_keyboard)));
+        assert!(ctx.text_inputs[&guest_text_input].empty_preedit_repeat_active);
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn keyboard_release_after_seat_release_does_not_deactivate_destroyed_host_seat() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_seat = 7;
+        let host_seat = 70;
+        let guest_keyboard = 5;
+        let host_keyboard = 50;
+        let guest_surface = 21;
+
+        ctx.shadow_table.map_id(guest_seat, host_seat);
+        ctx.shadow_table
+            .track_interface(guest_seat, "wl_seat".to_string());
+        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+        ctx.shadow_table
+            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+        ctx.shadow_table.map_id(guest_surface, 210);
+        ctx.shadow_table
+            .track_interface(guest_surface, "wl_surface".to_string());
+        ctx.shadow_table.map_id(40, 400);
+        ctx.shadow_table
+            .track_interface_with_version(40, "zwp_text_input_v3".to_string(), 1);
+        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboard_active_surfaces
+            .insert(HostId(host_keyboard), guest_surface);
+        ctx.active_surface_for_seat
+            .insert(guest_seat, guest_surface);
+        ctx.text_inputs.insert(
+            40,
+            crate::state::TextInputState {
+                host_v1_id: 401,
+                host_ext_id: None,
+                guest_seat,
+                active_surface: Some(guest_surface),
+                pending_enabled: false,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: None,
+                committed_surrounding_text: None,
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: String::new(),
+                guest_commit_serial: 1,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: Vec::new(),
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: false,
+                host_activated: true,
+            },
+        );
+
+        // Parent seat release has already invalidated the host seat proxy.
+        ctx.shadow_table.mark_pending_destroy(guest_seat);
+        ctx.last_sender_id = guest_keyboard;
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "do not send v1 deactivate through a released host seat"
+        );
+        assert!(!ctx.text_inputs[&40].host_activated);
+    }
+
+    #[test]
+    fn keyboard_release_invalidates_all_same_seat_text_inputs_and_delayed_leave_is_not_duplicate() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_seat = 7;
+        let guest_keyboard = 5;
+        let host_keyboard = 50;
+        let released_surface = 21;
+        let delayed_host_surface = 210;
+        let other_surface = 22;
+
+        ctx.shadow_table.map_id(guest_seat, 70);
+        ctx.shadow_table
+            .track_interface(guest_seat, "wl_seat".to_string());
+        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+        ctx.shadow_table
+            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+        for (guest_surface, host_surface) in [
+            (released_surface, delayed_host_surface),
+            (other_surface, 220),
+        ] {
+            ctx.shadow_table.map_id(guest_surface, host_surface);
+            ctx.shadow_table
+                .track_interface(guest_surface, "wl_surface".to_string());
+        }
+        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboard_active_surfaces
+            .insert(HostId(host_keyboard), released_surface);
+        ctx.active_surface_for_seat
+            .insert(guest_seat, released_surface);
+
+        for (guest_text_input, active_surface) in [
+            (40, Some(released_surface)),
+            (41, Some(other_surface)),
+            (42, None),
+        ] {
+            ctx.shadow_table
+                .map_id(guest_text_input, guest_text_input + 400);
+            ctx.shadow_table.track_interface_with_version(
+                guest_text_input,
+                "zwp_text_input_v3".to_string(),
+                1,
+            );
+            ctx.text_inputs.insert(
+                guest_text_input,
+                crate::state::TextInputState {
+                    host_v1_id: guest_text_input + 500,
+                    host_ext_id: None,
+                    guest_seat,
+                    active_surface,
+                    pending_enabled: false,
+                    committed_enabled: true,
+                    enabled_dirty: false,
+                    pending_surrounding_text: None,
+                    committed_surrounding_text: None,
+                    surrounding_text_dirty: false,
+                    content_hint: 0,
+                    content_purpose: 0,
+                    content_type_dirty: false,
+                    cursor_rect: None,
+                    cursor_rect_dirty: false,
+                    text_change_cause: 0,
+                    current_preedit: String::new(),
+                    guest_commit_serial: 1,
+                    pending_preedit_cursor: None,
+                    pending_preedit_selection: None,
+                    pending_deletes: Vec::new(),
+                    pending_cursor_position: None,
+                    empty_preedit_repeat_active: false,
+                    host_activated: true,
+                },
+            );
+        }
+
+        ctx.last_sender_id = guest_keyboard;
+        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        assert!(ctx
+            .text_inputs
+            .values()
+            .all(|state| state.active_surface.is_none()));
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            2,
+            "only focused text inputs should receive leave events"
+        );
+
+        let guest_queue_len = ctx.host_to_client_queue.len();
+        let host_queue_len = ctx.client_to_host_queue.len();
+        ctx.last_sender_id = host_keyboard;
+        assert_eq!(
+            handler.on_leave(&mut ctx, 1, delayed_host_surface),
+            Action::Forward
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), guest_queue_len);
+        assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
+    }
+
+    #[test]
     fn keyboard_enter_invalidates_stale_text_input_before_new_enable() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.map_id(5, 10);
         ctx.keyboard_to_seat.insert(5, 7);
+        // Text-input v1 activation needs a real host-side wl_seat mapping.
+        // The keyboard route above identifies guest seat 7, so model the
+        // corresponding host seat as well.
+        ctx.shadow_table.map_id(7, 2);
+        ctx.shadow_table.track_interface(7, "wl_seat".to_string());
         ctx.shadow_table.map_id(20, 30);
         ctx.text_inputs.insert(
             40,
@@ -2169,10 +3445,6 @@ mod tests {
             .entry(HostId(10))
             .or_default()
             .insert(EVDEV_KEY_BACKSPACE);
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
         ctx.last_sender_id = 10;
         assert_eq!(
             handler.on_key(&mut ctx, 2, 10, 30, WL_KEY_PRESSED),
@@ -2184,10 +3456,30 @@ mod tests {
             .contains(&HostId(10)));
         assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
 
+        ctx.last_sender_id = 10;
+        // The previous physical Backspace session ended before the new
+        // transaction.  Its release clears the cancellation marker; the
+        // following press is the newly-held physical key that the IME
+        // fallback is allowed to consume.
+        assert_eq!(
+            handler.on_key(&mut ctx, 5, 13, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert!(!ctx
+            .keyboard_pressed_keys
+            .get(&HostId(10))
+            .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE)));
         ctx.text_inputs
             .get_mut(&40)
             .unwrap()
             .empty_preedit_repeat_active = true;
+        ctx.extended_keyboard_to_keyboard
+            .insert(HostId(100), HostId(10));
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 6, 14, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Drop
+        );
         ctx.last_sender_id = 10;
         assert_eq!(
             handler.on_key(&mut ctx, 3, 11, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
@@ -2198,11 +3490,234 @@ mod tests {
             handler.on_key(&mut ctx, 4, 12, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
             Action::Drop
         );
-        assert!(
-            !ctx.keyboard_pressed_keys
-                .get(&HostId(10))
-                .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE))
-        );
+        assert!(!ctx
+            .keyboard_pressed_keys
+            .get(&HostId(10))
+            .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE)));
         assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+    }
+
+    #[test]
+    fn stale_leave_does_not_end_current_seat_backspace_repeat() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.shadow_table.map_id(21, 31);
+        ctx.active_surface_for_seat.insert(7, 20);
+        add_active_text_input(&mut ctx, 40, 7, 50);
+        let state = ctx.text_inputs.get_mut(&40).expect("text input");
+        state.active_surface = Some(20);
+        state.empty_preedit_repeat_active = true;
+
+        // The old keyboard object reports leave for surface 21 after surface
+        // 20 is already focused. This event must not tear down seat-level IME
+        // state or send a v3 leave for the current focus.
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 31), Action::Forward);
+        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert!(ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "stale leave must not emit a text-input leave"
+        );
+
+        // A matching leave still ends the fallback and clears focus.
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 2, 30), Action::Forward);
+        assert!(!ctx.active_surface_for_seat.contains_key(&7));
+        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+    }
+
+    #[test]
+    fn mapped_stale_leave_clears_old_keyboard_state_without_disturbing_new_focus() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+
+        // Keyboard A is leaving its old surface while keyboard B already owns
+        // a different current surface on the same seat. The leave is mapped
+        // (unlike the destroyed-surface case below), so this ordering must
+        // still retire A's physical/IME state before returning.
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        map_keyboard(&mut ctx, 6, 11, 51, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.shadow_table.map_id(21, 31);
+        ctx.active_surface_for_seat.insert(7, 21);
+        ctx.keyboard_active_surfaces.insert(HostId(10), 20);
+        ctx.keyboard_active_surfaces.insert(HostId(11), 21);
+        ctx.keyboard_pressed_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
+        ctx.keyboard_event_times.insert(HostId(10), 123);
+        ctx.keyboard_ime_suppressed_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        ctx.keyboard_forwarded_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        ctx.keyboard_keysym_forwarded_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        handler
+            .dropped_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        handler.modifiers.insert(HostId(10), 0xdead_beef);
+
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 30), Action::Forward);
+
+        assert!(
+            !ctx.keyboard_active_surfaces.contains_key(&HostId(10)),
+            "the stale keyboard's focus association must be retired"
+        );
+        assert_eq!(
+            ctx.keyboard_active_surfaces.get(&HostId(11)),
+            Some(&21),
+            "the other keyboard's current focus must remain intact"
+        );
+        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&21));
+        assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(10)));
+        assert!(!ctx
+            .keyboard_backspace_repeat_cancelled
+            .contains(&HostId(10)));
+        assert!(!ctx.keyboard_event_times.contains_key(&HostId(10)));
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(10)));
+        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(10)));
+        assert!(!ctx.keyboard_keysym_forwarded_keys.contains_key(&HostId(10)));
+        assert!(!handler.dropped_keys.contains_key(&HostId(10)));
+        assert!(!handler.modifiers.contains_key(&HostId(10)));
+    }
+
+    #[test]
+    fn unmapped_leave_does_not_clear_live_keyboard_focus_state() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.active_surface_for_seat.insert(7, 20);
+        ctx.keyboard_active_surfaces.insert(HostId(10), 20);
+        ctx.keyboard_pressed_keys
+            .entry(HostId(10))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+        add_active_text_input(&mut ctx, 40, 7, 60);
+        ctx.text_inputs
+            .get_mut(&40)
+            .expect("text input")
+            .active_surface = Some(20);
+
+        // Surface 999 was already unmapped from the guest, but the seat has a
+        // live focused surface. A delayed leave for the old surface must not
+        // tear down the current keyboard session.
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
+        assert!(ctx
+            .keyboard_pressed_keys
+            .get(&HostId(10))
+            .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE)));
+        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn unmapped_leave_clears_focus_when_destroyed_surface_was_current() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        add_active_text_input(&mut ctx, 40, 7, 60);
+        ctx.active_surface_for_seat.insert(7, 20);
+        ctx.text_inputs
+            .get_mut(&40)
+            .expect("text input")
+            .active_surface = Some(20);
+
+        // Surface 20 was destroyed before the host leave event arrived, so
+        // its host→guest mapping is gone and the leave carries no valid guest
+        // object ID. The seat focus must still be retired to avoid leaving
+        // text-input-v3 active on a dead surface.
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
+        assert!(!ctx.active_surface_for_seat.contains_key(&7));
+        assert!(ctx.text_inputs[&40].active_surface.is_none());
+        assert!(!ctx.text_inputs[&40].host_activated);
+    }
+
+    #[test]
+    fn delayed_enter_for_pending_destroy_surface_does_not_revive_focus() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+
+        // Model a live keyboard and a surface whose guest destroy request has
+        // already been queued. The shadow mapping is intentionally retained
+        // until host wl_display.delete_id so that a delayed host event can
+        // still be translated; that event must not make the dead surface
+        // current again.
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.shadow_table
+            .track_interface(20, "wl_surface".to_string());
+        ctx.shadow_table.mark_pending_destroy(20);
+        assert!(ctx.shadow_table.is_pending_destroy_guest(20));
+
+        ctx.last_sender_id = 10;
+        assert_eq!(
+            handler.on_enter(&mut ctx, 1, 30, &[]),
+            Action::Drop,
+            "the stale event must not be forwarded to the guest"
+        );
+
+        assert!(
+            !ctx.keyboard_active_surfaces.contains_key(&HostId(10)),
+            "a delayed enter must not register a destroyed surface on the keyboard"
+        );
+        assert!(
+            !ctx.active_surface_for_seat.contains_key(&7),
+            "a delayed enter must not revive seat IME focus for a destroyed surface"
+        );
+    }
+
+    #[test]
+    fn unmapped_leave_clears_stale_keyboard_state_when_another_keyboard_is_focused() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+
+        // Keyboard A held Backspace on a surface that was destroyed. Keyboard
+        // B subsequently owns the same seat and a live surface. A's delayed
+        // leave is unmapped; it must retire A's per-keyboard state without
+        // disturbing B's focus or physical key state.
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        map_keyboard(&mut ctx, 6, 11, 51, 7);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.active_surface_for_seat.insert(7, 20);
+        ctx.keyboard_active_surfaces.insert(HostId(11), 20);
+        ctx.keyboard_pressed_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
+        ctx.keyboard_ime_suppressed_keys
+            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+
+        ctx.last_sender_id = 10;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
+
+        assert!(
+            !ctx.keyboard_pressed_keys.contains_key(&HostId(10)),
+            "stale keyboard A pressed state must be retired"
+        );
+        assert!(
+            !ctx.keyboard_backspace_repeat_cancelled
+                .contains(&HostId(10)),
+            "stale keyboard A repeat marker must be retired"
+        );
+        assert!(
+            !ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(10)),
+            "stale keyboard A IME marker must be retired"
+        );
+        assert!(
+            ctx.keyboard_active_surfaces.get(&HostId(11)) == Some(&20),
+            "keyboard B's focus must remain active"
+        );
+        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert!(
+            !crate::handler::text_input::backspace_pressed_for_seat(&ctx, 7),
+            "a dead keyboard must not keep the seat's Backspace fallback armed"
+        );
     }
 }

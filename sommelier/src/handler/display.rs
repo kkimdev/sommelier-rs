@@ -21,6 +21,103 @@ use log::error;
 
 pub struct DisplayHandler;
 
+/// Report a fatal protocol error against a guest object.
+///
+/// Wayland errors are fatal for the client session. Callers must mark the
+/// context as fatal as well; the proxy flushes this queued event before
+/// closing the session so the client receives the diagnostic.
+pub(crate) fn queue_protocol_error(
+    ctx: &mut Context,
+    object_id: u32,
+    code: u32,
+    message: impl AsRef<str>,
+) {
+    // Whether or not the diagnostic itself fits in the Wayland wire limit,
+    // the malformed request is fatal and must terminate the session.
+    ctx.fatal_protocol_error = true;
+    // The error event itself is subject to Wayland's 16-bit message-length
+    // limit. A client-controlled interface name or diagnostic can otherwise
+    // make the proxy drop the diagnostic while still tearing down the
+    // connection. Keep a useful bounded prefix and preserve UTF-8 validity.
+    const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+    let message = message.as_ref();
+    let diagnostic = if message.len() <= MAX_DIAGNOSTIC_BYTES {
+        message
+    } else {
+        let mut end = MAX_DIAGNOSTIC_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        &message[..end]
+    };
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(object_id);
+    builder.write_u32(code);
+    builder.write_string(diagnostic);
+    let _ = queue_message(
+        &mut ctx.host_to_client_queue,
+        1,
+        wl_display::EVT_ERROR,
+        builder,
+    );
+}
+
+/// Queue a local `wl_display.delete_id` event for a guest object.
+///
+/// Proxy-local objects such as the v3 text-input manager do not have a host
+/// object that can acknowledge their destructor. Their handlers call the
+/// local wrapper below after cleaning local state so the guest observes the
+/// same lifecycle as it would for a compositor-owned object.
+pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
+    if ctx.shadow_table.get_interface(guest_id).is_none() {
+        return false;
+    }
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(guest_id);
+    queue_message(
+        &mut ctx.host_to_client_queue,
+        1,
+        wl_display::EVT_DELETE_ID,
+        builder,
+    )
+}
+
+/// Retire a synthetic guest object and queue its local delete acknowledgement.
+///
+/// The object must not have a host mapping. Mapped guest objects backed by a
+/// host protocol without a destructor use [`queue_guest_delete_id`] followed
+/// by `ShadowTable::remove_guest_mapping` so the host-side reservation remains
+/// alive for stale-event suppression.
+pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
+    if ctx.shadow_table.get_interface(guest_id).is_some()
+        && ctx.shadow_table.get_host_id(guest_id).is_none()
+        && queue_guest_delete_id(ctx, guest_id)
+    {
+        ctx.shadow_table.remove_id(guest_id);
+    }
+}
+
+fn queue_message(
+    queue: &mut Vec<(Vec<u8>, Vec<std::os::unix::io::RawFd>)>,
+    sender_id: u32,
+    opcode: u16,
+    builder: MessageBuilder,
+) -> bool {
+    match builder.try_build_message(sender_id, opcode) {
+        Ok(message) => {
+            queue.push((message, Vec::new()));
+            true
+        }
+        Err(error) => {
+            error!(
+                "Dropping display message sender={} opcode={}: {}",
+                sender_id, opcode, error
+            );
+            false
+        }
+    }
+}
+
 impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
         let host_registry_id = ctx.shadow_table.allocate_host_id();
@@ -32,14 +129,12 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         let mut builder = MessageBuilder::new();
         builder.write_u32(host_registry_id);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&1u32.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (wl_display::REQ_GET_REGISTRY as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.client_to_host_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.client_to_host_queue,
+            1,
+            wl_display::REQ_GET_REGISTRY,
+            builder,
+        );
 
         Action::Drop
     }
@@ -54,19 +149,23 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         let mut builder = MessageBuilder::new();
         builder.write_u32(host_callback_id);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&1u32.to_ne_bytes());
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (wl_display::REQ_SYNC as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.client_to_host_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.client_to_host_queue,
+            1,
+            wl_display::REQ_SYNC,
+            builder,
+        );
 
         Action::Drop
     }
 
     fn on_delete_id(&mut self, ctx: &mut Context, id: u32) -> Action {
+        if ctx.shadow_table.consume_host_delete_id(id) {
+            // Internal host-only objects have no guest object ID. Consume
+            // their destructor acknowledgement locally instead of emitting an
+            // invalid delete_id(0) event to the guest.
+            return Action::Drop;
+        }
         let guest_id = ctx.shadow_table.get_guest_id(id).unwrap_or(0);
         if guest_id != 0 {
             ctx.shadow_table.remove_id(guest_id);
@@ -75,14 +174,12 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             let mut builder = MessageBuilder::new();
             builder.write_u32(guest_id);
 
-            let mut full_msg = Vec::new();
-            full_msg.extend_from_slice(&1u32.to_ne_bytes()); // wl_display is ID 1
-            let len = (builder.payload.len() + 8) as u32;
-            let word2 = (len << 16) | (wl_display::EVT_DELETE_ID as u32);
-            full_msg.extend_from_slice(&word2.to_ne_bytes());
-            full_msg.extend_from_slice(&builder.payload);
-
-            ctx.host_to_client_queue.push((full_msg, Vec::new()));
+            queue_message(
+                &mut ctx.host_to_client_queue,
+                1,
+                wl_display::EVT_DELETE_ID,
+                builder,
+            );
         }
         Action::Drop
     }
@@ -94,7 +191,17 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         code: u32,
         message: &String,
     ) -> Action {
-        let guest_id = ctx.shadow_table.get_guest_id(object_id).unwrap_or(0);
+        let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
+            // wl_display.error.object_id is a non-null object argument. An
+            // internal host-only object has no valid guest ID; forwarding 0
+            // would make the guest receive an invalid Wayland error event and
+            // can trigger a secondary protocol error in its display parser.
+            error!(
+                "Dropping host display error for unmapped object_id={} (code={})",
+                object_id, code
+            );
+            return Action::Drop;
+        };
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
@@ -105,15 +212,95 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         builder.write_u32(code);
         builder.write_string(message);
 
-        let mut full_msg = Vec::new();
-        full_msg.extend_from_slice(&1u32.to_ne_bytes()); // wl_display is ID 1
-        let len = (builder.payload.len() + 8) as u32;
-        let word2 = (len << 16) | (wl_display::EVT_ERROR as u32);
-        full_msg.extend_from_slice(&word2.to_ne_bytes());
-        full_msg.extend_from_slice(&builder.payload);
-
-        ctx.host_to_client_queue.push((full_msg, Vec::new()));
+        queue_message(
+            &mut ctx.host_to_client_queue,
+            1,
+            wl_display::EVT_ERROR,
+            builder,
+        );
 
         Action::Drop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
+    use crate::state::Context;
+    use crate::wire::{ProtocolError, WireMessage};
+
+    struct ProbeHandler;
+
+    impl WlDisplayHandler for ProbeHandler {
+        fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
+            ctx.synthetic_keyboard_serial = 99;
+            Action::Drop
+        }
+    }
+
+    #[test]
+    fn unmapped_request_is_rejected_before_handler_state_mutation() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let payload = 20u32.to_ne_bytes();
+        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload, &[]);
+        let mut handler = ProbeHandler;
+
+        assert_eq!(
+            wl_display::dispatch_request(&mut msg, &mut handler, &mut ctx),
+            Err(ProtocolError::InvalidObjectId(999))
+        );
+        assert_eq!(
+            ctx.synthetic_keyboard_serial, 0,
+            "an invalid sender must not reach a mutating handler"
+        );
+    }
+
+    #[test]
+    fn unmapped_host_error_is_not_encoded_with_invalid_object_zero() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut handler = DisplayHandler;
+
+        assert_eq!(
+            handler.on_error(&mut ctx, 77, 3, &"internal error".to_string()),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "an unmapped host-only object must not produce wl_display.error"
+        );
+    }
+
+    #[test]
+    fn oversized_host_error_is_dropped_before_wire_encoding() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(7, 77);
+        let mut handler = DisplayHandler;
+
+        assert_eq!(
+            handler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520)),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "a host-supplied error string must not wrap the 16-bit wire length"
+        );
+    }
+
+    #[test]
+    fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        queue_protocol_error(&mut ctx, 7, 3, "x".repeat(65_520));
+
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            1,
+            "fatal validation must still deliver a display.error event"
+        );
+        assert!(
+            ctx.host_to_client_queue[0].0.len() <= 0xffff,
+            "the bounded diagnostic must fit Wayland's message length field"
+        );
     }
 }

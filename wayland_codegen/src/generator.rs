@@ -61,6 +61,7 @@ pub fn generate(protocol: &Protocol) -> String {
             #![allow(clippy::too_many_arguments)]
             #![allow(clippy::type_complexity)]
             #![allow(clippy::single_match)]
+            #![allow(clippy::collapsible_match)]
 
             use std::os::unix::io::RawFd;
             use crate::wire::{WireMessage, MessageBuilder, Action, ProtocolError};
@@ -133,7 +134,11 @@ fn map_type(arg: &Arg) -> TokenStream {
     match arg.typ.as_str() {
         "int" => quote! { i32 },
         "uint" => quote! { u32 },
-        "fixed" => quote! { f32 },
+        // Keep wl_fixed_t in its raw signed 24.8 representation. A float
+        // round-trip can lose low bits while proxying an otherwise opaque
+        // protocol value.
+        "fixed" => quote! { i32 },
+        "string" if arg.allow_null.unwrap_or(false) => quote! { Option<String> },
         "string" => quote! { String },
         "object" => quote! { u32 },
         "new_id" => {
@@ -163,6 +168,7 @@ fn map_read_fn(arg: &Arg) -> TokenStream {
         "int" => quote! { msg.read_i32()? },
         "uint" => quote! { msg.read_u32()? },
         "fixed" => quote! { msg.read_fixed()? },
+        "string" if arg.allow_null.unwrap_or(false) => quote! { msg.read_nullable_string()? },
         "string" => quote! { msg.read_string()? },
         "object" => quote! { msg.read_u32()? },
         "new_id" => {
@@ -194,6 +200,9 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
             }
         }
         "fixed" => quote! { builder.write_fixed(#name) },
+        "string" if arg.allow_null.unwrap_or(false) => {
+            quote! { builder.write_nullable_string(#name.as_deref()) }
+        }
         "string" => quote! { builder.write_string(&#name) },
         "array" => quote! { builder.write_array(&#name) },
         "fd" => quote! { builder.write_fd(#name) },
@@ -236,6 +245,8 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 let decodes = generate_reads(&req.items);
                 let field_names = generate_field_names(&req.items);
+                let request_validations = generate_request_validations(&req.items);
+                let request_version_validation = generate_version_validation(req.since, false);
                 request_decoders.push(quote! {
                     #req_idx => {
                         #decodes
@@ -264,6 +275,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                 for arg_item in &req.items {
                     if let MessageItem::Arg(arg) = arg_item {
                         let name = sanitize_ident(&arg.name);
+                        let arg_name_str = &arg.name;
                         field_names_list.push(name.clone());
 
                         if arg.typ == "string"
@@ -280,11 +292,20 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                 let is_nullable = arg.allow_null.unwrap_or(false);
                                 if is_nullable {
                                     mapping_and_writing.push(quote! {
-                                        let host_id = ctx.shadow_table.get_host_id(#name).unwrap_or(0);
+                                        let host_id = if #name == 0 {
+                                            0
+                                        } else if let Some(id) = ctx.shadow_table.get_host_id(#name) {
+                                            id
+                                        } else {
+                                            log::debug!(
+                                                "Dropping request due to missing mapping for nullable argument {}",
+                                                #arg_name_str
+                                            );
+                                            return Ok(None);
+                                        };
                                         builder.write_u32(host_id);
                                     });
                                 } else {
-                                    let arg_name_str = &arg.name;
                                     let req_name_str = &req.name;
                                     mapping_and_writing.push(quote! {
                                         let host_id = if let Some(id) = ctx.shadow_table.get_host_id(#name) {
@@ -300,9 +321,18 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
                                     mapping_and_writing.push(quote! {
+                                        let object_version = ctx
+                                            .shadow_table
+                                            .guest_object_version(msg.sender_id)
+                                            .unwrap_or(u32::MAX);
                                         let host_id = ctx.shadow_table.allocate_host_id();
                                         ctx.shadow_table.map_id(#name, host_id);
-                                        ctx.shadow_table.track_interface(#name, #interface_name.to_string());
+                                        ctx.shadow_table.track_interface_with_version(
+                                            #name,
+                                            #interface_name.to_string(),
+                                            object_version,
+                                        );
+                                        ctx.shadow_table.set_host_version(host_id, object_version);
                                         builder.write_u32(host_id);
                                     });
                                 } else {
@@ -312,7 +342,12 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                         builder.write_u32(version);
                                         let host_id = ctx.shadow_table.allocate_host_id();
                                         ctx.shadow_table.map_id(id, host_id);
-                                        ctx.shadow_table.track_interface(id, interface_name.clone());
+                                        ctx.shadow_table.track_interface_with_version(
+                                            id,
+                                            interface_name.clone(),
+                                            version,
+                                        );
+                                        ctx.shadow_table.set_host_version(host_id, version);
                                         builder.write_u32(host_id);
                                     });
                                 }
@@ -327,27 +362,54 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 let is_destructor = req.msg_type.as_deref() == Some("destructor");
                 let destructor_cleanup = if is_destructor {
-                    quote! { ctx.shadow_table.remove_id(msg.sender_id); }
+                    quote! { ctx.shadow_table.mark_pending_destroy(msg.sender_id); }
+                } else {
+                    quote! {}
+                };
+                let local_destructor_cleanup = if is_destructor {
+                    quote! {
+                        if is_local_only {
+                            crate::handler::display::queue_local_delete_id(ctx, msg.sender_id);
+                        }
+                    }
                 } else {
                     quote! {}
                 };
 
                 dispatch_request_arms.push(quote! {
                     Request::#var_name { #(#field_names_list),* } => {
-                        if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
+                        if ctx.shadow_table.is_pending_destroy_guest(msg.sender_id) {
+                            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
+                        }
+                        #request_version_validation
+                        #(#request_validations)*
+                        let host_sender_id = ctx.shadow_table.get_host_id(msg.sender_id);
+                        if host_sender_id.is_none()
+                            && !ctx.shadow_table.is_local_only_guest_object(msg.sender_id)
+                        {
+                            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
+                        }
+                        let is_local_only = host_sender_id.is_none()
+                            && ctx.shadow_table.is_local_only_guest_object(msg.sender_id);
+                        let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
+                        if handler_action == Action::Forward {
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
-                            let host_sender_id = ctx.shadow_table.get_host_id(msg.sender_id).unwrap_or(0);
-                            let mut full_msg = Vec::new();
-                            full_msg.extend_from_slice(&host_sender_id.to_ne_bytes());
-                            let len = (builder.payload.len() + 8) as u32;
-                            let word2 = (len << 16) | (#req_idx as u32);
-                            full_msg.extend_from_slice(&word2.to_ne_bytes());
-                            full_msg.extend_from_slice(&builder.payload);
+                            let Some(host_sender_id) = host_sender_id else {
+                                log::debug!(
+                                    "Dropping request from unmapped sender {}",
+                                    msg.sender_id
+                                );
+                                #local_destructor_cleanup
+                                return Ok(None);
+                            };
+                            let full_msg =
+                                builder.try_build_message(host_sender_id, #req_idx)?;
                             #destructor_cleanup
                             return Ok(Some((full_msg, builder.fds)));
                         }
+                        #local_destructor_cleanup
                     }
                 });
 
@@ -363,6 +425,8 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 let decodes = generate_reads(&evt.items);
                 let field_names = generate_field_names(&evt.items);
+                let event_validations = generate_event_validations(&evt.items);
+                let event_version_validation = generate_version_validation(evt.since, true);
                 event_decoders.push(quote! {
                     #evt_idx => {
                         #decodes
@@ -391,6 +455,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                 for arg_item in &evt.items {
                     if let MessageItem::Arg(arg) = arg_item {
                         let name = sanitize_ident(&arg.name);
+                        let arg_name_str = &arg.name;
                         field_names_list.push(name.clone());
 
                         if arg.typ == "string"
@@ -407,11 +472,20 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                 let is_nullable = arg.allow_null.unwrap_or(false);
                                 if is_nullable {
                                     mapping_and_writing.push(quote! {
-                                        let guest_id = ctx.shadow_table.get_guest_id(#name).unwrap_or(0);
+                                        let guest_id = if #name == 0 {
+                                            0
+                                        } else if let Some(id) = ctx.shadow_table.get_guest_id(#name) {
+                                            id
+                                        } else {
+                                            log::debug!(
+                                                "Dropping event due to missing mapping for nullable argument {}",
+                                                #arg_name_str
+                                            );
+                                            return Ok(None);
+                                        };
                                         builder.write_u32(guest_id);
                                     });
                                 } else {
-                                    let arg_name_str = &arg.name;
                                     let evt_name_str = &evt.name;
                                     mapping_and_writing.push(quote! {
                                         let guest_id = if let Some(id) = ctx.shadow_table.get_guest_id(#name) {
@@ -427,9 +501,19 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
                                     mapping_and_writing.push(quote! {
-                                        ctx.shadow_table.map_id(#name, #name);
-                                        ctx.shadow_table.track_interface(#name, #interface_name.to_string());
-                                        builder.write_u32(#name);
+                                        let object_version = ctx
+                                            .shadow_table
+                                            .host_object_version(msg.sender_id)
+                                            .unwrap_or(u32::MAX);
+                                        let guest_id = ctx.shadow_table.allocate_guest_server_id();
+                                        ctx.shadow_table.map_id(guest_id, #name);
+                                        ctx.shadow_table.track_interface_with_version(
+                                            guest_id,
+                                            #interface_name.to_string(),
+                                            object_version,
+                                        );
+                                        ctx.shadow_table.set_host_version(#name, object_version);
+                                        builder.write_u32(guest_id);
                                     });
                                 } else {
                                     mapping_and_writing.push(quote! {
@@ -448,7 +532,6 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                 let is_destructor = evt.msg_type.as_deref() == Some("destructor");
                 let destructor_cleanup = if is_destructor {
                     quote! {
-                        let guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id).unwrap_or(0);
                         ctx.shadow_table.remove_id(guest_sender_id);
                     }
                 } else {
@@ -457,17 +540,30 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 dispatch_event_arms.push(quote! {
                     Event::#var_name { #(#field_names_list),* } => {
+                        #event_version_validation
+                        #(#event_validations)*
+                        // Capture the paired guest sender before invoking the
+                        // handler. A custom handler may retire the mapping
+                        // while consuming or translating an event; forwarding
+                        // must still use the ID that addressed the event on
+                        // the wire, and destructor cleanup must remove that
+                        // same object rather than looking it up again.
+                        let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
                         if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
-                            let guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id).unwrap_or(0);
-                            let mut full_msg = Vec::new();
-                            full_msg.extend_from_slice(&guest_sender_id.to_ne_bytes());
-                            let len = (builder.payload.len() + 8) as u32;
-                            let word2 = (len << 16) | (#evt_idx as u32);
-                            full_msg.extend_from_slice(&word2.to_ne_bytes());
-                            full_msg.extend_from_slice(&builder.payload);
+                            let guest_sender_id = if let Some(id) = mapped_guest_sender_id {
+                                id
+                            } else {
+                                log::debug!(
+                                    "Dropping event from unmapped sender {}",
+                                    msg.sender_id
+                                );
+                                return Ok(None);
+                            };
+                            let full_msg =
+                                builder.try_build_message(guest_sender_id, #evt_idx)?;
                             #destructor_cleanup
                             return Ok(Some((full_msg, builder.fds)));
                         }
@@ -554,6 +650,13 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                 handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+                if !ctx.shadow_table.is_event_sender_known(msg.sender_id) {
+                    log::debug!(
+                        "Dropping event from untracked host sender {}",
+                        msg.sender_id
+                    );
+                    return Ok(None);
+                }
                 let evt = Event::from_wire(msg)?;
                 match evt {
                     #(#dispatch_event_arms)*
@@ -639,6 +742,168 @@ fn generate_reads(items: &[MessageItem]) -> TokenStream {
         }
     }
     quote! { #(#statements)* }
+}
+
+/// Generate the object-version guard required by Wayland's `since`
+/// attribute. Requests use the guest object's negotiated version, while
+/// events use the host object's version.
+fn generate_version_validation(since: Option<u32>, host_to_guest: bool) -> TokenStream {
+    let Some(required) = since else {
+        return quote! {};
+    };
+
+    let lookup = if host_to_guest {
+        quote! { ctx.shadow_table.host_object_version(msg.sender_id) }
+    } else {
+        quote! { ctx.shadow_table.guest_object_version(msg.sender_id) }
+    };
+
+    quote! {
+        let object_version = #lookup
+            .ok_or(ProtocolError::InvalidObjectId(msg.sender_id))?;
+        if object_version < #required {
+            return Err(ProtocolError::UnsupportedVersion {
+                object_id: msg.sender_id,
+                required: #required,
+                actual: object_version,
+            });
+        }
+    }
+}
+
+/// Generate pre-handler validation for IDs supplied by a guest request.
+///
+/// Wayland clients own the IDs in requests. A repeated, null, or
+/// server-reserved ID is a protocol error and must not be allowed to overwrite
+/// an existing shadow-table entry. Object arguments are checked here as well so
+/// an unknown non-null object cannot later be silently translated to 0.
+fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
+    let mut validations = Vec::new();
+    for item in items {
+        let MessageItem::Arg(arg) = item else {
+            continue;
+        };
+        let name = sanitize_ident(&arg.name);
+        match arg.typ.as_str() {
+            "new_id" => {
+                let id = if arg.interface.is_none() {
+                    quote! { #name.2 }
+                } else {
+                    quote! { #name }
+                };
+                validations.push(quote! {
+                    if !ctx.shadow_table.is_guest_id_available(#id) {
+                        return Err(ProtocolError::InvalidObjectId(#id));
+                    }
+                });
+            }
+            "object" => {
+                let is_nullable = arg.allow_null.unwrap_or(false);
+                if let Some(interface) = &arg.interface {
+                    if is_nullable {
+                        validations.push(quote! {
+                            if #name != 0
+                                && (ctx.shadow_table.is_pending_destroy_guest(#name)
+                                    || !ctx.shadow_table.guest_object_matches(#name, #interface)
+                                    || ctx.shadow_table.get_host_id(#name).is_none())
+                            {
+                                return Err(ProtocolError::InvalidObjectId(#name));
+                            }
+                        });
+                    } else {
+                        validations.push(quote! {
+                            if ctx.shadow_table.is_pending_destroy_guest(#name)
+                                || !ctx.shadow_table.guest_object_matches(#name, #interface)
+                                || ctx.shadow_table.get_host_id(#name).is_none()
+                            {
+                                return Err(ProtocolError::InvalidObjectId(#name));
+                            }
+                        });
+                    }
+                } else if is_nullable {
+                    validations.push(quote! {
+                        if #name != 0
+                            && (ctx.shadow_table.is_pending_destroy_guest(#name)
+                                || ctx.shadow_table.get_host_id(#name).is_none())
+                        {
+                            return Err(ProtocolError::InvalidObjectId(#name));
+                        }
+                    });
+                } else {
+                    validations.push(quote! {
+                        if ctx.shadow_table.is_pending_destroy_guest(#name)
+                            || ctx.shadow_table.get_host_id(#name).is_none()
+                        {
+                            return Err(ProtocolError::InvalidObjectId(#name));
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    validations
+}
+
+/// Generate validation for IDs carried by a host event. A host-generated
+/// object is handled by the event mapping code below, while object arguments
+/// must already refer to a known host object before the handler runs.
+fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
+    let mut validations = Vec::new();
+    for item in items {
+        let MessageItem::Arg(arg) = item else {
+            continue;
+        };
+        let name = sanitize_ident(&arg.name);
+        match arg.typ.as_str() {
+            "new_id" if arg.interface.is_some() => {
+                validations.push(quote! {
+                    if !ctx.shadow_table.is_host_id_available(#name) {
+                        return Err(ProtocolError::InvalidObjectId(#name));
+                    }
+                });
+            }
+            "object" => {
+                let is_nullable = arg.allow_null.unwrap_or(false);
+                if let Some(interface) = &arg.interface {
+                    if is_nullable {
+                        validations.push(quote! {
+                            if #name != 0
+                                && (ctx.shadow_table.is_pending_destroy_host(#name)
+                                    || !ctx.shadow_table.host_object_matches(#name, #interface)
+                                    || ctx.shadow_table.get_guest_id(#name).is_none())
+                            {
+                                return Ok(None);
+                            }
+                        });
+                    } else {
+                        validations.push(quote! {
+                            if ctx.shadow_table.is_pending_destroy_host(#name)
+                                || !ctx.shadow_table.host_object_matches(#name, #interface)
+                                || ctx.shadow_table.get_guest_id(#name).is_none()
+                            {
+                                return Ok(None);
+                            }
+                        });
+                    }
+                } else if is_nullable {
+                    validations.push(quote! {
+                        if #name != 0 && ctx.shadow_table.get_guest_id(#name).is_none() {
+                            return Ok(None);
+                        }
+                    });
+                } else {
+                    validations.push(quote! {
+                        if ctx.shadow_table.get_guest_id(#name).is_none() {
+                            return Ok(None);
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    validations
 }
 
 fn generate_field_names(items: &[MessageItem]) -> TokenStream {

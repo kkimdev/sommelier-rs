@@ -10,8 +10,16 @@
 //   cargo test -p sommelier-test-gui                  # run tests
 
 use eframe::egui;
-use egui::{Event, ImeEvent, RawInput, Rgba, TextEdit, Ui, ViewportBuilder, ViewportCommand};
+use egui::{
+    Event, FontData, FontDefinitions, FontFamily, ImeEvent, RawInput, Rgba, TextEdit, Ui,
+    ViewportBuilder, ViewportCommand,
+};
 use std::time::{Duration, Instant};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const WINDOW_WIDTH: f32 = 800.0;
 const WINDOW_HEIGHT: f32 = 600.0;
@@ -20,6 +28,15 @@ const BG_DARK: f32 = 0.12;
 const TEXT_EDIT_ROWS: usize = 10;
 const UI_SPACING: f32 = 8.0;
 const TEXT_EDIT_ID: &str = "ime-text-field";
+const KOREAN_FONT_ENV: &str = "SOMMELIER_TEST_GUI_FONT";
+
+const KOREAN_FONT_PATHS: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-VF.otf.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic-Regular.ttf",
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -46,7 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Sommelier IME Test",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            install_korean_font(&cc.egui_ctx).map_err(|error| {
+                Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, error))
+                    as Box<dyn std::error::Error + Send + Sync>
+            })?;
             Ok(Box::new(App {
                 text: String::new(),
                 auto_exit,
@@ -57,6 +78,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     Ok(())
+}
+
+/// Add a Korean-capable system font as the last-resort egui fallback.
+///
+/// egui's bundled fonts intentionally stay small and do not contain Hangul.
+/// The sample app is specifically used to inspect Korean IME commits, so
+/// silently rendering tofu boxes would make a successful input test look
+/// broken.  `SOMMELIER_TEST_GUI_FONT` can point at a font in a packaged
+/// environment; otherwise use the common Noto/Nanum locations.
+fn install_korean_font(ctx: &egui::Context) -> Result<PathBuf, String> {
+    let font_path = korean_font_path()?;
+    let font_bytes = fs::read(&font_path).map_err(|error| {
+        format!(
+            "failed to read Korean font {}: {error}",
+            font_path.display()
+        )
+    })?;
+
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "korean-ime".to_owned(),
+        Arc::new(FontData::from_owned(font_bytes)),
+    );
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("korean-ime".to_owned());
+    }
+    ctx.set_fonts(fonts);
+    log::info!("Registered Korean IME test font: {}", font_path.display());
+    Ok(font_path)
+}
+
+fn korean_font_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os(KOREAN_FONT_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "{KOREAN_FONT_ENV} points to a missing file: {}",
+            path.display()
+        ));
+    }
+
+    let mut candidates: Vec<PathBuf> = KOREAN_FONT_PATHS.iter().map(PathBuf::from).collect();
+    if let Some(home) = env::var_os("HOME") {
+        let home = Path::new(&home);
+        candidates.push(home.join(".nix-profile/share/fonts/truetype/NanumGothic-Regular.ttf"));
+        candidates.push(home.join(".local/share/fonts/NanumGothic-Regular.ttf"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "no Korean-capable font found; install Noto/Nanum or set \
+                 {KOREAN_FONT_ENV} to a .ttf/.otf/.ttc file"
+            )
+        })
 }
 
 struct App {
@@ -216,6 +301,22 @@ mod tests {
 
     fn key_event(key: Key, pressed: bool) -> Event {
         key_event_with_repeat(key, pressed, false)
+    }
+
+    #[test]
+    fn korean_font_candidates_cover_standard_installations() {
+        assert!(
+            KOREAN_FONT_PATHS
+                .iter()
+                .any(|path| path.contains("NotoSansCJK")),
+            "Noto CJK fallback must remain supported"
+        );
+        assert!(
+            KOREAN_FONT_PATHS
+                .iter()
+                .any(|path| path.contains("NanumGothic")),
+            "Nanum fallback must remain supported"
+        );
     }
 
     // ── IME Commit flows ────────────────────────────────────────────────

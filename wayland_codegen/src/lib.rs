@@ -67,5 +67,64 @@ mod tests {
         assert!(code.contains("const REQ_SYNC"));
         assert!(code.contains("pub enum Request"));
         assert!(code.contains("fn from_wire"));
+        assert!(
+            code.contains("allocate_guest_server_id"),
+            "host-generated new_id events must allocate a guest server ID"
+        );
+        assert!(
+            code.contains("map_id(guest_id, id)"),
+            "generated host-generated new_id events must map guest IDs to host IDs"
+        );
+        assert!(
+            code.contains("mark_pending_destroy(msg.sender_id)"),
+            "generated destructor requests must retain mappings until host delete_id"
+        );
+        assert!(
+            code.contains("queue_local_delete_id"),
+            "generated local-only destructors must synthesize a guest delete_id"
+        );
+    }
+
+    #[test]
+    fn test_generate_nullable_strings_without_collapsing_null_to_empty() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path =
+            manifest_dir.join("../third_party/protocols/text-input-unstable-v3.xml");
+        let protocol = parse(protocol_path).expect("Failed to parse text-input-unstable-v3.xml");
+        let code = generator::generate(&protocol);
+
+        assert!(
+            code.contains("text: Option<String>"),
+            "nullable protocol strings must use Option<String> in generated messages"
+        );
+        assert!(
+            code.contains("msg.read_nullable_string()?"),
+            "nullable protocol strings must use the nullable wire decoder"
+        );
+        assert!(
+            code.contains("builder.write_nullable_string(text.as_deref())"),
+            "nullable protocol strings must preserve a null wire value when forwarded"
+        );
+    }
+
+    #[test]
+    fn test_generate_since_version_guards() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path = manifest_dir.join("../third_party/protocols/xdg-shell.xml");
+        let protocol = parse(protocol_path).expect("Failed to parse xdg-shell.xml");
+        let code = generator::generate(&protocol);
+
+        assert!(
+            code.contains("guest_object_version(msg.sender_id)"),
+            "generated requests must check the negotiated guest object version"
+        );
+        assert!(
+            code.contains("host_object_version(msg.sender_id)"),
+            "generated events must check the negotiated host object version"
+        );
+        assert!(
+            code.contains("ProtocolError::UnsupportedVersion"),
+            "version failures must be reported as protocol errors"
+        );
     }
 }

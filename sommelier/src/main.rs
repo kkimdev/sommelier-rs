@@ -63,7 +63,12 @@ struct Args {
     #[arg(long)]
     local_compositor: Option<String>,
 
-    /// Enable GPU acceleration (virtio-gpu). Currently broken in this branch!
+    /// Enable GPU acceleration (virtio-gpu).
+    ///
+    /// The GBM-to-host path is intentionally disabled until the proxy can
+    /// submit PRIME buffers through linux-dmabuf. Treating a PRIME fd as a
+    /// wl_shm pool fd is invalid and can make the host compositor mmap the
+    /// wrong object.
     #[arg(long, hide = true, default_value_t = false)]
     gpu_accel: bool,
 
@@ -80,11 +85,6 @@ struct Args {
     display: String,
 }
 
-// SAFETY INVARIANT for `unsafe impl Send for KeyboardHandler` (keyboard.rs):
-// KeyboardHandler holds xkb::Context/Keymap/State which are !Send. The impl is
-// sound only when client tasks are never migrated across OS threads. We enforce
-// this by using a single-threaded Tokio runtime — all tasks run on one thread,
-// so no cross-thread migration can occur.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
@@ -103,6 +103,12 @@ async fn main() {
 
     if virtio_wl.is_some() && gpu_accel {
         log::error!("--virtio-wl and --gpu-accel cannot be used together");
+        return;
+    }
+    if gpu_accel {
+        log::error!(
+            "--gpu-accel is not available yet: PRIME buffers require a linux-dmabuf host path"
+        );
         return;
     }
 

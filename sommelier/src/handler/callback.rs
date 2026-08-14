@@ -37,25 +37,21 @@ impl WlCallbackHandler for CallbackHandler {
             let mut builder = MessageBuilder::new();
             builder.write_u32(callback_data);
 
-            let mut done_msg = Vec::new();
-            done_msg.extend_from_slice(&guest_id.to_ne_bytes());
-            let len = (builder.payload.len() + 8) as u32;
-            let word2 = (len << 16) | (protocols::wayland::wl_callback::EVT_DONE as u32);
-            done_msg.extend_from_slice(&word2.to_ne_bytes());
-            done_msg.extend_from_slice(&builder.payload);
-            ctx.host_to_client_queue.push((done_msg, Vec::new()));
+            if let Ok(done_msg) =
+                builder.try_build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE)
+            {
+                ctx.host_to_client_queue.push((done_msg, Vec::new()));
+            }
 
             // 2. Send delete_id to client
             let mut builder2 = MessageBuilder::new();
             builder2.write_u32(guest_id);
 
-            let mut del_msg = Vec::new();
-            del_msg.extend_from_slice(&1u32.to_ne_bytes()); // wl_display
-            let len = (builder2.payload.len() + 8) as u32;
-            let word2 = (len << 16) | (protocols::wayland::wl_display::EVT_DELETE_ID as u32);
-            del_msg.extend_from_slice(&word2.to_ne_bytes());
-            del_msg.extend_from_slice(&builder2.payload);
-            ctx.host_to_client_queue.push((del_msg, Vec::new()));
+            if let Ok(del_msg) =
+                builder2.try_build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
+            {
+                ctx.host_to_client_queue.push((del_msg, Vec::new()));
+            }
 
             // 3. Remove from shadow table
             ctx.shadow_table.remove_id(guest_id);
