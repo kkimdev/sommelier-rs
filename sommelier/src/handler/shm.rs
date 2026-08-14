@@ -145,12 +145,38 @@ pub(crate) fn record_host_shm_format(ctx: &mut Context, format: u32) {
     }
 }
 
+pub(crate) fn record_host_shm_wl_format(ctx: &mut Context, format: u32) {
+    if supported_shm_format(format) {
+        ctx.host_wl_shm_formats.insert(format);
+    }
+    record_host_shm_format(ctx, format);
+}
+
 /// Record a format reported by the internal host dmabuf object. ChromiumOS
 /// uses those events as the capability source when the virtwl channel exposes
 /// dmabuf-backed SHM buffers.
 pub(crate) fn record_host_shm_drm_format(ctx: &mut Context, format: u32) {
     if let Some(shm_format) = shm_format_from_drm(format) {
+        ctx.host_dmabuf_shm_formats.insert(shm_format);
         record_host_shm_format(ctx, shm_format);
+    }
+}
+
+pub(crate) fn clear_host_shm_wl_formats(ctx: &mut Context) {
+    let removed = std::mem::take(&mut ctx.host_wl_shm_formats);
+    for format in removed {
+        if !ctx.host_dmabuf_shm_formats.contains(&format) {
+            ctx.host_shm_formats.remove(&format);
+        }
+    }
+}
+
+pub(crate) fn clear_host_shm_dmabuf_formats(ctx: &mut Context) {
+    let removed = std::mem::take(&mut ctx.host_dmabuf_shm_formats);
+    for format in removed {
+        if !ctx.host_wl_shm_formats.contains(&format) {
+            ctx.host_shm_formats.remove(&format);
+        }
     }
 }
 
@@ -389,6 +415,29 @@ fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
     if page_size == 0 || !layout.offset0.is_multiple_of(page_size) {
         return None;
     }
+    // A successful mmap does not prove that a regular file is large enough:
+    // touching a page beyond EOF raises SIGBUS. DMA-BUF providers generally
+    // expose anon-inode descriptors without a useful st_size, so only enforce
+    // the check for regular files (including memfd objects).
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return None;
+    }
+    let file_type = (stat.st_mode as libc::mode_t) & libc::S_IFMT;
+    if stat.st_size < 0 {
+        return None;
+    }
+    // DMA-BUF anon-inode implementations differ in their mode bits, but
+    // several expose a positive st_size that is authoritative. Check every
+    // descriptor with a usable size; only a zero-sized non-regular provider
+    // has to rely on mmap as the final validation.
+    if file_type == libc::S_IFREG || stat.st_size > 0 {
+        let file_size = u64::try_from(stat.st_size).ok()?;
+        let required_size = u64::try_from(layout.span).ok()?;
+        if file_size < required_size {
+            return None;
+        }
+    }
     let map_size = layout.span - layout.offset0;
     let ptr = unsafe {
         libc::mmap(
@@ -567,6 +616,17 @@ fn allocate_gbm_buffer(
     // query failure as an allocation failure instead of silently labelling an
     // unknown/tiled BO as LINEAR (modifier 0).
     let modifier = bo.modifier().map(u64::from).map_err(io::Error::other)?;
+    if drm_format == WL_SHM_FORMAT_NV12 && modifier != 0 {
+        // The NV12 copy path maps the PRIME descriptor directly because GBM's
+        // single-plane map API does not promise that the UV plane is present.
+        // A tiled/compressed modifier would make those linear byte offsets
+        // incorrect even if mmap itself succeeds. Fall back to ordinary SHM
+        // allocation instead of presenting corrupted frames.
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("GBM returned non-linear NV12 modifier {modifier:#x}"),
+        ));
+    }
     let offset1 = offset0.checked_add(plane1_offset).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -924,7 +984,7 @@ fn cleanup_direct_dmabuf_failure(
     }
 }
 
-fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool {
+pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool {
     let builder = MessageBuilder::new();
     let queued = queue_message(
         &mut ctx.client_to_host_queue,
@@ -958,6 +1018,21 @@ fn surface_references_buffer(ctx: &Context, guest_id: u32) -> bool {
     !surfaces_referencing_buffer(ctx, guest_id).is_empty()
 }
 
+/// Return whether a buffer is attached to a surface but has not replaced that
+/// surface's currently committed buffer yet.  An attach is double-buffered:
+/// the host has already received it, and a later commit may still make it
+/// compositor-visible even if the guest destroys the wl_buffer in between.
+///
+/// This deliberately includes re-attaching the surface's current buffer.  The
+/// host cannot distinguish an attach that will be committed from one that will
+/// be replaced later, so destroying the guest object immediately could queue a
+/// host destructor before a valid pending commit.
+fn has_uncommitted_buffer_attach(ctx: &Context, guest_id: u32) -> bool {
+    ctx.surfaces
+        .values()
+        .any(|surface| surface.pending_buffer_id == Some(Some(guest_id)))
+}
+
 fn surfaces_referencing_buffer(ctx: &Context, guest_id: u32) -> HashSet<u32> {
     ctx.surfaces
         .iter()
@@ -969,8 +1044,14 @@ fn surfaces_referencing_buffer(ctx: &Context, guest_id: u32) -> HashSet<u32> {
         .collect()
 }
 
-/// Drop deferred SHM buffers once the host has released them and no surface
-/// still refers to their guest ID.
+/// Drop deferred SHM buffers once the host has released them and no pending
+/// attach can make them compositor-visible again.
+///
+/// `current_buffer_id` is intentionally retained until the next surface
+/// commit, so it can be stale after a release followed by `attach(NULL)` (or
+/// a replacement attach).  A release proves that the old compositor-use
+/// interval has ended; only a still-pending attach to the same buffer keeps
+/// the host object alive for a possible new interval.
 pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
     let referenced: std::collections::HashSet<u32> = ctx
         .surfaces
@@ -982,26 +1063,30 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
                 .chain(surface.pending_buffer_id.into_iter().flatten())
         })
         .collect();
-    let releasable: Vec<u32> = ctx
+    let releasable: Vec<(u32, u32)> = ctx
         .retired_buffers
         .iter()
         .filter_map(|(&guest_id, buffer)| {
-            (buffer.host_released && !referenced.contains(&guest_id)).then_some(guest_id)
+            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
+            (buffer.host_released && (!referenced.contains(&guest_id) || !pending_attach))
+                .then_some((guest_id, buffer.host_buffer_id))
         })
         .collect();
-    for guest_id in releasable {
+    for (guest_id, host_id) in releasable {
         ctx.retired_buffers.remove(&guest_id);
-        if !ctx.shadow_table.is_pending_destroy_guest(guest_id) {
-            ctx.shadow_table.remove_id(guest_id);
-        }
+        // Keep the guest↔host mapping reserved until the host acknowledges
+        // this destructor with wl_display.delete_id.
+        let _ = queue_host_buffer_destroy(ctx, host_id);
+        ctx.shadow_table.mark_pending_destroy(guest_id);
         ctx.submitted_buffers.remove(&guest_id);
     }
 }
 
-/// Drop retired SHM buffers whose only reference was a pending attach that
-/// has since been replaced or cleared. Such a buffer was never committed, so
-/// the host compositor will not send `wl_buffer.release`; queue its
-/// destructor after the replacement request instead of waiting forever.
+/// Drop retired SHM buffers whose only reference was a pending attach that has
+/// since been replaced or cleared. If the old compositor-use interval already
+/// released, the host destructor is safe immediately; otherwise only buffers
+/// that were never submitted (or are explicitly allowed after surface
+/// destruction) may be retired without waiting for `wl_buffer.release`.
 fn collect_retired_buffers_without_release(
     ctx: &mut Context,
     allow_submitted: Option<&std::collections::HashSet<u32>>,
@@ -1020,9 +1105,10 @@ fn collect_retired_buffers_without_release(
         .retired_buffers
         .iter()
         .filter_map(|(&guest_id, buffer)| {
-            (!buffer.host_released
-                && !referenced.contains(&guest_id)
+            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
+            ((!referenced.contains(&guest_id) || (buffer.host_released && !pending_attach))
                 && (!ctx.submitted_buffers.contains(&guest_id)
+                    || buffer.host_released
                     || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
             .then_some((guest_id, buffer.host_buffer_id))
         })
@@ -1037,6 +1123,23 @@ fn collect_retired_buffers_without_release(
 
 pub(crate) fn collect_uncommitted_retired_buffers(ctx: &mut Context) {
     collect_retired_buffers_without_release(ctx, None);
+}
+
+/// A surface destructor is ordered before any buffer destructors that follow
+/// it in the guest stream.  Once the destroyed surface is gone, a submitted
+/// marker is no longer needed for a buffer that no other surface references:
+/// if the guest destroys that buffer later, its host wl_buffer can be retired
+/// immediately even when the compositor does not emit a separate release for
+/// surface teardown.  Keep the marker while another surface still owns it.
+pub(crate) fn clear_submitted_buffers_after_surface_destroy(
+    ctx: &mut Context,
+    destroyed_surface_buffers: &HashSet<u32>,
+) {
+    for &guest_id in destroyed_surface_buffers {
+        if !surface_references_buffer(ctx, guest_id) {
+            ctx.submitted_buffers.remove(&guest_id);
+        }
+    }
 }
 
 /// Drop retired SHM buffers after their host surface was destroyed. The
@@ -1078,8 +1181,11 @@ fn collect_deferred_native_buffers_impl(
         .deferred_host_buffers
         .iter()
         .filter_map(|(&guest_id, &host_id)| {
-            (!referenced.contains(&guest_id)
+            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
+            ((!referenced.contains(&guest_id)
+                || (ctx.released_host_buffers.contains(&guest_id) && !pending_attach))
                 && (!ctx.submitted_buffers.contains(&guest_id)
+                    || ctx.released_host_buffers.contains(&guest_id)
                     || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
             .then_some((guest_id, host_id))
         })
@@ -1113,7 +1219,7 @@ pub(crate) fn collect_deferred_native_buffers_after_surface_destroy(
 impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
     fn on_format(&mut self, ctx: &mut Context, format: u32) -> Action {
         if ctx.host_shm_id == Some(ctx.last_sender_id) {
-            record_host_shm_format(ctx, format);
+            record_host_shm_wl_format(ctx, format);
             return Action::Drop;
         }
         Action::Forward
@@ -1190,6 +1296,17 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
 
         Action::Drop
+    }
+
+    fn on_release(&mut self, ctx: &mut Context) -> Action {
+        // Synthetic wl_shm is local-only. The generated dispatcher emits the
+        // guest delete_id after this handler returns, but it cannot know about
+        // the per-object capability cache. Clear it first so a later guest ID
+        // reuse cannot receive stale format events from this dead object.
+        let guest_id = ctx.last_sender_id;
+        ctx.shm_guest_formats.remove(&guest_id);
+        ctx.stale_shm_guest_objects.remove(&guest_id);
+        Action::Forward
     }
 }
 
@@ -1825,6 +1942,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         // client is allowed to destroy the wl_buffer in that interval; the
         // host surface still owns the attached host buffer and needs its local
         // SHM backing through the pending commit.
+        let uncommitted_attach = has_uncommitted_buffer_attach(ctx, guest_id);
         let still_referenced =
             ctx.submitted_buffers.contains(&guest_id) || surface_references_buffer(ctx, guest_id);
 
@@ -1834,13 +1952,17 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         // damage-only commit can dereference unmapped memory and the host
         // release event can be routed to a newly reused object ID.
         if let Some(mut buffer) = ctx.buffers.remove(&guest_id) {
-            if still_referenced && !buffer.host_released {
+            if still_referenced && (!buffer.host_released || uncommitted_attach) {
                 // Keep the host wl_buffer alive until its release event. A
                 // destroy request would remove the host resource before it
                 // can report release, leaving no compositor-use lifetime
                 // signal for the deferred mmap. The guest object and host
                 // object therefore have deliberately different destruction
-                // points.
+                // points.  If the previous interval was already released,
+                // retain that edge while a pending attach is unresolved;
+                // `on_commit` clears it when a new interval actually starts,
+                // while replacing the attach lets the collector destroy the
+                // host object immediately.
                 buffer.guest_buffer_id = guest_id;
                 ctx.retired_buffers.insert(guest_id, buffer);
                 ctx.shadow_table.retire_guest_object(guest_id);
@@ -1860,15 +1982,25 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             // A release may have arrived before the guest destroys the
             // wl_buffer. In that case the host has already completed its use
             // interval and no deferred lifetime signal remains to wait for.
-            let host_already_released = ctx.released_host_buffers.remove(&guest_id);
-            if still_referenced && !host_already_released {
+            let host_already_released = ctx.released_host_buffers.contains(&guest_id);
+            if still_referenced && (!host_already_released || uncommitted_attach) {
                 if let Some(host_id) = host_id {
                     ctx.deferred_host_buffers.insert(guest_id, host_id);
+                    // Keep a release edge that predates the unresolved
+                    // pending attach.  A later commit clears it and starts a
+                    // fresh use interval; replacing the attach allows the
+                    // collector to retire the already-idle host buffer.
+                    if host_already_released {
+                        ctx.released_host_buffers.insert(guest_id);
+                    }
                     ctx.shadow_table.retire_guest_object(guest_id);
                     return Action::Drop;
                 }
             } else if let Some(host_id) = host_id {
+                ctx.released_host_buffers.remove(&guest_id);
                 let _ = queue_host_buffer_destroy(ctx, host_id);
+            } else {
+                ctx.released_host_buffers.remove(&guest_id);
             }
             clear_surface_buffer_references(ctx, guest_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
@@ -1884,6 +2016,15 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         };
 
         if let Some(deferred_host_id) = ctx.deferred_host_buffers.remove(&guest_id) {
+            if has_uncommitted_buffer_attach(ctx, guest_id) {
+                // This release completes the previous compositor-use
+                // interval. Keep the deferred host object alive because the
+                // pending attach may still be committed; the collector uses
+                // this marker to retire it if the attach is replaced first.
+                ctx.released_host_buffers.insert(guest_id);
+                ctx.deferred_host_buffers.insert(guest_id, deferred_host_id);
+                return Action::Drop;
+            }
             // The guest object was destroyed before the host compositor
             // released a native dma-buf. Now that the release is the lifetime
             // signal, destroy the host proxy and retain its mapping until the
@@ -1897,6 +2038,17 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         }
 
         if ctx.retired_buffers.contains_key(&guest_id) {
+            if has_uncommitted_buffer_attach(ctx, guest_id) {
+                // The release belongs to the previous compositor-use
+                // interval. Keep the retired state and host object alive for
+                // the pending attach; on commit the state is reopened for a
+                // new interval, while replacing the attach lets the
+                // collectors queue the destructor.
+                if let Some(buffer) = ctx.retired_buffers.get_mut(&guest_id) {
+                    buffer.host_released = true;
+                }
+                return Action::Drop;
+            }
             // The guest object is already gone, so there is no valid object on
             // which to deliver the release event. It is nevertheless the
             // release that makes it safe to drop the deferred backing storage.
@@ -1954,8 +2106,9 @@ mod tests {
     use super::map_dmabuf;
     use super::ShmHandler;
     use super::{
-        backing_fd_has_size, collect_retired_buffers, copy_shm_damage, copy_shm_planes,
-        guest_shm_format_available, record_host_shm_drm_format, record_host_shm_format,
+        backing_fd_has_size, clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats,
+        collect_retired_buffers, copy_shm_damage, copy_shm_planes, guest_shm_format_available,
+        record_host_shm_drm_format, record_host_shm_format, record_host_shm_wl_format,
         register_guest_shm, release_temporary_host_pool, same_dma_buf_object, valid_buffer_layout,
         valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout,
         virtwl_allocation_size, DmabufLayout, WL_SHM_FORMAT_NV12,
@@ -1966,7 +2119,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::DamageRect;
     use crate::state::{BufferState, Context, PoolInner, PoolState};
-    use crate::wire::Action;
+    use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::sync::{Arc, RwLock};
 
@@ -2363,6 +2516,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_regular_dmabuf_backing_shorter_than_metadata() {
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+
+        let fd = memfd_create(
+            CString::new("sommelier-short-dmabuf").unwrap().as_c_str(),
+            MFdFlags::empty(),
+        )
+        .expect("memfd_create");
+        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
+
+        assert!(
+            map_dmabuf(
+                fd.as_raw_fd(),
+                DmabufLayout {
+                    stride0: 64,
+                    stride1: 0,
+                    offset0: 0,
+                    offset1: 0,
+                    span: 8192,
+                }
+            )
+            .is_none(),
+            "mmap preflight must reject a regular backing that would SIGBUS"
+        );
+    }
+
+    #[test]
     fn synthetic_shm_advertises_mandatory_formats_until_host_capabilities_arrive() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         register_guest_shm(&mut ctx, 20);
@@ -2398,6 +2579,98 @@ mod tests {
         assert!(guest_shm_format_available(&ctx, 0x3631_4752));
         let format = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
         assert_eq!(format, 0x3631_4752);
+    }
+
+    #[test]
+    fn synthetic_shm_release_clears_cache_before_guest_id_reuse() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_shm = 20;
+        let optional_format = 0x3631_4752;
+        ctx.host_shm_formats.insert(optional_format);
+        ctx.shadow_table
+            .track_interface_with_version(guest_shm, "wl_shm".to_string(), 2);
+        register_guest_shm(&mut ctx, guest_shm);
+        ctx.host_to_client_queue.clear();
+        ctx.stale_shm_guest_objects.insert(guest_shm);
+
+        let mut handler = ShmHandler;
+        ctx.last_sender_id = guest_shm;
+        let mut release = WireMessage::new(
+            guest_shm,
+            crate::protocols::wayland::wl_shm::REQ_RELEASE,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            crate::protocols::wayland::wl_shm::dispatch_request(
+                &mut release,
+                &mut handler,
+                &mut ctx
+            ),
+            Ok(None)
+        );
+        assert!(!ctx.shm_guest_formats.contains_key(&guest_shm));
+        assert!(!ctx.stale_shm_guest_objects.contains(&guest_shm));
+        assert!(ctx.shadow_table.get_interface(guest_shm).is_none());
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            1,
+            "local wl_shm.release must emit one guest delete_id"
+        );
+
+        // Reusing the same guest ID must behave like a fresh synthetic object.
+        ctx.shadow_table
+            .track_interface_with_version(guest_shm, "wl_shm".to_string(), 2);
+        register_guest_shm(&mut ctx, guest_shm);
+        ctx.host_to_client_queue.clear();
+        record_host_shm_format(&mut ctx, optional_format);
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "a capability already sent by the replacement object must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn source_separated_host_formats_survive_single_source_removal() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_shm = 20;
+        let format = 0x3631_4752;
+        register_guest_shm(&mut ctx, guest_shm);
+        ctx.host_to_client_queue.clear();
+
+        record_host_shm_wl_format(&mut ctx, format);
+        record_host_shm_drm_format(&mut ctx, format);
+        assert!(ctx.host_wl_shm_formats.contains(&format));
+        assert!(ctx.host_dmabuf_shm_formats.contains(&format));
+        assert!(ctx.host_shm_formats.contains(&format));
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+
+        ctx.host_to_client_queue.clear();
+        clear_host_shm_dmabuf_formats(&mut ctx);
+        assert!(
+            ctx.host_shm_formats.contains(&format),
+            "wl_shm remains a valid capability source"
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        clear_host_shm_wl_formats(&mut ctx);
+        assert!(!ctx.host_shm_formats.contains(&format));
+
+        record_host_shm_wl_format(&mut ctx, format);
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            0,
+            "an existing object must not receive a duplicate format event"
+        );
+        register_guest_shm(&mut ctx, guest_shm + 1);
+        assert!(
+            ctx.host_to_client_queue
+                .iter()
+                .any(
+                    |(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()) == format
+                ),
+            "a replacement synthetic object must receive the re-advertised format"
+        );
     }
 
     #[test]
@@ -2924,6 +3197,20 @@ mod tests {
             .host_released = true;
         collect_retired_buffers(&mut ctx);
         assert!(!ctx.retired_buffers.contains_key(&guest_buffer));
-        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
+        assert_eq!(
+            ctx.shadow_table.get_host_id(guest_buffer),
+            Some(host_buffer),
+            "the host mapping remains reserved until wl_display.delete_id"
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .any(
+                    |(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())
+                        == host_buffer
+                ),
+            "retiring a released buffer must queue its host destructor"
+        );
     }
 }

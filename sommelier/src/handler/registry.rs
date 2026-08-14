@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::register_guest_shm;
+use crate::handler::shm::{
+    clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
+};
 use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
@@ -215,6 +217,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         }
         ctx.host_dmabuf_global_name = None;
         ctx.supported_formats.clear();
+        clear_host_shm_dmabuf_formats(ctx);
     }
     if ctx.host_shm_global_name == Some(name) {
         if let Some(host_id) = ctx.host_shm_id.take() {
@@ -228,7 +231,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             .extend(ctx.shm_guest_formats.keys().copied());
         ctx.stale_shm_pools.extend(ctx.pools.keys().copied());
         ctx.host_shm_global_name = None;
-        ctx.host_shm_formats.clear();
+        clear_host_shm_wl_formats(ctx);
     }
     if ctx.host_text_input_manager_v1_global_name == Some(name) {
         // The v1 manager has no wire-level destructor.  `global_remove`

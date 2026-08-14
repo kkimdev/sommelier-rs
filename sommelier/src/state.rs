@@ -351,6 +351,17 @@ impl ShadowTable {
         self.pending_destroy_guest_ids.contains(&guest_id)
     }
 
+    /// Clear a guest destructor marker after the guest-side mapping has been
+    /// removed while a host-only reservation remains for a delayed event.
+    ///
+    /// This is narrower than [`remove_id`]: orphaned asynchronous
+    /// linux-dmabuf params can acknowledge their guest `delete_id` before
+    /// emitting `created`/`failed`, so their host interface metadata must stay
+    /// registered until that final event is consumed.
+    pub fn clear_pending_destroy_guest(&mut self, guest_id: u32) {
+        self.pending_destroy_guest_ids.remove(&guest_id);
+    }
+
     pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
         self.host_to_guest
             .get(&host_id)
@@ -860,6 +871,11 @@ pub struct Context {
     /// event. The key is the guest params object ID; the event handler moves
     /// the value to `native_buffer_sizes` under the host-created buffer ID.
     pub pending_native_buffer_sizes: HashMap<u32, (i32, i32)>,
+    /// Async linux-dmabuf params objects whose guest destructor was sent
+    /// before the host emitted `created`/`failed`. The key is the host params
+    /// ID, which may outlive the guest mapping when the host acknowledges the
+    /// params destructor first.
+    pub orphaned_dmabuf_params: HashMap<u32, u32>,
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
@@ -900,6 +916,13 @@ pub struct Context {
     /// the wl_shm contract; optional formats are added only after the host
     /// advertises them.
     pub host_shm_formats: HashSet<u32>,
+    /// Optional formats learned from the internal host wl_shm binding.
+    /// Keeping the source separate lets a dmabuf global disappear without
+    /// invalidating a format that the host's real wl_shm object still offers.
+    pub host_wl_shm_formats: HashSet<u32>,
+    /// Optional formats learned from the internal host linux-dmabuf binding.
+    /// These are removed when that binding's global is withdrawn.
+    pub host_dmabuf_shm_formats: HashSet<u32>,
     /// Formats already sent to each synthetic guest wl_shm object. Keeping
     /// this per object prevents duplicate format events when host capability
     /// events arrive after a guest bind.
@@ -1059,6 +1082,7 @@ impl Context {
             released_host_buffers: HashSet::new(),
             native_buffer_sizes: HashMap::new(),
             pending_native_buffer_sizes: HashMap::new(),
+            orphaned_dmabuf_params: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),
@@ -1080,6 +1104,8 @@ impl Context {
             host_keyboard_extension_global_name: None,
             host_zaura_shell_global_name: None,
             host_shm_formats: HashSet::new(),
+            host_wl_shm_formats: HashSet::new(),
+            host_dmabuf_shm_formats: HashSet::new(),
             shm_guest_formats: HashMap::new(),
             stale_shm_guest_objects: HashSet::new(),
             stale_shm_pools: HashSet::new(),

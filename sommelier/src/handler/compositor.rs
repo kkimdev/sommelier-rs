@@ -478,6 +478,48 @@ fn queue_surface_commit(ctx: &mut Context, surface_id: u32) {
     ctx.client_to_host_queue.push((message, Vec::new()));
 }
 
+#[derive(Clone, Copy)]
+struct SurfaceCommitRollback {
+    pending_buffer_id: Option<Option<u32>>,
+    previous_buffer_id: Option<u32>,
+    previous_buffer_scale: i32,
+    previous_buffer_transform: i32,
+    previous_offset: (i32, i32),
+    previous_viewport: Option<ViewportState>,
+    pending_buffer_scale: Option<i32>,
+    pending_buffer_transform: Option<i32>,
+    pending_offset: Option<(i32, i32)>,
+    pending_attach_offset: Option<(i32, i32)>,
+    pending_viewport: Option<Option<ViewportState>>,
+}
+
+fn restore_failed_surface_commit(
+    ctx: &mut Context,
+    surface_id: u32,
+    rollback: SurfaceCommitRollback,
+    surface_damage: Vec<DamageRect>,
+    buffer_damage: Vec<DamageRect>,
+) {
+    let Some(surface_state) = ctx.surfaces.get_mut(&surface_id) else {
+        return;
+    };
+    if rollback.pending_buffer_id.is_some() {
+        surface_state.current_buffer_id = rollback.previous_buffer_id;
+        surface_state.pending_buffer_id = rollback.pending_buffer_id;
+    }
+    surface_state.current_buffer_scale = rollback.previous_buffer_scale;
+    surface_state.current_buffer_transform = rollback.previous_buffer_transform;
+    surface_state.current_offset = rollback.previous_offset;
+    surface_state.viewport = rollback.previous_viewport;
+    surface_state.pending_buffer_scale = rollback.pending_buffer_scale;
+    surface_state.pending_buffer_transform = rollback.pending_buffer_transform;
+    surface_state.pending_offset = rollback.pending_offset;
+    surface_state.pending_attach_offset = rollback.pending_attach_offset;
+    surface_state.pending_viewport = rollback.pending_viewport;
+    surface_state.pending_surface_damage = surface_damage;
+    surface_state.pending_buffer_damage = buffer_damage;
+}
+
 impl WlSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let wl_surface_guest_id = ctx.last_sender_id;
@@ -541,6 +583,10 @@ impl WlSurfaceHandler for CompositorHandler {
             ctx.client_to_host_queue.push((message, Vec::new()));
         }
         ctx.surfaces.remove(&ctx.last_sender_id);
+        crate::handler::shm::clear_submitted_buffers_after_surface_destroy(
+            ctx,
+            &destroyed_surface_buffers,
+        );
         // Pending-only objects do not receive a host release event. This
         // collector is safe even without a host surface mapping because it
         // only handles buffers that were never submitted.
@@ -662,20 +708,6 @@ impl WlSurfaceHandler for CompositorHandler {
         // reset a previously committed wl_surface.offset.
         let legacy_attach_offset =
             object_version.is_none_or(|version| version < 5 || version == u32::MAX);
-        if buffer != 0 {
-            // A host release completes one compositor-use interval for native
-            // linux-dmabuf buffers too. Attaching the same wl_buffer starts a
-            // new interval, so do not let the previous release make a later
-            // guest destroy tear down the host resource before this attach is
-            // committed and released.
-            ctx.released_host_buffers.remove(&buffer);
-            if let Some(buffer_state) = ctx.buffers.get_mut(&buffer) {
-                // A release completes one compositor-use interval. Reusing
-                // the same wl_buffer starts a new interval and must clear the
-                // old marker before it is submitted again.
-                buffer_state.host_released = false;
-            }
-        }
         if buffer != 0 && legacy_attach_offset {
             surface_state.pending_attach_offset = Some((x, y));
         }
@@ -770,42 +802,92 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
         let surface_id = ctx.last_sender_id;
 
-        let (pending_buffer_id, surface_damage, buffer_damage, full_mapping) = ctx
-            .surfaces
-            .get_mut(&surface_id)
-            .map_or((None, Vec::new(), Vec::new(), false), |surface_state| {
-                if let Some(buffer_id) = surface_state.pending_buffer_id.take() {
-                    surface_state.current_buffer_id = buffer_id;
-                }
-                if let Some(scale) = surface_state.pending_buffer_scale.take() {
-                    surface_state.current_buffer_scale = scale;
-                }
-                if let Some(transform) = surface_state.pending_buffer_transform.take() {
-                    surface_state.current_buffer_transform = transform;
-                }
-                let explicit_offset = surface_state.pending_offset.take();
-                let attach_offset = surface_state.pending_attach_offset.take();
-                if let Some(offset) = explicit_offset {
-                    surface_state.current_offset = offset;
-                } else if let Some(offset) = attach_offset {
-                    surface_state.current_offset = offset;
-                }
-                if let Some(viewport) = surface_state.pending_viewport.take() {
-                    surface_state.viewport = viewport;
-                }
-                let full_mapping = surface_state.current_buffer_scale != 1
-                    || surface_state.current_buffer_transform != 0
-                    || surface_state.current_offset != (0, 0)
-                    || surface_state
-                        .viewport
-                        .is_some_and(|viewport| !viewport.is_identity());
+        let (rollback, surface_damage, buffer_damage, full_mapping) =
+            ctx.surfaces.get_mut(&surface_id).map_or(
                 (
-                    surface_state.current_buffer_id,
-                    std::mem::take(&mut surface_state.pending_surface_damage),
-                    std::mem::take(&mut surface_state.pending_buffer_damage),
-                    full_mapping,
-                )
-            });
+                    SurfaceCommitRollback {
+                        pending_buffer_id: None,
+                        previous_buffer_id: None,
+                        previous_buffer_scale: 1,
+                        previous_buffer_transform: 0,
+                        previous_offset: (0, 0),
+                        previous_viewport: None,
+                        pending_buffer_scale: None,
+                        pending_buffer_transform: None,
+                        pending_offset: None,
+                        pending_attach_offset: None,
+                        pending_viewport: None,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                ),
+                |surface_state| {
+                    let pending_buffer_id = surface_state.pending_buffer_id.take();
+                    let previous_buffer_id = surface_state.current_buffer_id;
+                    let previous_buffer_scale = surface_state.current_buffer_scale;
+                    let previous_buffer_transform = surface_state.current_buffer_transform;
+                    let previous_offset = surface_state.current_offset;
+                    let previous_viewport = surface_state.viewport;
+                    if let Some(buffer_id) = pending_buffer_id {
+                        surface_state.current_buffer_id = buffer_id;
+                    }
+                    let pending_buffer_scale = surface_state.pending_buffer_scale.take();
+                    if let Some(scale) = pending_buffer_scale {
+                        surface_state.current_buffer_scale = scale;
+                    }
+                    let pending_buffer_transform = surface_state.pending_buffer_transform.take();
+                    if let Some(transform) = pending_buffer_transform {
+                        surface_state.current_buffer_transform = transform;
+                    }
+                    let pending_offset = surface_state.pending_offset.take();
+                    let pending_attach_offset = surface_state.pending_attach_offset.take();
+                    if let Some(offset) = pending_offset {
+                        surface_state.current_offset = offset;
+                    } else if let Some(offset) = pending_attach_offset {
+                        surface_state.current_offset = offset;
+                    }
+                    let pending_viewport = surface_state.pending_viewport.take();
+                    if let Some(viewport) = pending_viewport {
+                        surface_state.viewport = viewport;
+                    }
+                    let full_mapping = surface_state.current_buffer_scale != 1
+                        || surface_state.current_buffer_transform != 0
+                        || surface_state.current_offset != (0, 0)
+                        || surface_state
+                            .viewport
+                            .is_some_and(|viewport| !viewport.is_identity());
+                    (
+                        SurfaceCommitRollback {
+                            pending_buffer_id,
+                            previous_buffer_id,
+                            previous_buffer_scale,
+                            previous_buffer_transform,
+                            previous_offset,
+                            previous_viewport,
+                            pending_buffer_scale,
+                            pending_buffer_transform,
+                            pending_offset,
+                            pending_attach_offset,
+                            pending_viewport,
+                        },
+                        std::mem::take(&mut surface_state.pending_surface_damage),
+                        std::mem::take(&mut surface_state.pending_buffer_damage),
+                        full_mapping,
+                    )
+                },
+            );
+        // A commit with no new attach reuses the currently committed buffer
+        // (for damage-only commits). An explicit attach(NULL), represented by
+        // `Some(None)`, is the one case that deliberately commits no buffer.
+        let pending_buffer_state = rollback.pending_buffer_id;
+        let previous_buffer_id = rollback.previous_buffer_id;
+        let commit_buffer_id = pending_buffer_state.flatten().or_else(|| {
+            pending_buffer_state
+                .is_none()
+                .then_some(previous_buffer_id)
+                .flatten()
+        });
 
         // The viewporter protocol permits fractional source rectangles only
         // when a destination size is also set. If the source is fractional
@@ -834,6 +916,13 @@ impl WlSurfaceHandler for CompositorHandler {
                             "fractional wp_viewport source requires a destination",
                         );
                     }
+                    restore_failed_surface_commit(
+                        ctx,
+                        surface_id,
+                        rollback,
+                        surface_damage,
+                        buffer_damage,
+                    );
                     return Action::Drop;
                 }
             }
@@ -844,7 +933,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // the pre-copy value is retained separately for the host damage
         // request.
         let surface_snapshot = ctx.surfaces.get(&surface_id).cloned();
-        let needs_full_damage = pending_buffer_id
+        let needs_full_damage = commit_buffer_id
             .or_else(|| {
                 surface_snapshot
                     .as_ref()
@@ -864,7 +953,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // mmap, or GBM mapping fails. A failed copy leaves `needs_full_copy`
         // set so a later commit retries the complete image.
         let mut commit_ready = true;
-        if let Some(buffer_id) = pending_buffer_id {
+        if let Some(buffer_id) = commit_buffer_id {
             let allocator = ctx.allocator.as_ref();
             let buffer = if ctx.buffers.contains_key(&buffer_id) {
                 ctx.buffers.get_mut(&buffer_id)
@@ -1053,13 +1142,12 @@ impl WlSurfaceHandler for CompositorHandler {
             // consumes it.
             queue_surface_commit(ctx, surface_id);
 
-            if let Some(buffer_id) = pending_buffer_id {
-                // A commit without a new attach still starts a fresh
-                // compositor-use interval for the current native dma-buf.
-                // Clear the release edge before marking it submitted;
-                // otherwise a later guest destroy could mistake the previous
-                // interval's release for the new one and destroy the host
-                // wl_buffer while it is in use.
+            if let Some(buffer_id) = commit_buffer_id {
+                // The pending attach has now been consumed by a successful
+                // commit, so a fresh compositor-use interval begins. Clear
+                // the previous release edge only here; doing it in attach
+                // would make an attach-without-commit leak when the guest
+                // destroys the otherwise-idle buffer.
                 ctx.released_host_buffers.remove(&buffer_id);
                 ctx.submitted_buffers.insert(buffer_id);
                 if let Some(buffer) = ctx.buffers.get_mut(&buffer_id) {
@@ -1078,6 +1166,9 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Skipping host wl_surface.commit for {} because its SHM copy failed",
                 surface_id
             );
+        }
+        if !commit_ready {
+            restore_failed_surface_commit(ctx, surface_id, rollback, surface_damage, buffer_damage);
         }
         crate::handler::shm::collect_retired_buffers(ctx);
         Action::Drop
@@ -1776,6 +1867,238 @@ mod tests {
                 .any(|(message, _)| msg_sender(message) == host_buffer_id),
             "host buffer destroy must wait for the new release"
         );
+    }
+
+    #[test]
+    fn attaching_idle_shm_buffer_without_commit_keeps_release_edge() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.buffers.insert(
+            buffer_id,
+            mapped_test_buffer(buffer_id, 1, 1, 4, false, false),
+        );
+        ctx.surfaces
+            .entry(surface_id)
+            .or_default()
+            .current_buffer_id = Some(buffer_id);
+        ctx.submitted_buffers.insert(buffer_id);
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Forward
+        );
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
+            Action::Forward
+        );
+
+        // No commit follows the attach yet. Keep the host object alive until
+        // the pending state is resolved; otherwise a later commit could race
+        // the queued destructor.
+        ctx.last_sender_id = buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.retired_buffers.contains_key(&buffer_id));
+        assert!(!ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+
+        // Replacing the pending attach proves that it will never commit, so
+        // the host destructor can now be ordered safely.
+        ctx.last_sender_id = surface_id;
+        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        assert!(!ctx.retired_buffers.contains_key(&buffer_id));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+    }
+
+    #[test]
+    fn attaching_idle_native_buffer_without_commit_keeps_release_edge() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.surfaces
+            .entry(surface_id)
+            .or_default()
+            .current_buffer_id = Some(buffer_id);
+        ctx.submitted_buffers.insert(buffer_id);
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Forward
+        );
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
+            Action::Forward
+        );
+
+        ctx.last_sender_id = buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.deferred_host_buffers.contains_key(&buffer_id));
+        assert!(!ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+
+        ctx.last_sender_id = surface_id;
+        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        assert!(!ctx.deferred_host_buffers.contains_key(&buffer_id));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+    }
+
+    #[test]
+    fn delayed_shm_release_before_pending_commit_keeps_host_buffer_alive() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.buffers.insert(
+            buffer_id,
+            mapped_test_buffer(buffer_id, 1, 1, 4, true, false),
+        );
+        ctx.surfaces
+            .entry(surface_id)
+            .or_default()
+            .current_buffer_id = Some(buffer_id);
+        ctx.submitted_buffers.insert(buffer_id);
+
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
+            Action::Forward
+        );
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = buffer_id;
+        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+        assert!(ctx.retired_buffers.contains_key(&buffer_id));
+
+        // This release belongs to the old committed interval. It must not
+        // destroy the host object while the pending attach can still commit.
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.retired_buffers.contains_key(&buffer_id));
+        assert!(!ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+
+        ctx.last_sender_id = surface_id;
+        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert!(ctx.retired_buffers.contains_key(&buffer_id));
+        assert!(ctx.submitted_buffers.contains(&buffer_id));
+
+        // A release for the newly committed interval is the one that permits
+        // the host destructor.
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(!ctx.retired_buffers.contains_key(&buffer_id));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+    }
+
+    #[test]
+    fn delayed_native_release_before_pending_commit_keeps_host_buffer_alive() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.surfaces
+            .entry(surface_id)
+            .or_default()
+            .current_buffer_id = Some(buffer_id);
+        ctx.submitted_buffers.insert(buffer_id);
+
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
+            Action::Forward
+        );
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = buffer_id;
+        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            ctx.deferred_host_buffers.get(&buffer_id),
+            Some(&host_buffer_id)
+        );
+
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.deferred_host_buffers.contains_key(&buffer_id));
+        assert!(ctx.released_host_buffers.contains(&buffer_id));
+        assert!(!ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+
+        ctx.last_sender_id = surface_id;
+        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(ctx.deferred_host_buffers.contains_key(&buffer_id));
+        assert!(!ctx.released_host_buffers.contains(&buffer_id));
+
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(!ctx.deferred_host_buffers.contains_key(&buffer_id));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| msg_sender(message) == host_buffer_id));
     }
 
     #[test]
@@ -2892,6 +3215,58 @@ mod tests {
                 .map(|(message, _)| msg_opcode(message)),
             Some(0),
             "the final queued request must be wl_buffer.destroy"
+        );
+    }
+
+    #[test]
+    fn destroying_surface_then_live_buffer_does_not_wait_for_release() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let wl_surface_guest = 100u32;
+        let guest_buffer = 50u32;
+        let host_buffer = 51u32;
+
+        ctx.shadow_table.map_id(guest_buffer, host_buffer);
+        ctx.shadow_table
+            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.buffers.insert(
+            guest_buffer,
+            mapped_test_buffer(guest_buffer, 1, 1, 4, false, false),
+        );
+        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.surfaces
+            .entry(wl_surface_guest)
+            .or_default()
+            .current_buffer_id = Some(guest_buffer);
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = wl_surface_guest;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
+        assert!(
+            !ctx.submitted_buffers.contains(&guest_buffer),
+            "the destroyed surface was the only compositor-use reference"
+        );
+
+        // The guest is allowed to keep the wl_buffer alive after destroying
+        // its surface. Once it eventually destroys the buffer, host teardown
+        // must be ordered after the already-queued surface destructor instead
+        // of waiting forever for a release that may never arrive.
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(!ctx.retired_buffers.contains_key(&guest_buffer));
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
+                .eq([wl_surface_host, host_buffer]),
+            "surface destroy must precede the live buffer destroy"
         );
     }
 

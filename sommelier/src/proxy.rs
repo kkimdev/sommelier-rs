@@ -85,7 +85,28 @@ fn pending_host_event_is_stale(
         && guest_id.is_some_and(|gid| {
             ctx.retired_buffers.contains_key(&gid) || ctx.deferred_host_buffers.contains_key(&gid)
         });
-    ctx.shadow_table.is_pending_destroy_host(sender_id) && !allows_deferred_buffer_release
+    // An asynchronous linux-dmabuf create can legally be followed by
+    // params.destroy before the compositor emits `created`.  The host still
+    // owns the newly-created wl_buffer in that case, so let the event reach
+    // the handler, which turns it into a host-only buffer and destroys it.
+    // Dropping `created` here would leak the host buffer because generated
+    // new_id mapping only runs when the event is forwarded.
+    let allows_orphan_dmabuf_created = host_interface
+        .or(guest_interface)
+        .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
+        && opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
+        && (guest_id.is_some_and(|gid| ctx.shadow_table.is_pending_destroy_guest(gid))
+            || ctx.orphaned_dmabuf_params.contains_key(&sender_id));
+    let allows_orphan_dmabuf_failed = host_interface
+        .or(guest_interface)
+        .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
+        && opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED
+        && (guest_id.is_some_and(|gid| ctx.shadow_table.is_pending_destroy_guest(gid))
+            || ctx.orphaned_dmabuf_params.contains_key(&sender_id));
+    ctx.shadow_table.is_pending_destroy_host(sender_id)
+        && !allows_deferred_buffer_release
+        && !allows_orphan_dmabuf_created
+        && !allows_orphan_dmabuf_failed
 }
 
 fn set_nonblocking(fd: RawFd) -> nix::Result<()> {

@@ -166,6 +166,29 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // invalid delete_id(0) event to the guest.
             return Action::Drop;
         }
+        if let Some(&guest_id) = ctx.orphaned_dmabuf_params.get(&id) {
+            // An async linux-dmabuf create may emit `created`/`failed` after
+            // the host has acknowledged params.destroy. Retain the host
+            // interface metadata so that late event can still be dispatched,
+            // but complete the guest-side delete_id now.
+            let mapping_alive = ctx.shadow_table.get_guest_id(id) == Some(guest_id);
+            if mapping_alive {
+                if queue_guest_delete_id(ctx, guest_id) {
+                    ctx.shadow_table.remove_guest_mapping(guest_id);
+                    // remove_guest_mapping intentionally leaves the host
+                    // interface reserved for the late async event. Clear
+                    // only the guest pending-destroy marker; remove_id would
+                    // discard the host interface before `created`/`failed`.
+                    ctx.shadow_table.clear_pending_destroy_guest(guest_id);
+                }
+                // Only clear dimensions belonging to the object whose
+                // delete_id was acknowledged. The guest may have reused the
+                // numeric ID after receiving that event; in that case the
+                // pending dimensions belong to the replacement object.
+                ctx.pending_native_buffer_sizes.remove(&guest_id);
+            }
+            return Action::Drop;
+        }
         let guest_id = ctx.shadow_table.get_guest_id(id).unwrap_or(0);
         if guest_id != 0 {
             ctx.shadow_table.remove_id(guest_id);
