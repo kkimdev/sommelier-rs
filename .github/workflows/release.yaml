@@ -155,9 +155,14 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           release_id="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}" \
-              --jq '.id'
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${TAG_NAME}\") | .id"
           )"
+          test -n "${release_id}" || {
+            echo "::error::Draft release for ${TAG_NAME} was not found"
+            exit 1
+          }
           gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
             -f draft=false
