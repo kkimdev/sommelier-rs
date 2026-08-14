@@ -74,10 +74,11 @@ jobs:
           cargo_version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "sommelier") | .version')"
           tag_version="${GITHUB_REF_NAME#virtwl-v}"
+          base_tag_version="${tag_version%%-*}"
 
           echo "Cargo version: ${cargo_version}"
           echo "Tag version: ${tag_version}"
-          test "${cargo_version}" = "${tag_version}" || {
+          test "${cargo_version}" = "${base_tag_version}" || {
             echo "::error::Cargo.toml version does not match the release tag"
             exit 1
           }
