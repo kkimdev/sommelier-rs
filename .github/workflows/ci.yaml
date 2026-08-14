@@ -81,3 +81,145 @@ jobs:
       - name: Check lints (x86_64 only)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+
+      - name: Prepare CI artifact
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p ci-artifact
+          install -Dm755 \
+            "target/${TARGET}/debug/sommelier" \
+            "ci-artifact/sommelier-${TARGET}"
+          {
+            printf 'commit=%s\n' "${GITHUB_SHA}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'target=%s\n' "${TARGET}"
+          } > ci-artifact/BUILD-INFO
+
+      - name: Upload CI artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtwl-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          path: ci-artifact
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  tag-ci-build:
+    name: Tag successful CI build
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/virtwl'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Create non-release CI tag
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA:0:12}"
+          ci_tag="virtwl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${short_sha}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "${ci_tag}" "${GITHUB_SHA}" \
+            --message "Successful Virtwl CI build ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          git push origin "refs/tags/${ci_tag}"
+
+  cleanup-ci-builds:
+    name: Retain recent CI builds
+    needs: tag-ci-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/virtwl' && needs.tag-ci-build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      KEEP_COUNT: ${{ vars.CI_KEEP_COUNT || 10 }}
+
+    steps:
+      - name: Validate retention count
+        shell: bash
+        run: |
+          if ! [[ "${KEEP_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::CI_KEEP_COUNT must be a positive integer"
+            exit 1
+          fi
+
+      - name: Delete CI artifacts beyond retention count
+        shell: bash
+        run: |
+          mapfile -t artifact_rows < <(
+            gh api --paginate \
+              "repos/${GH_REPO}/actions/artifacts?per_page=100" \
+              --jq '.artifacts[]
+                | select(.name | startswith("virtwl-ci-"))
+                | [.created_at, (.id | tostring), .name]
+                | @tsv' |
+            sort -r
+          )
+
+          declare -A kept_runs=()
+          for row in "${artifact_rows[@]}"; do
+            IFS=$'\t' read -r _created_at artifact_id artifact_name <<< "${row}"
+            if [[ ! "${artifact_name}" =~ ^virtwl-ci-([0-9]+)-([0-9]+)- ]]; then
+              echo "Skipping artifact with unexpected name: ${artifact_name}"
+              continue
+            fi
+
+            run_key="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
+            if [[ -n "${kept_runs[${run_key}]+x}" ]]; then
+              continue
+            fi
+            if (( ${#kept_runs[@]} < KEEP_COUNT )); then
+              kept_runs["${run_key}"]=1
+              continue
+            fi
+
+            echo "Deleting old CI artifact ${artifact_id} (${artifact_name})"
+            gh api --method DELETE \
+              "repos/${GH_REPO}/actions/artifacts/${artifact_id}"
+          done
+
+      - name: Delete CI tags beyond retention count
+        shell: bash
+        run: |
+          mapfile -t ci_tags < <(
+            gh api --paginate \
+              "repos/${GH_REPO}/git/matching-refs/tags/virtwl-ci-" \
+              --jq '.[].ref | sub("^refs/tags/"; "")' |
+            while IFS= read -r tag; do
+              if [[ "${tag}" =~ ^virtwl-ci-([0-9]+)-([0-9]+)- ]]; then
+                printf '%s\t%s\t%s\n' \
+                  "${BASH_REMATCH[1]}" \
+                  "${BASH_REMATCH[2]}" \
+                  "${tag}"
+              fi
+            done |
+            sort -k1,1nr -k2,2nr |
+            cut -f3-
+          )
+
+          kept_tags=0
+          for tag in "${ci_tags[@]}"; do
+            if (( kept_tags < KEEP_COUNT )); then
+              kept_tags=$((kept_tags + 1))
+              continue
+            fi
+
+            echo "Deleting old CI tag ${tag}"
+            gh api --method DELETE \
+              "repos/${GH_REPO}/git/refs/tags/${tag}"
+          done

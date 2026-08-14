@@ -106,6 +106,15 @@ git push personal virtwl-v0.2.1
 The workflow publishes both binaries and a `SHA256SUMS` file to the GitHub
 Release after both architecture builds pass.
 
+### CI build artifacts
+
+Each successful push to `virtwl` also publishes debug binaries for both
+architectures as short-lived CI artifacts and creates a non-release tag such
+as `virtwl-ci-<run-id>-<attempt>-<sha>`. CI artifacts expire after seven days;
+the cleanup job additionally keeps only the ten most recent CI build runs.
+Set the repository variable `CI_KEEP_COUNT` to change that count. These tags
+never trigger the release workflow, which only matches `virtwl-v*`.
+
 ## Other Notes
 
 This is not an officially supported Google product. This project is not
