@@ -380,6 +380,39 @@ impl WaylandConnection {
             }
         }
     }
+
+    /// Attempt one receive without waiting for transport readiness.
+    ///
+    /// `Ok(None)` means the non-blocking transport has no data. Any received
+    /// bytes and descriptors are appended to the same ordered buffers used by
+    /// [`Self::recv`].
+    pub(crate) fn try_recv(&mut self) -> io::Result<Option<usize>> {
+        match &mut self.transport {
+            ConnectionTransport::Unix(fd) => {
+                let mut buf = [0u8; 4096];
+                let mut cmsg_space = nix::cmsg_space!([RawFd; UNIX_MAX_SCM_RIGHTS_FDS]);
+                match recv_unix_message(fd.as_raw_fd(), &mut buf, &mut cmsg_space) {
+                    Ok((bytes, fds)) => {
+                        self.read_buf.extend_from_slice(&buf[..bytes]);
+                        self.read_fds.extend(fds);
+                        Ok(Some(bytes))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }
+            ConnectionTransport::VirtWayland(channel) => match channel.try_recv()? {
+                Some((data, fds)) => {
+                    let len = data.len();
+                    self.read_buf.extend(data);
+                    self.read_fds
+                        .extend(fds.into_iter().map(|fd| fd.into_raw_fd()));
+                    Ok(Some(len))
+                }
+                None => Ok(None),
+            },
+        }
+    }
 }
 
 impl AsRawFd for WaylandConnection {
@@ -408,6 +441,7 @@ mod tests {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     use std::fs;
     use std::io::IoSlice;
+    use std::io::Write;
     use std::os::fd::{IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
@@ -417,6 +451,26 @@ mod tests {
             unix_send_flags().contains(nix::sys::socket::MsgFlags::MSG_NOSIGNAL),
             "disconnecting Wayland peers must return EPIPE instead of killing Sommelier"
         );
+    }
+
+    #[tokio::test]
+    async fn try_recv_is_nonblocking_and_preserves_the_ordered_stream() {
+        let (mut peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+
+        assert_eq!(
+            connection.try_recv().expect("empty non-blocking receive"),
+            None
+        );
+
+        let message = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        peer.write_all(&message).expect("write peer message");
+        assert_eq!(
+            connection.try_recv().expect("ready non-blocking receive"),
+            Some(message.len())
+        );
+        assert_eq!(connection.read_buf, message);
+        assert!(connection.read_fds.is_empty());
     }
 
     #[tokio::test]

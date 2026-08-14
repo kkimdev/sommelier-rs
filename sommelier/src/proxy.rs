@@ -20,6 +20,7 @@ use crate::state::{Context, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{ProtocolError, WireMessage};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use std::io;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::Arc;
@@ -32,9 +33,13 @@ type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 // unbounded stream of those requests without returning to the executor:
 // keyboard/text-input events arrive on the opposite direction and otherwise
 // wait behind the entire render burst on the current-thread runtime.
-const MAX_MESSAGES_PER_BATCH: usize = 128;
+// Keep the fairness quantum short enough that a render burst cannot hold a
+// keyboard or text-input event behind several frames.  Ghostty can emit a
+// dozen small requests per frame at 4K; 32 messages still amortizes a send
+// while bounding the opposite direction to roughly one frame of work.
+const MAX_MESSAGES_PER_BATCH: usize = 32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     ClientToHost,
     HostToClient,
@@ -200,20 +205,12 @@ impl Client {
         // while a large client render burst is being drained.
         let mut prefer_host = true;
         loop {
-            let buffered_direction = if prefer_host {
-                if self.host_conn.has_complete_message() {
-                    Some(Direction::HostToClient)
-                } else if self.client_conn.has_complete_message() {
-                    Some(Direction::ClientToHost)
-                } else {
-                    None
+            let buffered_direction = match self.next_buffered_direction(prefer_host) {
+                Ok(direction) => direction,
+                Err(error) => {
+                    log::debug!("Wayland connection closed during fairness probe: {}", error);
+                    break;
                 }
-            } else if self.client_conn.has_complete_message() {
-                Some(Direction::ClientToHost)
-            } else if self.host_conn.has_complete_message() {
-                Some(Direction::HostToClient)
-            } else {
-                None
             };
             if let Some(direction) = buffered_direction {
                 if !self.handle_msgs(direction).await {
@@ -252,6 +249,59 @@ impl Client {
         // cannot keep its duplicated descriptors or task alive after either
         // endpoint disconnects.
         self.ctx.stop_clipboard_pumps().await;
+    }
+
+    /// Choose the next buffered direction while opportunistically receiving
+    /// from the preferred transport.
+    ///
+    /// A bounded dispatch batch only improves fairness for events already in
+    /// `read_buf`. Under a continuous client render burst, host keyboard/IME
+    /// bytes may still be waiting in the VirtWL kernel queue. Probe the
+    /// preferred side once before consuming another fallback batch so input
+    /// latency is bounded by one batch rather than the entire buffered burst.
+    fn next_buffered_direction(&mut self, prefer_host: bool) -> io::Result<Option<Direction>> {
+        let (preferred_direction, fallback_direction) = if prefer_host {
+            (Direction::HostToClient, Direction::ClientToHost)
+        } else {
+            (Direction::ClientToHost, Direction::HostToClient)
+        };
+
+        if self.connection(preferred_direction).has_complete_message() {
+            return Ok(Some(preferred_direction));
+        }
+        if !self.connection(fallback_direction).has_complete_message() {
+            return Ok(None);
+        }
+
+        if self
+            .connection_mut(preferred_direction)
+            .try_recv()?
+            .is_some_and(|bytes| bytes == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "preferred Wayland transport closed",
+            ));
+        }
+        if self.connection(preferred_direction).has_complete_message() {
+            Ok(Some(preferred_direction))
+        } else {
+            Ok(Some(fallback_direction))
+        }
+    }
+
+    fn connection(&self, direction: Direction) -> &WaylandConnection {
+        match direction {
+            Direction::ClientToHost => &self.client_conn,
+            Direction::HostToClient => &self.host_conn,
+        }
+    }
+
+    fn connection_mut(&mut self, direction: Direction) -> &mut WaylandConnection {
+        match direction {
+            Direction::ClientToHost => &mut self.client_conn,
+            Direction::HostToClient => &mut self.host_conn,
+        }
     }
 
     fn dispatch_request(
@@ -590,6 +640,12 @@ impl Client {
             }
         }
 
+        // Host linux-dmabuf capability discovery emits one format event and
+        // then a long modifier stream. The dmabuf handler coalesces feedback
+        // refreshes within this dispatch batch; allow the next batch to
+        // publish a newer table after more capabilities have arrived.
+        self.ctx.synthetic_feedback_refresh_pending.clear();
+
         let mut success = true;
         if !out_buffer.is_empty() && other_conn.send(&out_buffer, &out_fds).await.is_err() {
             success = false;
@@ -663,6 +719,46 @@ mod tests {
     use super::*;
     use crate::wire::MessageBuilder;
     use std::fs;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (_guest_peer, client_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (mut host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            false,
+            false,
+        );
+
+        let render_request = MessageBuilder::new().build_message(7, 0);
+        client
+            .client_conn
+            .read_buf
+            .extend_from_slice(&render_request);
+        assert_eq!(
+            client.next_buffered_direction(true).unwrap(),
+            Some(Direction::ClientToHost),
+            "an idle preferred transport must not block the buffered fallback"
+        );
+
+        let host_event = MessageBuilder::new().build_message(8, 0);
+        host_peer
+            .write_all(&host_event)
+            .expect("queue host input event");
+        assert_eq!(
+            client.next_buffered_direction(true).unwrap(),
+            Some(Direction::HostToClient),
+            "host bytes queued after a render batch must be received before another batch"
+        );
+        assert_eq!(client.host_conn.read_buf, host_event);
+    }
 
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
@@ -1165,6 +1261,74 @@ mod tests {
     }
 
     #[test]
+    fn wl_fixes_destroy_registry_forwards_host_id_until_delete_id() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface_with_version(1, "wl_display".to_string(), 1);
+        ctx.shadow_table.map_id(5, 15);
+        ctx.shadow_table
+            .track_interface_with_version(5, "wl_fixes".to_string(), 1);
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+        let mut handler = SommelierHandler::new();
+
+        let payload = 10u32.to_ne_bytes();
+        let mut destroy_registry = WireMessage::new(
+            5,
+            protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY,
+            &payload,
+            &[],
+        );
+        let (forwarded, fds) = protocols::wayland::dispatch_request(
+            "wl_fixes",
+            &mut destroy_registry,
+            &mut handler,
+            &mut ctx,
+        )
+        .expect("destroy_registry request should dispatch")
+        .expect("destroy_registry request should be forwarded");
+        assert!(fds.is_empty());
+        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 15);
+        assert_eq!(
+            u16::from_ne_bytes(forwarded[4..6].try_into().unwrap()),
+            protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY
+        );
+        assert_eq!(
+            u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
+            20,
+            "the registry object argument must use its host ID"
+        );
+        assert_eq!(ctx.shadow_table.get_guest_id(20), Some(10));
+        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
+
+        let payload = 20u32.to_ne_bytes();
+        let mut delete_id = WireMessage::new(
+            1,
+            protocols::wayland::wl_display::EVT_DELETE_ID,
+            &payload,
+            &[],
+        );
+        assert_eq!(
+            protocols::wayland::dispatch_event(
+                "wl_display",
+                &mut delete_id,
+                &mut handler,
+                &mut ctx
+            ),
+            Ok(None)
+        );
+        let (message, _) = ctx
+            .host_to_client_queue
+            .pop()
+            .expect("host delete_id should be queued for the guest");
+        assert_eq!(u32::from_ne_bytes(message[8..12].try_into().unwrap()), 10);
+        assert_eq!(ctx.shadow_table.get_guest_id(20), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_guest(10));
+    }
+
+    #[test]
     fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table.map_id(10, 20);
@@ -1429,7 +1593,8 @@ protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
     wl_data_source: data_device,
     wl_data_offer: data_device,
     wl_keyboard: keyboard,
-    wl_seat: seat
+    wl_seat: seat,
+    wl_fixes: registry
 });
 impl protocols::wayland::ProtocolHandler for SommelierHandler {}
 

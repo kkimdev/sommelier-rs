@@ -911,12 +911,21 @@ impl WlSurfaceHandler for CompositorHandler {
         // `Some(None)`, is the one case that deliberately commits no buffer.
         let pending_buffer_state = rollback.pending_buffer_id;
         let previous_buffer_id = rollback.previous_buffer_id;
+        // A native dma-buf acquire fence belongs to the new contents submitted
+        // by an attach.  Re-running the dma-buf wait for a damage-only commit
+        // blocks this single-threaded proxy even though the host compositor
+        // is already using the same buffer.  ChromiumOS Sommelier waits at
+        // attach time as well; keep explicit attach(NULL) and damage-only
+        // commits non-blocking.
         let commit_buffer_id = pending_buffer_state.flatten().or_else(|| {
             pending_buffer_state
                 .is_none()
                 .then_some(previous_buffer_id)
                 .flatten()
         });
+        let wait_for_native_sync = matches!(pending_buffer_state, Some(Some(_)))
+            || commit_buffer_id
+                .is_some_and(|buffer_id| ctx.released_host_buffers.contains(&buffer_id));
 
         // The viewporter protocol permits fractional source rectangles only
         // when a destination size is also set. If the source is fractional
@@ -1147,11 +1156,13 @@ impl WlSurfaceHandler for CompositorHandler {
         }
 
         if commit_ready {
-            if let Some(buffer_id) = commit_buffer_id {
-                // Native linux-dmabuf buffers bypass the local SHM copy path.
-                // Wait for guest GPU writes before the host compositor samples
-                // the buffer, matching ChromiumOS Sommelier's sync_point path.
-                wait_for_native_buffer(ctx, buffer_id);
+            if wait_for_native_sync {
+                if let Some(buffer_id) = commit_buffer_id {
+                    // Native linux-dmabuf buffers bypass the local SHM copy path.
+                    // Wait for guest GPU writes before the host compositor samples
+                    // the buffer, matching ChromiumOS Sommelier's sync_point path.
+                    wait_for_native_buffer(ctx, buffer_id);
+                }
             }
             // Damage requests are double-buffered. Emit the translated host
             // requests immediately before the commit so the host sees exactly

@@ -25,6 +25,22 @@ pub struct CallbackHandler;
 impl WlCallbackHandler for CallbackHandler {
     fn on_done(&mut self, ctx: &mut Context, callback_data: u32) -> Action {
         let host_id = ctx.last_sender_id;
+        if let Some(generation) = ctx.dmabuf_capability_callbacks.remove(&host_id) {
+            // wl_callback.done destroys the host callback resource. Reserve its
+            // numeric ID until wl_display.delete_id arrives, while making any
+            // duplicate event undispatchable immediately.
+            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
+                log::warn!(
+                    "linux-dmabuf capability callback {} was not tracked as host-only",
+                    host_id
+                );
+            }
+            crate::handler::linux_dmabuf::LinuxDmabufHandler::complete_capability_discovery(
+                ctx, generation,
+            );
+            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+            return Action::Drop;
+        }
         let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);
 
         if guest_id != 0 {
@@ -57,5 +73,36 @@ impl WlCallbackHandler for CallbackHandler {
             ctx.shadow_table.remove_id(guest_id);
         }
         Action::Drop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallbackHandler;
+    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+    use crate::state::Context;
+    use crate::wire::Action;
+
+    #[test]
+    fn internal_dmabuf_callback_completes_exact_generation() {
+        let callback_id = 40;
+        let generation = 7;
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            callback_id,
+            "wl_callback".to_string(),
+            1,
+        );
+        ctx.dmabuf_capabilities.entry(generation).or_default();
+        ctx.host_dmabuf_generation = Some(generation);
+        ctx.dmabuf_capability_callbacks
+            .insert(callback_id, generation);
+        ctx.last_sender_id = callback_id;
+
+        let mut handler = CallbackHandler;
+        assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(ctx.dmabuf_capabilities[&generation].ready);
+        assert!(!ctx.dmabuf_capability_callbacks.contains_key(&callback_id));
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
     }
 }

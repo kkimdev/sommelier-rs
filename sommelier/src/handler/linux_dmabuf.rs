@@ -22,8 +22,20 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::state::{Context, PendingParam};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::fs::File;
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::io::{IntoRawFd, RawFd};
+
+/// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
+/// the linux-dmabuf v3 format events. Keep this local instead of depending on
+/// libdrm headers so the proxy remains buildable in the minimal Nix shell.
+const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
+const FEEDBACK_VERSION: u32 = 4;
+const MAX_FEEDBACK_FORMATS: usize = u16::MAX as usize + 1;
+// A Wayland message has a 16-bit byte length. Account for the 8-byte header
+// and 4-byte array length, then keep the uint16 index payload 4-byte aligned.
+const MAX_TRANCHE_INDICES_PER_EVENT: usize = (65_532 - 8 - 4) / 2;
 
 pub struct LinuxDmabufHandler;
 
@@ -132,6 +144,241 @@ fn format_table_fd_can_map(fd: RawFd, size: usize) -> bool {
                 .is_some_and(|file_size| file_size >= size as u64))
 }
 
+fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
+    let allocator = ctx.allocator.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "GBM allocator unavailable for synthetic dmabuf feedback",
+        )
+    })?;
+    let mut device = vec![0u8; std::mem::size_of::<libc::dev_t>()];
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(allocator.device.as_fd().as_raw_fd(), &mut stat) } == 0 {
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                (&stat.st_rdev as *const libc::dev_t).cast::<u8>(),
+                std::mem::size_of::<libc::dev_t>(),
+            )
+        };
+        device.copy_from_slice(raw);
+        Ok(device)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn feedback_pairs(ctx: &Context, generation: u64) -> Vec<(u32, u64)> {
+    let mut pairs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(capabilities) = ctx.dmabuf_capabilities.get(&generation) {
+        for &(format, modifier) in &capabilities.format_modifiers {
+            if is_supported_drm_format(format)
+                && seen.insert((format, modifier))
+                && pairs.len() < MAX_FEEDBACK_FORMATS
+            {
+                pairs.push((format, modifier));
+            }
+        }
+    }
+
+    pairs
+}
+
+pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, generation: u64) -> bool {
+    !feedback_pairs(ctx, generation).is_empty()
+}
+
+pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation: u64) {
+    let referenced = ctx.host_dmabuf_generation == Some(generation)
+        || ctx
+            .dmabuf_capability_callbacks
+            .values()
+            .any(|&value| value == generation)
+        || ctx
+            .dmabuf_guest_generations
+            .values()
+            .any(|&value| value == generation)
+        || ctx
+            .synthetic_feedback_objects
+            .values()
+            .any(|&value| value == generation)
+        || ctx
+            .pending_dmabuf_globals
+            .iter()
+            .any(|pending| pending.generation == generation);
+    if !referenced {
+        ctx.dmabuf_capabilities.remove(&generation);
+    }
+}
+
+fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(RawFd, u32)> {
+    if pairs.is_empty() || pairs.len() > MAX_FEEDBACK_FORMATS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid synthetic feedback table length",
+        ));
+    }
+    let size = pairs
+        .len()
+        .checked_mul(16)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "format table overflow"))?;
+    let name = b"sommelier-dmabuf\0";
+    let fd = unsafe {
+        libc::memfd_create(
+            name.as_ptr().cast::<libc::c_char>(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(size as u64)?;
+
+    let mut table = Vec::with_capacity(size);
+    for &(format, modifier) in pairs {
+        table.extend_from_slice(&format.to_ne_bytes());
+        table.extend_from_slice(&0u32.to_ne_bytes());
+        table.extend_from_slice(&modifier.to_ne_bytes());
+    }
+    file.write_all(&table)?;
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((file.into_raw_fd(), size as u32))
+}
+
+fn close_queued_fds(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>) {
+    for (_, fds) in queue.drain(..) {
+        for fd in fds {
+            if fd >= 0 {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+}
+
+fn build_synthetic_feedback_messages(
+    guest_id: u32,
+    pairs: &[(u32, u64)],
+    device: &[u8],
+) -> io::Result<Vec<(Vec<u8>, Vec<RawFd>)>> {
+    let (table_fd, table_size) = create_feedback_format_table(pairs)?;
+    let mut pending = Vec::new();
+    let queue = |pending: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
+                 opcode: u16,
+                 builder: MessageBuilder,
+                 fds: Vec<RawFd>|
+     -> io::Result<()> {
+        if queue_message(pending, guest_id, opcode, builder, fds) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "synthetic dmabuf feedback event exceeds Wayland wire limits",
+            ))
+        }
+    };
+
+    // The table is sent before the parameter sequence, matching existing
+    // compositors and allowing every following tranche index to refer to it.
+    let mut format_table = MessageBuilder::new();
+    format_table.write_u32(table_size);
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
+        format_table,
+        vec![table_fd],
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+
+    let mut main_device = MessageBuilder::new();
+    main_device.write_array(device);
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
+        main_device,
+        Vec::new(),
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+
+    let mut tranche_device = MessageBuilder::new();
+    tranche_device.write_array(device);
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
+        tranche_device,
+        Vec::new(),
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+
+    // No direct-scanout preference is known for a guest-side render node; a
+    // zero flag is the conservative default tranche.
+    let mut tranche_flags = MessageBuilder::new();
+    tranche_flags.write_u32(0);
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS,
+        tranche_flags,
+        Vec::new(),
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+
+    for start in (0..pairs.len()).step_by(MAX_TRANCHE_INDICES_PER_EVENT) {
+        let end = pairs
+            .len()
+            .min(start.saturating_add(MAX_TRANCHE_INDICES_PER_EVENT));
+        let mut bytes = Vec::with_capacity((end - start) * 2);
+        for index in start..end {
+            bytes.extend_from_slice(&(index as u16).to_ne_bytes());
+        }
+        let mut tranche_formats = MessageBuilder::new();
+        tranche_formats.write_array(&bytes);
+        if let Err(error) = queue(
+            &mut pending,
+            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
+            tranche_formats,
+            Vec::new(),
+        ) {
+            close_queued_fds(&mut pending);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
+        MessageBuilder::new(),
+        Vec::new(),
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+    if let Err(error) = queue(
+        &mut pending,
+        zwp_linux_dmabuf_feedback_v1::EVT_DONE,
+        MessageBuilder::new(),
+        Vec::new(),
+    ) {
+        close_queued_fds(&mut pending);
+        return Err(error);
+    }
+
+    Ok(pending)
+}
+
 fn dmabuf_plane_layout(format: u32, plane_idx: u32, width: i32, height: i32) -> Option<(u64, u64)> {
     let width = u64::try_from(width).ok()?;
     let height = u64::try_from(height).ok()?;
@@ -171,6 +418,134 @@ fn valid_dmabuf_plane(param: &PendingParam, format: u32, width: i32, height: i32
 }
 
 impl LinuxDmabufHandler {
+    fn queue_synthetic_feedback(
+        ctx: &mut Context,
+        guest_id: u32,
+        generation: u64,
+    ) -> io::Result<()> {
+        let pairs = feedback_pairs(ctx, generation);
+        let device = local_device_id(ctx)?;
+        let pending = build_synthetic_feedback_messages(guest_id, &pairs, &device)?;
+
+        // Publish a complete sequence atomically. A client must never observe a
+        // new format_table without the matching done event.
+        ctx.host_to_client_queue.extend(pending);
+        Ok(())
+    }
+
+    fn create_synthetic_feedback(ctx: &mut Context, guest_id: u32) -> Action {
+        let factory_id = ctx.last_sender_id;
+        let Some(generation) = ctx.dmabuf_guest_generations.get(&factory_id).copied() else {
+            log::error!(
+                "Cannot create synthetic dmabuf feedback for untracked factory {}",
+                factory_id
+            );
+            queue_protocol_error(
+                ctx,
+                factory_id,
+                0,
+                "linux-dmabuf factory has no capability generation",
+            );
+            return Action::Drop;
+        };
+        ctx.shadow_table.track_interface_with_version(
+            guest_id,
+            "zwp_linux_dmabuf_feedback_v1".to_string(),
+            FEEDBACK_VERSION,
+        );
+        ctx.synthetic_feedback_objects.insert(guest_id, generation);
+        let ready = ctx
+            .dmabuf_capabilities
+            .get(&generation)
+            .is_some_and(|capabilities| capabilities.ready);
+        if ready {
+            if let Err(error) = Self::queue_synthetic_feedback(ctx, guest_id, generation) {
+                log::error!(
+                    "Failed to create synthetic dmabuf feedback for generation {}: {}",
+                    generation,
+                    error
+                );
+                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+            }
+        }
+        Action::Drop
+    }
+
+    pub(crate) fn complete_capability_discovery(ctx: &mut Context, generation: u64) {
+        let Some(capabilities) = ctx.dmabuf_capabilities.get_mut(&generation) else {
+            log::warn!(
+                "Ignoring linux-dmabuf capability callback for unknown generation {}",
+                generation
+            );
+            return;
+        };
+        if capabilities.ready {
+            return;
+        }
+        capabilities.ready = true;
+
+        crate::handler::registry::publish_pending_dmabuf_globals(ctx, generation);
+
+        let feedback_ids = ctx
+            .synthetic_feedback_objects
+            .iter()
+            .filter_map(|(&guest_id, &object_generation)| {
+                (object_generation == generation).then_some(guest_id)
+            })
+            .collect::<Vec<_>>();
+        for guest_id in feedback_ids {
+            if let Err(error) = Self::queue_synthetic_feedback(ctx, guest_id, generation) {
+                log::error!(
+                    "Failed to publish completed dmabuf feedback generation {}: {}",
+                    generation,
+                    error
+                );
+                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+                break;
+            }
+        }
+    }
+
+    fn refresh_synthetic_feedbacks(ctx: &mut Context) {
+        let Some(generation) = ctx.host_dmabuf_generation else {
+            return;
+        };
+        if !ctx
+            .dmabuf_capabilities
+            .get(&generation)
+            .is_some_and(|capabilities| capabilities.ready)
+        {
+            return;
+        }
+        let feedback_ids = ctx
+            .synthetic_feedback_objects
+            .iter()
+            .filter_map(|(&guest_id, &object_generation)| {
+                (object_generation == generation).then_some(guest_id)
+            })
+            .collect::<Vec<_>>();
+        for guest_id in feedback_ids {
+            // Legacy dmabuf capabilities arrive as one format event followed
+            // by many modifier events. Queue at most one replacement per
+            // proxy dispatch batch; otherwise every event creates another
+            // memfd-bearing format_table message and a large host roundtrip
+            // can exceed the receiver's SCM_RIGHTS capacity.
+            if !ctx.synthetic_feedback_refresh_pending.insert(guest_id) {
+                continue;
+            }
+            if let Err(error) = Self::queue_synthetic_feedback(ctx, guest_id, generation) {
+                log::error!(
+                    "Failed to refresh synthetic dmabuf feedback generation {}: {}",
+                    generation,
+                    error
+                );
+                ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
+                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+                break;
+            }
+        }
+    }
+
     fn process_params(
         &self,
         ctx: &mut Context,
@@ -337,7 +712,10 @@ impl LinuxDmabufHandler {
 }
 
 impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
-    fn on_destroy(&mut self, _ctx: &mut Context) -> Action {
+    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
+        if let Some(generation) = ctx.dmabuf_guest_generations.remove(&ctx.last_sender_id) {
+            maybe_reclaim_capability_generation(ctx, generation);
+        }
         Action::Forward
     }
 
@@ -357,11 +735,11 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 
     fn on_get_default_feedback(&mut self, _ctx: &mut Context, _id: u32) -> Action {
-        Action::Forward
+        Self::create_synthetic_feedback(_ctx, _id)
     }
 
-    fn on_get_surface_feedback(&mut self, _ctx: &mut Context, _id: u32, _surface: u32) -> Action {
-        Action::Forward
+    fn on_get_surface_feedback(&mut self, ctx: &mut Context, id: u32, _surface: u32) -> Action {
+        Self::create_synthetic_feedback(ctx, id)
     }
 
     fn on_format(&mut self, ctx: &mut Context, format: u32) -> Action {
@@ -373,8 +751,37 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);
+                let mut changed = false;
+                if let Some(generation) = ctx.host_dmabuf_generation {
+                    let capabilities = ctx.dmabuf_capabilities.entry(generation).or_default();
+                    if capabilities.format_modifiers.len() < MAX_FEEDBACK_FORMATS
+                        && !capabilities
+                            .format_modifiers
+                            .contains(&(format, DRM_FORMAT_MOD_INVALID))
+                    {
+                        capabilities
+                            .format_modifiers
+                            .push((format, DRM_FORMAT_MOD_INVALID));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    Self::refresh_synthetic_feedbacks(ctx);
+                }
                 return Action::Drop;
             }
+        }
+
+        // A synthetic v4 factory is backed by a v3 host object so create_params
+        // remains forwardable. Do not leak the host's deprecated legacy events
+        // to a guest that bound the v4 contract.
+        if ctx
+            .shadow_table
+            .get_guest_id(ctx.last_sender_id)
+            .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
+            .is_some_and(|version| version >= FEEDBACK_VERSION)
+        {
+            return Action::Drop;
         }
 
         // if format == 0x34324241 || format == 0x34324258 {
@@ -406,8 +813,29 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
         if let Some(internal_id) = ctx.host_dmabuf_id {
             if ctx.last_sender_id == internal_id {
                 record_host_shm_drm_format(ctx, format);
+                let mut changed = false;
+                if let Some(generation) = ctx.host_dmabuf_generation {
+                    let capabilities = ctx.dmabuf_capabilities.entry(generation).or_default();
+                    if capabilities.format_modifiers.len() < MAX_FEEDBACK_FORMATS
+                        && !capabilities.format_modifiers.contains(&(format, modifier))
+                    {
+                        capabilities.format_modifiers.push((format, modifier));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    Self::refresh_synthetic_feedbacks(ctx);
+                }
                 return Action::Drop;
             }
+        }
+        if ctx
+            .shadow_table
+            .get_guest_id(ctx.last_sender_id)
+            .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
+            .is_some_and(|version| version >= FEEDBACK_VERSION)
+        {
+            return Action::Drop;
         }
         Action::Forward
     }
@@ -616,6 +1044,12 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         // until the connection is torn down and can corrupt a later feedback
         // object that reuses the ID.
         let guest_id = ctx.last_sender_id;
+        if let Some(generation) = ctx.synthetic_feedback_objects.remove(&guest_id) {
+            ctx.feedback_index_maps.remove(&guest_id);
+            ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
+            maybe_reclaim_capability_generation(ctx, generation);
+            return Action::Drop;
+        }
         ctx.feedback_index_maps.remove(&guest_id);
         Action::Forward
     }
@@ -983,16 +1417,220 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 #[cfg(test)]
 mod tests {
     use super::{
-        format_table_fd_can_map, guest_device_bytes, is_supported_drm_format, LinuxDmabufHandler,
+        build_synthetic_feedback_messages, feedback_pairs, format_table_fd_can_map,
+        guest_device_bytes, is_supported_drm_format, maybe_reclaim_capability_generation,
+        LinuxDmabufHandler, DRM_FORMAT_MOD_INVALID, MAX_FEEDBACK_FORMATS,
+        MAX_TRANCHE_INDICES_PER_EVENT,
     };
     use crate::handler::display::DisplayHandler;
     use crate::handler::shm::WL_SHM_FORMAT_NV12;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, PendingParam};
     use crate::wire::{Action, WireMessage};
+
+    fn message_opcode(message: &[u8]) -> u16 {
+        u16::from_ne_bytes(message[4..6].try_into().unwrap())
+    }
+
+    #[test]
+    fn rejected_dmabuf_message_closes_attached_descriptors() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        assert!(attached_fd >= 1000);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let mut builder = crate::wire::MessageBuilder::new();
+        builder.write_array(&vec![0; u16::MAX as usize]);
+        let mut queue = Vec::new();
+        assert!(!super::queue_message(
+            &mut queue,
+            7,
+            0,
+            builder,
+            vec![attached_fd]
+        ));
+        assert!(queue.is_empty());
+        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn capability_snapshot_is_reclaimed_after_its_last_reference() {
+        let generation = 9;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.dmabuf_capabilities.entry(generation).or_default();
+        ctx.dmabuf_guest_generations.insert(7, generation);
+
+        maybe_reclaim_capability_generation(&mut ctx, generation);
+        assert!(
+            ctx.dmabuf_capabilities.contains_key(&generation),
+            "a live factory must retain its immutable capability snapshot"
+        );
+
+        ctx.dmabuf_guest_generations.remove(&7);
+        maybe_reclaim_capability_generation(&mut ctx, generation);
+        assert!(
+            !ctx.dmabuf_capabilities.contains_key(&generation),
+            "an unreferenced removed generation must not accumulate forever"
+        );
+    }
+
+    #[test]
+    fn synthetic_feedback_messages_are_atomic_sealed_and_protocol_ordered() {
+        let pairs = [(0x3432_5258, 0), (0x3432_5241, DRM_FORMAT_MOD_INVALID)];
+        let device = 0x1234_5678_u64.to_ne_bytes();
+        let messages =
+            build_synthetic_feedback_messages(77, &pairs, &device).expect("feedback messages");
+
+        let opcodes = messages
+            .iter()
+            .map(|(message, _)| message_opcode(message))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opcodes,
+            vec![
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
+                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_DONE,
+            ]
+        );
+        assert!(messages
+            .iter()
+            .all(|(message, _)| { u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 77 }));
+        assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
+
+        let table_fd = messages[0].1[0];
+        let expected_seals =
+            libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+        let seals = unsafe { libc::fcntl(table_fd, libc::F_GET_SEALS) };
+        assert_eq!(seals & expected_seals, expected_seals);
+
+        let mut table = [0u8; 32];
+        assert_eq!(
+            unsafe { libc::pread(table_fd, table.as_mut_ptr().cast(), table.len(), 0) },
+            table.len() as isize
+        );
+        assert_eq!(
+            u32::from_ne_bytes(table[0..4].try_into().unwrap()),
+            pairs[0].0
+        );
+        assert_eq!(
+            u64::from_ne_bytes(table[8..16].try_into().unwrap()),
+            pairs[0].1
+        );
+        assert_eq!(
+            u64::from_ne_bytes(table[24..32].try_into().unwrap()),
+            pairs[1].1
+        );
+
+        for (_, fds) in messages {
+            for fd in fds {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+
+    #[test]
+    fn large_synthetic_feedback_splits_tranche_indices_at_wire_limit() {
+        let pairs = (0..MAX_FEEDBACK_FORMATS)
+            .map(|index| (0x3432_5258, index as u64))
+            .collect::<Vec<_>>();
+        let messages = build_synthetic_feedback_messages(77, &pairs, &[0; 8])
+            .expect("maximum-size feedback should be representable");
+        let tranche_messages = messages
+            .iter()
+            .filter(|(message, _)| {
+                message_opcode(message)
+                    == crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tranche_messages.len(),
+            MAX_FEEDBACK_FORMATS.div_ceil(MAX_TRANCHE_INDICES_PER_EVENT)
+        );
+        assert!(messages.iter().all(|(message, _)| message.len() <= 65_532));
+
+        for (_, fds) in messages {
+            for fd in fds {
+                let _ = nix::unistd::close(fd);
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_feedback_waits_for_capability_barrier() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.dmabuf_guest_generations.insert(7, 42);
+        ctx.dmabuf_capabilities.entry(42).or_default();
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+
+        assert_eq!(
+            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut handler, &mut ctx, 90),
+            Action::Drop
+        );
+        assert_eq!(ctx.synthetic_feedback_objects.get(&90), Some(&42));
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "feedback must remain pending until the host capability callback"
+        );
+        assert!(!ctx.dmabuf_capabilities[&42].ready);
+    }
+
+    #[test]
+    fn capability_snapshots_remain_isolated_by_global_generation() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.dmabuf_capabilities
+            .entry(1)
+            .or_default()
+            .format_modifiers
+            .push((0x3432_5258, 1));
+        ctx.dmabuf_capabilities
+            .entry(2)
+            .or_default()
+            .format_modifiers
+            .push((0x3432_5258, 2));
+
+        assert_eq!(feedback_pairs(&ctx, 1), vec![(0x3432_5258, 1)]);
+        assert_eq!(feedback_pairs(&ctx, 2), vec![(0x3432_5258, 2)]);
+    }
+
+    #[test]
+    fn legacy_capability_events_are_hidden_from_synthetic_v4_factory() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "zwp_linux_dmabuf_v1".to_string(), 4);
+        ctx.last_sender_id = 20;
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(handler.on_format(&mut ctx, 0x3432_5258), Action::Drop);
+        assert_eq!(
+            handler.on_modifier(&mut ctx, 0x3432_5258, 0, 0),
+            Action::Drop
+        );
+
+        ctx.shadow_table.remove_id(10);
+        ctx.shadow_table.map_id(11, 21);
+        ctx.shadow_table
+            .track_interface_with_version(11, "zwp_linux_dmabuf_v1".to_string(), 3);
+        ctx.last_sender_id = 21;
+        assert_eq!(handler.on_format(&mut ctx, 0x3432_5258), Action::Forward);
+        assert_eq!(
+            handler.on_modifier(&mut ctx, 0x3432_5258, 0, 0),
+            Action::Forward
+        );
+    }
 
     #[test]
     fn forwards_device_id_when_no_local_allocator_exists() {

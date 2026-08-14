@@ -24,11 +24,11 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABU
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
-use crate::protocols::wayland::wl_registry;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
+use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, HostGlobal, HostId};
+use crate::state::{Context, HostGlobal, HostId, PendingDmabufGlobal};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -36,7 +36,10 @@ use log::error;
 // plus the v4 feedback objects. Do not advertise v5: v5 adds tranche events
 // and semantics that are not translated by this proxy.
 const LINUX_DMABUF_VERSION: u32 = 4;
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 2;
+// Legacy format/modifier events are needed to synthesize the v4 feedback
+// object exposed to the guest.  `create_immed` is available since v2 and
+// explicit modifier events since v3, so bind at v3 when the host supports it.
+const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 3;
 const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
 const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const WL_COMPOSITOR_VERSION: u32 = 4;
@@ -135,10 +138,20 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
 }
 
 fn queue_synthetic_global(ctx: &mut Context, name: u32, interface: &str, version: u32) -> bool {
+    queue_synthetic_global_for_registry(ctx, ctx.last_sender_id, name, interface, version)
+}
+
+fn queue_synthetic_global_for_registry(
+    ctx: &mut Context,
+    registry_host_id: u32,
+    name: u32,
+    interface: &str,
+    version: u32,
+) -> bool {
     let registry_guest_id = ctx
         .shadow_table
-        .get_guest_id(ctx.last_sender_id)
-        .unwrap_or(ctx.last_sender_id);
+        .get_guest_id(registry_host_id)
+        .unwrap_or(registry_host_id);
     let mut builder = MessageBuilder::new();
     builder.write_u32(name);
     builder.write_string(interface);
@@ -156,6 +169,91 @@ fn queue_synthetic_global(ctx: &mut Context, name: u32, interface: &str, version
                 error
             );
             false
+        }
+    }
+}
+
+fn defer_synthetic_dmabuf_global(
+    ctx: &mut Context,
+    registry_host_id: u32,
+    name: u32,
+    version: u32,
+    generation: u64,
+) {
+    let pending = PendingDmabufGlobal {
+        registry_host_id,
+        name,
+        version,
+        generation,
+    };
+    if !ctx.pending_dmabuf_globals.contains(&pending) {
+        ctx.pending_dmabuf_globals.push(pending);
+    }
+    ctx.registry_global_visibility
+        .entry(registry_host_id)
+        .or_default()
+        .insert(name, false);
+}
+
+pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64) {
+    let can_publish = crate::handler::linux_dmabuf::has_synthetic_feedback_formats(ctx, generation);
+    let mut matching = Vec::new();
+    ctx.pending_dmabuf_globals.retain(|pending| {
+        if pending.generation == generation {
+            matching.push(pending.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    if !can_publish {
+        log::warn!(
+            "Hiding linux-dmabuf generation {} because the host advertised no supported formats",
+            generation
+        );
+        return;
+    }
+
+    for pending in matching {
+        let is_current = ctx
+            .registry_global_names
+            .get(&pending.registry_host_id)
+            .is_some_and(|names| names.contains(&pending.name))
+            && ctx
+                .registry_global_generations
+                .get(&pending.registry_host_id)
+                .and_then(|generations| generations.get(&pending.name))
+                .is_some_and(|&current| current == generation)
+            && !ctx
+                .registry_global_removed
+                .get(&pending.registry_host_id)
+                .is_some_and(|names| names.contains(&pending.name))
+            && ctx.global_generations.get(&pending.name) == Some(&generation);
+        if !is_current {
+            continue;
+        }
+
+        ctx.host_globals.insert(
+            pending.name,
+            HostGlobal {
+                interface: "zwp_linux_dmabuf_v1".to_string(),
+                version: pending.version,
+            },
+        );
+        let visible = queue_synthetic_global_for_registry(
+            ctx,
+            pending.registry_host_id,
+            pending.name,
+            "zwp_linux_dmabuf_v1",
+            pending.version,
+        );
+        ctx.registry_global_visibility
+            .entry(pending.registry_host_id)
+            .or_default()
+            .insert(pending.name, visible);
+        if !visible {
+            ctx.host_globals.remove(&pending.name);
         }
     }
 }
@@ -190,6 +288,32 @@ fn queue_internal_bind(
     }
 }
 
+fn queue_dmabuf_capability_barrier(ctx: &mut Context, generation: u64) -> bool {
+    let callback_id = ctx.shadow_table.allocate_host_id();
+    ctx.shadow_table
+        .track_host_interface_with_version(callback_id, "wl_callback".to_string(), 1);
+
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(callback_id);
+    match builder.try_build_message(1, wl_display::REQ_SYNC) {
+        Ok(message) => {
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.dmabuf_capability_callbacks
+                .insert(callback_id, generation);
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Unable to encode linux-dmabuf capability barrier for generation {}: {}",
+                generation,
+                error
+            );
+            ctx.shadow_table.remove_host_interface(callback_id);
+            false
+        }
+    }
+}
+
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
     ctx.host_dmabuf_global_name == Some(name)
         || ctx.host_shm_global_name == Some(name)
@@ -207,6 +331,7 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
 /// object that no longer represents the current host global.
 fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     if ctx.host_dmabuf_global_name == Some(name) {
+        let generation = ctx.host_dmabuf_generation.take();
         if let Some(host_id) = ctx.host_dmabuf_id.take() {
             // A registry global removal invalidates the name, not objects
             // already bound from it. Explicitly destroy our hidden binding so
@@ -218,6 +343,9 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         ctx.host_dmabuf_global_name = None;
         ctx.supported_formats.clear();
         clear_host_shm_dmabuf_formats(ctx);
+        if let Some(generation) = generation {
+            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+        }
     }
     if ctx.host_shm_global_name == Some(name) {
         if let Some(host_id) = ctx.host_shm_id.take() {
@@ -435,6 +563,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         }
 
         if interface == "zwp_linux_dmabuf_v1" {
+            let generation = ctx
+                .global_generations
+                .get(&name)
+                .copied()
+                .unwrap_or_default();
             let virtwl_supports_dmabuf = ctx
                 .virtwayland_channel
                 .as_ref()
@@ -443,34 +576,71 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 record_registry_global_visibility(ctx, name, false);
                 return Action::Drop;
             }
-            let client_version = version.min(LINUX_DMABUF_VERSION);
+            // A v3 host still has enough legacy format/modifier information
+            // for our synthetic v4 feedback object. Advertise v4 to the
+            // guest while clamping only the internal host bind to v3.
+            let can_synthesize_feedback =
+                version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_some();
+            let client_version = if can_synthesize_feedback {
+                LINUX_DMABUF_VERSION
+            } else {
+                if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_none() {
+                    log::warn!(
+                        "GBM allocator unavailable; exposing linux-dmabuf v3 without synthetic \
+                         device feedback"
+                    );
+                }
+                version.min(LINUX_DMABUF_CAPABILITY_VERSION)
+            };
             if ctx.host_dmabuf_id.is_some() {
                 // One host dmabuf object is shared for capability discovery.
                 // A second guest registry still needs the client-facing
                 // global event when the GPU path is enabled.
                 if ctx.gpu_accel {
-                    ctx.host_globals.insert(
-                        name,
-                        HostGlobal {
-                            interface: interface.clone(),
-                            version: client_version,
-                        },
-                    );
-                    let visible = queue_synthetic_global(ctx, name, interface, client_version);
-                    record_registry_global_visibility(ctx, name, visible);
+                    let capability_ready = ctx
+                        .dmabuf_capabilities
+                        .get(&generation)
+                        .is_some_and(|capabilities| capabilities.ready);
+                    if can_synthesize_feedback && !capability_ready {
+                        defer_synthetic_dmabuf_global(
+                            ctx,
+                            ctx.last_sender_id,
+                            name,
+                            client_version,
+                            generation,
+                        );
+                    } else if !can_synthesize_feedback
+                        || crate::handler::linux_dmabuf::has_synthetic_feedback_formats(
+                            ctx, generation,
+                        )
+                    {
+                        ctx.host_globals.insert(
+                            name,
+                            HostGlobal {
+                                interface: interface.clone(),
+                                version: client_version,
+                            },
+                        );
+                        let visible = queue_synthetic_global(ctx, name, interface, client_version);
+                        record_registry_global_visibility(ctx, name, visible);
+                    } else {
+                        record_registry_global_visibility(ctx, name, false);
+                    }
                 } else {
                     ctx.hidden_host_globals.insert(name, interface.clone());
                     record_registry_global_visibility(ctx, name, false);
                 }
                 return Action::Drop;
             }
-            // ChromiumOS binds its internal dmabuf proxy at v2. This keeps
-            // create_immed available for the compositor's own SHM copy path
-            // while still allowing v1 hosts to be probed conservatively.
+            // Bind at v3 when available so the proxy can collect legacy
+            // format/modifier pairs and synthesize the v4 feedback object.
+            // v2 still keeps create_immed available on older hosts.
             let host_bind_version = client_version.min(LINUX_DMABUF_CAPABILITY_VERSION);
             let host_id = ctx.shadow_table.allocate_host_id();
             ctx.host_dmabuf_id = Some(host_id);
             ctx.host_dmabuf_global_name = Some(name);
+            ctx.host_dmabuf_generation = Some(generation);
+            ctx.dmabuf_capabilities.entry(generation).or_default();
             // Register for event dispatch: the host compositor sends format/modifier
             // events to the dmabuf factory object after we bind it.
             ctx.shadow_table.track_host_interface_with_version(
@@ -480,15 +650,25 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
 
             if ctx.gpu_accel {
-                ctx.host_globals.insert(
-                    name,
-                    HostGlobal {
-                        interface: interface.clone(),
-                        version: client_version,
-                    },
-                );
-                let visible = queue_synthetic_global(ctx, name, interface, client_version);
-                record_registry_global_visibility(ctx, name, visible);
+                if can_synthesize_feedback {
+                    defer_synthetic_dmabuf_global(
+                        ctx,
+                        ctx.last_sender_id,
+                        name,
+                        client_version,
+                        generation,
+                    );
+                } else {
+                    ctx.host_globals.insert(
+                        name,
+                        HostGlobal {
+                            interface: interface.clone(),
+                            version: client_version,
+                        },
+                    );
+                    let visible = queue_synthetic_global(ctx, name, interface, client_version);
+                    record_registry_global_visibility(ctx, name, visible);
+                }
             } else {
                 // Virtwl uses this object only to learn the formats that can
                 // be advertised by the synthetic wl_shm global. Keep the
@@ -500,7 +680,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            let bound = queue_internal_bind(
                 ctx,
                 registry_host_id,
                 name,
@@ -508,6 +688,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 host_bind_version,
                 host_id,
             );
+            if bound && can_synthesize_feedback {
+                if !queue_dmabuf_capability_barrier(ctx, generation) {
+                    ctx.fatal_protocol_error = true;
+                }
+            } else if !bound {
+                ctx.fatal_protocol_error = true;
+            }
 
             // Drop the original global event so we don't send the host's
             // uncapped advertisement.
@@ -767,6 +954,14 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         if !registry_seen {
             return Action::Drop;
         }
+        ctx.pending_dmabuf_globals.retain(|pending| {
+            !(pending.registry_host_id == registry_id
+                && pending.name == name
+                && Some(pending.generation) == removed_generation)
+        });
+        if let Some(generation) = removed_generation {
+            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+        }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
             visibility.remove(&name);
         }
@@ -893,7 +1088,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
-        ctx.shadow_table.set_host_version(host_new_id, *version);
+        // The guest-facing dmabuf global is synthesized at v4, while the
+        // host object used for params/create may only be v2/v3. Keep the
+        // guest metadata at v4 so feedback requests are accepted locally,
+        // but clamp the paired host object to v3 so registry.bind does not
+        // request an unsupported host version.
+        let host_version = if interface == "zwp_linux_dmabuf_v1" {
+            (*version).min(LINUX_DMABUF_CAPABILITY_VERSION)
+        } else {
+            *version
+        };
+        ctx.shadow_table.set_host_version(host_new_id, host_version);
 
         // We need to send the bind request to the host.
         // The sender is the registry object.
@@ -906,29 +1111,77 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
-        queue_internal_bind(
+        let bind_version = if interface == "zwp_linux_dmabuf_v1" {
+            host_version
+        } else {
+            *version
+        };
+        if !queue_internal_bind(
             ctx,
             registry_host_id,
             name,
             interface,
-            *version,
+            bind_version,
             host_new_id,
-        );
+        ) {
+            ctx.shadow_table.remove_id(*guest_new_id);
+            ctx.fatal_protocol_error = true;
+            return Action::Drop;
+        }
+        if interface == "zwp_linux_dmabuf_v1" {
+            let generation = ctx
+                .registry_global_generations
+                .get(&registry_host_id)
+                .and_then(|generations| generations.get(&name))
+                .copied()
+                .or_else(|| ctx.global_generations.get(&name).copied())
+                .unwrap_or_default();
+            ctx.dmabuf_guest_generations
+                .insert(*guest_new_id, generation);
+        }
 
         Action::Drop
+    }
+}
+
+impl wl_fixes::WlFixesHandler for RegistryHandler {
+    fn on_destroy_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
+        let registry_host_id = ctx.shadow_table.get_host_id(registry).unwrap_or(registry);
+        let generations = ctx
+            .registry_global_generations
+            .remove(&registry_host_id)
+            .into_iter()
+            .flat_map(|generations| generations.into_values())
+            .collect::<std::collections::HashSet<_>>();
+        ctx.registry_global_names.remove(&registry_host_id);
+        ctx.registry_global_removed.remove(&registry_host_id);
+        ctx.registry_global_visibility.remove(&registry_host_id);
+        ctx.pending_dmabuf_globals
+            .retain(|pending| pending.registry_host_id != registry_host_id);
+        for generation in generations {
+            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+        }
+
+        // wl_fixes destroys the registry passed as an object argument rather
+        // than its own request sender. Reserve that guest/host mapping until
+        // wl_display.delete_id acknowledges the host-side destruction.
+        ctx.shadow_table.mark_pending_destroy(registry);
+        Action::Forward
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
-        RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
+        advertised_global_version, keyboard_extension_version, queue_dmabuf_capability_barrier,
+        should_bind_internal_dmabuf, RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
     };
+    use crate::handler::linux_dmabuf::LinuxDmabufHandler;
     use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
+    use crate::protocols::wayland::wl_fixes::WlFixesHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::state::{Context, HostGlobal, HostId};
     use crate::wire::Action;
@@ -947,6 +1200,67 @@ mod tests {
             "a virtwl channel with dmabuf support must be probed and bound even \
              when the guest-facing GPU path is disabled"
         );
+    }
+
+    #[test]
+    fn dmabuf_capability_barrier_is_a_tracked_host_callback() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        assert!(queue_dmabuf_capability_barrier(&mut ctx, 9));
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+
+        let message = &ctx.client_to_host_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            1,
+            "wl_display must own the sync request"
+        );
+        assert_eq!(
+            u16::from_ne_bytes(message[4..6].try_into().unwrap()),
+            crate::protocols::wayland::wl_display::REQ_SYNC
+        );
+        let callback_id = u32::from_ne_bytes(message[8..12].try_into().unwrap());
+        assert_eq!(ctx.dmabuf_capability_callbacks.get(&callback_id), Some(&9));
+        assert_eq!(
+            ctx.shadow_table.get_host_interface(callback_id),
+            Some(&"wl_callback".to_string())
+        );
+    }
+
+    #[test]
+    fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.shadow_table.map_id(10, 100);
+        ctx.shadow_table
+            .track_interface(10, "wl_registry".to_string());
+        ctx.registry_global_names.entry(100).or_default().insert(7);
+        ctx.registry_global_generations
+            .entry(100)
+            .or_default()
+            .insert(7, 9);
+        ctx.registry_global_visibility
+            .entry(100)
+            .or_default()
+            .insert(7, false);
+        ctx.dmabuf_capabilities.entry(9).or_default();
+        ctx.pending_dmabuf_globals
+            .push(crate::state::PendingDmabufGlobal {
+                registry_host_id: 100,
+                name: 7,
+                version: 4,
+                generation: 9,
+            });
+
+        let mut handler = RegistryHandler;
+        assert_eq!(
+            WlFixesHandler::on_destroy_registry(&mut handler, &mut ctx, 10),
+            Action::Forward
+        );
+        assert!(!ctx.registry_global_names.contains_key(&100));
+        assert!(!ctx.registry_global_generations.contains_key(&100));
+        assert!(!ctx.registry_global_visibility.contains_key(&100));
+        assert!(ctx.pending_dmabuf_globals.is_empty());
+        assert!(!ctx.dmabuf_capabilities.contains_key(&9));
+        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
     }
 
     #[test]
@@ -1068,7 +1382,7 @@ mod tests {
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 99), Action::Drop);
         let dmabuf_id = ctx.host_dmabuf_id.expect("dmabuf binding");
-        assert_eq!(ctx.shadow_table.host_object_version(dmabuf_id), Some(2));
+        assert_eq!(ctx.shadow_table.host_object_version(dmabuf_id), Some(3));
 
         let extension = "zcr_text_input_extension_v1".to_string();
         assert_eq!(
@@ -1085,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_dmabuf_binding_uses_capability_version_two() {
+    fn internal_dmabuf_binding_uses_capability_version_three() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
@@ -1099,9 +1413,9 @@ mod tests {
         let host_id = ctx.host_dmabuf_id.expect("internal dmabuf binding");
         assert_eq!(
             ctx.shadow_table.host_object_version(host_id),
-            Some(2),
-            "the internal binding must match ChromiumOS's v2 capability proxy \
-             even when the guest-facing global supports feedback v4+"
+            Some(3),
+            "the internal binding must collect v3 legacy modifiers while the \
+             guest-facing global supports feedback v4+"
         );
 
         let bind = &ctx.client_to_host_queue[0].0;
@@ -1110,10 +1424,65 @@ mod tests {
         assert_eq!(wire.read_string().unwrap(), dmabuf);
         assert_eq!(
             wire.read_u32().unwrap(),
-            2,
-            "internal host bind should request v2 for capability discovery"
+            3,
+            "internal host bind should request v3 for legacy modifier discovery"
         );
         assert_eq!(wire.read_u32().unwrap(), host_id);
+    }
+
+    #[test]
+    fn synthetic_dmabuf_global_waits_for_completed_capabilities() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
+        let generation = ctx.global_generations[&10];
+        assert!(!ctx.host_globals.contains_key(&10));
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert_eq!(ctx.pending_dmabuf_globals.len(), 1);
+
+        ctx.dmabuf_capabilities
+            .get_mut(&generation)
+            .expect("capability generation")
+            .format_modifiers
+            .push((0x3432_5258, 0));
+        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
+
+        assert_eq!(
+            ctx.host_globals.get(&10),
+            Some(&HostGlobal {
+                interface: dmabuf,
+                version: 4,
+            })
+        );
+        assert!(ctx.pending_dmabuf_globals.is_empty());
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(ctx.registry_global_visibility[&1].get(&10), Some(&true));
+    }
+
+    #[test]
+    fn synthetic_dmabuf_global_stays_hidden_without_supported_formats() {
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
+        let generation = ctx.global_generations[&10];
+        LinuxDmabufHandler::complete_capability_discovery(&mut ctx, generation);
+
+        assert!(!ctx.host_globals.contains_key(&10));
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert!(ctx.pending_dmabuf_globals.is_empty());
+        assert_eq!(ctx.registry_global_visibility[&1].get(&10), Some(&false));
     }
 
     #[test]
@@ -1614,8 +1983,13 @@ mod tests {
 
         assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
         let host_id = ctx.host_dmabuf_id.expect("internal dmabuf binding");
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
+        assert_eq!(
+            handler.on_global_remove(&mut ctx, 10),
+            Action::Drop,
+            "a global removed before capability discovery was never visible"
+        );
         assert_eq!(ctx.host_dmabuf_id, None);
+        assert!(ctx.pending_dmabuf_globals.is_empty());
         assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
         let destroy = ctx
             .client_to_host_queue
