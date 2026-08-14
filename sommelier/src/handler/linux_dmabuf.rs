@@ -185,6 +185,11 @@ impl LinuxDmabufHandler {
         };
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
             error!("Unknown host ID for params {}", params_id);
+            // A stale entry can only arise after an earlier create failed
+            // between parameter decoding and host-ID lookup. Drop it before
+            // closing the queued plane descriptors so this params ID cannot
+            // accidentally retain a sync fence for a later request.
+            ctx.pending_native_sync_fds.remove(&params_id);
             for param in params {
                 unsafe { libc::close(param.fd) };
             }
@@ -195,6 +200,33 @@ impl LinuxDmabufHandler {
             ctx.fatal_protocol_error = true;
             return false;
         };
+
+        // Keep one independent plane descriptor for the host buffer's
+        // compositor-use fence. The queued ADD owns the descriptor passed to
+        // the host; this duplicate survives until the corresponding host
+        // wl_buffer.delete_id and is waited immediately before each commit.
+        let sync_source = params
+            .iter()
+            .find(|param| param.plane_idx == 0)
+            .or_else(|| params.first());
+        let sync_fd = sync_source.and_then(|param| {
+            nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(param.fd) })
+                .map_err(|error| {
+                    error!(
+                        "Failed to duplicate dma-buf fd for synchronization: {}",
+                        error
+                    );
+                })
+                .ok()
+        });
+        let Some(sync_fd) = sync_fd else {
+            for param in params {
+                unsafe { libc::close(param.fd) };
+            }
+            ctx.fatal_protocol_error = true;
+            return false;
+        };
+        ctx.pending_native_sync_fds.insert(params_id, sync_fd);
 
         // Send ADDs. If the wire builder ever rejects one of these fixed-size
         // messages, close every descriptor that was not handed to the queue
@@ -220,6 +252,7 @@ impl LinuxDmabufHandler {
                 for remaining in params {
                     unsafe { libc::close(remaining.fd) };
                 }
+                ctx.pending_native_sync_fds.remove(&params_id);
                 ctx.fatal_protocol_error = true;
                 return false;
             }
@@ -227,6 +260,7 @@ impl LinuxDmabufHandler {
 
         // Send CREATE only after every ADD was queued successfully.
         if !send_create(ctx, host_id) {
+            ctx.pending_native_sync_fds.remove(&params_id);
             ctx.fatal_protocol_error = true;
             return false;
         }
@@ -234,6 +268,7 @@ impl LinuxDmabufHandler {
     }
 
     fn discard_pending_params(ctx: &mut Context, params_id: u32) {
+        ctx.pending_native_sync_fds.remove(&params_id);
         if let Some(params) = ctx.pending_params.remove(&params_id) {
             for param in params {
                 unsafe {
@@ -307,6 +342,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
+        ctx.pending_native_sync_fds.remove(&params_id);
         if let Some(previous) = ctx.pending_params.insert(params_id, Vec::new()) {
             // Reusing a params ID is a protocol violation, but closing stale
             // duplicated plane FDs here keeps the connection from leaking
@@ -597,6 +633,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             // can still be dispatched after the guest mapping is retired.
             ctx.orphaned_dmabuf_params.insert(host_id, id);
         }
+        ctx.pending_native_sync_fds.remove(&id);
         if let Some(params) = ctx.pending_params.remove(&id) {
             for p in params {
                 unsafe { libc::close(p.fd) };
@@ -763,6 +800,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 ctx.shadow_table.remove_host_interface(buffer);
             }
             ctx.orphaned_dmabuf_params.remove(&host_params_id);
+            ctx.pending_native_sync_fds.remove(&guest_params_id);
             if params_mapping_alive {
                 ctx.pending_native_buffer_sizes.remove(&guest_params_id);
             }
@@ -816,6 +854,9 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 // interval; compositor damage lookup resolves the guest ID
                 // back to this host ID.
                 ctx.native_buffer_sizes.insert(buffer, dimensions);
+                if let Some(sync_fd) = ctx.pending_native_sync_fds.remove(&guest_params_id) {
+                    ctx.native_buffer_sync_fds.insert(buffer, sync_fd);
+                }
             }
         }
         Action::Forward
@@ -827,6 +868,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             let params_mapping_alive =
                 ctx.shadow_table.get_guest_id(host_params_id) == Some(guest_params_id);
             ctx.orphaned_dmabuf_params.remove(&host_params_id);
+            ctx.pending_native_sync_fds.remove(&guest_params_id);
             if params_mapping_alive {
                 ctx.pending_native_buffer_sizes.remove(&guest_params_id);
             }
@@ -841,9 +883,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             if ctx.shadow_table.is_pending_destroy_guest(guest_params_id) {
                 ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_buffer_sizes.remove(&guest_params_id);
+                ctx.pending_native_sync_fds.remove(&guest_params_id);
                 return Action::Drop;
             }
             ctx.pending_native_buffer_sizes.remove(&guest_params_id);
+            ctx.pending_native_sync_fds.remove(&guest_params_id);
         }
         Action::Forward
     }
@@ -929,6 +973,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         if !queued {
             ctx.native_buffer_sizes.remove(&buffer_id);
             ctx.shadow_table.remove_id(buffer_id);
+        } else if let Some(sync_fd) = ctx.pending_native_sync_fds.remove(&params_id) {
+            ctx.native_buffer_sync_fds.insert(host_buffer_id, sync_fd);
         }
         Action::Drop
     }
@@ -1153,6 +1199,10 @@ mod tests {
             Some(&(16, 8)),
             "async create must retain dimensions until the host emits created"
         );
+        assert!(
+            ctx.pending_native_sync_fds.contains_key(&guest_params_id),
+            "async create must retain a dma-buf fence descriptor until created"
+        );
         assert!(!ctx.native_buffer_sizes.contains_key(&host_buffer_id));
 
         let payload = host_buffer_id.to_ne_bytes();
@@ -1174,7 +1224,12 @@ mod tests {
             "created must still be forwarded to the guest"
         );
         assert_eq!(ctx.pending_native_buffer_sizes.get(&guest_params_id), None);
+        assert!(!ctx.pending_native_sync_fds.contains_key(&guest_params_id));
         assert_eq!(ctx.native_buffer_sizes.get(&host_buffer_id), Some(&(16, 8)));
+        assert!(
+            ctx.native_buffer_sync_fds.contains_key(&host_buffer_id),
+            "created must move the retained fence descriptor to the host buffer"
+        );
         let guest_buffer_id = ctx
             .shadow_table
             .get_guest_id(host_buffer_id)

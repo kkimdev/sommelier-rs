@@ -18,7 +18,7 @@ use gbm::{BufferObjectFlags, Format};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +28,9 @@ const VIRTIO_GPU_DRIVER: &str = "virtio_gpu";
 const DRM_COMMAND_BASE: u8 = 64;
 const VIRTGPU_GETPARAM_COMMAND: u8 = DRM_COMMAND_BASE + 0x03;
 const VIRTGPU_RESOURCE_INFO_COMMAND: u8 = DRM_COMMAND_BASE + 0x05;
+const VIRTGPU_WAIT_COMMAND: u8 = DRM_COMMAND_BASE + 0x08;
 const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
+const DMA_BUF_SYNC_READ: u32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -43,6 +45,20 @@ struct DrmPrimeHandle {
 struct DrmGemClose {
     handle: u32,
     pad: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+struct DrmVirtGpuWait {
+    handle: u32,
+    flags: u32,
 }
 
 #[repr(C)]
@@ -78,6 +94,14 @@ const DRM_IOCTL_PRIME_FD_TO_HANDLE: libc::c_ulong =
         as libc::c_ulong;
 const DRM_IOCTL_GEM_CLOSE: libc::c_ulong =
     nix::request_code_write!(b'd', 0x09, std::mem::size_of::<DrmGemClose>()) as libc::c_ulong;
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong =
+    nix::request_code_readwrite!(b'b', 0x02, std::mem::size_of::<DmaBufExportSyncFile>())
+        as libc::c_ulong;
+const DRM_IOCTL_VIRTGPU_WAIT: libc::c_ulong = nix::request_code_readwrite!(
+    b'd',
+    VIRTGPU_WAIT_COMMAND,
+    std::mem::size_of::<DrmVirtGpuWait>()
+) as libc::c_ulong;
 const DRM_IOCTL_VIRTGPU_GETPARAM: libc::c_ulong = nix::request_code_readwrite!(
     b'd',
     VIRTGPU_GETPARAM_COMMAND,
@@ -180,6 +204,65 @@ fn ioctl_getparam(fd: RawFd, getparam: &mut DrmVirtGpuGetParam) -> io::Result<()
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn wait_sync_file(fd: RawFd) -> io::Result<()> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // Match ChromiumOS Sommelier's bounded fence wait. A GPU hang must
+        // not permanently stall the proxy's single Wayland event loop.
+        let result = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, 1_000) };
+        if result > 0 {
+            if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(io::Error::other("dma-buf sync fence reported an error"));
+            }
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "dma-buf sync fence wait timed out",
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
+            return Err(error);
+        }
+    }
+}
+
+fn export_dmabuf_read_fence(fd: RawFd) -> io::Result<OwnedFd> {
+    let mut sync_file = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    loop {
+        let result = unsafe {
+            libc::ioctl(
+                fd,
+                DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _,
+                std::ptr::from_mut(&mut sync_file),
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
+            return Err(error);
+        }
+    }
+    if sync_file.fd < 0 {
+        return Err(io::Error::other(
+            "dma-buf export returned an invalid sync-file fd",
+        ));
+    }
+    // The kernel transfers ownership of the returned descriptor to userspace.
+    Ok(unsafe { OwnedFd::from_raw_fd(sync_file.fd) })
 }
 
 fn resource_info_type_supported(
@@ -525,14 +608,82 @@ impl Allocator {
             self.drm_has_virtgpu_resource_info_type,
         )
     }
+
+    /// Wait until a guest dma-buf's outstanding writers have completed before
+    /// forwarding a surface commit to the host compositor.
+    ///
+    /// ChromiumOS Sommelier first exports and polls a dma-buf sync file, then
+    /// falls back to the virtio-gpu GEM wait when the export ioctl is absent.
+    /// The Rust proxy must retain one duplicate of each native buffer fd until
+    /// its host `wl_buffer` is destroyed so this ordering remains intact.
+    pub(crate) fn wait_for_dmabuf(&self, fd: RawFd) -> io::Result<()> {
+        if fd < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid dma-buf descriptor",
+            ));
+        }
+
+        match export_dmabuf_read_fence(fd) {
+            Ok(sync_file) => wait_sync_file(sync_file.as_fd().as_raw_fd()),
+            Err(export_error) => {
+                let mut prime = DrmPrimeHandle {
+                    fd,
+                    ..DrmPrimeHandle::default()
+                };
+                let import_result = unsafe {
+                    libc::ioctl(
+                        self.device.as_fd().as_raw_fd(),
+                        DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
+                        std::ptr::from_mut(&mut prime),
+                    )
+                };
+                if import_result != 0 {
+                    return Err(export_error);
+                }
+
+                let mut wait = DrmVirtGpuWait {
+                    handle: prime.handle,
+                    flags: 0,
+                };
+                let wait_result = unsafe {
+                    libc::ioctl(
+                        self.device.as_fd().as_raw_fd(),
+                        DRM_IOCTL_VIRTGPU_WAIT as _,
+                        std::ptr::from_mut(&mut wait),
+                    )
+                };
+                let wait_error = (wait_result != 0).then(io::Error::last_os_error);
+
+                let mut close = DrmGemClose {
+                    handle: prime.handle,
+                    ..DrmGemClose::default()
+                };
+                let close_result = unsafe {
+                    libc::ioctl(
+                        self.device.as_fd().as_raw_fd(),
+                        DRM_IOCTL_GEM_CLOSE as _,
+                        std::ptr::from_mut(&mut close),
+                    )
+                };
+                if let Some(error) = wait_error {
+                    return Err(error);
+                }
+                if close_result != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         apply_dmabuf_plane0_fixup, drm_device_candidates, is_virtio_gpu_driver, open_drm_device,
-        render_node_number, resource_info_type_supported, sorted_render_nodes, VirtGpuResourceInfo,
-        VirtGpuResourceInfoProbe, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS,
+        render_node_number, resource_info_type_supported, sorted_render_nodes, wait_sync_file,
+        VirtGpuResourceInfo, VirtGpuResourceInfoProbe, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS,
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
     };
     use std::ffi::OsStr;
@@ -692,5 +843,27 @@ mod tests {
                 is_virtgpu_buffer: true,
             }
         );
+    }
+
+    #[test]
+    fn ready_sync_file_returns_without_blocking() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let byte = [1_u8];
+        assert_eq!(
+            unsafe {
+                libc::write(
+                    pipe_fds[1],
+                    byte.as_ptr().cast::<libc::c_void>(),
+                    byte.len(),
+                )
+            },
+            1
+        );
+        assert!(wait_sync_file(pipe_fds[0]).is_ok());
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
     }
 }

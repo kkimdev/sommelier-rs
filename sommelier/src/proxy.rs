@@ -27,6 +27,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 
+// A frame can generate many small Wayland requests (damage, attach, commit,
+// callbacks, and buffer bookkeeping).  Keep one client from processing an
+// unbounded stream of those requests without returning to the executor:
+// keyboard/text-input events arrive on the opposite direction and otherwise
+// wait behind the entire render burst on the current-thread runtime.
+const MAX_MESSAGES_PER_BATCH: usize = 128;
+
 #[derive(Debug, Clone, Copy)]
 enum Direction {
     ClientToHost,
@@ -188,13 +195,41 @@ impl Client {
             .shadow_table
             .track_interface(1, "wl_display".to_string());
 
+        // When both streams already have complete messages buffered, alternate
+        // directions. This gives host input (keyboard/IME) a bounded wait even
+        // while a large client render burst is being drained.
+        let mut prefer_host = true;
         loop {
+            let buffered_direction = if prefer_host {
+                if self.host_conn.has_complete_message() {
+                    Some(Direction::HostToClient)
+                } else if self.client_conn.has_complete_message() {
+                    Some(Direction::ClientToHost)
+                } else {
+                    None
+                }
+            } else if self.client_conn.has_complete_message() {
+                Some(Direction::ClientToHost)
+            } else if self.host_conn.has_complete_message() {
+                Some(Direction::HostToClient)
+            } else {
+                None
+            };
+            if let Some(direction) = buffered_direction {
+                if !self.handle_msgs(direction).await {
+                    break;
+                }
+                prefer_host = matches!(direction, Direction::ClientToHost);
+                continue;
+            }
+
             tokio::select! {
                 res = self.client_conn.recv() => {
                     match res {
                         Ok(bytes) => {
                             if bytes == 0 { break; }
                             if !self.handle_msgs(Direction::ClientToHost).await { break; }
+                            prefer_host = true;
                         }
                         Err(_) => break,
                     }
@@ -204,6 +239,7 @@ impl Client {
                         Ok(bytes) => {
                             if bytes == 0 { break; }
                             if !self.handle_msgs(Direction::HostToClient).await { break; }
+                            prefer_host = false;
                         }
                         Err(_) => break,
                     }
@@ -318,6 +354,7 @@ impl Client {
         let mut out_fds = Vec::new();
         let mut offset: usize = 0;
         let mut fd_offset: usize = 0;
+        let mut processed_messages = 0;
         // A complete untracked message cannot tell us whether descriptors
         // currently queued on the ordered stream belong to it or to a later
         // message. Retain them while the next message is partial (the bytes
@@ -544,7 +581,11 @@ impl Client {
             }
 
             offset = message_end;
+            processed_messages += 1;
             if self.ctx.fatal_protocol_error {
+                break;
+            }
+            if processed_messages >= MAX_MESSAGES_PER_BATCH {
                 break;
             }
         }
@@ -622,6 +663,41 @@ mod tests {
     use super::*;
     use crate::wire::MessageBuilder;
     use std::fs;
+
+    #[tokio::test]
+    async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (client_socket, host_socket) =
+            UnixStream::pair().expect("test socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            false,
+            false,
+        );
+
+        // Use an untracked host event so dispatch has no protocol state to
+        // mutate. The batch limit itself is what this regression test covers.
+        let message = MessageBuilder::new().build_message(77, 0);
+        for _ in 0..=MAX_MESSAGES_PER_BATCH {
+            client.host_conn.read_buf.extend_from_slice(&message);
+        }
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(
+            client.host_conn.has_complete_message(),
+            "a bounded batch must leave complete frames for the next loop turn"
+        );
+        assert_eq!(
+            client.host_conn.read_buf.len(),
+            message.len(),
+            "exactly one frame should remain after the first bounded batch"
+        );
+
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.host_conn.read_buf.is_empty());
+    }
 
     fn assert_fd_released(fd: std::os::unix::io::RawFd, target: &std::path::Path) {
         let current = fs::read_link(format!("/proc/self/fd/{fd}"));

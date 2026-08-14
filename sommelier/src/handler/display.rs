@@ -164,6 +164,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // Internal host-only objects have no guest object ID. Consume
             // their destructor acknowledgement locally instead of emitting an
             // invalid delete_id(0) event to the guest.
+            ctx.native_buffer_sync_fds.remove(&id);
             return Action::Drop;
         }
         if let Some(&guest_id) = ctx.orphaned_dmabuf_params.get(&id) {
@@ -191,6 +192,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         }
         let guest_id = ctx.shadow_table.get_guest_id(id).unwrap_or(0);
         if guest_id != 0 {
+            ctx.native_buffer_sync_fds.remove(&id);
             ctx.shadow_table.remove_id(guest_id);
             ctx.native_buffer_sizes.remove(&guest_id);
             ctx.native_buffer_sizes.remove(&id);

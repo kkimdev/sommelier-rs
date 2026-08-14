@@ -739,6 +739,129 @@ fn clipped_damage(
     ))
 }
 
+/// Return the half-open edges of a damage rectangle without overflowing i32.
+///
+/// Wayland damage coordinates are signed and may extend outside the buffer.
+/// Keeping the intermediate edges in i64 lets the union path remain safe
+/// before the copy path clips them to the actual image dimensions.
+fn damage_edges(rect: DamageRect) -> Option<(i64, i64, i64, i64)> {
+    if rect.width <= 0 || rect.height <= 0 {
+        return None;
+    }
+    let x0 = i64::from(rect.x);
+    let y0 = i64::from(rect.y);
+    let x1 = x0.checked_add(i64::from(rect.width))?;
+    let y1 = y0.checked_add(i64::from(rect.height))?;
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+fn damage_edges_fit_i32(edges: (i64, i64, i64, i64)) -> bool {
+    let (x0, y0, x1, y1) = edges;
+    x0 >= i64::from(i32::MIN)
+        && y0 >= i64::from(i32::MIN)
+        && x0 <= i64::from(i32::MAX)
+        && y0 <= i64::from(i32::MAX)
+        && x1 <= i64::from(i32::MAX)
+        && y1 <= i64::from(i32::MAX)
+        && x1 - x0 <= i64::from(i32::MAX)
+        && y1 - y0 <= i64::from(i32::MAX)
+}
+
+fn damage_from_edges(edges: (i64, i64, i64, i64)) -> DamageRect {
+    let (x0, y0, x1, y1) = edges;
+    DamageRect::new(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
+}
+
+fn damage_rects_touch_or_overlap(
+    first: (i64, i64, i64, i64),
+    second: (i64, i64, i64, i64),
+) -> bool {
+    let (first_x0, first_y0, first_x1, first_y1) = first;
+    let (second_x0, second_y0, second_x1, second_y1) = second;
+    first_x0 <= second_x1 && second_x0 <= first_x1 && first_y0 <= second_y1 && second_y0 <= first_y1
+}
+
+fn damage_area(edges: (i64, i64, i64, i64)) -> u128 {
+    let (x0, y0, x1, y1) = edges;
+    (x1 - x0) as u128 * (y1 - y0) as u128
+}
+
+fn damage_union_is_compact(
+    first: (i64, i64, i64, i64),
+    second: (i64, i64, i64, i64),
+    expanded: (i64, i64, i64, i64),
+) -> bool {
+    // A bounding rectangle is safe but can be much larger than two sparse
+    // damage regions (for example, two rectangles that only touch at a
+    // corner). Keep the merge when the overdraw is bounded to 50%; this still
+    // collapses adjacent text/cursor spans while avoiding a sparse 4K frame
+    // turning into a full-buffer copy.
+    damage_area(expanded).saturating_mul(2)
+        <= damage_area(first)
+            .saturating_add(damage_area(second))
+            .saturating_mul(3)
+}
+
+/// Union overlapping or edge-adjacent damage rectangles.
+///
+/// `wl_surface.damage` is a region operation, not a list of independent
+/// copies.  The C++ Sommelier implementation gets this behavior from
+/// pixman_region32; keeping a vector of raw requests would copy the same
+/// 4K pixels repeatedly when GTK emits several overlapping rectangles for one
+/// frame.  A merged bounding rectangle can include a small amount of clean
+/// area, which is safe and substantially cheaper than duplicate row copies.
+pub(crate) fn coalesce_damage_rects(damage: &[DamageRect]) -> Vec<DamageRect> {
+    let mut merged = Vec::with_capacity(damage.len());
+
+    for rect in damage {
+        let Some(mut candidate) = damage_edges(*rect) else {
+            continue;
+        };
+
+        // Merge until the expanded candidate no longer intersects another
+        // rectangle.  The fixed-point loop is needed for A touching B and B
+        // touching C while A and C do not touch directly.
+        while let Some(index) = merged.iter().position(|existing: &DamageRect| {
+            damage_edges(*existing).is_some_and(|existing_edges| {
+                if !damage_rects_touch_or_overlap(candidate, existing_edges) {
+                    return false;
+                }
+                let expanded = (
+                    candidate.0.min(existing_edges.0),
+                    candidate.1.min(existing_edges.1),
+                    candidate.2.max(existing_edges.2),
+                    candidate.3.max(existing_edges.3),
+                );
+                damage_edges_fit_i32(expanded)
+                    && damage_union_is_compact(candidate, existing_edges, expanded)
+            })
+        }) {
+            let existing =
+                damage_edges(merged[index]).expect("merged damage rectangles are always positive");
+            let expanded = (
+                candidate.0.min(existing.0),
+                candidate.1.min(existing.1),
+                candidate.2.max(existing.2),
+                candidate.3.max(existing.3),
+            );
+            merged.swap_remove(index);
+            candidate = expanded;
+        }
+
+        // A malformed client can submit representable i32 rectangles whose
+        // union exceeds the wire field. Leave those rectangles separate so
+        // the existing per-message validation can reject or clamp them
+        // without an i64→i32 wrap.
+        if damage_edges_fit_i32(candidate) {
+            merged.push(damage_from_edges(candidate));
+        } else {
+            merged.push(*rect);
+        }
+    }
+
+    merged
+}
+
 /// Copy only the damaged rectangles of a SHM image into the host-side
 /// linear buffer.
 ///
@@ -777,8 +900,9 @@ pub(crate) fn copy_shm_damage(
 
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
     let plane_count = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 };
+    let merged_damage = coalesce_damage_rects(damage);
     let mut spans = Vec::new();
-    for rect in damage {
+    for rect in &merged_damage {
         let Some((mut x0, mut y0, mut x1, mut y1)) = clipped_damage(*rect, width, height) else {
             continue;
         };
@@ -881,6 +1005,20 @@ pub(crate) fn copy_shm_damage(
     // is valid.
     unsafe {
         for plane in spans {
+            // A full-width image with matching strides is physically
+            // contiguous in both mappings.  One large copy is noticeably
+            // cheaper than issuing one call per row for 4K buffers.
+            if plane.row_bytes == plane.src_stride && plane.row_bytes == plane.dst_stride {
+                let Some(bytes) = plane.row_bytes.checked_mul(plane.rows) else {
+                    return false;
+                };
+                ptr::copy_nonoverlapping(
+                    src_ptr.add(plane.src_offset),
+                    dst_ptr.add(plane.dst_offset),
+                    bytes,
+                );
+                continue;
+            }
             for row in 0..plane.rows {
                 let Some(row_src_offset) = row.checked_mul(plane.src_stride) else {
                     return false;
@@ -1382,7 +1520,17 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         let wants_dmabuf = ctx.gpu_accel && ctx.host_dmabuf_id.is_some();
         let mut allocation = if wants_dmabuf {
             match allocate_virtwl_dmabuf(ctx, width, height, format) {
-                Ok(allocation) => Some(allocation),
+                Ok(allocation) => {
+                    debug!(
+                        "Using VirtWL linux-dmabuf allocation: {}x{} format={:#010x} stride={} modifier={:#x}",
+                        width,
+                        height,
+                        format,
+                        allocation.stride0,
+                        allocation.modifier
+                    );
+                    Some(allocation)
+                }
                 Err(error) => {
                     debug!("VirtWL dma-buf allocation unavailable: {}", error);
                     None
@@ -1415,6 +1563,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         return Action::Drop;
                     }
                 };
+                debug!(
+                    "Using VirtWL shared-memory allocation: {}x{} format={:#010x} size={}",
+                    width, height, format, buffer_size
+                );
                 allocation = Some(HostBufferAllocation {
                     bo: None,
                     fd,
@@ -1449,7 +1601,17 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 }
                 allocation = Some(
                     match allocate_gbm_buffer(allocator, width, height, format, true) {
-                        Ok(allocation) => allocation,
+                        Ok(allocation) => {
+                            debug!(
+                                "Using GBM linux-dmabuf allocation: {}x{} format={:#010x} stride={} modifier={:#x}",
+                                width,
+                                height,
+                                format,
+                                allocation.stride0,
+                                allocation.modifier
+                            );
+                            allocation
+                        }
                         Err(error) => {
                             error!("Failed to allocate GBM dma-buf: {}", error);
                             return Action::Drop;
@@ -2107,11 +2269,12 @@ mod tests {
     use super::ShmHandler;
     use super::{
         backing_fd_has_size, clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats,
-        collect_retired_buffers, copy_shm_damage, copy_shm_planes, guest_shm_format_available,
-        record_host_shm_drm_format, record_host_shm_format, record_host_shm_wl_format,
-        register_guest_shm, release_temporary_host_pool, same_dma_buf_object, valid_buffer_layout,
-        valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout,
-        virtwl_allocation_size, DmabufLayout, WL_SHM_FORMAT_NV12,
+        coalesce_damage_rects, collect_retired_buffers, copy_shm_damage, copy_shm_planes,
+        guest_shm_format_available, record_host_shm_drm_format, record_host_shm_format,
+        record_host_shm_wl_format, register_guest_shm, release_temporary_host_pool,
+        same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
+        valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size, DmabufLayout,
+        WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -2264,6 +2427,44 @@ mod tests {
     fn virtwl_allocation_size_rejects_u32_truncation() {
         assert_eq!(virtwl_allocation_size(u32::MAX as usize), Some(u32::MAX));
         assert_eq!(virtwl_allocation_size(u32::MAX as usize + 1), None);
+    }
+
+    #[test]
+    fn coalesces_overlapping_and_compact_adjacent_damage() {
+        let damage = [
+            DamageRect::new(0, 0, 8, 4),
+            DamageRect::new(6, 2, 8, 4),
+            DamageRect::new(14, 2, 2, 4),
+        ];
+
+        assert_eq!(
+            coalesce_damage_rects(&damage),
+            vec![DamageRect::new(0, 0, 16, 6)]
+        );
+    }
+
+    #[test]
+    fn keeps_sparse_corner_damage_separate() {
+        let damage = [DamageRect::new(0, 0, 2, 2), DamageRect::new(2, 2, 2, 2)];
+
+        assert_eq!(coalesce_damage_rects(&damage), damage);
+    }
+
+    #[test]
+    fn coalescing_discards_empty_damage_without_overflowing_edges() {
+        let damage = [
+            DamageRect::new(0, 0, 0, 8),
+            DamageRect::new(i32::MAX, i32::MAX, 1, 1),
+            DamageRect::new(4, 4, 2, 2),
+        ];
+
+        assert_eq!(
+            coalesce_damage_rects(&damage),
+            vec![
+                DamageRect::new(i32::MAX, i32::MAX, 1, 1),
+                DamageRect::new(4, 4, 2, 2)
+            ]
+        );
     }
 
     #[test]

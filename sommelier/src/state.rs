@@ -1013,6 +1013,13 @@ pub struct Context {
     /// new binds in the meantime.
     pub removed_host_globals: HashSet<u32>,
     pub pending_params: HashMap<u32, Vec<PendingParam>>,
+    /// One retained duplicate of a native dma-buf plane, keyed by the host
+    /// `wl_buffer` ID. It is used to wait for guest GPU writes immediately
+    /// before each host surface commit and is dropped after host delete_id.
+    pub native_buffer_sync_fds: HashMap<u32, OwnedFd>,
+    /// Native dma-buf sync descriptors waiting for an asynchronous
+    /// linux-dmabuf `created` event, keyed by guest params ID.
+    pub pending_native_sync_fds: HashMap<u32, OwnedFd>,
     pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
@@ -1133,6 +1140,8 @@ impl Context {
             next_global_generation: 1,
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
+            native_buffer_sync_fds: HashMap::new(),
+            pending_native_sync_fds: HashMap::new(),
             feedback_index_maps: HashMap::new(),
             gpu_accel,
             xdg_decoration,

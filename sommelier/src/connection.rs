@@ -267,6 +267,27 @@ impl WaylandConnection {
         }
     }
 
+    /// Return whether the buffered byte stream contains a complete Wayland
+    /// message.
+    ///
+    /// The proxy may deliberately stop dispatching after a bounded batch so a
+    /// busy renderer cannot monopolize the current-thread executor.  The
+    /// next loop iteration must be able to distinguish a partial header/body
+    /// (which still needs another read) from a complete message already in
+    /// `read_buf` (which must be dispatched without waiting for new socket
+    /// activity).
+    pub(crate) fn has_complete_message(&self) -> bool {
+        if self.read_buf.len() < 8 {
+            return false;
+        }
+        let length = u16::from_ne_bytes([self.read_buf[4], self.read_buf[5]]) as usize;
+        // An invalid length is "ready" too: dispatching it lets the normal
+        // protocol validation report the error instead of spinning on a
+        // permanently buffered malformed header. A valid message is ready
+        // only once all of its bytes are buffered.
+        length < 8 || !length.is_multiple_of(4) || length <= self.read_buf.len()
+    }
+
     pub async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
         if data.is_empty() && fds.is_empty() {
             return Ok(());
@@ -516,6 +537,39 @@ mod tests {
         assert_eq!(
             leaked_pipe_fds, 0,
             "MSG_CTRUNC cleanup must close every descriptor installed by recvmsg"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_message_readiness_distinguishes_partial_and_complete_frames() {
+        let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
+        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+
+        // A partial header/body must wait for another recvmsg call.
+        connection.read_buf.extend_from_slice(&[0; 7]);
+        assert!(!connection.has_complete_message());
+        connection.read_buf.push(0);
+        // Wayland length is 8 bytes for a header-only message.
+        connection.read_buf[4..6].copy_from_slice(&8_u16.to_ne_bytes());
+        assert!(connection.has_complete_message());
+
+        connection.read_buf.clear();
+        connection.read_buf.extend_from_slice(&[0; 8]);
+        connection.read_buf[4..6].copy_from_slice(&16_u16.to_ne_bytes());
+        assert!(!connection.has_complete_message());
+        connection.read_buf.extend_from_slice(&[0; 8]);
+        assert!(connection.has_complete_message());
+    }
+
+    #[tokio::test]
+    async fn malformed_buffered_length_is_ready_for_protocol_validation() {
+        let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
+        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        connection.read_buf.extend_from_slice(&[0; 8]);
+        connection.read_buf[4..6].copy_from_slice(&6_u16.to_ne_bytes());
+        assert!(
+            connection.has_complete_message(),
+            "invalid buffered headers must not make the event loop wait forever"
         );
     }
 }

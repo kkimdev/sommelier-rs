@@ -28,7 +28,7 @@ use crate::protocols::wayland::wl_surface::{
 use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
 use crate::state::{Context, DamageRect, SurfaceState, ViewportState};
 use crate::wire::Action;
-use log::debug;
+use log::trace;
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -98,6 +98,32 @@ impl Drop for DmabufWriteSync<'_> {
             }
             self.ended = true;
         }
+    }
+}
+
+fn wait_for_native_buffer(ctx: &Context, guest_buffer_id: u32) {
+    let Some(host_buffer_id) = ctx.shadow_table.get_host_id(guest_buffer_id) else {
+        return;
+    };
+    let Some(sync_fd) = ctx.native_buffer_sync_fds.get(&host_buffer_id) else {
+        return;
+    };
+    let Some(allocator) = ctx.allocator.as_ref() else {
+        log::warn!(
+            "Cannot synchronize native dma-buf host buffer {} without a DRM allocator",
+            host_buffer_id
+        );
+        return;
+    };
+    if let Err(error) = allocator.wait_for_dmabuf(sync_fd.as_raw_fd()) {
+        // Match the C Sommelier fallback: a missing/unsupported wait ioctl is
+        // not a protocol error, but make the degraded synchronization visible
+        // instead of silently presenting potentially stale pixels.
+        log::warn!(
+            "Native dma-buf wait failed for host buffer {}: {}",
+            host_buffer_id,
+            error
+        );
     }
 }
 
@@ -446,7 +472,10 @@ fn queue_surface_damage(
             .map(|rect| map_buffer_damage(*rect, surface_state, buffer_width, buffer_height)),
     );
 
-    for rect in mapped {
+    // The host compositor treats damage as a unioned region. Coalescing here
+    // keeps a GTK frame with many overlapping requests from becoming a long
+    // sequence of redundant Wayland messages as well as redundant copies.
+    for rect in crate::handler::shm::coalesce_damage_rects(&mapped) {
         if rect.width <= 0 || rect.height <= 0 {
             continue;
         }
@@ -1079,7 +1108,11 @@ impl WlSurfaceHandler for CompositorHandler {
                             );
                         } else {
                             buffer.needs_full_copy = false;
-                            debug!(
+                            // A 4K frame can reach this path every refresh.
+                            // Keep the per-frame diagnostic at trace level so
+                            // enabling ordinary debug logging cannot turn
+                            // terminal rendering into synchronous PTY I/O.
+                            trace!(
                                 "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
                                  width={}, height={}, format={:#010x}, buffer.offset={}, \
                                  pool_size={}, dest_size={}",
@@ -1114,6 +1147,12 @@ impl WlSurfaceHandler for CompositorHandler {
         }
 
         if commit_ready {
+            if let Some(buffer_id) = commit_buffer_id {
+                // Native linux-dmabuf buffers bypass the local SHM copy path.
+                // Wait for guest GPU writes before the host compositor samples
+                // the buffer, matching ChromiumOS Sommelier's sync_point path.
+                wait_for_native_buffer(ctx, buffer_id);
+            }
             // Damage requests are double-buffered. Emit the translated host
             // requests immediately before the commit so the host sees exactly
             // the same pending damage set as the guest compositor.

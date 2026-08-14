@@ -173,6 +173,25 @@ WAYLAND_DISPLAY=wayland-2 cargo run -p sommelier-test-gui
 If the system font is not sufficient for Korean text, set
 `SOMMELIER_TEST_GUI_FONT` to a font file with Korean/CJK coverage.
 
+For a repeatable runtime check, build both binaries and run the ignored GUI
+smoke test. It starts a temporary `sommelier --gpu-accel` socket, launches the
+sample GUI with `--auto-exit`, and verifies the connection, text-input/keymap
+handshake, clean exit, and selected buffer transport:
+
+```bash
+cargo build --release -p sommelier -p sommelier-test-gui
+cargo test -p sommelier --test gui_smoke -- --ignored --nocapture
+```
+
+The test accepts the validated SHM fallback when the current kernel reports
+that VirtWL dma-buf allocation is unavailable. Set
+`SOMMELIER_GUI_SMOKE_REQUIRE_GPU=1` to require a real linux-dmabuf allocation.
+The GUI is bounded by a 15-second timeout; override it with
+`SOMMELIER_GUI_SMOKE_TIMEOUT` when testing a slow compositor.
+For a host-side compositor smoke test, set
+`SOMMELIER_GUI_SMOKE_COMPOSITOR=/run/user/$(id -u)/wayland-0`; otherwise the
+test uses `/dev/wl0`.
+
 ## Configuration
 
 | Variable/option | Purpose |
