@@ -609,70 +609,116 @@ impl Allocator {
         )
     }
 
-    /// Wait until a guest dma-buf's outstanding writers have completed before
-    /// forwarding a surface commit to the host compositor.
-    ///
-    /// ChromiumOS Sommelier first exports and polls a dma-buf sync file, then
-    /// falls back to the virtio-gpu GEM wait when the export ioctl is absent.
-    /// The Rust proxy must retain one duplicate of each native buffer fd until
-    /// its host `wl_buffer` is destroyed so this ordering remains intact.
-    pub(crate) fn wait_for_dmabuf(&self, fd: RawFd) -> io::Result<()> {
-        if fd < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid dma-buf descriptor",
-            ));
+    fn wait_for_virtgpu_resource(&self, fd: RawFd) -> io::Result<()> {
+        let mut prime = DrmPrimeHandle {
+            fd,
+            ..DrmPrimeHandle::default()
+        };
+        let import_result = unsafe {
+            libc::ioctl(
+                self.device.as_fd().as_raw_fd(),
+                DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
+                std::ptr::from_mut(&mut prime),
+            )
+        };
+        if import_result != 0 {
+            return Err(io::Error::last_os_error());
         }
 
-        match export_dmabuf_read_fence(fd) {
-            Ok(sync_file) => wait_sync_file(sync_file.as_fd().as_raw_fd()),
-            Err(export_error) => {
-                let mut prime = DrmPrimeHandle {
-                    fd,
-                    ..DrmPrimeHandle::default()
-                };
-                let import_result = unsafe {
-                    libc::ioctl(
-                        self.device.as_fd().as_raw_fd(),
-                        DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
-                        std::ptr::from_mut(&mut prime),
-                    )
-                };
-                if import_result != 0 {
-                    return Err(export_error);
-                }
+        let mut wait = DrmVirtGpuWait {
+            handle: prime.handle,
+            flags: 0,
+        };
+        let wait_result = unsafe {
+            libc::ioctl(
+                self.device.as_fd().as_raw_fd(),
+                DRM_IOCTL_VIRTGPU_WAIT as _,
+                std::ptr::from_mut(&mut wait),
+            )
+        };
+        let wait_error = (wait_result != 0).then(io::Error::last_os_error);
 
-                let mut wait = DrmVirtGpuWait {
-                    handle: prime.handle,
-                    flags: 0,
-                };
-                let wait_result = unsafe {
-                    libc::ioctl(
-                        self.device.as_fd().as_raw_fd(),
-                        DRM_IOCTL_VIRTGPU_WAIT as _,
-                        std::ptr::from_mut(&mut wait),
-                    )
-                };
-                let wait_error = (wait_result != 0).then(io::Error::last_os_error);
+        let mut close = DrmGemClose {
+            handle: prime.handle,
+            ..DrmGemClose::default()
+        };
+        let close_result = unsafe {
+            libc::ioctl(
+                self.device.as_fd().as_raw_fd(),
+                DRM_IOCTL_GEM_CLOSE as _,
+                std::ptr::from_mut(&mut close),
+            )
+        };
+        if let Some(error) = wait_error {
+            return Err(error);
+        }
+        if close_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 
-                let mut close = DrmGemClose {
-                    handle: prime.handle,
-                    ..DrmGemClose::default()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DmabufWaitResult {
+    Synchronized,
+    ImplicitSyncFallback,
+}
+
+fn dmabuf_sync_capability_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTTY | libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
+/// Wait until a guest dma-buf's outstanding writers have completed.
+///
+/// Exporting and polling the dma-buf's sync file requires only the plane fd,
+/// so it is always attempted. A DRM allocator is an optional compatibility
+/// fallback for kernels that require the virtio-gpu GEM wait path. Kernels
+/// which implement neither mechanism retain ChromiumOS Sommelier's implicit
+/// synchronization compatibility path; actual I/O failures remain fatal.
+pub(crate) fn wait_for_dmabuf(
+    fd: RawFd,
+    allocator: Option<&Allocator>,
+) -> io::Result<DmabufWaitResult> {
+    if fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid dma-buf descriptor",
+        ));
+    }
+
+    match export_dmabuf_read_fence(fd) {
+        Ok(sync_file) => {
+            wait_sync_file(sync_file.as_fd().as_raw_fd())?;
+            Ok(DmabufWaitResult::Synchronized)
+        }
+        Err(export_error) => {
+            let export_capability_missing = dmabuf_sync_capability_unavailable(&export_error);
+            let Some(allocator) = allocator else {
+                return if export_capability_missing {
+                    Ok(DmabufWaitResult::ImplicitSyncFallback)
+                } else {
+                    Err(export_error)
                 };
-                let close_result = unsafe {
-                    libc::ioctl(
-                        self.device.as_fd().as_raw_fd(),
-                        DRM_IOCTL_GEM_CLOSE as _,
-                        std::ptr::from_mut(&mut close),
-                    )
-                };
-                if let Some(error) = wait_error {
-                    return Err(error);
+            };
+            match allocator.wait_for_virtgpu_resource(fd) {
+                Ok(()) => Ok(DmabufWaitResult::Synchronized),
+                Err(fallback_error)
+                    if export_capability_missing
+                        && dmabuf_sync_capability_unavailable(&fallback_error) =>
+                {
+                    Ok(DmabufWaitResult::ImplicitSyncFallback)
                 }
-                if close_result != 0 {
-                    return Err(io::Error::last_os_error());
+                Err(fallback_error) => {
+                    if export_capability_missing {
+                        Err(fallback_error)
+                    } else {
+                        Err(export_error)
+                    }
                 }
-                Ok(())
             }
         }
     }
@@ -681,8 +727,9 @@ impl Allocator {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_dmabuf_plane0_fixup, drm_device_candidates, is_virtio_gpu_driver, open_drm_device,
-        render_node_number, resource_info_type_supported, sorted_render_nodes, wait_sync_file,
+        apply_dmabuf_plane0_fixup, dmabuf_sync_capability_unavailable, drm_device_candidates,
+        is_virtio_gpu_driver, open_drm_device, render_node_number, resource_info_type_supported,
+        sorted_render_nodes, wait_for_dmabuf, wait_sync_file, DmabufWaitResult,
         VirtGpuResourceInfo, VirtGpuResourceInfoProbe, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS,
         DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
     };
@@ -861,6 +908,36 @@ mod tests {
             1
         );
         assert!(wait_sync_file(pipe_fds[0]).is_ok());
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+
+    #[test]
+    fn only_known_dmabuf_capability_errors_allow_implicit_sync() {
+        for errno in [libc::ENOTTY, libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(dmabuf_sync_capability_unavailable(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+        for errno in [libc::EBADF, libc::EIO, libc::ETIMEDOUT] {
+            assert!(!dmabuf_sync_capability_unavailable(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+    }
+
+    #[test]
+    fn dmabuf_wait_without_allocator_uses_implicit_sync_when_ioctl_is_missing() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+
+        assert_eq!(
+            wait_for_dmabuf(pipe_fds[0], None).unwrap(),
+            DmabufWaitResult::ImplicitSyncFallback
+        );
+
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);

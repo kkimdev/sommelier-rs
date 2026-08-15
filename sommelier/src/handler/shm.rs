@@ -1250,19 +1250,13 @@ fn can_retire_deferred_buffer(
         && !ctx.buffer_is_submitted(guest_id)
 }
 
-/// Retire every eligible guest-destroyed render buffer.
-pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
-    collect_deferred_buffers_impl(ctx);
-}
-
-/// Retire guest-destroyed local-copy and native buffers with one lifecycle
-/// predicate.
+/// Retire every eligible guest-destroyed local-copy or native buffer.
 ///
 /// SHM and native buffers differ only in whether local copy backing must be
 /// retained. Surface references, submitted/released phases, and ordered
 /// surface-destroy proofs have identical lifetime meaning and therefore must
 /// not be evaluated by separate condition trees.
-fn collect_deferred_buffers_impl(ctx: &mut Context) {
+pub(crate) fn retire_eligible_buffers(ctx: &mut Context) {
     let references = SurfaceBufferReferences::collect(ctx);
     let candidates: Vec<(u32, HostId)> = ctx
         .render_buffer_lifecycles()
@@ -1286,34 +1280,30 @@ fn collect_deferred_buffers_impl(ctx: &mut Context) {
     }
 }
 
-/// A surface destructor is ordered before any buffer destructors that follow
-/// it in the guest stream.  Once the destroyed surface is gone, a submitted
-/// marker is no longer needed for a buffer that no other committed surface
-/// references: if the guest destroys that buffer later, its host wl_buffer can
-/// be retired immediately even when the compositor does not emit a separate
-/// release for surface teardown. A pending attach preserves backing lifetime
-/// but does not begin a new compositor-use interval until commit.
+/// Apply the ordering proof provided by one successfully queued surface
+/// destructor to the buffer that surface held.
+///
+/// The authoritative current-surface edges live in `Context::surfaces`. The
+/// registry stores only whether an earlier detached use still lacks a host
+/// release, so destroying a different current surface cannot erase that
+/// unresolved use.
 pub(crate) fn clear_buffer_uses_after_surface_destroy(
     ctx: &mut Context,
-    destroyed_surface_buffers: &HashSet<u32>,
+    destroyed_surface_buffer: Option<u32>,
 ) {
+    let Some(guest_id) = destroyed_surface_buffer else {
+        return;
+    };
     let references = SurfaceBufferReferences::collect(ctx);
-    for &guest_id in destroyed_surface_buffers {
-        if !references.has_current(guest_id)
-            && ctx.host_buffer_use(guest_id).is_some()
-            && !ctx.clear_buffer_use(guest_id)
-        {
-            log::error!("Render buffer {} could not clear its surface use", guest_id);
-            ctx.fatal_protocol_error = true;
-        }
+    if ctx.host_buffer_use(guest_id).is_some()
+        && !ctx.finish_surface_destroy_use(guest_id, references.has_current(guest_id))
+    {
+        log::error!(
+            "Render buffer {} could not finish its destroyed-surface use",
+            guest_id
+        );
+        ctx.fatal_protocol_error = true;
     }
-}
-
-/// Retire buffers whose only reference was a pending attach that has since
-/// been replaced or cleared. A submitted buffer remains deferred until its
-/// release event.
-pub(crate) fn collect_deferred_buffers(ctx: &mut Context) {
-    collect_deferred_buffers_impl(ctx);
 }
 
 impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
@@ -2255,13 +2245,12 @@ mod tests {
     use super::ShmHandler;
     use super::{
         backing_fd_has_size, clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats,
-        coalesce_damage_rects, collect_deferred_buffers, collect_retired_buffers, copy_shm_damage,
-        copy_shm_planes, guest_shm_format_available, record_host_shm_drm_format,
-        record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
-        release_temporary_host_pool, rollback_queued_host_messages, rollback_registered_buffer,
-        same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size, DmabufLayout,
-        WL_SHM_FORMAT_NV12,
+        coalesce_damage_rects, copy_shm_damage, copy_shm_planes, guest_shm_format_available,
+        record_host_shm_drm_format, record_host_shm_format, record_host_shm_wl_format,
+        register_guest_shm, release_temporary_host_pool, retire_eligible_buffers,
+        rollback_queued_host_messages, rollback_registered_buffer, same_dma_buf_object,
+        valid_buffer_layout, valid_pool_resize, valid_pool_size, valid_shm_stride,
+        validate_dmabuf_layout, virtwl_allocation_size, DmabufLayout, WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -2301,7 +2290,7 @@ mod tests {
     }
 
     fn buffer_is_guest_destroyed(ctx: &Context, host_id: u32) -> bool {
-        buffer_lifecycle(ctx, host_id).is_some_and(RenderBufferLifecycle::is_guest_destroyed)
+        buffer_lifecycle(ctx, host_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
     fn buffer_host_destroy_is_queued(ctx: &Context, host_id: u32) -> bool {
@@ -3638,13 +3627,13 @@ mod tests {
         ctx.surfaces.entry(40).or_default().pending_buffer_id = Some(Some(local_buffer));
         ctx.surfaces.entry(41).or_default().pending_buffer_id = Some(Some(native_buffer));
 
-        collect_deferred_buffers(&mut ctx);
+        retire_eligible_buffers(&mut ctx);
         assert!(buffer_is_guest_destroyed(&ctx, local_host));
         assert!(buffer_is_guest_destroyed(&ctx, native_host));
 
         ctx.surfaces.get_mut(&40).unwrap().pending_buffer_id = Some(None);
         ctx.surfaces.get_mut(&41).unwrap().pending_buffer_id = Some(None);
-        collect_deferred_buffers(&mut ctx);
+        retire_eligible_buffers(&mut ctx);
 
         assert!(buffer_host_destroy_is_queued(&ctx, local_host));
         assert!(buffer_host_destroy_is_queued(&ctx, native_host));
@@ -3704,11 +3693,11 @@ mod tests {
         ctx.mark_buffer_submitted(guest_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
 
-        collect_retired_buffers(&mut ctx);
+        retire_eligible_buffers(&mut ctx);
         assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
 
         assert!(ctx.mark_buffer_released(guest_buffer));
-        collect_retired_buffers(&mut ctx);
+        retire_eligible_buffers(&mut ctx);
         assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),

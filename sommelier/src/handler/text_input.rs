@@ -20,8 +20,10 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, GuestKeyOwner, HostId, SeatFocusChange};
+use crate::protocols::wayland::{wl_display, wl_keyboard};
+#[cfg(test)]
+use crate::state::GuestKeyOwner;
+use crate::state::{Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostId, SeatFocusChange};
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
@@ -304,9 +306,8 @@ fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeat
         .max_by_key(|candidate| candidate.1)?;
 
     let latest_sequence = ctx
-        .keyboard_latest_peek_sequences
-        .get(&(guest_seat, active_surface))
-        .copied();
+        .key_generations
+        .latest_peek_sequence(guest_seat, active_surface);
     let is_latest_generation = latest_sequence.is_none_or(|sequence| sequence == press.sequence);
     let physically_held = ctx.key_generations.physically_held(host_keyboard_id, key);
     let repeatable = ctx
@@ -447,11 +448,9 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
 }
 
 fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
-    let owner = ctx.guest_key_owner(held.host_keyboard_id, held.key);
-    if matches!(
-        owner,
-        Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-    ) {
+    let decision =
+        ctx.transition_guest_key(held.host_keyboard_id, held.key, GuestKeyEvent::RecoverIme);
+    if decision.delivery != GuestKeyDelivery::EmitBalancedPair {
         // The normal wl_keyboard path already delivered this physical
         // generation to the guest. The confirmation still closes a
         // text-input transaction, but another key pair would duplicate it.
@@ -461,11 +460,6 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
             held.host_keyboard_id.0
         );
         return false;
-    }
-    if owner.is_none() {
-        let claimed =
-            ctx.claim_guest_key(held.host_keyboard_id, held.key, GuestKeyOwner::ImeRecovery);
-        debug_assert!(claimed, "guest owner was checked above");
     }
     for state in [1, 0] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
@@ -824,125 +818,35 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 .copied()
                 .or_else(|| keysym_to_evdev_keycode(sym));
             if let Some(keycode) = keycode {
-                match state {
-                    crate::handler::keyboard::WL_KEY_PRESSED => {
-                        let owner = ctx.guest_key_owner(host_keyboard_id, keycode);
-                        // A text-input keysym event can describe the same
-                        // physical key as a normal wl_keyboard.key event.
-                        // Only synthesize a press when the guest has not
-                        // already received one; otherwise the duplicate
-                        // would make clients observe two presses for one key.
-                        if owner == Some(GuestKeyOwner::Physical) {
-                            log::debug!(
-                                "Dropping duplicate keysym press for host keyboard {} key {}",
-                                host_keyboard_id.0,
-                                keycode
-                            );
-                            return Action::Drop;
-                        }
-                        if !ctx.claim_text_input_key(host_keyboard_id, keycode, wayland_serial) {
-                            // A completed synthetic pair remains a tombstone
-                            // while the physical generation is held. This
-                            // suppresses a delayed duplicate keysym without
-                            // blocking the next released generation.
-                            log::debug!(
-                                "Dropping keysym key {} already completed for host keyboard {}",
-                                keycode,
-                                host_keyboard_id.0,
-                            );
-                            return Action::Drop;
-                        }
-                        if keycode != crate::handler::keyboard::EVDEV_KEY_BACKSPACE {
-                            if let Some(guest_seat) = guest_seat {
-                                crate::handler::text_input::end_backspace_repeat_for_seat(
-                                    ctx, guest_seat,
-                                );
-                            }
-                        }
-                    }
-                    crate::handler::keyboard::WL_KEY_REPEATED => {
-                        // A repeated keysym follows wl_keyboard.key's v10
-                        // repeated state. It is a real event, but it must not
-                        // invent a new press/release pair or mark a physical
-                        // press as synthetic. Drop malformed repeats and
-                        // repeats already consumed by the IME fallback.
-                        let owner = ctx.guest_key_owner(host_keyboard_id, keycode);
-                        let already_forwarded = matches!(
-                            owner,
-                            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                        );
-                        let ime_suppressed = owner == Some(GuestKeyOwner::ImeRecovery);
-                        if !already_forwarded || ime_suppressed {
-                            log::debug!(
-                                "Dropping repeated keysym without a live guest press (key={}, ime_suppressed={})",
-                                keycode,
-                                ime_suppressed
-                            );
-                            return Action::Drop;
-                        }
-                        if keycode != crate::handler::keyboard::EVDEV_KEY_BACKSPACE {
-                            if let Some(guest_seat) = guest_seat {
-                                crate::handler::text_input::end_backspace_repeat_for_seat(
-                                    ctx, guest_seat,
-                                );
-                            }
-                        }
-                    }
-                    crate::handler::keyboard::WL_KEY_RELEASED => {
-                        if ctx.key_generations.take_pending_text_input_release(
-                            host_keyboard_id,
-                            keycode,
-                            wayland_serial,
-                        ) {
-                            // The release closes a press from a retired
-                            // physical generation. Leave the current
-                            // generation untouched.
-                            log::debug!(
-                                "Forwarding delayed keysym release for retired host keyboard {} key {}",
-                                host_keyboard_id.0,
-                                keycode
-                            );
-                        } else {
-                            if let Some(press_serial) = ctx
-                                .key_generations
-                                .guest_press_serial(host_keyboard_id, keycode)
-                            {
-                                if !crate::state::serial_is_after(wayland_serial, press_serial) {
-                                    log::debug!(
-                                    "Dropping stale keysym release serial {} before press serial {}",
-                                    wayland_serial,
-                                    press_serial
-                                );
-                                    return Action::Drop;
-                                }
-                            }
-                            // A keysym release is valid only for a press that this
-                            // path synthesized. If the physical keyboard path
-                            // owns the press, leave its marker and wait for the
-                            // real wl_keyboard release.
-                            let synthetic_press = ctx.complete_guest_key_if(
-                                host_keyboard_id,
-                                keycode,
-                                GuestKeyOwner::TextInputKeysym,
-                            );
-                            if !synthetic_press {
-                                log::debug!(
-                                "Dropping keysym release without a synthetic press for host keyboard {} key {}",
-                                host_keyboard_id.0,
-                                keycode
-                            );
-                                return Action::Drop;
-                            }
-                            if keycode == crate::handler::keyboard::EVDEV_KEY_BACKSPACE {
-                                if let Some(guest_seat) = guest_seat {
-                                    crate::handler::text_input::end_backspace_repeat_for_seat(
-                                        ctx, guest_seat,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                let event = match state {
+                    crate::handler::keyboard::WL_KEY_PRESSED => GuestKeyEvent::TextInputPress {
+                        serial: wayland_serial,
+                    },
+                    crate::handler::keyboard::WL_KEY_REPEATED => GuestKeyEvent::TextInputRepeat,
+                    crate::handler::keyboard::WL_KEY_RELEASED => GuestKeyEvent::TextInputRelease {
+                        serial: wayland_serial,
+                    },
                     _ => unreachable!("keysym state validated above"),
+                };
+                let decision = ctx.transition_guest_key(host_keyboard_id, keycode, event);
+                if decision.delivery != GuestKeyDelivery::Forward {
+                    log::debug!(
+                        "Dropping text-input keysym for host keyboard {} key {} state {}",
+                        host_keyboard_id.0,
+                        keycode,
+                        state
+                    );
+                    return Action::Drop;
+                }
+                if ((state == crate::handler::keyboard::WL_KEY_PRESSED
+                    || state == crate::handler::keyboard::WL_KEY_REPEATED)
+                    && keycode != crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                    || (decision.ends_repeat
+                        && keycode == crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                {
+                    if let Some(guest_seat) = guest_seat {
+                        crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
+                    }
                 }
                 log::debug!(
                     "  -> forwarding wl_keyboard.key: keyboard_id={}, serial={}, time={}, keycode={}, state={}",
@@ -1450,9 +1354,85 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 }
 
-/// Tracks the host-side activation state of a text input v1 object, sending
-/// `activate` / `deactivate` requests only when the state actually transitions.
-/// Called when the guest's enabled state or focused surface changes.
+fn queue_host_deactivation_barrier(
+    ctx: &mut Context,
+    guest_id: u32,
+    host_v1_id: u32,
+    host_seat: u32,
+) -> bool {
+    let callback_id = HostId(ctx.shadow_table.allocate_host_id());
+
+    let mut deactivate = MessageBuilder::new();
+    deactivate.write_u32(host_seat);
+    let Ok(deactivate) = deactivate.try_build_message(host_v1_id, 1) else {
+        log::error!(
+            "Unable to encode text-input deactivation for guest {}",
+            guest_id
+        );
+        ctx.fatal_protocol_error = true;
+        return false;
+    };
+
+    let mut sync = MessageBuilder::new();
+    sync.write_u32(callback_id.0);
+    let Ok(sync) = sync.try_build_message(1, wl_display::REQ_SYNC) else {
+        log::error!(
+            "Unable to encode text-input activation barrier for guest {}",
+            guest_id
+        );
+        ctx.fatal_protocol_error = true;
+        return false;
+    };
+
+    ctx.shadow_table
+        .track_host_interface_with_version(callback_id.0, "wl_callback".to_string(), 1);
+    if !ctx
+        .text_input_activation_barriers
+        .install(callback_id, guest_id, host_v1_id)
+    {
+        log::error!("Text-input {} already has an activation barrier", guest_id);
+        ctx.shadow_table.remove_host_interface(callback_id.0);
+        ctx.fatal_protocol_error = true;
+        return false;
+    }
+
+    // The ordered host stream is the proof: deactivate first, then sync.
+    // While the callback is pending host_activated is false, so every stale
+    // event dispatched before callback.done is discarded.
+    ctx.client_to_host_queue.push((deactivate, Vec::new()));
+    ctx.client_to_host_queue.push((sync, Vec::new()));
+    true
+}
+
+/// Complete one host activation barrier and reconcile the newest guest state.
+///
+/// Returns `true` when `callback_id` belongs to this subsystem.
+pub(crate) fn complete_host_activation_barrier(ctx: &mut Context, callback_id: HostId) -> bool {
+    let Some((guest_id, host_v1_id)) = ctx.text_input_activation_barriers.complete(callback_id)
+    else {
+        return false;
+    };
+    if !ctx.shadow_table.mark_pending_destroy_host(callback_id.0) {
+        log::warn!(
+            "Text-input activation callback {} was not tracked as host-only",
+            callback_id.0
+        );
+    }
+    if ctx
+        .text_inputs
+        .get(&guest_id)
+        .is_some_and(|state| state.host_v1_id == host_v1_id)
+    {
+        update_host_activation(ctx, guest_id);
+    }
+    true
+}
+
+/// Reconcile the host-side activation state of a reused text-input-v1 object.
+///
+/// Deactivation opens an internal sync barrier. Reactivation is deferred until
+/// callback.done proves that events from the previous focus generation have
+/// already been dispatched and dropped.
 pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     let Some(state) = ctx.text_inputs.get(&guest_id) else {
         return;
@@ -1464,6 +1444,17 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     let target_activated = state.committed_enabled && host_surface.is_some();
 
     if target_activated == state.host_activated {
+        return;
+    }
+    if target_activated
+        && ctx
+            .text_input_activation_barriers
+            .is_pending(guest_id, state.host_v1_id)
+    {
+        log::debug!(
+            "Deferring text input {} activation until the previous generation drains",
+            guest_id
+        );
         return;
     }
 
@@ -1506,9 +1497,6 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     let host_seat = host_seat.expect("checked above");
     let host_v1_id = state.host_v1_id;
     let host_surface = host_surface.unwrap_or(0);
-    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-        state.host_activated = target_activated;
-    }
 
     if target_activated {
         log::info!(
@@ -1521,17 +1509,22 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
         let mut builder = MessageBuilder::new();
         builder.write_u32(host_seat);
         builder.write_u32(host_surface);
-        push_msg(&mut ctx.client_to_host_queue, host_v1_id, 0, builder);
+        if push_msg(&mut ctx.client_to_host_queue, host_v1_id, 0, builder) {
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.host_activated = true;
+            }
+        }
     } else {
         log::info!(
             "update_host_activation: deactivating text input v1 (guest_id={}, host_v1_id={})",
             guest_id,
             host_v1_id
         );
-        // deactivate: opcode 1
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_seat);
-        push_msg(&mut ctx.client_to_host_queue, host_v1_id, 1, builder);
+        if queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat) {
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.host_activated = false;
+            }
+        }
     }
 }
 
@@ -1574,8 +1567,8 @@ pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFoc
             continue;
         }
 
-        ctx.keyboard_latest_peek_sequences
-            .retain(|(guest_seat, _), _| *guest_seat != change.guest_seat);
+        ctx.key_generations
+            .clear_peek_watermarks_for_seat(change.guest_seat);
         end_backspace_repeat_for_seat(ctx, change.guest_seat);
         let updates = ctx
             .text_inputs
@@ -2101,6 +2094,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
     use crate::handler::seat::SeatHandler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
@@ -2108,6 +2102,7 @@ mod tests {
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
+    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
 
@@ -3217,6 +3212,217 @@ mod tests {
     }
 
     #[test]
+    fn focus_generation_barrier_drops_old_events_before_reactivation() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let next_surface = 901;
+        ctx.shadow_table.map_id(next_surface, 902);
+        ctx.shadow_table
+            .track_interface(next_surface, "wl_surface".to_string());
+
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        update_host_activation(&mut ctx, guest_id);
+
+        assert!(!ctx.text_inputs[&guest_id].host_activated);
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 1);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 1);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 1),
+            wl_display::REQ_SYNC
+        );
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(guest_id, host_v1_id)
+            .expect("deactivation must open a barrier");
+
+        // Events already queued by the old surface are dispatched before
+        // callback.done and must not mutate or reach the next guest focus.
+        let mut v1 = TextInputV1Handler;
+        ctx.last_sender_id = host_v1_id;
+        assert_eq!(
+            v1.on_preedit_string(&mut ctx, 1, &"old".to_string(), &String::new()),
+            Action::Drop
+        );
+        assert_eq!(
+            v1.on_commit_string(&mut ctx, 1, &"old".to_string()),
+            Action::Drop
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = true;
+            state.active_surface = Some(next_surface);
+        }
+        update_host_activation(&mut ctx, guest_id);
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            2,
+            "activation must remain deferred while old events drain"
+        );
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(ctx.text_inputs[&guest_id].host_activated);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);
+
+        // Once the ordered barrier completes, events belong to the new focus
+        // generation and may be translated normally.
+        ctx.last_sender_id = host_v1_id;
+        assert_eq!(
+            v1.on_preedit_string(&mut ctx, 2, &"new".to_string(), &String::new()),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+    }
+
+    #[test]
+    fn activation_barrier_orders_new_editor_transaction_before_activate() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let next_surface = 901;
+        ctx.shadow_table.map_id(next_surface, 902);
+        ctx.shadow_table
+            .track_interface(next_surface, "wl_surface".to_string());
+
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        update_host_activation(&mut ctx, guest_id);
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(guest_id, host_v1_id)
+            .expect("deactivation must open a barrier");
+
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.active_surface = Some(next_surface);
+        }
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
+        assert_eq!(
+            v3.on_set_surrounding_text(&mut ctx, &"new".to_string(), 3, 3),
+            Action::Drop
+        );
+        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
+        assert!(!ctx.text_inputs[&guest_id].host_activated);
+        assert!(
+            ctx.client_to_host_queue.iter().all(|message| msg_sender(
+                std::slice::from_ref(message),
+                0
+            ) != host_v1_id
+                || msg_opcode(std::slice::from_ref(message), 0) != 0),
+            "activation must remain deferred while the old generation drains"
+        );
+        let commit_state_index = ctx
+            .client_to_host_queue
+            .iter()
+            .position(|message| {
+                msg_sender(std::slice::from_ref(message), 0) == host_v1_id
+                    && msg_opcode(std::slice::from_ref(message), 0) == 9
+            })
+            .expect("the new editor transaction must include commit_state");
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        let activate_index = ctx.client_to_host_queue.len() - 1;
+        assert_eq!(
+            (
+                msg_sender(&ctx.client_to_host_queue, activate_index),
+                msg_opcode(&ctx.client_to_host_queue, activate_index)
+            ),
+            (host_v1_id, 0)
+        );
+        assert!(
+            commit_state_index < activate_index,
+            "the host must receive the new editor transaction before reactivation"
+        );
+    }
+
+    #[test]
+    fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        for (guest_surface, host_surface) in [(901, 902), (903, 904)] {
+            ctx.shadow_table.map_id(guest_surface, host_surface);
+            ctx.shadow_table
+                .track_interface(guest_surface, "wl_surface".to_string());
+        }
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        update_host_activation(&mut ctx, guest_id);
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(guest_id, host_v1_id)
+            .unwrap();
+
+        for (enabled, surface) in [(true, Some(901)), (true, Some(903)), (false, Some(903))] {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = enabled;
+            state.active_surface = surface;
+            update_host_activation(&mut ctx, guest_id);
+        }
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            2,
+            "one deactivation generation must own exactly one sync barrier"
+        );
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(!ctx.text_inputs[&guest_id].host_activated);
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            2,
+            "a final disabled target must not reactivate after callback.done"
+        );
+    }
+
+    #[test]
+    fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
+        let (mut ctx, old_host_v1_id, guest_id) = setup_v1_ctx();
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        update_host_activation(&mut ctx, guest_id);
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(guest_id, old_host_v1_id)
+            .unwrap();
+
+        let mut replacement = ctx.text_inputs.remove(&guest_id).unwrap();
+        replacement.host_v1_id = 11;
+        replacement.committed_enabled = true;
+        replacement.active_surface = Some(901);
+        replacement.host_activated = false;
+        ctx.shadow_table.map_id(901, 902);
+        ctx.text_inputs.insert(guest_id, replacement);
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(!ctx.text_inputs[&guest_id].host_activated);
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "an old host generation callback must not activate the replacement object"
+        );
+    }
+
+    #[test]
     fn second_text_input_enable_on_same_seat_is_ignored() {
         let (mut ctx, _, first_id) = setup_v1_ctx();
         let surface = 40;
@@ -3622,8 +3828,18 @@ mod tests {
             2,
             "deactivate must carry the live host wl_seat ID"
         );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 30);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 1), 0);
+        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        assert_eq!(
+            msg_sender(&ctx.client_to_host_queue, 2),
+            30,
+            "host extension release follows the text-input generation barrier"
+        );
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 1);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 1),
+            wl_display::REQ_SYNC
+        );
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);
         assert_eq!(
             msg_sender(&ctx.host_to_client_queue, 0),
             1,

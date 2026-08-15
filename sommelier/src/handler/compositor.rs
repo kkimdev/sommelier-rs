@@ -29,7 +29,6 @@ use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
 use crate::state::{Context, DamageRect, SurfaceCommit, SurfaceState, ViewportState};
 use crate::wire::Action;
 use log::trace;
-use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
@@ -101,41 +100,40 @@ impl Drop for DmabufWriteSync<'_> {
     }
 }
 
-fn unsupported_native_wait(error: &std::io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(libc::ENOTTY) | Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-    )
-}
+fn wait_for_native_buffer(ctx: &mut Context, guest_buffer_id: u32) -> std::io::Result<()> {
+    if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
+        return Ok(());
+    }
 
-fn wait_for_native_buffer(ctx: &Context, guest_buffer_id: u32) -> bool {
-    let Some(sync_fds) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
-        return true;
-    };
-    let Some(allocator) = ctx.allocator.as_ref() else {
-        log::warn!(
-            "Cannot synchronize native dma-buf guest buffer {} without a DRM allocator",
-            guest_buffer_id
-        );
-        return true;
-    };
-    for sync_fd in sync_fds {
-        if let Err(error) = allocator.wait_for_dmabuf(sync_fd.as_raw_fd()) {
-            log::warn!(
-                "Native dma-buf wait failed for guest buffer {}: {}",
-                guest_buffer_id,
-                error
-            );
-            // Match C Sommelier's compatibility fallback only when the kernel
-            // explicitly lacks the required ioctl. Timeouts, invalid FDs and
-            // poll errors mean writes may still be in flight, so presenting
-            // the buffer would permit torn pixels.
-            if !unsupported_native_wait(&error) {
-                return false;
+    let needs_implicit_sync = {
+        let Some(sync_fds) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
+            return Ok(());
+        };
+        let mut needs_implicit_sync = false;
+        for sync_fd in sync_fds {
+            match crate::allocator::wait_for_dmabuf(sync_fd.as_raw_fd(), ctx.allocator.as_ref())? {
+                crate::allocator::DmabufWaitResult::Synchronized => {}
+                crate::allocator::DmabufWaitResult::ImplicitSyncFallback => {
+                    needs_implicit_sync = true;
+                    break;
+                }
             }
         }
+        needs_implicit_sync
+    };
+
+    if needs_implicit_sync {
+        if !ctx.enable_native_buffer_implicit_sync(guest_buffer_id) {
+            return Err(std::io::Error::other(
+                "native dma-buf disappeared while enabling implicit synchronization",
+            ));
+        }
+        log::warn!(
+            "Native dma-buf synchronization ioctls are unavailable for guest buffer {}; using implicit synchronization",
+            guest_buffer_id
+        );
     }
-    true
+    Ok(())
 }
 
 impl WlCompositorHandler for CompositorHandler {}
@@ -543,7 +541,7 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
                         buffer_width,
                         buffer_height,
                         source_stride,
-                        needs_full_copy,
+                        needs_full_copy || commit.has_full_damage(),
                         src_ptr,
                         inner.size,
                         buffer.dest_ptr,
@@ -551,8 +549,8 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
                         buffer.bo_stride as usize,
                         buffer.dmabuf_plane1_offset,
                         buffer.dmabuf_plane1_stride,
-                        &commit.surface_damage,
-                        &commit.buffer_damage,
+                        commit.surface_damage.rects(),
+                        commit.buffer_damage.rects(),
                         commit.uses_full_mapping(),
                     )
                 } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
@@ -565,7 +563,7 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
                                     buffer_width,
                                     buffer_height,
                                     source_stride,
-                                    needs_full_copy,
+                                    needs_full_copy || commit.has_full_damage(),
                                     src_ptr,
                                     inner.size,
                                     mapped.buffer_mut().as_mut_ptr(),
@@ -573,8 +571,8 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
                                     mapped.stride() as usize,
                                     buffer.dmabuf_plane1_offset,
                                     buffer.dmabuf_plane1_stride,
-                                    &commit.surface_damage,
-                                    &commit.buffer_damage,
+                                    commit.surface_damage.rects(),
+                                    commit.buffer_damage.rects(),
                                     commit.uses_full_mapping(),
                                 )
                             }) {
@@ -667,12 +665,10 @@ impl WlSurfaceHandler for CompositorHandler {
         // surface and still be waiting for wl_buffer.release; only buffers
         // that this host surface actually held may be retired merely because
         // its destructor is ordered ahead of the buffer destructor.
-        let destroyed_surface_buffers: HashSet<u32> = ctx
+        let destroyed_surface_buffer = ctx
             .surfaces
             .get(&wl_surface_guest_id)
-            .into_iter()
-            .flat_map(|surface| surface.current_buffer_id())
-            .collect();
+            .and_then(|surface| surface.current_buffer_id());
         // Clean up any host-side zaura_surface we created for this wl_surface.
         if let Some(zaura_surface_host_id) =
             ctx.wl_surface_to_zaura_surface.remove(&wl_surface_host_id)
@@ -702,19 +698,14 @@ impl WlSurfaceHandler for CompositorHandler {
         // paired wl_surface destructor.
         ctx.client_to_host_queue.push((surface_destroy, Vec::new()));
         ctx.surfaces.remove(&ctx.last_sender_id);
-        crate::handler::shm::clear_buffer_uses_after_surface_destroy(
-            ctx,
-            &destroyed_surface_buffers,
-        );
-        // Pending-only objects do not receive a host release event. This
-        // collector is safe even without a host surface mapping because it
-        // only handles buffers that were never submitted.
-        crate::handler::shm::collect_deferred_buffers(ctx);
-        crate::handler::shm::collect_retired_buffers(ctx);
+        crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
+        // Pending-only objects do not receive a host release event. Retire
+        // every buffer made eligible by removing this surface in one pass.
+        crate::handler::shm::retire_eligible_buffers(ctx);
         ctx.viewport_to_wl_surface
             .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-        ctx.keyboard_latest_peek_sequences
-            .retain(|(_, surface), _| *surface != Some(wl_surface_guest_id));
+        ctx.key_generations
+            .clear_peek_watermarks_for_surface(wl_surface_guest_id);
         // Surface destruction can race the host's wl_keyboard.leave event.
         // Transition the authoritative registry first, then emit the
         // mandatory v3 leave while the guest surface ID is still valid. A
@@ -779,7 +770,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // means the compositor will never emit wl_buffer.release for the
         // superseded object, so retire its host proxy after the new attach
         // request in the ordered queue.
-        crate::handler::shm::collect_deferred_buffers(ctx);
+        crate::handler::shm::retire_eligible_buffers(ctx);
         Action::Forward
     }
 
@@ -904,8 +895,8 @@ impl WlSurfaceHandler for CompositorHandler {
             return Action::Drop;
         }
 
-        let surface_damage = &commit.surface_damage;
-        let buffer_damage = &commit.buffer_damage;
+        let surface_damage = commit.surface_damage.rects();
+        let buffer_damage = commit.buffer_damage.rects();
         // Keep a snapshot of the committed surface state for damage
         // translation. The buffer copy below can clear `needs_full_copy`, so
         // the pre-copy value is retained separately for the host damage
@@ -915,26 +906,15 @@ impl WlSurfaceHandler for CompositorHandler {
             .map(|buffer| buffer.needs_full_copy)
             .unwrap_or(false);
         let force_full_damage = needs_full_damage
-            || commit.surface_damage_is_full
-            || commit.buffer_damage_is_full
+            || commit.has_full_damage()
             || (commit.buffer_offset != (0, 0)
                 && (!surface_damage.is_empty() || !buffer_damage.is_empty()))
             || (attached_full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
-        let host_surface_damage = if commit.surface_damage_is_full {
-            &[][..]
-        } else {
-            surface_damage.as_slice()
-        };
-        let host_buffer_damage = if commit.buffer_damage_is_full {
-            &[][..]
-        } else {
-            buffer_damage.as_slice()
-        };
         let Some(mut host_messages) = build_surface_commit_messages(
             ctx,
             surface_id,
-            host_surface_damage,
-            host_buffer_damage,
+            surface_damage,
+            buffer_damage,
             &commit.state,
             force_full_damage,
         ) else {
@@ -946,7 +926,7 @@ impl WlSurfaceHandler for CompositorHandler {
             if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                 commit.rollback(surface);
             }
-            crate::handler::shm::collect_retired_buffers(ctx);
+            crate::handler::shm::retire_eligible_buffers(ctx);
             return Action::Drop;
         };
 
@@ -966,7 +946,7 @@ impl WlSurfaceHandler for CompositorHandler {
             if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                 commit.rollback(surface);
             }
-            crate::handler::shm::collect_retired_buffers(ctx);
+            crate::handler::shm::retire_eligible_buffers(ctx);
             return Action::Drop;
         }
 
@@ -975,42 +955,52 @@ impl WlSurfaceHandler for CompositorHandler {
                 // Native linux-dmabuf buffers bypass the local SHM copy path.
                 // Wait for guest GPU writes before the host compositor samples
                 // the buffer, matching ChromiumOS Sommelier's sync_point path.
-                if !wait_for_native_buffer(ctx, buffer_id) {
-                    log::warn!(
-                        "Skipping host wl_surface.commit for {} because dma-buf synchronization failed",
-                        surface_id
+                if let Err(error) = wait_for_native_buffer(ctx, buffer_id) {
+                    log::error!(
+                        "Native dma-buf synchronization failed for surface {}: {}",
+                        surface_id,
+                        error
                     );
+                    // wl_surface.commit has no recoverable failure response.
+                    // Disconnect rather than silently rolling back a request
+                    // the guest reasonably believes was accepted.
+                    ctx.fatal_protocol_error = true;
                     if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                         commit.rollback(surface);
                     }
-                    crate::handler::shm::collect_retired_buffers(ctx);
+                    crate::handler::shm::retire_eligible_buffers(ctx);
                     return Action::Drop;
                 }
             }
         }
 
-        if let Some(buffer_id) = attached_buffer_id {
-            // The pending attach has now been consumed by a successful
-            // commit, so a fresh compositor-use interval begins. Finalize
-            // every fallible local transition before appending any host
-            // message; appending the prepared Vec is then infallible.
-            let dimensions = ctx.buffer_dimensions(buffer_id);
-            let snapshot_updated = ctx.surfaces.get_mut(&surface_id).is_some_and(|surface| {
-                surface.set_current_buffer_dimensions(buffer_id, dimensions)
-            });
-            let use_updated = ctx.render_buffer_host_id(buffer_id).is_none()
-                || ctx.mark_buffer_submitted(buffer_id);
+        if let Some((previous_buffer, next_buffer)) = commit.attachment_transition() {
+            // The pending replacement has now passed every copy, fence, and
+            // wire-encoding check. Apply its content snapshot and both buffer
+            // lifecycle edges before appending any host message. The registry
+            // validates both generations before changing either one, so a
+            // failed replacement remains completely rollback-safe.
+            let snapshot_updated = match next_buffer {
+                Some(buffer_id) => {
+                    let dimensions = ctx.buffer_dimensions(buffer_id);
+                    ctx.surfaces.get_mut(&surface_id).is_some_and(|surface| {
+                        surface.set_current_buffer_dimensions(buffer_id, dimensions)
+                    })
+                }
+                None => ctx.surfaces.contains_key(&surface_id),
+            };
+            let use_updated =
+                snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
             if !snapshot_updated || !use_updated {
                 log::error!(
-                    "Render buffer {} could not finalize attached surface {}",
-                    buffer_id,
+                    "Render-buffer replacement could not finalize surface {}",
                     surface_id
                 );
                 ctx.fatal_protocol_error = true;
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                     commit.rollback(surface);
                 }
-                crate::handler::shm::collect_retired_buffers(ctx);
+                crate::handler::shm::retire_eligible_buffers(ctx);
                 return Action::Drop;
             }
         }
@@ -1019,7 +1009,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // finalized. Preserve their ordering while making a partial host
         // transaction impossible.
         ctx.client_to_host_queue.append(&mut host_messages);
-        crate::handler::shm::collect_retired_buffers(ctx);
+        crate::handler::shm::retire_eligible_buffers(ctx);
         Action::Drop
     }
 }
@@ -1303,6 +1293,7 @@ mod tests {
     use crate::state::{
         BufferState, Context, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
     };
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::{Arc, RwLock};
 
     fn msg_sender(msg: &[u8]) -> u32 {
@@ -1451,6 +1442,15 @@ mod tests {
     }
 
     fn register_test_native(ctx: &mut Context, guest_id: u32, size: (i32, i32)) {
+        register_test_native_with_sync_fds(ctx, guest_id, size, Vec::new());
+    }
+
+    fn register_test_native_with_sync_fds(
+        ctx: &mut Context,
+        guest_id: u32,
+        size: (i32, i32),
+        sync_fds: Vec<OwnedFd>,
+    ) {
         let host_id = ctx.shadow_table.get_host_id(guest_id).unwrap_or_else(|| {
             let host_id = guest_id + 1;
             ctx.shadow_table.map_id(guest_id, host_id);
@@ -1459,7 +1459,21 @@ mod tests {
             ctx.shadow_table.set_host_version(host_id, 1);
             host_id
         });
-        assert!(ctx.register_native_buffer(host_id, size, Vec::new()));
+        assert!(ctx.register_native_buffer(host_id, size, sync_fds));
+    }
+
+    fn unsupported_dmabuf_sync_fd() -> OwnedFd {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::close(pipe_fds[1]) }, 0);
+        unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) }
+    }
+
+    fn invalid_ioctl_fd() -> OwnedFd {
+        let path = std::ffi::CString::new("/proc/self/exe").unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        unsafe { OwnedFd::from_raw_fd(fd) }
     }
 
     fn set_test_surface_content(
@@ -1472,6 +1486,76 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .set_current_buffer_for_test(buffer_id, dimensions);
+    }
+
+    #[test]
+    fn unsupported_native_sync_uses_cached_implicit_fallback_and_commits() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let surface = 100;
+        let buffer = 50;
+        ctx.allocator = None;
+        register_test_native_with_sync_fds(
+            &mut ctx,
+            buffer,
+            (1, 1),
+            vec![unsupported_dmabuf_sync_fd()],
+        );
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = surface;
+        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+        assert!(ctx.native_buffer_uses_implicit_sync(buffer));
+        assert_eq!(
+            ctx.client_to_host_queue
+                .last()
+                .map(|(message, _)| (msg_sender(message), msg_opcode(message))),
+            Some((wl_surface_host, REQ_COMMIT))
+        );
+
+        ctx.client_to_host_queue.clear();
+        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+        assert_eq!(
+            ctx.client_to_host_queue
+                .last()
+                .map(|(message, _)| (msg_sender(message), msg_opcode(message))),
+            Some((wl_surface_host, REQ_COMMIT)),
+            "the cached compatibility mode must keep later commits live"
+        );
+    }
+
+    #[test]
+    fn unexpected_native_sync_failure_is_fatal_and_never_commits() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface = 100;
+        let buffer = 50;
+        ctx.allocator = None;
+        let sync_fd = invalid_ioctl_fd();
+        let error = crate::allocator::wait_for_dmabuf(sync_fd.as_raw_fd(), None).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![sync_fd]);
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = surface;
+        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+
+        assert!(ctx.fatal_protocol_error);
+        assert!(!ctx.native_buffer_uses_implicit_sync(buffer));
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
+            "a commit whose synchronization failed must not reach the host"
+        );
+        assert_eq!(
+            ctx.surfaces.get(&surface).unwrap().pending_buffer_id,
+            Some(Some(buffer)),
+            "fatal teardown still rolls back the prepared surface transaction"
+        );
     }
 
     #[test]
@@ -1601,29 +1685,13 @@ mod tests {
         assert_eq!(destination, source);
     }
 
-    #[test]
-    fn native_wait_fallback_accepts_only_unsupported_kernel_operations() {
-        for errno in [libc::ENOTTY, libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
-            assert!(unsupported_native_wait(&std::io::Error::from_raw_os_error(
-                errno
-            )));
-        }
-        assert!(!unsupported_native_wait(
-            &std::io::Error::from_raw_os_error(libc::EBADF)
-        ));
-        assert!(!unsupported_native_wait(&std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "fence timeout"
-        )));
-    }
-
     fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
         let host_id = ctx.render_buffer_host_id(guest_id)?;
         ctx.render_buffer_lifecycle_for_host(host_id)
     }
 
     fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {
-        buffer_lifecycle(ctx, guest_id).is_some_and(RenderBufferLifecycle::is_guest_destroyed)
+        buffer_lifecycle(ctx, guest_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
     fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> bool {
@@ -3573,6 +3641,115 @@ mod tests {
         );
     }
 
+    fn assert_detached_use_survives_destroy_of_new_current_surface(native: bool) {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _first_surface_host) = setup_ctx();
+        let first_surface = 100u32;
+        let second_surface = 101u32;
+        let second_surface_host = 201u32;
+        let guest_buffer = 50u32;
+        let host_buffer = 51u32;
+
+        ctx.shadow_table.map_id(second_surface, second_surface_host);
+        ctx.shadow_table
+            .track_interface_with_version(second_surface, "wl_surface".to_string(), 5);
+        ctx.shadow_table.set_host_version(second_surface_host, 5);
+        ctx.shadow_table.map_id(guest_buffer, host_buffer);
+        ctx.shadow_table
+            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer, 1);
+        if native {
+            register_test_native(&mut ctx, guest_buffer, (1, 1));
+        } else {
+            register_test_local(
+                &mut ctx,
+                guest_buffer,
+                mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+            );
+        }
+
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = first_surface;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, guest_buffer, 0, 0),
+            Action::Forward
+        );
+        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+
+        // Replacing B on S0 begins an unattributed outstanding use: S0 no
+        // longer names B, but only wl_buffer.release can prove the host has
+        // stopped sampling that detached attachment.
+        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            ctx.host_buffer_use(guest_buffer),
+            Some(RenderBufferUse::AwaitingRelease {
+                has_detached_use: true
+            })
+        );
+
+        // A later current use must preserve, not overwrite, the detached
+        // latch from S0.
+        ctx.last_sender_id = second_surface;
+        assert_eq!(
+            compositor.on_attach(&mut ctx, guest_buffer, 0, 0),
+            Action::Forward
+        );
+        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            ctx.host_buffer_use(guest_buffer),
+            Some(RenderBufferUse::AwaitingRelease {
+                has_detached_use: true
+            })
+        );
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = second_surface;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
+            Action::Drop
+        );
+        assert_eq!(
+            buffer_lifecycle(&ctx, guest_buffer),
+            Some(RenderBufferLifecycle::GuestDestroyed(
+                RenderBufferUse::AwaitingRelease {
+                    has_detached_use: true
+                }
+            )),
+            "destroying S1 proves only S1's current use, not S0's detached use"
+        );
+        assert!(
+            !buffer_host_destroy_is_queued(&ctx, guest_buffer),
+            "the detached S0 use must keep backing alive until host release"
+        );
+
+        ctx.last_sender_id = host_buffer;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Drop
+        );
+        assert!(
+            buffer_host_destroy_is_queued(&ctx, guest_buffer),
+            "the global host release closes every outstanding use"
+        );
+    }
+
+    #[test]
+    fn detached_native_use_survives_destroy_of_new_current_surface() {
+        assert_detached_use_survives_destroy_of_new_current_surface(true);
+    }
+
+    #[test]
+    fn detached_local_use_survives_destroy_of_new_current_surface() {
+        assert_detached_use_survives_destroy_of_new_current_surface(false);
+    }
+
     fn assert_destroying_pending_only_surface_keeps_awaiting_release(native: bool) {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         let wl_surface_guest = 100u32;
@@ -3612,7 +3789,9 @@ mod tests {
         assert_eq!(
             buffer_lifecycle(&ctx, guest_buffer),
             Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::AwaitingRelease
+                RenderBufferUse::AwaitingRelease {
+                    has_detached_use: false
+                }
             ))
         );
 
@@ -3625,7 +3804,9 @@ mod tests {
         assert_eq!(
             buffer_lifecycle(&ctx, guest_buffer),
             Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::AwaitingRelease
+                RenderBufferUse::AwaitingRelease {
+                    has_detached_use: false
+                }
             )),
             "destroying a pending-only surface must not consume another use's release edge"
         );
@@ -3706,9 +3887,14 @@ mod tests {
             .cancel_backspace_repeat(host_keyboard_id, 14);
         ctx.keyboard_repeatable_keys
             .insert(host_keyboard_id, [14].into_iter().collect());
-        ctx.keyboard_latest_peek_sequences
-            .insert((1, Some(wl_surface_guest_id)), sequence);
-        ctx.keyboard_latest_peek_sequences.insert((2, Some(999)), 2);
+        ctx.key_generations.record_latest_peek(
+            1,
+            Some(wl_surface_guest_id),
+            host_keyboard_id,
+            sequence,
+        );
+        ctx.key_generations
+            .record_latest_peek(2, Some(999), crate::state::HostId(701), 2);
         assert!(ctx.claim_guest_key(
             host_keyboard_id,
             14,
@@ -3755,13 +3941,14 @@ mod tests {
             "surface focus teardown must preserve keymap-derived capabilities"
         );
         assert!(
-            !ctx.keyboard_latest_peek_sequences
-                .contains_key(&(1, Some(wl_surface_guest_id))),
+            ctx.key_generations
+                .latest_peek_sequence(1, Some(wl_surface_guest_id))
+                .is_none(),
             "destroying a surface must retire its peek watermark"
         );
         assert_eq!(
-            ctx.keyboard_latest_peek_sequences.get(&(2, Some(999))),
-            Some(&2),
+            ctx.key_generations.latest_peek_sequence(2, Some(999)),
+            Some(2),
             "another live seat's watermark must remain intact"
         );
         assert_eq!(
@@ -3910,13 +4097,13 @@ mod tests {
             live_surface,
             live_host_surface,
         );
-        for (sequence, (guest_seat, surface)) in [
-            (1, (1, destroyed_surface)),
-            (2, (3, destroyed_surface)),
-            (3, (5, live_surface)),
+        for (sequence, (guest_seat, surface, keyboard)) in [
+            (1, (1, destroyed_surface, crate::state::HostId(900))),
+            (2, (3, destroyed_surface, crate::state::HostId(901))),
+            (3, (5, live_surface, crate::state::HostId(902))),
         ] {
-            ctx.keyboard_latest_peek_sequences
-                .insert((guest_seat, Some(surface)), sequence);
+            ctx.key_generations
+                .record_latest_peek(guest_seat, Some(surface), keyboard, sequence);
         }
 
         ctx.last_sender_id = destroyed_surface;
@@ -3956,16 +4143,18 @@ mod tests {
             .client_to_host_queue
             .iter()
             .all(|(message, _)| msg_sender(message) != 722));
-        assert!(!ctx
-            .keyboard_latest_peek_sequences
-            .contains_key(&(1, Some(destroyed_surface))));
-        assert!(!ctx
-            .keyboard_latest_peek_sequences
-            .contains_key(&(3, Some(destroyed_surface))));
+        assert!(ctx
+            .key_generations
+            .latest_peek_sequence(1, Some(destroyed_surface))
+            .is_none());
+        assert!(ctx
+            .key_generations
+            .latest_peek_sequence(3, Some(destroyed_surface))
+            .is_none());
         assert_eq!(
-            ctx.keyboard_latest_peek_sequences
-                .get(&(5, Some(live_surface))),
-            Some(&3)
+            ctx.key_generations
+                .latest_peek_sequence(5, Some(live_surface)),
+            Some(3)
         );
         assert_eq!(ctx.keyboard_focus.surface_for_seat(5), Some(live_surface));
 
@@ -4030,12 +4219,24 @@ mod tests {
                 .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
             ctx.text_inputs.insert(guest_text_input, state);
         }
-        ctx.keyboard_latest_peek_sequences
-            .insert((seat_with_replacement, Some(destroyed_surface)), 1);
-        ctx.keyboard_latest_peek_sequences
-            .insert((seat_with_replacement, Some(replacement_surface)), 2);
-        ctx.keyboard_latest_peek_sequences
-            .insert((seat_without_owner, Some(destroyed_surface)), 3);
+        ctx.key_generations.record_latest_peek(
+            seat_with_replacement,
+            Some(destroyed_surface),
+            crate::state::HostId(801),
+            1,
+        );
+        ctx.key_generations.record_latest_peek(
+            seat_with_replacement,
+            Some(replacement_surface),
+            crate::state::HostId(802),
+            2,
+        );
+        ctx.key_generations.record_latest_peek(
+            seat_without_owner,
+            Some(destroyed_surface),
+            crate::state::HostId(803),
+            3,
+        );
         assert!(
             ctx.keyboard_focus
                 .surface_for_seat(seat_without_owner)
@@ -4081,13 +4282,17 @@ mod tests {
             .iter()
             .all(|(message, _)| { msg_sender(message) != 712 }));
         assert!(ctx
-            .keyboard_latest_peek_sequences
-            .keys()
-            .all(|(_, surface)| *surface != Some(destroyed_surface)));
+            .key_generations
+            .latest_peek_sequence(seat_with_replacement, Some(destroyed_surface))
+            .is_none());
+        assert!(ctx
+            .key_generations
+            .latest_peek_sequence(seat_without_owner, Some(destroyed_surface))
+            .is_none());
         assert_eq!(
-            ctx.keyboard_latest_peek_sequences
-                .get(&(seat_with_replacement, Some(replacement_surface))),
-            Some(&2)
+            ctx.key_generations
+                .latest_peek_sequence(seat_with_replacement, Some(replacement_surface)),
+            Some(2)
         );
     }
 

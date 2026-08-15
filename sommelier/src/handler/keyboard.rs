@@ -27,7 +27,9 @@ limitations under the License.
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, GuestKeyOwner, HostId, KeyboardFocus};
+use crate::state::{
+    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
+};
 use crate::wire::Action;
 use xkbcommon::xkb;
 
@@ -777,156 +779,69 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
             }
         }
-        let guest_owner_before = ctx.guest_key_owner(host_keyboard_id, key);
-        let forwarded_before = matches!(
-            guest_owner_before,
-            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-        );
-        let synthetic_suppressed_before = guest_owner_before == Some(GuestKeyOwner::ImeRecovery);
-        let suppress_recovered_key =
-            synthetic_suppressed_before || (backspace_repeat_active && !forwarded_before);
-        let mut action = if suppress_recovered_key {
-            log::debug!(
-                "  -> dropping host key {} already handled by IME repeat recovery",
-                key
-            );
-            Action::Drop
-        } else {
-            Action::Forward
-        };
-        // `handled` is the value sent back to Exo in ack_key. It must describe
-        // whether this particular event was accepted by the guest-side proxy,
-        // not merely whether the event was a press. In particular, a physical
-        // release whose press was consumed by an accelerator or IME is
-        // NOT_HANDLED and must not be forwarded into the guest.
-        let mut handled = false;
-
-        if state == WL_KEY_RELEASED || (state == WL_KEY_REPEATED && forwarded_before) {
+        if state == WL_KEY_RELEASED
+            || (state == WL_KEY_REPEATED
+                && matches!(
+                    ctx.guest_key_owner(host_keyboard_id, key),
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                ))
+        {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
         }
 
-        // WL_KEY_PRESSED = 1, WL_KEY_RELEASED = 0.
-        // `other` catches any future unknown state values (e.g. if Wayland adds
-        // a new key-repeat state) without silently falling through to a wrong arm.
-        // In Rust, integer match arms are unordered — each arm matches its exact
-        // pattern and `other` fires only for values not matched above.
-        match state {
+        let decision = match state {
             WL_KEY_PRESSED | WL_KEY_REPEATED => {
                 let repeated = state == WL_KEY_REPEATED;
-                let dropped_before = ctx
-                    .key_generations
-                    .host_accelerator_suppressed(host_keyboard_id, key);
-                if suppress_recovered_key && guest_owner_before.is_none() {
-                    let claimed =
-                        ctx.claim_guest_key(host_keyboard_id, key, GuestKeyOwner::ImeRecovery);
-                    debug_assert!(claimed, "guest owner was checked above");
-                }
                 if key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
-                // Key pressed: check if this is a host accelerator.
                 let host_accelerator =
                     self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
-                if dropped_before || host_accelerator {
-                    log::debug!("  -> accelerator key, dropping");
-                    action = Action::Drop;
-                    handled = false;
-                    if host_accelerator {
-                        // A host accelerator can also be visible through
-                        // peek_key. It must never become a candidate for a
-                        // later empty IME confirmation.
-                        Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
-                    }
-                    // If a prior press was already forwarded (for example a
-                    // repeat whose modifier state changed), retain that
-                    // physical press so its eventual release still reaches
-                    // the guest. ChromiumOS's pressed-key set has the same
-                    // behavior.
-                    if !forwarded_before {
-                        ctx.key_generations
-                            .suppress_host_accelerator(host_keyboard_id, key);
-                    }
-                } else if action == Action::Forward {
-                    if forwarded_before && !repeated {
-                        // Suppress duplicate pressed events while still
-                        // acknowledging them as handled; the original press
-                        // remains paired with the release. A v10 repeated
-                        // event is a real event and must be forwarded.
-                        action = Action::Drop;
-                        handled = true;
-                        log::debug!("  -> dropping duplicate press for key {}", key);
-                    } else if repeated && !forwarded_before {
-                        // A repeated event without a preceding forwarded
-                        // press is malformed from the guest's perspective.
-                        // Do not invent a press/release pair.
-                        action = Action::Drop;
-                        handled = false;
-                        log::warn!(
-                            "  -> dropping repeated key {} without a forwarded press",
-                            key
-                        );
-                    } else if repeated {
-                        // The original owner remains responsible for the
-                        // eventual release; a repeat is forwarded without
-                        // claiming a second generation.
-                        handled = true;
-                    } else {
-                        let claimed =
-                            ctx.claim_guest_key(host_keyboard_id, key, GuestKeyOwner::Physical);
-                        debug_assert!(claimed, "forwarded key had no existing guest owner");
-                        handled = true;
-                    }
+                if host_accelerator {
+                    // A host accelerator can also be visible through peek_key.
+                    // It must never become a later IME recovery candidate.
+                    Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
                 }
-                // ChromiumOS sends an ack for every key event. For an
-                // accelerator press `handled` is false; for an IME-suppressed
-                // press it is also false because no guest event was emitted.
-                Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
+                ctx.transition_guest_key(
+                    host_keyboard_id,
+                    key,
+                    GuestKeyEvent::PhysicalPress {
+                        repeated,
+                        host_accelerator,
+                        ime_repeat_active: backspace_repeat_active,
+                    },
+                )
             }
             WL_KEY_RELEASED => {
-                // ChromiumOS forwards a release only when its corresponding
-                // press was forwarded. This prevents an unmatched release
-                // from reaching the guest after an accelerator or IME
-                // consumed the press.
-                let dropped_press = ctx
-                    .key_generations
-                    .take_host_accelerator_suppression(host_keyboard_id, key);
-                let owner = ctx.guest_key_owner(host_keyboard_id, key);
-                let ime_suppressed = owner == Some(GuestKeyOwner::ImeRecovery);
-                let keysym_synthetic = owner == Some(GuestKeyOwner::TextInputKeysym);
-                let forwarded_press = matches!(
-                    owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
-                );
-                if !ime_suppressed {
-                    ctx.take_guest_key_owner(host_keyboard_id, key);
-                }
-                handled = forwarded_press;
-                action = if forwarded_press && !dropped_press && !ime_suppressed {
-                    Action::Forward
-                } else {
-                    Action::Drop
-                };
-                Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
-                if dropped_press || ime_suppressed {
-                    log::debug!(
-                        "  -> dropping release for key {} (dropped_press={}, ime_suppressed={}, keysym_synthetic={})",
-                        key, dropped_press, ime_suppressed, keysym_synthetic
-                    );
-                }
-                if key == EVDEV_KEY_BACKSPACE {
+                let decision =
+                    ctx.transition_guest_key(host_keyboard_id, key, GuestKeyEvent::PhysicalRelease);
+                if key == EVDEV_KEY_BACKSPACE && decision.ends_repeat {
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
+                decision
             }
             other => {
                 log::warn!("on_key: received unknown key state {}, ignoring", other);
-                action = Action::Drop;
+                return Action::Drop;
             }
-        }
+        };
+
+        let handled = decision
+            .ack_handled
+            .expect("physical key decisions always carry an ACK");
+        Self::send_ack_key(ctx, host_keyboard_id, serial, handled);
+        let action = match decision.delivery {
+            GuestKeyDelivery::Forward => Action::Forward,
+            GuestKeyDelivery::Drop => Action::Drop,
+            GuestKeyDelivery::EmitBalancedPair => {
+                unreachable!("physical key events never emit synthetic pairs")
+            }
+        };
 
         log::debug!("  -> action={:?}", action);
         action
@@ -1007,15 +922,6 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let guest_id = ctx.last_sender_id;
         log::info!(">>> wl_keyboard.on_release: guest_id={}", guest_id);
         let guest_seat = ctx.keyboard_to_seat.remove(&guest_id);
-        if guest_seat.is_some_and(|seat| {
-            !ctx.keyboard_to_seat
-                .values()
-                .any(|other_seat| *other_seat == seat)
-        }) {
-            let released_seat = guest_seat.expect("checked above");
-            ctx.keyboard_latest_peek_sequences
-                .retain(|(seat, _), _| *seat != released_seat);
-        }
         // Translate guest ID → host ID. Returns None for unknown keyboards
         // (e.g. keyboards that never received an on_enter event).
         let Some(host_keyboard_id) = ctx
@@ -1126,8 +1032,12 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                                 ctx.keyboard_focus
                                     .keyboard_owns_surface(host_keyboard_id, *surface)
                             });
-                        ctx.keyboard_latest_peek_sequences
-                            .insert((guest_seat, focused_surface), sequence);
+                        ctx.key_generations.record_latest_peek(
+                            guest_seat,
+                            focused_surface,
+                            host_keyboard_id,
+                            sequence,
+                        );
                     }
                 } else if state == WL_KEY_REPEATED
                     || (state == WL_KEY_PRESSED && peek_pressed_before)
@@ -1818,9 +1728,12 @@ mod tests {
 
         ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 7);
-        ctx.keyboard_latest_peek_sequences.insert((7, None), 1);
-        ctx.keyboard_latest_peek_sequences.insert((7, Some(100)), 2);
-        ctx.keyboard_latest_peek_sequences.insert((8, Some(200)), 3);
+        ctx.key_generations
+            .record_latest_peek(7, None, HostId(host_keyboard_id), 1);
+        ctx.key_generations
+            .record_latest_peek(7, Some(100), HostId(host_keyboard_id), 2);
+        ctx.key_generations
+            .record_latest_peek(8, Some(200), HostId(11), 3);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
         ctx.extended_keyboard_to_keyboard
@@ -1859,14 +1772,16 @@ mod tests {
             "keyboard release must discard retired guest releases"
         );
         assert!(
-            ctx.keyboard_latest_peek_sequences
-                .keys()
-                .all(|(seat, _)| *seat != 7),
-            "releasing the seat's last keyboard must retire its peek watermarks"
+            ctx.key_generations.latest_peek_sequence(7, None).is_none()
+                && ctx
+                    .key_generations
+                    .latest_peek_sequence(7, Some(100))
+                    .is_none(),
+            "releasing a keyboard must retire the peek watermarks it owns"
         );
         assert_eq!(
-            ctx.keyboard_latest_peek_sequences.get(&(8, Some(200))),
-            Some(&3),
+            ctx.key_generations.latest_peek_sequence(8, Some(200)),
+            Some(3),
             "another seat's watermark must remain intact"
         );
 
@@ -3003,6 +2918,59 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_retirement_removes_its_watermark_and_recovers_other_held_key() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        focus_keyboard(&mut ctx, 100, 1, 900);
+        focus_keyboard(&mut ctx, 101, 1, 900);
+
+        ctx.last_sender_id = 100;
+        let first_keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&first_keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        ctx.last_sender_id = 101;
+        let second_keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let shift =
+            find_keycode(&second_keymap, xkb::keysyms::KEY_Shift_L).expect("Shift in keymap");
+
+        // Keyboard 100 owns an older repeatable held key. Keyboard 101 then
+        // becomes the causal watermark with a non-repeatable key.
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+        ctx.last_sender_id = 1001;
+        keyboard_handler.on_peek_key(&mut ctx, 2, 501, shift, WL_KEY_PRESSED);
+        ctx.last_sender_id = 2000;
+        crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1);
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        // Destroying keyboard 101 makes its generation permanently unable to
+        // produce another event. Its watermark must disappear with it so the
+        // still-live keyboard 100 can continue the held-Space repeat.
+        ctx.last_sender_id = 11;
+        assert_eq!(keyboard_handler.on_release(&mut ctx), Action::Forward);
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            3,
+            "the remaining held key must emit a balanced pair and text-input done"
+        );
+        assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 10);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[1]), 10);
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
+    }
+
+    #[test]
     fn repeated_peek_key_refreshes_the_synthetic_event_time() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let mut keyboard_handler = KeyboardHandler::new();
@@ -3975,8 +3943,15 @@ mod tests {
         );
         assert_eq!(
             ctx.client_to_host_queue.len(),
-            1,
-            "keyboard release must deactivate the host v1 input"
+            2,
+            "keyboard release must deactivate then fence the host v1 input"
+        );
+        assert_eq!(message_sender(&ctx.client_to_host_queue[0]), 401);
+        assert_eq!(message_opcode(&ctx.client_to_host_queue[0]), 1);
+        assert_eq!(message_sender(&ctx.client_to_host_queue[1]), 1);
+        assert_eq!(
+            message_opcode(&ctx.client_to_host_queue[1]),
+            crate::protocols::wayland::wl_display::REQ_SYNC
         );
     }
 

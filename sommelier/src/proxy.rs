@@ -1448,58 +1448,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_proxy_dispatch_repeats_held_space_after_korean_commit() {
-        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
-        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
-        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
-        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-        use crate::protocols::wayland::wl_keyboard;
+    const GUEST_KEYBOARD: u32 = 10;
+    const HOST_KEYBOARD: u32 = 100;
+    const HOST_EXTENDED_KEYBOARD: u32 = 1_000;
+    const GUEST_TEXT_INPUT: u32 = 40;
+    const HOST_TEXT_INPUT: u32 = 140;
+    const HOST_EXTENDED_TEXT_INPUT: u32 = 2_000;
+    const GUEST_SEAT: u32 = 1;
+    const HOST_SEAT: u32 = 902;
+    const GUEST_SURFACE: u32 = 900;
+    const HOST_SURFACE: u32 = 901;
+    const KEY_BACKSPACE: u32 = 14;
+    const KEY_SPACE: u32 = 57;
+    const KEY_RELEASED: u32 = 0;
+    const KEY_PRESSED: u32 = 1;
+    const KEY_REPEATED: u32 = 2;
+
+    fn dispatch_raw_event_result(
+        handler: &mut SommelierHandler,
+        ctx: &mut Context,
+        interface: &str,
+        message: Vec<u8>,
+    ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
+        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
+        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let result = Client::dispatch_event(handler, ctx, interface, &mut wire)
+            .expect("raw host event must dispatch");
+        assert!(
+            wire.is_payload_consumed(),
+            "proxy dispatch must consume the complete raw event payload"
+        );
+        result
+    }
+
+    fn dispatch_raw_event(
+        handler: &mut SommelierHandler,
+        ctx: &mut Context,
+        interface: &str,
+        message: Vec<u8>,
+    ) {
+        assert!(
+            dispatch_raw_event_result(handler, ctx, interface, message).is_none(),
+            "raw host event must be consumed by the proxy handler"
+        );
+    }
+
+    fn dispatch_raw_request_result(
+        handler: &mut SommelierHandler,
+        ctx: &mut Context,
+        interface: &str,
+        message: Vec<u8>,
+    ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
+        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
+        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
+            .expect("raw guest request must dispatch");
+        assert!(
+            wire.is_payload_consumed(),
+            "proxy dispatch must consume the complete raw request payload"
+        );
+        result
+    }
+
+    fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+        u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+    }
+
+    fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+        (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+    }
+
+    fn setup_raw_ime_dispatch() -> (Context, SommelierHandler) {
         use crate::state::{HostId, TextInputState};
 
-        const GUEST_KEYBOARD: u32 = 10;
-        const HOST_KEYBOARD: u32 = 100;
-        const HOST_EXTENDED_KEYBOARD: u32 = 1_000;
-        const GUEST_TEXT_INPUT: u32 = 40;
-        const HOST_TEXT_INPUT: u32 = 140;
-        const HOST_EXTENDED_TEXT_INPUT: u32 = 2_000;
-        const GUEST_SEAT: u32 = 1;
-        const GUEST_SURFACE: u32 = 900;
-        const KEY_BACKSPACE: u32 = 14;
-        const KEY_SPACE: u32 = 57;
-        const KEY_RELEASED: u32 = 0;
-        const KEY_PRESSED: u32 = 1;
-
-        fn dispatch_raw_event(
-            handler: &mut SommelierHandler,
-            ctx: &mut Context,
-            interface: &str,
-            message: Vec<u8>,
-        ) {
-            let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-            let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-            let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
-            assert_eq!(
-                Client::dispatch_event(handler, ctx, interface, &mut wire),
-                Ok(None),
-                "raw host event must be consumed by the proxy handler"
-            );
-            assert!(
-                wire.is_payload_consumed(),
-                "proxy dispatch must consume the complete raw event payload"
-            );
-        }
-
-        fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
-            u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
-        }
-
-        fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
-            (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
-        }
-
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let mut handler = SommelierHandler::new();
+        ctx.shadow_table
+            .track_host_interface_with_version(1, "wl_display".to_string(), 1);
+        ctx.shadow_table.map_id(GUEST_SEAT, HOST_SEAT);
+        ctx.shadow_table
+            .track_interface_with_version(GUEST_SEAT, "wl_seat".to_string(), 1);
+        ctx.shadow_table
+            .track_host_interface_with_version(HOST_SEAT, "wl_seat".to_string(), 1);
 
         ctx.shadow_table.map_id(GUEST_KEYBOARD, HOST_KEYBOARD);
         ctx.shadow_table.track_interface_with_version(
@@ -1526,7 +1557,15 @@ mod tests {
             HostId(HOST_KEYBOARD),
             GUEST_SEAT,
             GUEST_SURFACE,
-            GUEST_SURFACE,
+            HOST_SURFACE,
+        );
+        ctx.shadow_table.map_id(GUEST_SURFACE, HOST_SURFACE);
+        ctx.shadow_table
+            .track_interface_with_version(GUEST_SURFACE, "wl_surface".to_string(), 1);
+        ctx.shadow_table.track_host_interface_with_version(
+            HOST_SURFACE,
+            "wl_surface".to_string(),
+            1,
         );
 
         ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
@@ -1575,6 +1614,20 @@ mod tests {
                 host_activated: true,
             },
         );
+
+        (ctx, SommelierHandler::new())
+    }
+
+    #[test]
+    fn raw_proxy_dispatch_repeats_held_space_after_korean_commit() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::state::HostId;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
 
         let mut peek_press = MessageBuilder::new();
         peek_press.write_u32(700);
@@ -1970,6 +2023,287 @@ mod tests {
             ctx.host_to_client_queue.len(),
             3,
             "the second Backspace hold must start a fresh repeat generation"
+        );
+    }
+
+    #[test]
+    fn raw_proxy_dispatch_retires_destroyed_text_input_activation_barrier() {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+        use crate::protocols::wayland::{wl_callback, wl_display};
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        {
+            let state = ctx.text_inputs.get_mut(&GUEST_TEXT_INPUT).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+            .expect("deactivation must install a callback barrier");
+        let initial_guest_events = ctx.host_to_client_queue.len();
+
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            MessageBuilder::new().build_message(GUEST_TEXT_INPUT, zwp_text_input_v3::REQ_DESTROY),
+        )
+        .is_none());
+        assert!(!ctx.text_inputs.contains_key(&GUEST_TEXT_INPUT));
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            initial_guest_events + 1,
+            "destroy must only acknowledge the guest text-input object"
+        );
+
+        let mut stale_preedit = MessageBuilder::new();
+        stale_preedit.write_u32(1);
+        stale_preedit.write_string("stale");
+        stale_preedit.write_string("");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            stale_preedit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_PREEDIT_STRING),
+        );
+        let mut stale_commit = MessageBuilder::new();
+        stale_commit.write_u32(1);
+        stale_commit.write_string("stale");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            stale_commit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_COMMIT_STRING),
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), initial_guest_events + 1);
+
+        let mut done = MessageBuilder::new();
+        done.write_u32(0);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_callback",
+            done.build_message(callback_id.0, wl_callback::EVT_DONE),
+        );
+        assert!(
+            ctx.text_input_activation_barriers
+                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+                .is_none(),
+            "callback.done must consume the activation barrier"
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            initial_guest_events + 1,
+            "a host-only callback must not emit guest done/delete_id events"
+        );
+
+        let mut delete_id = MessageBuilder::new();
+        delete_id.write_u32(callback_id.0);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_display",
+            delete_id.build_message(1, wl_display::EVT_DELETE_ID),
+        );
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_host_id_available(callback_id.0));
+        assert!(
+            ctx.host_to_client_queue.iter().all(|message| {
+                sender(message) != 1
+                    || opcode(message) != wl_display::EVT_DELETE_ID
+                    || u32::from_ne_bytes(message.0[8..12].try_into().unwrap()) != 0
+            }),
+            "internal callback teardown must never forward delete_id(0)"
+        );
+    }
+
+    #[test]
+    fn raw_proxy_dispatch_keeps_new_generation_after_delayed_release_and_focus_loss() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::state::{GuestKeyOwner, HostId};
+
+        fn peek_key(serial: u32, time: u32, state: u32) -> Vec<u8> {
+            let mut event = MessageBuilder::new();
+            event.write_u32(serial);
+            event.write_u32(time);
+            event.write_u32(KEY_SPACE);
+            event.write_u32(state);
+            event.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            )
+        }
+
+        fn keyboard_key(serial: u32, time: u32, state: u32) -> Vec<u8> {
+            let mut event = MessageBuilder::new();
+            event.write_u32(serial);
+            event.write_u32(time);
+            event.write_u32(KEY_SPACE);
+            event.write_u32(state);
+            event.build_message(HOST_KEYBOARD, wl_keyboard::EVT_KEY)
+        }
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        let old_press = u32::MAX - 2;
+        let old_release = u32::MAX;
+        let new_press = 1;
+        let new_release = 3;
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_key(old_press, 100, KEY_PRESSED),
+        );
+        assert!(
+            dispatch_raw_event_result(
+                &mut handler,
+                &mut ctx,
+                "wl_keyboard",
+                keyboard_key(old_press, 100, KEY_PRESSED),
+            )
+            .is_some(),
+            "the first physical generation must reach the guest"
+        );
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_key(old_release, 110, KEY_RELEASED),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_key(new_press, 200, KEY_PRESSED),
+        );
+        assert!(
+            dispatch_raw_event_result(
+                &mut handler,
+                &mut ctx,
+                "wl_keyboard",
+                keyboard_key(new_press, 200, KEY_PRESSED),
+            )
+            .is_some(),
+            "the wrapped serial must start a new physical generation"
+        );
+
+        assert!(
+            dispatch_raw_event_result(
+                &mut handler,
+                &mut ctx,
+                "wl_keyboard",
+                keyboard_key(old_release, 110, KEY_RELEASED),
+            )
+            .is_some(),
+            "the delayed release must still balance its retired guest press"
+        );
+        assert!(ctx
+            .key_generations
+            .physically_held(HostId(HOST_KEYBOARD), KEY_SPACE));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(HOST_KEYBOARD), KEY_SPACE),
+            Some(GuestKeyOwner::Physical),
+            "the old release must not clear the wrapped current generation"
+        );
+
+        assert!(
+            dispatch_raw_event_result(
+                &mut handler,
+                &mut ctx,
+                "wl_keyboard",
+                keyboard_key(2, 210, KEY_REPEATED),
+            )
+            .is_some(),
+            "repeat forwarding requires the current generation to remain owned"
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_key(new_release, 220, KEY_RELEASED),
+        );
+        assert!(
+            dispatch_raw_event_result(
+                &mut handler,
+                &mut ctx,
+                "wl_keyboard",
+                keyboard_key(new_release, 220, KEY_RELEASED),
+            )
+            .is_some(),
+            "the current generation must retain its own balancing release"
+        );
+        assert!(!ctx
+            .key_generations
+            .physically_held(HostId(HOST_KEYBOARD), KEY_SPACE));
+        assert!(ctx
+            .guest_key_owner(HostId(HOST_KEYBOARD), KEY_SPACE)
+            .is_none());
+
+        let acknowledgements = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| sender(message) == HOST_EXTENDED_KEYBOARD && opcode(message) == 1)
+            .map(|message| {
+                (
+                    u32::from_ne_bytes(message.0[8..12].try_into().unwrap()),
+                    u32::from_ne_bytes(message.0[12..16].try_into().unwrap()) != 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            acknowledgements,
+            vec![
+                (old_press, true),
+                (new_press, true),
+                (old_release, true),
+                (2, true),
+                (new_release, true),
+            ],
+            "every physical event must receive exactly one policy-consistent ACK"
+        );
+
+        // A held key that loses keyboard focus cannot become a later synthetic
+        // IME recovery pair.
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_key(4, 300, KEY_PRESSED),
+        );
+        let mut leave = MessageBuilder::new();
+        leave.write_u32(5);
+        leave.write_u32(HOST_SURFACE);
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            leave.build_message(HOST_KEYBOARD, wl_keyboard::EVT_LEAVE),
+        )
+        .is_some());
+        ctx.host_to_client_queue.clear();
+
+        let mut confirm = MessageBuilder::new();
+        confirm.write_u32(1);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            confirm.build_message(
+                HOST_EXTENDED_TEXT_INPUT,
+                zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+            ),
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "focus loss must prevent a later IME confirmation from recovering the held key"
         );
     }
 

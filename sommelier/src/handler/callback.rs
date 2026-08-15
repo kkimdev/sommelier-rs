@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols;
 use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-use crate::state::Context;
+use crate::state::{Context, HostId};
 use crate::wire::{Action, MessageBuilder};
 use log::debug;
 
@@ -25,6 +25,9 @@ pub struct CallbackHandler;
 impl WlCallbackHandler for CallbackHandler {
     fn on_done(&mut self, ctx: &mut Context, callback_data: u32) -> Action {
         let host_id = ctx.last_sender_id;
+        if crate::handler::text_input::complete_host_activation_barrier(ctx, HostId(host_id)) {
+            return Action::Drop;
+        }
         if let Some(generation) = ctx.dmabuf_capability_callbacks.remove(&host_id) {
             // wl_callback.done destroys the host callback resource. Reserve its
             // numeric ID until wl_display.delete_id arrives, while making any

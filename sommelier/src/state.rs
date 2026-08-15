@@ -772,43 +772,56 @@ impl DamageRect {
 }
 
 const MAX_PENDING_DAMAGE_RECTS: usize = 256;
-const FULL_DAMAGE_SENTINEL: DamageRect = DamageRect::new(0, 0, i32::MAX, i32::MAX);
 
 /// Bounded damage accumulated for one surface commit.
 ///
 /// A client may send arbitrarily many damage requests before committing.
 /// Keeping every rectangle makes later coalescing quadratic and permits
-/// unbounded memory growth. Once the exact set reaches its cap, replace it
-/// with one conservative rectangle covering every valid buffer or surface
-/// coordinate; downstream clipping reduces it to the actual content extent.
+/// unbounded memory growth. Once the exact set reaches its cap, transition to
+/// an explicit full-damage state. Full damage is deliberately not encoded as
+/// a magic rectangle: every consumer must handle the same authoritative
+/// variant, so host damage and local copies cannot disagree.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DamageRegion {
-    rects: Vec<DamageRect>,
-    full: bool,
+pub enum DamageRegion {
+    #[default]
+    Empty,
+    Rects(Vec<DamageRect>),
+    Full,
 }
 
 impl DamageRegion {
     pub fn push(&mut self, rect: DamageRect) {
-        if self.full || rect.width <= 0 || rect.height <= 0 {
+        if matches!(self, Self::Full) || rect.width <= 0 || rect.height <= 0 {
             return;
         }
-        if self.rects.len() >= MAX_PENDING_DAMAGE_RECTS {
-            self.rects.clear();
-            self.rects.push(FULL_DAMAGE_SENTINEL);
-            self.full = true;
-            return;
+        match self {
+            Self::Empty => *self = Self::Rects(vec![rect]),
+            Self::Rects(rects) if rects.len() >= MAX_PENDING_DAMAGE_RECTS => {
+                *self = Self::Full;
+            }
+            Self::Rects(rects) => rects.push(rect),
+            Self::Full => unreachable!("full damage returned above"),
         }
-        self.rects.push(rect);
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.rects.is_empty()
+        matches!(self, Self::Empty)
     }
 
-    fn take(&mut self) -> (Vec<DamageRect>, bool) {
-        let full = std::mem::take(&mut self.full);
-        (std::mem::take(&mut self.rects), full)
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub fn rects(&self) -> &[DamageRect] {
+        match self {
+            Self::Rects(rects) => rects,
+            Self::Empty | Self::Full => &[],
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
     }
 }
 
@@ -898,10 +911,8 @@ pub struct SurfaceCommit {
     /// `Some(None)` is an explicit `attach(NULL)`; `None` means no attach was
     /// included in this commit.
     pub attachment: Option<Option<u32>>,
-    pub surface_damage: Vec<DamageRect>,
-    pub buffer_damage: Vec<DamageRect>,
-    pub surface_damage_is_full: bool,
-    pub buffer_damage_is_full: bool,
+    pub surface_damage: DamageRegion,
+    pub buffer_damage: DamageRegion,
     /// One-shot placement of the pending attachment relative to the previous
     /// surface contents. wl_surface.offset replaces legacy attach(x, y); it is
     /// consumed by this commit and is not persistent surface state.
@@ -915,6 +926,15 @@ impl SurfaceCommit {
 
     pub fn attached_buffer_id(&self) -> Option<u32> {
         self.attachment.flatten()
+    }
+
+    pub fn attachment_transition(&self) -> Option<(Option<u32>, Option<u32>)> {
+        self.attachment
+            .map(|next| (self.previous.current_buffer_id(), next))
+    }
+
+    pub fn has_full_damage(&self) -> bool {
+        self.surface_damage.is_full() || self.buffer_damage.is_full()
     }
 
     pub fn uses_full_mapping(&self) -> bool {
@@ -1024,8 +1044,8 @@ impl SurfaceState {
         if let Some(viewport) = self.pending_viewport.take() {
             self.viewport = viewport;
         }
-        let (surface_damage, surface_damage_is_full) = self.pending_surface_damage.take();
-        let (buffer_damage, buffer_damage_is_full) = self.pending_buffer_damage.take();
+        let surface_damage = self.pending_surface_damage.take();
+        let buffer_damage = self.pending_buffer_damage.take();
 
         SurfaceCommit {
             previous,
@@ -1033,8 +1053,6 @@ impl SurfaceState {
             attachment,
             surface_damage,
             buffer_damage,
-            surface_damage_is_full,
-            buffer_damage_is_full,
             buffer_offset,
         }
     }
@@ -1138,6 +1156,19 @@ pub struct PeekKeyProvenance {
     pub eligible: bool,
 }
 
+/// Causal watermark for the newest physical generation in one seat/focus
+/// domain.
+///
+/// Recording the owning keyboard lets keyboard teardown retire an otherwise
+/// stale watermark atomically with its key generations. Without the owner, a
+/// newer generation from a destroyed keyboard can permanently make an older
+/// still-held key on another keyboard ineligible for IME repeat recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeekWatermark {
+    keyboard: HostId,
+    sequence: u64,
+}
+
 /// Exclusive guest-side ownership of one evdev key generation.
 ///
 /// A key can have at most one owner: either a real `wl_keyboard` press is
@@ -1153,6 +1184,47 @@ pub enum GuestKeyOwner {
     /// tombstone suppresses delayed duplicate channels and permits repeat
     /// recovery without leaving an open guest press.
     ImeRecovery,
+}
+
+/// Normalized guest-delivery input from every host key channel.
+///
+/// Handlers decode protocol-specific fields and provide policy facts, while
+/// the key-generation registry alone decides ownership, forwarding, and
+/// wl_keyboard ACK semantics. The sum type prevents impossible combinations
+/// such as attaching a host ACK to a text-input keysym.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestKeyEvent {
+    PhysicalPress {
+        repeated: bool,
+        host_accelerator: bool,
+        ime_repeat_active: bool,
+    },
+    PhysicalRelease,
+    TextInputPress {
+        serial: u32,
+    },
+    TextInputRepeat,
+    TextInputRelease {
+        serial: u32,
+    },
+    RecoverIme,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestKeyDelivery {
+    Drop,
+    Forward,
+    EmitBalancedPair,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestKeyDecision {
+    pub delivery: GuestKeyDelivery,
+    /// Present only for real wl_keyboard events.
+    pub ack_handled: Option<bool>,
+    /// The event closes the current generation's repeat session. Retired
+    /// delayed releases deliberately leave a newer session untouched.
+    pub ends_repeat: bool,
 }
 
 /// A guest press from a retired physical generation whose release channel has
@@ -1231,6 +1303,7 @@ pub struct KeyGenerationRegistry {
     next_generation: u64,
     entries: HashMap<HostId, HashMap<u32, KeyGeneration>>,
     retired_guest_releases: HashMap<(HostId, u32), Vec<RetiredGuestRelease>>,
+    latest_peek_sequences: HashMap<(u32, Option<u32>), PeekWatermark>,
 }
 
 impl KeyGenerationRegistry {
@@ -1281,6 +1354,41 @@ impl KeyGenerationRegistry {
         self.entries.remove(&keyboard);
         self.retired_guest_releases
             .retain(|(pending_keyboard, _), _| *pending_keyboard != keyboard);
+        self.latest_peek_sequences
+            .retain(|_, watermark| watermark.keyboard != keyboard);
+    }
+
+    pub(crate) fn record_latest_peek(
+        &mut self,
+        guest_seat: u32,
+        focused_surface: Option<u32>,
+        keyboard: HostId,
+        sequence: u64,
+    ) {
+        self.latest_peek_sequences.insert(
+            (guest_seat, focused_surface),
+            PeekWatermark { keyboard, sequence },
+        );
+    }
+
+    pub(crate) fn latest_peek_sequence(
+        &self,
+        guest_seat: u32,
+        focused_surface: Option<u32>,
+    ) -> Option<u64> {
+        self.latest_peek_sequences
+            .get(&(guest_seat, focused_surface))
+            .map(|watermark| watermark.sequence)
+    }
+
+    pub(crate) fn clear_peek_watermarks_for_seat(&mut self, guest_seat: u32) {
+        self.latest_peek_sequences
+            .retain(|(seat, _), _| *seat != guest_seat);
+    }
+
+    pub(crate) fn clear_peek_watermarks_for_surface(&mut self, guest_surface: u32) {
+        self.latest_peek_sequences
+            .retain(|(_, surface), _| *surface != Some(guest_surface));
     }
 
     pub(crate) fn physically_held(&self, keyboard: HostId, key: u32) -> bool {
@@ -1766,6 +1874,181 @@ impl KeyGenerationRegistry {
             self.prune_key(keyboard, key);
         }
     }
+
+    /// Apply the only guest-delivery ownership transition for one key event.
+    ///
+    /// Physical state and peek provenance are observed separately because they
+    /// can arrive even when no guest event is emitted. This reducer owns the
+    /// mutually exclusive delivery channels and returns all information the
+    /// protocol handlers need to encode their result.
+    pub(crate) fn transition_guest_key(
+        &mut self,
+        keyboard: HostId,
+        key: u32,
+        event: GuestKeyEvent,
+    ) -> GuestKeyDecision {
+        match event {
+            GuestKeyEvent::PhysicalPress {
+                repeated,
+                host_accelerator,
+                ime_repeat_active,
+            } => {
+                let owner = self.guest_owner(keyboard, key);
+                let forwarded = matches!(
+                    owner,
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                );
+                let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
+                let suppress_for_ime = ime_recovered || (ime_repeat_active && !forwarded);
+                if suppress_for_ime && owner.is_none() {
+                    let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::ImeRecovery);
+                    debug_assert!(claimed, "guest owner was checked above");
+                }
+
+                let accelerator_was_suppressed = self.host_accelerator_suppressed(keyboard, key);
+                if accelerator_was_suppressed || host_accelerator {
+                    if !forwarded {
+                        self.suppress_host_accelerator(keyboard, key);
+                    }
+                    return GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Drop,
+                        ack_handled: Some(false),
+                        ends_repeat: false,
+                    };
+                }
+                if suppress_for_ime {
+                    return GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Drop,
+                        ack_handled: Some(false),
+                        ends_repeat: false,
+                    };
+                }
+                if forwarded && !repeated {
+                    return GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Drop,
+                        ack_handled: Some(true),
+                        ends_repeat: false,
+                    };
+                }
+                if repeated {
+                    return GuestKeyDecision {
+                        delivery: if forwarded {
+                            GuestKeyDelivery::Forward
+                        } else {
+                            GuestKeyDelivery::Drop
+                        },
+                        ack_handled: Some(forwarded),
+                        ends_repeat: false,
+                    };
+                }
+
+                let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::Physical);
+                debug_assert!(claimed, "new physical delivery had no guest owner");
+                GuestKeyDecision {
+                    delivery: GuestKeyDelivery::Forward,
+                    ack_handled: Some(true),
+                    ends_repeat: false,
+                }
+            }
+            GuestKeyEvent::PhysicalRelease => {
+                let accelerator_suppressed = self.take_host_accelerator_suppression(keyboard, key);
+                let owner = self.guest_owner(keyboard, key);
+                let ime_recovered = owner == Some(GuestKeyOwner::ImeRecovery);
+                let forwarded = matches!(
+                    owner,
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                );
+                if !ime_recovered {
+                    self.take_guest_owner(keyboard, key);
+                }
+                GuestKeyDecision {
+                    delivery: if forwarded && !accelerator_suppressed && !ime_recovered {
+                        GuestKeyDelivery::Forward
+                    } else {
+                        GuestKeyDelivery::Drop
+                    },
+                    ack_handled: Some(forwarded),
+                    ends_repeat: true,
+                }
+            }
+            GuestKeyEvent::TextInputPress { serial } => {
+                if self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical)
+                    || !self.claim_text_input_owner(keyboard, key, serial)
+                {
+                    GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Drop,
+                        ack_handled: None,
+                        ends_repeat: false,
+                    }
+                } else {
+                    GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Forward,
+                        ack_handled: None,
+                        ends_repeat: false,
+                    }
+                }
+            }
+            GuestKeyEvent::TextInputRepeat => GuestKeyDecision {
+                delivery: if matches!(
+                    self.guest_owner(keyboard, key),
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                ) {
+                    GuestKeyDelivery::Forward
+                } else {
+                    GuestKeyDelivery::Drop
+                },
+                ack_handled: None,
+                ends_repeat: false,
+            },
+            GuestKeyEvent::TextInputRelease { serial } => {
+                let retired = self.take_pending_text_input_release(keyboard, key, serial);
+                let current = if retired {
+                    true
+                } else {
+                    let serial_is_current = self
+                        .guest_press_serial(keyboard, key)
+                        .is_none_or(|press_serial| serial_is_after(serial, press_serial));
+                    serial_is_current
+                        && self.complete_guest_owner_if(
+                            keyboard,
+                            key,
+                            GuestKeyOwner::TextInputKeysym,
+                        )
+                };
+                GuestKeyDecision {
+                    delivery: if current {
+                        GuestKeyDelivery::Forward
+                    } else {
+                        GuestKeyDelivery::Drop
+                    },
+                    ack_handled: None,
+                    ends_repeat: current && !retired,
+                }
+            }
+            GuestKeyEvent::RecoverIme => {
+                let owner = self.guest_owner(keyboard, key);
+                if matches!(
+                    owner,
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                ) {
+                    return GuestKeyDecision {
+                        delivery: GuestKeyDelivery::Drop,
+                        ack_handled: None,
+                        ends_repeat: false,
+                    };
+                }
+                if owner.is_none() {
+                    let claimed = self.claim_guest_owner(keyboard, key, GuestKeyOwner::ImeRecovery);
+                    debug_assert!(claimed, "guest owner was checked above");
+                }
+                GuestKeyDecision {
+                    delivery: GuestKeyDelivery::EmitBalancedPair,
+                    ack_handled: None,
+                    ends_repeat: false,
+                }
+            }
+        }
+    }
 }
 
 /// One `wl_keyboard` focus generation.
@@ -2005,11 +2288,28 @@ impl KeyboardFocusRegistry {
 }
 
 /// Host-compositor use phase of one render buffer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RenderBufferUse {
     NeverSubmitted,
-    AwaitingRelease,
+    AwaitingRelease {
+        /// At least one earlier attachment was replaced before the host
+        /// compositor emitted `wl_buffer.release`. No surface destructor can
+        /// prove that detached use complete; only the release event can.
+        has_detached_use: bool,
+    },
     Released,
+}
+
+impl RenderBufferUse {
+    fn awaiting() -> Self {
+        Self::AwaitingRelease {
+            has_detached_use: false,
+        }
+    }
+
+    fn is_awaiting_release(&self) -> bool {
+        matches!(self, Self::AwaitingRelease { .. })
+    }
 }
 
 /// Guest/host ownership phase of one render buffer.
@@ -2017,7 +2317,7 @@ pub enum RenderBufferUse {
 /// The lifecycle and use phase live in one enum so guest-destroyed backing
 /// cannot accidentally remain in a separate "live" map, and a queued host
 /// destructor cannot still be represented as compositor-owned.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RenderBufferLifecycle {
     GuestAlive(RenderBufferUse),
     GuestDestroyed(RenderBufferUse),
@@ -2025,16 +2325,23 @@ pub enum RenderBufferLifecycle {
 }
 
 impl RenderBufferLifecycle {
-    pub fn use_state(self) -> Option<RenderBufferUse> {
+    pub fn use_state(&self) -> Option<&RenderBufferUse> {
         match self {
             Self::GuestAlive(use_state) | Self::GuestDestroyed(use_state) => Some(use_state),
             Self::HostDestroyQueued => None,
         }
     }
 
-    pub fn is_guest_destroyed(self) -> bool {
+    pub fn is_guest_destroyed(&self) -> bool {
         matches!(self, Self::GuestDestroyed(_))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderBufferOwnership {
+    GuestAlive,
+    GuestDestroyed,
+    HostDestroyQueued,
 }
 
 /// Storage owned by one host `wl_buffer` generation.
@@ -2050,7 +2357,9 @@ enum RenderBufferBacking {
 
 struct RenderBuffer {
     backing: Option<RenderBufferBacking>,
-    lifecycle: RenderBufferLifecycle,
+    ownership: RenderBufferOwnership,
+    use_state: RenderBufferUse,
+    implicit_sync_fallback: bool,
 }
 
 /// Canonical host-ID keyed registry for every render buffer.
@@ -2070,7 +2379,9 @@ impl RenderBufferRegistry {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer {
                     backing: Some(RenderBufferBacking::LocalCopy(backing)),
-                    lifecycle: RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
+                    ownership: RenderBufferOwnership::GuestAlive,
+                    use_state: RenderBufferUse::NeverSubmitted,
+                    implicit_sync_fallback: false,
                 });
                 true
             }
@@ -2088,7 +2399,9 @@ impl RenderBufferRegistry {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer {
                     backing: Some(RenderBufferBacking::Native { size, sync_fds }),
-                    lifecycle: RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
+                    ownership: RenderBufferOwnership::GuestAlive,
+                    use_state: RenderBufferUse::NeverSubmitted,
+                    implicit_sync_fallback: false,
                 });
                 true
             }
@@ -2128,14 +2441,41 @@ impl RenderBufferRegistry {
         }
     }
 
+    fn uses_implicit_sync_fallback(&self, host_id: HostId) -> bool {
+        self.entries
+            .get(&host_id)
+            .is_some_and(|buffer| buffer.implicit_sync_fallback)
+    }
+
+    fn enable_implicit_sync_fallback(&mut self, host_id: HostId) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        if !matches!(buffer.backing, Some(RenderBufferBacking::Native { .. })) {
+            return false;
+        }
+        buffer.implicit_sync_fallback = true;
+        true
+    }
+
     fn lifecycle(&self, host_id: HostId) -> Option<RenderBufferLifecycle> {
-        self.entries.get(&host_id).map(|buffer| buffer.lifecycle)
+        let buffer = self.entries.get(&host_id)?;
+        Some(match buffer.ownership {
+            RenderBufferOwnership::GuestAlive => {
+                RenderBufferLifecycle::GuestAlive(buffer.use_state.clone())
+            }
+            RenderBufferOwnership::GuestDestroyed => {
+                RenderBufferLifecycle::GuestDestroyed(buffer.use_state.clone())
+            }
+            RenderBufferOwnership::HostDestroyQueued => RenderBufferLifecycle::HostDestroyQueued,
+        })
     }
 
     fn lifecycles(&self) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
-        self.entries
-            .iter()
-            .map(|(&host_id, buffer)| (host_id, buffer.lifecycle))
+        self.entries.keys().filter_map(|&host_id| {
+            self.lifecycle(host_id)
+                .map(|lifecycle| (host_id, lifecycle))
+        })
     }
 
     #[cfg(test)]
@@ -2147,19 +2487,32 @@ impl RenderBufferRegistry {
         self.entries.remove(&host_id).is_some()
     }
 
+    fn can_submit(&self, host_id: HostId) -> bool {
+        self.entries
+            .get(&host_id)
+            .is_some_and(|buffer| buffer.ownership != RenderBufferOwnership::HostDestroyQueued)
+    }
+
+    fn can_detach(&self, host_id: HostId) -> bool {
+        self.entries.get(&host_id).is_some_and(|buffer| {
+            buffer.ownership != RenderBufferOwnership::HostDestroyQueued
+                && !matches!(buffer.use_state, RenderBufferUse::NeverSubmitted)
+        })
+    }
+
     fn submit(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        buffer.lifecycle = match buffer.lifecycle {
-            RenderBufferLifecycle::GuestAlive(_) => {
-                RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease)
+        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
+            return false;
+        }
+        match &mut buffer.use_state {
+            RenderBufferUse::AwaitingRelease { .. } => {}
+            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released => {
+                buffer.use_state = RenderBufferUse::awaiting();
             }
-            RenderBufferLifecycle::GuestDestroyed(_) => {
-                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease)
-            }
-            RenderBufferLifecycle::HostDestroyQueued => return false,
-        };
+        }
         true
     }
 
@@ -2167,37 +2520,74 @@ impl RenderBufferRegistry {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        buffer.lifecycle = match buffer.lifecycle {
-            RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease) => {
-                RenderBufferLifecycle::GuestAlive(RenderBufferUse::Released)
-            }
-            RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease) => {
-                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::Released)
-            }
-            RenderBufferLifecycle::GuestAlive(
-                RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
-            )
-            | RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
-            )
-            | RenderBufferLifecycle::HostDestroyQueued => return false,
-        };
+        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued
+            || !buffer.use_state.is_awaiting_release()
+        {
+            return false;
+        }
+        buffer.use_state = RenderBufferUse::Released;
         true
     }
 
-    fn clear_use_after_surface_destroy(&mut self, host_id: HostId) -> bool {
+    fn detach(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        buffer.lifecycle = match buffer.lifecycle {
-            RenderBufferLifecycle::GuestAlive(_) => {
-                RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted)
+        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
+            return false;
+        }
+        match &mut buffer.use_state {
+            RenderBufferUse::AwaitingRelease { has_detached_use } => {
+                *has_detached_use = true;
+                true
             }
-            RenderBufferLifecycle::GuestDestroyed(_) => {
-                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::NeverSubmitted)
-            }
-            RenderBufferLifecycle::HostDestroyQueued => return false,
+            RenderBufferUse::Released => true,
+            RenderBufferUse::NeverSubmitted => false,
+        }
+    }
+
+    fn end_last_surface_use(&mut self, host_id: HostId, has_other_current: bool) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
         };
+        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
+            return false;
+        }
+        if has_other_current {
+            return true;
+        }
+        match &mut buffer.use_state {
+            RenderBufferUse::AwaitingRelease { has_detached_use } => {
+                if !*has_detached_use {
+                    buffer.use_state = RenderBufferUse::NeverSubmitted;
+                }
+                true
+            }
+            RenderBufferUse::Released => true,
+            RenderBufferUse::NeverSubmitted => false,
+        }
+    }
+
+    /// Atomically apply one successful `wl_surface` attachment replacement.
+    ///
+    /// Both generations are validated before either lifecycle changes. This
+    /// keeps a failed replacement from latching the old buffer as detached or
+    /// beginning a use interval for the new buffer.
+    fn finalize_attachment(&mut self, previous: Option<HostId>, next: Option<HostId>) -> bool {
+        if previous == next {
+            return next.is_none_or(|host_id| self.submit(host_id));
+        }
+        if previous.is_some_and(|host_id| !self.can_detach(host_id))
+            || next.is_some_and(|host_id| !self.can_submit(host_id))
+        {
+            return false;
+        }
+        if let Some(host_id) = previous {
+            debug_assert!(self.detach(host_id));
+        }
+        if let Some(host_id) = next {
+            debug_assert!(self.submit(host_id));
+        }
         true
     }
 
@@ -2205,12 +2595,12 @@ impl RenderBufferRegistry {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        match buffer.lifecycle {
-            RenderBufferLifecycle::GuestAlive(use_state) => {
-                buffer.lifecycle = RenderBufferLifecycle::GuestDestroyed(use_state);
+        match buffer.ownership {
+            RenderBufferOwnership::GuestAlive => {
+                buffer.ownership = RenderBufferOwnership::GuestDestroyed;
                 true
             }
-            RenderBufferLifecycle::GuestDestroyed(_) | RenderBufferLifecycle::HostDestroyQueued => {
+            RenderBufferOwnership::GuestDestroyed | RenderBufferOwnership::HostDestroyQueued => {
                 false
             }
         }
@@ -2220,11 +2610,11 @@ impl RenderBufferRegistry {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        if buffer.lifecycle == RenderBufferLifecycle::HostDestroyQueued {
+        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
             return false;
         }
         buffer.backing = None;
-        buffer.lifecycle = RenderBufferLifecycle::HostDestroyQueued;
+        buffer.ownership = RenderBufferOwnership::HostDestroyQueued;
         true
     }
 }
@@ -2238,6 +2628,61 @@ pub struct DmabufCapabilityState {
     /// Set only after a host wl_display.sync callback proves that every
     /// format/modifier event generated by the internal v3 bind has arrived.
     pub ready: bool,
+}
+
+/// Internal `wl_display.sync` barriers that separate host text-input
+/// activation generations.
+///
+/// Host text-input-v1 objects have no destructor and are reused across guest
+/// focus changes. A deactivate followed by this barrier proves that every
+/// event from the previous activation has been dispatched while
+/// `host_activated` is false, before the object may be activated again.
+#[derive(Default)]
+pub struct TextInputActivationBarrierRegistry {
+    by_callback: HashMap<HostId, (u32, u32)>,
+    by_text_input_generation: HashMap<(u32, u32), HostId>,
+}
+
+impl TextInputActivationBarrierRegistry {
+    pub(crate) fn is_pending(&self, guest_text_input: u32, host_v1_id: u32) -> bool {
+        self.by_text_input_generation
+            .contains_key(&(guest_text_input, host_v1_id))
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        callback: HostId,
+        guest_text_input: u32,
+        host_v1_id: u32,
+    ) -> bool {
+        if self.by_callback.contains_key(&callback)
+            || self
+                .by_text_input_generation
+                .contains_key(&(guest_text_input, host_v1_id))
+        {
+            return false;
+        }
+        self.by_callback
+            .insert(callback, (guest_text_input, host_v1_id));
+        self.by_text_input_generation
+            .insert((guest_text_input, host_v1_id), callback);
+        true
+    }
+
+    pub(crate) fn complete(&mut self, callback: HostId) -> Option<(u32, u32)> {
+        let generation = self.by_callback.remove(&callback)?;
+        if self.by_text_input_generation.get(&generation) == Some(&callback) {
+            self.by_text_input_generation.remove(&generation);
+        }
+        Some(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn callback_for(&self, guest_text_input: u32, host_v1_id: u32) -> Option<HostId> {
+        self.by_text_input_generation
+            .get(&(guest_text_input, host_v1_id))
+            .copied()
+    }
 }
 
 pub struct Context {
@@ -2328,11 +2773,6 @@ pub struct Context {
     /// Physical, peek, repeat-recovery, and guest-delivery state for every
     /// keyboard/key generation.
     pub key_generations: KeyGenerationRegistry,
-    /// Newest physical generation per seat and focused-surface domain.
-    ///
-    /// This watermark outlives an individual keyboard's release tombstone so
-    /// an older held key on another keyboard cannot become causal afterward.
-    pub keyboard_latest_peek_sequences: HashMap<(u32, Option<u32>), u64>,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
     pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
@@ -2397,6 +2837,9 @@ pub struct Context {
     pub host_dmabuf_generation: Option<u64>,
     /// Host-only wl_callback IDs used as capability-discovery barriers.
     pub dmabuf_capability_callbacks: HashMap<u32, u64>,
+    /// Host callback generations that drain stale text-input events before
+    /// reactivation of a reused v1 object.
+    pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
@@ -2523,11 +2966,24 @@ impl Context {
         self.render_buffers.native_sync_fds(host_id)
     }
 
-    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
-        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
-        self.render_buffers.lifecycle(host_id)?.use_state()
+    pub(crate) fn native_buffer_uses_implicit_sync(&self, guest_buffer_id: u32) -> bool {
+        self.render_buffer_host_id(guest_buffer_id)
+            .is_some_and(|host_id| self.render_buffers.uses_implicit_sync_fallback(host_id))
     }
 
+    pub(crate) fn enable_native_buffer_implicit_sync(&mut self, guest_buffer_id: u32) -> bool {
+        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+            return false;
+        };
+        self.render_buffers.enable_implicit_sync_fallback(host_id)
+    }
+
+    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
+        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
+        self.render_buffers.lifecycle(host_id)?.use_state().cloned()
+    }
+
+    #[cfg(test)]
     pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
@@ -2542,11 +2998,26 @@ impl Context {
         self.render_buffers.release(host_id)
     }
 
-    pub(crate) fn clear_buffer_use(&mut self, guest_buffer_id: u32) -> bool {
+    pub(crate) fn finish_surface_destroy_use(
+        &mut self,
+        guest_buffer_id: u32,
+        has_other_current: bool,
+    ) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
-        self.render_buffers.clear_use_after_surface_destroy(host_id)
+        self.render_buffers
+            .end_last_surface_use(host_id, has_other_current)
+    }
+
+    pub(crate) fn finalize_surface_attachment(
+        &mut self,
+        previous_guest_buffer: Option<u32>,
+        next_guest_buffer: Option<u32>,
+    ) -> bool {
+        let previous = previous_guest_buffer.and_then(|id| self.render_buffer_host_id(id));
+        let next = next_guest_buffer.and_then(|id| self.render_buffer_host_id(id));
+        self.render_buffers.finalize_attachment(previous, next)
     }
 
     pub(crate) fn mark_buffer_guest_destroyed(&mut self, guest_buffer_id: u32) -> bool {
@@ -2593,7 +3064,8 @@ impl Context {
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
-        self.host_buffer_use(guest_buffer_id) == Some(RenderBufferUse::AwaitingRelease)
+        self.host_buffer_use(guest_buffer_id)
+            .is_some_and(|use_state| use_state.is_awaiting_release())
     }
 
     pub(crate) fn buffer_is_released(&self, guest_buffer_id: u32) -> bool {
@@ -2603,7 +3075,7 @@ impl Context {
     pub(crate) fn host_buffer_is_guest_destroyed(&self, host_buffer_id: u32) -> bool {
         self.render_buffers
             .lifecycle(HostId(host_buffer_id))
-            .is_some_and(RenderBufferLifecycle::is_guest_destroyed)
+            .is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
     }
 
     pub(crate) fn guest_key_owner(
@@ -2614,11 +3086,22 @@ impl Context {
         self.key_generations.guest_owner(host_keyboard_id, key)
     }
 
+    pub(crate) fn transition_guest_key(
+        &mut self,
+        host_keyboard_id: HostId,
+        key: u32,
+        event: GuestKeyEvent,
+    ) -> GuestKeyDecision {
+        self.key_generations
+            .transition_guest_key(host_keyboard_id, key, event)
+    }
+
     /// Claim delivery ownership for a key that currently has no guest owner.
     ///
     /// Returning `false` leaves the existing owner untouched. Callers can
     /// therefore reject duplicate presses without accidentally changing which
     /// event source must close or suppress the eventual release.
+    #[cfg(test)]
     pub(crate) fn claim_guest_key(
         &mut self,
         host_keyboard_id: HostId,
@@ -2627,25 +3110,6 @@ impl Context {
     ) -> bool {
         self.key_generations
             .claim_guest_owner(host_keyboard_id, key, owner)
-    }
-
-    pub(crate) fn claim_text_input_key(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-        serial: u32,
-    ) -> bool {
-        self.key_generations
-            .claim_text_input_owner(host_keyboard_id, key, serial)
-    }
-
-    /// Release any guest owner for a key and prune the empty keyboard entry.
-    pub(crate) fn take_guest_key_owner(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-    ) -> Option<GuestKeyOwner> {
-        self.key_generations.take_guest_owner(host_keyboard_id, key)
     }
 
     /// Release a key only when the expected source still owns it.
@@ -2658,16 +3122,6 @@ impl Context {
     ) -> bool {
         self.key_generations
             .take_guest_owner_if(host_keyboard_id, key, expected)
-    }
-
-    pub(crate) fn complete_guest_key_if(
-        &mut self,
-        host_keyboard_id: HostId,
-        key: u32,
-        expected: GuestKeyOwner,
-    ) -> bool {
-        self.key_generations
-            .complete_guest_owner_if(host_keyboard_id, key, expected)
     }
 
     pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
@@ -2735,7 +3189,6 @@ impl Context {
             keyboard_to_extended_keyboard: HashMap::new(),
             extended_keyboard_to_keyboard: HashMap::new(),
             key_generations: KeyGenerationRegistry::default(),
-            keyboard_latest_peek_sequences: HashMap::new(),
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
@@ -2757,6 +3210,7 @@ impl Context {
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,
             dmabuf_capability_callbacks: HashMap::new(),
+            text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
@@ -2831,6 +3285,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::fd::{FromRawFd, OwnedFd};
+
+    fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
+        RenderBufferUse::AwaitingRelease { has_detached_use }
+    }
 
     #[tokio::test]
     async fn stop_clipboard_pumps_aborts_and_closes_owned_fds() {
@@ -3314,10 +3772,15 @@ mod tests {
         assert!(commit.has_buffer_attach());
         assert!(commit.uses_full_mapping());
         assert!(!commit.has_invalid_fractional_viewport());
-        assert_eq!(commit.surface_damage, vec![DamageRect::new(1, 2, 3, 4)]);
-        assert_eq!(commit.buffer_damage, vec![DamageRect::new(5, 6, 7, 8)]);
-        assert!(!commit.surface_damage_is_full);
-        assert!(!commit.buffer_damage_is_full);
+        assert_eq!(
+            commit.surface_damage,
+            DamageRegion::Rects(vec![DamageRect::new(1, 2, 3, 4)])
+        );
+        assert_eq!(
+            commit.buffer_damage,
+            DamageRegion::Rects(vec![DamageRect::new(5, 6, 7, 8)])
+        );
+        assert!(!commit.has_full_damage());
         assert_eq!(
             commit.buffer_offset,
             (9, 10),
@@ -3346,8 +3809,7 @@ mod tests {
         assert!(next.attachment.is_none());
         assert!(next.surface_damage.is_empty());
         assert!(next.buffer_damage.is_empty());
-        assert!(!next.surface_damage_is_full);
-        assert!(!next.buffer_damage_is_full);
+        assert!(!next.has_full_damage());
         assert_eq!(next.buffer_offset, (0, 0));
         assert_eq!(next.state, commit.state);
     }
@@ -3423,17 +3885,12 @@ mod tests {
             surface.pending_buffer_damage.push(*rect);
         }
 
-        assert_eq!(surface.pending_buffer_damage.rects, exact);
-        assert!(!surface.pending_buffer_damage.full);
+        assert_eq!(surface.pending_buffer_damage, DamageRegion::Rects(exact));
 
         surface
             .pending_buffer_damage
             .push(DamageRect::new(-10, -20, 30, 40));
-        assert_eq!(
-            surface.pending_buffer_damage.rects,
-            vec![FULL_DAMAGE_SENTINEL]
-        );
-        assert!(surface.pending_buffer_damage.full);
+        assert_eq!(surface.pending_buffer_damage, DamageRegion::Full);
 
         for _ in 0..MAX_PENDING_DAMAGE_RECTS {
             surface
@@ -3441,16 +3898,15 @@ mod tests {
                 .push(DamageRect::new(1, 1, 1, 1));
         }
         assert_eq!(
-            surface.pending_buffer_damage.rects,
-            vec![FULL_DAMAGE_SENTINEL],
+            surface.pending_buffer_damage,
+            DamageRegion::Full,
             "a collapsed region must remain bounded"
         );
 
         let commit = surface.prepare_commit();
-        assert_eq!(commit.buffer_damage, vec![FULL_DAMAGE_SENTINEL]);
-        assert!(commit.buffer_damage_is_full);
+        assert_eq!(commit.buffer_damage, DamageRegion::Full);
+        assert!(commit.has_full_damage());
         assert!(surface.pending_buffer_damage.is_empty());
-        assert!(!surface.pending_buffer_damage.full);
     }
 
     #[test]
@@ -3464,13 +3920,12 @@ mod tests {
         let pending = surface.clone();
 
         let commit = surface.prepare_commit();
-        assert!(commit.surface_damage_is_full);
+        assert_eq!(commit.surface_damage, DamageRegion::Full);
         commit.rollback(&mut surface);
 
         assert_eq!(surface, pending);
         let retry = surface.prepare_commit();
-        assert!(retry.surface_damage_is_full);
-        assert_eq!(retry.surface_damage, vec![FULL_DAMAGE_SENTINEL]);
+        assert_eq!(retry.surface_damage, DamageRegion::Full);
     }
 
     #[test]
@@ -3504,10 +3959,7 @@ mod tests {
             Some(RenderBufferUse::NeverSubmitted)
         );
         assert!(ctx.mark_buffer_submitted(buffer));
-        assert_eq!(
-            ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::AwaitingRelease)
-        );
+        assert_eq!(ctx.host_buffer_use(buffer), Some(awaiting_release(false)));
         assert!(ctx.buffer_is_submitted(buffer));
         assert!(!ctx.buffer_is_released(buffer));
 
@@ -3519,10 +3971,10 @@ mod tests {
         assert!(ctx.mark_buffer_submitted(buffer));
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::AwaitingRelease),
+            Some(awaiting_release(false)),
             "a new commit must replace the prior release edge"
         );
-        assert!(ctx.clear_buffer_use(buffer));
+        assert!(ctx.finish_surface_destroy_use(buffer, false));
         assert_eq!(
             ctx.host_buffer_use(buffer),
             Some(RenderBufferUse::NeverSubmitted)
@@ -3536,25 +3988,90 @@ mod tests {
     }
 
     #[test]
-    fn host_buffer_use_matches_all_short_transition_sequences() {
-        #[derive(Clone, Copy)]
-        enum Operation {
-            Submit,
-            Release,
-            Clear,
-        }
-
-        let operations = [Operation::Submit, Operation::Release, Operation::Clear];
-        let sequence_len = 7;
-        let sequence_count = operations.len().pow(sequence_len);
+    fn same_buffer_reattach_does_not_create_a_detached_use() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
         ctx.shadow_table.map_id(buffer, host_buffer);
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
+        assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
+        assert!(ctx.finalize_surface_attachment(Some(buffer), Some(buffer)));
+        assert_eq!(ctx.host_buffer_use(buffer), Some(awaiting_release(false)));
+    }
+
+    #[test]
+    fn release_clears_the_detached_latch_before_a_new_submit() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let buffer = 20;
+        let host_buffer = 40;
+        ctx.shadow_table.map_id(buffer, host_buffer);
+        assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
+
+        assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
+        assert!(ctx.finalize_surface_attachment(Some(buffer), None));
+        assert_eq!(ctx.host_buffer_use(buffer), Some(awaiting_release(true)));
+        assert!(ctx.mark_buffer_released(buffer));
+        assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
+        assert_eq!(ctx.host_buffer_use(buffer), Some(awaiting_release(false)));
+        assert!(ctx.finish_surface_destroy_use(buffer, false));
+        assert_eq!(
+            ctx.host_buffer_use(buffer),
+            Some(RenderBufferUse::NeverSubmitted)
+        );
+    }
+
+    #[test]
+    fn failed_attachment_replacement_mutates_neither_buffer_generation() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let old = 20;
+        let old_host = 40;
+        let new = 21;
+        let new_host = 41;
+        for (guest, host) in [(old, old_host), (new, new_host)] {
+            ctx.shadow_table.map_id(guest, host);
+            assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
+        }
+        assert!(ctx.mark_buffer_submitted(old));
+        assert!(ctx
+            .render_buffers
+            .mark_host_destroy_queued(HostId(new_host)));
+
+        assert!(!ctx.finalize_surface_attachment(Some(old), Some(new)));
+        assert_eq!(ctx.host_buffer_use(old), Some(awaiting_release(false)));
+        assert_eq!(
+            ctx.render_buffers.lifecycle(HostId(new_host)),
+            Some(RenderBufferLifecycle::HostDestroyQueued)
+        );
+    }
+
+    #[test]
+    fn host_buffer_use_matches_all_short_transition_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Submit,
+            Release,
+            Detach,
+            LastSurfaceDestroy,
+            OtherSurfaceRemains,
+        }
+
+        let operations = [
+            Operation::Submit,
+            Operation::Release,
+            Operation::Detach,
+            Operation::LastSurfaceDestroy,
+            Operation::OtherSurfaceRemains,
+        ];
+        let sequence_len = 6;
+        let sequence_count = operations.len().pow(sequence_len);
+        let buffer = 20;
+        let host_buffer = 40;
+
         for mut encoded in 0..sequence_count {
-            assert!(ctx.clear_buffer_use(buffer));
+            let mut ctx = Context::new_for_test(false, false, Vec::new());
+            ctx.shadow_table.map_id(buffer, host_buffer);
+            assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
             let mut model = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
@@ -3562,25 +4079,43 @@ mod tests {
                 encoded /= operations.len();
                 match operation {
                     Operation::Submit => {
-                        model = RenderBufferUse::AwaitingRelease;
+                        if !matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
+                            model = awaiting_release(false);
+                        }
                         assert!(ctx.mark_buffer_submitted(buffer));
                     }
                     Operation::Release => {
-                        let expected = model == RenderBufferUse::AwaitingRelease;
+                        let expected = matches!(&model, RenderBufferUse::AwaitingRelease { .. });
                         if expected {
                             model = RenderBufferUse::Released;
                         }
                         assert_eq!(ctx.mark_buffer_released(buffer), expected);
                     }
-                    Operation::Clear => {
-                        model = RenderBufferUse::NeverSubmitted;
-                        assert!(ctx.clear_buffer_use(buffer));
+                    Operation::Detach => {
+                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        if matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
+                            model = awaiting_release(true);
+                        }
+                        assert_eq!(
+                            ctx.finalize_surface_attachment(Some(buffer), None),
+                            expected
+                        );
+                    }
+                    Operation::LastSurfaceDestroy => {
+                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        if model == awaiting_release(false) {
+                            model = RenderBufferUse::NeverSubmitted;
+                        }
+                        assert_eq!(ctx.finish_surface_destroy_use(buffer, false), expected);
+                    }
+                    Operation::OtherSurfaceRemains => {
+                        assert!(ctx.finish_surface_destroy_use(buffer, true));
                     }
                 }
-                assert_eq!(ctx.host_buffer_use(buffer), Some(model));
+                assert_eq!(ctx.host_buffer_use(buffer), Some(model.clone()));
                 assert_eq!(
                     ctx.render_buffers.lifecycle(HostId(host_buffer)),
-                    Some(RenderBufferLifecycle::GuestAlive(model))
+                    Some(RenderBufferLifecycle::GuestAlive(model.clone()))
                 );
             }
         }
@@ -3609,7 +4144,8 @@ mod tests {
         enum Operation {
             Submit,
             Release,
-            Clear,
+            Detach,
+            LastSurfaceDestroy,
             GuestDestroy,
             HostDestroy,
         }
@@ -3617,7 +4153,8 @@ mod tests {
         let operations = [
             Operation::Submit,
             Operation::Release,
-            Operation::Clear,
+            Operation::Detach,
+            Operation::LastSurfaceDestroy,
             Operation::GuestDestroy,
             Operation::HostDestroy,
         ];
@@ -3628,7 +4165,8 @@ mod tests {
         for mut encoded in 0..sequence_count {
             let mut registry = RenderBufferRegistry::default();
             assert!(registry.register_native(HostId(host_id), (1, 1), Vec::new()));
-            let mut model = RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted);
+            let mut ownership = RenderBufferOwnership::GuestAlive;
+            let mut use_state = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
                 let operation = operations[encoded % operations.len()];
@@ -3637,67 +4175,80 @@ mod tests {
                 let actual_changed = match operation {
                     Operation::Submit => registry.submit(HostId(host_id)),
                     Operation::Release => registry.release(HostId(host_id)),
-                    Operation::Clear => registry.clear_use_after_surface_destroy(HostId(host_id)),
+                    Operation::Detach => registry.detach(HostId(host_id)),
+                    Operation::LastSurfaceDestroy => {
+                        registry.end_last_surface_use(HostId(host_id), false)
+                    }
                     Operation::GuestDestroy => registry.mark_guest_destroyed(HostId(host_id)),
                     Operation::HostDestroy => registry.mark_host_destroy_queued(HostId(host_id)),
                 };
-                let (expected, expected_changed) = match (model, operation) {
-                    (RenderBufferLifecycle::GuestAlive(_), Operation::Submit) => (
-                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease),
-                        true,
-                    ),
-                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Submit) => (
-                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease),
-                        true,
-                    ),
-                    (
-                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease),
-                        Operation::Release,
-                    ) => (
-                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::Released),
-                        true,
-                    ),
-                    (
-                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease),
-                        Operation::Release,
-                    ) => (
-                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::Released),
-                        true,
-                    ),
-                    (
-                        RenderBufferLifecycle::GuestAlive(
-                            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
-                        )
-                        | RenderBufferLifecycle::GuestDestroyed(
-                            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
-                        ),
-                        Operation::Release,
-                    ) => (model, false),
-                    (RenderBufferLifecycle::GuestAlive(_), Operation::Clear) => (
-                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
-                        true,
-                    ),
-                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Clear) => (
-                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::NeverSubmitted),
-                        true,
-                    ),
-                    (RenderBufferLifecycle::GuestAlive(use_state), Operation::GuestDestroy) => {
-                        (RenderBufferLifecycle::GuestDestroyed(use_state), true)
+                let expected_changed = match (ownership, operation) {
+                    (RenderBufferOwnership::HostDestroyQueued, _) => false,
+                    (_, Operation::Submit) => {
+                        if !matches!(&use_state, RenderBufferUse::AwaitingRelease { .. }) {
+                            use_state = awaiting_release(false);
+                        }
+                        true
                     }
+                    (_, Operation::Release) => {
+                        let awaiting =
+                            matches!(&use_state, RenderBufferUse::AwaitingRelease { .. });
+                        if awaiting {
+                            use_state = RenderBufferUse::Released;
+                        }
+                        awaiting
+                    }
+                    (_, Operation::Detach) => match &use_state {
+                        RenderBufferUse::AwaitingRelease { .. } => {
+                            use_state = awaiting_release(true);
+                            true
+                        }
+                        RenderBufferUse::Released => true,
+                        RenderBufferUse::NeverSubmitted => false,
+                    },
+                    (_, Operation::LastSurfaceDestroy) => match &use_state {
+                        RenderBufferUse::AwaitingRelease {
+                            has_detached_use: false,
+                        } => {
+                            use_state = RenderBufferUse::NeverSubmitted;
+                            true
+                        }
+                        RenderBufferUse::AwaitingRelease {
+                            has_detached_use: true,
+                        }
+                        | RenderBufferUse::Released => true,
+                        RenderBufferUse::NeverSubmitted => false,
+                    },
+                    (RenderBufferOwnership::GuestAlive, Operation::GuestDestroy) => {
+                        ownership = RenderBufferOwnership::GuestDestroyed;
+                        true
+                    }
+                    (RenderBufferOwnership::GuestDestroyed, Operation::GuestDestroy) => false,
                     (
-                        RenderBufferLifecycle::GuestAlive(_)
-                        | RenderBufferLifecycle::GuestDestroyed(_),
+                        RenderBufferOwnership::GuestAlive | RenderBufferOwnership::GuestDestroyed,
                         Operation::HostDestroy,
-                    ) => (RenderBufferLifecycle::HostDestroyQueued, true),
-                    (state, _) => (state, false),
+                    ) => {
+                        ownership = RenderBufferOwnership::HostDestroyQueued;
+                        true
+                    }
                 };
-                model = expected;
+                let expected = match ownership {
+                    RenderBufferOwnership::GuestAlive => {
+                        RenderBufferLifecycle::GuestAlive(use_state.clone())
+                    }
+                    RenderBufferOwnership::GuestDestroyed => {
+                        RenderBufferLifecycle::GuestDestroyed(use_state.clone())
+                    }
+                    RenderBufferOwnership::HostDestroyQueued => {
+                        RenderBufferLifecycle::HostDestroyQueued
+                    }
+                };
 
                 assert_eq!(actual_changed, expected_changed);
-                assert_eq!(registry.lifecycle(HostId(host_id)), Some(model));
+                assert_eq!(registry.lifecycle(HostId(host_id)), Some(expected));
                 assert_eq!(
                     registry.dimensions(HostId(host_id)).is_some(),
-                    model != RenderBufferLifecycle::HostDestroyQueued
+                    ownership != RenderBufferOwnership::HostDestroyQueued
                 );
             }
         }
@@ -4179,6 +4730,285 @@ mod tests {
                     }
                 }
                 assert_eq!(ctx.guest_key_owner(keyboard, key), model);
+            }
+        }
+    }
+
+    #[test]
+    fn guest_key_reducer_couples_delivery_ack_and_generation_ownership() {
+        let keyboard = HostId(10);
+        let physical_key = 30;
+        let accelerator_key = 31;
+        let keysym_key = 32;
+        let mut registry = KeyGenerationRegistry::default();
+
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                physical_key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: false,
+                    ime_repeat_active: false,
+                },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Forward,
+                ack_handled: Some(true),
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                physical_key,
+                GuestKeyEvent::TextInputPress { serial: 1 },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: None,
+                ends_repeat: false,
+            },
+            "a second protocol channel cannot duplicate the physical press"
+        );
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                physical_key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: true,
+                    host_accelerator: false,
+                    ime_repeat_active: false,
+                },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Forward,
+                ack_handled: Some(true),
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::PhysicalRelease,),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Forward,
+                ack_handled: Some(true),
+                ends_repeat: true,
+            }
+        );
+
+        assert_eq!(
+            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::RecoverIme,),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::EmitBalancedPair,
+                ack_handled: None,
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                physical_key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: false,
+                    ime_repeat_active: true,
+                },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(false),
+                ends_repeat: false,
+            },
+            "delayed physical delivery cannot duplicate a recovered pair"
+        );
+
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                accelerator_key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: true,
+                    ime_repeat_active: false,
+                },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(false),
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                accelerator_key,
+                GuestKeyEvent::PhysicalRelease,
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(false),
+                ends_repeat: true,
+            },
+            "an accelerator release cannot escape without a guest press"
+        );
+
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                keysym_key,
+                GuestKeyEvent::TextInputPress { serial: 10 },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Forward,
+                ack_handled: None,
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry
+                .transition_guest_key(keyboard, keysym_key, GuestKeyEvent::TextInputRepeat,)
+                .delivery,
+            GuestKeyDelivery::Forward
+        );
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                keysym_key,
+                GuestKeyEvent::TextInputRelease { serial: 11 },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Forward,
+                ack_handled: None,
+                ends_repeat: true,
+            }
+        );
+        assert_eq!(
+            registry
+                .transition_guest_key(
+                    keyboard,
+                    keysym_key,
+                    GuestKeyEvent::TextInputRelease { serial: 12 },
+                )
+                .delivery,
+            GuestKeyDelivery::Drop,
+            "each synthetic press has exactly one releasable owner"
+        );
+    }
+
+    #[test]
+    fn guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            PhysicalPress,
+            PhysicalRepeat,
+            PhysicalRelease,
+            TextPress,
+            TextRepeat,
+            TextRelease,
+            Recover,
+        }
+
+        let operations = [
+            Operation::PhysicalPress,
+            Operation::PhysicalRepeat,
+            Operation::PhysicalRelease,
+            Operation::TextPress,
+            Operation::TextRepeat,
+            Operation::TextRelease,
+            Operation::Recover,
+        ];
+        let sequence_len = 6;
+        let sequence_count = operations.len().pow(sequence_len);
+        let keyboard = HostId(10);
+        let key = 30;
+
+        for mut encoded in 0..sequence_count {
+            let mut registry = KeyGenerationRegistry::default();
+            let mut guest_press_open = false;
+            let mut serial = 0_u32;
+
+            for _ in 0..sequence_len {
+                let operation = operations[encoded % operations.len()];
+                encoded /= operations.len();
+                serial = serial.wrapping_add(1);
+                let event = match operation {
+                    Operation::PhysicalPress => GuestKeyEvent::PhysicalPress {
+                        repeated: false,
+                        host_accelerator: false,
+                        ime_repeat_active: false,
+                    },
+                    Operation::PhysicalRepeat => GuestKeyEvent::PhysicalPress {
+                        repeated: true,
+                        host_accelerator: false,
+                        ime_repeat_active: false,
+                    },
+                    Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
+                    Operation::TextPress => GuestKeyEvent::TextInputPress { serial },
+                    Operation::TextRepeat => GuestKeyEvent::TextInputRepeat,
+                    Operation::TextRelease => GuestKeyEvent::TextInputRelease { serial },
+                    Operation::Recover => GuestKeyEvent::RecoverIme,
+                };
+                let decision = registry.transition_guest_key(keyboard, key, event);
+
+                assert_eq!(
+                    decision.ack_handled.is_some(),
+                    matches!(
+                        operation,
+                        Operation::PhysicalPress
+                            | Operation::PhysicalRepeat
+                            | Operation::PhysicalRelease
+                    ),
+                    "only wl_keyboard events may produce host ACKs"
+                );
+                match (operation, decision.delivery) {
+                    (
+                        Operation::PhysicalPress | Operation::TextPress,
+                        GuestKeyDelivery::Forward,
+                    ) => {
+                        assert!(!guest_press_open, "a second press cannot be forwarded");
+                        guest_press_open = true;
+                    }
+                    (
+                        Operation::PhysicalRepeat | Operation::TextRepeat,
+                        GuestKeyDelivery::Forward,
+                    ) => {
+                        assert!(
+                            guest_press_open,
+                            "repeat forwarding requires an open guest press"
+                        );
+                    }
+                    (
+                        Operation::PhysicalRelease | Operation::TextRelease,
+                        GuestKeyDelivery::Forward,
+                    ) => {
+                        assert!(
+                            guest_press_open,
+                            "release forwarding requires an open guest press"
+                        );
+                        guest_press_open = false;
+                    }
+                    (_, GuestKeyDelivery::EmitBalancedPair) => {
+                        assert!(
+                            matches!(operation, Operation::Recover),
+                            "only IME recovery may emit a balanced pair"
+                        );
+                        assert!(
+                            !guest_press_open,
+                            "recovery cannot overlap an owned guest press"
+                        );
+                    }
+                    (_, GuestKeyDelivery::Drop) => {}
+                    _ => panic!("delivery kind does not match its normalized input event"),
+                }
+
+                assert_eq!(
+                    matches!(
+                        registry.guest_owner(keyboard, key),
+                        Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                    ),
+                    guest_press_open,
+                    "registry ownership must exactly match the observer's open pair"
+                );
             }
         }
     }
