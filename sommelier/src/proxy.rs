@@ -1070,6 +1070,156 @@ mod tests {
     }
 
     #[test]
+    fn raw_proxy_dispatch_balances_each_keyboard_focus_generation_once() {
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::state::HostId;
+
+        fn dispatch_keyboard_event(
+            handler: &mut SommelierHandler,
+            ctx: &mut Context,
+            message: Vec<u8>,
+        ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+            let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
+            let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
+            let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+            let result = Client::dispatch_event(handler, ctx, "wl_keyboard", &mut wire)
+                .expect("raw keyboard event must dispatch");
+            assert!(
+                wire.is_payload_consumed(),
+                "proxy dispatch must consume the complete keyboard event"
+            );
+            result
+        }
+
+        fn enter(keyboard: u32, serial: u32, surface: u32) -> Vec<u8> {
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(serial);
+            builder.write_u32(surface);
+            builder.write_array(&[]);
+            builder.build_message(keyboard, wl_keyboard::EVT_ENTER)
+        }
+
+        fn leave(keyboard: u32, serial: u32, surface: u32) -> Vec<u8> {
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(serial);
+            builder.write_u32(surface);
+            builder.build_message(keyboard, wl_keyboard::EVT_LEAVE)
+        }
+
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = SommelierHandler::new();
+        let guest_seat = 1;
+        let guest_surface = 20;
+        let host_surface = 200;
+        let replacement_guest_surface = 21;
+        let replacement_host_surface = 201;
+        let keyboard_a = (10, 100);
+        let keyboard_b = (11, 101);
+
+        for (guest, host) in [
+            (guest_surface, host_surface),
+            (replacement_guest_surface, replacement_host_surface),
+        ] {
+            ctx.shadow_table.map_id(guest, host);
+            ctx.shadow_table
+                .track_interface_with_version(guest, "wl_surface".to_string(), 1);
+            ctx.shadow_table
+                .track_host_interface_with_version(host, "wl_surface".to_string(), 1);
+        }
+        for (guest_keyboard, host_keyboard) in [keyboard_a, keyboard_b] {
+            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            ctx.shadow_table.track_interface_with_version(
+                guest_keyboard,
+                "wl_keyboard".to_string(),
+                10,
+            );
+            ctx.shadow_table.track_host_interface_with_version(
+                host_keyboard,
+                "wl_keyboard".to_string(),
+                10,
+            );
+            ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        }
+
+        assert!(dispatch_keyboard_event(
+            &mut handler,
+            &mut ctx,
+            enter(keyboard_a.1, 1, host_surface)
+        )
+        .is_some());
+        assert!(
+            dispatch_keyboard_event(&mut handler, &mut ctx, enter(keyboard_b.1, 2, host_surface))
+                .is_some(),
+            "a second keyboard resource needs its own forwarded enter"
+        );
+        assert!(
+            dispatch_keyboard_event(&mut handler, &mut ctx, enter(keyboard_b.1, 3, host_surface))
+                .is_none(),
+            "an exact duplicate enter must be suppressed"
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        assert!(dispatch_keyboard_event(
+            &mut handler,
+            &mut ctx,
+            leave(keyboard_a.1, 4, host_surface)
+        )
+        .is_some());
+        assert_eq!(
+            ctx.keyboard_focus
+                .focus_for_keyboard(HostId(keyboard_b.1))
+                .map(|focus| focus.guest_surface),
+            Some(guest_surface)
+        );
+        assert!(
+            dispatch_keyboard_event(&mut handler, &mut ctx, leave(keyboard_a.1, 5, host_surface))
+                .is_none(),
+            "a duplicate leave must not escape the proxy"
+        );
+        assert!(dispatch_keyboard_event(
+            &mut handler,
+            &mut ctx,
+            leave(keyboard_b.1, 6, host_surface)
+        )
+        .is_some());
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), None);
+
+        // A different keyboard can replace the seat's surface before the
+        // old resource receives its leave. That retired enter still needs one
+        // guest-visible leave, without changing the replacement IME focus.
+        assert!(dispatch_keyboard_event(
+            &mut handler,
+            &mut ctx,
+            enter(keyboard_a.1, 7, host_surface)
+        )
+        .is_some());
+        assert!(dispatch_keyboard_event(
+            &mut handler,
+            &mut ctx,
+            enter(keyboard_b.1, 8, replacement_host_surface)
+        )
+        .is_some());
+        assert!(
+            dispatch_keyboard_event(&mut handler, &mut ctx, leave(keyboard_a.1, 9, host_surface))
+                .is_some(),
+            "the replaced keyboard's enter must receive one balancing leave"
+        );
+        assert_eq!(
+            ctx.keyboard_focus.surface_for_seat(guest_seat),
+            Some(replacement_guest_surface)
+        );
+        assert!(
+            dispatch_keyboard_event(
+                &mut handler,
+                &mut ctx,
+                leave(keyboard_a.1, 10, host_surface)
+            )
+            .is_none(),
+            "the balancing delayed leave must be consumed exactly once"
+        );
+    }
+
+    #[test]
     fn raw_proxy_dispatch_repeats_held_space_after_korean_commit() {
         use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
         use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
@@ -1142,10 +1292,12 @@ mod tests {
             .entry(HostId(HOST_KEYBOARD))
             .or_default()
             .insert(KEY_SPACE);
-        ctx.active_surface_for_seat
-            .insert(GUEST_SEAT, GUEST_SURFACE);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(HOST_KEYBOARD), GUEST_SURFACE);
+        ctx.keyboard_focus.set_for_test(
+            HostId(HOST_KEYBOARD),
+            GUEST_SEAT,
+            GUEST_SURFACE,
+            GUEST_SURFACE,
+        );
 
         ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
         ctx.shadow_table.track_interface_with_version(
@@ -1321,6 +1473,87 @@ mod tests {
             ctx.host_to_client_queue.is_empty(),
             "release and a later confirmation must not emit guest input"
         );
+
+        // A second physical hold must start a fresh generation. This catches
+        // tombstones or repeat-cancellation state leaking across release,
+        // which otherwise produces the reported first-hold/second-hold
+        // asymmetry.
+        let mut second_peek_press = MessageBuilder::new();
+        second_peek_press.write_u32(702);
+        second_peek_press.write_u32(1_400);
+        second_peek_press.write_u32(KEY_SPACE);
+        second_peek_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            second_peek_press.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+
+        let mut second_preedit = MessageBuilder::new();
+        second_preedit.write_u32(2);
+        second_preedit.write_string("나");
+        second_preedit.write_string("");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            second_preedit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_PREEDIT_STRING),
+        );
+        let mut second_commit = MessageBuilder::new();
+        second_commit.write_u32(2);
+        second_commit.write_string("나 ");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            second_commit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_COMMIT_STRING),
+        );
+        ctx.host_to_client_queue.clear();
+
+        for _ in 0..2 {
+            let mut confirm = MessageBuilder::new();
+            confirm.write_u32(1);
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zcr_extended_text_input_v1",
+                confirm.build_message(
+                    HOST_EXTENDED_TEXT_INPUT,
+                    zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+                ),
+            );
+        }
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            6,
+            "the second hold must repeat with the same balanced transactions"
+        );
+
+        ctx.host_to_client_queue.clear();
+        let mut second_peek_release = MessageBuilder::new();
+        second_peek_release.write_u32(703);
+        second_peek_release.write_u32(1_500);
+        second_peek_release.write_u32(KEY_SPACE);
+        second_peek_release.write_u32(KEY_RELEASED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            second_peek_release.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+        assert!(!ctx
+            .keyboard_pressed_keys
+            .contains_key(&HostId(HOST_KEYBOARD)));
+        assert!(!ctx
+            .keyboard_peek_key_presses
+            .contains_key(&HostId(HOST_KEYBOARD)));
     }
 
     #[test]

@@ -27,8 +27,8 @@ limitations under the License.
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, GuestKeyOwner, HostId};
-use crate::wire::{Action, MessageBuilder};
+use crate::state::{Context, GuestId, GuestKeyOwner, HostId, KeyboardFocus};
+use crate::wire::Action;
 use xkbcommon::xkb;
 
 /// `wl_keyboard.key` state values (Wayland spec §wl_keyboard.key).
@@ -208,6 +208,12 @@ impl KeyboardHandler {
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
         ctx.clear_guest_keys(host_keyboard_id);
+    }
+
+    fn retire_focus_scoped_keyboard_state(&mut self, ctx: &mut Context, host_keyboard_id: HostId) {
+        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
+        self.dropped_keys.remove(&host_keyboard_id);
+        self.reset_host_keyboard_modifiers(host_keyboard_id);
     }
 
     fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
@@ -650,11 +656,17 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             );
             return Action::Drop;
         }
-
-        // Lazily bind the extended keyboard object on first enter.
-        // This sends zcr_keyboard_extension_v1.get_extended_keyboard to the
-        // host, which enables ack mode (SetNeedKeyboardKeyAcks(true) in Exo).
-        Self::ensure_extended_keyboard_bound(ctx, host_keyboard_id);
+        if guest_surface_id == 0 {
+            // Forwarding an enter with an unmapped object argument would turn
+            // a stale host event into a guest protocol error. It must not
+            // mutate the current focus generation or allocate extension
+            // objects for an event that cannot be delivered.
+            log::debug!(
+                "Ignoring wl_keyboard.enter for unknown host surface {}",
+                surface
+            );
+            return Action::Drop;
+        }
 
         log::info!(
             ">>> wl_keyboard.on_enter: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
@@ -664,18 +676,19 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             guest_surface_id
         );
 
-        if guest_surface_id == 0 {
-            Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
-            self.dropped_keys.remove(&host_keyboard_id);
-            self.reset_host_keyboard_modifiers(host_keyboard_id);
-            ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-            return Action::Forward;
-        }
-        let duplicate_keyboard_focus = ctx
-            .keyboard_active_surfaces
-            .get(&host_keyboard_id)
-            .is_some_and(|focused_surface| *focused_surface == guest_surface_id);
-        if duplicate_keyboard_focus {
+        let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
+            log::warn!(
+                "  -> guest_kb {} not in keyboard_to_seat map",
+                guest_keyboard_id
+            );
+            return Action::Drop;
+        };
+        let focus = KeyboardFocus {
+            guest_seat: guest_seat_id,
+            guest_surface: guest_surface_id,
+            host_surface: surface,
+        };
+        if ctx.keyboard_focus.focus_for_keyboard(host_keyboard_id) == Some(focus) {
             // The C reference suppresses an enter when the resource already
             // owns this focus. Preserve physical pressed-key and XKB state as
             // well; rebuilding it from an empty/partial keys array would make
@@ -691,68 +704,33 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             // restart its text-input transaction.
             return Action::Drop;
         }
+
+        // Lazily bind the extended keyboard only after the event is known to
+        // be deliverable. A malformed route must not allocate host objects or
+        // queue extension requests before being rejected.
+        Self::ensure_extended_keyboard_bound(ctx, host_keyboard_id);
+
+        let focus_update = ctx.keyboard_focus.enter(host_keyboard_id, focus);
+        for retired_keyboard in &focus_update.retired_keyboards {
+            self.retire_focus_scoped_keyboard_state(ctx, *retired_keyboard);
+        }
         Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
         self.dropped_keys.remove(&host_keyboard_id);
         self.reset_host_keyboard_modifiers(host_keyboard_id);
-        // Focus is owned by the individual wl_keyboard object. Keep this
-        // association even when the seat-level active surface is unchanged:
-        // another keyboard's delayed leave must not tear down this object's
-        // still-live focus.
-        ctx.keyboard_active_surfaces
-            .insert(host_keyboard_id, guest_surface_id);
-        let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
-            log::warn!(
-                "  -> guest_kb {} not in keyboard_to_seat map",
-                guest_keyboard_id
-            );
-            return Action::Forward;
-        };
-        let focus_changed =
-            ctx.active_surface_for_seat.get(&guest_seat_id) != Some(&guest_surface_id);
-        if !focus_changed {
-            // ChromiumOS's C proxy suppresses a duplicate enter for the
-            // already-focused surface. Re-emitting text-input-v3.enter here
-            // would invalidate the editor transaction and can make an IME
-            // lose an in-progress English/Korean composition.
+
+        if focus_update.seat_changes.is_empty() {
+            // Another wl_keyboard resource can enter the seat's already
+            // focused surface. The guest resource still needs its own enter,
+            // but the seat-level text-input focus must remain untouched.
+            // Exact duplicates for the same resource were rejected above.
             log::debug!(
-                "  -> duplicate enter for seat {} surface {}, leaving IME focus intact",
+                "  -> additional keyboard entered seat {} surface {}, leaving IME focus intact",
                 guest_seat_id,
                 guest_surface_id
             );
-            return Action::Drop;
+            return Action::Forward;
         }
-        log::info!(
-            "  -> seat_id={}: setting active_surface={}",
-            guest_seat_id,
-            guest_surface_id
-        );
-        ctx.active_surface_for_seat
-            .insert(guest_seat_id, guest_surface_id);
-
-        let mut text_inputs_to_update = Vec::new();
-        // Find the v3 text input for this seat.
-        for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
-            if state.guest_seat == guest_seat_id {
-                log::info!(
-                    "  -> text_input {}: active_surface = {}",
-                    guest_text_input_id,
-                    guest_surface_id
-                );
-                crate::handler::text_input::invalidate_for_keyboard_focus(state);
-                state.active_surface = Some(guest_surface_id);
-
-                // Send zwp_text_input_v3.enter (opcode 0).
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(guest_surface_id);
-                let msg = builder.build_message(*guest_text_input_id, 0);
-                ctx.host_to_client_queue.push((msg, Vec::new()));
-                text_inputs_to_update.push(*guest_text_input_id);
-            }
-        }
-
-        for id in text_inputs_to_update {
-            crate::handler::text_input::update_host_activation(ctx, id);
-        }
+        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
 
         Action::Forward
     }
@@ -766,6 +744,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             .map(|g| g.0)
             .unwrap_or(0);
         let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
+        let surface_can_be_forwarded =
+            guest_surface_id != 0 && !ctx.shadow_table.is_pending_destroy_host(surface);
 
         log::info!(
             ">>> wl_keyboard.on_leave: host_kb={:?}, guest_kb={}, surface={}, guest_surface={}",
@@ -775,206 +755,25 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             guest_surface_id
         );
 
-        let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
-        let tracked_surface = ctx.keyboard_active_surfaces.get(&host_keyboard_id).copied();
-        if guest_surface_id == 0 {
-            // A missing surface mapping can mean either that the old surface
-            // was destroyed or that a delayed leave raced with a new enter.
-            // Preserve the keyboard/IME state when a live surface is already
-            // focused on this seat; otherwise retire the stale session.
-            let live_active_surface = guest_seat
-                .and_then(|seat| ctx.active_surface_for_seat.get(&seat))
-                .is_some_and(|surface| ctx.shadow_table.get_host_id(*surface).is_some());
-            if live_active_surface {
-                let this_keyboard_still_focused = tracked_surface.is_some_and(|tracked_surface| {
-                    guest_seat.and_then(|seat| ctx.active_surface_for_seat.get(&seat))
-                        == Some(&tracked_surface)
-                        && ctx.shadow_table.get_host_id(tracked_surface).is_some()
-                });
-                if this_keyboard_still_focused {
-                    // The leave names an older surface, but this same
-                    // wl_keyboard has already entered the current live one.
-                    // Keep its active-surface and physical-key state intact.
-                    log::debug!(
-                        "  -> ignoring stale unmapped leave for keyboard {} (tracked current surface {})",
-                        host_keyboard_id.0,
-                        tracked_surface.expect("checked above")
-                    );
-                    return Action::Forward;
-                }
-                // If another wl_keyboard object owns the live seat focus, an
-                // unmapped leave for this object belongs to a destroyed old
-                // surface. Retire this keyboard's physical/IME state even
-                // though the seat-level focus must remain on the other
-                // keyboard. Keeping it would let the Backspace fallback
-                // select this dead keyboard later.
-                let another_keyboard_is_focused = guest_seat.is_some_and(|seat| {
-                    ctx.keyboard_active_surfaces.iter().any(
-                        |(&other_keyboard_id, &other_surface)| {
-                            other_keyboard_id != host_keyboard_id
-                                && ctx
-                                    .shadow_table
-                                    .guest_id_of(other_keyboard_id)
-                                    .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
-                                    == Some(&seat)
-                                && ctx.active_surface_for_seat.get(&seat) == Some(&other_surface)
-                        },
-                    )
-                });
-                if another_keyboard_is_focused {
-                    ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-                    Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-                    self.dropped_keys.remove(&host_keyboard_id);
-                    self.reset_host_keyboard_modifiers(host_keyboard_id);
-                }
-                log::debug!(
-                    "  -> ignoring unmapped stale leave for host keyboard {}",
-                    host_keyboard_id.0
-                );
-                ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-                return Action::Forward;
-            }
-            ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-            self.dropped_keys.remove(&host_keyboard_id);
-            self.reset_host_keyboard_modifiers(host_keyboard_id);
-            if let Some(guest_seat) = guest_seat {
-                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
-                ctx.active_surface_for_seat.remove(&guest_seat);
-                let mut text_inputs_to_update = Vec::new();
-                for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
-                    if state.guest_seat == guest_seat {
-                        state.active_surface = None;
-                        crate::handler::text_input::invalidate_for_keyboard_focus(state);
-                        text_inputs_to_update.push(*guest_text_input_id);
-                    }
-                }
-                for guest_text_input_id in text_inputs_to_update {
-                    crate::handler::text_input::update_host_activation(ctx, guest_text_input_id);
-                }
-            }
-            return Action::Forward;
-        }
-        if tracked_surface.is_some_and(|tracked| tracked != guest_surface_id) {
-            // The same wl_keyboard can leave an old surface after a newer
-            // enter has already installed a different one. This leave belongs
-            // to the old focus and must not clear the current keyboard state.
+        let focus_update = ctx.keyboard_focus.leave(host_keyboard_id, surface);
+        if !focus_update.accepted {
             log::debug!(
-                "  -> ignoring stale leave for keyboard {} surface {} (tracked={:?})",
+                "  -> ignoring stale leave for keyboard {} host surface {}",
                 host_keyboard_id.0,
-                guest_surface_id,
-                tracked_surface
+                surface
             );
-            return Action::Forward;
+            return Action::Drop;
         }
-        ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-        let Some(&guest_seat_id) = ctx.keyboard_to_seat.get(&guest_keyboard_id) else {
-            log::warn!(
-                "  -> guest_kb {} not in keyboard_to_seat map",
-                guest_keyboard_id
-            );
-            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-            self.dropped_keys.remove(&host_keyboard_id);
-            self.reset_host_keyboard_modifiers(host_keyboard_id);
-            return Action::Forward;
-        };
-        let leave_matches_active_surface =
-            ctx.active_surface_for_seat.get(&guest_seat_id) == Some(&guest_surface_id);
-        if !leave_matches_active_surface {
-            // A seat can have more than one wl_keyboard object. Ignore a
-            // stale leave for a surface that is no longer focused; otherwise
-            // an old keyboard would tear down the current IME focus. The
-            // leaving keyboard's own physical/XKB session is still stale,
-            // however, so retire that per-keyboard state before returning.
-            log::debug!(
-                "  -> ignoring stale leave for seat {} surface {} (active={:?})",
-                guest_seat_id,
-                guest_surface_id,
-                ctx.active_surface_for_seat.get(&guest_seat_id)
-            );
-            Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-            self.dropped_keys.remove(&host_keyboard_id);
-            self.reset_host_keyboard_modifiers(host_keyboard_id);
-            return Action::Forward;
+        for retired_keyboard in &focus_update.retired_keyboards {
+            self.retire_focus_scoped_keyboard_state(ctx, *retired_keyboard);
         }
+        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
 
-        // Clear physical-key, accelerator, and modifier state only after the
-        // stale-leave check. A second wl_keyboard object can report a delayed
-        // leave for an old surface after another object has entered a new one;
-        // that event must not release the current keyboard's held keys.
-        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-        self.dropped_keys.remove(&host_keyboard_id);
-        self.reset_host_keyboard_modifiers(host_keyboard_id);
-
-        // Only the leave for the currently focused surface may end the
-        // seat-scoped IME Backspace fallback. A stale leave from another
-        // wl_keyboard object must not interrupt a newer focus.
-        if let Some(guest_seat) = guest_seat {
-            let another_keyboard_is_focused =
-                ctx.keyboard_active_surfaces
-                    .iter()
-                    .any(|(&other_keyboard_id, &other_surface)| {
-                        other_keyboard_id != host_keyboard_id
-                            && other_surface == guest_surface_id
-                            && ctx
-                                .shadow_table
-                                .guest_id_of(other_keyboard_id)
-                                .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
-                                == Some(&guest_seat)
-                    });
-            if !another_keyboard_is_focused {
-                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
-            }
+        if surface_can_be_forwarded {
+            Action::Forward
+        } else {
+            Action::Drop
         }
-
-        let another_keyboard_is_focused =
-            ctx.keyboard_active_surfaces
-                .iter()
-                .any(|(&other_keyboard_id, &other_surface)| {
-                    other_keyboard_id != host_keyboard_id
-                        && other_surface == guest_surface_id
-                        && ctx
-                            .shadow_table
-                            .guest_id_of(other_keyboard_id)
-                            .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
-                            == Some(&guest_seat_id)
-                });
-        if another_keyboard_is_focused {
-            log::debug!(
-                "  -> keeping seat {} focused on surface {} for another keyboard",
-                guest_seat_id,
-                guest_surface_id
-            );
-            return Action::Forward;
-        }
-        log::info!("  -> seat_id={}: removing active_surface", guest_seat_id);
-        ctx.active_surface_for_seat.remove(&guest_seat_id);
-
-        let mut text_inputs_to_update = Vec::new();
-        // Find the v3 text input for this seat.
-        for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
-            if state.guest_seat == guest_seat_id {
-                log::info!(
-                    "  -> text_input {}: active_surface = None",
-                    guest_text_input_id
-                );
-                state.active_surface = None;
-                crate::handler::text_input::invalidate_for_keyboard_focus(state);
-
-                // Send zwp_text_input_v3.leave (opcode 1).
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(guest_surface_id);
-                let msg = builder.build_message(*guest_text_input_id, 1);
-                ctx.host_to_client_queue.push((msg, Vec::new()));
-                text_inputs_to_update.push(*guest_text_input_id);
-            }
-        }
-
-        for id in text_inputs_to_update {
-            crate::handler::text_input::update_host_activation(ctx, id);
-        }
-
-        Action::Forward
     }
 
     /// Handle key events: resolve keysym, check against SOMMELIER_ACCELERATORS,
@@ -1285,6 +1084,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
             return Action::Forward;
         };
+        let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
         // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
         // All must be reset so that a re-created keyboard starts from a clean
         // slate and doesn't inherit stale state from the previous session.
@@ -1312,51 +1112,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 host_keyboard_id.0
             );
         }
-        let released_surface = ctx.keyboard_active_surfaces.remove(&host_keyboard_id);
-        if let (Some(guest_seat), Some(released_surface)) = (guest_seat, released_surface) {
-            let seat_focus_is_owned_by_released_keyboard =
-                ctx.active_surface_for_seat.get(&guest_seat) == Some(&released_surface);
-            let another_keyboard_has_same_focus =
-                ctx.keyboard_active_surfaces
-                    .iter()
-                    .any(|(&other_keyboard_id, &other_surface)| {
-                        other_surface == released_surface
-                            && ctx
-                                .shadow_table
-                                .guest_id_of(other_keyboard_id)
-                                .and_then(|guest_id| ctx.keyboard_to_seat.get(&guest_id.0))
-                                == Some(&guest_seat)
-                    });
-            if seat_focus_is_owned_by_released_keyboard && !another_keyboard_has_same_focus {
-                ctx.active_surface_for_seat.remove(&guest_seat);
-                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
-
-                let mut text_inputs_to_update = Vec::new();
-                for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
-                    if state.guest_seat == guest_seat {
-                        let previous_surface = state.active_surface.take();
-                        crate::handler::text_input::invalidate_for_keyboard_focus(state);
-
-                        if let Some(previous_surface) = previous_surface {
-                            let mut builder = MessageBuilder::new();
-                            builder.write_u32(previous_surface);
-                            ctx.host_to_client_queue
-                                .push((builder.build_message(*guest_text_input_id, 1), Vec::new()));
-                            text_inputs_to_update.push(*guest_text_input_id);
-                        } else if state.host_activated {
-                            // A stale local activation can exist even when no
-                            // guest focus was recorded. Reconcile it without
-                            // emitting a protocol leave for a surface we
-                            // cannot identify.
-                            text_inputs_to_update.push(*guest_text_input_id);
-                        }
-                    }
-                }
-                for guest_text_input_id in text_inputs_to_update {
-                    crate::handler::text_input::update_host_activation(ctx, guest_text_input_id);
-                }
-            }
-        }
+        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
         Action::Forward
     }
 }
@@ -1421,12 +1177,11 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                     ctx.keyboard_peek_sequence = ctx.keyboard_peek_sequence.wrapping_add(1).max(1);
                     if let Some(guest_seat) = guest_seat {
                         let focused_surface = ctx
-                            .active_surface_for_seat
-                            .get(&guest_seat)
-                            .copied()
+                            .keyboard_focus
+                            .surface_for_seat(guest_seat)
                             .filter(|surface| {
-                                ctx.keyboard_active_surfaces.get(&host_keyboard_id)
-                                    == Some(surface)
+                                ctx.keyboard_focus
+                                    .keyboard_owns_surface(host_keyboard_id, *surface)
                             });
                         ctx.keyboard_latest_peek_sequences
                             .insert((guest_seat, focused_surface), ctx.keyboard_peek_sequence);
@@ -1630,12 +1385,34 @@ mod tests {
             .insert(EVDEV_KEY_BACKSPACE);
     }
 
+    fn focus_keyboard(
+        ctx: &mut Context,
+        host_keyboard_id: u32,
+        guest_seat: u32,
+        guest_surface: u32,
+    ) {
+        let host_surface = ctx
+            .shadow_table
+            .get_host_id(guest_surface)
+            .unwrap_or(guest_surface);
+        ctx.keyboard_focus.set_for_test(
+            HostId(host_keyboard_id),
+            guest_seat,
+            guest_surface,
+            host_surface,
+        );
+    }
+
     fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
         u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
     }
 
     fn message_opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
         (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+    }
+
+    fn message_first_u32(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+        u32::from_ne_bytes(message.0[8..12].try_into().unwrap())
     }
 
     fn keyboard_event_payload(
@@ -2623,9 +2400,7 @@ mod tests {
             guest_seat,
             host_extended_text_input,
         );
-        ctx.active_surface_for_seat.insert(guest_seat, 900);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), 900);
+        focus_keyboard(&mut ctx, host_keyboard, guest_seat, 900);
 
         ctx.last_sender_id = host_keyboard;
         let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
@@ -3005,8 +2780,7 @@ mod tests {
         let mut keyboard_handler = KeyboardHandler::new();
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.active_surface_for_seat.insert(1, 900);
-        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        focus_keyboard(&mut ctx, 100, 1, 900);
         ctx.last_sender_id = 100;
         let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
         let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
@@ -3069,9 +2843,8 @@ mod tests {
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         map_keyboard(&mut ctx, 11, 101, 1001, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.active_surface_for_seat.insert(1, 900);
-        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
-        ctx.keyboard_active_surfaces.insert(HostId(101), 900);
+        focus_keyboard(&mut ctx, 100, 1, 900);
+        focus_keyboard(&mut ctx, 101, 1, 900);
 
         ctx.last_sender_id = 100;
         load_test_keymap(&mut keyboard_handler, &mut ctx);
@@ -3136,9 +2909,8 @@ mod tests {
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         map_keyboard(&mut ctx, 11, 101, 1001, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.active_surface_for_seat.insert(1, 900);
-        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
-        ctx.keyboard_active_surfaces.insert(HostId(101), 900);
+        focus_keyboard(&mut ctx, 100, 1, 900);
+        focus_keyboard(&mut ctx, 101, 1, 900);
 
         ctx.last_sender_id = 100;
         let first_keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
@@ -3240,8 +3012,7 @@ mod tests {
         let mut keyboard_handler = KeyboardHandler::new();
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.active_surface_for_seat.insert(1, 900);
-        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        focus_keyboard(&mut ctx, 100, 1, 900);
         ctx.last_sender_id = 100;
         let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
         let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
@@ -3274,8 +3045,7 @@ mod tests {
         let mut keyboard_handler = KeyboardHandler::new();
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.active_surface_for_seat.insert(1, 900);
-        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        focus_keyboard(&mut ctx, 100, 1, 900);
         ctx.last_sender_id = 100;
         let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
         let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
@@ -3494,7 +3264,7 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         ctx.shadow_table.map_id(20, 200);
-        ctx.active_surface_for_seat.insert(1, 20);
+        focus_keyboard(&mut ctx, 100, 1, 20);
         add_active_text_input(&mut ctx, 40, 1, 2000);
         {
             let state = ctx.text_inputs.get_mut(&40).expect("text input");
@@ -3545,6 +3315,54 @@ mod tests {
     }
 
     #[test]
+    fn direct_focus_replacement_sends_balanced_leave_then_enter() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.shadow_table.map_id(21, 201);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 200, &[]), Action::Forward);
+        ctx.host_to_client_queue.clear();
+
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_enter(&mut ctx, 2, 201, &[]), Action::Forward);
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 40);
+        assert_eq!(message_opcode(&ctx.host_to_client_queue[0]), 1);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[0]), 20);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[1]), 40);
+        assert_eq!(message_opcode(&ctx.host_to_client_queue[1]), 0);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[1]), 21);
+        assert_eq!(ctx.text_inputs[&40].active_surface, Some(21));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(21));
+        assert!(
+            ctx.keyboard_focus.focus_for_keyboard(HostId(100)).is_none(),
+            "a newer surface must retire older keyboard generations on the seat"
+        );
+
+        let message_count = ctx.host_to_client_queue.len();
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_leave(&mut ctx, 3, 200), Action::Forward);
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            message_count,
+            "the delayed old leave must be idempotent"
+        );
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(21));
+
+        assert_eq!(
+            handler.on_leave(&mut ctx, 4, 200),
+            Action::Drop,
+            "the retired guest enter can be balanced only once"
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), message_count);
+    }
+
+    #[test]
     fn leave_from_one_keyboard_keeps_same_surface_focused_for_another() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let mut handler = KeyboardHandler::new();
@@ -3557,15 +3375,19 @@ mod tests {
         assert_eq!(handler.on_enter(&mut ctx, 1, 200, &[]), Action::Forward);
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = 101;
-        assert_eq!(handler.on_enter(&mut ctx, 2, 200, &[]), Action::Drop);
+        assert_eq!(
+            handler.on_enter(&mut ctx, 2, 200, &[]),
+            Action::Forward,
+            "each wl_keyboard resource needs its own enter"
+        );
         ctx.host_to_client_queue.clear();
-        assert_eq!(ctx.active_surface_for_seat.get(&1), Some(&20));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(20));
 
         // The first keyboard leaves, but the second one still owns the same
         // surface. Seat-level IME focus must remain active.
         ctx.last_sender_id = 100;
         assert_eq!(handler.on_leave(&mut ctx, 3, 200), Action::Forward);
-        assert_eq!(ctx.active_surface_for_seat.get(&1), Some(&20));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(20));
         assert!(
             ctx.host_to_client_queue.is_empty(),
             "the remaining keyboard must keep text-input focus"
@@ -3573,8 +3395,32 @@ mod tests {
 
         ctx.last_sender_id = 101;
         assert_eq!(handler.on_leave(&mut ctx, 4, 200), Action::Forward);
-        assert!(!ctx.active_surface_for_seat.contains_key(&1));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), None);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
+    }
+
+    #[test]
+    fn same_keyboard_reenter_drops_delayed_old_leave() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.shadow_table.map_id(21, 201);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 200, &[]), Action::Forward);
+        assert_eq!(handler.on_enter(&mut ctx, 2, 201, &[]), Action::Forward);
+        let message_count = ctx.host_to_client_queue.len();
+
+        assert_eq!(
+            handler.on_leave(&mut ctx, 3, 200),
+            Action::Drop,
+            "an old leave must not clear a newer enter on the same resource"
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), message_count);
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(21));
+        assert_eq!(ctx.text_inputs[&40].active_surface, Some(21));
     }
 
     #[test]
@@ -4002,10 +3848,7 @@ mod tests {
             1,
         );
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), guest_surface);
-        ctx.active_surface_for_seat
-            .insert(guest_seat, guest_surface);
+        focus_keyboard(&mut ctx, host_keyboard, guest_seat, guest_surface);
         ctx.text_inputs.insert(
             guest_text_input,
             crate::state::TextInputState {
@@ -4040,7 +3883,7 @@ mod tests {
         ctx.last_sender_id = guest_keyboard;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
         assert!(
-            !ctx.active_surface_for_seat.contains_key(&guest_seat),
+            ctx.keyboard_focus.surface_for_seat(guest_seat).is_none(),
             "keyboard release must not leave a stale seat focus"
         );
         assert_eq!(
@@ -4085,8 +3928,7 @@ mod tests {
             ctx.shadow_table
                 .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
             ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
-            ctx.keyboard_active_surfaces
-                .insert(HostId(host_keyboard_id), guest_surface);
+            focus_keyboard(&mut ctx, host_keyboard_id, guest_seat, guest_surface);
         }
         ctx.shadow_table.map_id(guest_text_input, 400);
         ctx.shadow_table.track_interface_with_version(
@@ -4094,8 +3936,6 @@ mod tests {
             "zwp_text_input_v3".to_string(),
             1,
         );
-        ctx.active_surface_for_seat
-            .insert(guest_seat, guest_surface);
         ctx.text_inputs.insert(
             guest_text_input,
             crate::state::TextInputState {
@@ -4130,8 +3970,8 @@ mod tests {
         ctx.last_sender_id = guest_keyboard;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
         assert_eq!(
-            ctx.active_surface_for_seat.get(&guest_seat),
-            Some(&guest_surface)
+            ctx.keyboard_focus.surface_for_seat(guest_seat),
+            Some(guest_surface)
         );
         assert_eq!(
             ctx.text_inputs[&guest_text_input].active_surface,
@@ -4139,8 +3979,9 @@ mod tests {
         );
         assert!(ctx.host_to_client_queue.is_empty());
         assert!(ctx
-            .keyboard_active_surfaces
-            .contains_key(&HostId(other_host_keyboard)));
+            .keyboard_focus
+            .focus_for_keyboard(HostId(other_host_keyboard))
+            .is_some());
     }
 
     #[test]
@@ -4169,8 +4010,7 @@ mod tests {
             ctx.shadow_table
                 .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
             ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
-            ctx.keyboard_active_surfaces
-                .insert(HostId(host_keyboard_id), guest_surface);
+            focus_keyboard(&mut ctx, host_keyboard_id, guest_seat, guest_surface);
         }
         ctx.shadow_table.map_id(guest_text_input, 400);
         ctx.shadow_table.track_interface_with_version(
@@ -4178,8 +4018,6 @@ mod tests {
             "zwp_text_input_v3".to_string(),
             1,
         );
-        ctx.active_surface_for_seat
-            .insert(guest_seat, guest_surface);
         ctx.keyboard_pressed_keys.insert(
             HostId(other_host_keyboard),
             [EVDEV_KEY_BACKSPACE].into_iter().collect(),
@@ -4253,10 +4091,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(40, "zwp_text_input_v3".to_string(), 1);
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), guest_surface);
-        ctx.active_surface_for_seat
-            .insert(guest_seat, guest_surface);
+        focus_keyboard(&mut ctx, host_keyboard, guest_seat, guest_surface);
         ctx.text_inputs.insert(
             40,
             crate::state::TextInputState {
@@ -4325,10 +4160,7 @@ mod tests {
                 .track_interface(guest_surface, "wl_surface".to_string());
         }
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), released_surface);
-        ctx.active_surface_for_seat
-            .insert(guest_seat, released_surface);
+        focus_keyboard(&mut ctx, host_keyboard, guest_seat, released_surface);
 
         for (guest_text_input, active_surface) in [
             (40, Some(released_surface)),
@@ -4380,10 +4212,27 @@ mod tests {
             .text_inputs
             .values()
             .all(|state| state.active_surface.is_none()));
+        assert!(ctx.text_inputs.values().all(|state| {
+            !state.pending_enabled
+                && !state.committed_enabled
+                && !state.host_activated
+                && state.current_preedit.is_empty()
+        }));
         assert_eq!(
             ctx.host_to_client_queue.len(),
             2,
             "only focused text inputs should receive leave events"
+        );
+        let deactivated_host_inputs = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| {
+                message_opcode(message) == 1 && [540, 541, 542].contains(&message_sender(message))
+            })
+            .count();
+        assert_eq!(
+            deactivated_host_inputs, 3,
+            "every active host v1 input must be deactivated, including a stale local None focus"
         );
 
         let guest_queue_len = ctx.host_to_client_queue.len();
@@ -4391,7 +4240,7 @@ mod tests {
         ctx.last_sender_id = host_keyboard;
         assert_eq!(
             handler.on_leave(&mut ctx, 1, delayed_host_surface),
-            Action::Forward
+            Action::Drop
         );
         assert_eq!(ctx.host_to_client_queue.len(), guest_queue_len);
         assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
@@ -4527,7 +4376,7 @@ mod tests {
         map_keyboard(&mut ctx, 5, 10, 50, 7);
         ctx.shadow_table.map_id(20, 30);
         ctx.shadow_table.map_id(21, 31);
-        ctx.active_surface_for_seat.insert(7, 20);
+        focus_keyboard(&mut ctx, 10, 7, 20);
         add_active_text_input(&mut ctx, 40, 7, 50);
         let state = ctx.text_inputs.get_mut(&40).expect("text input");
         state.active_surface = Some(20);
@@ -4537,8 +4386,8 @@ mod tests {
         // 20 is already focused. This event must not tear down seat-level IME
         // state or send a v3 leave for the current focus.
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_leave(&mut ctx, 1, 31), Action::Forward);
-        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert_eq!(handler.on_leave(&mut ctx, 1, 31), Action::Drop);
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), Some(20));
         assert!(ctx.text_inputs[&40].empty_preedit_repeat_active);
         assert!(
             ctx.host_to_client_queue.is_empty(),
@@ -4548,7 +4397,7 @@ mod tests {
         // A matching leave still ends the fallback and clears focus.
         ctx.last_sender_id = 10;
         assert_eq!(handler.on_leave(&mut ctx, 2, 30), Action::Forward);
-        assert!(!ctx.active_surface_for_seat.contains_key(&7));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), None);
         assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
     }
 
@@ -4565,9 +4414,7 @@ mod tests {
         map_keyboard(&mut ctx, 6, 11, 51, 7);
         ctx.shadow_table.map_id(20, 30);
         ctx.shadow_table.map_id(21, 31);
-        ctx.active_surface_for_seat.insert(7, 21);
-        ctx.keyboard_active_surfaces.insert(HostId(10), 20);
-        ctx.keyboard_active_surfaces.insert(HostId(11), 21);
+        focus_keyboard(&mut ctx, 10, 7, 20);
         ctx.keyboard_pressed_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
@@ -4592,19 +4439,27 @@ mod tests {
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         handler.modifiers.insert(HostId(10), 0xdead_beef);
 
+        // Entering a new surface is the transition that retires the older
+        // keyboard generation. The later leave must already be a no-op.
+        ctx.last_sender_id = 11;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 31, &[]), Action::Forward);
+        let queued_after_enter = ctx.host_to_client_queue.len();
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_leave(&mut ctx, 1, 30), Action::Forward);
+        assert_eq!(handler.on_leave(&mut ctx, 2, 30), Action::Forward);
+        assert_eq!(ctx.host_to_client_queue.len(), queued_after_enter);
 
         assert!(
-            !ctx.keyboard_active_surfaces.contains_key(&HostId(10)),
+            ctx.keyboard_focus.focus_for_keyboard(HostId(10)).is_none(),
             "the stale keyboard's focus association must be retired"
         );
         assert_eq!(
-            ctx.keyboard_active_surfaces.get(&HostId(11)),
-            Some(&21),
+            ctx.keyboard_focus
+                .focus_for_keyboard(HostId(11))
+                .map(|focus| focus.guest_surface),
+            Some(21),
             "the other keyboard's current focus must remain intact"
         );
-        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&21));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), Some(21));
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(10)));
         assert!(!ctx
             .keyboard_backspace_repeat_cancelled
@@ -4627,8 +4482,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         map_keyboard(&mut ctx, 5, 10, 50, 7);
         ctx.shadow_table.map_id(20, 30);
-        ctx.active_surface_for_seat.insert(7, 20);
-        ctx.keyboard_active_surfaces.insert(HostId(10), 20);
+        focus_keyboard(&mut ctx, 10, 7, 20);
         ctx.keyboard_pressed_keys
             .entry(HostId(10))
             .or_default()
@@ -4643,34 +4497,32 @@ mod tests {
         // live focused surface. A delayed leave for the old surface must not
         // tear down the current keyboard session.
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
+        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Drop);
         assert!(ctx
             .keyboard_pressed_keys
             .get(&HostId(10))
             .is_some_and(|keys| keys.contains(&EVDEV_KEY_BACKSPACE)));
-        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), Some(20));
         assert!(ctx.host_to_client_queue.is_empty());
     }
 
     #[test]
-    fn unmapped_leave_clears_focus_when_destroyed_surface_was_current() {
+    fn matching_leave_uses_stored_host_surface_after_mapping_is_unavailable() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         map_keyboard(&mut ctx, 5, 10, 50, 7);
         add_active_text_input(&mut ctx, 40, 7, 60);
-        ctx.active_surface_for_seat.insert(7, 20);
+        ctx.keyboard_focus.set_for_test(HostId(10), 7, 20, 999);
         ctx.text_inputs
             .get_mut(&40)
             .expect("text input")
             .active_surface = Some(20);
 
-        // Surface 20 was destroyed before the host leave event arrived, so
-        // its host→guest mapping is gone and the leave carries no valid guest
-        // object ID. The seat focus must still be retired to avoid leaving
-        // text-input-v3 active on a dead surface.
+        // The guest mapping is unavailable, but the registry retained the
+        // exact host surface generation needed to match this leave.
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
-        assert!(!ctx.active_surface_for_seat.contains_key(&7));
+        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Drop);
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), None);
         assert!(ctx.text_inputs[&40].active_surface.is_none());
         assert!(!ctx.text_inputs[&40].host_activated);
     }
@@ -4700,17 +4552,48 @@ mod tests {
         );
 
         assert!(
-            !ctx.keyboard_active_surfaces.contains_key(&HostId(10)),
+            ctx.keyboard_focus.focus_for_keyboard(HostId(10)).is_none(),
             "a delayed enter must not register a destroyed surface on the keyboard"
         );
         assert!(
-            !ctx.active_surface_for_seat.contains_key(&7),
+            ctx.keyboard_focus.surface_for_seat(7).is_none(),
             "a delayed enter must not revive seat IME focus for a destroyed surface"
         );
     }
 
     #[test]
-    fn unmapped_leave_clears_stale_keyboard_state_when_another_keyboard_is_focused() {
+    fn enter_without_keyboard_route_has_no_extension_side_effects() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let guest_keyboard = 5;
+        let host_keyboard = 10;
+
+        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+        ctx.shadow_table.map_id(20, 30);
+        ctx.host_keyboard_extension_id = Some(HostId(99));
+        ctx.shadow_table.track_host_interface_with_version(
+            99,
+            "zcr_keyboard_extension_v1".to_string(),
+            2,
+        );
+
+        ctx.last_sender_id = host_keyboard;
+        assert_eq!(
+            handler.on_enter(&mut ctx, 1, 30, &[]),
+            Action::Drop,
+            "an enter without a guest keyboard-to-seat route is undeliverable"
+        );
+        assert!(ctx.keyboard_to_extended_keyboard.is_empty());
+        assert!(ctx.extended_keyboard_to_keyboard.is_empty());
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert!(ctx
+            .keyboard_focus
+            .focus_for_keyboard(HostId(host_keyboard))
+            .is_none());
+    }
+
+    #[test]
+    fn new_focus_retires_stale_keyboard_state_before_delayed_leave() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
 
@@ -4721,15 +4604,17 @@ mod tests {
         map_keyboard(&mut ctx, 5, 10, 50, 7);
         map_keyboard(&mut ctx, 6, 11, 51, 7);
         ctx.shadow_table.map_id(20, 30);
-        ctx.active_surface_for_seat.insert(7, 20);
-        ctx.keyboard_active_surfaces.insert(HostId(11), 20);
+        ctx.shadow_table.map_id(21, 31);
+        focus_keyboard(&mut ctx, 10, 7, 21);
         ctx.keyboard_pressed_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
         assert!(ctx.claim_guest_key(HostId(10), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
 
+        ctx.last_sender_id = 11;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 30, &[]), Action::Forward);
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
+        assert_eq!(handler.on_leave(&mut ctx, 2, 999), Action::Drop);
 
         assert!(
             !ctx.keyboard_pressed_keys.contains_key(&HostId(10)),
@@ -4746,10 +4631,10 @@ mod tests {
             "stale keyboard A IME marker must be retired"
         );
         assert!(
-            ctx.keyboard_active_surfaces.get(&HostId(11)) == Some(&20),
+            ctx.keyboard_focus.keyboard_owns_surface(HostId(11), 20),
             "keyboard B's focus must remain active"
         );
-        assert_eq!(ctx.active_surface_for_seat.get(&7), Some(&20));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(7), Some(20));
         assert!(
             !crate::handler::text_input::backspace_pressed_for_seat(&ctx, 7),
             "a dead keyboard must not keep the seat's Backspace fallback armed"

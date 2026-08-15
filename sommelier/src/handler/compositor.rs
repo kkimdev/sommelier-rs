@@ -724,54 +724,16 @@ impl WlSurfaceHandler for CompositorHandler {
         crate::handler::shm::collect_retired_buffers(ctx);
         ctx.viewport_to_wl_surface
             .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-        // A client may destroy the focused surface before the compositor's
-        // delayed wl_keyboard.leave reaches the proxy. Retire the local
-        // text-input focus immediately; otherwise a subsequent commit can
-        // reactivate the host IME against a dead surface.
-        ctx.active_surface_for_seat
-            .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-        let mut text_inputs_to_update = Vec::new();
-        for (guest_text_input_id, state) in ctx.text_inputs.iter_mut() {
-            if state.active_surface == Some(wl_surface_guest_id) {
-                state.active_surface = None;
-                crate::handler::text_input::invalidate_for_keyboard_focus(state);
-                text_inputs_to_update.push(*guest_text_input_id);
-            }
-        }
-        // Surface destruction can race the host's wl_keyboard.leave event.
-        // Emit the mandatory v3 leave now, while the guest surface ID is
-        // still valid. The later host leave is deliberately treated as stale
-        // and must not emit a duplicate event.
-        for guest_text_input_id in &text_inputs_to_update {
-            let mut builder = crate::wire::MessageBuilder::new();
-            builder.write_u32(wl_surface_guest_id);
-            let message = builder.build_message(*guest_text_input_id, 1);
-            ctx.host_to_client_queue.push((message, Vec::new()));
-        }
-        for guest_text_input_id in text_inputs_to_update {
-            crate::handler::text_input::update_host_activation(ctx, guest_text_input_id);
-        }
-        // Do not retain a dead surface as the current focus of an individual
-        // keyboard. A later delayed leave is still allowed to clear the
-        // keyboard's physical state; if the keyboard entered a new surface in
-        // the meantime, on_enter will have installed that newer surface and
-        // the leave path will preserve it.
-        // The delayed host wl_keyboard.leave may be rejected as stale once
-        // the surface enters pending-destroy state. Retire all proxy-owned
-        // physical-key/IME bookkeeping now so a later keyboard or text-input
-        // event cannot synthesize input against this dead surface.
-        let destroyed_keyboard_ids: Vec<_> = ctx
-            .keyboard_active_surfaces
-            .iter()
-            .filter_map(|(keyboard_id, surface_id)| {
-                (*surface_id == wl_surface_guest_id).then_some(*keyboard_id)
-            })
-            .collect();
-        ctx.keyboard_active_surfaces
-            .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
         ctx.keyboard_latest_peek_sequences
-            .retain(|(_, surface_id), _| *surface_id != Some(wl_surface_guest_id));
-        for keyboard_id in destroyed_keyboard_ids {
+            .retain(|(_, surface), _| *surface != Some(wl_surface_guest_id));
+        // Surface destruction can race the host's wl_keyboard.leave event.
+        // Transition the authoritative registry first, then emit the
+        // mandatory v3 leave while the guest surface ID is still valid. A
+        // later host leave matches no live generation and is idempotent.
+        let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
+        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
+        crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
+        for keyboard_id in focus_update.retired_keyboards {
             ctx.keyboard_pressed_keys.remove(&keyboard_id);
             ctx.keyboard_peek_key_presses.remove(&keyboard_id);
             ctx.keyboard_backspace_repeat_cancelled.remove(&keyboard_id);
@@ -1360,6 +1322,40 @@ mod tests {
             .insert(xdg_toplevel_id, wl_surface_guest);
 
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
+    }
+
+    fn active_text_input_state(
+        host_v1_id: u32,
+        guest_seat: u32,
+        active_surface: u32,
+    ) -> crate::state::TextInputState {
+        crate::state::TextInputState {
+            host_v1_id,
+            host_ext_id: None,
+            guest_seat,
+            active_surface: Some(active_surface),
+            pending_enabled: true,
+            committed_enabled: true,
+            enabled_dirty: true,
+            pending_surrounding_text: Some(("한".to_string(), 3, 3)),
+            committed_surrounding_text: Some(("한".to_string(), 3, 3)),
+            surrounding_text_dirty: true,
+            content_hint: 1,
+            content_purpose: 1,
+            committed_content_type: Some((1, 1)),
+            content_type_dirty: true,
+            cursor_rect: Some((1, 2, 3, 4)),
+            cursor_rect_dirty: true,
+            text_change_cause: 1,
+            current_preedit: "한".to_string(),
+            guest_commit_serial: 1,
+            pending_preedit_cursor: Some(1),
+            pending_preedit_selection: Some((0, 1)),
+            pending_deletes: vec![(1, 1)],
+            pending_cursor_position: Some((1, 1)),
+            empty_preedit_repeat_active: true,
+            host_activated: true,
+        }
     }
 
     fn mapped_test_buffer(
@@ -3309,8 +3305,8 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let wl_surface_guest_id = 100u32;
         let host_keyboard_id = crate::state::HostId(700);
-        ctx.keyboard_active_surfaces
-            .insert(host_keyboard_id, wl_surface_guest_id);
+        ctx.keyboard_focus
+            .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, _wl_surface_host);
         ctx.keyboard_pressed_keys
             .insert(host_keyboard_id, [14_u32].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled
@@ -3334,14 +3330,14 @@ mod tests {
             .insert(host_keyboard_id, [14].into_iter().collect());
         ctx.keyboard_latest_peek_sequences
             .insert((1, Some(wl_surface_guest_id)), 1);
-        ctx.keyboard_latest_peek_sequences.insert((1, Some(999)), 2);
+        ctx.keyboard_latest_peek_sequences.insert((2, Some(999)), 2);
         assert!(ctx.claim_guest_key(
             host_keyboard_id,
             14,
             crate::state::GuestKeyOwner::ImeRecovery
         ));
-        ctx.keyboard_active_surfaces
-            .insert(crate::state::HostId(701), 999);
+        ctx.keyboard_focus
+            .set_for_test(crate::state::HostId(701), 2, 999, 1999);
         ctx.last_sender_id = wl_surface_guest_id;
 
         let mut handler = CompositorHandler;
@@ -3350,8 +3346,9 @@ mod tests {
             Action::Drop
         );
         assert!(
-            !ctx.keyboard_active_surfaces
-                .contains_key(&crate::state::HostId(700)),
+            ctx.keyboard_focus
+                .focus_for_keyboard(crate::state::HostId(700))
+                .is_none(),
             "destroying a surface must retire per-keyboard focus"
         );
         assert!(
@@ -3375,13 +3372,15 @@ mod tests {
             "destroying a surface must retire its peek watermark"
         );
         assert_eq!(
-            ctx.keyboard_latest_peek_sequences.get(&(1, Some(999))),
+            ctx.keyboard_latest_peek_sequences.get(&(2, Some(999))),
             Some(&2),
-            "another live surface's watermark must remain intact"
+            "another live seat's watermark must remain intact"
         );
         assert_eq!(
-            ctx.keyboard_active_surfaces.get(&crate::state::HostId(701)),
-            Some(&999),
+            ctx.keyboard_focus
+                .focus_for_keyboard(crate::state::HostId(701))
+                .map(|focus| focus.guest_surface),
+            Some(999),
             "focus for another live surface must remain intact"
         );
     }
@@ -3403,9 +3402,12 @@ mod tests {
         ctx.shadow_table
             .track_interface(guest_keyboard, "wl_keyboard".to_string());
         ctx.keyboard_to_seat.insert(guest_keyboard, 1);
-        ctx.keyboard_active_surfaces
-            .insert(crate::state::HostId(host_keyboard), surface);
-        ctx.active_surface_for_seat.insert(1, surface);
+        ctx.keyboard_focus.set_for_test(
+            crate::state::HostId(host_keyboard),
+            1,
+            surface,
+            _wl_surface_host,
+        );
         ctx.text_inputs.insert(
             text_input,
             crate::state::TextInputState {
@@ -3459,9 +3461,246 @@ mod tests {
         ctx.last_sender_id = host_keyboard;
         assert_eq!(
             WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 1, 200),
-            Action::Forward
+            Action::Drop
         );
         assert_eq!(ctx.host_to_client_queue.len(), 1);
+    }
+
+    #[test]
+    fn wl_surface_destroy_transitions_all_focused_seats_and_preserves_others() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, destroyed_host_surface) = setup_ctx();
+        let destroyed_surface = 100;
+        let live_surface = 101;
+        let live_host_surface = 201;
+        let seats = [(1, 2), (3, 4), (5, 6)];
+        let keyboards = [(800, 900), (801, 901), (802, 902)];
+        let text_inputs = [(700, 701, 702), (710, 711, 712), (720, 721, 722)];
+
+        ctx.shadow_table.map_id(live_surface, live_host_surface);
+        for (guest_seat, host_seat) in seats {
+            ctx.shadow_table.map_id(guest_seat, host_seat);
+            ctx.shadow_table
+                .track_interface(guest_seat, "wl_seat".to_string());
+        }
+        for ((guest_keyboard, host_keyboard), (guest_seat, _)) in keyboards.into_iter().zip(seats) {
+            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            ctx.shadow_table
+                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+            ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        }
+        for (((guest_text_input, host_object, host_v1), (guest_seat, _)), active_surface) in
+            text_inputs.into_iter().zip(seats).zip([
+                destroyed_surface,
+                destroyed_surface,
+                live_surface,
+            ])
+        {
+            ctx.shadow_table.map_id(guest_text_input, host_object);
+            ctx.shadow_table
+                .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
+            ctx.text_inputs.insert(
+                guest_text_input,
+                active_text_input_state(host_v1, guest_seat, active_surface),
+            );
+        }
+
+        ctx.keyboard_focus.set_for_test(
+            crate::state::HostId(900),
+            1,
+            destroyed_surface,
+            destroyed_host_surface,
+        );
+        ctx.keyboard_focus.set_for_test(
+            crate::state::HostId(901),
+            3,
+            destroyed_surface,
+            destroyed_host_surface,
+        );
+        ctx.keyboard_focus.set_for_test(
+            crate::state::HostId(902),
+            5,
+            live_surface,
+            live_host_surface,
+        );
+        for (sequence, (guest_seat, surface)) in [
+            (1, (1, destroyed_surface)),
+            (2, (3, destroyed_surface)),
+            (3, (5, live_surface)),
+        ] {
+            ctx.keyboard_latest_peek_sequences
+                .insert((guest_seat, Some(surface)), sequence);
+        }
+
+        ctx.last_sender_id = destroyed_surface;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+
+        for guest_text_input in [700, 710] {
+            let state = &ctx.text_inputs[&guest_text_input];
+            assert_eq!(state.active_surface, None);
+            assert!(!state.committed_enabled);
+            assert!(!state.host_activated);
+        }
+        let unaffected = &ctx.text_inputs[&720];
+        assert_eq!(unaffected.active_surface, Some(live_surface));
+        assert!(unaffected.committed_enabled);
+        assert!(unaffected.host_activated);
+        assert_eq!(unaffected.current_preedit, "한");
+
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        for guest_text_input in [700, 710] {
+            assert!(ctx.host_to_client_queue.iter().any(|(message, _)| {
+                msg_sender(message) == guest_text_input && msg_opcode(message) == 1
+            }));
+        }
+        assert!(ctx
+            .host_to_client_queue
+            .iter()
+            .all(|(message, _)| msg_sender(message) != 720));
+        for host_v1 in [702, 712] {
+            assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
+                msg_sender(message) == host_v1 && msg_opcode(message) == 1
+            }));
+        }
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .all(|(message, _)| msg_sender(message) != 722));
+        assert!(!ctx
+            .keyboard_latest_peek_sequences
+            .contains_key(&(1, Some(destroyed_surface))));
+        assert!(!ctx
+            .keyboard_latest_peek_sequences
+            .contains_key(&(3, Some(destroyed_surface))));
+        assert_eq!(
+            ctx.keyboard_latest_peek_sequences
+                .get(&(5, Some(live_surface))),
+            Some(&3)
+        );
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(5), Some(live_surface));
+
+        let guest_queue_len = ctx.host_to_client_queue.len();
+        let host_queue_len = ctx.client_to_host_queue.len();
+        let mut keyboard = crate::handler::keyboard::KeyboardHandler::new();
+        for host_keyboard in [900, 901] {
+            ctx.last_sender_id = host_keyboard;
+            assert_eq!(
+                WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 10, destroyed_host_surface,),
+                Action::Drop
+            );
+        }
+        assert_eq!(ctx.host_to_client_queue.len(), guest_queue_len);
+        assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
+    }
+
+    #[test]
+    fn wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let destroyed_surface = 100;
+        let replacement_surface = 101;
+        let replacement_host_surface = 201;
+        let seat_with_replacement = 1;
+        let seat_without_owner = 3;
+        let stale_with_replacement = 700;
+        let healthy_on_replacement = 710;
+        let stale_without_owner = 720;
+
+        for (guest_seat, host_seat) in [(seat_with_replacement, 2), (seat_without_owner, 4)] {
+            ctx.shadow_table.map_id(guest_seat, host_seat);
+            ctx.shadow_table
+                .track_interface(guest_seat, "wl_seat".to_string());
+        }
+        ctx.shadow_table
+            .map_id(replacement_surface, replacement_host_surface);
+        ctx.keyboard_focus.set_for_test(
+            crate::state::HostId(900),
+            seat_with_replacement,
+            replacement_surface,
+            replacement_host_surface,
+        );
+        for (guest_text_input, host_object, state) in [
+            (
+                stale_with_replacement,
+                701,
+                active_text_input_state(702, seat_with_replacement, destroyed_surface),
+            ),
+            (
+                healthy_on_replacement,
+                711,
+                active_text_input_state(712, seat_with_replacement, replacement_surface),
+            ),
+            (
+                stale_without_owner,
+                721,
+                active_text_input_state(722, seat_without_owner, destroyed_surface),
+            ),
+        ] {
+            ctx.shadow_table.map_id(guest_text_input, host_object);
+            ctx.shadow_table
+                .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
+            ctx.text_inputs.insert(guest_text_input, state);
+        }
+        ctx.keyboard_latest_peek_sequences
+            .insert((seat_with_replacement, Some(destroyed_surface)), 1);
+        ctx.keyboard_latest_peek_sequences
+            .insert((seat_with_replacement, Some(replacement_surface)), 2);
+        ctx.keyboard_latest_peek_sequences
+            .insert((seat_without_owner, Some(destroyed_surface)), 3);
+        assert!(
+            ctx.keyboard_focus
+                .surface_for_seat(seat_without_owner)
+                .is_none(),
+            "one stale projection must have no remaining keyboard owner"
+        );
+
+        ctx.last_sender_id = destroyed_surface;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+
+        let repaired = &ctx.text_inputs[&stale_with_replacement];
+        assert_eq!(repaired.active_surface, Some(replacement_surface));
+        assert!(!repaired.committed_enabled);
+        assert!(!repaired.host_activated);
+        assert!(repaired.current_preedit.is_empty());
+
+        let repaired_without_owner = &ctx.text_inputs[&stale_without_owner];
+        assert_eq!(repaired_without_owner.active_surface, None);
+        assert!(!repaired_without_owner.committed_enabled);
+        assert!(!repaired_without_owner.host_activated);
+
+        let healthy = &ctx.text_inputs[&healthy_on_replacement];
+        assert_eq!(healthy.active_surface, Some(replacement_surface));
+        assert!(healthy.committed_enabled);
+        assert!(healthy.host_activated);
+        assert_eq!(healthy.current_preedit, "한");
+
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        assert!(ctx
+            .host_to_client_queue
+            .iter()
+            .all(|(message, _)| { msg_sender(message) != healthy_on_replacement }));
+        for host_text_input in [702, 722] {
+            assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
+                msg_sender(message) == host_text_input && msg_opcode(message) == 1
+            }));
+        }
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .all(|(message, _)| { msg_sender(message) != 712 }));
+        assert!(ctx
+            .keyboard_latest_peek_sequences
+            .keys()
+            .all(|(_, surface)| *surface != Some(destroyed_surface)));
+        assert_eq!(
+            ctx.keyboard_latest_peek_sequences
+                .get(&(seat_with_replacement, Some(replacement_surface))),
+            Some(&2)
+        );
     }
 
     #[test]

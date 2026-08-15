@@ -1002,6 +1002,242 @@ pub enum GuestKeyOwner {
     ImeRecovery,
 }
 
+/// One `wl_keyboard` focus generation.
+///
+/// Keep both object namespaces: the guest surface drives text-input events,
+/// while the host surface identifies delayed `wl_keyboard.leave` events even
+/// after the guest mapping has been retired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyboardFocus {
+    pub guest_seat: u32,
+    pub guest_surface: u32,
+    pub host_surface: u32,
+}
+
+/// One authoritative seat focus transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeatFocusChange {
+    pub guest_seat: u32,
+    pub previous_surface: Option<u32>,
+    pub current_surface: Option<u32>,
+}
+
+/// Result of mutating keyboard focus ownership.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct KeyboardFocusUpdate {
+    /// Whether the event changed focus or consumed one deliverable retired leave.
+    pub accepted: bool,
+    /// Seat transitions that must be projected to text-input objects.
+    pub seat_changes: Vec<SeatFocusChange>,
+    /// Keyboard sessions whose focus-scoped key state is no longer valid.
+    pub retired_keyboards: Vec<HostId>,
+}
+
+/// Canonical keyboard-to-seat/surface focus registry.
+///
+/// Every keyboard on one seat must own the same surface. Entering a different
+/// surface retires older keyboard generations for that seat instead of
+/// retaining a fallback focus that a delayed leave could revive.
+#[derive(Default)]
+pub struct KeyboardFocusRegistry {
+    keyboards: HashMap<HostId, KeyboardFocus>,
+    /// Focus generations superseded by a different keyboard resource.
+    ///
+    /// Their seat focus is no longer authoritative, but the guest resource
+    /// received an enter and still needs exactly one matching leave. A newer
+    /// enter on the same keyboard supersedes its older generation without a
+    /// tombstone because forwarding that delayed leave would clear the newer
+    /// resource focus.
+    retired_guest_enters: HashMap<(HostId, u32), KeyboardFocus>,
+}
+
+impl KeyboardFocusRegistry {
+    pub fn surface_for_seat(&self, guest_seat: u32) -> Option<u32> {
+        self.keyboards
+            .values()
+            .find(|focus| focus.guest_seat == guest_seat)
+            .map(|focus| focus.guest_surface)
+    }
+
+    pub fn focus_for_keyboard(&self, host_keyboard: HostId) -> Option<KeyboardFocus> {
+        self.keyboards.get(&host_keyboard).copied()
+    }
+
+    pub fn keyboard_owns_surface(&self, host_keyboard: HostId, guest_surface: u32) -> bool {
+        self.focus_for_keyboard(host_keyboard)
+            .is_some_and(|focus| focus.guest_surface == guest_surface)
+    }
+
+    #[cfg(test)]
+    pub fn set_for_test(
+        &mut self,
+        host_keyboard: HostId,
+        guest_seat: u32,
+        guest_surface: u32,
+        host_surface: u32,
+    ) {
+        let _ = self.enter(
+            host_keyboard,
+            KeyboardFocus {
+                guest_seat,
+                guest_surface,
+                host_surface,
+            },
+        );
+    }
+
+    pub fn enter(&mut self, host_keyboard: HostId, focus: KeyboardFocus) -> KeyboardFocusUpdate {
+        if self.focus_for_keyboard(host_keyboard) == Some(focus) {
+            return KeyboardFocusUpdate::default();
+        }
+
+        let mut affected_seats = vec![focus.guest_seat];
+        if let Some(previous_focus) = self.focus_for_keyboard(host_keyboard) {
+            affected_seats.push(previous_focus.guest_seat);
+        }
+        affected_seats.sort_unstable();
+        affected_seats.dedup();
+        let previous_surfaces = affected_seats
+            .iter()
+            .map(|&guest_seat| (guest_seat, self.surface_for_seat(guest_seat)))
+            .collect::<Vec<_>>();
+
+        // A newer enter on the same wl_keyboard resource supersedes every
+        // older resource generation. Delayed leaves for those generations
+        // must not become visible after the newer enter.
+        self.retired_guest_enters
+            .retain(|(keyboard, _), _| *keyboard != host_keyboard);
+        let mut retired_keyboards = self
+            .keyboards
+            .iter()
+            .filter_map(|(&keyboard, current)| {
+                (keyboard == host_keyboard
+                    || (current.guest_seat == focus.guest_seat
+                        && current.guest_surface != focus.guest_surface))
+                    .then_some(keyboard)
+            })
+            .collect::<Vec<_>>();
+        retired_keyboards.sort_unstable_by_key(|keyboard| keyboard.0);
+        for keyboard in &retired_keyboards {
+            if let Some(retired_focus) = self.keyboards.remove(keyboard) {
+                if *keyboard != host_keyboard {
+                    self.retired_guest_enters
+                        .insert((*keyboard, retired_focus.host_surface), retired_focus);
+                }
+            }
+        }
+        self.keyboards.insert(host_keyboard, focus);
+
+        let seat_changes = previous_surfaces
+            .into_iter()
+            .filter_map(|(guest_seat, previous_surface)| {
+                let current_surface = self.surface_for_seat(guest_seat);
+                (previous_surface != current_surface).then_some(SeatFocusChange {
+                    guest_seat,
+                    previous_surface,
+                    current_surface,
+                })
+            })
+            .collect();
+        KeyboardFocusUpdate {
+            accepted: true,
+            seat_changes,
+            retired_keyboards,
+        }
+    }
+
+    pub fn leave(&mut self, host_keyboard: HostId, host_surface: u32) -> KeyboardFocusUpdate {
+        let Some(focus) = self.focus_for_keyboard(host_keyboard) else {
+            return if self
+                .retired_guest_enters
+                .remove(&(host_keyboard, host_surface))
+                .is_some()
+            {
+                KeyboardFocusUpdate {
+                    accepted: true,
+                    ..KeyboardFocusUpdate::default()
+                }
+            } else {
+                KeyboardFocusUpdate::default()
+            };
+        };
+        if focus.host_surface != host_surface {
+            return KeyboardFocusUpdate::default();
+        }
+        self.remove_keyboard(host_keyboard, focus)
+    }
+
+    pub fn release(&mut self, host_keyboard: HostId) -> KeyboardFocusUpdate {
+        self.retired_guest_enters
+            .retain(|(keyboard, _), _| *keyboard != host_keyboard);
+        let Some(focus) = self.focus_for_keyboard(host_keyboard) else {
+            return KeyboardFocusUpdate::default();
+        };
+        self.remove_keyboard(host_keyboard, focus)
+    }
+
+    pub fn destroy_surface(&mut self, guest_surface: u32) -> KeyboardFocusUpdate {
+        let mut affected_seats = self
+            .keyboards
+            .values()
+            .filter_map(|focus| (focus.guest_surface == guest_surface).then_some(focus.guest_seat))
+            .collect::<Vec<_>>();
+        affected_seats.sort_unstable();
+        affected_seats.dedup();
+
+        let mut retired_keyboards = self
+            .keyboards
+            .iter()
+            .filter_map(|(&keyboard, focus)| {
+                (focus.guest_surface == guest_surface).then_some(keyboard)
+            })
+            .collect::<Vec<_>>();
+        retired_keyboards.sort_unstable_by_key(|keyboard| keyboard.0);
+        for keyboard in &retired_keyboards {
+            self.keyboards.remove(keyboard);
+        }
+        self.retired_guest_enters
+            .retain(|_, focus| focus.guest_surface != guest_surface);
+
+        let seat_changes = affected_seats
+            .into_iter()
+            .map(|guest_seat| SeatFocusChange {
+                guest_seat,
+                previous_surface: Some(guest_surface),
+                current_surface: self.surface_for_seat(guest_seat),
+            })
+            .collect();
+        KeyboardFocusUpdate {
+            accepted: !retired_keyboards.is_empty(),
+            seat_changes,
+            retired_keyboards,
+        }
+    }
+
+    fn remove_keyboard(
+        &mut self,
+        host_keyboard: HostId,
+        focus: KeyboardFocus,
+    ) -> KeyboardFocusUpdate {
+        let previous_surface = self.surface_for_seat(focus.guest_seat);
+        self.keyboards.remove(&host_keyboard);
+        let current_surface = self.surface_for_seat(focus.guest_seat);
+        let seat_changes = (previous_surface != current_surface)
+            .then_some(SeatFocusChange {
+                guest_seat: focus.guest_seat,
+                previous_surface,
+                current_surface,
+            })
+            .into_iter()
+            .collect();
+        KeyboardFocusUpdate {
+            accepted: true,
+            seat_changes,
+            retired_keyboards: vec![host_keyboard],
+        }
+    }
+}
+
 /// Host-compositor use phase of one render buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderBufferUse {
@@ -1181,12 +1417,7 @@ pub struct Context {
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
-    pub active_surface_for_seat: HashMap<u32, u32>,
-    /// Current guest surface entered by each host keyboard. A seat can expose
-    /// multiple wl_keyboard objects; a leave from one object must not clear
-    /// the seat focus while another object is still entered on the same
-    /// surface.
-    pub keyboard_active_surfaces: HashMap<HostId, u32>,
+    pub keyboard_focus: KeyboardFocusRegistry,
     pub last_sender_id: u32,
     /// Pending messages to send from client→host (e.g. ack_key, bind requests).
     pub client_to_host_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
@@ -1599,8 +1830,7 @@ impl Context {
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),
-            active_surface_for_seat: HashMap::new(),
-            keyboard_active_surfaces: HashMap::new(),
+            keyboard_focus: KeyboardFocusRegistry::default(),
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
@@ -2494,6 +2724,409 @@ mod tests {
                     actual.backing.is_some(),
                     model != RenderBufferLifecycle::HostDestroyQueued
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
+        let keyboard_a = HostId(10);
+        let keyboard_b = HostId(11);
+        let focus_a = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 20,
+            host_surface: 200,
+        };
+        let focus_b = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 21,
+            host_surface: 201,
+        };
+        let mut registry = KeyboardFocusRegistry::default();
+
+        assert_eq!(
+            registry.enter(keyboard_a, focus_a),
+            KeyboardFocusUpdate {
+                accepted: true,
+                seat_changes: vec![SeatFocusChange {
+                    guest_seat: 1,
+                    previous_surface: None,
+                    current_surface: Some(20),
+                }],
+                retired_keyboards: Vec::new(),
+            }
+        );
+        assert_eq!(
+            registry.enter(keyboard_b, focus_b),
+            KeyboardFocusUpdate {
+                accepted: true,
+                seat_changes: vec![SeatFocusChange {
+                    guest_seat: 1,
+                    previous_surface: Some(20),
+                    current_surface: Some(21),
+                }],
+                retired_keyboards: vec![keyboard_a],
+            }
+        );
+        assert_eq!(registry.surface_for_seat(1), Some(21));
+        assert_eq!(
+            registry.leave(keyboard_a, focus_a.host_surface),
+            KeyboardFocusUpdate {
+                accepted: true,
+                ..KeyboardFocusUpdate::default()
+            },
+            "a delayed leave must balance the retired guest enter once"
+        );
+        assert_eq!(
+            registry.leave(keyboard_a, focus_a.host_surface),
+            KeyboardFocusUpdate::default(),
+            "a duplicate delayed leave must be rejected"
+        );
+        assert_eq!(registry.surface_for_seat(1), Some(21));
+    }
+
+    #[test]
+    fn keyboard_focus_registry_rejects_old_leave_after_same_keyboard_reenter() {
+        let keyboard = HostId(10);
+        let focus_a = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 20,
+            host_surface: 200,
+        };
+        let focus_b = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 21,
+            host_surface: 201,
+        };
+        let mut registry = KeyboardFocusRegistry::default();
+
+        registry.enter(keyboard, focus_a);
+        registry.enter(keyboard, focus_b);
+        assert_eq!(
+            registry.leave(keyboard, focus_a.host_surface),
+            KeyboardFocusUpdate::default(),
+            "an old leave on the same resource must not clear its newer enter"
+        );
+        assert_eq!(registry.focus_for_keyboard(keyboard), Some(focus_b));
+    }
+
+    #[test]
+    fn keyboard_focus_registry_release_and_destroy_discard_retired_enters() {
+        let keyboard_a = HostId(10);
+        let keyboard_b = HostId(11);
+        let focus_a = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 20,
+            host_surface: 200,
+        };
+        let focus_b = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 21,
+            host_surface: 201,
+        };
+
+        let mut released = KeyboardFocusRegistry::default();
+        released.enter(keyboard_a, focus_a);
+        released.enter(keyboard_b, focus_b);
+        released.release(keyboard_a);
+        assert_eq!(
+            released.leave(keyboard_a, focus_a.host_surface),
+            KeyboardFocusUpdate::default(),
+            "a released keyboard resource cannot receive a delayed leave"
+        );
+
+        let mut destroyed = KeyboardFocusRegistry::default();
+        destroyed.enter(keyboard_a, focus_a);
+        destroyed.enter(keyboard_b, focus_b);
+        destroyed.destroy_surface(focus_a.guest_surface);
+        assert_eq!(
+            destroyed.leave(keyboard_a, focus_a.host_surface),
+            KeyboardFocusUpdate::default(),
+            "a destroyed guest surface cannot receive a delayed leave"
+        );
+    }
+
+    #[test]
+    fn keyboard_focus_registry_keeps_shared_surface_until_last_owner() {
+        let keyboard_a = HostId(10);
+        let keyboard_b = HostId(11);
+        let focus = KeyboardFocus {
+            guest_seat: 1,
+            guest_surface: 20,
+            host_surface: 200,
+        };
+        let mut registry = KeyboardFocusRegistry::default();
+        registry.enter(keyboard_a, focus);
+        registry.enter(keyboard_b, focus);
+
+        let first_leave = registry.leave(keyboard_a, focus.host_surface);
+        assert!(first_leave.accepted);
+        assert!(first_leave.seat_changes.is_empty());
+        assert_eq!(registry.surface_for_seat(1), Some(20));
+
+        let last_leave = registry.leave(keyboard_b, focus.host_surface);
+        assert_eq!(
+            last_leave.seat_changes,
+            vec![SeatFocusChange {
+                guest_seat: 1,
+                previous_surface: Some(20),
+                current_surface: None,
+            }]
+        );
+        assert_eq!(registry.surface_for_seat(1), None);
+    }
+
+    #[test]
+    fn keyboard_focus_registry_destroys_surface_across_seats_without_fallback() {
+        let mut registry = KeyboardFocusRegistry::default();
+        registry.enter(
+            HostId(10),
+            KeyboardFocus {
+                guest_seat: 1,
+                guest_surface: 20,
+                host_surface: 200,
+            },
+        );
+        registry.enter(
+            HostId(11),
+            KeyboardFocus {
+                guest_seat: 2,
+                guest_surface: 20,
+                host_surface: 200,
+            },
+        );
+        registry.enter(
+            HostId(12),
+            KeyboardFocus {
+                guest_seat: 3,
+                guest_surface: 30,
+                host_surface: 300,
+            },
+        );
+
+        let update = registry.destroy_surface(20);
+        assert_eq!(update.retired_keyboards, vec![HostId(10), HostId(11)]);
+        assert_eq!(
+            update.seat_changes,
+            vec![
+                SeatFocusChange {
+                    guest_seat: 1,
+                    previous_surface: Some(20),
+                    current_surface: None,
+                },
+                SeatFocusChange {
+                    guest_seat: 2,
+                    previous_surface: Some(20),
+                    current_surface: None,
+                },
+            ]
+        );
+        assert_eq!(registry.surface_for_seat(1), None);
+        assert_eq!(registry.surface_for_seat(2), None);
+        assert_eq!(registry.surface_for_seat(3), Some(30));
+    }
+
+    #[test]
+    fn keyboard_focus_registry_preserves_invariants_for_all_short_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            EnterA20,
+            EnterA21,
+            EnterB20,
+            EnterB21,
+            LeaveA20,
+            LeaveA21,
+            LeaveB20,
+            LeaveB21,
+            ReleaseA,
+            ReleaseB,
+            Destroy20,
+            Destroy21,
+        }
+
+        #[derive(Clone, Copy)]
+        enum GuestDelivery {
+            Enter(HostId, KeyboardFocus),
+            Leave(HostId, u32),
+            Release(HostId),
+            Destroy(u32),
+        }
+
+        let operations = [
+            Operation::EnterA20,
+            Operation::EnterA21,
+            Operation::EnterB20,
+            Operation::EnterB21,
+            Operation::LeaveA20,
+            Operation::LeaveA21,
+            Operation::LeaveB20,
+            Operation::LeaveB21,
+            Operation::ReleaseA,
+            Operation::ReleaseB,
+            Operation::Destroy20,
+            Operation::Destroy21,
+        ];
+        let sequence_len = 5;
+        let sequence_count = operations.len().pow(sequence_len);
+
+        for mut encoded in 0..sequence_count {
+            let mut registry = KeyboardFocusRegistry::default();
+            // Model the focus currently visible to each guest wl_keyboard
+            // resource. A newer enter on the same resource supersedes its
+            // previous surface; active and retired registry generations must
+            // account for this model exactly.
+            let mut guest_focus = HashMap::new();
+            for _ in 0..sequence_len {
+                let (update, delivery) = match operations[encoded % operations.len()] {
+                    Operation::EnterA20 => {
+                        let focus = KeyboardFocus {
+                            guest_seat: 1,
+                            guest_surface: 20,
+                            host_surface: 200,
+                        };
+                        (
+                            registry.enter(HostId(10), focus),
+                            GuestDelivery::Enter(HostId(10), focus),
+                        )
+                    }
+                    Operation::EnterA21 => {
+                        let focus = KeyboardFocus {
+                            guest_seat: 1,
+                            guest_surface: 21,
+                            host_surface: 201,
+                        };
+                        (
+                            registry.enter(HostId(10), focus),
+                            GuestDelivery::Enter(HostId(10), focus),
+                        )
+                    }
+                    Operation::EnterB20 => {
+                        let focus = KeyboardFocus {
+                            guest_seat: 1,
+                            guest_surface: 20,
+                            host_surface: 200,
+                        };
+                        (
+                            registry.enter(HostId(11), focus),
+                            GuestDelivery::Enter(HostId(11), focus),
+                        )
+                    }
+                    Operation::EnterB21 => {
+                        let focus = KeyboardFocus {
+                            guest_seat: 1,
+                            guest_surface: 21,
+                            host_surface: 201,
+                        };
+                        (
+                            registry.enter(HostId(11), focus),
+                            GuestDelivery::Enter(HostId(11), focus),
+                        )
+                    }
+                    Operation::LeaveA20 => (
+                        registry.leave(HostId(10), 200),
+                        GuestDelivery::Leave(HostId(10), 200),
+                    ),
+                    Operation::LeaveA21 => (
+                        registry.leave(HostId(10), 201),
+                        GuestDelivery::Leave(HostId(10), 201),
+                    ),
+                    Operation::LeaveB20 => (
+                        registry.leave(HostId(11), 200),
+                        GuestDelivery::Leave(HostId(11), 200),
+                    ),
+                    Operation::LeaveB21 => (
+                        registry.leave(HostId(11), 201),
+                        GuestDelivery::Leave(HostId(11), 201),
+                    ),
+                    Operation::ReleaseA => (
+                        registry.release(HostId(10)),
+                        GuestDelivery::Release(HostId(10)),
+                    ),
+                    Operation::ReleaseB => (
+                        registry.release(HostId(11)),
+                        GuestDelivery::Release(HostId(11)),
+                    ),
+                    Operation::Destroy20 => {
+                        (registry.destroy_surface(20), GuestDelivery::Destroy(20))
+                    }
+                    Operation::Destroy21 => {
+                        (registry.destroy_surface(21), GuestDelivery::Destroy(21))
+                    }
+                };
+                encoded /= operations.len();
+
+                match delivery {
+                    GuestDelivery::Enter(keyboard, focus) => {
+                        if update.accepted {
+                            guest_focus.insert(keyboard, focus);
+                        }
+                    }
+                    GuestDelivery::Leave(keyboard, host_surface) => {
+                        if update.accepted {
+                            assert_eq!(
+                                guest_focus.get(&keyboard).map(|focus| focus.host_surface),
+                                Some(host_surface),
+                                "only a guest-visible enter can accept a leave"
+                            );
+                            guest_focus.remove(&keyboard);
+                        }
+                    }
+                    GuestDelivery::Release(keyboard) => {
+                        guest_focus.remove(&keyboard);
+                    }
+                    GuestDelivery::Destroy(surface) => {
+                        guest_focus.retain(|_, focus| focus.guest_surface != surface);
+                    }
+                }
+
+                for change in &update.seat_changes {
+                    assert_ne!(change.previous_surface, change.current_surface);
+                    assert_eq!(
+                        registry.surface_for_seat(change.guest_seat),
+                        change.current_surface
+                    );
+                }
+                for left in registry.keyboards.values() {
+                    for right in registry.keyboards.values() {
+                        if left.guest_seat == right.guest_seat {
+                            assert_eq!(
+                                left.guest_surface, right.guest_surface,
+                                "one seat must never retain competing surface generations"
+                            );
+                        }
+                    }
+                }
+                for (&(keyboard, host_surface), retired) in &registry.retired_guest_enters {
+                    assert_eq!(retired.host_surface, host_surface);
+                    assert!(
+                        !registry.keyboards.contains_key(&keyboard),
+                        "one keyboard cannot have active and retired guest enters"
+                    );
+                    assert_eq!(
+                        registry
+                            .retired_guest_enters
+                            .keys()
+                            .filter(|(candidate, _)| *candidate == keyboard)
+                            .count(),
+                        1,
+                        "one keyboard can have at most one deliverable retired leave"
+                    );
+                }
+                assert_eq!(
+                    guest_focus.len(),
+                    registry.keyboards.len() + registry.retired_guest_enters.len(),
+                    "every guest-visible focus must be active or await one retired leave"
+                );
+                for (&keyboard, &focus) in &guest_focus {
+                    assert!(
+                        registry.focus_for_keyboard(keyboard) == Some(focus)
+                            || registry
+                                .retired_guest_enters
+                                .get(&(keyboard, focus.host_surface))
+                                == Some(&focus),
+                        "the registry must account for the guest resource's current focus"
+                    );
+                }
             }
         }
     }

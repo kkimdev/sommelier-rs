@@ -65,19 +65,19 @@ mod tests {
         ctx.shadow_table
             .track_interface(guest_keyboard, "wl_keyboard".to_string());
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.active_surface_for_seat.insert(guest_seat, 40);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), 40);
+        ctx.keyboard_focus
+            .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
         ctx.keyboard_pressed_keys
             .insert(HostId(host_keyboard), [14].into_iter().collect());
         ctx.last_sender_id = guest_seat;
 
         assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
-        assert_eq!(ctx.active_surface_for_seat.get(&guest_seat), Some(&40));
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(guest_seat), Some(40));
         assert_eq!(ctx.keyboard_to_seat.get(&guest_keyboard), Some(&guest_seat));
         assert!(ctx
-            .keyboard_active_surfaces
-            .contains_key(&HostId(host_keyboard)));
+            .keyboard_focus
+            .focus_for_keyboard(HostId(host_keyboard))
+            .is_some());
         assert!(ctx
             .keyboard_pressed_keys
             .contains_key(&HostId(host_keyboard)));
@@ -111,10 +111,12 @@ mod tests {
             1,
         );
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(host_keyboard), guest_surface);
-        ctx.active_surface_for_seat
-            .insert(guest_seat, guest_surface);
+        ctx.keyboard_focus.set_for_test(
+            HostId(host_keyboard),
+            guest_seat,
+            guest_surface,
+            host_surface,
+        );
         ctx.text_inputs.insert(
             guest_text_input,
             TextInputState {

@@ -21,7 +21,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, GuestKeyOwner, HostId};
+use crate::state::{Context, GuestId, GuestKeyOwner, HostId, SeatFocusChange};
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
@@ -274,7 +274,7 @@ struct HeldRepeatKey {
 /// generation, preferring the keyboard focused on the seat's current surface,
 /// then validate that exact generation without falling back to an older key.
 fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeatKey> {
-    let active_surface = ctx.active_surface_for_seat.get(&guest_seat).copied();
+    let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat);
     let mut candidates = Vec::new();
 
     for (&guest_keyboard_id, &seat) in &ctx.keyboard_to_seat {
@@ -285,7 +285,8 @@ fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeat
             continue;
         };
         let focused = active_surface.is_some_and(|surface| {
-            ctx.keyboard_active_surfaces.get(&host_keyboard_id) == Some(&surface)
+            ctx.keyboard_focus
+                .keyboard_owns_surface(host_keyboard_id, surface)
         });
         let Some(peek_keys) = ctx.keyboard_peek_key_presses.get(&host_keyboard_id) else {
             continue;
@@ -378,10 +379,11 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
     // through the wl_keyboard whose surface owns the seat's current focus.
     // With multiple keyboard objects on one seat, choosing solely by guest ID
     // can route text to a stale keyboard (and therefore to the wrong client).
-    let active_surface = ctx.active_surface_for_seat.get(&guest_seat).copied();
+    let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat);
     let is_focused = |(_, host_keyboard_id): &(u32, HostId)| {
         active_surface.is_some_and(|surface| {
-            ctx.keyboard_active_surfaces.get(host_keyboard_id) == Some(&surface)
+            ctx.keyboard_focus
+                .keyboard_owns_surface(*host_keyboard_id, surface)
         })
     };
 
@@ -1389,7 +1391,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             );
         }
 
-        let active_surface = ctx.active_surface_for_seat.get(&seat).copied();
+        let active_surface = ctx.keyboard_focus.surface_for_seat(seat);
 
         ctx.text_inputs.insert(
             id,
@@ -1546,6 +1548,93 @@ pub(crate) fn invalidate_for_keyboard_focus(state: &mut crate::state::TextInputS
     state.pending_deletes.clear();
     state.pending_cursor_position = None;
     state.empty_preedit_repeat_active = false;
+}
+
+/// Project authoritative seat focus changes onto every text-input object.
+///
+/// Keeping seat-wide repeat teardown here and delegating per-object mutation
+/// to the shared update path prevents handlers from implementing subtly
+/// different focus boundaries.
+pub(crate) fn apply_keyboard_focus_changes(ctx: &mut Context, changes: &[SeatFocusChange]) {
+    for change in changes {
+        if change.previous_surface == change.current_surface {
+            continue;
+        }
+
+        ctx.keyboard_latest_peek_sequences
+            .retain(|(guest_seat, _), _| *guest_seat != change.guest_seat);
+        end_backspace_repeat_for_seat(ctx, change.guest_seat);
+        let updates = ctx
+            .text_inputs
+            .iter()
+            .filter_map(|(&guest_text_input_id, state)| {
+                (state.guest_seat == change.guest_seat)
+                    .then_some((guest_text_input_id, change.current_surface))
+            })
+            .collect::<Vec<_>>();
+        apply_text_input_focus_updates(ctx, &updates);
+    }
+}
+
+/// Repair text inputs that still reference a surface after its keyboard
+/// generation was retired.
+///
+/// This is intentionally object-scoped. Treating one stale projection as a
+/// new seat transition would invalidate healthy text inputs that already
+/// track the registry's current surface.
+pub(crate) fn repair_destroyed_surface_focus(ctx: &mut Context, destroyed_surface: u32) {
+    let updates = ctx
+        .text_inputs
+        .iter()
+        .filter_map(|(&guest_text_input_id, state)| {
+            (state.active_surface == Some(destroyed_surface)).then_some((
+                guest_text_input_id,
+                ctx.keyboard_focus.surface_for_seat(state.guest_seat),
+            ))
+        })
+        .collect::<Vec<_>>();
+    apply_text_input_focus_updates(ctx, &updates);
+}
+
+/// Apply focused-surface targets to selected text-input objects atomically.
+///
+/// Both authoritative seat transitions and lifecycle recovery use this path,
+/// so editor invalidation, guest events, and host-v1 activation cannot drift.
+fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32>)]) {
+    let mut events = Vec::new();
+    let mut text_inputs_to_update = Vec::new();
+    for &(guest_text_input_id, current_surface) in updates {
+        let Some(state) = ctx.text_inputs.get_mut(&guest_text_input_id) else {
+            continue;
+        };
+
+        let previous_surface = state.active_surface;
+        invalidate_for_keyboard_focus(state);
+        state.active_surface = current_surface;
+
+        // A stale local projection can already equal the authoritative target
+        // even though the seat crossed a real focus boundary. Always
+        // invalidate and reconcile host activation, but do not fabricate
+        // duplicate guest leave/enter events in that case.
+        if previous_surface != current_surface {
+            if let Some(surface) = previous_surface {
+                let mut builder = MessageBuilder::new();
+                builder.write_u32(surface);
+                events.push((builder.build_message(guest_text_input_id, 1), Vec::new()));
+            }
+            if let Some(surface) = current_surface {
+                let mut builder = MessageBuilder::new();
+                builder.write_u32(surface);
+                events.push((builder.build_message(guest_text_input_id, 0), Vec::new()));
+            }
+        }
+        text_inputs_to_update.push(guest_text_input_id);
+    }
+
+    ctx.host_to_client_queue.extend(events);
+    for guest_text_input_id in text_inputs_to_update {
+        update_host_activation(ctx, guest_text_input_id);
+    }
 }
 
 /// Text-input-v3 requests are ignored while the object is not entered on a
@@ -2023,6 +2112,16 @@ mod tests {
     /// Helper: extract sender_id from a wire message.
     fn msg_sender(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
         u32::from_ne_bytes(queue[idx].0[0..4].try_into().unwrap())
+    }
+
+    fn set_test_focus(
+        ctx: &mut Context,
+        host_keyboard: HostId,
+        guest_seat: u32,
+        guest_surface: u32,
+    ) {
+        ctx.keyboard_focus
+            .set_for_test(host_keyboard, guest_seat, guest_surface, guest_surface);
     }
 
     #[test]
@@ -2912,11 +3011,7 @@ mod tests {
             ctx.shadow_table.map_id(guest_keyboard, host_keyboard.0);
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
-        ctx.active_surface_for_seat.insert(0, 900);
-        ctx.keyboard_active_surfaces
-            .insert(focused_host_keyboard, 900);
-        ctx.keyboard_active_surfaces
-            .insert(stale_host_keyboard, 901);
+        set_test_focus(&mut ctx, focused_host_keyboard, 0, 900);
         hold_repeatable_peek_key(&mut ctx, focused_host_keyboard, 57, 700, 100);
         hold_repeatable_peek_key(&mut ctx, stale_host_keyboard, 28, 701, 101);
         ctx.last_sender_id = 30;
@@ -2939,9 +3034,7 @@ mod tests {
         let stale_host_keyboard = HostId(41);
         ctx.shadow_table.map_id(40, stale_host_keyboard.0);
         ctx.keyboard_to_seat.insert(40, 0);
-        ctx.active_surface_for_seat.insert(0, 900);
-        ctx.keyboard_active_surfaces
-            .insert(stale_host_keyboard, 901);
+        set_test_focus(&mut ctx, HostId(99), 0, 900);
         hold_repeatable_peek_key(&mut ctx, stale_host_keyboard, 57, 700, 100);
         ctx.last_sender_id = 30;
 
@@ -3577,7 +3670,7 @@ mod tests {
     fn text_input_creation_works_without_optional_chromeos_extension() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.host_text_input_manager_v1_id = Some(50);
-        ctx.active_surface_for_seat.insert(7, 99);
+        set_test_focus(&mut ctx, HostId(70), 7, 99);
         let mut handler = TextInputManagerV3Handler;
 
         assert_eq!(handler.on_get_text_input(&mut ctx, 20, 7), Action::Drop);
@@ -3878,7 +3971,6 @@ mod tests {
         let stale_host_keyboard = 101;
         let focused_host_keyboard = 201;
         let current_surface = 300;
-        let old_surface = 301;
 
         for (guest_keyboard, host_keyboard) in [
             (stale_guest_keyboard, stale_host_keyboard),
@@ -3889,11 +3981,7 @@ mod tests {
                 .track_interface(guest_keyboard, "wl_keyboard".to_string());
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
-        ctx.active_surface_for_seat.insert(0, current_surface);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(stale_host_keyboard), old_surface);
-        ctx.keyboard_active_surfaces
-            .insert(HostId(focused_host_keyboard), current_surface);
+        set_test_focus(&mut ctx, HostId(focused_host_keyboard), 0, current_surface);
         ctx.last_sender_id = host_v1_id;
 
         let mut handler = TextInputV1Handler;
