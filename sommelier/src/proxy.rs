@@ -1236,6 +1236,7 @@ mod tests {
         const HOST_EXTENDED_TEXT_INPUT: u32 = 2_000;
         const GUEST_SEAT: u32 = 1;
         const GUEST_SURFACE: u32 = 900;
+        const KEY_BACKSPACE: u32 = 14;
         const KEY_SPACE: u32 = 57;
         const KEY_RELEASED: u32 = 0;
         const KEY_PRESSED: u32 = 1;
@@ -1291,7 +1292,7 @@ mod tests {
         ctx.keyboard_repeatable_keys
             .entry(HostId(HOST_KEYBOARD))
             .or_default()
-            .insert(KEY_SPACE);
+            .extend([KEY_BACKSPACE, KEY_SPACE]);
         ctx.keyboard_focus.set_for_test(
             HostId(HOST_KEYBOARD),
             GUEST_SEAT,
@@ -1382,6 +1383,35 @@ mod tests {
             commit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_COMMIT_STRING),
         );
 
+        // Exercise the real overlap that previously stopped held-Space after
+        // its first Korean commit: the text-input channel emits a balanced
+        // pair before the matching wl_keyboard press arrives.
+        for state in [KEY_PRESSED, KEY_RELEASED] {
+            let mut keysym = MessageBuilder::new();
+            keysym.write_u32(if state == KEY_PRESSED { 1_234 } else { 1_235 });
+            keysym.write_u32(if state == KEY_PRESSED { 700 } else { 701 });
+            keysym.write_u32(xkbcommon::xkb::keysyms::KEY_space);
+            keysym.write_u32(state);
+            keysym.write_u32(0);
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v1",
+                keysym.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_KEYSYM),
+            );
+        }
+        let mut delayed_key_press = MessageBuilder::new();
+        delayed_key_press.write_u32(700);
+        delayed_key_press.write_u32(1_234);
+        delayed_key_press.write_u32(KEY_SPACE);
+        delayed_key_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            delayed_key_press.build_message(HOST_KEYBOARD, wl_keyboard::EVT_KEY),
+        );
+
         let initial_commits: Vec<_> = ctx
             .host_to_client_queue
             .iter()
@@ -1403,6 +1433,16 @@ mod tests {
         );
         assert_eq!(initial_commit.read_string().unwrap(), "가 ");
         assert!(initial_commit.is_payload_consumed());
+        assert_eq!(
+            ctx.host_to_client_queue
+                .iter()
+                .filter(|message| {
+                    sender(message) == GUEST_KEYBOARD && opcode(message) == wl_keyboard::EVT_KEY
+                })
+                .count(),
+            2,
+            "delayed physical delivery must not duplicate the balanced keysym pair"
+        );
 
         ctx.host_to_client_queue.clear();
         for _ in 0..3 {
@@ -1549,11 +1589,159 @@ mod tests {
             ),
         );
         assert!(!ctx
-            .keyboard_pressed_keys
-            .contains_key(&HostId(HOST_KEYBOARD)));
-        assert!(!ctx
-            .keyboard_peek_key_presses
-            .contains_key(&HostId(HOST_KEYBOARD)));
+            .key_generations
+            .physically_held(HostId(HOST_KEYBOARD), KEY_SPACE));
+        assert!(ctx
+            .key_generations
+            .peek(HostId(HOST_KEYBOARD), KEY_SPACE)
+            .is_none());
+
+        // Replay the Backspace variant through raw protocol dispatch as well.
+        // This covers Korean preedit clearing, delayed duplicate channels,
+        // release cleanup, and a fresh second hold.
+        let mut backspace_press = MessageBuilder::new();
+        backspace_press.write_u32(800);
+        backspace_press.write_u32(1_600);
+        backspace_press.write_u32(KEY_BACKSPACE);
+        backspace_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            backspace_press.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+        for preedit_text in ["가", ""] {
+            let mut backspace_preedit = MessageBuilder::new();
+            backspace_preedit.write_u32(3);
+            backspace_preedit.write_string(preedit_text);
+            backspace_preedit.write_string("");
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v1",
+                backspace_preedit
+                    .build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_PREEDIT_STRING),
+            );
+        }
+        ctx.host_to_client_queue.clear();
+        for _ in 0..2 {
+            let mut confirm = MessageBuilder::new();
+            confirm.write_u32(1);
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zcr_extended_text_input_v1",
+                confirm.build_message(
+                    HOST_EXTENDED_TEXT_INPUT,
+                    zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+                ),
+            );
+        }
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            6,
+            "held Backspace must emit two balanced repeat transactions"
+        );
+
+        for state in [KEY_PRESSED, KEY_RELEASED] {
+            let mut keysym = MessageBuilder::new();
+            keysym.write_u32(if state == KEY_PRESSED { 1_600 } else { 1_601 });
+            keysym.write_u32(if state == KEY_PRESSED { 800 } else { 801 });
+            keysym.write_u32(xkbcommon::xkb::keysyms::KEY_BackSpace);
+            keysym.write_u32(state);
+            keysym.write_u32(0);
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v1",
+                keysym.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_KEYSYM),
+            );
+        }
+        let mut delayed_backspace_press = MessageBuilder::new();
+        delayed_backspace_press.write_u32(800);
+        delayed_backspace_press.write_u32(1_600);
+        delayed_backspace_press.write_u32(KEY_BACKSPACE);
+        delayed_backspace_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            delayed_backspace_press.build_message(HOST_KEYBOARD, wl_keyboard::EVT_KEY),
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            6,
+            "delayed Backspace channels must not duplicate recovered pairs"
+        );
+
+        ctx.host_to_client_queue.clear();
+        for interface in ["zcr_extended_keyboard_v1", "wl_keyboard"] {
+            let mut release = MessageBuilder::new();
+            release.write_u32(801);
+            release.write_u32(1_700);
+            release.write_u32(KEY_BACKSPACE);
+            release.write_u32(KEY_RELEASED);
+            let (sender_id, event) = if interface == "zcr_extended_keyboard_v1" {
+                (
+                    HOST_EXTENDED_KEYBOARD,
+                    zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+                )
+            } else {
+                (HOST_KEYBOARD, wl_keyboard::EVT_KEY)
+            };
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                interface,
+                release.build_message(sender_id, event),
+            );
+        }
+        let mut post_release_confirm = MessageBuilder::new();
+        post_release_confirm.write_u32(1);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            post_release_confirm.build_message(
+                HOST_EXTENDED_TEXT_INPUT,
+                zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+            ),
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        let mut second_backspace_press = MessageBuilder::new();
+        second_backspace_press.write_u32(810);
+        second_backspace_press.write_u32(1_800);
+        second_backspace_press.write_u32(KEY_BACKSPACE);
+        second_backspace_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            second_backspace_press.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+        let mut second_backspace_confirm = MessageBuilder::new();
+        second_backspace_confirm.write_u32(1);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            second_backspace_confirm.build_message(
+                HOST_EXTENDED_TEXT_INPUT,
+                zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+            ),
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            3,
+            "the second Backspace hold must start a fresh repeat generation"
+        );
     }
 
     #[test]

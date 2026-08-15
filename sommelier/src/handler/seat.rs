@@ -67,8 +67,8 @@ mod tests {
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         ctx.keyboard_focus
             .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
-        ctx.keyboard_pressed_keys
-            .insert(HostId(host_keyboard), [14].into_iter().collect());
+        ctx.key_generations
+            .observe_physical_state(HostId(host_keyboard), 14, 1);
         ctx.last_sender_id = guest_seat;
 
         assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
@@ -79,8 +79,8 @@ mod tests {
             .focus_for_keyboard(HostId(host_keyboard))
             .is_some());
         assert!(ctx
-            .keyboard_pressed_keys
-            .contains_key(&HostId(host_keyboard)));
+            .key_generations
+            .physically_held(HostId(host_keyboard), 14));
     }
 
     #[test]

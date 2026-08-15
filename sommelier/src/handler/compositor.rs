@@ -730,10 +730,7 @@ impl WlSurfaceHandler for CompositorHandler {
         crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
         crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
         for keyboard_id in focus_update.retired_keyboards {
-            ctx.keyboard_pressed_keys.remove(&keyboard_id);
-            ctx.keyboard_peek_key_presses.remove(&keyboard_id);
-            ctx.keyboard_backspace_repeat_cancelled.remove(&keyboard_id);
-            ctx.clear_guest_keys(keyboard_id);
+            ctx.key_generations.clear_keyboard(keyboard_id);
         }
         // xdg objects are separate guest objects, but both maps resolve back
         // to this wl_surface. Remove stale links now so a later client ID
@@ -3301,35 +3298,28 @@ mod tests {
         let host_keyboard_id = crate::state::HostId(700);
         ctx.keyboard_focus
             .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, _wl_surface_host);
-        ctx.keyboard_pressed_keys
-            .insert(host_keyboard_id, [14_u32].into_iter().collect());
-        ctx.keyboard_backspace_repeat_cancelled
-            .insert(host_keyboard_id);
-        ctx.keyboard_peek_key_presses.insert(
-            host_keyboard_id,
-            [(
-                14,
-                crate::state::PeekKeyPress {
-                    serial: 1,
-                    time: 123,
-                    sequence: 1,
-                    held: true,
-                    eligible: true,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        );
+        let sequence = ctx
+            .key_generations
+            .observe_peek_press(host_keyboard_id, 14, 1, 123, true);
+        ctx.key_generations
+            .cancel_backspace_repeat(host_keyboard_id, 14);
         ctx.keyboard_repeatable_keys
             .insert(host_keyboard_id, [14].into_iter().collect());
         ctx.keyboard_latest_peek_sequences
-            .insert((1, Some(wl_surface_guest_id)), 1);
+            .insert((1, Some(wl_surface_guest_id)), sequence);
         ctx.keyboard_latest_peek_sequences.insert((2, Some(999)), 2);
         assert!(ctx.claim_guest_key(
             host_keyboard_id,
             14,
             crate::state::GuestKeyOwner::ImeRecovery
         ));
+        assert!(ctx
+            .key_generations
+            .claim_text_input_owner(host_keyboard_id, 30, 1));
+        ctx.key_generations
+            .observe_physical_state(host_keyboard_id, 30, 0);
+        ctx.key_generations
+            .observe_physical_state(host_keyboard_id, 30, 1);
         ctx.keyboard_focus
             .set_for_test(crate::state::HostId(701), 2, 999, 1999);
         ctx.last_sender_id = wl_surface_guest_id;
@@ -3346,15 +3336,18 @@ mod tests {
             "destroying a surface must retire per-keyboard focus"
         );
         assert!(
-            !ctx.keyboard_pressed_keys.contains_key(&host_keyboard_id)
+            !ctx.key_generations.physically_held(host_keyboard_id, 14)
                 && !ctx
-                    .keyboard_backspace_repeat_cancelled
-                    .contains(&host_keyboard_id)
-                && !ctx
-                    .keyboard_peek_key_presses
-                    .contains_key(&host_keyboard_id)
+                    .key_generations
+                    .backspace_repeat_cancelled(host_keyboard_id, 14)
+                && ctx.key_generations.peek(host_keyboard_id, 14).is_none()
                 && ctx.guest_key_owner(host_keyboard_id, 14).is_none(),
             "destroying a surface must retire all per-keyboard input state"
+        );
+        assert!(
+            !ctx.key_generations
+                .take_pending_text_input_release(host_keyboard_id, 30, 2),
+            "surface destruction must discard retired guest releases"
         );
         assert!(
             ctx.keyboard_repeatable_keys.contains_key(&host_keyboard_id),
