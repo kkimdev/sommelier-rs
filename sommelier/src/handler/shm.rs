@@ -1084,6 +1084,41 @@ fn unmap_destination(ptr: *mut u8, size: usize) {
     }
 }
 
+/// Report a resource failure while creating a `wl_buffer`.
+///
+/// `create_buffer` carries a client supplied `new_id`; silently dropping the
+/// request leaves the client believing that the ID was created while the
+/// proxy has no object to service it.  Wayland errors terminate the connection,
+/// which is the only safe outcome once allocation or host request construction
+/// has failed.
+fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'static str) {
+    queue_protocol_error(ctx, object_id, 2, message);
+}
+
+/// Undo the guest mapping after a host `wl_buffer` has already been queued.
+///
+/// The host stream is ordered, so queueing `wl_buffer.destroy` after the
+/// create requests retires the host object even though no local
+/// `BufferState` was registered.  Keep the host numeric ID reserved until its
+/// `delete_id` acknowledgement; otherwise a subsequent allocation could route
+/// a late release to an unrelated object.
+fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
+    if ctx.shadow_table.get_host_id(guest_id) != Some(host_id) {
+        return;
+    }
+    let queued_destroy = queue_host_buffer_destroy(ctx, host_id);
+    ctx.shadow_table.remove_guest_mapping(guest_id);
+    if queued_destroy {
+        if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
+            ctx.fatal_protocol_error = true;
+        }
+    } else {
+        // The connection is already fatal when the fixed-size destroy could
+        // not be queued, so no host object can safely remain addressable.
+        ctx.shadow_table.remove_host_interface(host_id);
+    }
+}
+
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) -> bool {
     let queued = queue_message(
         &mut ctx.client_to_host_queue,
@@ -1418,6 +1453,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             Ok(inner) => inner.size,
             Err(_) => {
                 warn!("Cannot inspect SHM pool {}", pool_id);
+                queue_buffer_creation_error(ctx, pool_id, "unable to inspect wl_shm pool");
                 return Action::Drop;
             }
         };
@@ -1475,6 +1511,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         "Rejecting SHM buffer size {}: VirtWL allocation size exceeds u32",
                         buffer_size
                     );
+                    queue_buffer_creation_error(ctx, pool_id, "wl_shm buffer backing is too large");
                     return Action::Drop;
                 };
                 let (fd, _alloc_size) = match channel.allocate(allocation_size) {
@@ -1483,6 +1520,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         error!(
                             "Failed to allocate VirtWayland shared-memory buffer: {}",
                             error
+                        );
+                        queue_buffer_creation_error(
+                            ctx,
+                            pool_id,
+                            "unable to allocate wl_shm buffer backing",
                         );
                         return Action::Drop;
                     }
@@ -1521,6 +1563,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         "No VirtWL shared-memory channel is available; \
                          refusing to send a GBM PRIME fd as wl_shm"
                     );
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to allocate wl_shm buffer backing",
+                    );
                     return Action::Drop;
                 }
                 allocation = Some(
@@ -1538,12 +1585,22 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         }
                         Err(error) => {
                             error!("Failed to allocate GBM dma-buf: {}", error);
+                            queue_buffer_creation_error(
+                                ctx,
+                                pool_id,
+                                "unable to allocate wl_shm buffer backing",
+                            );
                             return Action::Drop;
                         }
                     },
                 );
             } else {
                 error!("No VirtWL or GBM allocator is available");
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to allocate wl_shm buffer backing",
+                );
                 return Action::Drop;
             }
         }
@@ -1564,12 +1621,22 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         if direct_dmabuf {
             let Some(host_dmabuf_id) = ctx.host_dmabuf_id else {
                 error!("GPU allocation succeeded without an internal dmabuf object");
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "wl_shm dma-buf allocator is unavailable",
+                );
                 return Action::Drop;
             };
             let host_plane1_offset = match (blob_offset as usize).checked_add(plane1_offset) {
                 Some(offset) => offset,
                 None => {
                     error!("VirtWL dma-buf plane-1 offset overflows usize");
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "invalid wl_shm dma-buf plane metadata",
+                    );
                     return Action::Drop;
                 }
             };
@@ -1577,6 +1644,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 Ok(offset) => offset,
                 Err(_) => {
                     error!("VirtWL dma-buf plane-1 offset overflows u32");
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "invalid wl_shm dma-buf plane metadata",
+                    );
                     return Action::Drop;
                 }
             };
@@ -1584,6 +1656,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 Ok(stride) => stride,
                 Err(_) => {
                     error!("VirtWL dma-buf plane-1 stride overflows u32");
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "invalid wl_shm dma-buf plane metadata",
+                    );
                     return Action::Drop;
                 }
             };
@@ -1591,6 +1668,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 && (plane1_stride == 0 || host_plane1_offset < blob_offset as usize)
             {
                 error!("VirtWL dma-buf returned invalid NV12 plane-1 metadata");
+                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
                 return Action::Drop;
             }
             let layout = DmabufLayout {
@@ -1606,6 +1684,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         "dma-buf cannot be safely mmaped (offset={}, size={})",
                         blob_offset, total_size
                     );
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to map wl_shm dma-buf backing",
+                    );
                     return Action::Drop;
                 };
                 (ptr, size)
@@ -1617,6 +1700,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 // commit defer forever without ever updating UV.
                 let Some(mapped) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
                     error!("GBM NV12 dma-buf cannot be safely mmaped");
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to map wl_shm dma-buf backing",
+                    );
                     return Action::Drop;
                 };
                 mapped
@@ -1641,6 +1729,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 Vec::new(),
             ) {
                 cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to queue wl_shm dma-buf parameters",
+                );
                 return Action::Drop;
             }
             params_queued = true;
@@ -1655,6 +1748,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         params_queued,
                         dest_ptr,
                         dest_size,
+                    );
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to duplicate wl_shm dma-buf backing",
                     );
                     return Action::Drop;
                 }
@@ -1673,6 +1771,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 vec![fd_to_send],
             ) {
                 cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                queue_buffer_creation_error(ctx, pool_id, "unable to queue wl_shm dma-buf plane");
                 return Action::Drop;
             }
             if format == WL_SHM_FORMAT_NV12 {
@@ -1697,6 +1796,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                             dest_ptr,
                             dest_size,
                         );
+                        queue_buffer_creation_error(
+                            ctx,
+                            pool_id,
+                            "unable to duplicate wl_shm dma-buf plane",
+                        );
                         return Action::Drop;
                     }
                 };
@@ -1713,6 +1817,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         params_queued,
                         dest_ptr,
                         dest_size,
+                    );
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to queue wl_shm dma-buf plane",
                     );
                     return Action::Drop;
                 }
@@ -1733,6 +1842,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 Vec::new(),
             ) {
                 cleanup_direct_dmabuf_failure(ctx, params_id, params_queued, dest_ptr, dest_size);
+                queue_buffer_creation_error(ctx, pool_id, "unable to queue wl_shm dma-buf buffer");
                 return Action::Drop;
             }
             // create_immed is processed before this destructor in the ordered
@@ -1767,7 +1877,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             if !registered {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
-                ctx.fatal_protocol_error = true;
+                rollback_registered_buffer(ctx, id, host_buffer_id);
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to register wl_shm dma-buf buffer",
+                );
             }
             return Action::Drop;
         }
@@ -1777,12 +1892,14 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         // mmap that has no BufferState owner.
         let Some(host_wl_shm_id) = ctx.host_shm_id else {
             error!("wl_shm not available on host");
+            queue_buffer_creation_error(ctx, pool_id, "host wl_shm is unavailable");
             return Action::Drop;
         };
         {
             // Map the buffer for SHM synchronization
             if total_size == 0 || total_size > i32::MAX as u64 {
                 error!("SHM destination size is invalid: {}", total_size);
+                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm destination size");
                 return Action::Drop;
             }
             let dest_size = total_size as usize;
@@ -1805,6 +1922,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     error!(
                         "Failed to mmap VirtWL SHM buffer: {:?}",
                         std::io::Error::last_os_error()
+                    );
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to map wl_shm buffer backing",
                     );
                     return Action::Drop;
                 }
@@ -1835,6 +1957,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     error!("Failed to dup FD: {}", e);
                     unmap_destination(dest_ptr, dest_size);
                     release_temporary_host_pool(ctx, host_pool_id);
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to duplicate wl_shm buffer backing",
+                    );
                     return Action::Drop;
                 }
             };
@@ -1849,6 +1976,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             ) {
                 unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
+                queue_buffer_creation_error(ctx, pool_id, "unable to queue wl_shm pool creation");
                 return Action::Drop;
             }
 
@@ -1861,6 +1989,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
                 unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
+                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm destination offset");
                 return Action::Drop;
             };
             builder.write_i32(blob_offset_i32); // offset
@@ -1871,6 +2000,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
                 unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
+                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm destination stride");
                 return Action::Drop;
             };
             builder.write_i32(bo_stride_i32); // stride
@@ -1886,6 +2016,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
                 unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
+                queue_buffer_creation_error(ctx, pool_id, "unable to queue wl_shm buffer creation");
                 return Action::Drop;
             }
 
@@ -1901,6 +2032,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
                 unmap_destination(dest_ptr, dest_size);
                 release_temporary_host_pool(ctx, host_pool_id);
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to queue wl_shm pool destruction",
+                );
                 return Action::Drop;
             }
 
@@ -1941,7 +2077,8 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             if !registered {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
-                ctx.fatal_protocol_error = true;
+                rollback_registered_buffer(ctx, id, host_buffer_id);
+                queue_buffer_creation_error(ctx, pool_id, "unable to register wl_shm buffer");
             }
         }
 
@@ -2112,9 +2249,10 @@ mod tests {
         coalesce_damage_rects, collect_deferred_buffers, collect_retired_buffers, copy_shm_damage,
         copy_shm_planes, guest_shm_format_available, record_host_shm_drm_format,
         record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
-        release_temporary_host_pool, same_dma_buf_object, valid_buffer_layout, valid_pool_resize,
-        valid_pool_size, valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size,
-        DmabufLayout, WL_SHM_FORMAT_NV12,
+        release_temporary_host_pool, rollback_queued_host_messages, rollback_registered_buffer,
+        same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
+        valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size, DmabufLayout,
+        WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -2810,6 +2948,134 @@ mod tests {
             None,
             "a failed temporary-pool setup must not leak its host ID reservation"
         );
+    }
+
+    #[test]
+    fn allocation_failure_is_fatal_without_creating_a_ghost_buffer() {
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+
+        let fd = memfd_create(
+            CString::new("sommelier-allocation-failure")
+                .unwrap()
+                .as_c_str(),
+            MFdFlags::empty(),
+        )
+        .expect("memfd_create");
+        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
+
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let pool_id = 20;
+        let buffer_id = 30;
+        ctx.pools.insert(
+            pool_id,
+            Arc::new(PoolState {
+                client_fd: fd.into_raw_fd(),
+                inner: RwLock::new(PoolInner {
+                    client_ptr: libc::MAP_FAILED,
+                    size: 4096,
+                }),
+            }),
+        );
+        ctx.shadow_table
+            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.last_sender_id = pool_id;
+
+        let mut handler = ShmHandler;
+        assert_eq!(
+            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(
+                &mut handler,
+                &mut ctx,
+                buffer_id,
+                0,
+                1,
+                1,
+                4,
+                0,
+            ),
+            Action::Drop
+        );
+
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            2,
+            "resource failures must report a no-memory-class fatal error"
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
+        assert_eq!(ctx.shadow_table.get_interface(buffer_id), None);
+        assert!(ctx.shadow_table.is_guest_id_available(buffer_id));
+        assert_eq!(ctx.render_buffer_count(), 0);
+        assert!(ctx.client_to_host_queue.is_empty());
+    }
+
+    #[test]
+    fn failed_registration_retires_host_buffer_without_guest_mapping() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let guest_id = 30;
+        let host_id = 40;
+        ctx.shadow_table.map_id(guest_id, host_id);
+        ctx.shadow_table
+            .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_id, 1);
+
+        rollback_registered_buffer(&mut ctx, guest_id, host_id);
+
+        assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
+        assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
+        assert!(ctx.shadow_table.is_guest_id_available(guest_id));
+        assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        assert_eq!(
+            u16::from_ne_bytes(ctx.client_to_host_queue[0].0[4..6].try_into().unwrap()),
+            0,
+            "rollback must queue wl_buffer.destroy"
+        );
+    }
+
+    #[test]
+    fn queued_message_rollback_closes_fds_and_preserves_prefix() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        assert!(attached_fd >= 1000);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let mut queue = vec![(vec![1], Vec::new()), (vec![2], vec![attached_fd])];
+        rollback_queued_host_messages(&mut queue, 1);
+
+        assert_eq!(queue, vec![(vec![1], Vec::new())]);
+        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn rejected_shm_message_closes_attached_descriptors() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        assert!(attached_fd >= 1000);
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+
+        let mut builder = crate::wire::MessageBuilder::new();
+        builder.write_array(&vec![0; u16::MAX as usize]);
+        let mut queue = Vec::new();
+        assert!(!super::queue_message(
+            &mut queue,
+            7,
+            0,
+            builder,
+            vec![attached_fd]
+        ));
+        assert!(queue.is_empty());
+        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
     }
 
     #[test]
