@@ -26,9 +26,7 @@ use crate::protocols::wayland::wl_surface::{
     WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY,
 };
 use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
-use crate::state::{
-    Context, DamageRect, RenderBufferBacking, SurfaceCommit, SurfaceState, ViewportState,
-};
+use crate::state::{Context, DamageRect, SurfaceCommit, SurfaceState, ViewportState};
 use crate::wire::Action;
 use log::trace;
 use std::collections::HashSet;
@@ -501,14 +499,12 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
     let Some(host_id) = ctx.render_buffer_host_id(buffer_id) else {
         return true;
     };
-    let allocator = ctx.allocator.as_ref();
-    let Some(RenderBufferBacking::LocalCopy(buffer)) = ctx
-        .render_buffers
-        .get_mut(host_id)
-        .and_then(|buffer| buffer.backing.as_mut())
-    else {
+    let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
         return true;
     };
+    let allocator = resources.allocator;
+    let virtwayland_channel = resources.channel;
+    let buffer = resources.buffer;
 
     let mut copy_ok = false;
     let pool = &buffer.pool;
@@ -523,7 +519,7 @@ fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit
             let needs_full_copy = buffer.needs_full_copy;
             let mut sync_guard = if buffer.dmabuf_sync {
                 let guard = DmabufWriteSync::begin(
-                    ctx.virtwayland_channel.as_ref(),
+                    virtwayland_channel,
                     buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd),
                 );
                 if guard.is_none() {
@@ -1443,9 +1439,7 @@ mod tests {
 
     fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
         let host_id = ctx.render_buffer_host_id(guest_id)?;
-        ctx.render_buffers
-            .get(host_id)
-            .map(|buffer| buffer.lifecycle)
+        ctx.render_buffer_lifecycle_for_host(host_id)
     }
 
     fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {

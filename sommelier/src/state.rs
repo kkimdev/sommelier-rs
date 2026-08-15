@@ -1272,7 +1272,7 @@ impl RenderBufferLifecycle {
 }
 
 /// Storage owned by one host `wl_buffer` generation.
-pub enum RenderBufferBacking {
+enum RenderBufferBacking {
     /// Guest SHM copied into proxy-owned host storage.
     LocalCopy(BufferState),
     /// Guest-created linux-dmabuf forwarded without a CPU copy.
@@ -1282,9 +1282,9 @@ pub enum RenderBufferBacking {
     },
 }
 
-pub struct RenderBuffer {
-    pub backing: Option<RenderBufferBacking>,
-    pub lifecycle: RenderBufferLifecycle,
+struct RenderBuffer {
+    backing: Option<RenderBufferBacking>,
+    lifecycle: RenderBufferLifecycle,
 }
 
 /// Canonical host-ID keyed registry for every render buffer.
@@ -1294,12 +1294,12 @@ pub struct RenderBuffer {
 /// becomes reusable. All backing, use, and ownership state therefore moves
 /// together under this one key.
 #[derive(Default)]
-pub struct RenderBufferRegistry {
+struct RenderBufferRegistry {
     entries: HashMap<HostId, RenderBuffer>,
 }
 
 impl RenderBufferRegistry {
-    pub fn register_local(&mut self, host_id: HostId, backing: BufferState) -> bool {
+    fn register_local(&mut self, host_id: HostId, backing: BufferState) -> bool {
         match self.entries.entry(host_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer {
@@ -1312,7 +1312,7 @@ impl RenderBufferRegistry {
         }
     }
 
-    pub fn register_native(
+    fn register_native(
         &mut self,
         host_id: HostId,
         size: (i32, i32),
@@ -1330,25 +1330,62 @@ impl RenderBufferRegistry {
         }
     }
 
-    pub fn get(&self, host_id: HostId) -> Option<&RenderBuffer> {
-        self.entries.get(&host_id)
+    fn contains(&self, host_id: HostId) -> bool {
+        self.entries.contains_key(&host_id)
     }
 
-    pub fn get_mut(&mut self, host_id: HostId) -> Option<&mut RenderBuffer> {
-        self.entries.get_mut(&host_id)
+    fn local_copy_mut(&mut self, host_id: HostId) -> Option<&mut BufferState> {
+        match self.entries.get_mut(&host_id)?.backing.as_mut()? {
+            RenderBufferBacking::LocalCopy(backing) => Some(backing),
+            RenderBufferBacking::Native { .. } => None,
+        }
     }
 
-    pub fn remove(&mut self, host_id: HostId) -> Option<RenderBuffer> {
-        self.entries.remove(&host_id)
+    fn local_copy(&self, host_id: HostId) -> Option<&BufferState> {
+        match self.entries.get(&host_id)?.backing.as_ref()? {
+            RenderBufferBacking::LocalCopy(backing) => Some(backing),
+            RenderBufferBacking::Native { .. } => None,
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (HostId, &RenderBuffer)> {
+    fn dimensions(&self, host_id: HostId) -> Option<(i32, i32)> {
+        match self.entries.get(&host_id)?.backing.as_ref()? {
+            RenderBufferBacking::LocalCopy(backing) => Some((backing.width, backing.height)),
+            RenderBufferBacking::Native { size, .. } => Some(*size),
+        }
+    }
+
+    fn native_sync_fd(&self, host_id: HostId) -> Option<&OwnedFd> {
+        match self.entries.get(&host_id)?.backing.as_ref()? {
+            RenderBufferBacking::Native {
+                sync_fd: Some(sync_fd),
+                ..
+            } => Some(sync_fd),
+            RenderBufferBacking::LocalCopy(_)
+            | RenderBufferBacking::Native { sync_fd: None, .. } => None,
+        }
+    }
+
+    fn lifecycle(&self, host_id: HostId) -> Option<RenderBufferLifecycle> {
+        self.entries.get(&host_id).map(|buffer| buffer.lifecycle)
+    }
+
+    fn lifecycles(&self) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
         self.entries
             .iter()
-            .map(|(&host_id, buffer)| (host_id, buffer))
+            .map(|(&host_id, buffer)| (host_id, buffer.lifecycle))
     }
 
-    pub fn set_use(&mut self, host_id: HostId, use_state: RenderBufferUse) -> bool {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn remove(&mut self, host_id: HostId) -> bool {
+        self.entries.remove(&host_id).is_some()
+    }
+
+    fn set_use(&mut self, host_id: HostId, use_state: RenderBufferUse) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
@@ -1362,7 +1399,7 @@ impl RenderBufferRegistry {
         true
     }
 
-    pub fn mark_guest_destroyed(&mut self, host_id: HostId) -> bool {
+    fn mark_guest_destroyed(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
@@ -1377,7 +1414,7 @@ impl RenderBufferRegistry {
         }
     }
 
-    pub fn mark_host_destroy_queued(&mut self, host_id: HostId) -> bool {
+    fn mark_host_destroy_queued(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
@@ -1404,7 +1441,7 @@ pub struct DmabufCapabilityState {
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
-    pub render_buffers: RenderBufferRegistry,
+    render_buffers: RenderBufferRegistry,
     /// Dimensions waiting for the host's asynchronous linux-dmabuf `created`
     /// event. The key is the guest params object ID; the event handler moves
     /// the value into the host-ID keyed render-buffer registry.
@@ -1604,12 +1641,18 @@ pub struct Context {
     pub(crate) clipboard_pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
+pub(crate) struct LocalBufferCopyResources<'a> {
+    pub allocator: Option<&'a Allocator>,
+    pub channel: Option<&'a Arc<VirtWaylandChannel>>,
+    pub buffer: &'a mut BufferState,
+}
+
 impl Context {
     pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: u32) -> Option<HostId> {
         self.shadow_table
             .get_host_id(guest_buffer_id)
             .map(HostId)
-            .filter(|host_id| self.render_buffers.get(*host_id).is_some())
+            .filter(|host_id| self.render_buffers.contains(*host_id))
     }
 
     pub(crate) fn register_local_buffer(
@@ -1638,10 +1681,45 @@ impl Context {
 
     pub(crate) fn local_buffer(&self, guest_buffer_id: u32) -> Option<&BufferState> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
-        match self.render_buffers.get(host_id)?.backing.as_ref()? {
-            RenderBufferBacking::LocalCopy(backing) => Some(backing),
-            RenderBufferBacking::Native { .. } => None,
-        }
+        self.render_buffers.local_copy(host_id)
+    }
+
+    pub(crate) fn local_buffer_copy_resources(
+        &mut self,
+        host_id: HostId,
+    ) -> Option<LocalBufferCopyResources<'_>> {
+        let allocator = self.allocator.as_ref();
+        let channel = self.virtwayland_channel.as_ref();
+        let buffer = self.render_buffers.local_copy_mut(host_id)?;
+        Some(LocalBufferCopyResources {
+            allocator,
+            channel,
+            buffer,
+        })
+    }
+
+    pub(crate) fn render_buffer_lifecycles(
+        &self,
+    ) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
+        self.render_buffers.lifecycles()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_buffer_lifecycle_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Option<RenderBufferLifecycle> {
+        self.render_buffers.lifecycle(host_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_render_buffer_host(&self, host_id: HostId) -> bool {
+        self.render_buffers.contains(host_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_buffer_count(&self) -> usize {
+        self.render_buffers.len()
     }
 
     pub(crate) fn buffer_dimensions(&self, guest_buffer_id: u32) -> Option<(i32, i32)> {
@@ -1650,27 +1728,17 @@ impl Context {
     }
 
     pub(crate) fn buffer_dimensions_for_host(&self, host_id: HostId) -> Option<(i32, i32)> {
-        match self.render_buffers.get(host_id)?.backing.as_ref()? {
-            RenderBufferBacking::LocalCopy(backing) => Some((backing.width, backing.height)),
-            RenderBufferBacking::Native { size, .. } => Some(*size),
-        }
+        self.render_buffers.dimensions(host_id)
     }
 
     pub(crate) fn native_buffer_sync_fd(&self, guest_buffer_id: u32) -> Option<&OwnedFd> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
-        match self.render_buffers.get(host_id)?.backing.as_ref()? {
-            RenderBufferBacking::Native {
-                sync_fd: Some(sync_fd),
-                ..
-            } => Some(sync_fd),
-            RenderBufferBacking::LocalCopy(_)
-            | RenderBufferBacking::Native { sync_fd: None, .. } => None,
-        }
+        self.render_buffers.native_sync_fd(host_id)
     }
 
     pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
-        self.render_buffers.get(host_id)?.lifecycle.use_state()
+        self.render_buffers.lifecycle(host_id)?.use_state()
     }
 
     fn set_buffer_use(&mut self, guest_buffer_id: u32, use_state: RenderBufferUse) -> bool {
@@ -1699,13 +1767,40 @@ impl Context {
         self.render_buffers.mark_guest_destroyed(host_id)
     }
 
-    pub(crate) fn mark_buffer_host_destroy_queued(&mut self, host_buffer_id: u32) -> bool {
-        self.render_buffers
-            .mark_host_destroy_queued(HostId(host_buffer_id))
+    pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
+        self.render_buffers.remove(HostId(host_buffer_id))
     }
 
-    pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
-        self.render_buffers.remove(HostId(host_buffer_id)).is_some()
+    /// Apply the ID-ownership policy after a host `wl_buffer.destroy` has
+    /// successfully entered the ordered outgoing stream.
+    ///
+    /// Client-created IDs must survive until the host's `delete_id` can be
+    /// translated back to the guest. Asynchronous dmabuf buffers use
+    /// server-created IDs on both sides, so the queued destructor is their
+    /// terminal lifecycle edge and the complete generation is removed now.
+    pub(crate) fn complete_queued_buffer_destroy(
+        &mut self,
+        guest_buffer_id: u32,
+        host_buffer_id: HostId,
+    ) -> bool {
+        if self.shadow_table.get_host_id(guest_buffer_id) != Some(host_buffer_id.0) {
+            return false;
+        }
+
+        if self.shadow_table.is_guest_server_id(guest_buffer_id) {
+            if !self.render_buffers.remove(host_buffer_id) {
+                return false;
+            }
+            self.shadow_table.remove_id(guest_buffer_id);
+        } else {
+            if self.render_buffers.contains(host_buffer_id)
+                && !self.render_buffers.mark_host_destroy_queued(host_buffer_id)
+            {
+                return false;
+            }
+            self.shadow_table.mark_pending_destroy(guest_buffer_id);
+        }
+        true
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
@@ -1718,8 +1813,8 @@ impl Context {
 
     pub(crate) fn host_buffer_is_guest_destroyed(&self, host_buffer_id: u32) -> bool {
         self.render_buffers
-            .get(HostId(host_buffer_id))
-            .is_some_and(|buffer| buffer.lifecycle.is_guest_destroyed())
+            .lifecycle(HostId(host_buffer_id))
+            .is_some_and(RenderBufferLifecycle::is_guest_destroyed)
     }
 
     pub(crate) fn guest_key_owner(
@@ -2557,9 +2652,7 @@ mod tests {
             Some(RenderBufferUse::NeverSubmitted)
         );
         assert_eq!(
-            ctx.render_buffers
-                .get(HostId(host_buffer))
-                .map(|buffer| buffer.lifecycle),
+            ctx.render_buffers.lifecycle(HostId(host_buffer)),
             Some(RenderBufferLifecycle::GuestAlive(
                 RenderBufferUse::NeverSubmitted
             ))
@@ -2605,9 +2698,7 @@ mod tests {
                 encoded /= operations.len();
                 assert_eq!(ctx.host_buffer_use(buffer), Some(model));
                 assert_eq!(
-                    ctx.render_buffers
-                        .get(HostId(host_buffer))
-                        .map(|buffer| buffer.lifecycle),
+                    ctx.render_buffers.lifecycle(HostId(host_buffer)),
                     Some(RenderBufferLifecycle::GuestAlive(model))
                 );
             }
@@ -2623,17 +2714,12 @@ mod tests {
         assert!(!registry.register_native(host_id, (99, 99), None));
 
         assert_eq!(
-            registry.get(host_id).map(|buffer| buffer.lifecycle),
+            registry.lifecycle(host_id),
             Some(RenderBufferLifecycle::GuestAlive(
                 RenderBufferUse::NeverSubmitted
             ))
         );
-        assert!(matches!(
-            registry
-                .get(host_id)
-                .and_then(|buffer| buffer.backing.as_ref()),
-            Some(RenderBufferBacking::Native { size: (16, 8), .. })
-        ));
+        assert_eq!(registry.dimensions(host_id), Some((16, 8)));
     }
 
     #[test]
@@ -2718,10 +2804,9 @@ mod tests {
                 model = expected;
 
                 assert_eq!(actual_changed, expected_changed);
-                let actual = registry.get(HostId(host_id)).expect("registry generation");
-                assert_eq!(actual.lifecycle, model);
+                assert_eq!(registry.lifecycle(HostId(host_id)), Some(model));
                 assert_eq!(
-                    actual.backing.is_some(),
+                    registry.dimensions(HostId(host_id)).is_some(),
                     model != RenderBufferLifecycle::HostDestroyQueued
                 );
             }

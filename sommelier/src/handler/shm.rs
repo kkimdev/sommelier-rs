@@ -1152,6 +1152,17 @@ fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
     }
 }
 
+fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: HostId) {
+    if !ctx.complete_queued_buffer_destroy(guest_id, host_id) {
+        log::error!(
+            "Render buffer generation diverged while destroying guest {} host {}",
+            guest_id,
+            host_id.0
+        );
+        ctx.fatal_protocol_error = true;
+    }
+}
+
 /// Canonical snapshot of every current and pending surface→buffer edge.
 ///
 /// Pending attaches are kept distinct because they have already reached the
@@ -1210,10 +1221,9 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
 fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&HashSet<u32>>) {
     let references = SurfaceBufferReferences::collect(ctx);
     let candidates: Vec<(u32, HostId)> = ctx
-        .render_buffers
-        .iter()
-        .filter_map(|(host_id, buffer)| {
-            if !buffer.lifecycle.is_guest_destroyed() {
+        .render_buffer_lifecycles()
+        .filter_map(|(host_id, lifecycle)| {
+            if !lifecycle.is_guest_destroyed() {
                 return None;
             }
             let guest_id = ctx.shadow_table.get_guest_id(host_id.0)?;
@@ -1224,11 +1234,11 @@ fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&Has
 
     for (guest_id, host_id) in candidates {
         if queue_host_buffer_destroy(ctx, host_id.0) {
-            ctx.mark_buffer_host_destroy_queued(host_id.0);
             // Keep the guest↔host mapping and empty registry generation
             // reserved until wl_display.delete_id acknowledges the host
-            // destructor.
-            ctx.shadow_table.mark_pending_destroy(guest_id);
+            // destructor. Server-created generations are removed immediately
+            // because neither side emits delete_id.
+            retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
         }
     }
 }
@@ -2040,11 +2050,10 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 
         if let Some(host_id) = host_id {
             if queue_host_buffer_destroy(ctx, host_id) {
-                ctx.mark_buffer_host_destroy_queued(host_id);
+                retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
             }
         }
         clear_surface_buffer_references(ctx, guest_id);
-        ctx.shadow_table.mark_pending_destroy(guest_id);
         Action::Drop
     }
 
@@ -2065,8 +2074,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             }
             ctx.mark_buffer_released(guest_id);
             if queue_host_buffer_destroy(ctx, host_id) {
-                ctx.mark_buffer_host_destroy_queued(host_id);
-                ctx.shadow_table.mark_pending_destroy(guest_id);
+                retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
                 clear_surface_buffer_references(ctx, guest_id);
             }
             return Action::Drop;
@@ -2126,15 +2134,23 @@ mod tests {
         assert!(ctx.register_native_buffer(host_id, (1, 1), None));
     }
 
+    fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
+        let guest_id = ctx.shadow_table.allocate_guest_server_id();
+        ctx.shadow_table.map_id(guest_id, host_id);
+        ctx.shadow_table
+            .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_id, 1);
+        register_test_native(ctx, host_id);
+        guest_id
+    }
+
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
         ctx.shadow_table.retire_guest_object(guest_id);
     }
 
     fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {
-        ctx.render_buffers
-            .get(HostId(host_id))
-            .map(|buffer| buffer.lifecycle)
+        ctx.render_buffer_lifecycle_for_host(HostId(host_id))
     }
 
     fn buffer_is_guest_destroyed(ctx: &Context, host_id: u32) -> bool {
@@ -3203,6 +3219,90 @@ mod tests {
         assert!(ctx.host_buffer_use(guest_buffer).is_none());
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+    }
+
+    #[test]
+    fn destroying_idle_server_created_buffer_ends_without_delete_id() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let host_buffer = 30;
+        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
+        let mut handler = ShmHandler;
+
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
+        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
+        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        let reused_guest = register_test_server_native(&mut ctx, host_buffer);
+        assert_ne!(reused_guest, guest_buffer);
+        assert_eq!(
+            ctx.shadow_table.get_host_id(reused_guest),
+            Some(host_buffer),
+            "a later ordered host event may reuse the server-owned buffer ID"
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "server-created guest IDs never receive wl_display.delete_id"
+        );
+    }
+
+    #[test]
+    fn destroying_submitted_server_created_buffer_retires_after_release() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let host_buffer = 30;
+        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
+        let mut handler = ShmHandler;
+
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            ctx.shadow_table.get_host_id(guest_buffer),
+            Some(host_buffer),
+            "the mapping must remain until a delayed host release can resolve"
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
+
+        ctx.last_sender_id = host_buffer;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            Action::Drop
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
+        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
+        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn released_server_created_buffer_retires_on_later_guest_destroy() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let host_buffer = 30;
+        let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
+        let mut handler = ShmHandler;
+
+        ctx.last_sender_id = host_buffer;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut handler, &mut ctx),
+            Action::Forward
+        );
+        assert!(ctx.buffer_is_released(guest_buffer));
+
+        ctx.last_sender_id = guest_buffer;
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
+        assert!(ctx.shadow_table.is_host_id_available(host_buffer));
+        assert!(ctx.host_to_client_queue.is_empty());
     }
 
     #[test]

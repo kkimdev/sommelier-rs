@@ -1424,13 +1424,13 @@ mod tests {
         MAX_TRANCHE_INDICES_PER_EVENT,
     };
     use crate::handler::display::DisplayHandler;
-    use crate::handler::shm::WL_SHM_FORMAT_NV12;
+    use crate::handler::shm::{ShmHandler, WL_SHM_FORMAT_NV12};
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::state::{Context, HostId, PendingParam, RenderBufferBacking};
+    use crate::state::{Context, HostId, PendingParam};
     use crate::wire::{Action, WireMessage};
 
     fn message_opcode(message: &[u8]) -> u16 {
@@ -1842,7 +1842,7 @@ mod tests {
             ctx.pending_native_sync_fds.contains_key(&guest_params_id),
             "async create must retain a dma-buf fence descriptor until created"
         );
-        assert!(ctx.render_buffers.get(HostId(host_buffer_id)).is_none());
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
 
         let payload = host_buffer_id.to_ne_bytes();
         ctx.last_sender_id = host_params_id;
@@ -1868,30 +1868,170 @@ mod tests {
             ctx.buffer_dimensions_for_host(HostId(host_buffer_id)),
             Some((16, 8))
         );
-        assert!(
-            matches!(
-                ctx.render_buffers
-                    .get(HostId(host_buffer_id))
-                    .and_then(|buffer| buffer.backing.as_ref()),
-                Some(RenderBufferBacking::Native {
-                    sync_fd: Some(_),
-                    ..
-                })
-            ),
-            "created must move the retained fence descriptor to the host buffer"
-        );
         let guest_buffer_id = ctx
             .shadow_table
             .get_guest_id(host_buffer_id)
             .expect("generated created event must map the host buffer");
         assert!(
+            ctx.native_buffer_sync_fd(guest_buffer_id).is_some(),
+            "created must move the retained fence descriptor to the host buffer"
+        );
+        assert!(
             ctx.buffer_dimensions(guest_buffer_id) == Some((16, 8)),
             "guest lookup must resolve the canonical host-ID keyed generation"
         );
-        assert_eq!(ctx.render_buffers.iter().count(), 1);
+        assert_eq!(ctx.render_buffer_count(), 1);
 
         unsafe {
             libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn async_created_buffer_destroy_allows_ordered_host_id_reuse() {
+        let mut first_pipe = [-1; 2];
+        let mut second_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
+        let first_guest_params = 7;
+        let first_host_params = 8;
+        let second_guest_params = 9;
+        let second_host_params = 10;
+        let host_buffer_id: u32 = 42;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut handler = LinuxDmabufHandler;
+
+        ctx.shadow_table
+            .map_id(first_guest_params, first_host_params);
+        ctx.shadow_table.track_interface_with_version(
+            first_guest_params,
+            "zwp_linux_buffer_params_v1".to_string(),
+            4,
+        );
+        ctx.shadow_table.set_host_version(first_host_params, 4);
+        ctx.pending_params.insert(
+            first_guest_params,
+            vec![PendingParam {
+                fd: first_pipe[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = first_guest_params;
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+
+        let payload = host_buffer_id.to_ne_bytes();
+        ctx.last_sender_id = first_host_params;
+        let mut created = WireMessage::new(
+            first_host_params,
+            zwp_linux_buffer_params_v1::EVT_CREATED,
+            &payload,
+            &[],
+        );
+        assert!(
+            zwp_linux_buffer_params_v1::dispatch_event(&mut created, &mut handler, &mut ctx)
+                .expect("first created event should decode")
+                .is_some()
+        );
+        let first_guest_buffer = ctx
+            .shadow_table
+            .get_guest_id(host_buffer_id)
+            .expect("created must allocate a guest server ID");
+        assert!(ctx.shadow_table.is_guest_server_id(first_guest_buffer));
+        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
+
+        let queued_before_destroy = ctx.client_to_host_queue.len();
+        ctx.last_sender_id = first_guest_buffer;
+        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[], &[]);
+        assert!(crate::protocols::wayland::wl_buffer::dispatch_request(
+            &mut destroy,
+            &mut ShmHandler,
+            &mut ctx,
+        )
+        .expect("server-created wl_buffer.destroy should decode")
+        .is_none());
+        assert_eq!(ctx.shadow_table.get_host_id(first_guest_buffer), None);
+        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer_id), None);
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(ctx.shadow_table.is_host_id_available(host_buffer_id));
+        assert!(!ctx
+            .shadow_table
+            .is_pending_destroy_guest(first_guest_buffer));
+        assert!(!ctx
+            .shadow_table
+            .is_pending_destroy_host_only(host_buffer_id));
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            queued_before_destroy + 1,
+            "destroy must queue exactly one host wl_buffer destructor"
+        );
+        let (destroy_message, destroy_fds) = ctx.client_to_host_queue.last().unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(destroy_message[0..4].try_into().unwrap()),
+            host_buffer_id
+        );
+        assert_eq!(
+            u16::from_ne_bytes(destroy_message[4..6].try_into().unwrap()),
+            0
+        );
+        assert!(destroy_fds.is_empty());
+
+        ctx.shadow_table
+            .map_id(second_guest_params, second_host_params);
+        ctx.shadow_table.track_interface_with_version(
+            second_guest_params,
+            "zwp_linux_buffer_params_v1".to_string(),
+            4,
+        );
+        ctx.shadow_table.set_host_version(second_host_params, 4);
+        ctx.pending_params.insert(
+            second_guest_params,
+            vec![PendingParam {
+                fd: second_pipe[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = second_guest_params;
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+
+        ctx.last_sender_id = second_host_params;
+        let mut reused = WireMessage::new(
+            second_host_params,
+            zwp_linux_buffer_params_v1::EVT_CREATED,
+            &payload,
+            &[],
+        );
+        assert!(
+            zwp_linux_buffer_params_v1::dispatch_event(&mut reused, &mut handler, &mut ctx)
+                .expect("reused host buffer ID should decode")
+                .is_some()
+        );
+        let second_guest_buffer = ctx
+            .shadow_table
+            .get_guest_id(host_buffer_id)
+            .expect("reused host buffer ID must map to a new guest server ID");
+        assert_ne!(second_guest_buffer, first_guest_buffer);
+        assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
+        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(!ctx.fatal_protocol_error);
+
+        unsafe {
+            libc::close(first_pipe[0]);
+            libc::close(second_pipe[0]);
         }
     }
 
@@ -1942,7 +2082,7 @@ mod tests {
             "failed must still be forwarded to the guest"
         );
         assert!(ctx.pending_native_buffer_sizes.is_empty());
-        assert_eq!(ctx.render_buffers.iter().count(), 0);
+        assert_eq!(ctx.render_buffer_count(), 0);
 
         unsafe {
             libc::close(pipe_fds[0]);
@@ -2009,7 +2149,7 @@ mod tests {
             "orphaned buffer must not be exposed to guest"
         );
         assert!(ctx.pending_native_buffer_sizes.is_empty());
-        assert!(ctx.render_buffers.get(HostId(host_buffer_id)).is_none());
+        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
