@@ -1682,6 +1682,15 @@ pub struct TextInputV3Handler;
 impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
+        // Destruction is the final disabled transition. Route it through the
+        // same activation reconciler as commit/focus changes so parent-seat
+        // lifetime validation cannot drift between teardown paths.
+        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        update_host_activation(ctx, guest_id);
+
         let Some(state) = ctx.text_inputs.remove(&guest_id) else {
             // Keep the guest lifecycle well-formed even if local text-input
             // state was already cleaned by a focus/seat teardown path.
@@ -1690,20 +1699,6 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             }
             return Action::Drop;
         };
-
-        if state.host_activated {
-            if let Some(host_seat) = ctx.shadow_table.get_host_id(state.guest_seat) {
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(host_seat);
-                push_msg(&mut ctx.client_to_host_queue, state.host_v1_id, 1, builder);
-            } else {
-                log::warn!(
-                    "Text input {} was active but its guest seat {} has no host mapping during destroy",
-                    guest_id,
-                    state.guest_seat
-                );
-            }
-        }
 
         // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
         // Stop extension events and remove all local routing state.
@@ -2097,6 +2092,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::seat::SeatHandler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
@@ -3649,6 +3645,11 @@ mod tests {
         );
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[8..12].try_into().unwrap()),
+            2,
+            "deactivate must carry the live host wl_seat ID"
+        );
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), 30);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 1), 0);
         assert_eq!(
@@ -3664,6 +3665,80 @@ mod tests {
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
             guest_id
         );
+    }
+
+    #[test]
+    fn destroy_after_seat_release_does_not_deactivate_destroyed_host_seat() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let guest_seat = 7;
+        let host_seat = 70;
+        ctx.shadow_table.map_id(guest_seat, host_seat);
+        ctx.shadow_table
+            .track_interface_with_version(guest_seat, "wl_seat".to_string(), 5);
+        ctx.shadow_table.set_host_version(host_seat, 5);
+        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = guest_seat;
+        ctx.shadow_table
+            .track_host_interface(30, "zcr_extended_text_input_v1".to_string());
+        ctx.last_sender_id = guest_seat;
+        let mut release = WireMessage::new(
+            guest_seat,
+            crate::protocols::wayland::wl_seat::REQ_RELEASE,
+            &[],
+            &[],
+        );
+        assert!(crate::protocols::wayland::wl_seat::dispatch_request(
+            &mut release,
+            &mut SeatHandler,
+            &mut ctx,
+        )
+        .expect("wl_seat.release should decode")
+        .is_some());
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_seat));
+
+        ctx.last_sender_id = guest_id;
+        let mut handler = TextInputV3Handler;
+
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert!(!ctx.text_inputs.contains_key(&guest_id));
+        assert!(ctx.shadow_table.get_host_id(guest_id).is_none());
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| msg_sender(std::slice::from_ref(message), 0) != host_v1_id),
+            "a child text-input must not reference its released parent host seat"
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 30);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            msg_opcode(&ctx.host_to_client_queue, 0),
+            crate::protocols::wayland::wl_display::EVT_DELETE_ID
+        );
+    }
+
+    #[test]
+    fn destroy_without_seat_mapping_completes_without_invalid_deactivate() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
+        ctx.shadow_table
+            .track_host_interface(30, "zcr_extended_text_input_v1".to_string());
+        ctx.last_sender_id = guest_id;
+        let mut handler = TextInputV3Handler;
+
+        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert!(!ctx.text_inputs.contains_key(&guest_id));
+        assert!(ctx.shadow_table.get_host_id(guest_id).is_none());
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| msg_sender(std::slice::from_ref(message), 0) != host_v1_id),
+            "a missing parent seat must not be encoded as object ID zero"
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 30);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
     }
 
     #[test]
