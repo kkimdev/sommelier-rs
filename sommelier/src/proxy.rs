@@ -2255,7 +2255,7 @@ mod tests {
         ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table
             .track_interface_with_version(12, "wl_buffer".to_string(), 1);
-        assert!(ctx.register_native_buffer(22, (1, 1), None));
+        assert!(ctx.register_native_buffer(22, (1, 1), Vec::new()));
         // Match the production native-buffer destroy path: the guest
         // interface is retired while the host-side interface remains
         // available long enough to dispatch wl_buffer.release.

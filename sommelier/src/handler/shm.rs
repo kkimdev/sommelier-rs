@@ -1178,12 +1178,19 @@ pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool
 
 fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
     for surface in ctx.surfaces.values_mut() {
-        if surface.current_buffer_id == Some(guest_id) {
-            surface.current_buffer_id = None;
-        }
+        surface.clear_current_buffer_reference(guest_id);
         if surface.pending_buffer_id == Some(Some(guest_id)) {
             surface.pending_buffer_id = Some(None);
         }
+    }
+}
+
+fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
+    if ctx.render_buffer_host_id(guest_id).is_some() && !ctx.mark_buffer_released(guest_id) {
+        log::warn!(
+            "Ignoring wl_buffer.release without an awaiting render use for guest {}",
+            guest_id
+        );
     }
 }
 
@@ -1214,7 +1221,7 @@ impl SurfaceBufferReferences {
         let mut current = HashSet::new();
         let mut pending = HashSet::new();
         for surface in ctx.surfaces.values() {
-            current.extend(surface.current_buffer_id);
+            current.extend(surface.current_buffer_id());
             pending.extend(surface.pending_buffer_id.flatten());
         }
         Self { current, pending }
@@ -1222,6 +1229,10 @@ impl SurfaceBufferReferences {
 
     fn contains(&self, guest_id: u32) -> bool {
         self.current.contains(&guest_id) || self.pending.contains(&guest_id)
+    }
+
+    fn has_current(&self, guest_id: u32) -> bool {
+        self.current.contains(&guest_id)
     }
 
     fn has_pending(&self, guest_id: u32) -> bool {
@@ -1233,17 +1244,15 @@ fn can_retire_deferred_buffer(
     ctx: &Context,
     references: &SurfaceBufferReferences,
     guest_id: u32,
-    allow_submitted: Option<&HashSet<u32>>,
 ) -> bool {
     (!references.contains(guest_id)
         || (ctx.buffer_is_released(guest_id) && !references.has_pending(guest_id)))
-        && (!ctx.buffer_is_submitted(guest_id)
-            || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id)))
+        && !ctx.buffer_is_submitted(guest_id)
 }
 
 /// Retire every eligible guest-destroyed render buffer.
 pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
-    collect_deferred_buffers_impl(ctx, None);
+    collect_deferred_buffers_impl(ctx);
 }
 
 /// Retire guest-destroyed local-copy and native buffers with one lifecycle
@@ -1253,7 +1262,7 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
 /// retained. Surface references, submitted/released phases, and ordered
 /// surface-destroy proofs have identical lifetime meaning and therefore must
 /// not be evaluated by separate condition trees.
-fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&HashSet<u32>>) {
+fn collect_deferred_buffers_impl(ctx: &mut Context) {
     let references = SurfaceBufferReferences::collect(ctx);
     let candidates: Vec<(u32, HostId)> = ctx
         .render_buffer_lifecycles()
@@ -1262,8 +1271,7 @@ fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&Has
                 return None;
             }
             let guest_id = ctx.shadow_table.get_guest_id(host_id.0)?;
-            can_retire_deferred_buffer(ctx, &references, guest_id, allow_submitted)
-                .then_some((guest_id, host_id))
+            can_retire_deferred_buffer(ctx, &references, guest_id).then_some((guest_id, host_id))
         })
         .collect();
 
@@ -1280,18 +1288,23 @@ fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&Has
 
 /// A surface destructor is ordered before any buffer destructors that follow
 /// it in the guest stream.  Once the destroyed surface is gone, a submitted
-/// marker is no longer needed for a buffer that no other surface references:
-/// if the guest destroys that buffer later, its host wl_buffer can be retired
-/// immediately even when the compositor does not emit a separate release for
-/// surface teardown.  Keep the marker while another surface still owns it.
+/// marker is no longer needed for a buffer that no other committed surface
+/// references: if the guest destroys that buffer later, its host wl_buffer can
+/// be retired immediately even when the compositor does not emit a separate
+/// release for surface teardown. A pending attach preserves backing lifetime
+/// but does not begin a new compositor-use interval until commit.
 pub(crate) fn clear_buffer_uses_after_surface_destroy(
     ctx: &mut Context,
     destroyed_surface_buffers: &HashSet<u32>,
 ) {
     let references = SurfaceBufferReferences::collect(ctx);
     for &guest_id in destroyed_surface_buffers {
-        if !references.contains(guest_id) {
-            ctx.clear_buffer_use(guest_id);
+        if !references.has_current(guest_id)
+            && ctx.host_buffer_use(guest_id).is_some()
+            && !ctx.clear_buffer_use(guest_id)
+        {
+            log::error!("Render buffer {} could not clear its surface use", guest_id);
+            ctx.fatal_protocol_error = true;
         }
     }
 }
@@ -1300,17 +1313,7 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
 /// been replaced or cleared. A submitted buffer remains deferred until its
 /// release event.
 pub(crate) fn collect_deferred_buffers(ctx: &mut Context) {
-    collect_deferred_buffers_impl(ctx, None);
-}
-
-/// Retire local-copy and native buffers after the owning host surface
-/// destructor has been queued. This is the one path that may retire a
-/// submitted buffer without waiting for a separate release event.
-pub(crate) fn collect_deferred_buffers_after_surface_destroy(
-    ctx: &mut Context,
-    destroyed_surface_buffers: &HashSet<u32>,
-) {
-    collect_deferred_buffers_impl(ctx, Some(destroyed_surface_buffers));
+    collect_deferred_buffers_impl(ctx);
 }
 
 impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
@@ -2180,7 +2183,13 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             && still_referenced
             && (!ctx.buffer_is_released(guest_id) || uncommitted_attach)
         {
-            ctx.mark_buffer_guest_destroyed(guest_id);
+            if !ctx.mark_buffer_guest_destroyed(guest_id) {
+                log::error!(
+                    "Render buffer {} could not enter guest-destroyed state",
+                    guest_id
+                );
+                ctx.fatal_protocol_error = true;
+            }
             ctx.shadow_table.retire_guest_object(guest_id);
             return Action::Drop;
         }
@@ -2206,10 +2215,10 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 // This release completes the previous use interval. Keep the
                 // deferred object alive because the pending attach may still
                 // begin another interval.
-                ctx.mark_buffer_released(guest_id);
+                record_host_buffer_release(ctx, guest_id);
                 return Action::Drop;
             }
-            ctx.mark_buffer_released(guest_id);
+            record_host_buffer_release(ctx, guest_id);
             if queue_host_buffer_destroy(ctx, host_id) {
                 retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
                 clear_surface_buffer_references(ctx, guest_id);
@@ -2220,7 +2229,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         // Retain the release phase for both local-copy and native buffers so a later
         // guest destroy can retire the host proxy immediately even when a
         // surface still stores the buffer as its current content.
-        ctx.mark_buffer_released(guest_id);
+        record_host_buffer_release(ctx, guest_id);
         // A release is the compositor's lifetime signal. Once it arrives, the
         // backing storage may be reused or destroyed, even if the surface
         // still has the buffer as its current content. Keeping this marker in
@@ -2269,7 +2278,7 @@ mod tests {
     }
 
     fn register_test_native(ctx: &mut Context, host_id: u32) {
-        assert!(ctx.register_native_buffer(host_id, (1, 1), None));
+        assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
     }
 
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
@@ -3278,13 +3287,9 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
-        ctx.surfaces.insert(
-            surface,
-            crate::state::SurfaceState {
-                current_buffer_id: Some(guest_buffer),
-                ..Default::default()
-            },
-        );
+        let mut surface_state = crate::state::SurfaceState::default();
+        surface_state.set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
+        ctx.surfaces.insert(surface, surface_state);
         let pool = Arc::new(PoolState {
             client_fd: -1,
             inner: RwLock::new(PoolInner {
@@ -3349,8 +3354,15 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface)
-                .and_then(|state| state.current_buffer_id),
+                .and_then(crate::state::SurfaceState::current_buffer_id),
             None
+        );
+        assert_eq!(
+            ctx.surfaces
+                .get(&surface)
+                .and_then(crate::state::SurfaceState::current_buffer_dimensions),
+            Some((1, 1)),
+            "destroying a released wl_buffer must preserve committed content metadata"
         );
         assert_eq!(
             ctx.client_to_host_queue.len(),
@@ -3478,7 +3490,10 @@ mod tests {
         // The surface can still retain the released buffer as its current
         // content. Destroying the guest object must use the recorded release
         // edge instead of waiting for a second event that cannot arrive.
-        ctx.surfaces.entry(100).or_default().current_buffer_id = Some(guest_buffer);
+        ctx.surfaces
+            .entry(100)
+            .or_default()
+            .set_current_buffer_for_test(Some(guest_buffer), None);
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
@@ -3617,7 +3632,8 @@ mod tests {
         register_test_native(&mut ctx, native_host);
         for guest_id in [local_buffer, native_buffer] {
             mark_test_buffer_guest_destroyed(&mut ctx, guest_id);
-            ctx.mark_buffer_released(guest_id);
+            assert!(ctx.mark_buffer_submitted(guest_id));
+            assert!(ctx.mark_buffer_released(guest_id));
         }
         ctx.surfaces.entry(40).or_default().pending_buffer_id = Some(Some(local_buffer));
         ctx.surfaces.entry(41).or_default().pending_buffer_id = Some(Some(native_buffer));
@@ -3691,7 +3707,7 @@ mod tests {
         collect_retired_buffers(&mut ctx);
         assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
 
-        ctx.mark_buffer_released(guest_buffer);
+        assert!(ctx.mark_buffer_released(guest_buffer));
         collect_retired_buffers(&mut ctx);
         assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert_eq!(

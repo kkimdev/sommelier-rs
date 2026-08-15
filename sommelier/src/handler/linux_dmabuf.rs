@@ -551,7 +551,7 @@ impl LinuxDmabufHandler {
         ctx: &mut Context,
         params_id: u32,
         send_create: impl FnOnce(&mut Context, u32) -> bool,
-    ) -> Option<(HostId, OwnedFd)> {
+    ) -> Option<(HostId, Vec<OwnedFd>)> {
         let params = ctx.pending_params.remove(&params_id)?;
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
             error!("Unknown host ID for params {}", params_id);
@@ -566,31 +566,38 @@ impl LinuxDmabufHandler {
             return None;
         };
 
-        // Keep one independent plane descriptor for the host buffer's
-        // compositor-use fence. The queued ADD owns the descriptor passed to
-        // the host; this duplicate survives until the corresponding host
-        // wl_buffer.delete_id and is waited immediately before each commit.
-        let sync_source = params
-            .iter()
-            .find(|param| param.plane_idx == 0)
-            .or_else(|| params.first());
-        let sync_fd = sync_source.and_then(|param| {
-            nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(param.fd) })
-                .map_err(|error| {
+        // Keep one descriptor for every plane. Multi-plane formats may use
+        // separate dma-buf objects, so waiting only plane zero can present
+        // plane-one GPU writes before they complete. Linux anon-inode
+        // metadata cannot reliably prove that two descriptors are the same
+        // dma-buf, while an extra wait on shared backing is harmless.
+        // The queued ADD owns the original descriptor while these duplicates
+        // live with the render-buffer generation through its final destroy.
+        let mut sync_fds = Vec::new();
+        for param in &params {
+            let sync_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(param.fd) });
+            match sync_fd {
+                Ok(sync_fd) => sync_fds.push(sync_fd),
+                Err(error) => {
                     error!(
                         "Failed to duplicate dma-buf fd for synchronization: {}",
                         error
                     );
-                })
-                .ok()
-        });
-        let Some(sync_fd) = sync_fd else {
+                    for param in params {
+                        unsafe { libc::close(param.fd) };
+                    }
+                    ctx.fatal_protocol_error = true;
+                    return None;
+                }
+            }
+        }
+        if sync_fds.is_empty() {
             for param in params {
                 unsafe { libc::close(param.fd) };
             }
             ctx.fatal_protocol_error = true;
             return None;
-        };
+        }
 
         // Send ADDs. If the wire builder ever rejects one of these fixed-size
         // messages, close every descriptor that was not handed to the queue
@@ -626,7 +633,8 @@ impl LinuxDmabufHandler {
             ctx.fatal_protocol_error = true;
             return None;
         }
-        Some((HostId(host_id), sync_fd))
+        ctx.used_dmabuf_params.insert(params_id);
+        Some((HostId(host_id), sync_fds))
     }
 
     fn discard_pending_params(ctx: &mut Context, params_id: u32) {
@@ -706,6 +714,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
+        ctx.used_dmabuf_params.remove(&params_id);
         if let Some(previous) = ctx.pending_params.insert(params_id, Vec::new()) {
             // Reusing a params ID is a protocol violation, but closing stale
             // duplicated plane FDs here keeps the connection from leaking
@@ -1043,6 +1052,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
 impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let id = ctx.last_sender_id;
+        ctx.used_dmabuf_params.remove(&id);
         if let Some(host_id) = ctx.shadow_table.get_host_id(id) {
             if ctx
                 .pending_native_creates
@@ -1081,6 +1091,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         }
 
         let params_id = ctx.last_sender_id;
+        if ctx.used_dmabuf_params.contains(&params_id) {
+            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            return Action::Drop;
+        }
         if plane_idx > 1 {
             queue_protocol_error(ctx, params_id, 1, "dmabuf plane index out of bounds");
             return Action::Drop;
@@ -1152,6 +1166,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         flags: u32,
     ) -> Action {
         let params_id = ctx.last_sender_id;
+        if ctx.used_dmabuf_params.contains(&params_id) {
+            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            return Action::Drop;
+        }
         if !Self::valid_params(ctx, params_id, width, height, format) {
             error!(
                 "Rejecting invalid dmabuf create: params={}, width={}, height={}, format={:#010x}",
@@ -1187,11 +1205,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 Vec::new(),
             )
         });
-        if let Some((host_params_id, sync_fd)) = processed {
+        if let Some((host_params_id, sync_fds)) = processed {
             let pending = PendingNativeCreate {
                 guest_params_id: params_id,
                 dimensions: (width, height),
-                sync_fd,
+                sync_fds,
             };
             match ctx.pending_native_creates.entry(host_params_id) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1292,7 +1310,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 // fresh guest server ID immediately after the handler returns.
                 // Register the host generation now; compositor lookup resolves
                 // the guest ID through the shadow table after forwarding.
-                if !ctx.register_native_buffer(buffer, pending.dimensions, Some(pending.sync_fd)) {
+                if !ctx.register_native_buffer(buffer, pending.dimensions, pending.sync_fds) {
                     error!("Duplicate render buffer host ID {}", buffer);
                     ctx.fatal_protocol_error = true;
                 }
@@ -1343,6 +1361,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         flags: u32,
     ) -> Action {
         let params_id = ctx.last_sender_id;
+        if ctx.used_dmabuf_params.contains(&params_id) {
+            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            return Action::Drop;
+        }
         // A params object is tracked as soon as create_params is decoded. If
         // it is absent here, do not allocate/map a host wl_buffer: doing so
         // leaves a dangling guest→host mapping even though no create request
@@ -1409,8 +1431,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 Vec::new(),
             )
         });
-        if let Some((_host_params_id, sync_fd)) = processed {
-            if !ctx.register_native_buffer(host_buffer_id, (width, height), Some(sync_fd)) {
+        if let Some((_host_params_id, sync_fds)) = processed {
+            if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
                 ctx.fatal_protocol_error = true;
             }
@@ -1448,9 +1470,9 @@ mod tests {
         PendingNativeCreate {
             guest_params_id,
             dimensions,
-            sync_fd: std::fs::File::open("/dev/null")
+            sync_fds: vec![std::fs::File::open("/dev/null")
                 .expect("open test synchronization descriptor")
-                .into(),
+                .into()],
         }
     }
 
@@ -1472,7 +1494,7 @@ mod tests {
         ctx.shadow_table.set_host_version(old_host_params_id, 4);
 
         let old_pending = pending_native_create(guest_params_id, (16, 8));
-        let old_sync_fd = old_pending.sync_fd.as_raw_fd();
+        let old_sync_fd = old_pending.sync_fds[0].as_raw_fd();
         ctx.pending_native_creates
             .insert(HostId(old_host_params_id), old_pending);
 
@@ -1506,7 +1528,7 @@ mod tests {
         ctx.shadow_table
             .set_host_version(replacement_host_params_id, 4);
         let replacement = pending_native_create(guest_params_id, (32, 16));
-        let replacement_sync_fd = replacement.sync_fd.as_raw_fd();
+        let replacement_sync_fd = replacement.sync_fds[0].as_raw_fd();
         ctx.pending_native_creates
             .insert(HostId(replacement_host_params_id), replacement);
 
@@ -1764,6 +1786,89 @@ mod tests {
     }
 
     #[test]
+    fn create_immed_registers_one_complete_buffer_generation() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let params_id = 7;
+        let host_params_id = 8;
+        let buffer_id = 90;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(params_id, host_params_id);
+        ctx.shadow_table.track_interface_with_version(
+            params_id,
+            "zwp_linux_buffer_params_v1".into(),
+            4,
+        );
+        ctx.shadow_table.set_host_version(host_params_id, 4);
+        ctx.pending_params.insert(
+            params_id,
+            vec![PendingParam {
+                fd: pipe_fds[1],
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.last_sender_id = params_id;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create_immed(&mut ctx, buffer_id, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+
+        let host_buffer_id = ctx.shadow_table.get_host_id(buffer_id).unwrap();
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(
+            message_opcode(&ctx.client_to_host_queue[0].0),
+            zwp_linux_buffer_params_v1::REQ_ADD
+        );
+        assert_eq!(
+            message_opcode(&ctx.client_to_host_queue[1].0),
+            zwp_linux_buffer_params_v1::REQ_CREATE_IMMED
+        );
+        assert_eq!(ctx.buffer_dimensions(buffer_id), Some((16, 8)));
+        assert_eq!(
+            ctx.native_buffer_sync_fds(buffer_id)
+                .map(|sync_fds| sync_fds.len()),
+            Some(1)
+        );
+        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(ctx.used_dmabuf_params.contains(&params_id));
+
+        drop(ctx);
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn reused_params_report_already_used_without_mapping_a_buffer() {
+        let params_id = 7;
+        let buffer_id = 90;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(params_id, 8);
+        ctx.used_dmabuf_params.insert(params_id);
+        ctx.last_sender_id = params_id;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create_immed(&mut ctx, buffer_id, 16, 8, 0x3432_5258, 0),
+            Action::Drop
+        );
+
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
     fn feedback_destroy_removes_format_index_mapping() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.map_id(10, 20);
@@ -1953,7 +2058,8 @@ mod tests {
             .get_guest_id(host_buffer_id)
             .expect("generated created event must map the host buffer");
         assert!(
-            ctx.native_buffer_sync_fd(guest_buffer_id).is_some(),
+            ctx.native_buffer_sync_fds(guest_buffer_id)
+                .is_some_and(|sync_fds| !sync_fds.is_empty()),
             "created must move the retained fence descriptor to the host buffer"
         );
         assert!(
@@ -1962,6 +2068,111 @@ mod tests {
         );
         assert_eq!(ctx.render_buffer_count(), 1);
 
+        unsafe {
+            libc::close(pipe_fds[0]);
+        }
+    }
+
+    #[test]
+    fn multi_plane_create_retains_each_distinct_backing_fence() {
+        let mut first_pipe = [-1; 2];
+        let mut second_pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
+        let guest_params_id = 7;
+        let host_params_id = 8;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(guest_params_id, host_params_id);
+        ctx.pending_params.insert(
+            guest_params_id,
+            vec![
+                PendingParam {
+                    fd: first_pipe[1],
+                    plane_idx: 0,
+                    offset: 0,
+                    stride: 16,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+                PendingParam {
+                    fd: second_pipe[1],
+                    plane_idx: 1,
+                    offset: 128,
+                    stride: 16,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+            ],
+        );
+        ctx.last_sender_id = guest_params_id;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, WL_SHM_FORMAT_NV12, 0),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.pending_native_creates[&HostId(host_params_id)]
+                .sync_fds
+                .len(),
+            2,
+            "every distinct plane backing must retain its own compositor fence"
+        );
+
+        drop(ctx);
+        unsafe {
+            libc::close(first_pipe[0]);
+            libc::close(second_pipe[0]);
+        }
+    }
+
+    #[test]
+    fn multi_plane_create_retains_each_shared_backing_plane() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let duplicate = unsafe { libc::dup(pipe_fds[1]) };
+        assert!(duplicate >= 0);
+        let guest_params_id = 7;
+        let host_params_id = 8;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(guest_params_id, host_params_id);
+        ctx.pending_params.insert(
+            guest_params_id,
+            vec![
+                PendingParam {
+                    fd: pipe_fds[1],
+                    plane_idx: 0,
+                    offset: 0,
+                    stride: 16,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+                PendingParam {
+                    fd: duplicate,
+                    plane_idx: 1,
+                    offset: 128,
+                    stride: 16,
+                    modifier_hi: 0,
+                    modifier_lo: 0,
+                },
+            ],
+        );
+        ctx.last_sender_id = guest_params_id;
+
+        let mut handler = LinuxDmabufHandler;
+        assert_eq!(
+            handler.on_create(&mut ctx, 16, 8, WL_SHM_FORMAT_NV12, 0),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.pending_native_creates[&HostId(host_params_id)]
+                .sync_fds
+                .len(),
+            2,
+            "descriptor identity must not incorrectly merge distinct dma-buf planes"
+        );
+
+        drop(ctx);
         unsafe {
             libc::close(pipe_fds[0]);
         }
@@ -2365,7 +2576,7 @@ mod tests {
             .expect("late old created must preserve replacement generation");
         assert_eq!(replacement.guest_params_id, 7);
         assert_eq!(replacement.dimensions, (32, 16));
-        assert_eq!(replacement.sync_fd.as_raw_fd(), replacement_sync_fd);
+        assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
         assert!(
             fd_is_open(replacement_sync_fd),
             "late old created must not close the replacement synchronization descriptor"
@@ -2405,7 +2616,7 @@ mod tests {
             .expect("late old failed must preserve replacement generation");
         assert_eq!(replacement.guest_params_id, 7);
         assert_eq!(replacement.dimensions, (32, 16));
-        assert_eq!(replacement.sync_fd.as_raw_fd(), replacement_sync_fd);
+        assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
         assert!(
             fd_is_open(replacement_sync_fd),
             "late old failed must not close the replacement synchronization descriptor"

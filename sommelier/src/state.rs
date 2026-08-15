@@ -761,7 +761,7 @@ impl Default for ViewportState {
 }
 
 impl DamageRect {
-    pub fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self {
             x,
             y,
@@ -771,20 +771,95 @@ impl DamageRect {
     }
 }
 
+const MAX_PENDING_DAMAGE_RECTS: usize = 256;
+const FULL_DAMAGE_SENTINEL: DamageRect = DamageRect::new(0, 0, i32::MAX, i32::MAX);
+
+/// Bounded damage accumulated for one surface commit.
+///
+/// A client may send arbitrarily many damage requests before committing.
+/// Keeping every rectangle makes later coalescing quadratic and permits
+/// unbounded memory growth. Once the exact set reaches its cap, replace it
+/// with one conservative rectangle covering every valid buffer or surface
+/// coordinate; downstream clipping reduces it to the actual content extent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DamageRegion {
+    rects: Vec<DamageRect>,
+    full: bool,
+}
+
+impl DamageRegion {
+    pub fn push(&mut self, rect: DamageRect) {
+        if self.full || rect.width <= 0 || rect.height <= 0 {
+            return;
+        }
+        if self.rects.len() >= MAX_PENDING_DAMAGE_RECTS {
+            self.rects.clear();
+            self.rects.push(FULL_DAMAGE_SENTINEL);
+            self.full = true;
+            return;
+        }
+        self.rects.push(rect);
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    fn take(&mut self) -> (Vec<DamageRect>, bool) {
+        let full = std::mem::take(&mut self.full);
+        (std::mem::take(&mut self.rects), full)
+    }
+}
+
+impl From<Vec<DamageRect>> for DamageRegion {
+    fn from(rects: Vec<DamageRect>) -> Self {
+        let mut region = Self::default();
+        for rect in rects {
+            region.push(rect);
+        }
+        region
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceContentSnapshot {
+    buffer_id: Option<u32>,
+    dimensions: Option<(i32, i32)>,
+}
+
+impl SurfaceContentSnapshot {
+    fn from_buffer(buffer_id: u32) -> Self {
+        Self {
+            buffer_id: Some(buffer_id),
+            dimensions: None,
+        }
+    }
+
+    fn buffer_id(&self) -> Option<u32> {
+        self.buffer_id
+    }
+
+    fn dimensions(&self) -> Option<(i32, i32)> {
+        self.dimensions
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceState {
-    /// Buffer selected by the most recent committed attach. A commit that
-    /// changes only damage still uses this buffer.
-    pub current_buffer_id: Option<u32>,
+    /// Immutable metadata for the committed surface contents plus an optional
+    /// live wl_buffer object reference. The reference may disappear after
+    /// wl_buffer.destroy while the dimensions remain valid for damage mapping.
+    current_content: Option<SurfaceContentSnapshot>,
     /// `Some(None)` represents an explicit `attach(NULL)`, while `None`
     /// means that this commit has no attach request at all.
     pub pending_buffer_id: Option<Option<u32>>,
     /// Damage expressed in surface-local coordinates. It can only be copied
     /// directly when the current buffer has the default transform and no
     /// viewport; otherwise the compositor falls back to a complete copy.
-    pub pending_surface_damage: Vec<DamageRect>,
+    pub pending_surface_damage: DamageRegion,
     /// Damage expressed in buffer pixel coordinates.
-    pub pending_buffer_damage: Vec<DamageRect>,
+    pub pending_buffer_damage: DamageRegion,
     /// Buffer scale/transform are double-buffered by wl_surface. Keeping the
     /// state here lets the commit path decide whether a damage rectangle can
     /// be mapped safely.
@@ -801,7 +876,6 @@ pub struct SurfaceState {
     /// zero-valued attach does not overwrite a real `wl_surface.offset`
     /// request that appeared earlier in the same state batch.
     pub pending_attach_offset: Option<(i32, i32)>,
-    pub current_offset: (i32, i32),
     /// A viewport object exists for this surface. The object's state is
     /// tracked separately because an unset viewport is an identity mapping.
     pub viewport: Option<ViewportState>,
@@ -826,21 +900,27 @@ pub struct SurfaceCommit {
     pub attachment: Option<Option<u32>>,
     pub surface_damage: Vec<DamageRect>,
     pub buffer_damage: Vec<DamageRect>,
+    pub surface_damage_is_full: bool,
+    pub buffer_damage_is_full: bool,
+    /// One-shot placement of the pending attachment relative to the previous
+    /// surface contents. wl_surface.offset replaces legacy attach(x, y); it is
+    /// consumed by this commit and is not persistent surface state.
+    pub buffer_offset: (i32, i32),
 }
 
 impl SurfaceCommit {
-    pub fn buffer_id(&self) -> Option<u32> {
-        self.state.current_buffer_id
-    }
-
     pub fn has_buffer_attach(&self) -> bool {
         matches!(self.attachment, Some(Some(_)))
+    }
+
+    pub fn attached_buffer_id(&self) -> Option<u32> {
+        self.attachment.flatten()
     }
 
     pub fn uses_full_mapping(&self) -> bool {
         self.state.current_buffer_scale != 1
             || self.state.current_buffer_transform != 0
-            || self.state.current_offset != (0, 0)
+            || (self.has_buffer_attach() && self.buffer_offset != (0, 0))
             || self
                 .state
                 .viewport
@@ -863,12 +943,70 @@ impl SurfaceCommit {
 }
 
 impl SurfaceState {
+    pub(crate) fn current_buffer_id(&self) -> Option<u32> {
+        self.current_content
+            .as_ref()
+            .and_then(SurfaceContentSnapshot::buffer_id)
+    }
+
+    pub(crate) fn current_buffer_dimensions(&self) -> Option<(i32, i32)> {
+        self.current_content
+            .as_ref()
+            .and_then(SurfaceContentSnapshot::dimensions)
+    }
+
+    pub(crate) fn set_current_buffer_dimensions(
+        &mut self,
+        buffer_id: u32,
+        dimensions: Option<(i32, i32)>,
+    ) -> bool {
+        if let Some(content) = self.current_content.as_mut() {
+            if content.buffer_id == Some(buffer_id) {
+                content.dimensions = dimensions;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn clear_current_buffer_reference(&mut self, buffer_id: u32) {
+        let remove_content = self.current_content.as_mut().is_some_and(|content| {
+            if content.buffer_id != Some(buffer_id) {
+                return false;
+            }
+            content.buffer_id = None;
+            content.dimensions.is_none()
+        });
+        if remove_content {
+            self.current_content = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_current_buffer_for_test(
+        &mut self,
+        buffer_id: Option<u32>,
+        dimensions: Option<(i32, i32)>,
+    ) {
+        self.current_content = buffer_id
+            .map(|buffer_id| SurfaceContentSnapshot {
+                buffer_id: Some(buffer_id),
+                dimensions,
+            })
+            .or_else(|| {
+                dimensions.map(|dimensions| SurfaceContentSnapshot {
+                    buffer_id: None,
+                    dimensions: Some(dimensions),
+                })
+            });
+    }
+
     /// Apply and consume all state pending for the next surface commit.
     pub fn prepare_commit(&mut self) -> SurfaceCommit {
         let previous = self.clone();
         let attachment = self.pending_buffer_id.take();
         if let Some(buffer_id) = attachment {
-            self.current_buffer_id = buffer_id;
+            self.current_content = buffer_id.map(SurfaceContentSnapshot::from_buffer);
         }
         if let Some(scale) = self.pending_buffer_scale.take() {
             self.current_buffer_scale = scale;
@@ -876,20 +1014,18 @@ impl SurfaceState {
         if let Some(transform) = self.pending_buffer_transform.take() {
             self.current_buffer_transform = transform;
         }
-        let offset = self
+        let buffer_offset = self
             .pending_offset
             .take()
-            .or_else(|| self.pending_attach_offset.take());
+            .or_else(|| self.pending_attach_offset.take())
+            .unwrap_or((0, 0));
         // Consume a legacy attach offset even when an explicit offset wins.
         self.pending_attach_offset = None;
-        if let Some(offset) = offset {
-            self.current_offset = offset;
-        }
         if let Some(viewport) = self.pending_viewport.take() {
             self.viewport = viewport;
         }
-        let surface_damage = std::mem::take(&mut self.pending_surface_damage);
-        let buffer_damage = std::mem::take(&mut self.pending_buffer_damage);
+        let (surface_damage, surface_damage_is_full) = self.pending_surface_damage.take();
+        let (buffer_damage, buffer_damage_is_full) = self.pending_buffer_damage.take();
 
         SurfaceCommit {
             previous,
@@ -897,6 +1033,9 @@ impl SurfaceState {
             attachment,
             surface_damage,
             buffer_damage,
+            surface_damage_is_full,
+            buffer_damage_is_full,
+            buffer_offset,
         }
     }
 }
@@ -904,17 +1043,16 @@ impl SurfaceState {
 impl Default for SurfaceState {
     fn default() -> Self {
         Self {
-            current_buffer_id: None,
+            current_content: None,
             pending_buffer_id: None,
-            pending_surface_damage: Vec::new(),
-            pending_buffer_damage: Vec::new(),
+            pending_surface_damage: DamageRegion::default(),
+            pending_buffer_damage: DamageRegion::default(),
             pending_buffer_scale: None,
             current_buffer_scale: 1,
             pending_buffer_transform: None,
             current_buffer_transform: 0,
             pending_offset: None,
             pending_attach_offset: None,
-            current_offset: (0, 0),
             viewport: None,
             pending_viewport: None,
         }
@@ -939,7 +1077,7 @@ pub struct PendingParam {
 pub struct PendingNativeCreate {
     pub guest_params_id: u32,
     pub dimensions: (i32, i32),
-    pub sync_fd: OwnedFd,
+    pub sync_fds: Vec<OwnedFd>,
 }
 
 pub struct TextInputState {
@@ -1906,7 +2044,7 @@ enum RenderBufferBacking {
     /// Guest-created linux-dmabuf forwarded without a CPU copy.
     Native {
         size: (i32, i32),
-        sync_fd: Option<OwnedFd>,
+        sync_fds: Vec<OwnedFd>,
     },
 }
 
@@ -1944,12 +2082,12 @@ impl RenderBufferRegistry {
         &mut self,
         host_id: HostId,
         size: (i32, i32),
-        sync_fd: Option<OwnedFd>,
+        sync_fds: Vec<OwnedFd>,
     ) -> bool {
         match self.entries.entry(host_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer {
-                    backing: Some(RenderBufferBacking::Native { size, sync_fd }),
+                    backing: Some(RenderBufferBacking::Native { size, sync_fds }),
                     lifecycle: RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
                 });
                 true
@@ -1983,14 +2121,10 @@ impl RenderBufferRegistry {
         }
     }
 
-    fn native_sync_fd(&self, host_id: HostId) -> Option<&OwnedFd> {
+    fn native_sync_fds(&self, host_id: HostId) -> Option<&[OwnedFd]> {
         match self.entries.get(&host_id)?.backing.as_ref()? {
-            RenderBufferBacking::Native {
-                sync_fd: Some(sync_fd),
-                ..
-            } => Some(sync_fd),
-            RenderBufferBacking::LocalCopy(_)
-            | RenderBufferBacking::Native { sync_fd: None, .. } => None,
+            RenderBufferBacking::Native { sync_fds, .. } => Some(sync_fds),
+            RenderBufferBacking::LocalCopy(_) => None,
         }
     }
 
@@ -2013,14 +2147,54 @@ impl RenderBufferRegistry {
         self.entries.remove(&host_id).is_some()
     }
 
-    fn set_use(&mut self, host_id: HostId, use_state: RenderBufferUse) -> bool {
+    fn submit(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
         buffer.lifecycle = match buffer.lifecycle {
-            RenderBufferLifecycle::GuestAlive(_) => RenderBufferLifecycle::GuestAlive(use_state),
+            RenderBufferLifecycle::GuestAlive(_) => {
+                RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease)
+            }
             RenderBufferLifecycle::GuestDestroyed(_) => {
-                RenderBufferLifecycle::GuestDestroyed(use_state)
+                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease)
+            }
+            RenderBufferLifecycle::HostDestroyQueued => return false,
+        };
+        true
+    }
+
+    fn release(&mut self, host_id: HostId) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        buffer.lifecycle = match buffer.lifecycle {
+            RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease) => {
+                RenderBufferLifecycle::GuestAlive(RenderBufferUse::Released)
+            }
+            RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease) => {
+                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::Released)
+            }
+            RenderBufferLifecycle::GuestAlive(
+                RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
+            )
+            | RenderBufferLifecycle::GuestDestroyed(
+                RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
+            )
+            | RenderBufferLifecycle::HostDestroyQueued => return false,
+        };
+        true
+    }
+
+    fn clear_use_after_surface_destroy(&mut self, host_id: HostId) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        buffer.lifecycle = match buffer.lifecycle {
+            RenderBufferLifecycle::GuestAlive(_) => {
+                RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted)
+            }
+            RenderBufferLifecycle::GuestDestroyed(_) => {
+                RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::NeverSubmitted)
             }
             RenderBufferLifecycle::HostDestroyQueued => return false,
         };
@@ -2197,6 +2371,12 @@ pub struct Context {
     /// new binds in the meantime.
     pub removed_host_globals: HashSet<u32>,
     pub pending_params: HashMap<u32, Vec<PendingParam>>,
+    /// Guest linux-dmabuf params objects consumed by create/create_immed.
+    ///
+    /// The protocol object remains alive after consumption so subsequent
+    /// add/create requests can report `already_used` instead of being
+    /// confused with an object that was never tracked.
+    pub used_dmabuf_params: HashSet<u32>,
     pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
@@ -2280,10 +2460,10 @@ impl Context {
         &mut self,
         host_buffer_id: u32,
         size: (i32, i32),
-        sync_fd: Option<OwnedFd>,
+        sync_fds: Vec<OwnedFd>,
     ) -> bool {
         self.render_buffers
-            .register_native(HostId(host_buffer_id), size, sync_fd)
+            .register_native(HostId(host_buffer_id), size, sync_fds)
     }
 
     pub(crate) fn local_buffer(&self, guest_buffer_id: u32) -> Option<&BufferState> {
@@ -2338,9 +2518,9 @@ impl Context {
         self.render_buffers.dimensions(host_id)
     }
 
-    pub(crate) fn native_buffer_sync_fd(&self, guest_buffer_id: u32) -> Option<&OwnedFd> {
+    pub(crate) fn native_buffer_sync_fds(&self, guest_buffer_id: u32) -> Option<&[OwnedFd]> {
         let host_id = self.render_buffer_host_id(guest_buffer_id)?;
-        self.render_buffers.native_sync_fd(host_id)
+        self.render_buffers.native_sync_fds(host_id)
     }
 
     pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
@@ -2348,23 +2528,25 @@ impl Context {
         self.render_buffers.lifecycle(host_id)?.use_state()
     }
 
-    fn set_buffer_use(&mut self, guest_buffer_id: u32, use_state: RenderBufferUse) -> bool {
+    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) -> bool {
         let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
             return false;
         };
-        self.render_buffers.set_use(host_id, use_state)
-    }
-
-    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) -> bool {
-        self.set_buffer_use(guest_buffer_id, RenderBufferUse::AwaitingRelease)
+        self.render_buffers.submit(host_id)
     }
 
     pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: u32) -> bool {
-        self.set_buffer_use(guest_buffer_id, RenderBufferUse::Released)
+        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+            return false;
+        };
+        self.render_buffers.release(host_id)
     }
 
     pub(crate) fn clear_buffer_use(&mut self, guest_buffer_id: u32) -> bool {
-        self.set_buffer_use(guest_buffer_id, RenderBufferUse::NeverSubmitted)
+        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+            return false;
+        };
+        self.render_buffers.clear_use_after_surface_destroy(host_id)
     }
 
     pub(crate) fn mark_buffer_guest_destroyed(&mut self, guest_buffer_id: u32) -> bool {
@@ -2568,6 +2750,7 @@ impl Context {
             next_global_generation: 1,
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
+            used_dmabuf_params: HashSet::new(),
             feedback_index_maps: HashMap::new(),
             synthetic_feedback_objects: HashMap::new(),
             synthetic_feedback_refresh_pending: HashSet::new(),
@@ -3106,40 +3289,42 @@ mod tests {
     #[test]
     fn surface_commit_applies_every_pending_field_atomically() {
         let mut surface = SurfaceState {
-            current_buffer_id: Some(1),
+            current_content: None,
             pending_buffer_id: Some(Some(2)),
-            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)],
-            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)],
+            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
+            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
             pending_buffer_scale: Some(2),
             current_buffer_scale: 1,
             pending_buffer_transform: Some(3),
             current_buffer_transform: 0,
             pending_offset: Some((9, 10)),
             pending_attach_offset: Some((11, 12)),
-            current_offset: (0, 0),
             viewport: None,
             pending_viewport: Some(Some(ViewportState {
                 source: Some((0, 0, 256, 256)),
                 destination: Some((20, 30)),
             })),
         };
+        surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
 
         let commit = surface.prepare_commit();
 
         assert_eq!(commit.attachment, Some(Some(2)));
-        assert_eq!(commit.buffer_id(), Some(2));
+        assert_eq!(commit.attached_buffer_id(), Some(2));
         assert!(commit.has_buffer_attach());
         assert!(commit.uses_full_mapping());
         assert!(!commit.has_invalid_fractional_viewport());
         assert_eq!(commit.surface_damage, vec![DamageRect::new(1, 2, 3, 4)]);
         assert_eq!(commit.buffer_damage, vec![DamageRect::new(5, 6, 7, 8)]);
-        assert_eq!(surface.current_buffer_scale, 2);
-        assert_eq!(surface.current_buffer_transform, 3);
+        assert!(!commit.surface_damage_is_full);
+        assert!(!commit.buffer_damage_is_full);
         assert_eq!(
-            surface.current_offset,
+            commit.buffer_offset,
             (9, 10),
             "an explicit offset must win over the legacy attach offset"
         );
+        assert_eq!(surface.current_buffer_scale, 2);
+        assert_eq!(surface.current_buffer_transform, 3);
         assert_eq!(
             surface.viewport,
             Some(ViewportState {
@@ -3161,33 +3346,131 @@ mod tests {
         assert!(next.attachment.is_none());
         assert!(next.surface_damage.is_empty());
         assert!(next.buffer_damage.is_empty());
+        assert!(!next.surface_damage_is_full);
+        assert!(!next.buffer_damage_is_full);
+        assert_eq!(next.buffer_offset, (0, 0));
         assert_eq!(next.state, commit.state);
     }
 
     #[test]
     fn surface_commit_rollback_restores_the_complete_snapshot() {
         let mut surface = SurfaceState {
-            current_buffer_id: Some(1),
+            current_content: None,
             pending_buffer_id: Some(None),
-            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)],
-            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)],
+            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
+            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
             pending_buffer_scale: Some(2),
             current_buffer_scale: 1,
             pending_buffer_transform: Some(3),
             current_buffer_transform: 0,
-            pending_offset: None,
+            pending_offset: Some((4, 5)),
             pending_attach_offset: Some((11, 12)),
-            current_offset: (4, 5),
             viewport: Some(ViewportState::new()),
             pending_viewport: Some(None),
         };
+        surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
         let before = surface.clone();
 
         let commit = surface.prepare_commit();
+        assert_eq!(commit.buffer_offset, (4, 5));
         assert_ne!(surface, before);
         commit.rollback(&mut surface);
 
         assert_eq!(surface, before);
+    }
+
+    #[test]
+    fn surface_commit_detach_clears_committed_content_dimensions() {
+        let mut surface = SurfaceState {
+            pending_buffer_id: Some(None),
+            ..SurfaceState::default()
+        };
+        surface.set_current_buffer_for_test(Some(1), Some((100, 50)));
+
+        let commit = surface.prepare_commit();
+
+        assert_eq!(commit.attachment, Some(None));
+        assert_eq!(surface.current_buffer_id(), None);
+        assert_eq!(surface.current_buffer_dimensions(), None);
+    }
+
+    #[test]
+    fn content_snapshot_ignores_mismatched_destroy_generations() {
+        let mut surface = SurfaceState::default();
+        surface.set_current_buffer_for_test(Some(7), Some((100, 50)));
+
+        surface.clear_current_buffer_reference(8);
+        assert_eq!(surface.current_buffer_id(), Some(7));
+        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
+
+        surface.clear_current_buffer_reference(7);
+        assert_eq!(surface.current_buffer_id(), None);
+        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
+        assert!(
+            !surface.set_current_buffer_dimensions(7, Some((1, 1))),
+            "a reused numeric ID must not mutate a dimensions-only old snapshot"
+        );
+        assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
+    }
+
+    #[test]
+    fn pending_damage_is_exact_until_bounded_then_becomes_full() {
+        let mut surface = SurfaceState::default();
+        let exact: Vec<_> = (0..MAX_PENDING_DAMAGE_RECTS)
+            .map(|index| DamageRect::new(index as i32, 0, 1, 1))
+            .collect();
+        for rect in &exact {
+            surface.pending_buffer_damage.push(*rect);
+        }
+
+        assert_eq!(surface.pending_buffer_damage.rects, exact);
+        assert!(!surface.pending_buffer_damage.full);
+
+        surface
+            .pending_buffer_damage
+            .push(DamageRect::new(-10, -20, 30, 40));
+        assert_eq!(
+            surface.pending_buffer_damage.rects,
+            vec![FULL_DAMAGE_SENTINEL]
+        );
+        assert!(surface.pending_buffer_damage.full);
+
+        for _ in 0..MAX_PENDING_DAMAGE_RECTS {
+            surface
+                .pending_buffer_damage
+                .push(DamageRect::new(1, 1, 1, 1));
+        }
+        assert_eq!(
+            surface.pending_buffer_damage.rects,
+            vec![FULL_DAMAGE_SENTINEL],
+            "a collapsed region must remain bounded"
+        );
+
+        let commit = surface.prepare_commit();
+        assert_eq!(commit.buffer_damage, vec![FULL_DAMAGE_SENTINEL]);
+        assert!(commit.buffer_damage_is_full);
+        assert!(surface.pending_buffer_damage.is_empty());
+        assert!(!surface.pending_buffer_damage.full);
+    }
+
+    #[test]
+    fn collapsed_damage_rollback_restores_the_full_pending_region() {
+        let mut surface = SurfaceState::default();
+        for index in 0..=MAX_PENDING_DAMAGE_RECTS {
+            surface
+                .pending_surface_damage
+                .push(DamageRect::new(index as i32, 0, 1, 1));
+        }
+        let pending = surface.clone();
+
+        let commit = surface.prepare_commit();
+        assert!(commit.surface_damage_is_full);
+        commit.rollback(&mut surface);
+
+        assert_eq!(surface, pending);
+        let retry = surface.prepare_commit();
+        assert!(retry.surface_damage_is_full);
+        assert_eq!(retry.surface_damage, vec![FULL_DAMAGE_SENTINEL]);
     }
 
     #[test]
@@ -3214,13 +3497,13 @@ mod tests {
         let buffer = 20;
         let host_buffer = 40;
         ctx.shadow_table.map_id(buffer, host_buffer);
-        assert!(ctx.register_native_buffer(host_buffer, (1, 1), None));
+        assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
             ctx.host_buffer_use(buffer),
             Some(RenderBufferUse::NeverSubmitted)
         );
-        ctx.mark_buffer_submitted(buffer);
+        assert!(ctx.mark_buffer_submitted(buffer));
         assert_eq!(
             ctx.host_buffer_use(buffer),
             Some(RenderBufferUse::AwaitingRelease)
@@ -3228,18 +3511,18 @@ mod tests {
         assert!(ctx.buffer_is_submitted(buffer));
         assert!(!ctx.buffer_is_released(buffer));
 
-        ctx.mark_buffer_released(buffer);
+        assert!(ctx.mark_buffer_released(buffer));
         assert_eq!(ctx.host_buffer_use(buffer), Some(RenderBufferUse::Released));
         assert!(!ctx.buffer_is_submitted(buffer));
         assert!(ctx.buffer_is_released(buffer));
 
-        ctx.mark_buffer_submitted(buffer);
+        assert!(ctx.mark_buffer_submitted(buffer));
         assert_eq!(
             ctx.host_buffer_use(buffer),
             Some(RenderBufferUse::AwaitingRelease),
             "a new commit must replace the prior release edge"
         );
-        ctx.clear_buffer_use(buffer);
+        assert!(ctx.clear_buffer_use(buffer));
         assert_eq!(
             ctx.host_buffer_use(buffer),
             Some(RenderBufferUse::NeverSubmitted)
@@ -3268,27 +3551,32 @@ mod tests {
         let buffer = 20;
         let host_buffer = 40;
         ctx.shadow_table.map_id(buffer, host_buffer);
-        assert!(ctx.register_native_buffer(host_buffer, (1, 1), None));
+        assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         for mut encoded in 0..sequence_count {
-            ctx.clear_buffer_use(buffer);
+            assert!(ctx.clear_buffer_use(buffer));
+            let mut model = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
-                let model = match operations[encoded % operations.len()] {
+                let operation = operations[encoded % operations.len()];
+                encoded /= operations.len();
+                match operation {
                     Operation::Submit => {
-                        ctx.mark_buffer_submitted(buffer);
-                        RenderBufferUse::AwaitingRelease
+                        model = RenderBufferUse::AwaitingRelease;
+                        assert!(ctx.mark_buffer_submitted(buffer));
                     }
                     Operation::Release => {
-                        ctx.mark_buffer_released(buffer);
-                        RenderBufferUse::Released
+                        let expected = model == RenderBufferUse::AwaitingRelease;
+                        if expected {
+                            model = RenderBufferUse::Released;
+                        }
+                        assert_eq!(ctx.mark_buffer_released(buffer), expected);
                     }
                     Operation::Clear => {
-                        ctx.clear_buffer_use(buffer);
-                        RenderBufferUse::NeverSubmitted
+                        model = RenderBufferUse::NeverSubmitted;
+                        assert!(ctx.clear_buffer_use(buffer));
                     }
-                };
-                encoded /= operations.len();
+                }
                 assert_eq!(ctx.host_buffer_use(buffer), Some(model));
                 assert_eq!(
                     ctx.render_buffers.lifecycle(HostId(host_buffer)),
@@ -3303,8 +3591,8 @@ mod tests {
         let host_id = HostId(40);
         let mut registry = RenderBufferRegistry::default();
 
-        assert!(registry.register_native(host_id, (16, 8), None));
-        assert!(!registry.register_native(host_id, (99, 99), None));
+        assert!(registry.register_native(host_id, (16, 8), Vec::new()));
+        assert!(!registry.register_native(host_id, (99, 99), Vec::new()));
 
         assert_eq!(
             registry.lifecycle(host_id),
@@ -3339,7 +3627,7 @@ mod tests {
 
         for mut encoded in 0..sequence_count {
             let mut registry = RenderBufferRegistry::default();
-            assert!(registry.register_native(HostId(host_id), (1, 1), None));
+            assert!(registry.register_native(HostId(host_id), (1, 1), Vec::new()));
             let mut model = RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted);
 
             for _ in 0..sequence_len {
@@ -3347,15 +3635,9 @@ mod tests {
                 encoded /= operations.len();
 
                 let actual_changed = match operation {
-                    Operation::Submit => {
-                        registry.set_use(HostId(host_id), RenderBufferUse::AwaitingRelease)
-                    }
-                    Operation::Release => {
-                        registry.set_use(HostId(host_id), RenderBufferUse::Released)
-                    }
-                    Operation::Clear => {
-                        registry.set_use(HostId(host_id), RenderBufferUse::NeverSubmitted)
-                    }
+                    Operation::Submit => registry.submit(HostId(host_id)),
+                    Operation::Release => registry.release(HostId(host_id)),
+                    Operation::Clear => registry.clear_use_after_surface_destroy(HostId(host_id)),
                     Operation::GuestDestroy => registry.mark_guest_destroyed(HostId(host_id)),
                     Operation::HostDestroy => registry.mark_host_destroy_queued(HostId(host_id)),
                 };
@@ -3368,14 +3650,29 @@ mod tests {
                         RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease),
                         true,
                     ),
-                    (RenderBufferLifecycle::GuestAlive(_), Operation::Release) => (
+                    (
+                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease),
+                        Operation::Release,
+                    ) => (
                         RenderBufferLifecycle::GuestAlive(RenderBufferUse::Released),
                         true,
                     ),
-                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Release) => (
+                    (
+                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease),
+                        Operation::Release,
+                    ) => (
                         RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::Released),
                         true,
                     ),
+                    (
+                        RenderBufferLifecycle::GuestAlive(
+                            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
+                        )
+                        | RenderBufferLifecycle::GuestDestroyed(
+                            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released,
+                        ),
+                        Operation::Release,
+                    ) => (model, false),
                     (RenderBufferLifecycle::GuestAlive(_), Operation::Clear) => (
                         RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
                         true,
