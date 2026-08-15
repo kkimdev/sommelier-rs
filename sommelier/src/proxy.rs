@@ -386,6 +386,43 @@ impl Client {
         }
     }
 
+    fn consume_event(interface: &str, msg: &mut WireMessage) -> Result<(), ProtocolError> {
+        if protocols::wayland::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::wayland::consume_event(interface, msg)
+        } else if protocols::xdg_shell::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::xdg_shell::consume_event(interface, msg)
+        } else if protocols::linux_dmabuf_v1::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::linux_dmabuf_v1::consume_event(interface, msg)
+        } else if protocols::viewporter::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::viewporter::consume_event(interface, msg)
+        } else if protocols::text_input_unstable_v3::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::text_input_unstable_v3::consume_event(interface, msg)
+        } else if protocols::text_input_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::text_input_unstable_v1::consume_event(interface, msg)
+        } else if protocols::text_input_extension_unstable_v1::ALLOWED_INTERFACES
+            .contains(&interface)
+        {
+            protocols::text_input_extension_unstable_v1::consume_event(interface, msg)
+        } else if protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::xdg_decoration_unstable_v1::consume_event(interface, msg)
+        } else if protocols::fractional_scale_v1::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::fractional_scale_v1::consume_event(interface, msg)
+        } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
+        {
+            protocols::keyboard_extension_unstable_v1::consume_event(interface, msg)
+        } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::aura_shell::consume_event(interface, msg)
+        } else {
+            log::error!(
+                "Cannot consume event for unsupported interface {} (id={}, opcode={})",
+                interface,
+                msg.sender_id,
+                msg.opcode
+            );
+            Err(ProtocolError::InvalidObjectId(msg.sender_id))
+        }
+    }
+
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
         self.ctx.reap_clipboard_pumps();
         let (conn, other_conn) = match direction {
@@ -461,21 +498,15 @@ impl Client {
             let target_sender_id =
                 translated_sender_id(&self.ctx.shadow_table, direction, sender_id);
 
+            let suppress_host_event = matches!(direction, Direction::HostToClient)
+                && pending_host_event_is_stale(&self.ctx, sender_id, opcode, guest_id);
             let interface = match direction {
                 Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id).cloned(),
                 Direction::HostToClient => {
                     let host_interface = self.ctx.shadow_table.get_host_interface(sender_id);
                     let guest_interface =
                         guest_id.and_then(|gid| self.ctx.shadow_table.get_interface(gid));
-                    if pending_host_event_is_stale(&self.ctx, sender_id, opcode, guest_id) {
-                        // A destructor has already been forwarded for this
-                        // object. Ignore host events queued before the
-                        // compositor processed it; only wl_display.delete_id
-                        // is meaningful while the mapping is pending.
-                        None
-                    } else {
-                        host_interface.or(guest_interface).cloned()
-                    }
+                    host_interface.or(guest_interface).cloned()
                 }
             };
 
@@ -495,6 +526,13 @@ impl Client {
                         &interface,
                         &mut msg,
                     ),
+                    Direction::HostToClient if suppress_host_event => {
+                        // A destructor has already been forwarded for this
+                        // object. Decode the queued event so its payload and
+                        // ordered SCM_RIGHTS descriptors are consumed, but do
+                        // not invoke handlers or expose it to the guest.
+                        Self::consume_event(&interface, &mut msg).map(|()| None)
+                    }
                     Direction::HostToClient => {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
@@ -799,6 +837,197 @@ mod tests {
             current.as_ref().map_or(true, |current| current != target),
             "descriptor {fd} still refers to its owned resource: {current:?}"
         );
+    }
+
+    const STALE_GUEST_KEYBOARD: u32 = 10;
+    const STALE_HOST_KEYBOARD: u32 = 20;
+    const LIVE_GUEST_KEYBOARD: u32 = 11;
+    const LIVE_HOST_KEYBOARD: u32 = 21;
+
+    fn pending_keyboard_client() -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (guest_peer, guest_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (_host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        guest_peer
+            .set_nonblocking(true)
+            .expect("guest peer should become nonblocking");
+        let mut client = Client::new(
+            WaylandConnection::new(guest_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            false,
+            false,
+        );
+
+        for (guest_id, host_id) in [
+            (STALE_GUEST_KEYBOARD, STALE_HOST_KEYBOARD),
+            (LIVE_GUEST_KEYBOARD, LIVE_HOST_KEYBOARD),
+        ] {
+            client.ctx.shadow_table.map_id(guest_id, host_id);
+            client.ctx.shadow_table.track_interface_with_version(
+                guest_id,
+                "wl_keyboard".to_string(),
+                10,
+            );
+            client.ctx.shadow_table.track_host_interface_with_version(
+                host_id,
+                "wl_keyboard".to_string(),
+                10,
+            );
+        }
+        client
+            .ctx
+            .shadow_table
+            .mark_pending_destroy(STALE_GUEST_KEYBOARD);
+        client.ctx.keyboard_repeatable_keys.insert(
+            crate::state::HostId(STALE_HOST_KEYBOARD),
+            std::collections::HashSet::from([57]),
+        );
+
+        (client, guest_peer, _host_peer)
+    }
+
+    fn duplicate_pipe_read_fd() -> (RawFd, std::path::PathBuf) {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let keymap_fd = unsafe { libc::fcntl(pipe_fds[0], libc::F_DUPFD_CLOEXEC, 1000) };
+        assert!(keymap_fd >= 1000, "fd duplication should succeed");
+        let keymap_target =
+            fs::read_link(format!("/proc/self/fd/{keymap_fd}")).expect("keymap fd target");
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+        (keymap_fd, keymap_target)
+    }
+
+    fn stale_keymap_event(keymap_fd: RawFd) -> Vec<u8> {
+        use crate::protocols::wayland::wl_keyboard;
+
+        let mut keymap = MessageBuilder::new();
+        keymap.write_u32(1);
+        keymap.write_fd(keymap_fd);
+        keymap.write_u32(0);
+        keymap.build_message(STALE_HOST_KEYBOARD, wl_keyboard::EVT_KEYMAP)
+    }
+
+    fn repeat_info_event(keyboard: u32) -> Vec<u8> {
+        use crate::protocols::wayland::wl_keyboard;
+
+        let mut repeat_info = MessageBuilder::new();
+        repeat_info.write_i32(25);
+        repeat_info.write_i32(400);
+        repeat_info.build_message(keyboard, wl_keyboard::EVT_REPEAT_INFO)
+    }
+
+    fn assert_live_repeat_info_forwarded(
+        guest_peer: &mut std::os::unix::net::UnixStream,
+        expected: &[u8],
+    ) {
+        use std::io::Read;
+
+        let mut forwarded = vec![0; expected.len()];
+        guest_peer
+            .read_exact(&mut forwarded)
+            .expect("the live follow-up event must reach the guest");
+        assert_eq!(forwarded, expected);
+    }
+
+    #[tokio::test]
+    async fn pending_destroy_event_consumes_known_fd_before_live_event_in_same_batch() {
+        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
+        let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
+        let keymap = stale_keymap_event(keymap_fd);
+        let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
+        let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
+
+        client.host_conn.read_buf.extend_from_slice(&keymap);
+        client
+            .host_conn
+            .read_buf
+            .extend_from_slice(&live_repeat_info);
+        client.host_conn.read_fds.push(keymap_fd);
+
+        assert!(
+            client.handle_msgs(Direction::HostToClient).await,
+            "a known stale event with an FD must not terminate the connection"
+        );
+        assert!(client.host_conn.read_buf.is_empty());
+        assert!(client.host_conn.read_fds.is_empty());
+        assert!(
+            !client.host_conn.ambiguous_untracked_fd,
+            "schema-aware consumption must not poison later FD ordering"
+        );
+        assert!(
+            client
+                .ctx
+                .shadow_table
+                .is_pending_destroy_guest(STALE_GUEST_KEYBOARD),
+            "dropping a stale event must not complete object teardown"
+        );
+        assert_eq!(
+            client.ctx.keyboard_repeatable_keys[&crate::state::HostId(STALE_HOST_KEYBOARD)],
+            std::collections::HashSet::from([57]),
+            "schema consumption must not invoke the keymap handler"
+        );
+        assert_live_repeat_info_forwarded(&mut guest_peer, &expected_repeat_info);
+        assert_fd_released(keymap_fd, &keymap_target);
+    }
+
+    #[tokio::test]
+    async fn pending_destroy_event_consumes_known_fd_before_partial_followup() {
+        use std::io::Read;
+
+        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
+        let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
+        let keymap = stale_keymap_event(keymap_fd);
+        let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
+        let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
+
+        client.host_conn.read_buf.extend_from_slice(&keymap);
+        client
+            .host_conn
+            .read_buf
+            .extend_from_slice(&live_repeat_info[..4]);
+        client.host_conn.read_fds.push(keymap_fd);
+
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert_eq!(
+            client.host_conn.read_buf,
+            live_repeat_info[..4],
+            "the incomplete follow-up must remain buffered"
+        );
+        assert!(client.host_conn.read_fds.is_empty());
+        assert!(!client.host_conn.ambiguous_untracked_fd);
+        assert_eq!(
+            client.ctx.keyboard_repeatable_keys[&crate::state::HostId(STALE_HOST_KEYBOARD)],
+            std::collections::HashSet::from([57]),
+            "schema consumption must not invoke the keymap handler"
+        );
+        let mut premature = [0u8; 1];
+        let read_error = guest_peer
+            .read(&mut premature)
+            .expect_err("an incomplete live event must not be forwarded");
+        assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
+        assert_fd_released(keymap_fd, &keymap_target);
+
+        client
+            .host_conn
+            .read_buf
+            .extend_from_slice(&live_repeat_info[4..]);
+        assert!(
+            client.handle_msgs(Direction::HostToClient).await,
+            "the completed live follow-up must remain decodable"
+        );
+        assert!(client.host_conn.read_buf.is_empty());
+        assert_live_repeat_info_forwarded(&mut guest_peer, &expected_repeat_info);
     }
 
     #[tokio::test]

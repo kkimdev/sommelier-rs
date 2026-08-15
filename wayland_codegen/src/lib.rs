@@ -95,6 +95,22 @@ mod tests {
             compact.contains("queue_local_delete_id"),
             "generated local-only destructors must synthesize a guest delete_id"
         );
+        assert!(
+            compact.contains(
+                "pubfnconsume_event(interface:&str,msg:&mutWireMessage,)->Result<(),ProtocolError>"
+            ),
+            "generated protocols must expose schema-aware event consumption"
+        );
+        assert!(
+            compact.contains(
+                "pubfnconsume_event(msg:&mutWireMessage)->Result<(),ProtocolError>{let_=Event::from_wire(msg)?;Ok(())}"
+            ),
+            "event consumption must decode the complete schema without dispatching a handler"
+        );
+        assert!(
+            compact.contains("_=>Err(ProtocolError::InvalidObjectId(msg.sender_id))"),
+            "event consumption must reject interfaces outside the generated protocol"
+        );
     }
 
     #[test]

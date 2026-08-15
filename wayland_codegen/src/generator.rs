@@ -17,8 +17,6 @@ limitations under the License.
 use crate::protocol::*;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 pub fn generate(protocol: &Protocol) -> String {
     let mut parts = Vec::new();
@@ -26,6 +24,7 @@ pub fn generate(protocol: &Protocol) -> String {
     let mut handler_trait_names = Vec::new();
     let mut dispatch_request_cases = Vec::new();
     let mut dispatch_event_cases = Vec::new();
+    let mut consume_event_cases = Vec::new();
 
     for item in &protocol.items {
         if let ProtocolItem::Interface(interface) = item {
@@ -41,6 +40,9 @@ pub fn generate(protocol: &Protocol) -> String {
             });
             dispatch_event_cases.push(quote! {
                 #name => #mod_name::dispatch_event(msg, handler, ctx),
+            });
+            consume_event_cases.push(quote! {
+                #name => #mod_name::consume_event(msg),
             });
 
             parts.push(generate_interface(interface));
@@ -103,31 +105,26 @@ pub fn generate(protocol: &Protocol) -> String {
                 }
             }
 
+            pub fn consume_event(
+                interface: &str,
+                msg: &mut WireMessage,
+            ) -> Result<(), ProtocolError> {
+                match interface {
+                    #(#consume_event_cases)*
+                    _ => Err(ProtocolError::InvalidObjectId(msg.sender_id)),
+                }
+            }
+
             #delegation_macro
         }
     };
 
-    format_rust_code(&expanded.to_string())
-}
-
-fn format_rust_code(code: &str) -> String {
-    if let Ok(mut child) = Command::new("rustfmt")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(code.as_bytes());
-        }
-        if let Ok(output) = child.wait_with_output()
-            && output.status.success()
-            && let Ok(formatted) = String::from_utf8(output.stdout)
-        {
-            return formatted;
-        }
-    }
-    code.to_string()
+    // `quote` already emits valid Rust. Running rustfmt here is unnecessary
+    // for generated build output, and large delegation macros can trigger
+    // rustfmt source-map ICEs instead of producing a diagnostic. Keep code
+    // generation deterministic and leave source formatting to handwritten
+    // files.
+    expanded.to_string()
 }
 
 fn map_type(arg: &Arg) -> TokenStream {
@@ -676,6 +673,11 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                     _ => {}
                 }
                 Ok(None)
+            }
+
+            pub fn consume_event(msg: &mut WireMessage) -> Result<(), ProtocolError> {
+                let _ = Event::from_wire(msg)?;
+                Ok(())
             }
         }
     }
