@@ -2111,13 +2111,18 @@ mod tests {
         );
         assert!(!ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
         assert!(ctx.shadow_table.is_host_id_available(callback_id.0));
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            initial_guest_events + 1,
+            "internal callback delete_id must not be forwarded to the guest"
+        );
         assert!(
             ctx.host_to_client_queue.iter().all(|message| {
                 sender(message) != 1
                     || opcode(message) != wl_display::EVT_DELETE_ID
-                    || u32::from_ne_bytes(message.0[8..12].try_into().unwrap()) != 0
+                    || u32::from_ne_bytes(message.0[8..12].try_into().unwrap()) != callback_id.0
             }),
-            "internal callback teardown must never forward delete_id(0)"
+            "internal callback teardown must never expose its host-only ID"
         );
     }
 

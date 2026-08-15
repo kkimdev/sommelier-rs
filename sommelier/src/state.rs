@@ -1972,7 +1972,13 @@ impl KeyGenerationRegistry {
                 }
             }
             GuestKeyEvent::TextInputPress { serial } => {
-                if self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical)
+                let accelerator_generation = self.host_accelerator_suppressed(keyboard, key)
+                    || (self.physically_held(keyboard, key)
+                        && self
+                            .peek(keyboard, key)
+                            .is_some_and(|press| !press.eligible));
+                if accelerator_generation
+                    || self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical)
                     || !self.claim_text_input_owner(keyboard, key, serial)
                 {
                     GuestKeyDecision {
@@ -4896,6 +4902,70 @@ mod tests {
     }
 
     #[test]
+    fn guest_key_reducer_prevents_keysym_from_bypassing_accelerator_generation() {
+        let keyboard = HostId(10);
+        let key = 57;
+        let mut registry = KeyGenerationRegistry::default();
+
+        registry.observe_peek_press(keyboard, key, 10, 100, false);
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                key,
+                GuestKeyEvent::TextInputPress { serial: 10 },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: None,
+                ends_repeat: false,
+            },
+            "an ineligible held peek generation is already known to be a host accelerator"
+        );
+        assert_eq!(registry.guest_owner(keyboard, key), None);
+
+        assert_eq!(
+            registry.transition_guest_key(
+                keyboard,
+                key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: true,
+                    ime_repeat_active: false,
+                },
+            ),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(false),
+                ends_repeat: false,
+            }
+        );
+        assert_eq!(
+            registry
+                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 11 },)
+                .delivery,
+            GuestKeyDelivery::Drop,
+            "the text-input channel must also honor explicit accelerator suppression"
+        );
+        registry.observe_peek_release(keyboard, key, 12);
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(false),
+                ends_repeat: true,
+            }
+        );
+        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(
+            registry
+                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 13 },)
+                .delivery,
+            GuestKeyDelivery::Forward,
+            "accelerator suppression must not leak into the next released generation"
+        );
+    }
+
+    #[test]
     fn guest_key_reducer_preserves_pairing_and_ack_invariants_for_short_traces() {
         #[derive(Clone, Copy)]
         enum Operation {
@@ -4948,17 +5018,40 @@ mod tests {
                     Operation::TextRelease => GuestKeyEvent::TextInputRelease { serial },
                     Operation::Recover => GuestKeyEvent::RecoverIme,
                 };
+                let owner_before = registry.guest_owner(keyboard, key);
                 let decision = registry.transition_guest_key(keyboard, key, event);
 
                 assert_eq!(
-                    decision.ack_handled.is_some(),
-                    matches!(
-                        operation,
+                    decision.ack_handled,
+                    match operation {
+                        Operation::PhysicalPress => {
+                            Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
+                        }
+                        Operation::PhysicalRepeat | Operation::PhysicalRelease => Some(matches!(
+                            owner_before,
+                            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                        )),
+                        Operation::TextPress
+                        | Operation::TextRepeat
+                        | Operation::TextRelease
+                        | Operation::Recover => None,
+                    },
+                    "ACK policy must remain coupled to the generation owner"
+                );
+                assert_eq!(
+                    decision.ends_repeat,
+                    match operation {
+                        Operation::PhysicalRelease => true,
+                        Operation::TextRelease => {
+                            owner_before == Some(GuestKeyOwner::TextInputKeysym)
+                        }
                         Operation::PhysicalPress
-                            | Operation::PhysicalRepeat
-                            | Operation::PhysicalRelease
-                    ),
-                    "only wl_keyboard events may produce host ACKs"
+                        | Operation::PhysicalRepeat
+                        | Operation::TextPress
+                        | Operation::TextRepeat
+                        | Operation::Recover => false,
+                    },
+                    "only the release that closes the current generation may end repeat"
                 );
                 match (operation, decision.delivery) {
                     (
