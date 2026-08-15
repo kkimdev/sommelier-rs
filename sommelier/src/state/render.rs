@@ -824,10 +824,18 @@ impl RenderBufferRegistry {
             return false;
         }
         if let Some(host_id) = previous {
-            debug_assert!(self.detach(host_id));
+            let detached = self.detach(host_id);
+            debug_assert!(detached);
+            if !detached {
+                return false;
+            }
         }
         if let Some(host_id) = next {
-            debug_assert!(self.submit(host_id));
+            let submitted = self.submit(host_id);
+            debug_assert!(submitted);
+            if !submitted {
+                return false;
+            }
         }
         true
     }

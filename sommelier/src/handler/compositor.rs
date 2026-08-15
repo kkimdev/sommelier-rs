@@ -999,8 +999,17 @@ impl WlSurfaceHandler for CompositorHandler {
                 snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
             if !snapshot_updated || !use_updated {
                 log::error!(
-                    "Render-buffer replacement could not finalize surface {}",
-                    surface_id
+                    "Render-buffer replacement could not finalize surface {}: \
+                     previous guest={:?} host={:?} use={:?}, \
+                     next guest={:?} host={:?} use={:?}, snapshot_updated={}",
+                    surface_id,
+                    previous_buffer,
+                    previous_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
+                    previous_buffer.and_then(|id| ctx.host_buffer_use(id)),
+                    next_buffer,
+                    next_buffer.and_then(|id| ctx.render_buffer_host_id(id)),
+                    next_buffer.and_then(|id| ctx.host_buffer_use(id)),
+                    snapshot_updated,
                 );
                 ctx.fatal_protocol_error = true;
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
