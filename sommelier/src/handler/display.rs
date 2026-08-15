@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_display;
-use crate::state::Context;
+use crate::state::{Context, HostId};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -182,11 +182,6 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
                     // discard the host interface before `created`/`failed`.
                     ctx.shadow_table.clear_pending_destroy_guest(guest_id);
                 }
-                // Only clear dimensions belonging to the object whose
-                // delete_id was acknowledged. The guest may have reused the
-                // numeric ID after receiving that event; in that case the
-                // pending dimensions belong to the replacement object.
-                ctx.pending_native_buffer_sizes.remove(&guest_id);
             }
             return Action::Drop;
         }
@@ -194,7 +189,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         if guest_id != 0 {
             ctx.remove_render_buffer_host(id);
             ctx.shadow_table.remove_id(guest_id);
-            ctx.pending_native_buffer_sizes.remove(&guest_id);
+            ctx.pending_native_creates.remove(&HostId(id));
 
             // Forward the corrected delete_id event to the client
             let mut builder = MessageBuilder::new();

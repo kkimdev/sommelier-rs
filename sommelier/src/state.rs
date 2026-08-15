@@ -930,6 +930,18 @@ pub struct PendingParam {
     pub modifier_lo: u32,
 }
 
+/// Resources owned by one asynchronous linux-dmabuf create generation.
+///
+/// Host params IDs identify generations even after the guest destroys and
+/// reuses its numeric object ID. Keeping the dimensions and synchronization
+/// descriptor together under that host ID prevents a late result from an old
+/// generation from consuming resources owned by its replacement.
+pub struct PendingNativeCreate {
+    pub guest_params_id: u32,
+    pub dimensions: (i32, i32),
+    pub sync_fd: OwnedFd,
+}
+
 pub struct TextInputState {
     pub host_v1_id: u32,
     pub host_ext_id: Option<u32>,
@@ -2058,10 +2070,8 @@ pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
     render_buffers: RenderBufferRegistry,
-    /// Dimensions waiting for the host's asynchronous linux-dmabuf `created`
-    /// event. The key is the guest params object ID; the event handler moves
-    /// the value into the host-ID keyed render-buffer registry.
-    pub pending_native_buffer_sizes: HashMap<u32, (i32, i32)>,
+    /// Asynchronous linux-dmabuf creates keyed by host params generation.
+    pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
     /// Async linux-dmabuf params objects whose guest destructor was sent
     /// before the host emitted `created`/`failed`. The key is the host params
     /// ID, which may outlive the guest mapping when the host acknowledges the
@@ -2187,9 +2197,6 @@ pub struct Context {
     /// new binds in the meantime.
     pub removed_host_globals: HashSet<u32>,
     pub pending_params: HashMap<u32, Vec<PendingParam>>,
-    /// Native dma-buf sync descriptors waiting for an asynchronous
-    /// linux-dmabuf `created` event, keyed by guest params ID.
-    pub pending_native_sync_fds: HashMap<u32, OwnedFd>,
     pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
@@ -2511,7 +2518,7 @@ impl Context {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
             render_buffers: RenderBufferRegistry::default(),
-            pending_native_buffer_sizes: HashMap::new(),
+            pending_native_creates: HashMap::new(),
             orphaned_dmabuf_params: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
@@ -2561,7 +2568,6 @@ impl Context {
             next_global_generation: 1,
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
-            pending_native_sync_fds: HashMap::new(),
             feedback_index_maps: HashMap::new(),
             synthetic_feedback_objects: HashMap::new(),
             synthetic_feedback_refresh_pending: HashSet::new(),
