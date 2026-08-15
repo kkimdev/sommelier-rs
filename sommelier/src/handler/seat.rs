@@ -143,7 +143,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 

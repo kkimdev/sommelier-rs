@@ -1204,7 +1204,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
     }
@@ -3320,14 +3320,14 @@ mod tests {
             state.active_surface = Some(20);
             state.current_preedit = "한".to_string();
             state.committed_enabled = true;
-            state.host_activated = true;
+            state.host_activation = crate::state::HostActivationState::Active;
         }
         ctx.last_sender_id = 100;
 
         assert_eq!(handler.on_enter(&mut ctx, 2, 200, &[]), Action::Drop);
         assert_eq!(ctx.text_inputs[&40].active_surface, Some(20));
         assert_eq!(ctx.text_inputs[&40].current_preedit, "한");
-        assert!(ctx.text_inputs[&40].host_activated);
+        assert!(ctx.text_inputs[&40].host_is_active());
         assert!(
             ctx.host_to_client_queue.is_empty(),
             "duplicate enter must not emit a second text-input enter"
@@ -3923,7 +3923,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -4016,7 +4016,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -4104,7 +4104,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -4169,7 +4169,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -4181,7 +4181,7 @@ mod tests {
             ctx.client_to_host_queue.is_empty(),
             "do not send v1 deactivate through a released host seat"
         );
-        assert!(!ctx.text_inputs[&40].host_activated);
+        assert!(!ctx.text_inputs[&40].host_is_active());
     }
 
     #[test]
@@ -4250,7 +4250,7 @@ mod tests {
                     pending_preedit_selection: None,
                     pending_deletes: Vec::new(),
                     pending_cursor_position: None,
-                    host_activated: true,
+                    host_activation: crate::state::HostActivationState::Active,
                 },
             );
         }
@@ -4264,7 +4264,7 @@ mod tests {
         assert!(ctx.text_inputs.values().all(|state| {
             !state.pending_enabled
                 && !state.committed_enabled
-                && !state.host_activated
+                && !state.host_is_active()
                 && state.current_preedit.is_empty()
         }));
         assert_eq!(
@@ -4333,7 +4333,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: vec![(3, 0)],
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
         ctx.last_sender_id = 10;
@@ -4344,7 +4344,7 @@ mod tests {
         assert_eq!(state.active_surface, Some(20));
         assert!(!state.pending_enabled);
         assert!(!state.committed_enabled);
-        assert!(!state.host_activated);
+        assert!(!state.host_is_active());
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
@@ -4573,7 +4573,7 @@ mod tests {
         assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Drop);
         assert_eq!(ctx.keyboard_focus.surface_for_seat(7), None);
         assert!(ctx.text_inputs[&40].active_surface.is_none());
-        assert!(!ctx.text_inputs[&40].host_activated);
+        assert!(!ctx.text_inputs[&40].host_is_active());
     }
 
     #[test]

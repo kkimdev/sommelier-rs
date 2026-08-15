@@ -1713,7 +1713,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -2393,9 +2393,8 @@ mod tests {
             state.active_surface = None;
         }
         crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
-        let callback_id = ctx
-            .text_input_activation_barriers
-            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+        let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
+            .draining_callback()
             .expect("deactivation must install a callback barrier");
         let initial_guest_events = ctx.host_to_client_queue.len();
 
@@ -2443,9 +2442,7 @@ mod tests {
             done.build_message(callback_id.0, wl_callback::EVT_DONE),
         );
         assert!(
-            ctx.text_input_activation_barriers
-                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
-                .is_none(),
+            !ctx.text_input_activation_barriers.contains(callback_id),
             "callback.done must consume the activation barrier"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
@@ -2538,9 +2535,8 @@ mod tests {
             raw_keyboard_leave(701, HOST_SURFACE),
         )
         .is_some());
-        let callback_id = ctx
-            .text_input_activation_barriers
-            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+        let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
+            .draining_callback()
             .expect("focus loss must install a deactivation barrier");
         assert!(dispatch_raw_event_result(
             &mut handler,
@@ -2563,7 +2559,7 @@ mod tests {
             raw_text_input_request(zwp_text_input_v3::REQ_COMMIT),
         )
         .is_none());
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
 
         ctx.host_to_client_queue.clear();
         dispatch_raw_event(
@@ -2596,13 +2592,11 @@ mod tests {
             raw_callback_done(callback_id.0),
         );
         assert!(
-            ctx.text_input_activation_barriers
-                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
-                .is_none(),
+            !ctx.text_input_activation_barriers.contains(callback_id),
             "the old callback must be consumed even after guest ID reuse"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
-        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
         dispatch_raw_event(
             &mut handler,
             &mut ctx,
@@ -2635,9 +2629,8 @@ mod tests {
             state.active_surface = None;
         }
         crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
-        let callback_id = ctx
-            .text_input_activation_barriers
-            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+        let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
+            .draining_callback()
             .expect("deactivation must install the old generation callback");
 
         assert!(dispatch_raw_request_result(
@@ -2674,7 +2667,7 @@ mod tests {
             )
             .is_none());
         }
-        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
 
         ctx.client_to_host_queue.clear();
         ctx.host_to_client_queue.clear();
@@ -2684,7 +2677,7 @@ mod tests {
             "wl_callback",
             raw_callback_done(callback_id.0),
         );
-        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
         assert_eq!(
             ctx.text_inputs[&GUEST_TEXT_INPUT].host_v1_id,
             replacement_host_id
@@ -2740,9 +2733,8 @@ mod tests {
             raw_keyboard_leave(800, HOST_SURFACE),
         )
         .is_some());
-        let callback_id = ctx
-            .text_input_activation_barriers
-            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+        let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
+            .draining_callback()
             .expect("focus loss must deactivate the committed old generation");
         assert!(dispatch_raw_event_result(
             &mut handler,
@@ -2758,13 +2750,11 @@ mod tests {
             raw_callback_done(callback_id.0),
         );
         assert!(
-            ctx.text_input_activation_barriers
-                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
-                .is_none(),
+            !ctx.text_input_activation_barriers.contains(callback_id),
             "callback.done must consume the old focus barrier"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
 
         ctx.client_to_host_queue.clear();
         assert!(dispatch_raw_request_result(
@@ -2814,7 +2804,7 @@ mod tests {
             raw_text_input_request(zwp_text_input_v3::REQ_COMMIT),
         )
         .is_none());
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
         assert!(
             ctx.client_to_host_queue
                 .iter()

@@ -20,6 +20,17 @@ use super::{serial_is_after, HostId};
 
 const MAX_PENDING_IME_DELETES: usize = 256;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HostActivationState {
+    /// The host object has no live activation generation.
+    #[default]
+    Inactive,
+    /// Host text-input events belong to the current guest generation.
+    Active,
+    /// A host sync callback is draining events from the prior generation.
+    Draining { callback: HostId },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
@@ -60,7 +71,7 @@ pub struct TextInputState {
     /// `commit_string` event.
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
-    pub host_activated: bool,
+    pub(crate) host_activation: HostActivationState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +155,65 @@ impl TextInputState {
             pending_preedit_selection: None,
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
-            host_activated: false,
+            host_activation: HostActivationState::Inactive,
+        }
+    }
+
+    /// Return whether host text-input events belong to this guest generation.
+    pub fn host_is_active(&self) -> bool {
+        self.host_activation == HostActivationState::Active
+    }
+
+    /// Return the complete host activation state.
+    pub fn host_activation(&self) -> HostActivationState {
+        self.host_activation
+    }
+
+    /// Start a host activation from an inactive generation.
+    pub fn activate_host(&mut self) -> bool {
+        if self.host_activation != HostActivationState::Inactive {
+            return false;
+        }
+        self.host_activation = HostActivationState::Active;
+        true
+    }
+
+    /// Begin draining the active generation behind `callback`.
+    pub fn begin_host_draining(&mut self, callback: HostId) -> bool {
+        if self.host_activation != HostActivationState::Active {
+            return false;
+        }
+        self.host_activation = HostActivationState::Draining { callback };
+        true
+    }
+
+    /// Complete the generation drained by the exact matching `callback`.
+    pub fn complete_host_draining(&mut self, callback: HostId) -> bool {
+        if self.host_activation != (HostActivationState::Draining { callback }) {
+            return false;
+        }
+        self.host_activation = HostActivationState::Inactive;
+        true
+    }
+
+    /// Drop an active generation when no live host seat can carry a barrier.
+    ///
+    /// A draining generation cannot be forced inactive because its callback
+    /// remains the ownership proof for events already queued by the host.
+    pub fn deactivate_host_without_barrier(&mut self) -> bool {
+        if self.host_activation != HostActivationState::Active {
+            return false;
+        }
+        self.host_activation = HostActivationState::Inactive;
+        true
+    }
+
+    /// Return the callback that owns the draining generation, if any.
+    #[cfg(test)]
+    pub fn draining_callback(&self) -> Option<HostId> {
+        match self.host_activation {
+            HostActivationState::Draining { callback } => Some(callback),
+            HostActivationState::Inactive | HostActivationState::Active => None,
         }
     }
 
@@ -314,7 +383,7 @@ impl TextInputState {
     }
 
     pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
-        self.host_activated.then_some(HostPreeditPlan {
+        self.host_is_active().then_some(HostPreeditPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
             had_preedit: !self.current_preedit.is_empty(),
@@ -344,7 +413,7 @@ impl TextInputState {
     }
 
     pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
-        self.host_activated.then(|| HostCommitPlan {
+        self.host_is_active().then(|| HostCommitPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
             had_preedit: !self.current_preedit.is_empty(),
@@ -362,7 +431,7 @@ impl TextInputState {
     }
 
     pub(crate) fn prepare_preedit_region(&self) -> Option<PreeditRegionPlan> {
-        if !self.host_activated {
+        if !self.host_is_active() {
             return None;
         }
         let (surrounding_text, surrounding_cursor, _) = self.committed_surrounding_text.as_ref()?;
@@ -386,7 +455,7 @@ impl TextInputState {
     }
 
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
-        self.host_activated.then(|| ConfirmPreeditPlan {
+        self.host_is_active().then(|| ConfirmPreeditPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
             preedit_text: self.current_preedit.clone(),
@@ -1621,52 +1690,34 @@ impl KeyboardFocusRegistry {
 /// Host text-input-v1 objects have no destructor and are reused across guest
 /// focus changes. A deactivate followed by this barrier proves that every
 /// event from the previous activation has been dispatched while
-/// `host_activated` is false, before the object may be activated again.
+/// [`HostActivationState::Draining`], before the object may be activated again.
 #[derive(Default)]
 pub struct TextInputActivationBarrierRegistry {
     by_callback: HashMap<HostId, (u32, u32)>,
-    by_text_input_generation: HashMap<(u32, u32), HostId>,
 }
 
 impl TextInputActivationBarrierRegistry {
-    pub(crate) fn is_pending(&self, guest_text_input: u32, host_v1_id: u32) -> bool {
-        self.by_text_input_generation
-            .contains_key(&(guest_text_input, host_v1_id))
-    }
-
     pub(crate) fn install(
         &mut self,
         callback: HostId,
         guest_text_input: u32,
         host_v1_id: u32,
     ) -> bool {
-        if self.by_callback.contains_key(&callback)
-            || self
-                .by_text_input_generation
-                .contains_key(&(guest_text_input, host_v1_id))
-        {
+        if self.by_callback.contains_key(&callback) {
             return false;
         }
         self.by_callback
             .insert(callback, (guest_text_input, host_v1_id));
-        self.by_text_input_generation
-            .insert((guest_text_input, host_v1_id), callback);
         true
     }
 
     pub(crate) fn complete(&mut self, callback: HostId) -> Option<(u32, u32)> {
-        let generation = self.by_callback.remove(&callback)?;
-        if self.by_text_input_generation.get(&generation) == Some(&callback) {
-            self.by_text_input_generation.remove(&generation);
-        }
-        Some(generation)
+        self.by_callback.remove(&callback)
     }
 
     #[cfg(test)]
-    pub(crate) fn callback_for(&self, guest_text_input: u32, host_v1_id: u32) -> Option<HostId> {
-        self.by_text_input_generation
-            .get(&(guest_text_input, host_v1_id))
-            .copied()
+    pub(crate) fn contains(&self, callback: HostId) -> bool {
+        self.by_callback.contains_key(&callback)
     }
 }
 
@@ -1674,6 +1725,173 @@ impl TextInputActivationBarrierRegistry {
 mod tests {
     use super::*;
     use crate::state::Context;
+
+    #[test]
+    fn host_activation_transitions_match_the_model_for_all_short_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Activate,
+            BeginDrainingA,
+            BeginDrainingB,
+            CompleteDrainingA,
+            CompleteDrainingB,
+            DeactivateWithoutBarrier,
+        }
+
+        const CALLBACK_A: HostId = HostId(100);
+        const CALLBACK_B: HostId = HostId(101);
+        const OPERATIONS: [Operation; 6] = [
+            Operation::Activate,
+            Operation::BeginDrainingA,
+            Operation::BeginDrainingB,
+            Operation::CompleteDrainingA,
+            Operation::CompleteDrainingB,
+            Operation::DeactivateWithoutBarrier,
+        ];
+        const INITIAL_STATES: [HostActivationState; 4] = [
+            HostActivationState::Inactive,
+            HostActivationState::Active,
+            HostActivationState::Draining {
+                callback: CALLBACK_A,
+            },
+            HostActivationState::Draining {
+                callback: CALLBACK_B,
+            },
+        ];
+
+        fn model_transition(
+            state: HostActivationState,
+            operation: Operation,
+        ) -> (HostActivationState, bool) {
+            match (state, operation) {
+                (HostActivationState::Inactive, Operation::Activate) => {
+                    (HostActivationState::Active, true)
+                }
+                (HostActivationState::Active, Operation::BeginDrainingA) => (
+                    HostActivationState::Draining {
+                        callback: CALLBACK_A,
+                    },
+                    true,
+                ),
+                (HostActivationState::Active, Operation::BeginDrainingB) => (
+                    HostActivationState::Draining {
+                        callback: CALLBACK_B,
+                    },
+                    true,
+                ),
+                (
+                    HostActivationState::Draining {
+                        callback: CALLBACK_A,
+                    },
+                    Operation::CompleteDrainingA,
+                )
+                | (
+                    HostActivationState::Draining {
+                        callback: CALLBACK_B,
+                    },
+                    Operation::CompleteDrainingB,
+                ) => (HostActivationState::Inactive, true),
+                (HostActivationState::Active, Operation::DeactivateWithoutBarrier) => {
+                    (HostActivationState::Inactive, true)
+                }
+                _ => (state, false),
+            }
+        }
+
+        fn assert_invariants(state: &TextInputState, expected: HostActivationState) {
+            assert_eq!(state.host_activation(), expected);
+            assert_eq!(
+                state.host_is_active(),
+                expected == HostActivationState::Active
+            );
+            assert_eq!(
+                state.draining_callback(),
+                match expected {
+                    HostActivationState::Draining { callback } => Some(callback),
+                    HostActivationState::Inactive | HostActivationState::Active => None,
+                }
+            );
+        }
+
+        fn walk(state: TextInputState, expected: HostActivationState, remaining: usize) {
+            assert_invariants(&state, expected);
+            if remaining == 0 {
+                return;
+            }
+
+            for operation in OPERATIONS {
+                let mut next = state.clone();
+                let actual_changed = match operation {
+                    Operation::Activate => next.activate_host(),
+                    Operation::BeginDrainingA => next.begin_host_draining(CALLBACK_A),
+                    Operation::BeginDrainingB => next.begin_host_draining(CALLBACK_B),
+                    Operation::CompleteDrainingA => next.complete_host_draining(CALLBACK_A),
+                    Operation::CompleteDrainingB => next.complete_host_draining(CALLBACK_B),
+                    Operation::DeactivateWithoutBarrier => next.deactivate_host_without_barrier(),
+                };
+                let (next_expected, expected_changed) = model_transition(expected, operation);
+                assert_eq!(actual_changed, expected_changed);
+                walk(next, next_expected, remaining - 1);
+            }
+        }
+
+        for initial in INITIAL_STATES {
+            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+            state.host_activation = initial;
+            walk(state, initial, 5);
+        }
+    }
+
+    #[test]
+    fn only_active_host_generation_accepts_ime_events() {
+        for activation in [
+            HostActivationState::Inactive,
+            HostActivationState::Active,
+            HostActivationState::Draining {
+                callback: HostId(100),
+            },
+        ] {
+            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+            state.host_activation = activation;
+            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+
+            assert_eq!(
+                state.prepare_host_preedit().is_some(),
+                activation == HostActivationState::Active
+            );
+            assert_eq!(
+                state.prepare_host_commit().is_some(),
+                activation == HostActivationState::Active
+            );
+            assert_eq!(
+                state.prepare_preedit_region().is_some(),
+                activation == HostActivationState::Active
+            );
+            assert_eq!(
+                state.prepare_confirm_preedit().is_some(),
+                activation == HostActivationState::Active
+            );
+        }
+    }
+
+    #[test]
+    fn editor_lifecycle_boundaries_preserve_host_activation_generation() {
+        for activation in [
+            HostActivationState::Inactive,
+            HostActivationState::Active,
+            HostActivationState::Draining {
+                callback: HostId(100),
+            },
+        ] {
+            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+            state.host_activation = activation;
+
+            state.apply_focus(Some(14));
+            assert_eq!(state.host_activation(), activation);
+            state.begin_destroy();
+            assert_eq!(state.host_activation(), activation);
+        }
+    }
 
     #[test]
     fn text_input_focus_boundary_resets_editor_state_only() {
@@ -1697,13 +1915,13 @@ mod tests {
         state.pending_preedit_selection = Some((0, 3));
         state.pending_deletes.push((3, 0));
         state.pending_cursor_position = Some((1, 1));
-        state.host_activated = true;
+        assert!(state.activate_host());
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
         let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
         expected.guest_commit_serial = 17;
-        expected.host_activated = true;
+        assert!(expected.activate_host());
         assert_eq!(state, expected);
     }
 
@@ -1811,7 +2029,7 @@ mod tests {
     fn host_preedit_metadata_is_consumed_only_after_finish() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
         assert!(state.prepare_host_preedit().is_none());
-        state.host_activated = true;
+        assert!(state.activate_host());
         state.guest_commit_serial = 7;
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -1834,7 +2052,7 @@ mod tests {
     #[test]
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        state.host_activated = true;
+        assert!(state.activate_host());
         state.guest_commit_serial = 7;
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -1867,7 +2085,7 @@ mod tests {
     #[test]
     fn confirming_preedit_closes_only_preedit_metadata() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        state.host_activated = true;
+        assert!(state.activate_host());
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
@@ -1889,7 +2107,7 @@ mod tests {
     #[test]
     fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        state.host_activated = true;
+        assert!(state.activate_host());
         for index in 0..MAX_PENDING_IME_DELETES {
             assert!(state.record_delete(index as u32, 0));
         }
@@ -1967,12 +2185,12 @@ mod tests {
                 match step {
                     Step::Focus | Step::Leave => {
                         let serial = next.guest_commit_serial;
-                        let host_activated = next.host_activated;
+                        let host_activation = next.host_activation();
                         let surface = matches!(step, Step::Focus).then_some(13);
                         next.apply_focus(surface);
                         let mut expected = TextInputState::new(10, Some(11), 12, surface);
                         expected.guest_commit_serial = serial;
-                        expected.host_activated = host_activated;
+                        expected.host_activation = host_activation;
                         assert_eq!(next, expected);
                     }
                     Step::Enable | Step::Disable if next.active_surface.is_some() => {
@@ -2027,10 +2245,10 @@ mod tests {
                     }
                     Step::Destroy => {
                         let serial = next.guest_commit_serial;
-                        let host_activated = next.host_activated;
+                        let host_activation = next.host_activation();
                         next.begin_destroy();
                         assert_eq!(next.guest_commit_serial, serial);
-                        assert_eq!(next.host_activated, host_activated);
+                        assert_eq!(next.host_activation(), host_activation);
                         assert!(!next.committed_enabled);
                         assert!(next.active_surface.is_none());
                     }
@@ -2041,7 +2259,7 @@ mod tests {
         }
 
         let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
-        initial.host_activated = true;
+        assert!(initial.activate_host());
         walk(initial, 4);
     }
 

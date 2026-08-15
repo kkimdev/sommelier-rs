@@ -1365,7 +1365,7 @@ mod tests {
             pending_preedit_selection: Some((0, 1)),
             pending_deletes: vec![(1, 1)],
             pending_cursor_position: Some((1, 1)),
-            host_activated: true,
+            host_activation: crate::state::HostActivationState::Active,
         }
     }
 
@@ -4008,7 +4008,7 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                host_activated: true,
+                host_activation: crate::state::HostActivationState::Active,
             },
         );
 
@@ -4114,12 +4114,12 @@ mod tests {
             let state = &ctx.text_inputs[&guest_text_input];
             assert_eq!(state.active_surface, None);
             assert!(!state.committed_enabled);
-            assert!(!state.host_activated);
+            assert!(!state.host_is_active());
         }
         let unaffected = &ctx.text_inputs[&720];
         assert_eq!(unaffected.active_surface, Some(live_surface));
         assert!(unaffected.committed_enabled);
-        assert!(unaffected.host_activated);
+        assert!(unaffected.host_is_active());
         assert_eq!(unaffected.current_preedit, "한");
 
         assert_eq!(ctx.host_to_client_queue.len(), 2);
@@ -4251,18 +4251,18 @@ mod tests {
         let repaired = &ctx.text_inputs[&stale_with_replacement];
         assert_eq!(repaired.active_surface, Some(replacement_surface));
         assert!(!repaired.committed_enabled);
-        assert!(!repaired.host_activated);
+        assert!(!repaired.host_is_active());
         assert!(repaired.current_preedit.is_empty());
 
         let repaired_without_owner = &ctx.text_inputs[&stale_without_owner];
         assert_eq!(repaired_without_owner.active_surface, None);
         assert!(!repaired_without_owner.committed_enabled);
-        assert!(!repaired_without_owner.host_activated);
+        assert!(!repaired_without_owner.host_is_active());
 
         let healthy = &ctx.text_inputs[&healthy_on_replacement];
         assert_eq!(healthy.active_surface, Some(replacement_surface));
         assert!(healthy.committed_enabled);
-        assert!(healthy.host_activated);
+        assert!(healthy.host_is_active());
         assert_eq!(healthy.current_preedit, "한");
 
         assert_eq!(ctx.host_to_client_queue.len(), 3);
