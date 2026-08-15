@@ -26,7 +26,9 @@ use crate::protocols::wayland::wl_surface::{
     WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY,
 };
 use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
-use crate::state::{Context, DamageRect, SurfaceCommit, SurfaceState, ViewportState};
+use crate::state::{
+    Context, DamageRect, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+};
 use crate::wire::Action;
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
@@ -754,7 +756,11 @@ impl WlSurfaceHandler for CompositorHandler {
             return Action::Drop;
         }
         let surface_state = ctx.surfaces.entry(surface_id).or_default();
-        surface_state.pending_buffer_id = Some(if buffer == 0 { None } else { Some(buffer) });
+        surface_state.pending_attachment = if buffer == 0 {
+            SurfaceAttachment::Detach
+        } else {
+            SurfaceAttachment::Attach(buffer)
+        };
         surface_state.pending_attach_offset = None;
         // Since wl_surface version 5, attach's x/y arguments are ignored
         // (and non-zero values were rejected above). Keep them out of the
@@ -1551,8 +1557,8 @@ mod tests {
             "a commit whose synchronization failed must not reach the host"
         );
         assert_eq!(
-            ctx.surfaces.get(&surface).unwrap().pending_buffer_id,
-            Some(Some(buffer)),
+            ctx.surfaces.get(&surface).unwrap().pending_attachment,
+            SurfaceAttachment::Attach(buffer),
             "fatal teardown still rolls back the prepared surface transaction"
         );
     }
@@ -1821,6 +1827,7 @@ mod tests {
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
+        register_test_native(&mut ctx, 42, (1, 1));
 
         assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
@@ -2564,8 +2571,8 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .and_then(|surface| surface.pending_buffer_id),
-            Some(Some(buffer_id))
+                .map(|surface| surface.pending_attachment),
+            Some(SurfaceAttachment::Attach(buffer_id))
         );
 
         unsafe {
@@ -2635,7 +2642,8 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .and_then(|surface| surface.pending_buffer_id),
+                .map(|surface| surface.pending_attachment)
+                .filter(|attachment| *attachment != SurfaceAttachment::Unchanged),
             None
         );
         assert_eq!(protocol_error_code(&ctx), 3);
@@ -3470,7 +3478,7 @@ mod tests {
         ctx.surfaces
             .entry(second_surface)
             .or_default()
-            .pending_buffer_id = Some(Some(guest_buffer));
+            .pending_attachment = SurfaceAttachment::Attach(guest_buffer);
 
         let mut handler = CompositorHandler;
         ctx.last_sender_id = first_surface;

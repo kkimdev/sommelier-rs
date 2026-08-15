@@ -25,7 +25,7 @@ use std::sync::RwLock;
 
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
-use self::render::{DamageRegion, RenderBufferOwnership, MAX_PENDING_DAMAGE_RECTS};
+use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use log::warn;
@@ -39,7 +39,7 @@ pub(crate) use self::input::{
 };
 pub(crate) use self::render::{
     BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
-    SurfaceCommit, SurfaceState, ViewportState,
+    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -1019,8 +1019,16 @@ impl Context {
         previous_guest_buffer: Option<u32>,
         next_guest_buffer: Option<u32>,
     ) -> bool {
-        let previous = previous_guest_buffer.and_then(|id| self.render_buffer_host_id(id));
-        let next = next_guest_buffer.and_then(|id| self.render_buffer_host_id(id));
+        let resolve = |guest_buffer| match guest_buffer {
+            Some(guest_id) => self.render_buffer_host_id(guest_id).map(Some),
+            None => Some(None),
+        };
+        let Some(previous) = resolve(previous_guest_buffer) else {
+            return false;
+        };
+        let Some(next) = resolve(next_guest_buffer) else {
+            return false;
+        };
         self.render_buffers.finalize_attachment(previous, next)
     }
 
@@ -1752,7 +1760,7 @@ mod tests {
     fn surface_commit_applies_every_pending_field_atomically() {
         let mut surface = SurfaceState {
             current_content: None,
-            pending_buffer_id: Some(Some(2)),
+            pending_attachment: SurfaceAttachment::Attach(2),
             pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
             pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
             pending_buffer_scale: Some(2),
@@ -1771,7 +1779,7 @@ mod tests {
 
         let commit = surface.prepare_commit();
 
-        assert_eq!(commit.attachment, Some(Some(2)));
+        assert_eq!(commit.attachment, SurfaceAttachment::Attach(2));
         assert_eq!(commit.attached_buffer_id(), Some(2));
         assert!(commit.has_buffer_attach());
         assert!(commit.uses_full_mapping());
@@ -1800,7 +1808,7 @@ mod tests {
             })
         );
         assert_eq!(surface, commit.state);
-        assert!(surface.pending_buffer_id.is_none());
+        assert_eq!(surface.pending_attachment, SurfaceAttachment::Unchanged);
         assert!(surface.pending_surface_damage.is_empty());
         assert!(surface.pending_buffer_damage.is_empty());
         assert!(surface.pending_buffer_scale.is_none());
@@ -1810,7 +1818,7 @@ mod tests {
         assert!(surface.pending_viewport.is_none());
 
         let next = surface.prepare_commit();
-        assert!(next.attachment.is_none());
+        assert_eq!(next.attachment, SurfaceAttachment::Unchanged);
         assert!(next.surface_damage.is_empty());
         assert!(next.buffer_damage.is_empty());
         assert!(!next.has_full_damage());
@@ -1822,7 +1830,7 @@ mod tests {
     fn surface_commit_rollback_restores_the_complete_snapshot() {
         let mut surface = SurfaceState {
             current_content: None,
-            pending_buffer_id: Some(None),
+            pending_attachment: SurfaceAttachment::Detach,
             pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
             pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
             pending_buffer_scale: Some(2),
@@ -1848,14 +1856,14 @@ mod tests {
     #[test]
     fn surface_commit_detach_clears_committed_content_dimensions() {
         let mut surface = SurfaceState {
-            pending_buffer_id: Some(None),
+            pending_attachment: SurfaceAttachment::Detach,
             ..SurfaceState::default()
         };
         surface.set_current_buffer_for_test(Some(1), Some((100, 50)));
 
         let commit = surface.prepare_commit();
 
-        assert_eq!(commit.attachment, Some(None));
+        assert_eq!(commit.attachment, SurfaceAttachment::Detach);
         assert_eq!(surface.current_buffer_id(), None);
         assert_eq!(surface.current_buffer_dimensions(), None);
     }
@@ -2143,7 +2151,49 @@ mod tests {
     }
 
     #[test]
+    fn surface_attachment_requires_both_exact_render_generations() {
+        let previous_guest = 20;
+        let previous_host = 40;
+        let next_guest = 21;
+        let next_host = 41;
+        let unregistered_guest = 22;
+        let unregistered_host = 42;
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        for (guest, host) in [
+            (previous_guest, previous_host),
+            (next_guest, next_host),
+            (unregistered_guest, unregistered_host),
+        ] {
+            ctx.shadow_table.map_id(guest, host);
+        }
+        assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
+        assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));
+        assert!(ctx.mark_buffer_submitted(previous_guest));
+
+        assert!(!ctx.finalize_surface_attachment(Some(previous_guest), Some(unregistered_guest)));
+        assert_eq!(
+            ctx.host_buffer_use(previous_guest),
+            Some(awaiting_release(false)),
+            "an unresolved next generation must not detach the previous one"
+        );
+
+        assert!(!ctx.finalize_surface_attachment(Some(unregistered_guest), Some(next_guest)));
+        assert_eq!(
+            ctx.host_buffer_use(next_guest),
+            Some(RenderBufferUse::NeverSubmitted),
+            "an unresolved previous generation must not submit the next one"
+        );
+    }
+
+    #[test]
     fn render_buffer_lifecycle_matches_all_short_transition_sequences() {
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum ModelOwnership {
+            GuestAlive,
+            GuestDestroyed,
+            HostDestroyQueued,
+        }
+
         #[derive(Clone, Copy)]
         enum Operation {
             Submit,
@@ -2169,7 +2219,7 @@ mod tests {
         for mut encoded in 0..sequence_count {
             let mut registry = RenderBufferRegistry::default();
             assert!(registry.register_native(HostId(host_id), (1, 1), Vec::new()));
-            let mut ownership = RenderBufferOwnership::GuestAlive;
+            let mut ownership = ModelOwnership::GuestAlive;
             let mut use_state = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
@@ -2187,7 +2237,7 @@ mod tests {
                     Operation::HostDestroy => registry.mark_host_destroy_queued(HostId(host_id)),
                 };
                 let expected_changed = match (ownership, operation) {
-                    (RenderBufferOwnership::HostDestroyQueued, _) => false,
+                    (ModelOwnership::HostDestroyQueued, _) => false,
                     (_, Operation::Submit) => {
                         if !matches!(&use_state, RenderBufferUse::AwaitingRelease { .. }) {
                             use_state = awaiting_release(false);
@@ -2223,36 +2273,34 @@ mod tests {
                         | RenderBufferUse::Released => true,
                         RenderBufferUse::NeverSubmitted => false,
                     },
-                    (RenderBufferOwnership::GuestAlive, Operation::GuestDestroy) => {
-                        ownership = RenderBufferOwnership::GuestDestroyed;
+                    (ModelOwnership::GuestAlive, Operation::GuestDestroy) => {
+                        ownership = ModelOwnership::GuestDestroyed;
                         true
                     }
-                    (RenderBufferOwnership::GuestDestroyed, Operation::GuestDestroy) => false,
+                    (ModelOwnership::GuestDestroyed, Operation::GuestDestroy) => false,
                     (
-                        RenderBufferOwnership::GuestAlive | RenderBufferOwnership::GuestDestroyed,
+                        ModelOwnership::GuestAlive | ModelOwnership::GuestDestroyed,
                         Operation::HostDestroy,
                     ) => {
-                        ownership = RenderBufferOwnership::HostDestroyQueued;
+                        ownership = ModelOwnership::HostDestroyQueued;
                         true
                     }
                 };
                 let expected = match ownership {
-                    RenderBufferOwnership::GuestAlive => {
+                    ModelOwnership::GuestAlive => {
                         RenderBufferLifecycle::GuestAlive(use_state.clone())
                     }
-                    RenderBufferOwnership::GuestDestroyed => {
+                    ModelOwnership::GuestDestroyed => {
                         RenderBufferLifecycle::GuestDestroyed(use_state.clone())
                     }
-                    RenderBufferOwnership::HostDestroyQueued => {
-                        RenderBufferLifecycle::HostDestroyQueued
-                    }
+                    ModelOwnership::HostDestroyQueued => RenderBufferLifecycle::HostDestroyQueued,
                 };
 
                 assert_eq!(actual_changed, expected_changed);
                 assert_eq!(registry.lifecycle(HostId(host_id)), Some(expected));
                 assert_eq!(
                     registry.dimensions(HostId(host_id)).is_some(),
-                    ownership != RenderBufferOwnership::HostDestroyQueued
+                    ownership != ModelOwnership::HostDestroyQueued
                 );
             }
         }

@@ -1179,8 +1179,8 @@ pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool
 fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
     for surface in ctx.surfaces.values_mut() {
         surface.clear_current_buffer_reference(guest_id);
-        if surface.pending_buffer_id == Some(Some(guest_id)) {
-            surface.pending_buffer_id = Some(None);
+        if surface.pending_attachment == crate::state::SurfaceAttachment::Attach(guest_id) {
+            surface.pending_attachment = crate::state::SurfaceAttachment::Detach;
         }
     }
 }
@@ -1222,7 +1222,7 @@ impl SurfaceBufferReferences {
         let mut pending = HashSet::new();
         for surface in ctx.surfaces.values() {
             current.extend(surface.current_buffer_id());
-            pending.extend(surface.pending_buffer_id.flatten());
+            pending.extend(surface.pending_attachment.buffer_id());
         }
         Self { current, pending }
     }
@@ -3624,15 +3624,19 @@ mod tests {
             assert!(ctx.mark_buffer_submitted(guest_id));
             assert!(ctx.mark_buffer_released(guest_id));
         }
-        ctx.surfaces.entry(40).or_default().pending_buffer_id = Some(Some(local_buffer));
-        ctx.surfaces.entry(41).or_default().pending_buffer_id = Some(Some(native_buffer));
+        ctx.surfaces.entry(40).or_default().pending_attachment =
+            crate::state::SurfaceAttachment::Attach(local_buffer);
+        ctx.surfaces.entry(41).or_default().pending_attachment =
+            crate::state::SurfaceAttachment::Attach(native_buffer);
 
         retire_eligible_buffers(&mut ctx);
         assert!(buffer_is_guest_destroyed(&ctx, local_host));
         assert!(buffer_is_guest_destroyed(&ctx, native_host));
 
-        ctx.surfaces.get_mut(&40).unwrap().pending_buffer_id = Some(None);
-        ctx.surfaces.get_mut(&41).unwrap().pending_buffer_id = Some(None);
+        ctx.surfaces.get_mut(&40).unwrap().pending_attachment =
+            crate::state::SurfaceAttachment::Detach;
+        ctx.surfaces.get_mut(&41).unwrap().pending_attachment =
+            crate::state::SurfaceAttachment::Detach;
         retire_eligible_buffers(&mut ctx);
 
         assert!(buffer_host_destroy_is_queued(&ctx, local_host));

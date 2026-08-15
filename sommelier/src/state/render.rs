@@ -241,15 +241,44 @@ impl SurfaceContentSnapshot {
     }
 }
 
+/// One double-buffered `wl_surface.attach` transition.
+///
+/// Wayland distinguishes an omitted attach request from `attach(NULL)`.
+/// Encoding that distinction as `Option<Option<u32>>` makes the most important
+/// surface transition easy to invert accidentally, so keep the three protocol
+/// states explicit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SurfaceAttachment {
+    #[default]
+    Unchanged,
+    Detach,
+    Attach(u32),
+}
+
+impl SurfaceAttachment {
+    pub fn buffer_id(self) -> Option<u32> {
+        match self {
+            Self::Attach(buffer_id) => Some(buffer_id),
+            Self::Unchanged | Self::Detach => None,
+        }
+    }
+
+    fn transition_from(self, previous: Option<u32>) -> Option<(Option<u32>, Option<u32>)> {
+        match self {
+            Self::Unchanged => None,
+            Self::Detach => Some((previous, None)),
+            Self::Attach(buffer_id) => Some((previous, Some(buffer_id))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceState {
     /// Immutable metadata for the committed surface contents plus an optional
     /// live wl_buffer object reference. The reference may disappear after
     /// wl_buffer.destroy while the dimensions remain valid for damage mapping.
     pub(super) current_content: Option<SurfaceContentSnapshot>,
-    /// `Some(None)` represents an explicit `attach(NULL)`, while `None`
-    /// means that this commit has no attach request at all.
-    pub pending_buffer_id: Option<Option<u32>>,
+    pub pending_attachment: SurfaceAttachment,
     /// Damage expressed in surface-local coordinates. It can only be copied
     /// directly when the current buffer has the default transform and no
     /// viewport; otherwise the compositor falls back to a complete copy.
@@ -291,9 +320,7 @@ pub struct SurfaceState {
 pub struct SurfaceCommit {
     previous: SurfaceState,
     pub state: SurfaceState,
-    /// `Some(None)` is an explicit `attach(NULL)`; `None` means no attach was
-    /// included in this commit.
-    pub attachment: Option<Option<u32>>,
+    pub attachment: SurfaceAttachment,
     pub surface_damage: DamageRegion,
     pub buffer_damage: DamageRegion,
     /// One-shot placement of the pending attachment relative to the previous
@@ -304,16 +331,16 @@ pub struct SurfaceCommit {
 
 impl SurfaceCommit {
     pub fn has_buffer_attach(&self) -> bool {
-        matches!(self.attachment, Some(Some(_)))
+        matches!(self.attachment, SurfaceAttachment::Attach(_))
     }
 
     pub fn attached_buffer_id(&self) -> Option<u32> {
-        self.attachment.flatten()
+        self.attachment.buffer_id()
     }
 
     pub fn attachment_transition(&self) -> Option<(Option<u32>, Option<u32>)> {
         self.attachment
-            .map(|next| (self.previous.current_buffer_id(), next))
+            .transition_from(self.previous.current_buffer_id())
     }
 
     pub fn has_full_damage(&self) -> bool {
@@ -407,9 +434,13 @@ impl SurfaceState {
     /// Apply and consume all state pending for the next surface commit.
     pub fn prepare_commit(&mut self) -> SurfaceCommit {
         let previous = self.clone();
-        let attachment = self.pending_buffer_id.take();
-        if let Some(buffer_id) = attachment {
-            self.current_content = buffer_id.map(SurfaceContentSnapshot::from_buffer);
+        let attachment = std::mem::take(&mut self.pending_attachment);
+        match attachment {
+            SurfaceAttachment::Unchanged => {}
+            SurfaceAttachment::Detach => self.current_content = None,
+            SurfaceAttachment::Attach(buffer_id) => {
+                self.current_content = Some(SurfaceContentSnapshot::from_buffer(buffer_id));
+            }
         }
         if let Some(scale) = self.pending_buffer_scale.take() {
             self.current_buffer_scale = scale;
@@ -445,7 +476,7 @@ impl Default for SurfaceState {
     fn default() -> Self {
         Self {
             current_content: None,
-            pending_buffer_id: None,
+            pending_attachment: SurfaceAttachment::Unchanged,
             pending_surface_damage: DamageRegion::default(),
             pending_buffer_damage: DamageRegion::default(),
             pending_buffer_scale: None,
@@ -510,13 +541,6 @@ impl RenderBufferLifecycle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RenderBufferOwnership {
-    GuestAlive,
-    GuestDestroyed,
-    HostDestroyQueued,
-}
-
 /// Storage owned by one host `wl_buffer` generation.
 enum RenderBufferBacking {
     /// Guest SHM copied into proxy-owned host storage.
@@ -528,11 +552,48 @@ enum RenderBufferBacking {
     },
 }
 
-struct RenderBuffer {
-    backing: Option<RenderBufferBacking>,
-    ownership: RenderBufferOwnership,
+struct ActiveRenderBuffer {
+    backing: RenderBufferBacking,
     use_state: RenderBufferUse,
     implicit_sync_fallback: bool,
+}
+
+/// One render-buffer generation.
+///
+/// Backing storage exists exactly while the host buffer can still be used.
+/// Making terminal destruction a separate variant prevents impossible states
+/// such as "destroy queued, but backing still live" or "destroy queued and
+/// awaiting release" from being representable.
+enum RenderBuffer {
+    GuestAlive(ActiveRenderBuffer),
+    GuestDestroyed(ActiveRenderBuffer),
+    HostDestroyQueued,
+}
+
+impl RenderBuffer {
+    fn active(&self) -> Option<&ActiveRenderBuffer> {
+        match self {
+            Self::GuestAlive(buffer) | Self::GuestDestroyed(buffer) => Some(buffer),
+            Self::HostDestroyQueued => None,
+        }
+    }
+
+    fn active_mut(&mut self) -> Option<&mut ActiveRenderBuffer> {
+        match self {
+            Self::GuestAlive(buffer) | Self::GuestDestroyed(buffer) => Some(buffer),
+            Self::HostDestroyQueued => None,
+        }
+    }
+
+    fn lifecycle(&self) -> RenderBufferLifecycle {
+        match self {
+            Self::GuestAlive(buffer) => RenderBufferLifecycle::GuestAlive(buffer.use_state.clone()),
+            Self::GuestDestroyed(buffer) => {
+                RenderBufferLifecycle::GuestDestroyed(buffer.use_state.clone())
+            }
+            Self::HostDestroyQueued => RenderBufferLifecycle::HostDestroyQueued,
+        }
+    }
 }
 
 /// Canonical host-ID keyed registry for every render buffer.
@@ -550,12 +611,11 @@ impl RenderBufferRegistry {
     pub(super) fn register_local(&mut self, host_id: HostId, backing: BufferState) -> bool {
         match self.entries.entry(host_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(RenderBuffer {
-                    backing: Some(RenderBufferBacking::LocalCopy(backing)),
-                    ownership: RenderBufferOwnership::GuestAlive,
+                entry.insert(RenderBuffer::GuestAlive(ActiveRenderBuffer {
+                    backing: RenderBufferBacking::LocalCopy(backing),
                     use_state: RenderBufferUse::NeverSubmitted,
                     implicit_sync_fallback: false,
-                });
+                }));
                 true
             }
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -570,12 +630,11 @@ impl RenderBufferRegistry {
     ) -> bool {
         match self.entries.entry(host_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(RenderBuffer {
-                    backing: Some(RenderBufferBacking::Native { size, sync_fds }),
-                    ownership: RenderBufferOwnership::GuestAlive,
+                entry.insert(RenderBuffer::GuestAlive(ActiveRenderBuffer {
+                    backing: RenderBufferBacking::Native { size, sync_fds },
                     use_state: RenderBufferUse::NeverSubmitted,
                     implicit_sync_fallback: false,
-                });
+                }));
                 true
             }
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -587,28 +646,28 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn local_copy_mut(&mut self, host_id: HostId) -> Option<&mut BufferState> {
-        match self.entries.get_mut(&host_id)?.backing.as_mut()? {
+        match &mut self.entries.get_mut(&host_id)?.active_mut()?.backing {
             RenderBufferBacking::LocalCopy(backing) => Some(backing),
             RenderBufferBacking::Native { .. } => None,
         }
     }
 
     pub(super) fn local_copy(&self, host_id: HostId) -> Option<&BufferState> {
-        match self.entries.get(&host_id)?.backing.as_ref()? {
+        match &self.entries.get(&host_id)?.active()?.backing {
             RenderBufferBacking::LocalCopy(backing) => Some(backing),
             RenderBufferBacking::Native { .. } => None,
         }
     }
 
     pub(super) fn dimensions(&self, host_id: HostId) -> Option<(i32, i32)> {
-        match self.entries.get(&host_id)?.backing.as_ref()? {
+        match &self.entries.get(&host_id)?.active()?.backing {
             RenderBufferBacking::LocalCopy(backing) => Some((backing.width, backing.height)),
             RenderBufferBacking::Native { size, .. } => Some(*size),
         }
     }
 
     pub(super) fn native_sync_fds(&self, host_id: HostId) -> Option<&[OwnedFd]> {
-        match self.entries.get(&host_id)?.backing.as_ref()? {
+        match &self.entries.get(&host_id)?.active()?.backing {
             RenderBufferBacking::Native { sync_fds, .. } => Some(sync_fds),
             RenderBufferBacking::LocalCopy(_) => None,
         }
@@ -617,14 +676,19 @@ impl RenderBufferRegistry {
     pub(super) fn uses_implicit_sync_fallback(&self, host_id: HostId) -> bool {
         self.entries
             .get(&host_id)
+            .and_then(RenderBuffer::active)
             .is_some_and(|buffer| buffer.implicit_sync_fallback)
     }
 
     pub(super) fn enable_implicit_sync_fallback(&mut self, host_id: HostId) -> bool {
-        let Some(buffer) = self.entries.get_mut(&host_id) else {
+        let Some(buffer) = self
+            .entries
+            .get_mut(&host_id)
+            .and_then(RenderBuffer::active_mut)
+        else {
             return false;
         };
-        if !matches!(buffer.backing, Some(RenderBufferBacking::Native { .. })) {
+        if !matches!(buffer.backing, RenderBufferBacking::Native { .. }) {
             return false;
         }
         buffer.implicit_sync_fallback = true;
@@ -632,16 +696,7 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn lifecycle(&self, host_id: HostId) -> Option<RenderBufferLifecycle> {
-        let buffer = self.entries.get(&host_id)?;
-        Some(match buffer.ownership {
-            RenderBufferOwnership::GuestAlive => {
-                RenderBufferLifecycle::GuestAlive(buffer.use_state.clone())
-            }
-            RenderBufferOwnership::GuestDestroyed => {
-                RenderBufferLifecycle::GuestDestroyed(buffer.use_state.clone())
-            }
-            RenderBufferOwnership::HostDestroyQueued => RenderBufferLifecycle::HostDestroyQueued,
-        })
+        self.entries.get(&host_id).map(RenderBuffer::lifecycle)
     }
 
     pub(super) fn lifecycles(&self) -> impl Iterator<Item = (HostId, RenderBufferLifecycle)> + '_ {
@@ -663,23 +718,24 @@ impl RenderBufferRegistry {
     fn can_submit(&self, host_id: HostId) -> bool {
         self.entries
             .get(&host_id)
-            .is_some_and(|buffer| buffer.ownership != RenderBufferOwnership::HostDestroyQueued)
+            .is_some_and(|buffer| buffer.active().is_some())
     }
 
     fn can_detach(&self, host_id: HostId) -> bool {
-        self.entries.get(&host_id).is_some_and(|buffer| {
-            buffer.ownership != RenderBufferOwnership::HostDestroyQueued
-                && !matches!(buffer.use_state, RenderBufferUse::NeverSubmitted)
-        })
+        self.entries
+            .get(&host_id)
+            .and_then(RenderBuffer::active)
+            .is_some_and(|buffer| !matches!(buffer.use_state, RenderBufferUse::NeverSubmitted))
     }
 
     pub(super) fn submit(&mut self, host_id: HostId) -> bool {
-        let Some(buffer) = self.entries.get_mut(&host_id) else {
+        let Some(buffer) = self
+            .entries
+            .get_mut(&host_id)
+            .and_then(RenderBuffer::active_mut)
+        else {
             return false;
         };
-        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
-            return false;
-        }
         match &mut buffer.use_state {
             RenderBufferUse::AwaitingRelease { .. } => {}
             RenderBufferUse::NeverSubmitted | RenderBufferUse::Released => {
@@ -690,12 +746,14 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn release(&mut self, host_id: HostId) -> bool {
-        let Some(buffer) = self.entries.get_mut(&host_id) else {
+        let Some(buffer) = self
+            .entries
+            .get_mut(&host_id)
+            .and_then(RenderBuffer::active_mut)
+        else {
             return false;
         };
-        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued
-            || !buffer.use_state.is_awaiting_release()
-        {
+        if !buffer.use_state.is_awaiting_release() {
             return false;
         }
         buffer.use_state = RenderBufferUse::Released;
@@ -703,12 +761,13 @@ impl RenderBufferRegistry {
     }
 
     pub(super) fn detach(&mut self, host_id: HostId) -> bool {
-        let Some(buffer) = self.entries.get_mut(&host_id) else {
+        let Some(buffer) = self
+            .entries
+            .get_mut(&host_id)
+            .and_then(RenderBuffer::active_mut)
+        else {
             return false;
         };
-        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
-            return false;
-        }
         match &mut buffer.use_state {
             RenderBufferUse::AwaitingRelease { has_detached_use } => {
                 *has_detached_use = true;
@@ -724,12 +783,13 @@ impl RenderBufferRegistry {
         host_id: HostId,
         has_other_current: bool,
     ) -> bool {
-        let Some(buffer) = self.entries.get_mut(&host_id) else {
+        let Some(buffer) = self
+            .entries
+            .get_mut(&host_id)
+            .and_then(RenderBuffer::active_mut)
+        else {
             return false;
         };
-        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
-            return false;
-        }
         if has_other_current {
             return true;
         }
@@ -776,26 +836,26 @@ impl RenderBufferRegistry {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        match buffer.ownership {
-            RenderBufferOwnership::GuestAlive => {
-                buffer.ownership = RenderBufferOwnership::GuestDestroyed;
-                true
-            }
-            RenderBufferOwnership::GuestDestroyed | RenderBufferOwnership::HostDestroyQueued => {
-                false
-            }
+        if !matches!(buffer, RenderBuffer::GuestAlive(_)) {
+            return false;
         }
+        let RenderBuffer::GuestAlive(active) =
+            std::mem::replace(buffer, RenderBuffer::HostDestroyQueued)
+        else {
+            unreachable!("guest-alive state checked above");
+        };
+        *buffer = RenderBuffer::GuestDestroyed(active);
+        true
     }
 
     pub(super) fn mark_host_destroy_queued(&mut self, host_id: HostId) -> bool {
         let Some(buffer) = self.entries.get_mut(&host_id) else {
             return false;
         };
-        if buffer.ownership == RenderBufferOwnership::HostDestroyQueued {
+        if matches!(buffer, RenderBuffer::HostDestroyQueued) {
             return false;
         }
-        buffer.backing = None;
-        buffer.ownership = RenderBufferOwnership::HostDestroyQueued;
+        *buffer = RenderBuffer::HostDestroyQueued;
         true
     }
 }
