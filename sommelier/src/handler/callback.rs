@@ -69,8 +69,19 @@ impl WlCallbackHandler for CallbackHandler {
                 ctx.host_to_client_queue.push((del_msg, Vec::new()));
             }
 
-            // 3. Remove from shadow table
-            ctx.shadow_table.remove_id(guest_id);
+            // The terminal event destroys the callback on both sides, but the
+            // host numeric ID cannot be reused until its later delete_id.
+            if ctx
+                .shadow_table
+                .retire_server_destroyed_object(guest_id)
+                .is_none()
+            {
+                log::warn!(
+                    "wl_callback {} could not retain host ID {} until delete_id",
+                    guest_id,
+                    host_id
+                );
+            }
         }
         Action::Drop
     }
@@ -79,7 +90,9 @@ impl WlCallbackHandler for CallbackHandler {
 #[cfg(test)]
 mod tests {
     use super::CallbackHandler;
+    use crate::handler::display::DisplayHandler;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+    use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::Context;
     use crate::wire::Action;
 
@@ -104,5 +117,34 @@ mod tests {
         assert!(ctx.dmabuf_capabilities[&generation].ready);
         assert!(!ctx.dmabuf_capability_callbacks.contains_key(&callback_id));
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
+    }
+
+    #[test]
+    fn guest_callback_reserves_host_id_until_real_delete_id() {
+        let guest_id = 20;
+        let host_id = 40;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(guest_id, host_id);
+        ctx.shadow_table
+            .track_interface_with_version(guest_id, "wl_callback".to_string(), 1);
+        ctx.last_sender_id = host_id;
+
+        let mut handler = CallbackHandler;
+        assert_eq!(handler.on_done(&mut ctx, 7), Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
+        assert_eq!(ctx.shadow_table.get_guest_id(host_id), None);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(!ctx.shadow_table.is_host_id_available(host_id));
+
+        ctx.last_sender_id = 1;
+        assert_eq!(DisplayHandler.on_delete_id(&mut ctx, host_id), Action::Drop);
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            2,
+            "the guest already received its callback delete_id"
+        );
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_host_id_available(host_id));
     }
 }

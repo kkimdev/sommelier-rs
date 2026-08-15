@@ -26,7 +26,7 @@ use crate::protocols::wayland::wl_surface::{
     WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY,
 };
 use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
-use crate::state::{Context, DamageRect, SurfaceState, ViewportState};
+use crate::state::{Context, DamageRect, SurfaceCommit, SurfaceState, ViewportState};
 use crate::wire::Action;
 use log::trace;
 use std::collections::HashSet;
@@ -507,46 +507,152 @@ fn queue_surface_commit(ctx: &mut Context, surface_id: u32) {
     ctx.client_to_host_queue.push((message, Vec::new()));
 }
 
-#[derive(Clone, Copy)]
-struct SurfaceCommitRollback {
-    pending_buffer_id: Option<Option<u32>>,
-    previous_buffer_id: Option<u32>,
-    previous_buffer_scale: i32,
-    previous_buffer_transform: i32,
-    previous_offset: (i32, i32),
-    previous_viewport: Option<ViewportState>,
-    pending_buffer_scale: Option<i32>,
-    pending_buffer_transform: Option<i32>,
-    pending_offset: Option<(i32, i32)>,
-    pending_attach_offset: Option<(i32, i32)>,
-    pending_viewport: Option<Option<ViewportState>>,
-}
-
-fn restore_failed_surface_commit(
-    ctx: &mut Context,
-    surface_id: u32,
-    rollback: SurfaceCommitRollback,
-    surface_damage: Vec<DamageRect>,
-    buffer_damage: Vec<DamageRect>,
-) {
-    let Some(surface_state) = ctx.surfaces.get_mut(&surface_id) else {
-        return;
+/// Copy one locally bridged SHM buffer before its prepared surface commit.
+///
+/// Native linux-dmabuf buffers have no local copy state and are immediately
+/// ready. Every SHM failure keeps `needs_full_copy` armed so retrying the
+/// transaction cannot lose the damaged pixels that were consumed while the
+/// commit was prepared.
+fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit) -> bool {
+    let allocator = ctx.allocator.as_ref();
+    let buffer = if ctx.buffers.contains_key(&buffer_id) {
+        ctx.buffers.get_mut(&buffer_id)
+    } else {
+        ctx.retired_buffers.get_mut(&buffer_id)
     };
-    if rollback.pending_buffer_id.is_some() {
-        surface_state.current_buffer_id = rollback.previous_buffer_id;
-        surface_state.pending_buffer_id = rollback.pending_buffer_id;
+    let Some(buffer) = buffer else {
+        return true;
+    };
+
+    let mut copy_ok = false;
+    let pool = &buffer.pool;
+    if let Ok(inner) = pool.inner.read() {
+        if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
+            let src_ptr = inner.client_ptr as *const u8;
+            let format = buffer.format;
+            let offset = buffer.offset;
+            let buffer_width = buffer.width;
+            let buffer_height = buffer.height;
+            let source_stride = buffer.stride;
+            let needs_full_copy = buffer.needs_full_copy;
+            let mut sync_guard = if buffer.dmabuf_sync {
+                let guard = DmabufWriteSync::begin(
+                    ctx.virtwayland_channel.as_ref(),
+                    buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd),
+                );
+                if guard.is_none() {
+                    log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
+                }
+                guard
+            } else {
+                None
+            };
+            let sync_started = !buffer.dmabuf_sync || sync_guard.is_some();
+            if sync_started {
+                copy_ok = if !buffer.dest_ptr.is_null() {
+                    copy_damage_to_ptr(
+                        format,
+                        offset,
+                        buffer_width,
+                        buffer_height,
+                        source_stride,
+                        needs_full_copy,
+                        src_ptr,
+                        inner.size,
+                        buffer.dest_ptr,
+                        buffer.dest_size,
+                        buffer.bo_stride as usize,
+                        buffer.dmabuf_plane1_offset,
+                        buffer.dmabuf_plane1_stride,
+                        &commit.surface_damage,
+                        &commit.buffer_damage,
+                        commit.uses_full_mapping(),
+                    )
+                } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
+                    match (u32::try_from(buffer_width), u32::try_from(buffer_height)) {
+                        (Ok(width), Ok(height)) => {
+                            match bo.map_mut(&allocator.device, 0, 0, width, height, |mapped| {
+                                copy_damage_to_ptr(
+                                    format,
+                                    offset,
+                                    buffer_width,
+                                    buffer_height,
+                                    source_stride,
+                                    needs_full_copy,
+                                    src_ptr,
+                                    inner.size,
+                                    mapped.buffer_mut().as_mut_ptr(),
+                                    mapped.buffer().len(),
+                                    mapped.stride() as usize,
+                                    buffer.dmabuf_plane1_offset,
+                                    buffer.dmabuf_plane1_stride,
+                                    &commit.surface_damage,
+                                    &commit.buffer_damage,
+                                    commit.uses_full_mapping(),
+                                )
+                            }) {
+                                Ok(Ok(copy_ok)) => copy_ok,
+                                Ok(Err(error)) => {
+                                    log::warn!("GBM BO map failed: {}", error);
+                                    false
+                                }
+                                Err(_) => {
+                                    log::warn!("GBM BO belongs to a different allocator device");
+                                    false
+                                }
+                            }
+                        }
+                        (Err(_), _) => {
+                            log::warn!("SHM buffer width cannot be represented as u32");
+                            false
+                        }
+                        (_, Err(_)) => {
+                            log::warn!("SHM buffer height cannot be represented as u32");
+                            false
+                        }
+                    }
+                } else {
+                    // No destination mapping is available. This can happen
+                    // only for a malformed or unsupported allocation path.
+                    false
+                };
+            }
+            if let Some(guard) = sync_guard.take() {
+                if !guard.end() {
+                    copy_ok = false;
+                }
+            }
+            if copy_ok {
+                buffer.needs_full_copy = false;
+                // A 4K frame can reach this path every refresh. Keep the
+                // per-frame diagnostic at trace level.
+                trace!(
+                    "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
+                     width={}, height={}, format={:#010x}, buffer.offset={}, \
+                     pool_size={}, dest_size={}",
+                    buffer.bo_stride,
+                    buffer.stride,
+                    buffer.width,
+                    buffer.height,
+                    buffer.format,
+                    buffer.offset,
+                    inner.size,
+                    buffer.dest_size
+                );
+            } else {
+                log::warn!("Deferring SHM commit with an invalid or unmappable destination");
+            }
+        } else {
+            log::warn!("SHM pool has no valid client mapping");
+        }
+    } else {
+        log::warn!("Unable to read SHM pool while committing buffer");
     }
-    surface_state.current_buffer_scale = rollback.previous_buffer_scale;
-    surface_state.current_buffer_transform = rollback.previous_buffer_transform;
-    surface_state.current_offset = rollback.previous_offset;
-    surface_state.viewport = rollback.previous_viewport;
-    surface_state.pending_buffer_scale = rollback.pending_buffer_scale;
-    surface_state.pending_buffer_transform = rollback.pending_buffer_transform;
-    surface_state.pending_offset = rollback.pending_offset;
-    surface_state.pending_attach_offset = rollback.pending_attach_offset;
-    surface_state.pending_viewport = rollback.pending_viewport;
-    surface_state.pending_surface_damage = surface_damage;
-    surface_state.pending_buffer_damage = buffer_damage;
+
+    if !copy_ok {
+        buffer.needs_full_copy = true;
+    }
+    copy_ok
 }
 
 impl WlSurfaceHandler for CompositorHandler {
@@ -612,25 +718,19 @@ impl WlSurfaceHandler for CompositorHandler {
             ctx.client_to_host_queue.push((message, Vec::new()));
         }
         ctx.surfaces.remove(&ctx.last_sender_id);
-        crate::handler::shm::clear_submitted_buffers_after_surface_destroy(
+        crate::handler::shm::clear_buffer_uses_after_surface_destroy(
             ctx,
             &destroyed_surface_buffers,
         );
         // Pending-only objects do not receive a host release event. This
         // collector is safe even without a host surface mapping because it
         // only handles buffers that were never submitted.
-        crate::handler::shm::collect_uncommitted_retired_buffers(ctx);
-        crate::handler::shm::collect_deferred_native_buffers(ctx);
+        crate::handler::shm::collect_deferred_buffers(ctx);
         if host_surface_destroy_queued {
-            // The host surface destructor was queued above. Any native
-            // dma-buf that was deferred solely for this surface can now be
-            // retired in the same ordered host stream, even if the host does
-            // not emit a separate wl_buffer.release on surface teardown.
-            crate::handler::shm::collect_deferred_native_buffers_after_surface_destroy(
-                ctx,
-                &destroyed_surface_buffers,
-            );
-            crate::handler::shm::collect_retired_buffers_after_surface_destroy(
+            // The host surface destructor was queued above. Any local-copy or
+            // native buffer deferred solely for this surface can now retire
+            // in the same ordered host stream.
+            crate::handler::shm::collect_deferred_buffers_after_surface_destroy(
                 ctx,
                 &destroyed_surface_buffers,
             );
@@ -745,8 +845,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // means the compositor will never emit wl_buffer.release for the
         // superseded object, so retire its host proxy after the new attach
         // request in the ordered queue.
-        crate::handler::shm::collect_uncommitted_retired_buffers(ctx);
-        crate::handler::shm::collect_deferred_native_buffers(ctx);
+        crate::handler::shm::collect_deferred_buffers(ctx);
         Action::Forward
     }
 
@@ -831,101 +930,24 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
         let surface_id = ctx.last_sender_id;
 
-        let (rollback, surface_damage, buffer_damage, full_mapping) =
-            ctx.surfaces.get_mut(&surface_id).map_or(
-                (
-                    SurfaceCommitRollback {
-                        pending_buffer_id: None,
-                        previous_buffer_id: None,
-                        previous_buffer_scale: 1,
-                        previous_buffer_transform: 0,
-                        previous_offset: (0, 0),
-                        previous_viewport: None,
-                        pending_buffer_scale: None,
-                        pending_buffer_transform: None,
-                        pending_offset: None,
-                        pending_attach_offset: None,
-                        pending_viewport: None,
-                    },
-                    Vec::new(),
-                    Vec::new(),
-                    false,
-                ),
-                |surface_state| {
-                    let pending_buffer_id = surface_state.pending_buffer_id.take();
-                    let previous_buffer_id = surface_state.current_buffer_id;
-                    let previous_buffer_scale = surface_state.current_buffer_scale;
-                    let previous_buffer_transform = surface_state.current_buffer_transform;
-                    let previous_offset = surface_state.current_offset;
-                    let previous_viewport = surface_state.viewport;
-                    if let Some(buffer_id) = pending_buffer_id {
-                        surface_state.current_buffer_id = buffer_id;
-                    }
-                    let pending_buffer_scale = surface_state.pending_buffer_scale.take();
-                    if let Some(scale) = pending_buffer_scale {
-                        surface_state.current_buffer_scale = scale;
-                    }
-                    let pending_buffer_transform = surface_state.pending_buffer_transform.take();
-                    if let Some(transform) = pending_buffer_transform {
-                        surface_state.current_buffer_transform = transform;
-                    }
-                    let pending_offset = surface_state.pending_offset.take();
-                    let pending_attach_offset = surface_state.pending_attach_offset.take();
-                    if let Some(offset) = pending_offset {
-                        surface_state.current_offset = offset;
-                    } else if let Some(offset) = pending_attach_offset {
-                        surface_state.current_offset = offset;
-                    }
-                    let pending_viewport = surface_state.pending_viewport.take();
-                    if let Some(viewport) = pending_viewport {
-                        surface_state.viewport = viewport;
-                    }
-                    let full_mapping = surface_state.current_buffer_scale != 1
-                        || surface_state.current_buffer_transform != 0
-                        || surface_state.current_offset != (0, 0)
-                        || surface_state
-                            .viewport
-                            .is_some_and(|viewport| !viewport.is_identity());
-                    (
-                        SurfaceCommitRollback {
-                            pending_buffer_id,
-                            previous_buffer_id,
-                            previous_buffer_scale,
-                            previous_buffer_transform,
-                            previous_offset,
-                            previous_viewport,
-                            pending_buffer_scale,
-                            pending_buffer_transform,
-                            pending_offset,
-                            pending_attach_offset,
-                            pending_viewport,
-                        },
-                        std::mem::take(&mut surface_state.pending_surface_damage),
-                        std::mem::take(&mut surface_state.pending_buffer_damage),
-                        full_mapping,
-                    )
-                },
-            );
+        let mut default_surface = SurfaceState::default();
+        let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
+            || default_surface.prepare_commit(),
+            SurfaceState::prepare_commit,
+        );
+        let full_mapping = commit.uses_full_mapping();
         // A commit with no new attach reuses the currently committed buffer
-        // (for damage-only commits). An explicit attach(NULL), represented by
-        // `Some(None)`, is the one case that deliberately commits no buffer.
-        let pending_buffer_state = rollback.pending_buffer_id;
-        let previous_buffer_id = rollback.previous_buffer_id;
+        // (for damage-only commits). An explicit attach(NULL) leaves the
+        // prepared committed state without a buffer.
+        let commit_buffer_id = commit.buffer_id();
         // A native dma-buf acquire fence belongs to the new contents submitted
         // by an attach.  Re-running the dma-buf wait for a damage-only commit
         // blocks this single-threaded proxy even though the host compositor
         // is already using the same buffer.  ChromiumOS Sommelier waits at
         // attach time as well; keep explicit attach(NULL) and damage-only
         // commits non-blocking.
-        let commit_buffer_id = pending_buffer_state.flatten().or_else(|| {
-            pending_buffer_state
-                .is_none()
-                .then_some(previous_buffer_id)
-                .flatten()
-        });
-        let wait_for_native_sync = matches!(pending_buffer_state, Some(Some(_)))
-            || commit_buffer_id
-                .is_some_and(|buffer_id| ctx.released_host_buffers.contains(&buffer_id));
+        let wait_for_native_sync = commit.has_buffer_attach()
+            || commit_buffer_id.is_some_and(|buffer_id| ctx.buffer_is_released(buffer_id));
 
         // The viewporter protocol permits fractional source rectangles only
         // when a destination size is also set. If the source is fractional
@@ -933,50 +955,32 @@ impl WlSurfaceHandler for CompositorHandler {
         // wp_viewport.bad_size when this double-buffered state is applied.
         // Report it against the viewport object, if it is still present, and
         // do not forward a commit that would otherwise apply invalid state.
-        if let Some(surface_state) = ctx.surfaces.get(&surface_id) {
-            if let Some((_, _, source_width, source_height)) =
-                surface_state.viewport.and_then(|viewport| viewport.source)
+        if commit.has_invalid_fractional_viewport() {
+            if let Some((&viewport_id, _)) = ctx
+                .viewport_to_wl_surface
+                .iter()
+                .find(|(_, &owner)| owner == surface_id)
             {
-                if surface_state
-                    .viewport
-                    .is_some_and(|viewport| viewport.destination.is_none())
-                    && (source_width % 256 != 0 || source_height % 256 != 0)
-                {
-                    if let Some((&viewport_id, _)) = ctx
-                        .viewport_to_wl_surface
-                        .iter()
-                        .find(|(_, &owner)| owner == surface_id)
-                    {
-                        queue_protocol_error(
-                            ctx,
-                            viewport_id,
-                            1,
-                            "fractional wp_viewport source requires a destination",
-                        );
-                    }
-                    restore_failed_surface_commit(
-                        ctx,
-                        surface_id,
-                        rollback,
-                        surface_damage,
-                        buffer_damage,
-                    );
-                    return Action::Drop;
-                }
+                queue_protocol_error(
+                    ctx,
+                    viewport_id,
+                    1,
+                    "fractional wp_viewport source requires a destination",
+                );
             }
+            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+                commit.rollback(surface);
+            }
+            return Action::Drop;
         }
 
+        let surface_damage = &commit.surface_damage;
+        let buffer_damage = &commit.buffer_damage;
         // Keep a snapshot of the committed surface state for damage
         // translation. The buffer copy below can clear `needs_full_copy`, so
         // the pre-copy value is retained separately for the host damage
         // request.
-        let surface_snapshot = ctx.surfaces.get(&surface_id).cloned();
         let needs_full_damage = commit_buffer_id
-            .or_else(|| {
-                surface_snapshot
-                    .as_ref()
-                    .and_then(|surface| surface.current_buffer_id)
-            })
             .and_then(|buffer_id| {
                 ctx.buffers
                     .get(&buffer_id)
@@ -990,170 +994,8 @@ impl WlSurfaceHandler for CompositorHandler {
         // compositor sample stale or uninitialised pixels if dma-buf sync,
         // mmap, or GBM mapping fails. A failed copy leaves `needs_full_copy`
         // set so a later commit retries the complete image.
-        let mut commit_ready = true;
-        if let Some(buffer_id) = commit_buffer_id {
-            let allocator = ctx.allocator.as_ref();
-            let buffer = if ctx.buffers.contains_key(&buffer_id) {
-                ctx.buffers.get_mut(&buffer_id)
-            } else {
-                ctx.retired_buffers.get_mut(&buffer_id)
-            };
-            if let Some(buffer) = buffer {
-                let mut copy_ok = false;
-                let pool = &buffer.pool;
-                if let Ok(inner) = pool.inner.read() {
-                    if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
-                        let src_ptr = inner.client_ptr as *const u8;
-                        let format = buffer.format;
-                        let offset = buffer.offset;
-                        let buffer_width = buffer.width;
-                        let buffer_height = buffer.height;
-                        let source_stride = buffer.stride;
-                        let needs_full_copy = buffer.needs_full_copy;
-                        let mut sync_guard = if buffer.dmabuf_sync {
-                            let guard = DmabufWriteSync::begin(
-                                ctx.virtwayland_channel.as_ref(),
-                                buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd),
-                            );
-                            if guard.is_none() {
-                                log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
-                            }
-                            guard
-                        } else {
-                            None
-                        };
-                        let sync_started = !buffer.dmabuf_sync || sync_guard.is_some();
-                        if sync_started {
-                            copy_ok = if !buffer.dest_ptr.is_null() {
-                                copy_damage_to_ptr(
-                                    format,
-                                    offset,
-                                    buffer_width,
-                                    buffer_height,
-                                    source_stride,
-                                    needs_full_copy,
-                                    src_ptr,
-                                    inner.size,
-                                    buffer.dest_ptr,
-                                    buffer.dest_size,
-                                    buffer.bo_stride as usize,
-                                    buffer.dmabuf_plane1_offset,
-                                    buffer.dmabuf_plane1_stride,
-                                    &surface_damage,
-                                    &buffer_damage,
-                                    full_mapping,
-                                )
-                            } else if let (Some(allocator), Some(bo)) =
-                                (allocator, buffer.bo.as_mut())
-                            {
-                                match (u32::try_from(buffer_width), u32::try_from(buffer_height)) {
-                                    (Ok(width), Ok(height)) => {
-                                        match bo.map_mut(
-                                            &allocator.device,
-                                            0,
-                                            0,
-                                            width,
-                                            height,
-                                            |mapped| {
-                                                copy_damage_to_ptr(
-                                                    format,
-                                                    offset,
-                                                    buffer_width,
-                                                    buffer_height,
-                                                    source_stride,
-                                                    needs_full_copy,
-                                                    src_ptr,
-                                                    inner.size,
-                                                    mapped.buffer_mut().as_mut_ptr(),
-                                                    mapped.buffer().len(),
-                                                    mapped.stride() as usize,
-                                                    buffer.dmabuf_plane1_offset,
-                                                    buffer.dmabuf_plane1_stride,
-                                                    &surface_damage,
-                                                    &buffer_damage,
-                                                    full_mapping,
-                                                )
-                                            },
-                                        ) {
-                                            Ok(Ok(copy_ok)) => copy_ok,
-                                            Ok(Err(error)) => {
-                                                log::warn!("GBM BO map failed: {}", error);
-                                                false
-                                            }
-                                            Err(_) => {
-                                                log::warn!(
-                                                    "GBM BO belongs to a different allocator device"
-                                                );
-                                                false
-                                            }
-                                        }
-                                    }
-                                    (Err(_), _) => {
-                                        log::warn!("SHM buffer width cannot be represented as u32");
-                                        false
-                                    }
-                                    (_, Err(_)) => {
-                                        log::warn!(
-                                            "SHM buffer height cannot be represented as u32"
-                                        );
-                                        false
-                                    }
-                                }
-                            } else {
-                                // No destination mapping is available. This can
-                                // happen only for a malformed or unsupported
-                                // allocation path; leave the host buffer untouched.
-                                false
-                            };
-                        }
-                        if let Some(guard) = sync_guard.take() {
-                            if !guard.end() {
-                                copy_ok = false;
-                            }
-                        }
-                        if !copy_ok {
-                            log::warn!(
-                                "Deferring SHM commit with an invalid or unmappable destination"
-                            );
-                        } else {
-                            buffer.needs_full_copy = false;
-                            // A 4K frame can reach this path every refresh.
-                            // Keep the per-frame diagnostic at trace level so
-                            // enabling ordinary debug logging cannot turn
-                            // terminal rendering into synchronous PTY I/O.
-                            trace!(
-                                "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
-                                 width={}, height={}, format={:#010x}, buffer.offset={}, \
-                                 pool_size={}, dest_size={}",
-                                buffer.bo_stride,
-                                buffer.stride,
-                                buffer.width,
-                                buffer.height,
-                                buffer.format,
-                                buffer.offset,
-                                inner.size,
-                                buffer.dest_size
-                            );
-                        }
-                    } else {
-                        log::warn!("SHM pool has no valid client mapping");
-                    }
-                } else {
-                    log::warn!("Unable to read SHM pool while committing buffer");
-                }
-                if !copy_ok {
-                    // Preserve a complete retry even when this was a
-                    // damage-only commit. Otherwise a transient sync/map
-                    // failure would discard the only dirty region.
-                    buffer.needs_full_copy = true;
-                    commit_ready = false;
-                }
-            } else {
-                // Buffers created through the native linux-dmabuf path do
-                // not have a local SHM copy state. Their attach is already
-                // forwarded and the host commit can proceed normally.
-            }
-        }
+        let commit_ready =
+            commit_buffer_id.is_none_or(|buffer_id| copy_surface_buffer(ctx, buffer_id, &commit));
 
         if commit_ready {
             if wait_for_native_sync {
@@ -1167,25 +1009,23 @@ impl WlSurfaceHandler for CompositorHandler {
             // Damage requests are double-buffered. Emit the translated host
             // requests immediately before the commit so the host sees exactly
             // the same pending damage set as the guest compositor.
-            if let Some(surface_state) = surface_snapshot {
-                // Offset-aware damage translation is not implemented yet. A
-                // partial surface-local damage rectangle would describe the
-                // wrong host region after the buffer is repositioned, while
-                // the local copy path conservatively updates the complete
-                // buffer. Keep the host damage equally conservative until an
-                // offset map exists.
-                let force_full_damage = needs_full_damage
-                    || surface_state.current_offset != (0, 0)
-                    || (full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
-                queue_surface_damage(
-                    ctx,
-                    surface_id,
-                    &surface_damage,
-                    &buffer_damage,
-                    &surface_state,
-                    force_full_damage,
-                );
-            }
+            // Offset-aware damage translation is not implemented yet. A
+            // partial surface-local damage rectangle would describe the
+            // wrong host region after the buffer is repositioned, while
+            // the local copy path conservatively updates the complete
+            // buffer. Keep the host damage equally conservative until an
+            // offset map exists.
+            let force_full_damage = needs_full_damage
+                || commit.state.current_offset != (0, 0)
+                || (full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
+            queue_surface_damage(
+                ctx,
+                surface_id,
+                surface_damage,
+                buffer_damage,
+                &commit.state,
+                force_full_damage,
+            );
             // The generated dispatcher appends context-queued messages after
             // the forwarded packet. Queue the commit itself so translated
             // damage is guaranteed to reach the host before the commit that
@@ -1198,18 +1038,10 @@ impl WlSurfaceHandler for CompositorHandler {
                 // the previous release edge only here; doing it in attach
                 // would make an attach-without-commit leak when the guest
                 // destroys the otherwise-idle buffer.
-                ctx.released_host_buffers.remove(&buffer_id);
-                ctx.submitted_buffers.insert(buffer_id);
-                if let Some(buffer) = ctx.buffers.get_mut(&buffer_id) {
-                    // A commit without a new attach still submits the current
-                    // buffer. A prior wl_buffer.release only completed the
-                    // previous compositor-use interval; this commit starts a
-                    // new one and must make a later guest destroy defer
-                    // cleanup again.
-                    buffer.host_released = false;
-                } else if let Some(buffer) = ctx.retired_buffers.get_mut(&buffer_id) {
-                    buffer.host_released = false;
-                }
+                // A commit without a new attach still submits the current
+                // buffer. A prior release only completed the previous use
+                // interval; this commit atomically starts a new one.
+                ctx.mark_buffer_submitted(buffer_id);
             }
         } else {
             log::warn!(
@@ -1218,7 +1050,9 @@ impl WlSurfaceHandler for CompositorHandler {
             );
         }
         if !commit_ready {
-            restore_failed_surface_commit(ctx, surface_id, rollback, surface_damage, buffer_damage);
+            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+                commit.rollback(surface);
+            }
         }
         crate::handler::shm::collect_retired_buffers(ctx);
         Action::Drop
@@ -1550,7 +1384,6 @@ mod tests {
         height: i32,
         stride: u32,
         needs_full_copy: bool,
-        host_released: bool,
     ) -> BufferState {
         let source_size = usize::try_from(height)
             .unwrap()
@@ -1603,7 +1436,6 @@ mod tests {
             dest_ptr: destination_ptr as *mut u8,
             dest_size: source_size,
             needs_full_copy,
-            host_released,
         }
     }
 
@@ -1767,23 +1599,18 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false, true),
-        );
+        ctx.mark_buffer_released(buffer_id);
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 1, 1, 4, false));
         ctx.last_sender_id = surface_id;
 
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(
-            !ctx.buffers
-                .get(&buffer_id)
-                .expect("current buffer")
-                .host_released,
+        assert_eq!(
+            ctx.host_buffer_use(buffer_id),
+            Some(crate::state::HostBufferUse::Submitted),
             "a damage-only commit must begin a new host compositor use interval"
         );
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
     }
 
     #[test]
@@ -1795,10 +1622,9 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false, true),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 1, 1, 4, false));
+        ctx.mark_buffer_released(buffer_id);
         // The host has released the previous compositor-use interval. A
         // damage-only commit must begin a new interval even though no attach
         // request appears in this commit.
@@ -1807,15 +1633,8 @@ mod tests {
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert!(
-            ctx.submitted_buffers.contains(&buffer_id),
+            ctx.buffer_is_submitted(buffer_id),
             "damage-only commit must mark the current buffer as submitted again"
-        );
-        assert!(
-            !ctx.buffers
-                .get(&buffer_id)
-                .expect("current buffer")
-                .host_released,
-            "damage-only commit must reopen the compositor-use interval"
         );
     }
 
@@ -1828,16 +1647,16 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.released_host_buffers.insert(buffer_id);
+        ctx.mark_buffer_released(buffer_id);
         ctx.last_sender_id = surface_id;
 
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert!(
-            !ctx.released_host_buffers.contains(&buffer_id),
+            !ctx.buffer_is_released(buffer_id),
             "a commit must clear the prior release marker for a native buffer"
         );
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_submitted(buffer_id));
     }
 
     #[test]
@@ -1885,7 +1704,7 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
+        ctx.mark_buffer_submitted(buffer_id);
 
         let mut shm = crate::handler::shm::ShmHandler;
         ctx.last_sender_id = host_buffer_id;
@@ -1893,15 +1712,15 @@ mod tests {
             WlBufferHandler::on_release(&mut shm, &mut ctx),
             Action::Forward
         );
-        assert!(ctx.released_host_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_released(buffer_id));
 
         // A damage-only commit starts a new host use interval even without an
         // attach request.
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
         assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.released_host_buffers.contains(&buffer_id));
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(!ctx.buffer_is_released(buffer_id));
+        assert!(ctx.buffer_is_submitted(buffer_id));
 
         // Destroying the guest object before the new host release must defer
         // the host destructor rather than using the old release marker.
@@ -1929,15 +1748,13 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer_id, 1);
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 1, 1, 4, false));
         ctx.surfaces
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
+        ctx.mark_buffer_submitted(buffer_id);
 
         let mut shm = crate::handler::shm::ShmHandler;
         ctx.last_sender_id = host_buffer_id;
@@ -1991,7 +1808,7 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
+        ctx.mark_buffer_submitted(buffer_id);
 
         let mut shm = crate::handler::shm::ShmHandler;
         ctx.last_sender_id = host_buffer_id;
@@ -2036,15 +1853,13 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer_id, 1);
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, true, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 1, 1, 4, true));
         ctx.surfaces
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
+        ctx.mark_buffer_submitted(buffer_id);
 
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
@@ -2074,7 +1889,7 @@ mod tests {
         ctx.last_sender_id = surface_id;
         assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
         assert!(ctx.retired_buffers.contains_key(&buffer_id));
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_submitted(buffer_id));
 
         // A release for the newly committed interval is the one that permits
         // the host destructor.
@@ -2104,7 +1919,7 @@ mod tests {
             .entry(surface_id)
             .or_default()
             .current_buffer_id = Some(buffer_id);
-        ctx.submitted_buffers.insert(buffer_id);
+        ctx.mark_buffer_submitted(buffer_id);
 
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
@@ -2127,7 +1942,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.deferred_host_buffers.contains_key(&buffer_id));
-        assert!(ctx.released_host_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_released(buffer_id));
         assert!(!ctx
             .client_to_host_queue
             .iter()
@@ -2135,9 +1950,9 @@ mod tests {
 
         ctx.last_sender_id = surface_id;
         assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_submitted(buffer_id));
         assert!(ctx.deferred_host_buffers.contains_key(&buffer_id));
-        assert!(!ctx.released_host_buffers.contains(&buffer_id));
+        assert!(!ctx.buffer_is_released(buffer_id));
 
         ctx.last_sender_id = host_buffer_id;
         assert_eq!(
@@ -2211,10 +2026,8 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(old_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(old_host_buffer, 1);
-        ctx.buffers.insert(
-            old_buffer,
-            mapped_test_buffer(old_buffer, 1, 1, 4, false, false),
-        );
+        ctx.buffers
+            .insert(old_buffer, mapped_test_buffer(old_buffer, 1, 1, 4, false));
 
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
@@ -2260,13 +2073,13 @@ mod tests {
         ctx.shadow_table.set_host_version(host_buffer, 1);
         ctx.retired_buffers.insert(
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
         );
         // The buffer was committed by an earlier surface state and destroyed
         // by the guest, but its host use interval is still in flight. It is
         // intentionally no longer referenced by the surface below: a later
         // attach must not mistake that state for an uncommitted pending attach.
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface_id;
@@ -2348,7 +2161,6 @@ mod tests {
                 dest_ptr: destination_ptr,
                 dest_size: BUFFER_BYTES,
                 needs_full_copy: true,
-                host_released: false,
             },
         );
 
@@ -2445,12 +2257,12 @@ mod tests {
                 dest_ptr: destination_ptr,
                 dest_size: BUFFER_BYTES,
                 needs_full_copy: true,
-                // This buffer has completed a previous compositor-use
-                // interval. A new attach must reopen that interval even when
-                // the guest destroys the object before commit.
-                host_released: true,
             },
         );
+        // This buffer has completed a previous compositor-use interval. A new
+        // attach must reopen that interval even when the guest destroys the
+        // object before commit.
+        ctx.mark_buffer_released(buffer_id);
         ctx.shadow_table.map_id(buffer_id, host_buffer_id);
         ctx.shadow_table
             .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
@@ -2496,7 +2308,7 @@ mod tests {
                 .and_then(|surface| surface.current_buffer_id),
             Some(buffer_id)
         );
-        assert!(ctx.submitted_buffers.contains(&buffer_id));
+        assert!(ctx.buffer_is_submitted(buffer_id));
     }
 
     #[test]
@@ -2693,10 +2505,8 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, true, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 8, 6, 32, true));
 
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2722,7 +2532,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, true, false);
+        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, true);
         let destination_ptr = buffer.dest_ptr;
         buffer.dest_ptr = std::ptr::null_mut();
         buffer.dest_size = 0;
@@ -2785,10 +2595,8 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 8, 6, 32, false));
 
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2832,10 +2640,8 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 8, 6, 32, false));
         ctx.surfaces.insert(
             surface_id,
             SurfaceState {
@@ -2866,10 +2672,8 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        ctx.buffers.insert(
-            buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false, false),
-        );
+        ctx.buffers
+            .insert(buffer_id, mapped_test_buffer(buffer_id, 8, 6, 32, false));
         ctx.surfaces.insert(
             surface_id,
             SurfaceState {
@@ -2954,7 +2758,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         ctx.buffers
-            .insert(42, mapped_test_buffer(42, 2048, 2048, 8192, false, false));
+            .insert(42, mapped_test_buffer(42, 2048, 2048, 8192, false));
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3189,7 +2993,7 @@ mod tests {
         ctx.shadow_table.set_host_version(host_buffer, 1);
         ctx.shadow_table.mark_pending_destroy(guest_buffer);
         ctx.deferred_host_buffers.insert(guest_buffer, host_buffer);
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
         ctx.surfaces
             .entry(wl_surface_guest)
             .or_default()
@@ -3203,7 +3007,7 @@ mod tests {
         );
 
         assert!(ctx.deferred_host_buffers.is_empty());
-        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(!ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             ctx.client_to_host_queue
                 .iter()
@@ -3222,6 +3026,62 @@ mod tests {
     }
 
     #[test]
+    fn shared_buffer_waits_for_its_last_surface_destroy() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, first_surface_host) = setup_ctx();
+        let first_surface = 100u32;
+        let second_surface = 101u32;
+        let second_surface_host = 201u32;
+        let guest_buffer = 50u32;
+        let host_buffer = 60u32;
+
+        ctx.shadow_table.map_id(second_surface, second_surface_host);
+        ctx.shadow_table
+            .track_interface_with_version(second_surface, "wl_surface".to_string(), 5);
+        ctx.shadow_table.set_host_version(second_surface_host, 5);
+        ctx.shadow_table.map_id(guest_buffer, host_buffer);
+        ctx.shadow_table
+            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.retire_guest_object(guest_buffer);
+        ctx.deferred_host_buffers.insert(guest_buffer, host_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
+        for surface in [first_surface, second_surface] {
+            ctx.surfaces.entry(surface).or_default().current_buffer_id = Some(guest_buffer);
+        }
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = first_surface;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.deferred_host_buffers.contains_key(&guest_buffer));
+        assert!(ctx.buffer_is_submitted(guest_buffer));
+        assert!(
+            !ctx.client_to_host_queue
+                .iter()
+                .any(|(message, _)| msg_sender(message) == host_buffer),
+            "one surface cannot retire a buffer still owned by another"
+        );
+
+        ctx.last_sender_id = second_surface;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
+        assert!(!ctx.deferred_host_buffers.contains_key(&guest_buffer));
+        assert!(ctx.host_buffer_use(guest_buffer).is_none());
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .map(|(message, _)| msg_sender(message))
+                .collect::<Vec<_>>(),
+            vec![first_surface_host, second_surface_host, host_buffer],
+            "the buffer destructor must follow both owning surface destructors"
+        );
+    }
+
+    #[test]
     fn wl_surface_destroy_retires_submitted_shm_buffer_after_surface_destroy() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         let wl_surface_guest = 100u32;
@@ -3234,9 +3094,9 @@ mod tests {
         ctx.shadow_table.set_host_version(host_buffer, 1);
         ctx.retired_buffers.insert(
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
         );
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
         ctx.surfaces
             .entry(wl_surface_guest)
             .or_default()
@@ -3250,7 +3110,7 @@ mod tests {
         );
 
         assert!(ctx.retired_buffers.is_empty());
-        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(!ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             ctx.client_to_host_queue
                 .iter()
@@ -3281,9 +3141,9 @@ mod tests {
         ctx.shadow_table.set_host_version(host_buffer, 1);
         ctx.buffers.insert(
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
         );
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
         ctx.surfaces
             .entry(wl_surface_guest)
             .or_default()
@@ -3296,7 +3156,7 @@ mod tests {
             Action::Drop
         );
         assert!(
-            !ctx.submitted_buffers.contains(&guest_buffer),
+            !ctx.buffer_is_submitted(guest_buffer),
             "the destroyed surface was the only compositor-use reference"
         );
 
@@ -3332,12 +3192,12 @@ mod tests {
         ctx.shadow_table.set_host_version(host_buffer, 1);
         ctx.retired_buffers.insert(
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
         );
         // This is a committed buffer whose surface was detached before the
         // release edge arrived. It is not owned by surface 100, even though
         // the submitted marker is global.
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = CompositorHandler;
         ctx.last_sender_id = 100;
@@ -3347,7 +3207,7 @@ mod tests {
         );
 
         assert!(ctx.retired_buffers.contains_key(&guest_buffer));
-        assert!(ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(ctx.buffer_is_submitted(guest_buffer));
         assert!(
             !ctx.client_to_host_queue
                 .iter()

@@ -539,6 +539,21 @@ impl ShadowTable {
         }
     }
 
+    /// Complete a server-destroyed paired object while reserving its host ID.
+    ///
+    /// Some event-only objects, notably `wl_callback`, cease to exist when the
+    /// host sends their terminal event. The guest mapping must disappear
+    /// immediately, but the host numeric ID remains unavailable until the
+    /// compositor's later `wl_display.delete_id`. Combining both transitions
+    /// prevents callers from accidentally opening an ID-reuse window between
+    /// removing the pair and installing the host-only reservation.
+    pub fn retire_server_destroyed_object(&mut self, guest_id: u32) -> Option<HostId> {
+        let host_id = *self.guest_to_host.get(&guest_id)?;
+        self.remove_guest_mapping(guest_id);
+        self.mark_pending_destroy_host(host_id)
+            .then_some(HostId(host_id))
+    }
+
     /// Mark a guest object as destroyed while retaining both sides of its
     /// mapping for a delayed host event (for example wl_buffer.release).
     ///
@@ -690,10 +705,6 @@ pub struct BufferState {
     /// frame must therefore copy the complete guest buffer even if the client
     /// omitted an explicit damage request.
     pub needs_full_copy: bool,
-    /// The host compositor has sent wl_buffer.release while this guest
-    /// object is still alive. A later guest destroy can drop local backing
-    /// storage immediately when this is set.
-    pub host_released: bool,
 }
 
 unsafe impl Send for BufferState {}
@@ -760,7 +771,7 @@ impl DamageRect {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceState {
     /// Buffer selected by the most recent committed attach. A commit that
     /// changes only damage still uses this buffer.
@@ -797,6 +808,97 @@ pub struct SurfaceState {
     /// Pending viewport state applied by the next surface commit. `Some(None)`
     /// represents destruction of the viewport object; `None` means unchanged.
     pub pending_viewport: Option<Option<ViewportState>>,
+}
+
+/// One atomically prepared `wl_surface.commit`.
+///
+/// Preparing a commit consumes every pending double-buffered field and applies
+/// it to [`SurfaceState`]. The complete pre-commit snapshot is retained so any
+/// validation or buffer-copy failure can restore the exact prior state. This
+/// makes rollback automatically cover fields added to `SurfaceState` later,
+/// instead of relying on a parallel list of manually restored fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceCommit {
+    previous: SurfaceState,
+    pub state: SurfaceState,
+    /// `Some(None)` is an explicit `attach(NULL)`; `None` means no attach was
+    /// included in this commit.
+    pub attachment: Option<Option<u32>>,
+    pub surface_damage: Vec<DamageRect>,
+    pub buffer_damage: Vec<DamageRect>,
+}
+
+impl SurfaceCommit {
+    pub fn buffer_id(&self) -> Option<u32> {
+        self.state.current_buffer_id
+    }
+
+    pub fn has_buffer_attach(&self) -> bool {
+        matches!(self.attachment, Some(Some(_)))
+    }
+
+    pub fn uses_full_mapping(&self) -> bool {
+        self.state.current_buffer_scale != 1
+            || self.state.current_buffer_transform != 0
+            || self.state.current_offset != (0, 0)
+            || self
+                .state
+                .viewport
+                .is_some_and(|viewport| !viewport.is_identity())
+    }
+
+    pub fn has_invalid_fractional_viewport(&self) -> bool {
+        let Some(viewport) = self.state.viewport else {
+            return false;
+        };
+        let Some((_, _, width, height)) = viewport.source else {
+            return false;
+        };
+        viewport.destination.is_none() && (width % 256 != 0 || height % 256 != 0)
+    }
+
+    pub fn rollback(self, surface: &mut SurfaceState) {
+        *surface = self.previous;
+    }
+}
+
+impl SurfaceState {
+    /// Apply and consume all state pending for the next surface commit.
+    pub fn prepare_commit(&mut self) -> SurfaceCommit {
+        let previous = self.clone();
+        let attachment = self.pending_buffer_id.take();
+        if let Some(buffer_id) = attachment {
+            self.current_buffer_id = buffer_id;
+        }
+        if let Some(scale) = self.pending_buffer_scale.take() {
+            self.current_buffer_scale = scale;
+        }
+        if let Some(transform) = self.pending_buffer_transform.take() {
+            self.current_buffer_transform = transform;
+        }
+        let offset = self
+            .pending_offset
+            .take()
+            .or_else(|| self.pending_attach_offset.take());
+        // Consume a legacy attach offset even when an explicit offset wins.
+        self.pending_attach_offset = None;
+        if let Some(offset) = offset {
+            self.current_offset = offset;
+        }
+        if let Some(viewport) = self.pending_viewport.take() {
+            self.viewport = viewport;
+        }
+        let surface_damage = std::mem::take(&mut self.pending_surface_damage);
+        let buffer_damage = std::mem::take(&mut self.pending_buffer_damage);
+
+        SurfaceCommit {
+            previous,
+            state: self.clone(),
+            attachment,
+            surface_damage,
+            buffer_damage,
+        }
+    }
 }
 
 impl Default for SurfaceState {
@@ -906,6 +1008,18 @@ pub enum GuestKeyOwner {
     ImeRecovery,
 }
 
+/// Exclusive host-compositor use phase of one guest `wl_buffer`.
+///
+/// Absence from the lifecycle map means the buffer has never been submitted
+/// or its lifecycle is fully retired. A submitted buffer cannot also be
+/// released; each host `wl_buffer.release` completes exactly one use interval,
+/// and a later commit starts a new submitted interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostBufferUse {
+    Submitted,
+    Released,
+}
+
 #[derive(Debug, Default)]
 pub struct DmabufCapabilityState {
     /// Legacy v3 format/modifier pairs collected for one host-global
@@ -926,18 +1040,15 @@ pub struct Context {
     /// the buffer, at which point the host object and backing storage can be
     /// retired safely.
     pub retired_buffers: HashMap<u32, BufferState>,
-    /// Guest buffer IDs that have been sent to the host in a committed
-    /// wl_surface state. A destroyed buffer with this marker retains its
-    /// local SHM backing until the surface switches away from it.
-    pub submitted_buffers: HashSet<u32>,
+    /// Exclusive host-compositor use phase for SHM and native buffers.
+    ///
+    /// This is private so rendering handlers cannot represent a buffer as
+    /// simultaneously submitted and released.
+    buffer_uses: HashMap<u32, HostBufferUse>,
     /// Native linux-dmabuf buffers have no local SHM mapping, but their host
     /// wl_buffer still must remain alive after the guest object is destroyed
     /// until the compositor sends wl_buffer.release.
     pub deferred_host_buffers: HashMap<u32, u32>,
-    /// Host release markers for native linux-dmabuf buffers that have no
-    /// BufferState entry. A released buffer may be destroyed even while a
-    /// surface still retains it as its current content.
-    pub released_host_buffers: HashSet<u32>,
     /// Dimensions of guest-created linux-dmabuf buffers. Native buffers do
     /// not need a local SHM `BufferState`, but the compositor bridge still
     /// needs their dimensions to translate `damage_buffer` and full damage
@@ -1152,6 +1263,32 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<HostBufferUse> {
+        self.buffer_uses.get(&guest_buffer_id).copied()
+    }
+
+    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) {
+        self.buffer_uses
+            .insert(guest_buffer_id, HostBufferUse::Submitted);
+    }
+
+    pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: u32) {
+        self.buffer_uses
+            .insert(guest_buffer_id, HostBufferUse::Released);
+    }
+
+    pub(crate) fn clear_buffer_use(&mut self, guest_buffer_id: u32) {
+        self.buffer_uses.remove(&guest_buffer_id);
+    }
+
+    pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
+        self.host_buffer_use(guest_buffer_id) == Some(HostBufferUse::Submitted)
+    }
+
+    pub(crate) fn buffer_is_released(&self, guest_buffer_id: u32) -> bool {
+        self.host_buffer_use(guest_buffer_id) == Some(HostBufferUse::Released)
+    }
+
     pub(crate) fn guest_key_owner(
         &self,
         host_keyboard_id: HostId,
@@ -1256,9 +1393,8 @@ impl Context {
             pools: HashMap::new(),
             buffers: HashMap::new(),
             retired_buffers: HashMap::new(),
-            submitted_buffers: HashSet::new(),
+            buffer_uses: HashMap::new(),
             deferred_host_buffers: HashMap::new(),
-            released_host_buffers: HashSet::new(),
             native_buffer_sizes: HashMap::new(),
             pending_native_buffer_sizes: HashMap::new(),
             orphaned_dmabuf_params: HashMap::new(),
@@ -1850,6 +1986,178 @@ mod tests {
             "PoolState::drop must unmap a poisoned pool"
         );
         assert_eq!(errno_value(), libc::ENOMEM);
+    }
+
+    #[test]
+    fn surface_commit_applies_every_pending_field_atomically() {
+        let mut surface = SurfaceState {
+            current_buffer_id: Some(1),
+            pending_buffer_id: Some(Some(2)),
+            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)],
+            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)],
+            pending_buffer_scale: Some(2),
+            current_buffer_scale: 1,
+            pending_buffer_transform: Some(3),
+            current_buffer_transform: 0,
+            pending_offset: Some((9, 10)),
+            pending_attach_offset: Some((11, 12)),
+            current_offset: (0, 0),
+            viewport: None,
+            pending_viewport: Some(Some(ViewportState {
+                source: Some((0, 0, 256, 256)),
+                destination: Some((20, 30)),
+            })),
+        };
+
+        let commit = surface.prepare_commit();
+
+        assert_eq!(commit.attachment, Some(Some(2)));
+        assert_eq!(commit.buffer_id(), Some(2));
+        assert!(commit.has_buffer_attach());
+        assert!(commit.uses_full_mapping());
+        assert!(!commit.has_invalid_fractional_viewport());
+        assert_eq!(commit.surface_damage, vec![DamageRect::new(1, 2, 3, 4)]);
+        assert_eq!(commit.buffer_damage, vec![DamageRect::new(5, 6, 7, 8)]);
+        assert_eq!(surface.current_buffer_scale, 2);
+        assert_eq!(surface.current_buffer_transform, 3);
+        assert_eq!(
+            surface.current_offset,
+            (9, 10),
+            "an explicit offset must win over the legacy attach offset"
+        );
+        assert_eq!(
+            surface.viewport,
+            Some(ViewportState {
+                source: Some((0, 0, 256, 256)),
+                destination: Some((20, 30)),
+            })
+        );
+        assert_eq!(surface, commit.state);
+        assert!(surface.pending_buffer_id.is_none());
+        assert!(surface.pending_surface_damage.is_empty());
+        assert!(surface.pending_buffer_damage.is_empty());
+        assert!(surface.pending_buffer_scale.is_none());
+        assert!(surface.pending_buffer_transform.is_none());
+        assert!(surface.pending_offset.is_none());
+        assert!(surface.pending_attach_offset.is_none());
+        assert!(surface.pending_viewport.is_none());
+
+        let next = surface.prepare_commit();
+        assert!(next.attachment.is_none());
+        assert!(next.surface_damage.is_empty());
+        assert!(next.buffer_damage.is_empty());
+        assert_eq!(next.state, commit.state);
+    }
+
+    #[test]
+    fn surface_commit_rollback_restores_the_complete_snapshot() {
+        let mut surface = SurfaceState {
+            current_buffer_id: Some(1),
+            pending_buffer_id: Some(None),
+            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)],
+            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)],
+            pending_buffer_scale: Some(2),
+            current_buffer_scale: 1,
+            pending_buffer_transform: Some(3),
+            current_buffer_transform: 0,
+            pending_offset: None,
+            pending_attach_offset: Some((11, 12)),
+            current_offset: (4, 5),
+            viewport: Some(ViewportState::new()),
+            pending_viewport: Some(None),
+        };
+        let before = surface.clone();
+
+        let commit = surface.prepare_commit();
+        assert_ne!(surface, before);
+        commit.rollback(&mut surface);
+
+        assert_eq!(surface, before);
+    }
+
+    #[test]
+    fn surface_commit_validates_fractional_viewport_as_one_state() {
+        let mut surface = SurfaceState {
+            pending_viewport: Some(Some(ViewportState {
+                source: Some((0, 0, 257, 256)),
+                destination: None,
+            })),
+            ..SurfaceState::default()
+        };
+        assert!(surface.prepare_commit().has_invalid_fractional_viewport());
+
+        surface.pending_viewport = Some(Some(ViewportState {
+            source: Some((0, 0, 257, 256)),
+            destination: Some((10, 10)),
+        }));
+        assert!(!surface.prepare_commit().has_invalid_fractional_viewport());
+    }
+
+    #[test]
+    fn host_buffer_use_is_an_exclusive_phase() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let buffer = 20;
+
+        assert!(ctx.host_buffer_use(buffer).is_none());
+        ctx.mark_buffer_submitted(buffer);
+        assert_eq!(ctx.host_buffer_use(buffer), Some(HostBufferUse::Submitted));
+        assert!(ctx.buffer_is_submitted(buffer));
+        assert!(!ctx.buffer_is_released(buffer));
+
+        ctx.mark_buffer_released(buffer);
+        assert_eq!(ctx.host_buffer_use(buffer), Some(HostBufferUse::Released));
+        assert!(!ctx.buffer_is_submitted(buffer));
+        assert!(ctx.buffer_is_released(buffer));
+
+        ctx.mark_buffer_submitted(buffer);
+        assert_eq!(
+            ctx.host_buffer_use(buffer),
+            Some(HostBufferUse::Submitted),
+            "a new commit must replace the prior release edge"
+        );
+        ctx.clear_buffer_use(buffer);
+        assert!(ctx.host_buffer_use(buffer).is_none());
+        assert!(!ctx.buffer_uses.contains_key(&buffer));
+    }
+
+    #[test]
+    fn host_buffer_use_matches_all_short_transition_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Submit,
+            Release,
+            Clear,
+        }
+
+        let operations = [Operation::Submit, Operation::Release, Operation::Clear];
+        let sequence_len = 7;
+        let sequence_count = operations.len().pow(sequence_len);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let buffer = 20;
+
+        for mut encoded in 0..sequence_count {
+            ctx.clear_buffer_use(buffer);
+
+            for _ in 0..sequence_len {
+                let model = match operations[encoded % operations.len()] {
+                    Operation::Submit => {
+                        ctx.mark_buffer_submitted(buffer);
+                        Some(HostBufferUse::Submitted)
+                    }
+                    Operation::Release => {
+                        ctx.mark_buffer_released(buffer);
+                        Some(HostBufferUse::Released)
+                    }
+                    Operation::Clear => {
+                        ctx.clear_buffer_use(buffer);
+                        None
+                    }
+                };
+                encoded /= operations.len();
+                assert_eq!(ctx.host_buffer_use(buffer), model);
+                assert_eq!(ctx.buffer_uses.contains_key(&buffer), model.is_some());
+            }
+        }
     }
 
     #[test]

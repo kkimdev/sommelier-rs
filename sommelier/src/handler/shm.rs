@@ -1152,34 +1152,47 @@ fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
     }
 }
 
-fn surface_references_buffer(ctx: &Context, guest_id: u32) -> bool {
-    !surfaces_referencing_buffer(ctx, guest_id).is_empty()
-}
-
-/// Return whether a buffer is attached to a surface but has not replaced that
-/// surface's currently committed buffer yet.  An attach is double-buffered:
-/// the host has already received it, and a later commit may still make it
-/// compositor-visible even if the guest destroys the wl_buffer in between.
+/// Canonical snapshot of every current and pending surface→buffer edge.
 ///
-/// This deliberately includes re-attaching the surface's current buffer.  The
-/// host cannot distinguish an attach that will be committed from one that will
-/// be replaced later, so destroying the guest object immediately could queue a
-/// host destructor before a valid pending commit.
-fn has_uncommitted_buffer_attach(ctx: &Context, guest_id: u32) -> bool {
-    ctx.surfaces
-        .values()
-        .any(|surface| surface.pending_buffer_id == Some(Some(guest_id)))
+/// Pending attaches are kept distinct because they have already reached the
+/// host but do not begin a compositor-use interval until commit. Computing the
+/// two sets together prevents SHM and native collectors from drifting into
+/// subtly different definitions of "referenced".
+struct SurfaceBufferReferences {
+    current: HashSet<u32>,
+    pending: HashSet<u32>,
 }
 
-fn surfaces_referencing_buffer(ctx: &Context, guest_id: u32) -> HashSet<u32> {
-    ctx.surfaces
-        .iter()
-        .filter_map(|(&surface_id, surface)| {
-            (surface.current_buffer_id == Some(guest_id)
-                || surface.pending_buffer_id == Some(Some(guest_id)))
-            .then_some(surface_id)
-        })
-        .collect()
+impl SurfaceBufferReferences {
+    fn collect(ctx: &Context) -> Self {
+        let mut current = HashSet::new();
+        let mut pending = HashSet::new();
+        for surface in ctx.surfaces.values() {
+            current.extend(surface.current_buffer_id);
+            pending.extend(surface.pending_buffer_id.flatten());
+        }
+        Self { current, pending }
+    }
+
+    fn contains(&self, guest_id: u32) -> bool {
+        self.current.contains(&guest_id) || self.pending.contains(&guest_id)
+    }
+
+    fn has_pending(&self, guest_id: u32) -> bool {
+        self.pending.contains(&guest_id)
+    }
+}
+
+fn can_retire_deferred_buffer(
+    ctx: &Context,
+    references: &SurfaceBufferReferences,
+    guest_id: u32,
+    allow_submitted: Option<&HashSet<u32>>,
+) -> bool {
+    (!references.contains(guest_id)
+        || (ctx.buffer_is_released(guest_id) && !references.has_pending(guest_id)))
+        && (!ctx.buffer_is_submitted(guest_id)
+            || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id)))
 }
 
 /// Drop deferred SHM buffers once the host has released them and no pending
@@ -1191,23 +1204,14 @@ fn surfaces_referencing_buffer(ctx: &Context, guest_id: u32) -> HashSet<u32> {
 /// interval has ended; only a still-pending attach to the same buffer keeps
 /// the host object alive for a possible new interval.
 pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
-    let referenced: std::collections::HashSet<u32> = ctx
-        .surfaces
-        .values()
-        .flat_map(|surface| {
-            surface
-                .current_buffer_id
-                .into_iter()
-                .chain(surface.pending_buffer_id.into_iter().flatten())
-        })
-        .collect();
+    let references = SurfaceBufferReferences::collect(ctx);
     let releasable: Vec<(u32, u32)> = ctx
         .retired_buffers
         .iter()
         .filter_map(|(&guest_id, buffer)| {
-            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
-            (buffer.host_released && (!referenced.contains(&guest_id) || !pending_attach))
-                .then_some((guest_id, buffer.host_buffer_id))
+            (ctx.buffer_is_released(guest_id)
+                && (!references.contains(guest_id) || !references.has_pending(guest_id)))
+            .then_some((guest_id, buffer.host_buffer_id))
         })
         .collect();
     for (guest_id, host_id) in releasable {
@@ -1216,51 +1220,48 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
         // this destructor with wl_display.delete_id.
         let _ = queue_host_buffer_destroy(ctx, host_id);
         ctx.shadow_table.mark_pending_destroy(guest_id);
-        ctx.submitted_buffers.remove(&guest_id);
+        ctx.clear_buffer_use(guest_id);
     }
 }
 
-/// Drop retired SHM buffers whose only reference was a pending attach that has
-/// since been replaced or cleared. If the old compositor-use interval already
-/// released, the host destructor is safe immediately; otherwise only buffers
-/// that were never submitted (or are explicitly allowed after surface
-/// destruction) may be retired without waiting for `wl_buffer.release`.
-fn collect_retired_buffers_without_release(
-    ctx: &mut Context,
-    allow_submitted: Option<&std::collections::HashSet<u32>>,
-) {
-    let referenced: std::collections::HashSet<u32> = ctx
-        .surfaces
-        .values()
-        .flat_map(|surface| {
-            surface
-                .current_buffer_id
-                .into_iter()
-                .chain(surface.pending_buffer_id.into_iter().flatten())
-        })
-        .collect();
-    let releasable: Vec<(u32, u32)> = ctx
+/// Retire guest-destroyed local-copy and native buffers with one lifecycle
+/// predicate.
+///
+/// SHM and native buffers differ only in whether local copy backing must be
+/// retained. Surface references, submitted/released phases, and ordered
+/// surface-destroy proofs have identical lifetime meaning and therefore must
+/// not be evaluated by separate condition trees.
+fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&HashSet<u32>>) {
+    let references = SurfaceBufferReferences::collect(ctx);
+    let local_copy_buffers: Vec<(u32, u32)> = ctx
         .retired_buffers
         .iter()
         .filter_map(|(&guest_id, buffer)| {
-            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
-            ((!referenced.contains(&guest_id) || (buffer.host_released && !pending_attach))
-                && (!ctx.submitted_buffers.contains(&guest_id)
-                    || buffer.host_released
-                    || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
-            .then_some((guest_id, buffer.host_buffer_id))
+            can_retire_deferred_buffer(ctx, &references, guest_id, allow_submitted)
+                .then_some((guest_id, buffer.host_buffer_id))
         })
         .collect();
-    for (guest_id, host_id) in releasable {
+    let native_buffers: Vec<(u32, u32)> = ctx
+        .deferred_host_buffers
+        .iter()
+        .filter_map(|(&guest_id, &host_id)| {
+            can_retire_deferred_buffer(ctx, &references, guest_id, allow_submitted)
+                .then_some((guest_id, host_id))
+        })
+        .collect();
+
+    for (guest_id, host_id) in local_copy_buffers {
         ctx.retired_buffers.remove(&guest_id);
         let _ = queue_host_buffer_destroy(ctx, host_id);
         ctx.shadow_table.mark_pending_destroy(guest_id);
-        ctx.submitted_buffers.remove(&guest_id);
+        ctx.clear_buffer_use(guest_id);
     }
-}
-
-pub(crate) fn collect_uncommitted_retired_buffers(ctx: &mut Context) {
-    collect_retired_buffers_without_release(ctx, None);
+    for (guest_id, host_id) in native_buffers {
+        ctx.deferred_host_buffers.remove(&guest_id);
+        ctx.clear_buffer_use(guest_id);
+        let _ = queue_host_buffer_destroy(ctx, host_id);
+        ctx.shadow_table.mark_pending_destroy(guest_id);
+    }
 }
 
 /// A surface destructor is ordered before any buffer destructors that follow
@@ -1269,89 +1270,33 @@ pub(crate) fn collect_uncommitted_retired_buffers(ctx: &mut Context) {
 /// if the guest destroys that buffer later, its host wl_buffer can be retired
 /// immediately even when the compositor does not emit a separate release for
 /// surface teardown.  Keep the marker while another surface still owns it.
-pub(crate) fn clear_submitted_buffers_after_surface_destroy(
+pub(crate) fn clear_buffer_uses_after_surface_destroy(
     ctx: &mut Context,
     destroyed_surface_buffers: &HashSet<u32>,
 ) {
+    let references = SurfaceBufferReferences::collect(ctx);
     for &guest_id in destroyed_surface_buffers {
-        if !surface_references_buffer(ctx, guest_id) {
-            ctx.submitted_buffers.remove(&guest_id);
+        if !references.contains(guest_id) {
+            ctx.clear_buffer_use(guest_id);
         }
     }
 }
 
-/// Drop retired SHM buffers after their host surface was destroyed. The
-/// surface destructor is ordered before the buffer destructors, so even a
-/// buffer that had already been committed no longer has a host surface that
-/// can sample it.
-pub(crate) fn collect_retired_buffers_after_surface_destroy(
-    ctx: &mut Context,
-    destroyed_surface_buffers: &std::collections::HashSet<u32>,
-) {
-    collect_retired_buffers_without_release(ctx, Some(destroyed_surface_buffers));
-}
-
-/// Retire native dma-buf host objects after a host surface is destroyed.
-///
-/// A guest wl_buffer can be destroyed while its host surface still references
-/// it. In that case the host buffer is normally retired by its release event.
-/// Destroying the host surface first is also a valid lifetime edge: once the
-/// ordered surface destructor reaches the compositor, no remaining surface in
-/// this connection can sample the buffer. Queue the host buffer destructor
-/// after that surface destructor so a compositor that does not emit a
-/// separate wl_buffer.release on surface teardown cannot leave the mapping
-/// permanently deferred.
-fn collect_deferred_native_buffers_impl(
-    ctx: &mut Context,
-    allow_submitted: Option<&std::collections::HashSet<u32>>,
-) {
-    let referenced: std::collections::HashSet<u32> = ctx
-        .surfaces
-        .values()
-        .flat_map(|surface| {
-            surface
-                .current_buffer_id
-                .into_iter()
-                .chain(surface.pending_buffer_id.into_iter().flatten())
-        })
-        .collect();
-    let releasable: Vec<(u32, u32)> = ctx
-        .deferred_host_buffers
-        .iter()
-        .filter_map(|(&guest_id, &host_id)| {
-            let pending_attach = has_uncommitted_buffer_attach(ctx, guest_id);
-            ((!referenced.contains(&guest_id)
-                || (ctx.released_host_buffers.contains(&guest_id) && !pending_attach))
-                && (!ctx.submitted_buffers.contains(&guest_id)
-                    || ctx.released_host_buffers.contains(&guest_id)
-                    || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id))))
-            .then_some((guest_id, host_id))
-        })
-        .collect();
-    for (guest_id, host_id) in releasable {
-        ctx.deferred_host_buffers.remove(&guest_id);
-        ctx.released_host_buffers.remove(&guest_id);
-        ctx.submitted_buffers.remove(&guest_id);
-        let _ = queue_host_buffer_destroy(ctx, host_id);
-        ctx.shadow_table.mark_pending_destroy(guest_id);
-    }
-}
-
-/// Retire native buffers whose only reference was a pending attach that has
+/// Retire buffers whose only reference was a pending attach that has since
 /// been replaced or cleared. A submitted buffer remains deferred until its
 /// release event.
-pub(crate) fn collect_deferred_native_buffers(ctx: &mut Context) {
-    collect_deferred_native_buffers_impl(ctx, None);
+pub(crate) fn collect_deferred_buffers(ctx: &mut Context) {
+    collect_deferred_buffers_impl(ctx, None);
 }
 
-/// Retire native buffers after the host surface destructor has been queued.
-/// This is the one path that may retire a submitted buffer without waiting
-/// for a separate release event.
-pub(crate) fn collect_deferred_native_buffers_after_surface_destroy(
+/// Retire local-copy and native buffers after the owning host surface
+/// destructor has been queued. This is the one path that may retire a
+/// submitted buffer without waiting for a separate release event.
+pub(crate) fn collect_deferred_buffers_after_surface_destroy(
     ctx: &mut Context,
-    destroyed_surface_buffers: &std::collections::HashSet<u32>,
+    destroyed_surface_buffers: &HashSet<u32>,
 ) {
-    collect_deferred_native_buffers_impl(ctx, Some(destroyed_surface_buffers));
+    collect_deferred_buffers_impl(ctx, Some(destroyed_surface_buffers));
 }
 
 impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
@@ -1840,7 +1785,6 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     dest_ptr,
                     dest_size,
                     needs_full_copy: true,
-                    host_released: false,
                 },
             );
             return Action::Drop;
@@ -2012,7 +1956,6 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     dest_ptr,
                     dest_size,
                     needs_full_copy: true,
-                    host_released: false,
                 },
             );
         }
@@ -2099,14 +2042,14 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         let host_id = ctx.shadow_table.get_host_id(guest_id);
-        // wl_surface.attach is forwarded immediately, while submitted_buffers
-        // is marked only when the later wl_surface.commit is handled. A
+        // wl_surface.attach is forwarded immediately, while the submitted
+        // phase starts only when the later wl_surface.commit is handled. A
         // client is allowed to destroy the wl_buffer in that interval; the
         // host surface still owns the attached host buffer and needs its local
         // SHM backing through the pending commit.
-        let uncommitted_attach = has_uncommitted_buffer_attach(ctx, guest_id);
-        let still_referenced =
-            ctx.submitted_buffers.contains(&guest_id) || surface_references_buffer(ctx, guest_id);
+        let references = SurfaceBufferReferences::collect(ctx);
+        let uncommitted_attach = references.has_pending(guest_id);
+        let still_referenced = ctx.buffer_is_submitted(guest_id) || references.contains(guest_id);
 
         // A guest may destroy a wl_buffer while a surface still has it
         // attached. Keep the backing mmap and the guest↔host mapping alive
@@ -2114,7 +2057,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         // damage-only commit can dereference unmapped memory and the host
         // release event can be routed to a newly reused object ID.
         if let Some(mut buffer) = ctx.buffers.remove(&guest_id) {
-            if still_referenced && (!buffer.host_released || uncommitted_attach) {
+            if still_referenced && (!ctx.buffer_is_released(guest_id) || uncommitted_attach) {
                 // Keep the host wl_buffer alive until its release event. A
                 // destroy request would remove the host resource before it
                 // can report release, leaving no compositor-use lifetime
@@ -2134,7 +2077,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 }
                 clear_surface_buffer_references(ctx, guest_id);
                 ctx.shadow_table.mark_pending_destroy(guest_id);
-                ctx.submitted_buffers.remove(&guest_id);
+                ctx.clear_buffer_use(guest_id);
             }
         } else {
             // Native linux-dmabuf buffers have no local mapping to retire, but
@@ -2144,7 +2087,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             // A release may have arrived before the guest destroys the
             // wl_buffer. In that case the host has already completed its use
             // interval and no deferred lifetime signal remains to wait for.
-            let host_already_released = ctx.released_host_buffers.contains(&guest_id);
+            let host_already_released = ctx.buffer_is_released(guest_id);
             if still_referenced && (!host_already_released || uncommitted_attach) {
                 if let Some(host_id) = host_id {
                     ctx.deferred_host_buffers.insert(guest_id, host_id);
@@ -2152,21 +2095,18 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                     // pending attach.  A later commit clears it and starts a
                     // fresh use interval; replacing the attach allows the
                     // collector to retire the already-idle host buffer.
-                    if host_already_released {
-                        ctx.released_host_buffers.insert(guest_id);
-                    }
                     ctx.shadow_table.retire_guest_object(guest_id);
                     return Action::Drop;
                 }
             } else if let Some(host_id) = host_id {
-                ctx.released_host_buffers.remove(&guest_id);
+                ctx.clear_buffer_use(guest_id);
                 let _ = queue_host_buffer_destroy(ctx, host_id);
             } else {
-                ctx.released_host_buffers.remove(&guest_id);
+                ctx.clear_buffer_use(guest_id);
             }
             clear_surface_buffer_references(ctx, guest_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
-            ctx.submitted_buffers.remove(&guest_id);
+            ctx.clear_buffer_use(guest_id);
         }
         Action::Drop
     }
@@ -2176,14 +2116,15 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
             return Action::Drop;
         };
+        let pending_attach = SurfaceBufferReferences::collect(ctx).has_pending(guest_id);
 
         if let Some(deferred_host_id) = ctx.deferred_host_buffers.remove(&guest_id) {
-            if has_uncommitted_buffer_attach(ctx, guest_id) {
+            if pending_attach {
                 // This release completes the previous compositor-use
                 // interval. Keep the deferred host object alive because the
                 // pending attach may still be committed; the collector uses
                 // this marker to retire it if the attach is replaced first.
-                ctx.released_host_buffers.insert(guest_id);
+                ctx.mark_buffer_released(guest_id);
                 ctx.deferred_host_buffers.insert(guest_id, deferred_host_id);
                 return Action::Drop;
             }
@@ -2191,38 +2132,33 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             // released a native dma-buf. Now that the release is the lifetime
             // signal, destroy the host proxy and retain its mapping until the
             // corresponding wl_display.delete_id arrives.
-            ctx.released_host_buffers.remove(&guest_id);
+            ctx.clear_buffer_use(guest_id);
             let _ = queue_host_buffer_destroy(ctx, deferred_host_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
-            ctx.submitted_buffers.remove(&guest_id);
             clear_surface_buffer_references(ctx, guest_id);
             return Action::Drop;
         }
 
         if ctx.retired_buffers.contains_key(&guest_id) {
-            if has_uncommitted_buffer_attach(ctx, guest_id) {
+            if pending_attach {
                 // The release belongs to the previous compositor-use
                 // interval. Keep the retired state and host object alive for
                 // the pending attach; on commit the state is reopened for a
                 // new interval, while replacing the attach lets the
                 // collectors queue the destructor.
-                if let Some(buffer) = ctx.retired_buffers.get_mut(&guest_id) {
-                    buffer.host_released = true;
-                }
+                ctx.mark_buffer_released(guest_id);
                 return Action::Drop;
             }
             // The guest object is already gone, so there is no valid object on
             // which to deliver the release event. It is nevertheless the
             // release that makes it safe to drop the deferred backing storage.
-            if let Some(buffer) = ctx.retired_buffers.get_mut(&guest_id) {
-                buffer.host_released = true;
-            }
+            ctx.mark_buffer_released(guest_id);
             // The host object remained alive specifically so this release
             // could arrive. It is now safe to destroy the host proxy and drop
             // the local backing.
             let _ = queue_host_buffer_destroy(ctx, host_id);
             ctx.shadow_table.mark_pending_destroy(guest_id);
-            ctx.submitted_buffers.remove(&guest_id);
+            ctx.clear_buffer_use(guest_id);
             clear_surface_buffer_references(ctx, guest_id);
             // The backing state can be dropped now that the compositor sent
             // release, but the host object still owes wl_display.delete_id
@@ -2233,21 +2169,15 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             return Action::Drop;
         }
 
-        if let Some(buffer) = ctx.buffers.get_mut(&guest_id) {
-            buffer.host_released = true;
-        } else {
-            // Native linux-dmabuf buffers have no BufferState entry. Retain
-            // the compositor's release edge so a later guest wl_buffer.destroy
-            // can destroy the host proxy immediately even when a surface still
-            // stores the buffer as its current content.
-            ctx.released_host_buffers.insert(guest_id);
-        }
+        // Retain the release edge for both SHM and native buffers so a later
+        // guest destroy can retire the host proxy immediately even when a
+        // surface still stores the buffer as its current content.
+        ctx.mark_buffer_released(guest_id);
         // A release is the compositor's lifetime signal. Once it arrives, the
         // backing storage may be reused or destroyed, even if the surface
         // still has the buffer as its current content. Keeping this marker in
-        // `submitted_buffers` would make a later guest destroy incorrectly
-        // retire an already-idle buffer.
-        ctx.submitted_buffers.remove(&guest_id);
+        // a submitted phase would make a later guest destroy incorrectly
+        // retain an already-idle buffer.
         collect_retired_buffers(ctx);
         Action::Forward
     }
@@ -2269,12 +2199,12 @@ mod tests {
     use super::ShmHandler;
     use super::{
         backing_fd_has_size, clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats,
-        coalesce_damage_rects, collect_retired_buffers, copy_shm_damage, copy_shm_planes,
-        guest_shm_format_available, record_host_shm_drm_format, record_host_shm_format,
-        record_host_shm_wl_format, register_guest_shm, release_temporary_host_pool,
-        same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size, DmabufLayout,
-        WL_SHM_FORMAT_NV12,
+        coalesce_damage_rects, collect_deferred_buffers, collect_retired_buffers, copy_shm_damage,
+        copy_shm_planes, guest_shm_format_available, record_host_shm_drm_format,
+        record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
+        release_temporary_host_pool, same_dma_buf_object, valid_buffer_layout, valid_pool_resize,
+        valid_pool_size, valid_shm_stride, validate_dmabuf_layout, virtwl_allocation_size,
+        DmabufLayout, WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -3144,7 +3074,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
         let pool = Arc::new(PoolState {
             client_fd: -1,
             inner: RwLock::new(PoolInner {
@@ -3172,7 +3102,6 @@ mod tests {
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,
-                host_released: false,
             },
         );
 
@@ -3255,10 +3184,9 @@ mod tests {
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,
-                host_released: false,
             },
         );
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = host_buffer;
@@ -3266,11 +3194,8 @@ mod tests {
             WlBufferHandler::on_release(&mut handler, &mut ctx),
             Action::Forward
         );
-        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
-        assert!(ctx
-            .buffers
-            .get(&guest_buffer)
-            .is_some_and(|buffer| buffer.host_released));
+        assert!(!ctx.buffer_is_submitted(guest_buffer));
+        assert!(ctx.buffer_is_released(guest_buffer));
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
@@ -3291,7 +3216,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_buffer;
@@ -3300,7 +3225,7 @@ mod tests {
             ctx.deferred_host_buffers.contains_key(&guest_buffer),
             "a submitted native buffer must stay alive until host release"
         );
-        assert!(ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(ctx.client_to_host_queue.len(), 0);
 
         ctx.last_sender_id = host_buffer;
@@ -3309,7 +3234,7 @@ mod tests {
             Action::Drop
         );
         assert!(!ctx.deferred_host_buffers.contains_key(&guest_buffer));
-        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(!ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer)
@@ -3326,7 +3251,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
-        ctx.submitted_buffers.insert(guest_buffer);
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = host_buffer;
@@ -3334,8 +3259,8 @@ mod tests {
             WlBufferHandler::on_release(&mut handler, &mut ctx),
             Action::Forward
         );
-        assert!(ctx.released_host_buffers.contains(&guest_buffer));
-        assert!(!ctx.submitted_buffers.contains(&guest_buffer));
+        assert!(ctx.buffer_is_released(guest_buffer));
+        assert!(!ctx.buffer_is_submitted(guest_buffer));
 
         // The surface can still retain the released buffer as its current
         // content. Destroying the guest object must use the recorded release
@@ -3344,9 +3269,80 @@ mod tests {
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert!(ctx.deferred_host_buffers.is_empty());
-        assert!(ctx.released_host_buffers.is_empty());
+        assert!(ctx.host_buffer_use(guest_buffer).is_none());
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+    }
+
+    #[test]
+    fn local_copy_and_native_buffers_share_one_retirement_oracle() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let local_buffer = 20;
+        let local_host = 30;
+        let native_buffer = 21;
+        let native_host = 31;
+
+        for (guest_id, host_id) in [(local_buffer, local_host), (native_buffer, native_host)] {
+            ctx.shadow_table.map_id(guest_id, host_id);
+            ctx.shadow_table
+                .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
+            ctx.shadow_table.set_host_version(host_id, 1);
+            ctx.shadow_table.retire_guest_object(guest_id);
+            ctx.mark_buffer_released(guest_id);
+        }
+        let pool = Arc::new(PoolState {
+            client_fd: -1,
+            inner: RwLock::new(PoolInner {
+                client_ptr: std::ptr::null_mut(),
+                size: 0,
+            }),
+        });
+        ctx.retired_buffers.insert(
+            local_buffer,
+            BufferState {
+                guest_buffer_id: local_buffer,
+                pool,
+                offset: 0,
+                width: 1,
+                height: 1,
+                stride: 4,
+                format: 0,
+                host_buffer_id: local_host,
+                bo: None,
+                dmabuf_fd: None,
+                bo_stride: 4,
+                dmabuf_plane1_offset: 0,
+                dmabuf_plane1_stride: 0,
+                dmabuf_sync: false,
+                dest_ptr: std::ptr::null_mut(),
+                dest_size: 0,
+                needs_full_copy: false,
+            },
+        );
+        ctx.deferred_host_buffers.insert(native_buffer, native_host);
+        ctx.surfaces.entry(40).or_default().pending_buffer_id = Some(Some(local_buffer));
+        ctx.surfaces.entry(41).or_default().pending_buffer_id = Some(Some(native_buffer));
+
+        collect_deferred_buffers(&mut ctx);
+        assert!(ctx.retired_buffers.contains_key(&local_buffer));
+        assert!(ctx.deferred_host_buffers.contains_key(&native_buffer));
+
+        ctx.surfaces.get_mut(&40).unwrap().pending_buffer_id = Some(None);
+        ctx.surfaces.get_mut(&41).unwrap().pending_buffer_id = Some(None);
+        collect_deferred_buffers(&mut ctx);
+
+        assert!(ctx.retired_buffers.is_empty());
+        assert!(ctx.deferred_host_buffers.is_empty());
+        assert!(ctx.host_buffer_use(local_buffer).is_none());
+        assert!(ctx.host_buffer_use(native_buffer).is_none());
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![local_host, native_host],
+            "local-copy and native buffers must make the same lifecycle decision"
+        );
     }
 
     #[test]
@@ -3381,7 +3377,6 @@ mod tests {
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
                 needs_full_copy: false,
-                host_released: false,
             },
         );
         ctx.shadow_table.map_id(guest_buffer, host_buffer);
@@ -3392,10 +3387,7 @@ mod tests {
         collect_retired_buffers(&mut ctx);
         assert!(ctx.retired_buffers.contains_key(&guest_buffer));
 
-        ctx.retired_buffers
-            .get_mut(&guest_buffer)
-            .expect("retired buffer")
-            .host_released = true;
+        ctx.mark_buffer_released(guest_buffer);
         collect_retired_buffers(&mut ctx);
         assert!(!ctx.retired_buffers.contains_key(&guest_buffer));
         assert_eq!(

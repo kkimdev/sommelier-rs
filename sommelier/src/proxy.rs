@@ -1392,7 +1392,6 @@ mod tests {
             dest_ptr: std::ptr::null_mut(),
             dest_size: 0,
             needs_full_copy: false,
-            host_released: false,
         }
     }
 
