@@ -683,11 +683,12 @@ impl WlSurfaceHandler for CompositorHandler {
             .collect();
         ctx.keyboard_active_surfaces
             .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
+        ctx.keyboard_latest_peek_sequences
+            .retain(|(_, surface_id), _| *surface_id != Some(wl_surface_guest_id));
         for keyboard_id in destroyed_keyboard_ids {
             ctx.keyboard_pressed_keys.remove(&keyboard_id);
+            ctx.keyboard_peek_key_presses.remove(&keyboard_id);
             ctx.keyboard_backspace_repeat_cancelled.remove(&keyboard_id);
-            ctx.keyboard_event_times.remove(&keyboard_id);
-            ctx.keyboard_backspace_events.remove(&keyboard_id);
             ctx.keyboard_ime_suppressed_keys.remove(&keyboard_id);
             ctx.keyboard_forwarded_keys.remove(&keyboard_id);
             ctx.keyboard_keysym_forwarded_keys.remove(&keyboard_id);
@@ -3398,7 +3399,26 @@ mod tests {
             .insert(host_keyboard_id, [14_u32].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled
             .insert(host_keyboard_id);
-        ctx.keyboard_event_times.insert(host_keyboard_id, 123);
+        ctx.keyboard_peek_key_presses.insert(
+            host_keyboard_id,
+            [(
+                14,
+                crate::state::PeekKeyPress {
+                    serial: 1,
+                    time: 123,
+                    sequence: 1,
+                    held: true,
+                    eligible: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        ctx.keyboard_repeatable_keys
+            .insert(host_keyboard_id, [14].into_iter().collect());
+        ctx.keyboard_latest_peek_sequences
+            .insert((1, Some(wl_surface_guest_id)), 1);
+        ctx.keyboard_latest_peek_sequences.insert((1, Some(999)), 2);
         ctx.keyboard_ime_suppressed_keys
             .insert(host_keyboard_id, [14_u32].into_iter().collect());
         ctx.keyboard_forwarded_keys
@@ -3424,7 +3444,9 @@ mod tests {
                 && !ctx
                     .keyboard_backspace_repeat_cancelled
                     .contains(&host_keyboard_id)
-                && !ctx.keyboard_event_times.contains_key(&host_keyboard_id)
+                && !ctx
+                    .keyboard_peek_key_presses
+                    .contains_key(&host_keyboard_id)
                 && !ctx
                     .keyboard_ime_suppressed_keys
                     .contains_key(&host_keyboard_id)
@@ -3433,6 +3455,20 @@ mod tests {
                     .keyboard_keysym_forwarded_keys
                     .contains_key(&host_keyboard_id),
             "destroying a surface must retire all per-keyboard input state"
+        );
+        assert!(
+            ctx.keyboard_repeatable_keys.contains_key(&host_keyboard_id),
+            "surface focus teardown must preserve keymap-derived capabilities"
+        );
+        assert!(
+            !ctx.keyboard_latest_peek_sequences
+                .contains_key(&(1, Some(wl_surface_guest_id))),
+            "destroying a surface must retire its peek watermark"
+        );
+        assert_eq!(
+            ctx.keyboard_latest_peek_sequences.get(&(1, Some(999))),
+            Some(&2),
+            "another live surface's watermark must remain intact"
         );
         assert_eq!(
             ctx.keyboard_active_surfaces.get(&crate::state::HostId(701)),

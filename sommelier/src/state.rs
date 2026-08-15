@@ -874,6 +874,24 @@ pub struct TextInputState {
     pub host_activated: bool,
 }
 
+/// Provenance for one physical key generation observed through ChromeOS
+/// `peek_key`.
+///
+/// Unlike `wl_keyboard.key`, `peek_key` is delivered even when the host IME
+/// consumes the key. The sequence makes the causal key for a later text-input
+/// confirmation unambiguous when several keys remain physically held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeekKeyPress {
+    pub serial: u32,
+    pub time: u32,
+    pub sequence: u64,
+    /// The physical generation has not received its release yet.
+    pub held: bool,
+    /// The generation may recover an IME-consumed repeat. Host accelerators
+    /// permanently clear this bit for the lifetime of the generation.
+    pub eligible: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct DmabufCapabilityState {
     /// Legacy v3 format/modifier pairs collected for one host-global
@@ -1003,18 +1021,24 @@ pub struct Context {
     /// `wl_keyboard.key` and ChromeOS `peek_key` events update this map, so
     /// IME-consumed keys remain observable without leaking state across seats.
     pub keyboard_pressed_keys: HashMap<HostId, HashSet<u32>>,
+    /// Initial physical press generations observed through ChromeOS
+    /// `peek_key`, keyed by host keyboard and evdev keycode.
+    pub keyboard_peek_key_presses: HashMap<HostId, HashMap<u32, PeekKeyPress>>,
+    /// Monotonic order assigned to initial `peek_key` presses.
+    pub keyboard_peek_sequence: u64,
+    /// Newest physical generation per seat and focused-surface domain.
+    ///
+    /// This watermark outlives an individual keyboard's release tombstone so
+    /// an older held key on another keyboard cannot become causal afterward.
+    pub keyboard_latest_peek_sequences: HashMap<(u32, Option<u32>), u64>,
+    /// Evdev keycodes that the active XKB keymap marks as repeatable.
+    pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
     /// Host keyboards whose held Backspace repeat was cancelled by a newer
     /// non-Backspace press. Physical key state remains intact until release,
     /// while empty IME confirmations must not rearm the cancelled repeat.
     pub keyboard_backspace_repeat_cancelled: HashSet<HostId>,
-    /// Most recent compositor-relative event time for each host keyboard.
-    /// Synthetic compatibility events must use this same time domain.
-    pub keyboard_event_times: HashMap<HostId, u32>,
-    /// Exact compositor serial/time of the held Backspace generation observed
-    /// through ChromeOS `peek_key`.
-    pub keyboard_backspace_events: HashMap<HostId, (u32, u32)>,
-    /// Backspace key releases that must be consumed because a synthetic press
-    /// and release pair was already delivered to the guest.
+    /// Physical key releases that must be consumed because IME recovery
+    /// already delivered a balanced synthetic press/release pair.
     pub keyboard_ime_suppressed_keys: HashMap<HostId, HashSet<u32>>,
     /// Keys whose physical press was forwarded to the guest and therefore
     /// still require a real release event.
@@ -1193,9 +1217,11 @@ impl Context {
             keyboard_to_extended_keyboard: HashMap::new(),
             extended_keyboard_to_keyboard: HashMap::new(),
             keyboard_pressed_keys: HashMap::new(),
+            keyboard_peek_key_presses: HashMap::new(),
+            keyboard_peek_sequence: 0,
+            keyboard_latest_peek_sequences: HashMap::new(),
+            keyboard_repeatable_keys: HashMap::new(),
             keyboard_backspace_repeat_cancelled: HashSet::new(),
-            keyboard_event_times: HashMap::new(),
-            keyboard_backspace_events: HashMap::new(),
             keyboard_ime_suppressed_keys: HashMap::new(),
             keyboard_forwarded_keys: HashMap::new(),
             keyboard_keysym_forwarded_keys: HashMap::new(),

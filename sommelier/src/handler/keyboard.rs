@@ -204,10 +204,9 @@ impl KeyboardHandler {
 
     fn clear_host_keyboard_state(ctx: &mut Context, host_keyboard_id: HostId) {
         ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
+        ctx.keyboard_peek_key_presses.remove(&host_keyboard_id);
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
-        ctx.keyboard_event_times.remove(&host_keyboard_id);
-        ctx.keyboard_backspace_events.remove(&host_keyboard_id);
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
         ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
         ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
@@ -232,32 +231,57 @@ impl KeyboardHandler {
         suppressed
     }
 
+    fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
+        if let Some(press) = ctx
+            .keyboard_peek_key_presses
+            .get_mut(&host_keyboard_id)
+            .and_then(|keys| keys.get_mut(&key))
+        {
+            press.eligible = false;
+        }
+    }
+
     pub(crate) fn update_host_keyboard_key_state(
         ctx: &mut Context,
         host_keyboard_id: HostId,
-        time: u32,
         key: u32,
         state: u32,
     ) {
-        ctx.keyboard_event_times.insert(host_keyboard_id, time);
-        let pressed_keys = ctx
-            .keyboard_pressed_keys
-            .entry(host_keyboard_id)
-            .or_default();
-        match state {
-            WL_KEY_PRESSED | WL_KEY_REPEATED => {
-                pressed_keys.insert(key);
-            }
-            WL_KEY_RELEASED => {
-                pressed_keys.remove(&key);
-                if key == EVDEV_KEY_BACKSPACE {
-                    ctx.keyboard_backspace_repeat_cancelled
-                        .remove(&host_keyboard_id);
+        let pressed_keys_empty = {
+            let pressed_keys = ctx
+                .keyboard_pressed_keys
+                .entry(host_keyboard_id)
+                .or_default();
+            match state {
+                WL_KEY_PRESSED | WL_KEY_REPEATED => {
+                    pressed_keys.insert(key);
                 }
+                WL_KEY_RELEASED => {
+                    pressed_keys.remove(&key);
+                }
+                _ => {}
             }
-            _ => {}
+            pressed_keys.is_empty()
+        };
+        if state == WL_KEY_RELEASED {
+            if pressed_keys_empty {
+                ctx.keyboard_peek_key_presses.remove(&host_keyboard_id);
+            } else if let Some(press) = ctx
+                .keyboard_peek_key_presses
+                .get_mut(&host_keyboard_id)
+                .and_then(|keys| keys.get_mut(&key))
+            {
+                // Keep the completed generation as a tombstone while another
+                // key remains held. It prevents an older held generation from
+                // becoming the causal key for a later stale confirmation.
+                press.held = false;
+            }
+            if key == EVDEV_KEY_BACKSPACE {
+                ctx.keyboard_backspace_repeat_cancelled
+                    .remove(&host_keyboard_id);
+            }
         }
-        if pressed_keys.is_empty() {
+        if pressed_keys_empty {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
         }
     }
@@ -291,10 +315,9 @@ impl KeyboardHandler {
         }
 
         ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
+        ctx.keyboard_peek_key_presses.remove(&host_keyboard_id);
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
-        ctx.keyboard_event_times.remove(&host_keyboard_id);
-        ctx.keyboard_backspace_events.remove(&host_keyboard_id);
         ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
         if pressed_keys.is_empty() {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
@@ -364,10 +387,11 @@ impl KeyboardHandler {
         }
     }
 
-    fn clear_host_keyboard_keymap(&mut self, host_keyboard_id: HostId) {
+    fn clear_host_keyboard_keymap(&mut self, ctx: &mut Context, host_keyboard_id: HostId) {
         self.keymaps.remove(&host_keyboard_id);
         self.states.remove(&host_keyboard_id);
         self.modifiers.remove(&host_keyboard_id);
+        ctx.keyboard_repeatable_keys.remove(&host_keyboard_id);
         self.dropped_keys.remove(&host_keyboard_id);
     }
 
@@ -376,7 +400,7 @@ impl KeyboardHandler {
         ctx: &mut Context,
         host_keyboard_id: HostId,
     ) {
-        self.clear_host_keyboard_keymap(host_keyboard_id);
+        self.clear_host_keyboard_keymap(ctx, host_keyboard_id);
         ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
         Self::clear_host_keyboard_state(ctx, host_keyboard_id);
     }
@@ -404,6 +428,15 @@ impl KeyboardHandler {
             }
         }
         keycodes
+    }
+
+    fn repeatable_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::HashSet<u32> {
+        (keymap.min_keycode().raw()..=keymap.max_keycode().raw())
+            .filter_map(|keycode_raw| {
+                (keycode_raw >= 8 && keymap.key_repeats(xkb::Keycode::new(keycode_raw)))
+                    .then_some(keycode_raw - 8)
+            })
+            .collect()
     }
 
     /// Ensure the `zcr_extended_keyboard_v1` object is bound for this keyboard.
@@ -586,15 +619,18 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     // would make the later releases disappear and leave the
                     // guest with stuck keys. Reset only XKB interpretation
                     // state and accelerator drop bookkeeping.
-                    self.clear_host_keyboard_keymap(host_keyboard_id);
+                    self.clear_host_keyboard_keymap(ctx, host_keyboard_id);
                     ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
                     let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
+                    let repeatable_keys = Self::repeatable_evdev_keycodes(&keymap);
                     self.states
                         .insert(host_keyboard_id, xkb::State::new(&keymap));
                     self.modifiers.remove(&host_keyboard_id);
                     self.keymaps.insert(host_keyboard_id, keymap);
                     ctx.keyboard_keysym_to_keycode
                         .insert(host_keyboard_id, keysym_map);
+                    ctx.keyboard_repeatable_keys
+                        .insert(host_keyboard_id, repeatable_keys);
                     // Clear stale drop state: a key dropped under the old
                     // keymap may map to a different keysym under the new one,
                     // and a forgotten drop entry would cause a stuck key.
@@ -968,7 +1004,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         &mut self,
         ctx: &mut Context,
         serial: u32,
-        time: u32,
+        _time: u32,
         key: u32,
         state: u32,
     ) -> Action {
@@ -988,7 +1024,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             key,
             state
         );
-        let repeat_active = key == EVDEV_KEY_BACKSPACE
+        let backspace_repeat_active = key == EVDEV_KEY_BACKSPACE
             && crate::handler::text_input::backspace_repeat_active_for_keyboard(
                 ctx,
                 host_keyboard_id,
@@ -1001,10 +1037,13 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             .keyboard_ime_suppressed_keys
             .get(&host_keyboard_id)
             .is_some_and(|keys| keys.contains(&key));
-        let suppress_redundant_backspace = key == EVDEV_KEY_BACKSPACE
-            && (synthetic_suppressed_before || (repeat_active && !forwarded_before));
-        let mut action = if suppress_redundant_backspace {
-            log::debug!("  -> dropping host Backspace already handled by repeat fallback");
+        let suppress_recovered_key =
+            synthetic_suppressed_before || (backspace_repeat_active && !forwarded_before);
+        let mut action = if suppress_recovered_key {
+            log::debug!(
+                "  -> dropping host key {} already handled by IME repeat recovery",
+                key
+            );
             Action::Drop
         } else {
             Action::Forward
@@ -1019,7 +1058,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         if matches!(state, WL_KEY_PRESSED | WL_KEY_RELEASED)
             || (state == WL_KEY_REPEATED && forwarded_before)
         {
-            Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
+            Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state);
         }
 
         // WL_KEY_PRESSED = 1, WL_KEY_RELEASED = 0.
@@ -1034,26 +1073,31 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     .dropped_keys
                     .get(&host_keyboard_id)
                     .is_some_and(|keys| keys.contains(&key));
-                if key == EVDEV_KEY_BACKSPACE {
-                    if suppress_redundant_backspace {
-                        ctx.keyboard_ime_suppressed_keys
-                            .entry(host_keyboard_id)
-                            .or_default()
-                            .insert(key);
-                    }
-                } else {
+                if suppress_recovered_key {
+                    ctx.keyboard_ime_suppressed_keys
+                        .entry(host_keyboard_id)
+                        .or_default()
+                        .insert(key);
+                }
+                if key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
                 // Key pressed: check if this is a host accelerator.
-                if dropped_before
-                    || self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key)
-                {
+                let host_accelerator =
+                    self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                if dropped_before || host_accelerator {
                     log::debug!("  -> accelerator key, dropping");
                     action = Action::Drop;
                     handled = false;
+                    if host_accelerator {
+                        // A host accelerator can also be visible through
+                        // peek_key. It must never become a candidate for a
+                        // later empty IME confirmation.
+                        Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
+                    }
                     // If a prior press was already forwarded (for example a
                     // repeat whose modifier state changed), retain that
                     // physical press so its eventual release still reaches
@@ -1245,6 +1289,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let guest_id = ctx.last_sender_id;
         log::info!(">>> wl_keyboard.on_release: guest_id={}", guest_id);
         let guest_seat = ctx.keyboard_to_seat.remove(&guest_id);
+        if guest_seat.is_some_and(|seat| {
+            !ctx.keyboard_to_seat
+                .values()
+                .any(|other_seat| *other_seat == seat)
+        }) {
+            let released_seat = guest_seat.expect("checked above");
+            ctx.keyboard_latest_peek_sequences
+                .retain(|(seat, _), _| *seat != released_seat);
+        }
         // Translate guest ID → host ID. Returns None for unknown keyboards
         // (e.g. keyboards that never received an on_enter event).
         let Some(host_keyboard_id) = ctx
@@ -1372,15 +1425,65 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             .keyboard_pressed_keys
             .get(&host_keyboard_id)
             .is_some_and(|keys| keys.contains(&key));
+        let peek_pressed_before = ctx
+            .keyboard_peek_key_presses
+            .get(&host_keyboard_id)
+            .and_then(|keys| keys.get(&key))
+            .is_some_and(|press| press.held);
         match state {
             WL_KEY_PRESSED | WL_KEY_REPEATED
                 if state == WL_KEY_PRESSED || pressed_before =>
             {
-                if key == EVDEV_KEY_BACKSPACE {
-                    ctx.keyboard_backspace_events
-                        .insert(host_keyboard_id, (serial, time));
+                if state == WL_KEY_PRESSED && !peek_pressed_before {
+                    let already_dropped_as_accelerator = self
+                        .dropped_keys
+                        .get(&host_keyboard_id)
+                        .is_some_and(|keys| keys.contains(&key));
+                    let eligible = !already_dropped_as_accelerator
+                        && !self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                    ctx.keyboard_peek_sequence = ctx.keyboard_peek_sequence.wrapping_add(1).max(1);
+                    if let Some(guest_seat) = guest_seat {
+                        let focused_surface = ctx
+                            .active_surface_for_seat
+                            .get(&guest_seat)
+                            .copied()
+                            .filter(|surface| {
+                                ctx.keyboard_active_surfaces.get(&host_keyboard_id)
+                                    == Some(surface)
+                            });
+                        ctx.keyboard_latest_peek_sequences
+                            .insert((guest_seat, focused_surface), ctx.keyboard_peek_sequence);
+                    }
+                    ctx.keyboard_peek_key_presses
+                        .entry(host_keyboard_id)
+                        .or_default()
+                        .insert(
+                            key,
+                            crate::state::PeekKeyPress {
+                                serial,
+                                time,
+                                sequence: ctx.keyboard_peek_sequence,
+                                held: true,
+                                eligible,
+                            },
+                        );
+                } else if state == WL_KEY_REPEATED
+                    || (state == WL_KEY_PRESSED && peek_pressed_before)
+                {
+                    if let Some(press) = ctx
+                        .keyboard_peek_key_presses
+                        .get_mut(&host_keyboard_id)
+                        .and_then(|keys| keys.get_mut(&key))
+                    {
+                        // Both protocol v10 repeated and legacy duplicate
+                        // pressed events describe the existing generation.
+                        // Keep its identity and eligibility stable while
+                        // synthetic events use the freshest host timestamp.
+                        press.serial = serial;
+                        press.time = time;
+                    }
                 }
-                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
+                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state);
                 if state == WL_KEY_PRESSED && key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
                     if let Some(guest_seat) = guest_seat {
@@ -1395,14 +1498,11 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 );
             }
             WL_KEY_RELEASED => {
-                if key == EVDEV_KEY_BACKSPACE {
-                    ctx.keyboard_backspace_events.remove(&host_keyboard_id);
-                }
-                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, time, key, state);
+                Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state);
                 // A key consumed by the host IME may have no corresponding
                 // wl_keyboard.key release. `peek_key` is the only release
                 // notification in that path, so retire the marker installed
-                // by a synthetic Backspace pair here.
+                // by a recovered synthetic key pair here.
                 Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key);
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
@@ -1422,7 +1522,10 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
 mod tests {
     use super::*;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
+    use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+    use crate::wire::WireMessage;
     use std::os::unix::io::AsRawFd;
 
     /// Helper: create an anonymous memfd, write the default keymap into it
@@ -1543,6 +1646,32 @@ mod tests {
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
         ctx.extended_keyboard_to_keyboard
             .insert(HostId(host_extended_id), HostId(host_keyboard_id));
+        // Most handler tests use Backspace without loading a full XKB map.
+        // Tests for other repeatable keys load the real test keymap.
+        ctx.keyboard_repeatable_keys
+            .entry(HostId(host_keyboard_id))
+            .or_default()
+            .insert(EVDEV_KEY_BACKSPACE);
+    }
+
+    fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+        u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+    }
+
+    fn message_opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+        (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+    }
+
+    fn keyboard_event_payload(
+        message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>),
+    ) -> (u32, u32, u32, u32) {
+        let payload = &message.0[8..];
+        (
+            u32::from_ne_bytes(payload[0..4].try_into().unwrap()),
+            u32::from_ne_bytes(payload[4..8].try_into().unwrap()),
+            u32::from_ne_bytes(payload[8..12].try_into().unwrap()),
+            u32::from_ne_bytes(payload[12..16].try_into().unwrap()),
+        )
     }
 
     #[test]
@@ -1997,6 +2126,9 @@ mod tests {
 
         ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 7);
+        ctx.keyboard_latest_peek_sequences.insert((7, None), 1);
+        ctx.keyboard_latest_peek_sequences.insert((7, Some(100)), 2);
+        ctx.keyboard_latest_peek_sequences.insert((8, Some(200)), 3);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
         ctx.extended_keyboard_to_keyboard
@@ -2021,6 +2153,17 @@ mod tests {
         assert!(
             !ctx.keyboard_to_seat.contains_key(&guest_keyboard_id),
             "guest keyboard-to-seat routing must be cleared after release"
+        );
+        assert!(
+            ctx.keyboard_latest_peek_sequences
+                .keys()
+                .all(|(seat, _)| *seat != 7),
+            "releasing the seat's last keyboard must retire its peek watermarks"
+        );
+        assert_eq!(
+            ctx.keyboard_latest_peek_sequences.get(&(8, Some(200))),
+            Some(&3),
+            "another seat's watermark must remain intact"
         );
 
         // destroy message must have been queued to the host.
@@ -2392,7 +2535,7 @@ mod tests {
             Action::Drop
         );
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
-        assert!(!ctx.keyboard_backspace_events.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(100)));
     }
 
     #[test]
@@ -2413,8 +2556,11 @@ mod tests {
             Action::Drop
         );
         assert_eq!(
-            ctx.keyboard_backspace_events.get(&HostId(100)),
-            Some(&(20, 200)),
+            ctx.keyboard_peek_key_presses
+                .get(&HostId(100))
+                .and_then(|keys| keys.get(&EVDEV_KEY_BACKSPACE))
+                .map(|press| (press.serial, press.time)),
+            Some((20, 200)),
             "an unrelated key event must not replace the Backspace peek identity"
         );
     }
@@ -2469,6 +2615,565 @@ mod tests {
             synthetic_time, 1234,
             "synthetic key events must use the host wl_keyboard time"
         );
+    }
+
+    #[test]
+    fn held_space_repeats_after_ime_commit_until_physical_release() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        let guest_keyboard = 10;
+        let host_keyboard = 100;
+        let host_extended_keyboard = 1000;
+        let guest_seat = 1;
+        let guest_text_input = 40;
+        let host_text_input = guest_text_input + 100;
+        let host_extended_text_input = 2000;
+
+        map_keyboard(
+            &mut ctx,
+            guest_keyboard,
+            host_keyboard,
+            host_extended_keyboard,
+            guest_seat,
+        );
+        add_active_text_input(
+            &mut ctx,
+            guest_text_input,
+            guest_seat,
+            host_extended_text_input,
+        );
+        ctx.active_surface_for_seat.insert(guest_seat, 900);
+        ctx.keyboard_active_surfaces
+            .insert(HostId(host_keyboard), 900);
+
+        ctx.last_sender_id = host_keyboard;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        assert!(ctx.keyboard_repeatable_keys[&HostId(host_keyboard)].contains(&space));
+
+        // Captured ChromeOS sequence: the host IME consumes the physical Space
+        // and includes the first one in its committed string. Further repeat
+        // ticks arrive only as empty confirm_preedit events.
+        ctx.last_sender_id = host_extended_keyboard;
+        assert_eq!(
+            keyboard_handler.on_peek_key(&mut ctx, 700, 1234, space, WL_KEY_PRESSED),
+            Action::Drop
+        );
+
+        let mut text_input_handler = crate::handler::text_input::TextInputV1Handler;
+        ctx.last_sender_id = host_text_input;
+        assert_eq!(
+            text_input_handler.on_preedit_string(&mut ctx, 1, &"가".to_string(), &String::new(),),
+            Action::Drop
+        );
+        assert_eq!(
+            text_input_handler.on_commit_string(&mut ctx, 1, &"가 ".to_string()),
+            Action::Drop
+        );
+
+        let committed: Vec<_> = ctx
+            .host_to_client_queue
+            .iter()
+            .filter(|message| {
+                message_sender(message) == guest_text_input && message_opcode(message) == 3
+            })
+            .map(|message| {
+                let mut wire = WireMessage::new(guest_text_input, 3, &message.0[8..], &message.1);
+                wire.read_string().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(committed, vec!["가 "], "the initial Space must commit once");
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = host_extended_text_input;
+        let mut extended_handler = crate::handler::text_input::ExtendedTextInputV1Handler;
+        for _ in 0..3 {
+            assert_eq!(
+                extended_handler.on_confirm_preedit(&mut ctx, 1),
+                Action::Drop
+            );
+        }
+
+        assert_eq!(ctx.host_to_client_queue.len(), 9);
+        let mut serials = std::collections::HashSet::new();
+        for transaction in ctx.host_to_client_queue.chunks_exact(3) {
+            for (message, expected_state) in transaction[..2]
+                .iter()
+                .zip([WL_KEY_PRESSED, WL_KEY_RELEASED])
+            {
+                assert_eq!(message_sender(message), guest_keyboard);
+                assert_eq!(message_opcode(message), wl_keyboard::EVT_KEY);
+                let (serial, time, key, state) = keyboard_event_payload(message);
+                assert!(serials.insert(serial), "synthetic serials must be unique");
+                assert_eq!(time, 1234);
+                assert_eq!(key, space);
+                assert_eq!(state, expected_state);
+            }
+            assert_eq!(message_sender(&transaction[2]), guest_text_input);
+            assert_eq!(message_opcode(&transaction[2]), 5);
+        }
+
+        let delivered_before_release = ctx.host_to_client_queue.len();
+        ctx.last_sender_id = host_extended_keyboard;
+        assert_eq!(
+            keyboard_handler.on_peek_key(&mut ctx, 701, 1300, space, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), delivered_before_release);
+        assert!(!ctx
+            .keyboard_pressed_keys
+            .contains_key(&HostId(host_keyboard)));
+        assert!(!ctx
+            .keyboard_peek_key_presses
+            .contains_key(&HostId(host_keyboard)));
+        assert!(!ctx
+            .keyboard_ime_suppressed_keys
+            .contains_key(&HostId(host_keyboard)));
+
+        ctx.last_sender_id = host_extended_text_input;
+        assert_eq!(
+            extended_handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            delivered_before_release,
+            "a confirmation after physical release must be a no-op"
+        );
+    }
+
+    #[test]
+    fn delayed_keyboard_events_do_not_duplicate_an_ime_recovered_key() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(100)].contains(&space));
+
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            keyboard_handler.on_key(&mut ctx, 2, 501, space, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(
+            keyboard_handler.on_key(&mut ctx, 3, 502, space, WL_KEY_REPEATED),
+            Action::Drop
+        );
+        assert_eq!(
+            keyboard_handler.on_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+
+        let handled: Vec<_> = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|message| u32::from_ne_bytes(message.0[12..16].try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            handled,
+            vec![0, 0, 0],
+            "recovered key events must remain host-owned"
+        );
+    }
+
+    #[test]
+    fn delayed_keysym_events_do_not_duplicate_an_ime_recovered_key() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        let recovered_messages = ctx.host_to_client_queue.len();
+
+        ctx.last_sender_id = 140;
+        let mut text_input_handler = crate::handler::text_input::TextInputV1Handler;
+        assert_eq!(
+            text_input_handler.on_keysym(
+                &mut ctx,
+                2,
+                501,
+                xkb::keysyms::KEY_space,
+                WL_KEY_PRESSED,
+                0,
+            ),
+            Action::Drop
+        );
+        assert_eq!(
+            text_input_handler.on_keysym(
+                &mut ctx,
+                3,
+                502,
+                xkb::keysyms::KEY_space,
+                WL_KEY_RELEASED,
+                0,
+            ),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), recovered_messages);
+        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
+        assert!(!ctx
+            .keyboard_keysym_forwarded_keys
+            .contains_key(&HostId(100)));
+        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(100)].contains(&space));
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED);
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+    }
+
+    #[test]
+    fn keysym_release_does_not_end_a_physical_ime_consumed_generation() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.active_surface_for_seat.insert(1, 900);
+        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+
+        // ChromeOS may deliver a text-input keysym pair for the initial key
+        // while peek_key remains the sole source of the physical hold state.
+        ctx.last_sender_id = 140;
+        let mut text_input_handler = crate::handler::text_input::TextInputV1Handler;
+        text_input_handler.on_keysym(&mut ctx, 2, 501, xkb::keysyms::KEY_space, WL_KEY_PRESSED, 0);
+        text_input_handler.on_keysym(
+            &mut ctx,
+            3,
+            502,
+            xkb::keysyms::KEY_space,
+            WL_KEY_RELEASED,
+            0,
+        );
+
+        assert!(ctx.keyboard_pressed_keys[&HostId(100)].contains(&space));
+        assert!(ctx.keyboard_peek_key_presses[&HostId(100)][&space].held);
+        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
+        assert!(!ctx
+            .keyboard_keysym_forwarded_keys
+            .contains_key(&HostId(100)));
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            3,
+            "an empty confirmation must recover one balanced key pair and done"
+        );
+        for (message, expected_state) in ctx.host_to_client_queue[..2]
+            .iter()
+            .zip([WL_KEY_PRESSED, WL_KEY_RELEASED])
+        {
+            let (_, _, recovered_key, state) = keyboard_event_payload(message);
+            assert_eq!(recovered_key, space);
+            assert_eq!(state, expected_state);
+        }
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED);
+        assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(100)));
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+    }
+
+    #[test]
+    fn keysym_and_repeat_recovery_share_the_latest_keyboard_owner() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.active_surface_for_seat.insert(1, 900);
+        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        ctx.keyboard_active_surfaces.insert(HostId(101), 900);
+
+        ctx.last_sender_id = 100;
+        load_test_keymap(&mut keyboard_handler, &mut ctx);
+        ctx.last_sender_id = 101;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        ctx.last_sender_id = 1001;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+
+        ctx.last_sender_id = 140;
+        let mut text_input_handler = crate::handler::text_input::TextInputV1Handler;
+        text_input_handler.on_keysym(&mut ctx, 2, 501, xkb::keysyms::KEY_space, WL_KEY_PRESSED, 0);
+        text_input_handler.on_keysym(
+            &mut ctx,
+            3,
+            502,
+            xkb::keysyms::KEY_space,
+            WL_KEY_RELEASED,
+            0,
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert!(
+            ctx.host_to_client_queue
+                .iter()
+                .all(|message| message_sender(message) == 11),
+            "keysym delivery must use the keyboard owning the latest matching peek"
+        );
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 2000;
+        crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1);
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 11);
+        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(101)].contains(&space));
+        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+
+        let recovered_messages = ctx.host_to_client_queue.len();
+        ctx.last_sender_id = 140;
+        text_input_handler.on_keysym(&mut ctx, 4, 503, xkb::keysyms::KEY_space, WL_KEY_PRESSED, 0);
+        text_input_handler.on_keysym(
+            &mut ctx,
+            5,
+            504,
+            xkb::keysyms::KEY_space,
+            WL_KEY_RELEASED,
+            0,
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            recovered_messages,
+            "delayed keysym events must see suppression on the same keyboard owner"
+        );
+    }
+
+    #[test]
+    fn newer_key_on_another_keyboard_remains_the_causal_watermark_after_release() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.active_surface_for_seat.insert(1, 900);
+        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        ctx.keyboard_active_surfaces.insert(HostId(101), 900);
+
+        ctx.last_sender_id = 100;
+        let first_keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&first_keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        ctx.last_sender_id = 101;
+        let second_keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let shift =
+            find_keycode(&second_keymap, xkb::keysyms::KEY_Shift_L).expect("Shift in keymap");
+        assert!(!ctx.keyboard_repeatable_keys[&HostId(101)].contains(&shift));
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+        ctx.last_sender_id = 1001;
+        keyboard_handler.on_peek_key(&mut ctx, 2, 501, shift, WL_KEY_PRESSED);
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        ctx.last_sender_id = 1001;
+        keyboard_handler.on_peek_key(&mut ctx, 3, 502, shift, WL_KEY_RELEASED);
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "releasing a newer key must not revive an older held generation"
+        );
+    }
+
+    #[test]
+    fn repeated_peek_key_refreshes_the_synthetic_event_time() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 100, space, WL_KEY_PRESSED);
+        keyboard_handler.on_peek_key(&mut ctx, 2, 200, space, WL_KEY_REPEATED);
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        for message in &ctx.host_to_client_queue[..2] {
+            let (_, time, recovered_key, _) = keyboard_event_payload(message);
+            assert_eq!(time, 200);
+            assert_eq!(recovered_key, space);
+        }
+    }
+
+    #[test]
+    fn duplicate_pressed_peek_refreshes_the_synthetic_event_time() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 1, 100, space, WL_KEY_PRESSED);
+        keyboard_handler.on_peek_key(&mut ctx, 2, 200, space, WL_KEY_PRESSED);
+        assert_eq!(
+            ctx.keyboard_peek_key_presses[&HostId(100)][&space].sequence,
+            1,
+            "a duplicate pressed event must not create a new physical generation"
+        );
+
+        ctx.last_sender_id = 2000;
+        crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1);
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        for message in &ctx.host_to_client_queue[..2] {
+            let (_, time, recovered_key, _) = keyboard_event_payload(message);
+            assert_eq!(time, 200);
+            assert_eq!(recovered_key, space);
+        }
+    }
+
+    #[test]
+    fn accelerator_peek_generation_stays_ineligible_after_modifier_release() {
+        let mut ctx = Context::new_for_test(
+            false,
+            false,
+            crate::accelerator::parse_accelerators("<Control>space").unwrap(),
+        );
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.active_surface_for_seat.insert(1, 900);
+        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        let ctrl_mask = 1 << keymap.mod_get_index("Control");
+        keyboard_handler.on_modifiers(&mut ctx, 1, ctrl_mask, 0, 0, 0);
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 2, 500, space, WL_KEY_PRESSED);
+        assert!(!ctx.keyboard_peek_key_presses[&HostId(100)][&space].eligible);
+
+        // Releasing Ctrl must not turn the same physical Space generation
+        // from a host accelerator into a recoverable text key.
+        ctx.last_sender_id = 100;
+        keyboard_handler.on_modifiers(&mut ctx, 3, 0, 0, 0, 0);
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn delayed_accelerator_peek_stays_ineligible_after_modifier_release() {
+        let mut ctx = Context::new_for_test(
+            false,
+            false,
+            crate::accelerator::parse_accelerators("<Control>space").unwrap(),
+        );
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.active_surface_for_seat.insert(1, 900);
+        ctx.keyboard_active_surfaces.insert(HostId(100), 900);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        let ctrl_mask = 1 << keymap.mod_get_index("Control");
+        keyboard_handler.on_modifiers(&mut ctx, 1, ctrl_mask, 0, 0, 0);
+
+        // The normal accelerator path may race ahead of peek_key. Preserve
+        // that source decision even if the modifier event changes before the
+        // delayed peek for the same physical generation arrives.
+        assert_eq!(
+            keyboard_handler.on_key(&mut ctx, 2, 500, space, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        keyboard_handler.on_modifiers(&mut ctx, 3, 0, 0, 0, 0);
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 4, 501, space, WL_KEY_PRESSED);
+        assert!(!ctx.keyboard_peek_key_presses[&HostId(100)][&space].eligible);
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn modified_non_accelerator_repeat_remains_recoverable() {
+        let mut ctx = Context::new_for_test(
+            false,
+            false,
+            crate::accelerator::parse_accelerators("<Control>space").unwrap(),
+        );
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+        let shift_mask = 1 << keymap.mod_get_index("Shift");
+        keyboard_handler.on_modifiers(&mut ctx, 1, shift_mask, 0, 0, 0);
+
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(&mut ctx, 2, 500, space, WL_KEY_PRESSED);
+        assert!(ctx.keyboard_peek_key_presses[&HostId(100)][&space].eligible);
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        let (_, _, recovered_key, _) = keyboard_event_payload(&ctx.host_to_client_queue[0]);
+        assert_eq!(recovered_key, space);
     }
 
     #[test]
@@ -2730,7 +3435,21 @@ mod tests {
             .or_default()
             .insert(EVDEV_KEY_BACKSPACE);
         ctx.keyboard_backspace_repeat_cancelled.insert(HostId(5));
-        ctx.keyboard_event_times.insert(HostId(5), 123);
+        ctx.keyboard_peek_key_presses.insert(
+            HostId(5),
+            [(
+                EVDEV_KEY_BACKSPACE,
+                crate::state::PeekKeyPress {
+                    serial: 1,
+                    time: 123,
+                    sequence: 1,
+                    held: true,
+                    eligible: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
         ctx.keyboard_ime_suppressed_keys
             .entry(HostId(5))
             .or_default()
@@ -2743,7 +3462,9 @@ mod tests {
         assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(5)));
         assert!(!ctx.keyboard_backspace_repeat_cancelled.contains(&HostId(5)));
-        assert!(!ctx.keyboard_event_times.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_repeatable_keys.contains_key(&HostId(5)));
+        assert!(!handler.modifiers.contains_key(&HostId(5)));
         assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(5)));
         assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(5)));
     }
@@ -3703,7 +4424,21 @@ mod tests {
         ctx.keyboard_pressed_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
-        ctx.keyboard_event_times.insert(HostId(10), 123);
+        ctx.keyboard_peek_key_presses.insert(
+            HostId(10),
+            [(
+                EVDEV_KEY_BACKSPACE,
+                crate::state::PeekKeyPress {
+                    serial: 1,
+                    time: 123,
+                    sequence: 1,
+                    held: true,
+                    eligible: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
         ctx.keyboard_ime_suppressed_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         ctx.keyboard_forwarded_keys
@@ -3732,7 +4467,11 @@ mod tests {
         assert!(!ctx
             .keyboard_backspace_repeat_cancelled
             .contains(&HostId(10)));
-        assert!(!ctx.keyboard_event_times.contains_key(&HostId(10)));
+        assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(10)));
+        assert!(
+            ctx.keyboard_repeatable_keys.contains_key(&HostId(10)),
+            "focus teardown must preserve keymap-derived repeatability"
+        );
         assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(10)));
         assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(10)));
         assert!(!ctx.keyboard_keysym_forwarded_keys.contains_key(&HostId(10)));
