@@ -1062,15 +1062,25 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 );
             }
             WL_KEY_RELEASED => {
-                if let Some(press_serial) = ctx
-                    .key_generations
-                    .peek_press_serial(host_keyboard_id, key)
-                {
-                    if !crate::state::serial_is_after(serial, press_serial) {
+                if let Some(press) = ctx.key_generations.peek(host_keyboard_id, key) {
+                    // ChromeOS may reuse one Wayland serial across many
+                    // physical key transitions. A newer serial is sufficient
+                    // to order the release; when the serial is reused, the
+                    // compositor timestamp orders events within that serial.
+                    // Do not accept a release merely because its timestamp is
+                    // newer: an old serial can arrive late with an unrelated
+                    // timestamp.
+                    let valid_release = crate::state::serial_is_after(serial, press.serial)
+                        || (serial == press.serial
+                            && !crate::state::serial_is_after(press.time, time));
+                    if !valid_release {
                         log::debug!(
-                            "peek_key: dropping stale release serial {} before press serial {}",
+                            "peek_key: dropping stale release serial={} time={} before \
+                             current serial={} time={}",
                             serial,
-                            press_serial
+                            time,
+                            press.serial,
+                            press.time,
                         );
                         return crate::wire::Action::Drop;
                     }
@@ -2241,6 +2251,93 @@ mod tests {
             synthetic_time, 1234,
             "synthetic key events must use the host wl_keyboard time"
         );
+    }
+
+    #[test]
+    fn equal_serial_peek_release_uses_timestamp_order() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        let keyboard = HostId(100);
+        let key = 20;
+        let shared_serial = 18_857;
+
+        ctx.last_sender_id = 1000;
+        handler.on_peek_key(&mut ctx, shared_serial, 100, key, WL_KEY_PRESSED);
+        handler.on_peek_key(&mut ctx, shared_serial, 110, key, WL_KEY_RELEASED);
+        assert!(
+            !ctx.key_generations.physically_held(keyboard, key),
+            "a later release must close a press even when ChromeOS reuses its serial"
+        );
+
+        handler.on_peek_key(&mut ctx, shared_serial, 130, key, WL_KEY_PRESSED);
+        handler.on_peek_key(&mut ctx, shared_serial, 120, key, WL_KEY_RELEASED);
+        assert!(
+            ctx.key_generations.physically_held(keyboard, key),
+            "an older delayed release must not close the current generation"
+        );
+        handler.on_peek_key(&mut ctx, shared_serial, 130, key, WL_KEY_RELEASED);
+        assert!(
+            !ctx.key_generations.physically_held(keyboard, key),
+            "equal timestamps must remain valid for fast press/release pairs"
+        );
+
+        handler.on_peek_key(&mut ctx, shared_serial + 2, 150, key, WL_KEY_PRESSED);
+        handler.on_peek_key(&mut ctx, shared_serial + 1, 160, key, WL_KEY_RELEASED);
+        assert!(
+            ctx.key_generations.physically_held(keyboard, key),
+            "an older serial must stay stale even when delivered with a newer timestamp"
+        );
+    }
+
+    #[test]
+    fn reused_peek_serial_does_not_recover_stale_t_for_backspace() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut keyboard_handler = KeyboardHandler::new();
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.last_sender_id = 100;
+        let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+        let t = find_keycode(&keymap, xkb::keysyms::KEY_t).expect("T in keymap");
+        let shared_serial = 18_857;
+
+        // Captured ChromeOS behavior: distinct key transitions shared one
+        // Wayland serial while their compositor timestamps kept increasing.
+        // If either release remains latched, the next Backspace press refreshes
+        // an old generation and empty IME confirmations recover T instead.
+        ctx.last_sender_id = 1000;
+        keyboard_handler.on_peek_key(
+            &mut ctx,
+            shared_serial,
+            100,
+            EVDEV_KEY_BACKSPACE,
+            WL_KEY_PRESSED,
+        );
+        keyboard_handler.on_peek_key(
+            &mut ctx,
+            shared_serial,
+            110,
+            EVDEV_KEY_BACKSPACE,
+            WL_KEY_RELEASED,
+        );
+        keyboard_handler.on_peek_key(&mut ctx, shared_serial, 120, t, WL_KEY_PRESSED);
+        keyboard_handler.on_peek_key(&mut ctx, shared_serial, 130, t, WL_KEY_RELEASED);
+        keyboard_handler.on_peek_key(
+            &mut ctx,
+            shared_serial,
+            140,
+            EVDEV_KEY_BACKSPACE,
+            WL_KEY_PRESSED,
+        );
+
+        ctx.last_sender_id = 2000;
+        assert_eq!(
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
+            Action::Drop
+        );
+        let (_, _, recovered_key, state) = keyboard_event_payload(&ctx.host_to_client_queue[0]);
+        assert_eq!(recovered_key, EVDEV_KEY_BACKSPACE);
+        assert_eq!(state, WL_KEY_PRESSED);
     }
 
     #[test]

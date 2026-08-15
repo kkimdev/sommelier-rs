@@ -1750,6 +1750,47 @@ mod tests {
     }
 
     #[test]
+    fn raw_proxy_dispatch_retires_equal_serial_peek_release() {
+        use crate::state::HostId;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        let shared_serial = 18_857;
+
+        for (time, state) in [(100, KEY_PRESSED), (110, KEY_RELEASED)] {
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zcr_extended_keyboard_v1",
+                raw_peek_key(shared_serial, time, KEY_BACKSPACE, state),
+            );
+        }
+        assert!(
+            !ctx.key_generations
+                .physically_held(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            "generated dispatch must retire a release that shares its press serial"
+        );
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            raw_peek_key(shared_serial, 120, KEY_BACKSPACE, KEY_PRESSED),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            Some(GUEST_TEXT_INPUT),
+            "the next generation must remain eligible for IME repeat recovery"
+        );
+    }
+
+    #[test]
     fn raw_confirm_preedit_preserves_delete_until_commit_string() {
         use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
         use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
