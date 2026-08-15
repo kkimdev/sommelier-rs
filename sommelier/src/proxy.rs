@@ -94,9 +94,7 @@ fn pending_host_event_is_stale(
         .or(guest_interface)
         .is_some_and(|name| name == "wl_buffer")
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
-        && guest_id.is_some_and(|gid| {
-            ctx.retired_buffers.contains_key(&gid) || ctx.deferred_host_buffers.contains_key(&gid)
-        });
+        && ctx.host_buffer_is_guest_destroyed(sender_id);
     // An asynchronous linux-dmabuf create can legally be followed by
     // params.destroy before the compositor emits `created`.  The host still
     // owns the newly-created wl_buffer in that case, so let the event reach
@@ -1594,8 +1592,9 @@ mod tests {
         ctx.shadow_table.map_id(11, 21);
         ctx.shadow_table
             .track_interface_with_version(11, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.mark_pending_destroy(11);
-        ctx.retired_buffers.insert(11, test_buffer_state());
+        assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
+        assert!(ctx.mark_buffer_guest_destroyed(11));
+        ctx.shadow_table.retire_guest_object(11);
         assert!(!pending_host_event_is_stale(
             &ctx,
             21,
@@ -1606,11 +1605,12 @@ mod tests {
         ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table
             .track_interface_with_version(12, "wl_buffer".to_string(), 1);
+        assert!(ctx.register_native_buffer(22, (1, 1), None));
         // Match the production native-buffer destroy path: the guest
         // interface is retired while the host-side interface remains
         // available long enough to dispatch wl_buffer.release.
+        assert!(ctx.mark_buffer_guest_destroyed(12));
         ctx.shadow_table.retire_guest_object(12);
-        ctx.deferred_host_buffers.insert(12, 22);
         assert!(!pending_host_event_is_stale(
             &ctx,
             22,
@@ -1623,7 +1623,6 @@ mod tests {
         use crate::state::{BufferState, PoolInner, PoolState};
         use std::sync::{Arc, RwLock};
         BufferState {
-            guest_buffer_id: 11,
             pool: Arc::new(PoolState {
                 client_fd: -1,
                 inner: RwLock::new(PoolInner {
@@ -1636,7 +1635,6 @@ mod tests {
             height: 1,
             stride: 4,
             format: 0,
-            host_buffer_id: 21,
             bo: None,
             dmabuf_fd: None,
             bo_stride: 4,

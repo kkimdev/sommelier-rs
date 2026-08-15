@@ -1284,12 +1284,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             if let Some(dimensions) = ctx.pending_native_buffer_sizes.remove(&guest_params_id) {
                 // The generated dispatcher maps this host-created buffer to a
                 // fresh guest server ID immediately after the handler returns.
-                // Store the dimensions under the host ID for that short
-                // interval; compositor damage lookup resolves the guest ID
-                // back to this host ID.
-                ctx.native_buffer_sizes.insert(buffer, dimensions);
-                if let Some(sync_fd) = ctx.pending_native_sync_fds.remove(&guest_params_id) {
-                    ctx.native_buffer_sync_fds.insert(buffer, sync_fd);
+                // Register the host generation now; compositor lookup resolves
+                // the guest ID through the shadow table after forwarding.
+                let sync_fd = ctx.pending_native_sync_fds.remove(&guest_params_id);
+                if !ctx.register_native_buffer(buffer, dimensions, sync_fd) {
+                    error!("Duplicate render buffer host ID {}", buffer);
+                    ctx.fatal_protocol_error = true;
                 }
             }
         }
@@ -1386,8 +1386,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         );
         ctx.shadow_table
             .set_host_version(host_buffer_id, buffer_version);
-        ctx.native_buffer_sizes.insert(buffer_id, (width, height));
-
         let queued = self.process_params(ctx, params_id, width, height, format, |ctx, host_id| {
             let mut builder = MessageBuilder::new();
             builder.write_u32(host_buffer_id);
@@ -1405,10 +1403,13 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             )
         });
         if !queued {
-            ctx.native_buffer_sizes.remove(&buffer_id);
             ctx.shadow_table.remove_id(buffer_id);
-        } else if let Some(sync_fd) = ctx.pending_native_sync_fds.remove(&params_id) {
-            ctx.native_buffer_sync_fds.insert(host_buffer_id, sync_fd);
+        } else {
+            let sync_fd = ctx.pending_native_sync_fds.remove(&params_id);
+            if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fd) {
+                error!("Duplicate render buffer host ID {}", host_buffer_id);
+                ctx.fatal_protocol_error = true;
+            }
         }
         Action::Drop
     }
@@ -1429,7 +1430,7 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::state::{Context, PendingParam};
+    use crate::state::{Context, HostId, PendingParam, RenderBufferBacking};
     use crate::wire::{Action, WireMessage};
 
     fn message_opcode(message: &[u8]) -> u16 {
@@ -1841,7 +1842,7 @@ mod tests {
             ctx.pending_native_sync_fds.contains_key(&guest_params_id),
             "async create must retain a dma-buf fence descriptor until created"
         );
-        assert!(!ctx.native_buffer_sizes.contains_key(&host_buffer_id));
+        assert!(ctx.render_buffers.get(HostId(host_buffer_id)).is_none());
 
         let payload = host_buffer_id.to_ne_bytes();
         ctx.last_sender_id = host_params_id;
@@ -1863,9 +1864,20 @@ mod tests {
         );
         assert_eq!(ctx.pending_native_buffer_sizes.get(&guest_params_id), None);
         assert!(!ctx.pending_native_sync_fds.contains_key(&guest_params_id));
-        assert_eq!(ctx.native_buffer_sizes.get(&host_buffer_id), Some(&(16, 8)));
+        assert_eq!(
+            ctx.buffer_dimensions_for_host(HostId(host_buffer_id)),
+            Some((16, 8))
+        );
         assert!(
-            ctx.native_buffer_sync_fds.contains_key(&host_buffer_id),
+            matches!(
+                ctx.render_buffers
+                    .get(HostId(host_buffer_id))
+                    .and_then(|buffer| buffer.backing.as_ref()),
+                Some(RenderBufferBacking::Native {
+                    sync_fd: Some(_),
+                    ..
+                })
+            ),
             "created must move the retained fence descriptor to the host buffer"
         );
         let guest_buffer_id = ctx
@@ -1873,9 +1885,10 @@ mod tests {
             .get_guest_id(host_buffer_id)
             .expect("generated created event must map the host buffer");
         assert!(
-            !ctx.native_buffer_sizes.contains_key(&guest_buffer_id),
-            "dimensions are keyed by host ID until the host delete_id lifecycle completes"
+            ctx.buffer_dimensions(guest_buffer_id) == Some((16, 8)),
+            "guest lookup must resolve the canonical host-ID keyed generation"
         );
+        assert_eq!(ctx.render_buffers.iter().count(), 1);
 
         unsafe {
             libc::close(pipe_fds[0]);
@@ -1929,7 +1942,7 @@ mod tests {
             "failed must still be forwarded to the guest"
         );
         assert!(ctx.pending_native_buffer_sizes.is_empty());
-        assert!(ctx.native_buffer_sizes.is_empty());
+        assert_eq!(ctx.render_buffers.iter().count(), 0);
 
         unsafe {
             libc::close(pipe_fds[0]);
@@ -1996,7 +2009,7 @@ mod tests {
             "orphaned buffer must not be exposed to guest"
         );
         assert!(ctx.pending_native_buffer_sizes.is_empty());
-        assert!(!ctx.native_buffer_sizes.contains_key(&host_buffer_id));
+        assert!(ctx.render_buffers.get(HostId(host_buffer_id)).is_none());
         assert_eq!(
             ctx.client_to_host_queue
                 .last()

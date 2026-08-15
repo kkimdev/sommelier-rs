@@ -17,7 +17,7 @@ limitations under the License.
 use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
-use crate::state::{BufferState, Context, DamageRect, PoolInner, PoolState};
+use crate::state::{BufferState, Context, DamageRect, HostId, PoolInner, PoolState};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
 use std::collections::HashSet;
@@ -1195,33 +1195,9 @@ fn can_retire_deferred_buffer(
             || allow_submitted.is_some_and(|allowed| allowed.contains(&guest_id)))
 }
 
-/// Drop deferred SHM buffers once the host has released them and no pending
-/// attach can make them compositor-visible again.
-///
-/// `current_buffer_id` is intentionally retained until the next surface
-/// commit, so it can be stale after a release followed by `attach(NULL)` (or
-/// a replacement attach).  A release proves that the old compositor-use
-/// interval has ended; only a still-pending attach to the same buffer keeps
-/// the host object alive for a possible new interval.
+/// Retire every eligible guest-destroyed render buffer.
 pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
-    let references = SurfaceBufferReferences::collect(ctx);
-    let releasable: Vec<(u32, u32)> = ctx
-        .retired_buffers
-        .iter()
-        .filter_map(|(&guest_id, buffer)| {
-            (ctx.buffer_is_released(guest_id)
-                && (!references.contains(guest_id) || !references.has_pending(guest_id)))
-            .then_some((guest_id, buffer.host_buffer_id))
-        })
-        .collect();
-    for (guest_id, host_id) in releasable {
-        ctx.retired_buffers.remove(&guest_id);
-        // Keep the guest↔host mapping reserved until the host acknowledges
-        // this destructor with wl_display.delete_id.
-        let _ = queue_host_buffer_destroy(ctx, host_id);
-        ctx.shadow_table.mark_pending_destroy(guest_id);
-        ctx.clear_buffer_use(guest_id);
-    }
+    collect_deferred_buffers_impl(ctx, None);
 }
 
 /// Retire guest-destroyed local-copy and native buffers with one lifecycle
@@ -1233,34 +1209,27 @@ pub(crate) fn collect_retired_buffers(ctx: &mut Context) {
 /// not be evaluated by separate condition trees.
 fn collect_deferred_buffers_impl(ctx: &mut Context, allow_submitted: Option<&HashSet<u32>>) {
     let references = SurfaceBufferReferences::collect(ctx);
-    let local_copy_buffers: Vec<(u32, u32)> = ctx
-        .retired_buffers
+    let candidates: Vec<(u32, HostId)> = ctx
+        .render_buffers
         .iter()
-        .filter_map(|(&guest_id, buffer)| {
-            can_retire_deferred_buffer(ctx, &references, guest_id, allow_submitted)
-                .then_some((guest_id, buffer.host_buffer_id))
-        })
-        .collect();
-    let native_buffers: Vec<(u32, u32)> = ctx
-        .deferred_host_buffers
-        .iter()
-        .filter_map(|(&guest_id, &host_id)| {
+        .filter_map(|(host_id, buffer)| {
+            if !buffer.lifecycle.is_guest_destroyed() {
+                return None;
+            }
+            let guest_id = ctx.shadow_table.get_guest_id(host_id.0)?;
             can_retire_deferred_buffer(ctx, &references, guest_id, allow_submitted)
                 .then_some((guest_id, host_id))
         })
         .collect();
 
-    for (guest_id, host_id) in local_copy_buffers {
-        ctx.retired_buffers.remove(&guest_id);
-        let _ = queue_host_buffer_destroy(ctx, host_id);
-        ctx.shadow_table.mark_pending_destroy(guest_id);
-        ctx.clear_buffer_use(guest_id);
-    }
-    for (guest_id, host_id) in native_buffers {
-        ctx.deferred_host_buffers.remove(&guest_id);
-        ctx.clear_buffer_use(guest_id);
-        let _ = queue_host_buffer_destroy(ctx, host_id);
-        ctx.shadow_table.mark_pending_destroy(guest_id);
+    for (guest_id, host_id) in candidates {
+        if queue_host_buffer_destroy(ctx, host_id.0) {
+            ctx.mark_buffer_host_destroy_queued(host_id.0);
+            // Keep the guest↔host mapping and empty registry generation
+            // reserved until wl_display.delete_id acknowledges the host
+            // destructor.
+            ctx.shadow_table.mark_pending_destroy(guest_id);
+        }
     }
 }
 
@@ -1765,17 +1734,16 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             ctx.shadow_table
                 .track_interface_with_version(id, "wl_buffer".to_string(), 1);
             ctx.shadow_table.set_host_version(host_buffer_id, 1);
-            ctx.buffers.insert(
+            let registered = ctx.register_local_buffer(
                 id,
+                host_buffer_id,
                 BufferState {
-                    guest_buffer_id: id,
                     pool: pool.clone(),
                     offset,
                     width,
                     height,
                     stride: stride as u32,
                     format,
-                    host_buffer_id,
                     bo,
                     dmabuf_fd: Some(dmabuf_fd_owned),
                     bo_stride,
@@ -1787,6 +1755,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     needs_full_copy: true,
                 },
             );
+            if !registered {
+                error!("Duplicate render buffer host ID {}", host_buffer_id);
+                ctx.fatal_protocol_error = true;
+            }
             return Action::Drop;
         }
 
@@ -1936,17 +1908,16 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             ctx.shadow_table.set_host_version(host_buffer_id, 1);
 
             // Save buffer state
-            ctx.buffers.insert(
+            let registered = ctx.register_local_buffer(
                 id,
+                host_buffer_id,
                 BufferState {
-                    guest_buffer_id: id,
                     pool: pool.clone(),
                     offset,
                     width,
                     height,
                     stride: stride as u32,
                     format,
-                    host_buffer_id,
                     bo,
                     dmabuf_fd: Some(dmabuf_fd_owned),
                     bo_stride, // Store bo_stride
@@ -1958,6 +1929,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     needs_full_copy: true,
                 },
             );
+            if !registered {
+                error!("Duplicate render buffer host ID {}", host_buffer_id);
+                ctx.fatal_protocol_error = true;
+            }
         }
 
         Action::Drop
@@ -2051,63 +2026,25 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         let uncommitted_attach = references.has_pending(guest_id);
         let still_referenced = ctx.buffer_is_submitted(guest_id) || references.contains(guest_id);
 
-        // A guest may destroy a wl_buffer while a surface still has it
-        // attached. Keep the backing mmap and the guest↔host mapping alive
-        // until the host compositor sends wl_buffer.release; otherwise a
-        // damage-only commit can dereference unmapped memory and the host
-        // release event can be routed to a newly reused object ID.
-        if let Some(mut buffer) = ctx.buffers.remove(&guest_id) {
-            if still_referenced && (!ctx.buffer_is_released(guest_id) || uncommitted_attach) {
-                // Keep the host wl_buffer alive until its release event. A
-                // destroy request would remove the host resource before it
-                // can report release, leaving no compositor-use lifetime
-                // signal for the deferred mmap. The guest object and host
-                // object therefore have deliberately different destruction
-                // points.  If the previous interval was already released,
-                // retain that edge while a pending attach is unresolved;
-                // `on_commit` clears it when a new interval actually starts,
-                // while replacing the attach lets the collector destroy the
-                // host object immediately.
-                buffer.guest_buffer_id = guest_id;
-                ctx.retired_buffers.insert(guest_id, buffer);
-                ctx.shadow_table.retire_guest_object(guest_id);
-            } else {
-                if let Some(host_id) = host_id {
-                    let _ = queue_host_buffer_destroy(ctx, host_id);
-                }
-                clear_surface_buffer_references(ctx, guest_id);
-                ctx.shadow_table.mark_pending_destroy(guest_id);
-                ctx.clear_buffer_use(guest_id);
-            }
-        } else {
-            // Native linux-dmabuf buffers have no local mapping to retire, but
-            // the host compositor still owns the attached resource until it
-            // sends wl_buffer.release. Keep the mapping alive across a guest
-            // destroy just like the SHM path.
-            // A release may have arrived before the guest destroys the
-            // wl_buffer. In that case the host has already completed its use
-            // interval and no deferred lifetime signal remains to wait for.
-            let host_already_released = ctx.buffer_is_released(guest_id);
-            if still_referenced && (!host_already_released || uncommitted_attach) {
-                if let Some(host_id) = host_id {
-                    ctx.deferred_host_buffers.insert(guest_id, host_id);
-                    // Keep a release edge that predates the unresolved
-                    // pending attach.  A later commit clears it and starts a
-                    // fresh use interval; replacing the attach allows the
-                    // collector to retire the already-idle host buffer.
-                    ctx.shadow_table.retire_guest_object(guest_id);
-                    return Action::Drop;
-                }
-            } else if let Some(host_id) = host_id {
-                ctx.clear_buffer_use(guest_id);
-                let _ = queue_host_buffer_destroy(ctx, host_id);
-            } else {
-                ctx.clear_buffer_use(guest_id);
-            }
-            clear_surface_buffer_references(ctx, guest_id);
-            ctx.shadow_table.mark_pending_destroy(guest_id);
-            ctx.clear_buffer_use(guest_id);
+        // Local-copy and native buffers have identical Wayland lifetime
+        // semantics. Keep either backing alive while a committed use interval
+        // or unresolved pending attach can still produce host traffic.
+        if ctx.render_buffer_host_id(guest_id).is_some()
+            && still_referenced
+            && (!ctx.buffer_is_released(guest_id) || uncommitted_attach)
+        {
+            ctx.mark_buffer_guest_destroyed(guest_id);
+            ctx.shadow_table.retire_guest_object(guest_id);
+            return Action::Drop;
         }
+
+        if let Some(host_id) = host_id {
+            if queue_host_buffer_destroy(ctx, host_id) {
+                ctx.mark_buffer_host_destroy_queued(host_id);
+            }
+        }
+        clear_surface_buffer_references(ctx, guest_id);
+        ctx.shadow_table.mark_pending_destroy(guest_id);
         Action::Drop
     }
 
@@ -2118,58 +2055,24 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         };
         let pending_attach = SurfaceBufferReferences::collect(ctx).has_pending(guest_id);
 
-        if let Some(deferred_host_id) = ctx.deferred_host_buffers.remove(&guest_id) {
+        if ctx.host_buffer_is_guest_destroyed(host_id) {
             if pending_attach {
-                // This release completes the previous compositor-use
-                // interval. Keep the deferred host object alive because the
-                // pending attach may still be committed; the collector uses
-                // this marker to retire it if the attach is replaced first.
-                ctx.mark_buffer_released(guest_id);
-                ctx.deferred_host_buffers.insert(guest_id, deferred_host_id);
-                return Action::Drop;
-            }
-            // The guest object was destroyed before the host compositor
-            // released a native dma-buf. Now that the release is the lifetime
-            // signal, destroy the host proxy and retain its mapping until the
-            // corresponding wl_display.delete_id arrives.
-            ctx.clear_buffer_use(guest_id);
-            let _ = queue_host_buffer_destroy(ctx, deferred_host_id);
-            ctx.shadow_table.mark_pending_destroy(guest_id);
-            clear_surface_buffer_references(ctx, guest_id);
-            return Action::Drop;
-        }
-
-        if ctx.retired_buffers.contains_key(&guest_id) {
-            if pending_attach {
-                // The release belongs to the previous compositor-use
-                // interval. Keep the retired state and host object alive for
-                // the pending attach; on commit the state is reopened for a
-                // new interval, while replacing the attach lets the
-                // collectors queue the destructor.
+                // This release completes the previous use interval. Keep the
+                // deferred object alive because the pending attach may still
+                // begin another interval.
                 ctx.mark_buffer_released(guest_id);
                 return Action::Drop;
             }
-            // The guest object is already gone, so there is no valid object on
-            // which to deliver the release event. It is nevertheless the
-            // release that makes it safe to drop the deferred backing storage.
             ctx.mark_buffer_released(guest_id);
-            // The host object remained alive specifically so this release
-            // could arrive. It is now safe to destroy the host proxy and drop
-            // the local backing.
-            let _ = queue_host_buffer_destroy(ctx, host_id);
-            ctx.shadow_table.mark_pending_destroy(guest_id);
-            ctx.clear_buffer_use(guest_id);
-            clear_surface_buffer_references(ctx, guest_id);
-            // The backing state can be dropped now that the compositor sent
-            // release, but the host object still owes wl_display.delete_id
-            // for the queued destroy request. Keep its numeric mapping until
-            // that acknowledgement instead of letting collect_retired_buffers
-            // remove it immediately.
-            ctx.retired_buffers.remove(&guest_id);
+            if queue_host_buffer_destroy(ctx, host_id) {
+                ctx.mark_buffer_host_destroy_queued(host_id);
+                ctx.shadow_table.mark_pending_destroy(guest_id);
+                clear_surface_buffer_references(ctx, guest_id);
+            }
             return Action::Drop;
         }
 
-        // Retain the release edge for both SHM and native buffers so a later
+        // Retain the release phase for both local-copy and native buffers so a later
         // guest destroy can retire the host proxy immediately even when a
         // surface still stores the buffer as its current content.
         ctx.mark_buffer_released(guest_id);
@@ -2178,7 +2081,6 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         // still has the buffer as its current content. Keeping this marker in
         // a submitted phase would make a later guest destroy incorrectly
         // retain an already-idle buffer.
-        collect_retired_buffers(ctx);
         Action::Forward
     }
 }
@@ -2211,10 +2113,37 @@ mod tests {
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::DamageRect;
-    use crate::state::{BufferState, Context, PoolInner, PoolState};
+    use crate::state::{BufferState, Context, HostId, PoolInner, PoolState, RenderBufferLifecycle};
     use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::sync::{Arc, RwLock};
+
+    fn register_test_local(ctx: &mut Context, guest_id: u32, host_id: u32, backing: BufferState) {
+        assert!(ctx.register_local_buffer(guest_id, host_id, backing));
+    }
+
+    fn register_test_native(ctx: &mut Context, host_id: u32) {
+        assert!(ctx.register_native_buffer(host_id, (1, 1), None));
+    }
+
+    fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
+        assert!(ctx.mark_buffer_guest_destroyed(guest_id));
+        ctx.shadow_table.retire_guest_object(guest_id);
+    }
+
+    fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {
+        ctx.render_buffers
+            .get(HostId(host_id))
+            .map(|buffer| buffer.lifecycle)
+    }
+
+    fn buffer_is_guest_destroyed(ctx: &Context, host_id: u32) -> bool {
+        buffer_lifecycle(ctx, host_id).is_some_and(RenderBufferLifecycle::is_guest_destroyed)
+    }
+
+    fn buffer_host_destroy_is_queued(ctx: &Context, host_id: u32) -> bool {
+        buffer_lifecycle(ctx, host_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
+    }
 
     #[test]
     fn rejects_non_positive_pool_sizes() {
@@ -3074,7 +3003,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.mark_buffer_submitted(guest_buffer);
         let pool = Arc::new(PoolState {
             client_fd: -1,
             inner: RwLock::new(PoolInner {
@@ -3082,17 +3010,17 @@ mod tests {
                 size: 0,
             }),
         });
-        ctx.buffers.insert(
+        register_test_local(
+            &mut ctx,
             guest_buffer,
+            host_buffer,
             BufferState {
-                guest_buffer_id: guest_buffer,
                 pool,
                 offset: 0,
                 width: 1,
                 height: 1,
                 stride: 4,
                 format: 0,
-                host_buffer_id: host_buffer,
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
@@ -3104,12 +3032,13 @@ mod tests {
                 needs_full_copy: false,
             },
         );
+        ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert!(
-            ctx.retired_buffers.contains_key(&guest_buffer),
+            buffer_is_guest_destroyed(&ctx, host_buffer),
             "destroy must retain backing state while the surface still references it"
         );
         assert_eq!(
@@ -3129,7 +3058,7 @@ mod tests {
             WlBufferHandler::on_release(&mut handler, &mut ctx),
             Action::Drop
         );
-        assert!(!ctx.retired_buffers.contains_key(&guest_buffer));
+        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer)
@@ -3164,17 +3093,17 @@ mod tests {
                 size: 0,
             }),
         });
-        ctx.buffers.insert(
+        register_test_local(
+            &mut ctx,
             guest_buffer,
+            host_buffer,
             BufferState {
-                guest_buffer_id: guest_buffer,
                 pool,
                 offset: 0,
                 width: 1,
                 height: 1,
                 stride: 4,
                 format: 0,
-                host_buffer_id: host_buffer,
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
@@ -3199,7 +3128,7 @@ mod tests {
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(ctx.retired_buffers.is_empty());
+        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer)
@@ -3216,13 +3145,14 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
+        register_test_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert!(
-            ctx.deferred_host_buffers.contains_key(&guest_buffer),
+            buffer_is_guest_destroyed(&ctx, host_buffer),
             "a submitted native buffer must stay alive until host release"
         );
         assert!(ctx.buffer_is_submitted(guest_buffer));
@@ -3233,7 +3163,7 @@ mod tests {
             WlBufferHandler::on_release(&mut handler, &mut ctx),
             Action::Drop
         );
-        assert!(!ctx.deferred_host_buffers.contains_key(&guest_buffer));
+        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert!(!ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
@@ -3251,6 +3181,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
+        register_test_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
 
         let mut handler = ShmHandler;
@@ -3268,7 +3199,7 @@ mod tests {
         ctx.surfaces.entry(100).or_default().current_buffer_id = Some(guest_buffer);
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(ctx.deferred_host_buffers.is_empty());
+        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert!(ctx.host_buffer_use(guest_buffer).is_none());
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
@@ -3287,8 +3218,6 @@ mod tests {
             ctx.shadow_table
                 .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
             ctx.shadow_table.set_host_version(host_id, 1);
-            ctx.shadow_table.retire_guest_object(guest_id);
-            ctx.mark_buffer_released(guest_id);
         }
         let pool = Arc::new(PoolState {
             client_fd: -1,
@@ -3297,17 +3226,17 @@ mod tests {
                 size: 0,
             }),
         });
-        ctx.retired_buffers.insert(
+        register_test_local(
+            &mut ctx,
             local_buffer,
+            local_host,
             BufferState {
-                guest_buffer_id: local_buffer,
                 pool,
                 offset: 0,
                 width: 1,
                 height: 1,
                 stride: 4,
                 format: 0,
-                host_buffer_id: local_host,
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
@@ -3319,27 +3248,34 @@ mod tests {
                 needs_full_copy: false,
             },
         );
-        ctx.deferred_host_buffers.insert(native_buffer, native_host);
+        register_test_native(&mut ctx, native_host);
+        for guest_id in [local_buffer, native_buffer] {
+            mark_test_buffer_guest_destroyed(&mut ctx, guest_id);
+            ctx.mark_buffer_released(guest_id);
+        }
         ctx.surfaces.entry(40).or_default().pending_buffer_id = Some(Some(local_buffer));
         ctx.surfaces.entry(41).or_default().pending_buffer_id = Some(Some(native_buffer));
 
         collect_deferred_buffers(&mut ctx);
-        assert!(ctx.retired_buffers.contains_key(&local_buffer));
-        assert!(ctx.deferred_host_buffers.contains_key(&native_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, local_host));
+        assert!(buffer_is_guest_destroyed(&ctx, native_host));
 
         ctx.surfaces.get_mut(&40).unwrap().pending_buffer_id = Some(None);
         ctx.surfaces.get_mut(&41).unwrap().pending_buffer_id = Some(None);
         collect_deferred_buffers(&mut ctx);
 
-        assert!(ctx.retired_buffers.is_empty());
-        assert!(ctx.deferred_host_buffers.is_empty());
+        assert!(buffer_host_destroy_is_queued(&ctx, local_host));
+        assert!(buffer_host_destroy_is_queued(&ctx, native_host));
         assert!(ctx.host_buffer_use(local_buffer).is_none());
         assert!(ctx.host_buffer_use(native_buffer).is_none());
+        let mut destroyed_hosts = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
+            .collect::<Vec<_>>();
+        destroyed_hosts.sort_unstable();
         assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
-                .collect::<Vec<_>>(),
+            destroyed_hosts,
             vec![local_host, native_host],
             "local-copy and native buffers must make the same lifecycle decision"
         );
@@ -3350,6 +3286,10 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
+        ctx.shadow_table.map_id(guest_buffer, host_buffer);
+        ctx.shadow_table
+            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer, 1);
         let pool = Arc::new(PoolState {
             client_fd: -1,
             inner: RwLock::new(PoolInner {
@@ -3357,17 +3297,17 @@ mod tests {
                 size: 0,
             }),
         });
-        ctx.retired_buffers.insert(
+        register_test_local(
+            &mut ctx,
             guest_buffer,
+            host_buffer,
             BufferState {
-                guest_buffer_id: guest_buffer,
                 pool,
                 offset: 0,
                 width: 1,
                 height: 1,
                 stride: 4,
                 format: 0,
-                host_buffer_id: host_buffer,
                 bo: None,
                 dmabuf_fd: None,
                 bo_stride: 4,
@@ -3379,17 +3319,15 @@ mod tests {
                 needs_full_copy: false,
             },
         );
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.mark_buffer_submitted(guest_buffer);
+        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
 
         collect_retired_buffers(&mut ctx);
-        assert!(ctx.retired_buffers.contains_key(&guest_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
 
         ctx.mark_buffer_released(guest_buffer);
         collect_retired_buffers(&mut ctx);
-        assert!(!ctx.retired_buffers.contains_key(&guest_buffer));
+        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer),

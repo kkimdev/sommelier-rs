@@ -671,18 +671,12 @@ impl Drop for PoolState {
 }
 
 pub struct BufferState {
-    /// Guest object ID that owns this state while the buffer is live. Retired
-    /// buffers keep this value after the guest object has been destroyed so
-    /// surface references can still be resolved for damage-only commits.
-    pub guest_buffer_id: u32,
     pub pool: Arc<PoolState>,
     pub offset: i32,
     pub width: i32,
     pub height: i32,
     pub stride: u32,
     pub format: u32,
-    #[allow(dead_code)]
-    pub host_buffer_id: u32,
     #[allow(dead_code)]
     pub bo: Option<gbm::BufferObject<()>>,
     #[allow(dead_code)]
@@ -1008,16 +1002,156 @@ pub enum GuestKeyOwner {
     ImeRecovery,
 }
 
-/// Exclusive host-compositor use phase of one guest `wl_buffer`.
-///
-/// Absence from the lifecycle map means the buffer has never been submitted
-/// or its lifecycle is fully retired. A submitted buffer cannot also be
-/// released; each host `wl_buffer.release` completes exactly one use interval,
-/// and a later commit starts a new submitted interval.
+/// Host-compositor use phase of one render buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostBufferUse {
-    Submitted,
+pub enum RenderBufferUse {
+    NeverSubmitted,
+    AwaitingRelease,
     Released,
+}
+
+/// Guest/host ownership phase of one render buffer.
+///
+/// The lifecycle and use phase live in one enum so guest-destroyed backing
+/// cannot accidentally remain in a separate "live" map, and a queued host
+/// destructor cannot still be represented as compositor-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderBufferLifecycle {
+    GuestAlive(RenderBufferUse),
+    GuestDestroyed(RenderBufferUse),
+    HostDestroyQueued,
+}
+
+impl RenderBufferLifecycle {
+    pub fn use_state(self) -> Option<RenderBufferUse> {
+        match self {
+            Self::GuestAlive(use_state) | Self::GuestDestroyed(use_state) => Some(use_state),
+            Self::HostDestroyQueued => None,
+        }
+    }
+
+    pub fn is_guest_destroyed(self) -> bool {
+        matches!(self, Self::GuestDestroyed(_))
+    }
+}
+
+/// Storage owned by one host `wl_buffer` generation.
+pub enum RenderBufferBacking {
+    /// Guest SHM copied into proxy-owned host storage.
+    LocalCopy(BufferState),
+    /// Guest-created linux-dmabuf forwarded without a CPU copy.
+    Native {
+        size: (i32, i32),
+        sync_fd: Option<OwnedFd>,
+    },
+}
+
+pub struct RenderBuffer {
+    pub backing: Option<RenderBufferBacking>,
+    pub lifecycle: RenderBufferLifecycle,
+}
+
+/// Canonical host-ID keyed registry for every render buffer.
+///
+/// A host ID is the Wayland generation identity: it remains unique while late
+/// `release` and `delete_id` events are in flight even if the guest numeric ID
+/// becomes reusable. All backing, use, and ownership state therefore moves
+/// together under this one key.
+#[derive(Default)]
+pub struct RenderBufferRegistry {
+    entries: HashMap<HostId, RenderBuffer>,
+}
+
+impl RenderBufferRegistry {
+    pub fn register_local(&mut self, host_id: HostId, backing: BufferState) -> bool {
+        match self.entries.entry(host_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RenderBuffer {
+                    backing: Some(RenderBufferBacking::LocalCopy(backing)),
+                    lifecycle: RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
+                });
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    pub fn register_native(
+        &mut self,
+        host_id: HostId,
+        size: (i32, i32),
+        sync_fd: Option<OwnedFd>,
+    ) -> bool {
+        match self.entries.entry(host_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RenderBuffer {
+                    backing: Some(RenderBufferBacking::Native { size, sync_fd }),
+                    lifecycle: RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
+                });
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    pub fn get(&self, host_id: HostId) -> Option<&RenderBuffer> {
+        self.entries.get(&host_id)
+    }
+
+    pub fn get_mut(&mut self, host_id: HostId) -> Option<&mut RenderBuffer> {
+        self.entries.get_mut(&host_id)
+    }
+
+    pub fn remove(&mut self, host_id: HostId) -> Option<RenderBuffer> {
+        self.entries.remove(&host_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (HostId, &RenderBuffer)> {
+        self.entries
+            .iter()
+            .map(|(&host_id, buffer)| (host_id, buffer))
+    }
+
+    pub fn set_use(&mut self, host_id: HostId, use_state: RenderBufferUse) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        buffer.lifecycle = match buffer.lifecycle {
+            RenderBufferLifecycle::GuestAlive(_) => RenderBufferLifecycle::GuestAlive(use_state),
+            RenderBufferLifecycle::GuestDestroyed(_) => {
+                RenderBufferLifecycle::GuestDestroyed(use_state)
+            }
+            RenderBufferLifecycle::HostDestroyQueued => return false,
+        };
+        true
+    }
+
+    pub fn mark_guest_destroyed(&mut self, host_id: HostId) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        match buffer.lifecycle {
+            RenderBufferLifecycle::GuestAlive(use_state) => {
+                buffer.lifecycle = RenderBufferLifecycle::GuestDestroyed(use_state);
+                true
+            }
+            RenderBufferLifecycle::GuestDestroyed(_) | RenderBufferLifecycle::HostDestroyQueued => {
+                false
+            }
+        }
+    }
+
+    pub fn mark_host_destroy_queued(&mut self, host_id: HostId) -> bool {
+        let Some(buffer) = self.entries.get_mut(&host_id) else {
+            return false;
+        };
+        if buffer.lifecycle == RenderBufferLifecycle::HostDestroyQueued {
+            return false;
+        }
+        buffer.backing = None;
+        buffer.lifecycle = RenderBufferLifecycle::HostDestroyQueued;
+        true
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1034,29 +1168,10 @@ pub struct DmabufCapabilityState {
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
-    pub buffers: HashMap<u32, BufferState>,
-    /// Buffers whose guest wl_buffer object was destroyed while a surface
-    /// could still reference them. They remain mapped until the host releases
-    /// the buffer, at which point the host object and backing storage can be
-    /// retired safely.
-    pub retired_buffers: HashMap<u32, BufferState>,
-    /// Exclusive host-compositor use phase for SHM and native buffers.
-    ///
-    /// This is private so rendering handlers cannot represent a buffer as
-    /// simultaneously submitted and released.
-    buffer_uses: HashMap<u32, HostBufferUse>,
-    /// Native linux-dmabuf buffers have no local SHM mapping, but their host
-    /// wl_buffer still must remain alive after the guest object is destroyed
-    /// until the compositor sends wl_buffer.release.
-    pub deferred_host_buffers: HashMap<u32, u32>,
-    /// Dimensions of guest-created linux-dmabuf buffers. Native buffers do
-    /// not need a local SHM `BufferState`, but the compositor bridge still
-    /// needs their dimensions to translate `damage_buffer` and full damage
-    /// rectangles correctly.
-    pub native_buffer_sizes: HashMap<u32, (i32, i32)>,
+    pub render_buffers: RenderBufferRegistry,
     /// Dimensions waiting for the host's asynchronous linux-dmabuf `created`
     /// event. The key is the guest params object ID; the event handler moves
-    /// the value to `native_buffer_sizes` under the host-created buffer ID.
+    /// the value into the host-ID keyed render-buffer registry.
     pub pending_native_buffer_sizes: HashMap<u32, (i32, i32)>,
     /// Async linux-dmabuf params objects whose guest destructor was sent
     /// before the host emitted `created`/`failed`. The key is the host params
@@ -1204,10 +1319,6 @@ pub struct Context {
     /// new binds in the meantime.
     pub removed_host_globals: HashSet<u32>,
     pub pending_params: HashMap<u32, Vec<PendingParam>>,
-    /// One retained duplicate of a native dma-buf plane, keyed by the host
-    /// `wl_buffer` ID. It is used to wait for guest GPU writes immediately
-    /// before each host surface commit and is dropped after host delete_id.
-    pub native_buffer_sync_fds: HashMap<u32, OwnedFd>,
     /// Native dma-buf sync descriptors waiting for an asynchronous
     /// linux-dmabuf `created` event, keyed by guest params ID.
     pub pending_native_sync_fds: HashMap<u32, OwnedFd>,
@@ -1263,30 +1374,121 @@ pub struct Context {
 }
 
 impl Context {
-    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<HostBufferUse> {
-        self.buffer_uses.get(&guest_buffer_id).copied()
+    pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: u32) -> Option<HostId> {
+        self.shadow_table
+            .get_host_id(guest_buffer_id)
+            .map(HostId)
+            .filter(|host_id| self.render_buffers.get(*host_id).is_some())
     }
 
-    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) {
-        self.buffer_uses
-            .insert(guest_buffer_id, HostBufferUse::Submitted);
+    pub(crate) fn register_local_buffer(
+        &mut self,
+        guest_buffer_id: u32,
+        host_buffer_id: u32,
+        backing: BufferState,
+    ) -> bool {
+        debug_assert_eq!(
+            self.shadow_table.get_host_id(guest_buffer_id),
+            Some(host_buffer_id)
+        );
+        self.render_buffers
+            .register_local(HostId(host_buffer_id), backing)
     }
 
-    pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: u32) {
-        self.buffer_uses
-            .insert(guest_buffer_id, HostBufferUse::Released);
+    pub(crate) fn register_native_buffer(
+        &mut self,
+        host_buffer_id: u32,
+        size: (i32, i32),
+        sync_fd: Option<OwnedFd>,
+    ) -> bool {
+        self.render_buffers
+            .register_native(HostId(host_buffer_id), size, sync_fd)
     }
 
-    pub(crate) fn clear_buffer_use(&mut self, guest_buffer_id: u32) {
-        self.buffer_uses.remove(&guest_buffer_id);
+    pub(crate) fn local_buffer(&self, guest_buffer_id: u32) -> Option<&BufferState> {
+        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
+        match self.render_buffers.get(host_id)?.backing.as_ref()? {
+            RenderBufferBacking::LocalCopy(backing) => Some(backing),
+            RenderBufferBacking::Native { .. } => None,
+        }
+    }
+
+    pub(crate) fn buffer_dimensions(&self, guest_buffer_id: u32) -> Option<(i32, i32)> {
+        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
+        self.buffer_dimensions_for_host(host_id)
+    }
+
+    pub(crate) fn buffer_dimensions_for_host(&self, host_id: HostId) -> Option<(i32, i32)> {
+        match self.render_buffers.get(host_id)?.backing.as_ref()? {
+            RenderBufferBacking::LocalCopy(backing) => Some((backing.width, backing.height)),
+            RenderBufferBacking::Native { size, .. } => Some(*size),
+        }
+    }
+
+    pub(crate) fn native_buffer_sync_fd(&self, guest_buffer_id: u32) -> Option<&OwnedFd> {
+        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
+        match self.render_buffers.get(host_id)?.backing.as_ref()? {
+            RenderBufferBacking::Native {
+                sync_fd: Some(sync_fd),
+                ..
+            } => Some(sync_fd),
+            RenderBufferBacking::LocalCopy(_)
+            | RenderBufferBacking::Native { sync_fd: None, .. } => None,
+        }
+    }
+
+    pub(crate) fn host_buffer_use(&self, guest_buffer_id: u32) -> Option<RenderBufferUse> {
+        let host_id = self.render_buffer_host_id(guest_buffer_id)?;
+        self.render_buffers.get(host_id)?.lifecycle.use_state()
+    }
+
+    fn set_buffer_use(&mut self, guest_buffer_id: u32, use_state: RenderBufferUse) -> bool {
+        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+            return false;
+        };
+        self.render_buffers.set_use(host_id, use_state)
+    }
+
+    pub(crate) fn mark_buffer_submitted(&mut self, guest_buffer_id: u32) -> bool {
+        self.set_buffer_use(guest_buffer_id, RenderBufferUse::AwaitingRelease)
+    }
+
+    pub(crate) fn mark_buffer_released(&mut self, guest_buffer_id: u32) -> bool {
+        self.set_buffer_use(guest_buffer_id, RenderBufferUse::Released)
+    }
+
+    pub(crate) fn clear_buffer_use(&mut self, guest_buffer_id: u32) -> bool {
+        self.set_buffer_use(guest_buffer_id, RenderBufferUse::NeverSubmitted)
+    }
+
+    pub(crate) fn mark_buffer_guest_destroyed(&mut self, guest_buffer_id: u32) -> bool {
+        let Some(host_id) = self.render_buffer_host_id(guest_buffer_id) else {
+            return false;
+        };
+        self.render_buffers.mark_guest_destroyed(host_id)
+    }
+
+    pub(crate) fn mark_buffer_host_destroy_queued(&mut self, host_buffer_id: u32) -> bool {
+        self.render_buffers
+            .mark_host_destroy_queued(HostId(host_buffer_id))
+    }
+
+    pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
+        self.render_buffers.remove(HostId(host_buffer_id)).is_some()
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
-        self.host_buffer_use(guest_buffer_id) == Some(HostBufferUse::Submitted)
+        self.host_buffer_use(guest_buffer_id) == Some(RenderBufferUse::AwaitingRelease)
     }
 
     pub(crate) fn buffer_is_released(&self, guest_buffer_id: u32) -> bool {
-        self.host_buffer_use(guest_buffer_id) == Some(HostBufferUse::Released)
+        self.host_buffer_use(guest_buffer_id) == Some(RenderBufferUse::Released)
+    }
+
+    pub(crate) fn host_buffer_is_guest_destroyed(&self, host_buffer_id: u32) -> bool {
+        self.render_buffers
+            .get(HostId(host_buffer_id))
+            .is_some_and(|buffer| buffer.lifecycle.is_guest_destroyed())
     }
 
     pub(crate) fn guest_key_owner(
@@ -1391,11 +1593,7 @@ impl Context {
         Self {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
-            buffers: HashMap::new(),
-            retired_buffers: HashMap::new(),
-            buffer_uses: HashMap::new(),
-            deferred_host_buffers: HashMap::new(),
-            native_buffer_sizes: HashMap::new(),
+            render_buffers: RenderBufferRegistry::default(),
             pending_native_buffer_sizes: HashMap::new(),
             orphaned_dmabuf_params: HashMap::new(),
             surfaces: HashMap::new(),
@@ -1451,7 +1649,6 @@ impl Context {
             next_global_generation: 1,
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
-            native_buffer_sync_fds: HashMap::new(),
             pending_native_sync_fds: HashMap::new(),
             feedback_index_maps: HashMap::new(),
             synthetic_feedback_objects: HashMap::new(),
@@ -2097,27 +2294,46 @@ mod tests {
     fn host_buffer_use_is_an_exclusive_phase() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
+        let host_buffer = 40;
+        ctx.shadow_table.map_id(buffer, host_buffer);
+        assert!(ctx.register_native_buffer(host_buffer, (1, 1), None));
 
-        assert!(ctx.host_buffer_use(buffer).is_none());
+        assert_eq!(
+            ctx.host_buffer_use(buffer),
+            Some(RenderBufferUse::NeverSubmitted)
+        );
         ctx.mark_buffer_submitted(buffer);
-        assert_eq!(ctx.host_buffer_use(buffer), Some(HostBufferUse::Submitted));
+        assert_eq!(
+            ctx.host_buffer_use(buffer),
+            Some(RenderBufferUse::AwaitingRelease)
+        );
         assert!(ctx.buffer_is_submitted(buffer));
         assert!(!ctx.buffer_is_released(buffer));
 
         ctx.mark_buffer_released(buffer);
-        assert_eq!(ctx.host_buffer_use(buffer), Some(HostBufferUse::Released));
+        assert_eq!(ctx.host_buffer_use(buffer), Some(RenderBufferUse::Released));
         assert!(!ctx.buffer_is_submitted(buffer));
         assert!(ctx.buffer_is_released(buffer));
 
         ctx.mark_buffer_submitted(buffer);
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(HostBufferUse::Submitted),
+            Some(RenderBufferUse::AwaitingRelease),
             "a new commit must replace the prior release edge"
         );
         ctx.clear_buffer_use(buffer);
-        assert!(ctx.host_buffer_use(buffer).is_none());
-        assert!(!ctx.buffer_uses.contains_key(&buffer));
+        assert_eq!(
+            ctx.host_buffer_use(buffer),
+            Some(RenderBufferUse::NeverSubmitted)
+        );
+        assert_eq!(
+            ctx.render_buffers
+                .get(HostId(host_buffer))
+                .map(|buffer| buffer.lifecycle),
+            Some(RenderBufferLifecycle::GuestAlive(
+                RenderBufferUse::NeverSubmitted
+            ))
+        );
     }
 
     #[test]
@@ -2134,6 +2350,9 @@ mod tests {
         let sequence_count = operations.len().pow(sequence_len);
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
+        let host_buffer = 40;
+        ctx.shadow_table.map_id(buffer, host_buffer);
+        assert!(ctx.register_native_buffer(host_buffer, (1, 1), None));
 
         for mut encoded in 0..sequence_count {
             ctx.clear_buffer_use(buffer);
@@ -2142,20 +2361,139 @@ mod tests {
                 let model = match operations[encoded % operations.len()] {
                     Operation::Submit => {
                         ctx.mark_buffer_submitted(buffer);
-                        Some(HostBufferUse::Submitted)
+                        RenderBufferUse::AwaitingRelease
                     }
                     Operation::Release => {
                         ctx.mark_buffer_released(buffer);
-                        Some(HostBufferUse::Released)
+                        RenderBufferUse::Released
                     }
                     Operation::Clear => {
                         ctx.clear_buffer_use(buffer);
-                        None
+                        RenderBufferUse::NeverSubmitted
                     }
                 };
                 encoded /= operations.len();
-                assert_eq!(ctx.host_buffer_use(buffer), model);
-                assert_eq!(ctx.buffer_uses.contains_key(&buffer), model.is_some());
+                assert_eq!(ctx.host_buffer_use(buffer), Some(model));
+                assert_eq!(
+                    ctx.render_buffers
+                        .get(HostId(host_buffer))
+                        .map(|buffer| buffer.lifecycle),
+                    Some(RenderBufferLifecycle::GuestAlive(model))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_buffer_registry_rejects_duplicate_host_generation_without_mutation() {
+        let host_id = HostId(40);
+        let mut registry = RenderBufferRegistry::default();
+
+        assert!(registry.register_native(host_id, (16, 8), None));
+        assert!(!registry.register_native(host_id, (99, 99), None));
+
+        assert_eq!(
+            registry.get(host_id).map(|buffer| buffer.lifecycle),
+            Some(RenderBufferLifecycle::GuestAlive(
+                RenderBufferUse::NeverSubmitted
+            ))
+        );
+        assert!(matches!(
+            registry
+                .get(host_id)
+                .and_then(|buffer| buffer.backing.as_ref()),
+            Some(RenderBufferBacking::Native { size: (16, 8), .. })
+        ));
+    }
+
+    #[test]
+    fn render_buffer_lifecycle_matches_all_short_transition_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Submit,
+            Release,
+            Clear,
+            GuestDestroy,
+            HostDestroy,
+        }
+
+        let operations = [
+            Operation::Submit,
+            Operation::Release,
+            Operation::Clear,
+            Operation::GuestDestroy,
+            Operation::HostDestroy,
+        ];
+        let sequence_len = 6;
+        let sequence_count = operations.len().pow(sequence_len);
+        let host_id = 40;
+
+        for mut encoded in 0..sequence_count {
+            let mut registry = RenderBufferRegistry::default();
+            assert!(registry.register_native(HostId(host_id), (1, 1), None));
+            let mut model = RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted);
+
+            for _ in 0..sequence_len {
+                let operation = operations[encoded % operations.len()];
+                encoded /= operations.len();
+
+                let actual_changed = match operation {
+                    Operation::Submit => {
+                        registry.set_use(HostId(host_id), RenderBufferUse::AwaitingRelease)
+                    }
+                    Operation::Release => {
+                        registry.set_use(HostId(host_id), RenderBufferUse::Released)
+                    }
+                    Operation::Clear => {
+                        registry.set_use(HostId(host_id), RenderBufferUse::NeverSubmitted)
+                    }
+                    Operation::GuestDestroy => registry.mark_guest_destroyed(HostId(host_id)),
+                    Operation::HostDestroy => registry.mark_host_destroy_queued(HostId(host_id)),
+                };
+                let (expected, expected_changed) = match (model, operation) {
+                    (RenderBufferLifecycle::GuestAlive(_), Operation::Submit) => (
+                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::AwaitingRelease),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Submit) => (
+                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::AwaitingRelease),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestAlive(_), Operation::Release) => (
+                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::Released),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Release) => (
+                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::Released),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestAlive(_), Operation::Clear) => (
+                        RenderBufferLifecycle::GuestAlive(RenderBufferUse::NeverSubmitted),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestDestroyed(_), Operation::Clear) => (
+                        RenderBufferLifecycle::GuestDestroyed(RenderBufferUse::NeverSubmitted),
+                        true,
+                    ),
+                    (RenderBufferLifecycle::GuestAlive(use_state), Operation::GuestDestroy) => {
+                        (RenderBufferLifecycle::GuestDestroyed(use_state), true)
+                    }
+                    (
+                        RenderBufferLifecycle::GuestAlive(_)
+                        | RenderBufferLifecycle::GuestDestroyed(_),
+                        Operation::HostDestroy,
+                    ) => (RenderBufferLifecycle::HostDestroyQueued, true),
+                    (state, _) => (state, false),
+                };
+                model = expected;
+
+                assert_eq!(actual_changed, expected_changed);
+                let actual = registry.get(HostId(host_id)).expect("registry generation");
+                assert_eq!(actual.lifecycle, model);
+                assert_eq!(
+                    actual.backing.is_some(),
+                    model != RenderBufferLifecycle::HostDestroyQueued
+                );
             }
         }
     }
