@@ -27,6 +27,10 @@ mod virtwl_channel;
 mod wire;
 
 mod protocols {
+    // Generated dispatch functions intentionally use independent validation
+    // guards with early returns. Compact token-stream output can make Clippy
+    // misread adjacent guards as a missing `else`.
+    #![allow(clippy::possible_missing_else)]
     #![allow(unused_macros)]
     include!(concat!(env!("OUT_DIR"), "/wayland_protocol.rs"));
     include!(concat!(env!("OUT_DIR"), "/xdg_shell_protocol.rs"));

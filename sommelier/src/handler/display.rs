@@ -173,15 +173,13 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // interface metadata so that late event can still be dispatched,
             // but complete the guest-side delete_id now.
             let mapping_alive = ctx.shadow_table.get_guest_id(id) == Some(guest_id);
-            if mapping_alive {
-                if queue_guest_delete_id(ctx, guest_id) {
-                    ctx.shadow_table.remove_guest_mapping(guest_id);
-                    // remove_guest_mapping intentionally leaves the host
-                    // interface reserved for the late async event. Clear
-                    // only the guest pending-destroy marker; remove_id would
-                    // discard the host interface before `created`/`failed`.
-                    ctx.shadow_table.clear_pending_destroy_guest(guest_id);
-                }
+            if mapping_alive && queue_guest_delete_id(ctx, guest_id) {
+                ctx.shadow_table.remove_guest_mapping(guest_id);
+                // remove_guest_mapping intentionally leaves the host
+                // interface reserved for the late async event. Clear
+                // only the guest pending-destroy marker; remove_id would
+                // discard the host interface before `created`/`failed`.
+                ctx.shadow_table.clear_pending_destroy_guest(guest_id);
             }
             return Action::Drop;
         }
