@@ -689,9 +689,7 @@ impl WlSurfaceHandler for CompositorHandler {
             ctx.keyboard_pressed_keys.remove(&keyboard_id);
             ctx.keyboard_peek_key_presses.remove(&keyboard_id);
             ctx.keyboard_backspace_repeat_cancelled.remove(&keyboard_id);
-            ctx.keyboard_ime_suppressed_keys.remove(&keyboard_id);
-            ctx.keyboard_forwarded_keys.remove(&keyboard_id);
-            ctx.keyboard_keysym_forwarded_keys.remove(&keyboard_id);
+            ctx.clear_guest_keys(keyboard_id);
         }
         // xdg objects are separate guest objects, but both maps resolve back
         // to this wl_surface. Remove stale links now so a later client ID
@@ -3419,12 +3417,11 @@ mod tests {
         ctx.keyboard_latest_peek_sequences
             .insert((1, Some(wl_surface_guest_id)), 1);
         ctx.keyboard_latest_peek_sequences.insert((1, Some(999)), 2);
-        ctx.keyboard_ime_suppressed_keys
-            .insert(host_keyboard_id, [14_u32].into_iter().collect());
-        ctx.keyboard_forwarded_keys
-            .insert(host_keyboard_id, [14_u32].into_iter().collect());
-        ctx.keyboard_keysym_forwarded_keys
-            .insert(host_keyboard_id, [14_u32].into_iter().collect());
+        assert!(ctx.claim_guest_key(
+            host_keyboard_id,
+            14,
+            crate::state::GuestKeyOwner::ImeRecovery
+        ));
         ctx.keyboard_active_surfaces
             .insert(crate::state::HostId(701), 999);
         ctx.last_sender_id = wl_surface_guest_id;
@@ -3447,13 +3444,7 @@ mod tests {
                 && !ctx
                     .keyboard_peek_key_presses
                     .contains_key(&host_keyboard_id)
-                && !ctx
-                    .keyboard_ime_suppressed_keys
-                    .contains_key(&host_keyboard_id)
-                && !ctx.keyboard_forwarded_keys.contains_key(&host_keyboard_id)
-                && !ctx
-                    .keyboard_keysym_forwarded_keys
-                    .contains_key(&host_keyboard_id),
+                && ctx.guest_key_owner(host_keyboard_id, 14).is_none(),
             "destroying a surface must retire all per-keyboard input state"
         );
         assert!(

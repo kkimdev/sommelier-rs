@@ -892,6 +892,20 @@ pub struct PeekKeyPress {
     pub eligible: bool,
 }
 
+/// Exclusive guest-side ownership of one evdev key generation.
+///
+/// A key can have at most one owner: either a real `wl_keyboard` press is
+/// awaiting its release, a text-input keysym press is awaiting its release, or
+/// IME recovery already emitted a balanced pair and later host events must be
+/// suppressed. Encoding these states as one enum prevents the parallel-set
+/// inconsistencies that previously caused duplicate and stuck keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestKeyOwner {
+    Physical,
+    TextInputKeysym,
+    ImeRecovery,
+}
+
 #[derive(Debug, Default)]
 pub struct DmabufCapabilityState {
     /// Legacy v3 format/modifier pairs collected for one host-global
@@ -1037,20 +1051,12 @@ pub struct Context {
     /// non-Backspace press. Physical key state remains intact until release,
     /// while empty IME confirmations must not rearm the cancelled repeat.
     pub keyboard_backspace_repeat_cancelled: HashSet<HostId>,
-    /// Physical key releases that must be consumed because IME recovery
-    /// already delivered a balanced synthetic press/release pair.
-    pub keyboard_ime_suppressed_keys: HashMap<HostId, HashSet<u32>>,
-    /// Keys whose physical press was forwarded to the guest and therefore
-    /// still require a real release event.
-    pub keyboard_forwarded_keys: HashMap<HostId, HashSet<u32>>,
-    /// Keys that were synthesized from a text-input-v1 `keysym` event.
+    /// Exclusive guest-delivery owner for each host keyboard and evdev key.
     ///
-    /// `keyboard_forwarded_keys` also contains ordinary physical presses, so
-    /// it cannot by itself tell whether a later keysym release belongs to a
-    /// synthetic press or is a duplicate of a real keyboard event. Keeping
-    /// this source marker prevents either path from stealing the other's
-    /// release.
-    pub keyboard_keysym_forwarded_keys: HashMap<HostId, HashSet<u32>>,
+    /// This field is private so handlers must use the transition methods on
+    /// [`Context`], which preserve the one-owner invariant and prune empty
+    /// per-keyboard maps.
+    keyboard_guest_key_owners: HashMap<HostId, HashMap<u32, GuestKeyOwner>>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
@@ -1146,6 +1152,79 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) fn guest_key_owner(
+        &self,
+        host_keyboard_id: HostId,
+        key: u32,
+    ) -> Option<GuestKeyOwner> {
+        self.keyboard_guest_key_owners
+            .get(&host_keyboard_id)
+            .and_then(|owners| owners.get(&key))
+            .copied()
+    }
+
+    /// Claim delivery ownership for a key that currently has no guest owner.
+    ///
+    /// Returning `false` leaves the existing owner untouched. Callers can
+    /// therefore reject duplicate presses without accidentally changing which
+    /// event source must close or suppress the eventual release.
+    pub(crate) fn claim_guest_key(
+        &mut self,
+        host_keyboard_id: HostId,
+        key: u32,
+        owner: GuestKeyOwner,
+    ) -> bool {
+        match self
+            .keyboard_guest_key_owners
+            .entry(host_keyboard_id)
+            .or_default()
+            .entry(key)
+        {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(owner);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Release any guest owner for a key and prune the empty keyboard entry.
+    pub(crate) fn take_guest_key_owner(
+        &mut self,
+        host_keyboard_id: HostId,
+        key: u32,
+    ) -> Option<GuestKeyOwner> {
+        let owner = self
+            .keyboard_guest_key_owners
+            .get_mut(&host_keyboard_id)
+            .and_then(|owners| owners.remove(&key));
+        if self
+            .keyboard_guest_key_owners
+            .get(&host_keyboard_id)
+            .is_some_and(|owners| owners.is_empty())
+        {
+            self.keyboard_guest_key_owners.remove(&host_keyboard_id);
+        }
+        owner
+    }
+
+    /// Release a key only when the expected source still owns it.
+    pub(crate) fn take_guest_key_if(
+        &mut self,
+        host_keyboard_id: HostId,
+        key: u32,
+        expected: GuestKeyOwner,
+    ) -> bool {
+        if self.guest_key_owner(host_keyboard_id, key) != Some(expected) {
+            return false;
+        }
+        self.take_guest_key_owner(host_keyboard_id, key) == Some(expected)
+    }
+
+    pub(crate) fn clear_guest_keys(&mut self, host_keyboard_id: HostId) {
+        self.keyboard_guest_key_owners.remove(&host_keyboard_id);
+    }
+
     pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
         // Initialize allocator
         let allocator = match Allocator::new() {
@@ -1222,9 +1301,7 @@ impl Context {
             keyboard_latest_peek_sequences: HashMap::new(),
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_backspace_repeat_cancelled: HashSet::new(),
-            keyboard_ime_suppressed_keys: HashMap::new(),
-            keyboard_forwarded_keys: HashMap::new(),
-            keyboard_keysym_forwarded_keys: HashMap::new(),
+            keyboard_guest_key_owners: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
             supported_formats: HashSet::new(),
@@ -1773,6 +1850,107 @@ mod tests {
             "PoolState::drop must unmap a poisoned pool"
         );
         assert_eq!(errno_value(), libc::ENOMEM);
+    }
+
+    #[test]
+    fn guest_key_owner_is_exclusive_and_source_checked() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let keyboard = HostId(10);
+        let key = 57;
+
+        assert!(ctx.claim_guest_key(keyboard, key, GuestKeyOwner::Physical));
+        for competing_owner in [GuestKeyOwner::TextInputKeysym, GuestKeyOwner::ImeRecovery] {
+            assert!(
+                !ctx.claim_guest_key(keyboard, key, competing_owner),
+                "a second source must not overwrite the live owner"
+            );
+        }
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::Physical)
+        );
+        assert!(!ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::TextInputKeysym));
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::Physical),
+            "a mismatched release must not steal another source's key"
+        );
+        assert!(ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::Physical));
+        assert!(ctx.guest_key_owner(keyboard, key).is_none());
+        assert!(
+            !ctx.keyboard_guest_key_owners.contains_key(&keyboard),
+            "releasing the last key must prune the per-keyboard owner map"
+        );
+    }
+
+    #[test]
+    fn guest_key_owner_matches_the_model_for_all_short_transition_sequences() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Claim(GuestKeyOwner),
+            Take(GuestKeyOwner),
+        }
+
+        let operations = [
+            Operation::Claim(GuestKeyOwner::Physical),
+            Operation::Claim(GuestKeyOwner::TextInputKeysym),
+            Operation::Claim(GuestKeyOwner::ImeRecovery),
+            Operation::Take(GuestKeyOwner::Physical),
+            Operation::Take(GuestKeyOwner::TextInputKeysym),
+            Operation::Take(GuestKeyOwner::ImeRecovery),
+        ];
+        let sequence_len = 5;
+        let sequence_count = operations.len().pow(sequence_len);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let keyboard = HostId(10);
+        let key = 57;
+
+        for mut encoded in 0..sequence_count {
+            ctx.clear_guest_keys(keyboard);
+            let mut model = None;
+
+            for _ in 0..sequence_len {
+                let operation = operations[encoded % operations.len()];
+                encoded /= operations.len();
+                match operation {
+                    Operation::Claim(owner) => {
+                        let expected = model.is_none();
+                        assert_eq!(ctx.claim_guest_key(keyboard, key, owner), expected);
+                        if expected {
+                            model = Some(owner);
+                        }
+                    }
+                    Operation::Take(owner) => {
+                        let expected = model == Some(owner);
+                        assert_eq!(ctx.take_guest_key_if(keyboard, key, owner), expected);
+                        if expected {
+                            model = None;
+                        }
+                    }
+                }
+                assert_eq!(ctx.guest_key_owner(keyboard, key), model);
+                assert_eq!(
+                    ctx.keyboard_guest_key_owners.contains_key(&keyboard),
+                    model.is_some(),
+                    "the outer map must exist exactly while a key has an owner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_guest_keys_is_scoped_to_one_keyboard() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        assert!(ctx.claim_guest_key(HostId(10), 57, GuestKeyOwner::ImeRecovery));
+        assert!(ctx.claim_guest_key(HostId(11), 57, GuestKeyOwner::TextInputKeysym));
+
+        ctx.clear_guest_keys(HostId(10));
+
+        assert!(ctx.guest_key_owner(HostId(10), 57).is_none());
+        assert_eq!(
+            ctx.guest_key_owner(HostId(11), 57),
+            Some(GuestKeyOwner::TextInputKeysym)
+        );
     }
 
     fn errno_reset() {

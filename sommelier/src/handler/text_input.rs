@@ -21,7 +21,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, HostId};
+use crate::state::{Context, GuestId, GuestKeyOwner, HostId};
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
@@ -458,11 +458,11 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
 }
 
 fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
-    let forwarded = ctx
-        .keyboard_forwarded_keys
-        .get(&held.host_keyboard_id)
-        .is_some_and(|keys| keys.contains(&held.key));
-    if forwarded {
+    let owner = ctx.guest_key_owner(held.host_keyboard_id, held.key);
+    if matches!(
+        owner,
+        Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+    ) {
         // The normal wl_keyboard path already delivered this physical
         // generation to the guest. The confirmation still closes a
         // text-input transaction, but another key pair would duplicate it.
@@ -473,10 +473,11 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         );
         return false;
     }
-    ctx.keyboard_ime_suppressed_keys
-        .entry(held.host_keyboard_id)
-        .or_default()
-        .insert(held.key);
+    if owner.is_none() {
+        let claimed =
+            ctx.claim_guest_key(held.host_keyboard_id, held.key, GuestKeyOwner::ImeRecovery);
+        debug_assert!(claimed, "guest owner was checked above");
+    }
     for state in [1, 0] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
         let mut builder = MessageBuilder::new();
@@ -828,11 +829,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             if let Some(keycode) = keycode {
                 match state {
                     crate::handler::keyboard::WL_KEY_PRESSED => {
-                        let ime_suppressed = ctx
-                            .keyboard_ime_suppressed_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.contains(&keycode));
-                        if ime_suppressed {
+                        let owner = ctx.guest_key_owner(host_keyboard_id, keycode);
+                        if owner == Some(GuestKeyOwner::ImeRecovery) {
                             // IME repeat recovery already emitted the complete
                             // synthetic pair for this physical generation.
                             // Keep the release marker for the real physical
@@ -849,10 +847,10 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                         // Only synthesize a press when the guest has not
                         // already received one; otherwise the duplicate
                         // would make clients observe two presses for one key.
-                        let already_forwarded = ctx
-                            .keyboard_forwarded_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.contains(&keycode));
+                        let already_forwarded = matches!(
+                            owner,
+                            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                        );
                         if already_forwarded {
                             log::debug!(
                                 "Dropping duplicate keysym press for host keyboard {} key {}",
@@ -868,14 +866,12 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                                 );
                             }
                         }
-                        ctx.keyboard_forwarded_keys
-                            .entry(host_keyboard_id)
-                            .or_default()
-                            .insert(keycode);
-                        ctx.keyboard_keysym_forwarded_keys
-                            .entry(host_keyboard_id)
-                            .or_default()
-                            .insert(keycode);
+                        let claimed = ctx.claim_guest_key(
+                            host_keyboard_id,
+                            keycode,
+                            GuestKeyOwner::TextInputKeysym,
+                        );
+                        debug_assert!(claimed, "duplicate owners were rejected above");
                     }
                     crate::handler::keyboard::WL_KEY_REPEATED => {
                         // A repeated keysym follows wl_keyboard.key's v10
@@ -883,14 +879,12 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                         // invent a new press/release pair or mark a physical
                         // press as synthetic. Drop malformed repeats and
                         // repeats already consumed by the IME fallback.
-                        let already_forwarded = ctx
-                            .keyboard_forwarded_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.contains(&keycode));
-                        let ime_suppressed = ctx
-                            .keyboard_ime_suppressed_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.contains(&keycode));
+                        let owner = ctx.guest_key_owner(host_keyboard_id, keycode);
+                        let already_forwarded = matches!(
+                            owner,
+                            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                        );
+                        let ime_suppressed = owner == Some(GuestKeyOwner::ImeRecovery);
                         if !already_forwarded || ime_suppressed {
                             log::debug!(
                                 "Dropping repeated keysym without a live guest press (key={}, ime_suppressed={})",
@@ -912,37 +906,12 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                         // path synthesized. If the physical keyboard path
                         // owns the press, leave its marker and wait for the
                         // real wl_keyboard release.
-                        let synthetic_press = ctx
-                            .keyboard_keysym_forwarded_keys
-                            .get_mut(&host_keyboard_id)
-                            .is_some_and(|keys| keys.remove(&keycode));
-                        if ctx
-                            .keyboard_keysym_forwarded_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.is_empty())
-                        {
-                            ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
-                        }
+                        let synthetic_press = ctx.take_guest_key_if(
+                            host_keyboard_id,
+                            keycode,
+                            GuestKeyOwner::TextInputKeysym,
+                        );
                         if !synthetic_press {
-                            log::debug!(
-                                "Dropping keysym release without a synthetic press for host keyboard {} key {}",
-                                host_keyboard_id.0,
-                                keycode
-                            );
-                            return Action::Drop;
-                        }
-                        let forwarded_press = ctx
-                            .keyboard_forwarded_keys
-                            .get_mut(&host_keyboard_id)
-                            .is_some_and(|keys| keys.remove(&keycode));
-                        if ctx
-                            .keyboard_forwarded_keys
-                            .get(&host_keyboard_id)
-                            .is_some_and(|keys| keys.is_empty())
-                        {
-                            ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
-                        }
-                        if !forwarded_press {
                             log::debug!(
                                 "Dropping keysym release without a synthetic press for host keyboard {} key {}",
                                 host_keyboard_id.0,
@@ -3068,10 +3037,11 @@ mod tests {
             1,
             100,
         );
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(host_keyboard_id))
-            .or_default()
-            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(
+            HostId(host_keyboard_id),
+            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            GuestKeyOwner::Physical
+        ));
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.current_preedit = "가".to_string();
@@ -3679,15 +3649,10 @@ mod tests {
             !ctx.keyboard_pressed_keys.contains_key(&HostId(888)),
             "a text-input keysym must not invent physical-key state"
         );
-        assert!(
-            ctx.keyboard_forwarded_keys[&HostId(888)]
-                .contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+        assert_eq!(
+            ctx.guest_key_owner(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+            Some(GuestKeyOwner::TextInputKeysym),
             "a synthetic keysym press must be paired with a later release"
-        );
-        assert!(
-            ctx.keyboard_keysym_forwarded_keys[&HostId(888)]
-                .contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            "the release must remember that this press came from keysym"
         );
     }
 
@@ -3704,10 +3669,11 @@ mod tests {
             .entry(HostId(host_keyboard_id))
             .or_default()
             .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(host_keyboard_id))
-            .or_default()
-            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(
+            HostId(host_keyboard_id),
+            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            GuestKeyOwner::Physical
+        ));
         ctx.last_sender_id = host_v1_id;
 
         let mut handler = TextInputV1Handler;
@@ -3726,9 +3692,12 @@ mod tests {
             ctx.host_to_client_queue.is_empty(),
             "a keysym duplicate must not emit a second wl_keyboard.key press"
         );
-        assert!(
-            !ctx.keyboard_keysym_forwarded_keys
-                .contains_key(&HostId(host_keyboard_id)),
+        assert_eq!(
+            ctx.guest_key_owner(
+                HostId(host_keyboard_id),
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
+            ),
+            Some(GuestKeyOwner::Physical),
             "a real keyboard press must not be mislabeled as synthetic"
         );
         assert!(
@@ -3749,10 +3718,7 @@ mod tests {
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
             .expect("fallback keymap must contain KEY_a");
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(host_keyboard_id))
-            .or_default()
-            .insert(keycode);
+        assert!(ctx.claim_guest_key(HostId(host_keyboard_id), keycode, GuestKeyOwner::Physical));
         ctx.keyboard_pressed_keys
             .entry(HostId(host_keyboard_id))
             .or_default()
@@ -3829,10 +3795,11 @@ mod tests {
             .entry(HostId(host_keyboard_id))
             .or_default()
             .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_ime_suppressed_keys
-            .entry(HostId(host_keyboard_id))
-            .or_default()
-            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(
+            HostId(host_keyboard_id),
+            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            GuestKeyOwner::ImeRecovery
+        ));
         ctx.last_sender_id = host_v1_id;
 
         let mut handler = TextInputV1Handler;
@@ -3852,8 +3819,10 @@ mod tests {
             "a keysym Backspace must not duplicate a pair already synthesized for the IME"
         );
         assert!(
-            ctx.keyboard_ime_suppressed_keys[&HostId(host_keyboard_id)]
-                .contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+            ctx.guest_key_owner(
+                HostId(host_keyboard_id),
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
+            ) == Some(GuestKeyOwner::ImeRecovery),
             "the physical release marker must remain until the real release arrives"
         );
     }
@@ -3960,10 +3929,11 @@ mod tests {
             .entry(HostId(host_keyboard_id))
             .or_default()
             .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(host_keyboard_id))
-            .or_default()
-            .insert(crate::handler::keyboard::EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(
+            HostId(host_keyboard_id),
+            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            GuestKeyOwner::Physical
+        ));
         ctx.last_sender_id = host_v1_id;
 
         let mut handler = TextInputV1Handler;
@@ -3983,8 +3953,10 @@ mod tests {
             "a keysym release must not steal the release for a real press"
         );
         assert!(
-            ctx.keyboard_forwarded_keys[&HostId(host_keyboard_id)]
-                .contains(&crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+            ctx.guest_key_owner(
+                HostId(host_keyboard_id),
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE
+            ) == Some(GuestKeyOwner::Physical),
             "the real press must remain paired with its physical release"
         );
         assert!(
@@ -4028,7 +4000,8 @@ mod tests {
             "keysym delivery must remain independent of physical-key state"
         );
         assert!(
-            !ctx.keyboard_forwarded_keys.contains_key(&HostId(888)),
+            ctx.guest_key_owner(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
+                .is_none(),
             "keysym release must close the synthetic press/release pairing"
         );
     }

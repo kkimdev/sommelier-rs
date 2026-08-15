@@ -50,7 +50,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::protocols::wayland::wl_seat::WlSeatHandler;
-    use crate::state::{Context, HostId, TextInputState};
+    use crate::state::{Context, GuestKeyOwner, HostId, TextInputState};
 
     #[test]
     fn release_keeps_child_keyboard_routing_state() {
@@ -193,10 +193,10 @@ mod tests {
             ),
             Action::Forward
         );
-        assert!(ctx
-            .keyboard_forwarded_keys
-            .get(&HostId(host_keyboard))
-            .is_some_and(|keys| keys.contains(&key)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(host_keyboard), key),
+            Some(GuestKeyOwner::Physical)
+        );
 
         // Release the parent seat without releasing its child keyboard.
         ctx.last_sender_id = guest_seat;

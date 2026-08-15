@@ -27,7 +27,7 @@ limitations under the License.
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
 use crate::protocols::wayland::wl_keyboard;
-use crate::state::{Context, GuestId, HostId};
+use crate::state::{Context, GuestId, GuestKeyOwner, HostId};
 use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
 
@@ -207,28 +207,7 @@ impl KeyboardHandler {
         ctx.keyboard_peek_key_presses.remove(&host_keyboard_id);
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
-        ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
-        ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
-        ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
-    }
-
-    fn take_ime_suppressed_key_release(
-        ctx: &mut Context,
-        host_keyboard_id: HostId,
-        key: u32,
-    ) -> bool {
-        let suppressed = ctx
-            .keyboard_ime_suppressed_keys
-            .get_mut(&host_keyboard_id)
-            .is_some_and(|keys| keys.remove(&key));
-        if ctx
-            .keyboard_ime_suppressed_keys
-            .get(&host_keyboard_id)
-            .is_some_and(|keys| keys.is_empty())
-        {
-            ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
-        }
-        suppressed
+        ctx.clear_guest_keys(host_keyboard_id);
     }
 
     fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
@@ -314,21 +293,21 @@ impl KeyboardHandler {
             );
         }
 
-        ctx.keyboard_ime_suppressed_keys.remove(&host_keyboard_id);
+        ctx.clear_guest_keys(host_keyboard_id);
         ctx.keyboard_peek_key_presses.remove(&host_keyboard_id);
         ctx.keyboard_backspace_repeat_cancelled
             .remove(&host_keyboard_id);
-        ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
         if pressed_keys.is_empty() {
             ctx.keyboard_pressed_keys.remove(&host_keyboard_id);
-            ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
         } else {
             ctx.keyboard_pressed_keys
                 .insert(host_keyboard_id, pressed_keys.clone());
             // The enter event itself is forwarded to the guest, so every key
             // listed in its keys array requires a matching real release.
-            ctx.keyboard_forwarded_keys
-                .insert(host_keyboard_id, pressed_keys);
+            for key in pressed_keys {
+                let claimed = ctx.claim_guest_key(host_keyboard_id, key, GuestKeyOwner::Physical);
+                debug_assert!(claimed, "guest key owners were cleared above");
+            }
         }
     }
 
@@ -1029,14 +1008,26 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 ctx,
                 host_keyboard_id,
             );
-        let forwarded_before = ctx
-            .keyboard_forwarded_keys
+        let physically_held_before = ctx
+            .keyboard_pressed_keys
             .get(&host_keyboard_id)
             .is_some_and(|keys| keys.contains(&key));
-        let synthetic_suppressed_before = ctx
-            .keyboard_ime_suppressed_keys
-            .get(&host_keyboard_id)
-            .is_some_and(|keys| keys.contains(&key));
+        if state == WL_KEY_PRESSED
+            && !physically_held_before
+            && ctx.guest_key_owner(host_keyboard_id, key) == Some(GuestKeyOwner::ImeRecovery)
+        {
+            // IME recovery remains as a completed-generation tombstone after
+            // release so late duplicate channels cannot revive the key. A new
+            // physical press is the unambiguous boundary that retires it.
+            let retired = ctx.take_guest_key_if(host_keyboard_id, key, GuestKeyOwner::ImeRecovery);
+            debug_assert!(retired, "recovery owner was checked above");
+        }
+        let guest_owner_before = ctx.guest_key_owner(host_keyboard_id, key);
+        let forwarded_before = matches!(
+            guest_owner_before,
+            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+        );
+        let synthetic_suppressed_before = guest_owner_before == Some(GuestKeyOwner::ImeRecovery);
         let suppress_recovered_key =
             synthetic_suppressed_before || (backspace_repeat_active && !forwarded_before);
         let mut action = if suppress_recovered_key {
@@ -1073,11 +1064,10 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     .dropped_keys
                     .get(&host_keyboard_id)
                     .is_some_and(|keys| keys.contains(&key));
-                if suppress_recovered_key {
-                    ctx.keyboard_ime_suppressed_keys
-                        .entry(host_keyboard_id)
-                        .or_default()
-                        .insert(key);
+                if suppress_recovered_key && guest_owner_before.is_none() {
+                    let claimed =
+                        ctx.claim_guest_key(host_keyboard_id, key, GuestKeyOwner::ImeRecovery);
+                    debug_assert!(claimed, "guest owner was checked above");
                 }
                 if key != EVDEV_KEY_BACKSPACE {
                     Self::cancel_backspace_repeat(ctx, host_keyboard_id);
@@ -1128,11 +1118,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                             "  -> dropping repeated key {} without a forwarded press",
                             key
                         );
+                    } else if repeated {
+                        // The original owner remains responsible for the
+                        // eventual release; a repeat is forwarded without
+                        // claiming a second generation.
+                        handled = true;
                     } else {
-                        ctx.keyboard_forwarded_keys
-                            .entry(host_keyboard_id)
-                            .or_default()
-                            .insert(key);
+                        let claimed =
+                            ctx.claim_guest_key(host_keyboard_id, key, GuestKeyOwner::Physical);
+                        debug_assert!(claimed, "forwarded key had no existing guest owner");
                         handled = true;
                     }
                 }
@@ -1157,33 +1151,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 {
                     self.dropped_keys.remove(&host_keyboard_id);
                 }
-                let ime_suppressed =
-                    Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key);
-                // A synthetic keysym press may be followed by the physical
-                // wl_keyboard release if the host emits both paths. Consume
-                // the source marker here so a later keysym release cannot
-                // generate a second guest release.
-                let keysym_synthetic = ctx
-                    .keyboard_keysym_forwarded_keys
-                    .get_mut(&host_keyboard_id)
-                    .is_some_and(|keys| keys.remove(&key));
-                if ctx
-                    .keyboard_keysym_forwarded_keys
-                    .get(&host_keyboard_id)
-                    .is_some_and(|keys| keys.is_empty())
-                {
-                    ctx.keyboard_keysym_forwarded_keys.remove(&host_keyboard_id);
-                }
-                let forwarded_press = ctx
-                    .keyboard_forwarded_keys
-                    .get_mut(&host_keyboard_id)
-                    .is_some_and(|keys| keys.remove(&key));
-                if ctx
-                    .keyboard_forwarded_keys
-                    .get(&host_keyboard_id)
-                    .is_some_and(|keys| keys.is_empty())
-                {
-                    ctx.keyboard_forwarded_keys.remove(&host_keyboard_id);
+                let owner = ctx.guest_key_owner(host_keyboard_id, key);
+                let ime_suppressed = owner == Some(GuestKeyOwner::ImeRecovery);
+                let keysym_synthetic = owner == Some(GuestKeyOwner::TextInputKeysym);
+                let forwarded_press = matches!(
+                    owner,
+                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                );
+                if !ime_suppressed {
+                    ctx.take_guest_key_owner(host_keyboard_id, key);
                 }
                 handled = forwarded_press;
                 action = if forwarded_press && !dropped_press && !ime_suppressed {
@@ -1435,6 +1411,7 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                 if state == WL_KEY_PRESSED || pressed_before =>
             {
                 if state == WL_KEY_PRESSED && !peek_pressed_before {
+                    ctx.take_guest_key_if(host_keyboard_id, key, GuestKeyOwner::ImeRecovery);
                     let already_dropped_as_accelerator = self
                         .dropped_keys
                         .get(&host_keyboard_id)
@@ -1499,11 +1476,10 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
             }
             WL_KEY_RELEASED => {
                 Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state);
-                // A key consumed by the host IME may have no corresponding
-                // wl_keyboard.key release. `peek_key` is the only release
-                // notification in that path, so retire the marker installed
-                // by a recovered synthetic key pair here.
-                Self::take_ime_suppressed_key_release(ctx, host_keyboard_id, key);
+                // Keep an IME-recovery owner as a completed-generation
+                // tombstone until the next physical press. Text-input keysym
+                // events may lag behind this release and must remain
+                // suppressible.
                 if key == EVDEV_KEY_BACKSPACE {
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
@@ -1823,10 +1799,7 @@ mod tests {
         ctx.host_keyboard_extension_id = Some(HostId(99));
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(5), HostId(50));
-        ctx.keyboard_ime_suppressed_keys
-            .entry(HostId(5))
-            .or_default()
-            .insert(EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(HostId(5), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
 
         // The IME fallback already emitted a synthetic press/release pair.
         // The later physical release must not create a stray guest release.
@@ -1842,8 +1815,18 @@ mod tests {
             "IME-consumed release must be acked as NOT_HANDLED"
         );
         assert!(
-            !ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(5)),
-            "suppressed release bookkeeping must be consumed exactly once"
+            ctx.guest_key_owner(HostId(5), EVDEV_KEY_BACKSPACE) == Some(GuestKeyOwner::ImeRecovery),
+            "recovery ownership must remain as a late-event tombstone"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 8, 200, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Forward,
+            "the next physical generation must retire the recovery tombstone"
+        );
+        assert_eq!(
+            ctx.guest_key_owner(HostId(5), EVDEV_KEY_BACKSPACE),
+            Some(GuestKeyOwner::Physical)
         );
     }
 
@@ -1924,9 +1907,7 @@ mod tests {
             "a repeat-only event must not create physical pressed-key state"
         );
         assert!(
-            !ctx.keyboard_forwarded_keys
-                .get(&HostId(5))
-                .is_some_and(|keys| keys.contains(&30)),
+            ctx.guest_key_owner(HostId(5), 30).is_none(),
             "a repeat-only event must not create forwarded-key state"
         );
         assert_eq!(ctx.client_to_host_queue.len(), 1);
@@ -1960,7 +1941,7 @@ mod tests {
             "a valid repeat must preserve physical pressed-key state"
         );
         assert!(
-            ctx.keyboard_forwarded_keys[&HostId(5)].contains(&30),
+            ctx.guest_key_owner(HostId(5), 30) == Some(GuestKeyOwner::Physical),
             "a valid repeat must preserve the outstanding forwarded press"
         );
 
@@ -1973,7 +1954,7 @@ mod tests {
             "release must retire physical pressed-key state"
         );
         assert!(
-            !ctx.keyboard_forwarded_keys.contains_key(&HostId(5)),
+            ctx.guest_key_owner(HostId(5), 30).is_none(),
             "release must retire the outstanding forwarded press"
         );
         assert_eq!(ctx.client_to_host_queue.len(), 3);
@@ -2726,9 +2707,9 @@ mod tests {
         assert!(!ctx
             .keyboard_peek_key_presses
             .contains_key(&HostId(host_keyboard)));
-        assert!(!ctx
-            .keyboard_ime_suppressed_keys
-            .contains_key(&HostId(host_keyboard)));
+        assert!(
+            ctx.guest_key_owner(HostId(host_keyboard), space) == Some(GuestKeyOwner::ImeRecovery)
+        );
 
         ctx.last_sender_id = host_extended_text_input;
         assert_eq!(
@@ -2759,7 +2740,10 @@ mod tests {
             crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1),
             Action::Drop
         );
-        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(100)].contains(&space));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
 
         ctx.last_sender_id = 100;
         assert_eq!(
@@ -2774,10 +2758,16 @@ mod tests {
             keyboard_handler.on_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED),
             Action::Drop
         );
-        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
         assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(100)));
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
 
         let handled: Vec<_> = ctx
             .client_to_host_queue
@@ -2835,15 +2825,178 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.host_to_client_queue.len(), recovered_messages);
-        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
-        assert!(!ctx
-            .keyboard_keysym_forwarded_keys
-            .contains_key(&HostId(100)));
-        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(100)].contains(&space));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
 
         ctx.last_sender_id = 1000;
         keyboard_handler.on_peek_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED);
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
+    }
+
+    #[test]
+    fn recovery_tombstone_suppresses_keysym_after_physical_release() {
+        #[derive(Clone, Copy)]
+        enum DelayedEvent {
+            KeyboardPress,
+            KeyboardRelease,
+            PeekRelease,
+            KeysymPress,
+            KeysymRelease,
+        }
+
+        let orderings = [
+            &[
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeysymRelease,
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::KeyboardRelease,
+                DelayedEvent::PeekRelease,
+            ][..],
+            &[
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeysymRelease,
+                DelayedEvent::KeyboardRelease,
+                DelayedEvent::PeekRelease,
+            ],
+            &[
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::KeyboardRelease,
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeysymRelease,
+                DelayedEvent::PeekRelease,
+            ],
+            &[
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::PeekRelease,
+                DelayedEvent::KeysymRelease,
+                DelayedEvent::KeyboardRelease,
+            ],
+            &[
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::PeekRelease,
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeysymRelease,
+                DelayedEvent::KeyboardRelease,
+            ],
+            &[
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeyboardPress,
+                DelayedEvent::KeyboardRelease,
+                DelayedEvent::PeekRelease,
+                DelayedEvent::KeysymRelease,
+            ],
+            &[
+                DelayedEvent::PeekRelease,
+                DelayedEvent::KeysymPress,
+                DelayedEvent::KeysymRelease,
+            ],
+        ];
+
+        for (ordering_index, ordering) in orderings.into_iter().enumerate() {
+            let mut ctx = Context::new_for_test(false, false, Vec::new());
+            let mut keyboard_handler = KeyboardHandler::new();
+            let mut text_input_handler = crate::handler::text_input::TextInputV1Handler;
+            map_keyboard(&mut ctx, 10, 100, 1000, 1);
+            add_active_text_input(&mut ctx, 40, 1, 2000);
+            ctx.last_sender_id = 100;
+            let keymap = load_test_keymap(&mut keyboard_handler, &mut ctx);
+            let space = find_keycode(&keymap, xkb::keysyms::KEY_space).expect("Space in keymap");
+
+            ctx.last_sender_id = 1000;
+            keyboard_handler.on_peek_key(&mut ctx, 1, 500, space, WL_KEY_PRESSED);
+            ctx.last_sender_id = 2000;
+            crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1);
+            let recovered_messages = ctx.host_to_client_queue.len();
+            assert_eq!(recovered_messages, 3);
+
+            for (event_index, event) in ordering.iter().enumerate() {
+                let serial = 2 + event_index as u32;
+                let time = 501 + event_index as u32;
+                match event {
+                    DelayedEvent::KeyboardPress => {
+                        ctx.last_sender_id = 100;
+                        keyboard_handler.on_key(&mut ctx, serial, time, space, WL_KEY_PRESSED);
+                    }
+                    DelayedEvent::KeyboardRelease => {
+                        ctx.last_sender_id = 100;
+                        keyboard_handler.on_key(&mut ctx, serial, time, space, WL_KEY_RELEASED);
+                    }
+                    DelayedEvent::PeekRelease => {
+                        ctx.last_sender_id = 1000;
+                        keyboard_handler.on_peek_key(
+                            &mut ctx,
+                            serial,
+                            time,
+                            space,
+                            WL_KEY_RELEASED,
+                        );
+                    }
+                    DelayedEvent::KeysymPress => {
+                        ctx.last_sender_id = 140;
+                        text_input_handler.on_keysym(
+                            &mut ctx,
+                            serial,
+                            time,
+                            xkb::keysyms::KEY_space,
+                            WL_KEY_PRESSED,
+                            0,
+                        );
+                    }
+                    DelayedEvent::KeysymRelease => {
+                        ctx.last_sender_id = 140;
+                        text_input_handler.on_keysym(
+                            &mut ctx,
+                            serial,
+                            time,
+                            xkb::keysyms::KEY_space,
+                            WL_KEY_RELEASED,
+                            0,
+                        );
+                    }
+                }
+                assert_eq!(
+                    ctx.host_to_client_queue.len(),
+                    recovered_messages,
+                    "ordering {ordering_index}, event {event_index} duplicated recovery"
+                );
+                assert_eq!(
+                    ctx.guest_key_owner(HostId(100), space),
+                    Some(GuestKeyOwner::ImeRecovery)
+                );
+            }
+
+            // A new physical generation is the retirement boundary. Its
+            // keysym pair must be delivered normally.
+            ctx.last_sender_id = 1000;
+            keyboard_handler.on_peek_key(&mut ctx, 6, 600, space, WL_KEY_PRESSED);
+            assert!(ctx.guest_key_owner(HostId(100), space).is_none());
+            ctx.last_sender_id = 140;
+            text_input_handler.on_keysym(
+                &mut ctx,
+                7,
+                601,
+                xkb::keysyms::KEY_space,
+                WL_KEY_PRESSED,
+                0,
+            );
+            text_input_handler.on_keysym(
+                &mut ctx,
+                8,
+                602,
+                xkb::keysyms::KEY_space,
+                WL_KEY_RELEASED,
+                0,
+            );
+            assert_eq!(ctx.host_to_client_queue.len(), recovered_messages + 2);
+            assert!(ctx.guest_key_owner(HostId(100), space).is_none());
+        }
     }
 
     #[test]
@@ -2877,10 +3030,7 @@ mod tests {
 
         assert!(ctx.keyboard_pressed_keys[&HostId(100)].contains(&space));
         assert!(ctx.keyboard_peek_key_presses[&HostId(100)][&space].held);
-        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(100)));
-        assert!(!ctx
-            .keyboard_keysym_forwarded_keys
-            .contains_key(&HostId(100)));
+        assert!(ctx.guest_key_owner(HostId(100), space).is_none());
 
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = 2000;
@@ -2906,7 +3056,10 @@ mod tests {
         keyboard_handler.on_peek_key(&mut ctx, 4, 503, space, WL_KEY_RELEASED);
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(100)));
         assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(100)));
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(100), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
     }
 
     #[test]
@@ -2952,8 +3105,11 @@ mod tests {
         crate::handler::text_input::ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 1);
         assert_eq!(ctx.host_to_client_queue.len(), 3);
         assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 11);
-        assert!(ctx.keyboard_ime_suppressed_keys[&HostId(101)].contains(&space));
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(100)));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(101), space),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
+        assert!(ctx.guest_key_owner(HostId(100), space).is_none());
 
         let recovered_messages = ctx.host_to_client_queue.len();
         ctx.last_sender_id = 140;
@@ -3212,10 +3368,7 @@ mod tests {
             .entry(HostId(100))
             .or_default()
             .insert(EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(100))
-            .or_default()
-            .insert(EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(HostId(100), EVDEV_KEY_BACKSPACE, GuestKeyOwner::Physical));
         ctx.text_inputs
             .get_mut(&40)
             .unwrap()
@@ -3330,7 +3483,7 @@ mod tests {
             "wl_keyboard.enter keys must seed the physical held-key state"
         );
         assert!(
-            ctx.keyboard_forwarded_keys[&HostId(100)].contains(&EVDEV_KEY_BACKSPACE),
+            ctx.guest_key_owner(HostId(100), EVDEV_KEY_BACKSPACE) == Some(GuestKeyOwner::Physical),
             "keys announced to the guest in enter still require real releases"
         );
     }
@@ -3450,14 +3603,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        ctx.keyboard_ime_suppressed_keys
-            .entry(HostId(5))
-            .or_default()
-            .insert(EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_forwarded_keys
-            .entry(HostId(5))
-            .or_default()
-            .insert(EVDEV_KEY_BACKSPACE);
+        assert!(ctx.claim_guest_key(HostId(5), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
 
         assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
         assert!(!ctx.keyboard_pressed_keys.contains_key(&HostId(5)));
@@ -3465,8 +3611,9 @@ mod tests {
         assert!(!ctx.keyboard_peek_key_presses.contains_key(&HostId(5)));
         assert!(!ctx.keyboard_repeatable_keys.contains_key(&HostId(5)));
         assert!(!handler.modifiers.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(5)));
+        assert!(ctx
+            .guest_key_owner(HostId(5), EVDEV_KEY_BACKSPACE)
+            .is_none());
     }
 
     #[test]
@@ -3745,13 +3892,16 @@ mod tests {
             handler.on_key(&mut ctx, 1, 0, wl_key_a, WL_KEY_PRESSED),
             Action::Forward
         );
-        assert!(ctx.keyboard_forwarded_keys[&HostId(5)].contains(&wl_key_a));
+        assert_eq!(
+            ctx.guest_key_owner(HostId(5), wl_key_a),
+            Some(GuestKeyOwner::Physical)
+        );
 
         // A compositor may resend the keymap while the key remains held.
         ctx.last_sender_id = 5;
         load_test_keymap(&mut handler, &mut ctx);
         assert!(
-            ctx.keyboard_forwarded_keys[&HostId(5)].contains(&wl_key_a),
+            ctx.guest_key_owner(HostId(5), wl_key_a) == Some(GuestKeyOwner::Physical),
             "keymap replacement must retain the outstanding forwarded press"
         );
 
@@ -3760,10 +3910,7 @@ mod tests {
             Action::Forward,
             "the release matching a pre-reload press must still be forwarded"
         );
-        assert!(!ctx
-            .keyboard_forwarded_keys
-            .get(&HostId(5))
-            .is_some_and(|keys| keys.contains(&wl_key_a)));
+        assert!(ctx.guest_key_owner(HostId(5), wl_key_a).is_none());
     }
 
     /// Regression: on_release must reset modifiers to 0 so a re-bound keyboard
@@ -4439,12 +4586,7 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        ctx.keyboard_ime_suppressed_keys
-            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
-        ctx.keyboard_forwarded_keys
-            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
-        ctx.keyboard_keysym_forwarded_keys
-            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        assert!(ctx.claim_guest_key(HostId(10), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
         handler
             .dropped_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
@@ -4472,9 +4614,9 @@ mod tests {
             ctx.keyboard_repeatable_keys.contains_key(&HostId(10)),
             "focus teardown must preserve keymap-derived repeatability"
         );
-        assert!(!ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(10)));
-        assert!(!ctx.keyboard_forwarded_keys.contains_key(&HostId(10)));
-        assert!(!ctx.keyboard_keysym_forwarded_keys.contains_key(&HostId(10)));
+        assert!(ctx
+            .guest_key_owner(HostId(10), EVDEV_KEY_BACKSPACE)
+            .is_none());
         assert!(!handler.dropped_keys.contains_key(&HostId(10)));
         assert!(!handler.modifiers.contains_key(&HostId(10)));
     }
@@ -4584,8 +4726,7 @@ mod tests {
         ctx.keyboard_pressed_keys
             .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
         ctx.keyboard_backspace_repeat_cancelled.insert(HostId(10));
-        ctx.keyboard_ime_suppressed_keys
-            .insert(HostId(10), [EVDEV_KEY_BACKSPACE].into_iter().collect());
+        assert!(ctx.claim_guest_key(HostId(10), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
 
         ctx.last_sender_id = 10;
         assert_eq!(handler.on_leave(&mut ctx, 1, 999), Action::Forward);
@@ -4600,7 +4741,8 @@ mod tests {
             "stale keyboard A repeat marker must be retired"
         );
         assert!(
-            !ctx.keyboard_ime_suppressed_keys.contains_key(&HostId(10)),
+            ctx.guest_key_owner(HostId(10), EVDEV_KEY_BACKSPACE)
+                .is_none(),
             "stale keyboard A IME marker must be retired"
         );
         assert!(
