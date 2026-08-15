@@ -82,6 +82,18 @@ sha256sum -c SHA256SUMS --ignore-missing
 chmod +x sommelier_rs_virtwl-v0.2.2-aarch64
 ```
 
+### Install with Nix
+
+The repository flake defaults to the prebuilt release binary and supports
+x86_64 and aarch64 Linux:
+
+```bash
+nix profile install github:kkimdev/sommelier-rs/virtwl#sommelier-rs-bin
+```
+
+Use `#sommelier-rs` instead to build the current `virtwl` source with Nix.
+Both packages install a `sommelier-rs` executable.
+
 ### Start the proxy
 
 The last positional argument is the guest display socket to create. The
@@ -229,6 +241,7 @@ The fork currently keeps `virtwl` as its only development branch.
 ## Repository layout
 
 - `sommelier/` — proxy executable, protocol state, handlers, and VirtWL bridge.
+- `nix/` — source and prebuilt-release Nix packages exposed by `flake.nix`.
 - `wayland_codegen/` — build-time Wayland protocol code generator.
 - `sommelier_test_app/` — standalone GUI/IME test client.
 - `third_party/protocols/` — vendored Wayland and ChromeOS protocol XML.
