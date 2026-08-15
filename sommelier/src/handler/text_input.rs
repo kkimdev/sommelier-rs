@@ -191,42 +191,45 @@ pub(crate) fn backspace_repeat_active_for_keyboard(
     ctx: &Context,
     host_keyboard_id: HostId,
 ) -> bool {
-    let Some(guest_keyboard_id) = ctx.shadow_table.guest_id_of(host_keyboard_id) else {
-        return false;
-    };
-    let Some(&guest_seat) = ctx.keyboard_to_seat.get(&guest_keyboard_id.0) else {
-        return false;
-    };
-    !ctx.key_generations.backspace_repeat_cancelled(
+    ctx.key_generations.ime_repeat_active(
         host_keyboard_id,
         crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-    ) && ctx.key_generations.physically_held(
-        host_keyboard_id,
-        crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-    ) && ctx
-        .text_inputs
-        .values()
-        .any(|state| state.guest_seat == guest_seat && state.empty_preedit_repeat_active)
+    )
 }
 
-pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
+fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<HostId> {
+    keyboard_for_seat(ctx, guest_seat)
+        .map(|(_, host_keyboard_id)| host_keyboard_id)
+        .filter(|host_keyboard_id| {
+            !ctx.key_generations.backspace_repeat_cancelled(
+                *host_keyboard_id,
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            ) && ctx.key_generations.physically_held(
+                *host_keyboard_id,
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            )
+        })
+}
+
+#[cfg(test)]
+fn ime_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
     ctx.keyboard_to_seat
         .iter()
-        .any(|(&guest_keyboard_id, &seat)| {
-            seat == guest_seat
-                && ctx
-                    .shadow_table
-                    .host_id_of(GuestId(guest_keyboard_id))
-                    .is_some_and(|host_keyboard_id| {
-                        !ctx.key_generations.backspace_repeat_cancelled(
-                            host_keyboard_id,
-                            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-                        ) && ctx.key_generations.physically_held(
-                            host_keyboard_id,
-                            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-                        )
-                    })
+        .filter(|(_, seat)| **seat == guest_seat)
+        .filter_map(|(&guest_keyboard_id, _)| {
+            ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id))
         })
+        .any(|host_keyboard_id| {
+            ctx.key_generations.ime_repeat_active(
+                host_keyboard_id,
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            )
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
+    held_backspace_keyboard_for_seat(ctx, guest_seat).is_some()
 }
 
 fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, HostId)> {
@@ -582,26 +585,20 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let Some(state) = ctx.text_inputs.get(&guest_id) else {
             return Action::Drop;
         };
-        let guest_seat = state.guest_seat;
-        if !state.host_activated {
+        let Some(plan) = state.prepare_host_preedit() else {
             log::debug!(
                 "Ignoring stale preedit_string for inactive text input {}",
                 guest_id
             );
             return Action::Drop;
-        }
-        let pending_selection = state.pending_preedit_selection;
-        let pending_cursor = state.pending_preedit_cursor;
-        let had_preedit = !state.current_preedit.is_empty();
-        let done_serial = state.guest_commit_serial;
-        let backspace_held = backspace_pressed_for_seat(ctx, guest_seat);
-        let (cursor_begin, cursor_end) =
-            resolve_preedit_cursor(text, pending_selection, pending_cursor);
-        if serial != done_serial {
+        };
+        let repeat_keyboard = held_backspace_keyboard_for_seat(ctx, plan.guest_seat);
+        let (cursor_begin, cursor_end) = resolve_preedit_cursor(text, plan.selection, plan.cursor);
+        if serial != plan.done_serial {
             log::debug!(
                 "Host preedit references guest serial {}, current serial is {}",
                 serial,
-                done_serial
+                plan.done_serial
             );
         }
 
@@ -620,7 +617,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         // intermediate syllable. Apply the fallback only when the host
         // actually clears the preedit (notably on reset/unfocus).
         let mut transaction = Vec::new();
-        if had_preedit && text.is_empty() && !commit.is_empty() {
+        if plan.had_preedit && text.is_empty() && !commit.is_empty() {
             let mut builder = MessageBuilder::new();
             builder.write_string(commit);
             if !push_msg(&mut transaction, guest_id, 3, builder) {
@@ -634,7 +631,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         builder.write_i32(cursor_begin);
         builder.write_i32(cursor_end);
         if !push_msg(&mut transaction, guest_id, 2, builder)
-            || !push_done_to(&mut transaction, guest_id, done_serial)
+            || !push_done_to(&mut transaction, guest_id, plan.done_serial)
         {
             return Action::Drop;
         }
@@ -643,17 +640,24 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             .text_inputs
             .get_mut(&guest_id)
             .expect("active text input disappeared while encoding preedit");
-        state.pending_preedit_selection = None;
-        state.pending_preedit_cursor = None;
-        if text.is_empty() {
-            // A non-empty v1 `commit` replaces the old preedit during reset.
-            // That is a commit operation, not an IME-consumed Backspace, so it
-            // must never arm the synthetic repeat fallback.
-            state.empty_preedit_repeat_active = had_preedit && commit.is_empty() && backspace_held;
+        let guest_seat = plan.guest_seat;
+        let arm_backspace_repeat = state.finish_host_preedit(
+            plan,
+            text.clone(),
+            commit.is_empty(),
+            repeat_keyboard.is_some(),
+        );
+        if arm_backspace_repeat {
+            let host_keyboard_id = repeat_keyboard.expect("held Backspace was checked above");
+            let armed = ctx.key_generations.arm_ime_repeat(
+                host_keyboard_id,
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+                guest_id,
+            );
+            debug_assert!(armed, "held Backspace disappeared within one event");
         } else {
-            state.empty_preedit_repeat_active = false;
+            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         }
-        state.current_preedit = text.clone();
 
         // Exo allocates v1 event serials independently. text-input-v3 instead
         // requires the number of the latest guest commit request.
@@ -669,22 +673,18 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let Some(state) = ctx.text_inputs.get(&guest_id) else {
             return Action::Drop;
         };
-        if !state.host_activated {
+        let Some(plan) = state.prepare_host_commit() else {
             log::debug!(
                 "Ignoring stale commit_string for inactive text input {}",
                 guest_id
             );
             return Action::Drop;
-        }
-        let had_preedit = !state.current_preedit.is_empty();
-        let pending_deletes = state.pending_deletes.clone();
-        let pending_cursor_position = state.pending_cursor_position;
-        let done_serial = state.guest_commit_serial;
-        if serial != done_serial {
+        };
+        if serial != plan.done_serial {
             log::debug!(
                 "Host commit references guest serial {}, current serial is {}",
                 serial,
-                done_serial
+                plan.done_serial
             );
         }
 
@@ -696,7 +696,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         );
 
         let mut transaction = Vec::new();
-        if had_preedit {
+        if plan.had_preedit {
             let mut builder = MessageBuilder::new();
             builder.write_string("");
             builder.write_i32(0);
@@ -709,7 +709,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         // v1 requires delete_surrounding_text and cursor_position to be
         // applied as part of the following commit_string. Preserve that
         // transaction boundary when translating to v3.
-        for (before, after) in pending_deletes {
+        for &(before, after) in &plan.deletes {
             let mut builder = MessageBuilder::new();
             builder.write_u32(before);
             builder.write_u32(after);
@@ -721,7 +721,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let mut builder = MessageBuilder::new();
         builder.write_string(text);
         if !push_msg(&mut transaction, guest_id, 3, builder)
-            || !push_done_to(&mut transaction, guest_id, done_serial)
+            || !push_done_to(&mut transaction, guest_id, plan.done_serial)
         {
             return Action::Drop;
         }
@@ -730,16 +730,10 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             .text_inputs
             .get_mut(&guest_id)
             .expect("active text input disappeared while encoding commit");
-        state.pending_deletes.clear();
-        state.pending_cursor_position = None;
-        state.pending_preedit_cursor = None;
-        state.pending_preedit_selection = None;
-        state.current_preedit.clear();
-        // A v1 commit event completes the host transaction even when the
-        // committed string is empty. Do not carry a prior empty-preedit
-        // confirmation into a later transaction and synthesize Backspace
-        // without a currently held physical key.
-        state.empty_preedit_repeat_active = false;
+        let pending_cursor_position = plan.cursor_position;
+        let guest_seat = plan.guest_seat;
+        state.finish_host_commit(plan);
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
 
         if let Some((index, anchor)) = pending_cursor_position {
             // text-input-v3 has no cursor-position event. The commit still
@@ -914,7 +908,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             let host_id = ctx.last_sender_id;
             if let Some(guest_id) = active_guest_for_host_text_input(ctx, host_id) {
                 if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                    state.pending_preedit_selection = Some((index, length));
+                    state.record_preedit_selection(index, length);
                 }
             }
         }
@@ -926,7 +920,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let host_id = ctx.last_sender_id;
         if let Some(guest_id) = active_guest_for_host_text_input(ctx, host_id) {
             if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                state.pending_preedit_cursor = Some(index);
+                state.record_preedit_cursor(index);
             }
         }
         Action::Drop
@@ -937,7 +931,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         let host_id = ctx.last_sender_id;
         if let Some(guest_id) = active_guest_for_host_text_input(ctx, host_id) {
             if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                state.pending_cursor_position = Some((index, anchor));
+                state.record_cursor_position(index, anchor);
             }
         }
         Action::Drop
@@ -962,7 +956,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 .expect("active text input disappeared while handling host event");
             // Per text-input-v1 this event is part of the following
             // commit_string, not a standalone edit.
-            state.pending_deletes.push(delete);
+            if !state.record_delete(delete.0, delete.1) {
+                log::warn!("Ignoring text-input delete beyond the pending transaction limit");
+            }
         } else {
             log::warn!(
                 "Ignoring unrepresentable v1 delete range: index={}, length={}",
@@ -1023,20 +1019,16 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         else {
             return Action::Drop;
         };
-        if !state.host_activated {
-            return Action::Drop;
-        }
-
-        let Some((text, cursor, _anchor)) = state.committed_surrounding_text.as_ref() else {
+        let Some(plan) = state.prepare_preedit_region() else {
             log::warn!(
-                "on_set_preedit_region: no surrounding text available for host_ext_id={}",
+                "on_set_preedit_region: inactive input or no surrounding text for host_ext_id={}",
                 host_ext_id
             );
             return Action::Drop;
         };
 
-        let done_serial = state.guest_commit_serial;
-        let cursor_i64 = *cursor as i64;
+        let text = &plan.surrounding_text;
+        let cursor_i64 = plan.surrounding_cursor as i64;
         let index_i64 = index as i64;
         let start_idx = cursor_i64 + index_i64;
         let length_i64 = length as i64;
@@ -1070,10 +1062,9 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             0
         };
         let default_cursor = (cursor_i64 - start_idx) as i32;
-        let pending_selection = state.pending_preedit_selection;
-        let pending_cursor = state.pending_preedit_cursor.or(Some(default_cursor));
+        let pending_cursor = plan.cursor.or(Some(default_cursor));
         let (cursor_begin, cursor_end) =
-            resolve_preedit_cursor(&preedit_text, pending_selection, pending_cursor);
+            resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
         let mut transaction = Vec::new();
         let mut builder = MessageBuilder::new();
@@ -1088,7 +1079,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         builder.write_i32(cursor_begin);
         builder.write_i32(cursor_end);
         if !push_msg(&mut transaction, guest_id, 2, builder)
-            || !push_done_to(&mut transaction, guest_id, done_serial)
+            || !push_done_to(&mut transaction, guest_id, plan.done_serial)
         {
             return Action::Drop;
         }
@@ -1097,13 +1088,9 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .text_inputs
             .get_mut(&guest_id)
             .expect("active text input disappeared while installing preedit region");
-        state.pending_preedit_selection = None;
-        state.pending_preedit_cursor = None;
-        state.current_preedit = preedit_text;
-        // Installing a fresh preedit completes any prior empty-confirm
-        // transaction. Do not let its held-Backspace fallback survive into
-        // this new composition.
-        state.empty_preedit_repeat_active = false;
+        let guest_seat = plan.guest_seat;
+        state.finish_preedit_region(plan, preedit_text);
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
 
         Action::Drop
@@ -1174,40 +1161,38 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let Some(state) = ctx.text_inputs.get(&guest_id) else {
             return Action::Drop;
         };
-        if !state.host_activated {
+        let Some(plan) = state.prepare_confirm_preedit() else {
             return Action::Drop;
-        }
-        let guest_seat = state.guest_seat;
-        let preedit_text = state.current_preedit.clone();
-        let done_serial = state.guest_commit_serial;
-        if preedit_text.is_empty() {
-            if let Some(held) = held_repeat_key_for_seat(ctx, guest_seat) {
+        };
+        if plan.preedit_text.is_empty() {
+            if let Some(held) = held_repeat_key_for_seat(ctx, plan.guest_seat) {
                 let backspace_repeat = held.key == crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-                ctx.text_inputs
-                    .get_mut(&guest_id)
-                    .expect("text input disappeared while confirming preedit")
-                    .empty_preedit_repeat_active = backspace_repeat;
                 if synthesize_ime_consumed_key_pair(ctx, held) {
+                    if backspace_repeat {
+                        let armed = ctx.key_generations.arm_ime_repeat(
+                            held.host_keyboard_id,
+                            held.key,
+                            guest_id,
+                        );
+                        debug_assert!(armed, "recovered held key disappeared within one event");
+                    } else {
+                        end_backspace_repeat_for_text_input(ctx, plan.guest_seat, guest_id);
+                    }
                     log::debug!(
                         "Recovered empty IME confirmation as held key {} press/release",
                         held.key
                     );
                 } else if backspace_repeat {
-                    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                        state.empty_preedit_repeat_active = false;
-                    }
+                    end_backspace_repeat_for_text_input(ctx, plan.guest_seat, guest_id);
                 }
                 // GTK waits for the matching text-input transaction to finish
                 // before applying a key that passed through the active IME.
                 // A v1 confirm with no preedit has no text mutation, so its v3
                 // equivalent is an empty done.
-                push_done(ctx, guest_id, done_serial);
+                push_done(ctx, guest_id, plan.done_serial);
                 return Action::Drop;
             }
-            ctx.text_inputs
-                .get_mut(&guest_id)
-                .expect("text input disappeared while confirming preedit")
-                .empty_preedit_repeat_active = false;
+            end_backspace_repeat_for_text_input(ctx, plan.guest_seat, guest_id);
             log::debug!(
                 "Ignoring confirm_preedit without an active preedit for guest {}",
                 guest_id
@@ -1216,13 +1201,13 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         }
         log::debug!(
             "  -> committing cached preedit={:?}, guest_id={}",
-            preedit_text,
+            plan.preedit_text,
             guest_id
         );
         log::debug!(
             "  -> sending v3 preedit_string(\"\") + commit_string({:?}) + done({})",
-            preedit_text,
-            done_serial
+            plan.preedit_text,
+            plan.done_serial
         );
         let mut transaction = Vec::new();
         let mut builder = MessageBuilder::new();
@@ -1234,9 +1219,9 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         }
 
         let mut builder = MessageBuilder::new();
-        builder.write_string(&preedit_text);
+        builder.write_string(&plan.preedit_text);
         if !push_msg(&mut transaction, guest_id, 3, builder)
-            || !push_done_to(&mut transaction, guest_id, done_serial)
+            || !push_done_to(&mut transaction, guest_id, plan.done_serial)
         {
             return Action::Drop;
         }
@@ -1245,8 +1230,9 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .text_inputs
             .get_mut(&guest_id)
             .expect("active text input disappeared while confirming preedit");
-        state.current_preedit.clear();
-        state.empty_preedit_repeat_active = false;
+        let guest_seat = plan.guest_seat;
+        state.finish_confirm_preedit(plan);
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
         Action::Drop
     }
@@ -1312,33 +1298,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
 
         ctx.text_inputs.insert(
             id,
-            crate::state::TextInputState {
-                host_v1_id,
-                host_ext_id,
-                guest_seat: seat,
-                active_surface,
-                pending_enabled: false,
-                committed_enabled: false,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: 0,
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
-                host_activated: false,
-            },
+            crate::state::TextInputState::new(host_v1_id, host_ext_id, seat, active_surface),
         );
 
         // A text-input object created after keyboard focus was established
@@ -1528,34 +1488,6 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     }
 }
 
-/// Invalidate all text-input-v3 state when keyboard focus leaves or enters.
-///
-/// The protocol requires clients to resend enable and editor state after a
-/// new `enter`. Keep the commit counter and host activation marker intact:
-/// the latter lets `update_host_activation` emit the required v1 deactivate
-/// transition after this reset.
-pub(crate) fn invalidate_for_keyboard_focus(state: &mut crate::state::TextInputState) {
-    state.pending_enabled = false;
-    state.committed_enabled = false;
-    state.enabled_dirty = false;
-    state.pending_surrounding_text = None;
-    state.committed_surrounding_text = None;
-    state.surrounding_text_dirty = false;
-    state.content_hint = 0;
-    state.content_purpose = 0;
-    state.committed_content_type = None;
-    state.content_type_dirty = false;
-    state.cursor_rect = None;
-    state.cursor_rect_dirty = false;
-    state.text_change_cause = 0;
-    state.current_preedit.clear();
-    state.pending_preedit_cursor = None;
-    state.pending_preedit_selection = None;
-    state.pending_deletes.clear();
-    state.pending_cursor_position = None;
-    state.empty_preedit_repeat_active = false;
-}
-
 /// Project authoritative seat focus changes onto every text-input object.
 ///
 /// Keeping seat-wide repeat teardown here and delegating per-object mutation
@@ -1614,9 +1546,7 @@ fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32
             continue;
         };
 
-        let previous_surface = state.active_surface;
-        invalidate_for_keyboard_focus(state);
-        state.active_surface = current_surface;
+        let previous_surface = state.apply_focus(current_surface);
 
         // A stale local projection can already equal the authoritative target
         // even though the seat crossed a real focus boundary. Always
@@ -1668,15 +1598,34 @@ pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) 
     // next empty confirm_preedit in the same held-key session would synthesize
     // another Backspace after the fallback was explicitly stopped.
     for host_keyboard_id in host_keyboards {
-        ctx.key_generations.cancel_backspace_repeat(
+        if ctx.key_generations.ime_repeat_active(
             host_keyboard_id,
             crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-        );
-    }
-    for state in ctx.text_inputs.values_mut() {
-        if state.guest_seat == guest_seat {
-            state.empty_preedit_repeat_active = false;
+        ) {
+            ctx.key_generations.cancel_backspace_repeat(
+                host_keyboard_id,
+                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            );
         }
+    }
+}
+
+fn end_backspace_repeat_for_text_input(ctx: &mut Context, guest_seat: u32, guest_text_input: u32) {
+    let host_keyboards: Vec<_> = ctx
+        .keyboard_to_seat
+        .iter()
+        .filter_map(|(&guest_keyboard_id, &seat)| {
+            (seat == guest_seat)
+                .then(|| ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id)))
+                .flatten()
+        })
+        .collect();
+    for host_keyboard_id in host_keyboards {
+        ctx.key_generations.cancel_backspace_repeat_for_owner(
+            host_keyboard_id,
+            crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
+            guest_text_input,
+        );
     }
 }
 
@@ -1687,9 +1636,12 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // Destruction is the final disabled transition. Route it through the
         // same activation reconciler as commit/focus changes so parent-seat
         // lifetime validation cannot drift between teardown paths.
+        let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.committed_enabled = false;
-            state.active_surface = None;
+            state.begin_destroy();
+        }
+        if let Some(guest_seat) = guest_seat {
+            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         }
         update_host_activation(ctx, guest_id);
 
@@ -1737,19 +1689,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         }
         log::info!(">>> v3 on_enable: guest_id={}", guest_id);
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            // v3 enable resets all client state. Later requests in the same
-            // transaction repopulate these pending values before commit.
-            state.pending_enabled = true;
-            state.enabled_dirty = true;
-            state.pending_surrounding_text = None;
-            state.surrounding_text_dirty = true;
-            state.content_hint = 0;
-            state.content_purpose = 0;
-            state.committed_content_type = None;
-            state.content_type_dirty = true;
-            state.cursor_rect = None;
-            state.cursor_rect_dirty = true;
-            state.text_change_cause = 0;
+            state.begin_enabled_transaction(true);
         }
         Action::Drop
     }
@@ -1761,17 +1701,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         }
         log::info!(">>> v3 on_disable: guest_id={}", guest_id);
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.pending_enabled = false;
-            state.enabled_dirty = true;
-            state.pending_surrounding_text = None;
-            state.surrounding_text_dirty = true;
-            state.content_hint = 0;
-            state.content_purpose = 0;
-            state.committed_content_type = None;
-            state.content_type_dirty = true;
-            state.cursor_rect = None;
-            state.cursor_rect_dirty = true;
-            state.text_change_cause = 0;
+            state.begin_enabled_transaction(false);
         }
         Action::Drop
     }
@@ -1810,8 +1740,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             return Action::Drop;
         }
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.pending_surrounding_text = Some((text.clone(), cursor, anchor));
-            state.surrounding_text_dirty = true;
+            state.set_surrounding_text(text.clone(), cursor, anchor);
         }
         Action::Drop
     }
@@ -1827,7 +1756,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             cause
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.text_change_cause = cause;
+            state.set_text_change_cause(cause);
         }
         Action::Drop
     }
@@ -1844,9 +1773,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             purpose
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.content_hint = hint;
-            state.content_purpose = purpose;
-            state.content_type_dirty = state.committed_content_type != Some((hint, purpose));
+            state.set_content_type(hint, purpose);
         }
         Action::Drop
     }
@@ -1872,8 +1799,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             height
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.cursor_rect = Some((x, y, width, height));
-            state.cursor_rect_dirty = true;
+            state.set_cursor_rect((x, y, width, height));
         }
         Action::Drop
     }
@@ -1892,34 +1818,19 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                         && other.committed_enabled
                 })
         });
-        let Some(state) = ctx.text_inputs.get(&guest_id) else {
+        let Some(plan) = ctx
+            .text_inputs
+            .get(&guest_id)
+            .map(|state| state.prepare_guest_commit(enable_conflict))
+        else {
             return Action::Drop;
         };
-        let reset_state = state.enabled_dirty;
-        let committed_enabled = if reset_state && !enable_conflict {
-            state.pending_enabled
-        } else {
-            state.committed_enabled
-        };
-        let commit_serial = state.guest_commit_serial.wrapping_add(1);
-        let host_v1_id = state.host_v1_id;
-        let host_ext_id = state.host_ext_id;
-        let surrounding_text_dirty = state.surrounding_text_dirty;
-        let committed_surrounding_text = if surrounding_text_dirty {
-            state.pending_surrounding_text.clone()
-        } else {
-            state.committed_surrounding_text.clone()
-        };
-        let content_type_dirty = state.content_type_dirty;
-        let content_type = (state.content_hint, state.content_purpose);
-        let cursor_rect_dirty = state.cursor_rect_dirty;
-        let cursor_rect = state.cursor_rect.unwrap_or((0, 0, 0, 0));
         log::trace!(
             ">>> v3 on_commit: guest_id={}, serial={}, enabled={}, host_v1_id={}",
             guest_id,
-            commit_serial,
-            committed_enabled,
-            host_v1_id
+            plan.serial,
+            plan.enabled,
+            plan.host_v1_id
         );
 
         // Construct the complete v1 transaction before publishing any part of
@@ -1927,8 +1838,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // unencodable variable-size field from leaving Exo and the bridge on
         // different committed editor states.
         let mut transaction = Vec::new();
-        if surrounding_text_dirty {
-            if let Some((text, cursor, anchor)) = &committed_surrounding_text {
+        if let Some(surrounding_text) = &plan.surrounding_text {
+            if let Some((text, cursor, anchor)) = surrounding_text {
                 log::debug!(
                     "  -> sending v1 set_surrounding_text({:?}, cursor={}, anchor={})",
                     text,
@@ -1940,7 +1851,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 builder.write_string(text);
                 builder.write_u32(*cursor as u32);
                 builder.write_u32(*anchor as u32);
-                if !push_msg(&mut transaction, host_v1_id, 5, builder) {
+                if !push_msg(&mut transaction, plan.host_v1_id, 5, builder) {
                     return Action::Drop;
                 }
             } else {
@@ -1953,18 +1864,17 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 builder.write_string("");
                 builder.write_u32(0);
                 builder.write_u32(0);
-                if !push_msg(&mut transaction, host_v1_id, 5, builder) {
+                if !push_msg(&mut transaction, plan.host_v1_id, 5, builder) {
                     return Action::Drop;
                 }
             }
         }
 
-        if content_type_dirty {
-            let (hint, purpose) = content_type;
+        if let Some((hint, purpose)) = plan.content_type {
             let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
                 map_v3_content_type(hint, purpose);
 
-            if let Some(host_ext_id) = host_ext_id {
+            if let Some(host_ext_id) = plan.host_ext_id {
                 let host_ext_version = ctx
                     .shadow_table
                     .host_object_version(host_ext_id)
@@ -1973,7 +1883,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                     // This request applies to the following content-type
                     // request, so keep both in the same transaction.
                     let mut builder = MessageBuilder::new();
-                    builder.write_u32(u32::from(committed_surrounding_text.is_some()));
+                    builder.write_u32(u32::from(plan.has_surrounding_text));
                     if !push_msg(&mut transaction, host_ext_id, 7, builder) {
                         return Action::Drop;
                     }
@@ -1984,11 +1894,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             let mut builder = MessageBuilder::new();
             builder.write_u32(v1_hint);
             builder.write_u32(v1_purpose);
-            if !push_msg(&mut transaction, host_v1_id, 6, builder) {
+            if !push_msg(&mut transaction, plan.host_v1_id, 6, builder) {
                 return Action::Drop;
             }
 
-            if let Some(host_ext_id) = host_ext_id {
+            if let Some(host_ext_id) = plan.host_ext_id {
                 let mut builder = MessageBuilder::new();
                 builder.write_u32(input_type);
                 builder.write_u32(input_mode);
@@ -2018,8 +1928,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             }
         }
 
-        if cursor_rect_dirty {
-            let (x, y, w, h) = cursor_rect;
+        if let Some((x, y, w, h)) = plan.cursor_rect {
             log::debug!(
                 "  -> sending v1 set_cursor_rectangle({}, {}, {}, {})",
                 x,
@@ -2033,57 +1942,36 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             builder.write_i32(y);
             builder.write_i32(w);
             builder.write_i32(h);
-            if !push_msg(&mut transaction, host_v1_id, 7, builder) {
+            if !push_msg(&mut transaction, plan.host_v1_id, 7, builder) {
                 return Action::Drop;
             }
         }
 
-        log::debug!("  -> sending v1 commit_state(serial={})", commit_serial);
+        log::debug!("  -> sending v1 commit_state(serial={})", plan.serial);
         // commit_state: opcode 9
         let mut builder = MessageBuilder::new();
-        builder.write_u32(commit_serial);
-        if !push_msg(&mut transaction, host_v1_id, 9, builder) {
+        builder.write_u32(plan.serial);
+        if !push_msg(&mut transaction, plan.host_v1_id, 9, builder) {
             return Action::Drop;
         }
 
-        if enable_conflict {
+        if plan.enable_conflict {
             log::warn!(
                 "Ignoring text-input enable for guest {}: another input is enabled on seat {}",
                 guest_id,
-                state.guest_seat
+                plan.guest_seat
             );
         }
         let state = ctx
             .text_inputs
             .get_mut(&guest_id)
             .expect("focused text input disappeared while committing state");
-        state.guest_commit_serial = commit_serial;
-        if reset_state {
-            if enable_conflict {
-                state.pending_enabled = state.committed_enabled;
-            } else {
-                state.committed_enabled = state.pending_enabled;
-            }
-            state.enabled_dirty = false;
-            state.current_preedit.clear();
-            state.pending_preedit_cursor = None;
-            state.pending_preedit_selection = None;
-            state.pending_deletes.clear();
-            state.pending_cursor_position = None;
-            state.empty_preedit_repeat_active = false;
+        let end_repeat = plan.resets_composition;
+        let guest_seat = plan.guest_seat;
+        state.finish_guest_commit(plan);
+        if end_repeat {
+            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         }
-        if surrounding_text_dirty {
-            state.surrounding_text_dirty = false;
-            state.committed_surrounding_text = committed_surrounding_text;
-        }
-        if content_type_dirty {
-            state.content_type_dirty = false;
-            state.committed_content_type = Some(content_type);
-        }
-        if cursor_rect_dirty {
-            state.cursor_rect_dirty = false;
-        }
-        state.text_change_cause = 0;
 
         update_host_activation(ctx, guest_id);
         ctx.client_to_host_queue.extend(transaction);
@@ -2154,10 +2042,12 @@ mod tests {
             Action::Drop
         );
         assert_eq!(handler.on_set_content_type(&mut ctx, 0, 13), Action::Drop);
+        let before = ctx.text_inputs[&guest_id].clone();
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.client_to_host_queue.is_empty());
         let state = &ctx.text_inputs[&guest_id];
+        assert_eq!(state, &before);
         assert_eq!(state.guest_commit_serial, 0);
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.surrounding_text_dirty);
@@ -2210,7 +2100,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
@@ -2247,6 +2136,48 @@ mod tests {
             .entry(host_keyboard_id)
             .or_default()
             .insert(key);
+    }
+
+    fn arm_backspace_repeat_for_test(
+        ctx: &mut Context,
+        guest_keyboard_id: u32,
+        host_keyboard_id: HostId,
+        guest_text_input: u32,
+    ) {
+        let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+        ctx.shadow_table
+            .map_id(guest_keyboard_id, host_keyboard_id.0);
+        ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
+        ctx.key_generations
+            .observe_physical_state(host_keyboard_id, backspace, 1);
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(host_keyboard_id, backspace, guest_text_input));
+    }
+
+    #[test]
+    fn ending_one_keyboard_repeat_does_not_cancel_another_held_keyboard() {
+        let (mut ctx, _, _) = setup_v1_ctx();
+        let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
+        for (guest_keyboard, host_keyboard) in [(40, 41), (42, 43)] {
+            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            ctx.keyboard_to_seat.insert(guest_keyboard, 0);
+            ctx.key_generations
+                .observe_physical_state(HostId(host_keyboard), backspace, 1);
+        }
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(41), backspace, 40));
+
+        end_backspace_repeat_for_seat(&mut ctx, 0);
+
+        assert!(ctx
+            .key_generations
+            .backspace_repeat_cancelled(HostId(41), backspace));
+        assert!(!ctx
+            .key_generations
+            .backspace_repeat_cancelled(HostId(43), backspace));
+        assert!(ctx.key_generations.physically_held(HostId(43), backspace));
     }
 
     fn extension_opcodes_for_version(version: Option<u32>) -> Vec<u16> {
@@ -2317,10 +2248,7 @@ mod tests {
         let commit_len =
             u32::from_ne_bytes(commit_payload[0..4].try_into().expect("commit length")) as usize;
         assert_eq!(&commit_payload[4..4 + commit_len - 1], "확정".as_bytes());
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "committing a reset preedit must not trigger Backspace repeat"
-        );
+        assert!(!ime_repeat_active_for_seat(&ctx, 0));
     }
 
     #[test]
@@ -2352,8 +2280,8 @@ mod tests {
             state.current_preedit = "old".to_string();
             state.pending_preedit_cursor = Some(1);
             state.pending_preedit_selection = Some((0, 1));
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         let oversized = "x".repeat(65_528);
         assert_eq!(
@@ -2366,7 +2294,7 @@ mod tests {
         assert_eq!(state.current_preedit, "old");
         assert_eq!(state.pending_preedit_cursor, Some(1));
         assert_eq!(state.pending_preedit_selection, Some((0, 1)));
-        assert!(state.empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2380,8 +2308,8 @@ mod tests {
             state.pending_cursor_position = Some((1, 1));
             state.pending_preedit_cursor = Some(1);
             state.pending_preedit_selection = Some((0, 1));
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         let oversized = "x".repeat(65_528);
         assert_eq!(
@@ -2396,7 +2324,7 @@ mod tests {
         assert_eq!(state.pending_cursor_position, Some((1, 1)));
         assert_eq!(state.pending_preedit_cursor, Some(1));
         assert_eq!(state.pending_preedit_selection, Some((0, 1)));
-        assert!(state.empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2484,20 +2412,14 @@ mod tests {
     fn empty_commit_clears_stale_backspace_repeat_state() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = host_v1_id;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("text input")
-            .empty_preedit_repeat_active = true;
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         let mut handler = TextInputV1Handler;
         assert_eq!(
             handler.on_commit_string(&mut ctx, 1, &String::new()),
             Action::Drop
         );
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "an empty commit must finish the old transaction"
-        );
+        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2653,15 +2575,12 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.committed_surrounding_text = Some(("가나다".to_string(), 9, 9));
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         let mut handler = ExtendedTextInputV1Handler;
         assert_eq!(handler.on_set_preedit_region(&mut ctx, -3, 3), Action::Drop);
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "a newly installed preedit must not inherit an old empty-confirm repeat"
-        );
+        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2675,8 +2594,8 @@ mod tests {
             state.pending_preedit_cursor = Some(7);
             state.pending_preedit_selection = Some((1, 2));
             state.current_preedit = "old".to_string();
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         assert_eq!(
             ExtendedTextInputV1Handler.on_set_preedit_region(&mut ctx, -65_528, 65_528),
@@ -2688,7 +2607,7 @@ mod tests {
         assert_eq!(state.pending_preedit_cursor, Some(7));
         assert_eq!(state.pending_preedit_selection, Some((1, 2)));
         assert_eq!(state.current_preedit, "old");
-        assert!(state.empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2715,6 +2634,10 @@ mod tests {
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.current_preedit = "나".to_string();
             state.guest_commit_serial = 42;
+            state.record_preedit_selection(0, 3);
+            state.record_preedit_cursor(3);
+            assert!(state.record_delete(3, 0));
+            state.record_cursor_position(1, 1);
         }
 
         let mut handler = ExtendedTextInputV1Handler;
@@ -2738,12 +2661,27 @@ mod tests {
         assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
         assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
 
-        // Cached preedit should be cleared
+        // Confirming commits only the preedit. v1 delete/cursor metadata
+        // belongs to the following commit_string transaction.
         if let Some(state) = ctx.text_inputs.get(&guest_id) {
             assert_eq!(state.current_preedit, "");
+            assert!(state.pending_preedit_selection.is_none());
+            assert!(state.pending_preedit_cursor.is_none());
+            assert_eq!(state.pending_deletes, vec![(3, 0)]);
+            assert_eq!(state.pending_cursor_position, Some((1, 1)));
         } else {
             panic!("state not found");
         }
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 10;
+        assert_eq!(
+            TextInputV1Handler.on_commit_string(&mut ctx, 42, &"다".to_string()),
+            Action::Drop
+        );
+        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
+        assert!(ctx.text_inputs[&guest_id].pending_deletes.is_empty());
+        assert!(ctx.text_inputs[&guest_id].pending_cursor_position.is_none());
     }
 
     #[test]
@@ -2753,8 +2691,8 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.current_preedit = "x".repeat(65_528);
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         assert_eq!(
             ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 0),
@@ -2764,7 +2702,7 @@ mod tests {
         assert!(ctx.host_to_client_queue.is_empty());
         let state = &ctx.text_inputs[&guest_id];
         assert_eq!(state.current_preedit.len(), 65_528);
-        assert!(state.empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]
@@ -2827,8 +2765,8 @@ mod tests {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.committed_surrounding_text = Some(("english".to_string(), 7, 7));
             state.pending_surrounding_text = state.committed_surrounding_text.clone();
-            state.empty_preedit_repeat_active = true;
         }
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
         end_backspace_repeat_for_seat(&mut ctx, 0);
         ctx.last_sender_id = 30;
         let mut handler = ExtendedTextInputV1Handler;
@@ -2868,7 +2806,10 @@ mod tests {
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 9);
-        assert!(ctx.text_inputs[&guest_id].empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(
+            &ctx,
+            HostId(host_keyboard_id)
+        ));
         let mut key_serials = Vec::new();
         for messages in ctx.host_to_client_queue.chunks_exact(3) {
             assert_eq!(msg_sender(messages, 0), 40);
@@ -3109,7 +3050,10 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
         let mut v1_handler = TextInputV1Handler;
         v1_handler.on_preedit_string(&mut ctx, 1, &String::new(), &String::new());
-        assert!(ctx.text_inputs[&guest_id].empty_preedit_repeat_active);
+        assert!(backspace_repeat_active_for_keyboard(
+            &ctx,
+            HostId(host_keyboard_id)
+        ));
 
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = 30;
@@ -3121,20 +3065,16 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
         assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 5);
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "the duplicate fallback must be disarmed when the physical press owns the edit"
-        );
+        assert!(!backspace_repeat_active_for_keyboard(
+            &ctx,
+            HostId(host_keyboard_id)
+        ));
     }
 
     #[test]
     fn held_backspace_fallback_requires_guest_keyboard_for_seat() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
+        let (mut ctx, _, _) = setup_v1_ctx();
         ctx.last_sender_id = 30;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
         let mut handler = ExtendedTextInputV1Handler;
 
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
@@ -3462,7 +3402,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: false,
             },
         );
@@ -3471,6 +3410,7 @@ mod tests {
         ctx.last_sender_id = first_id;
         handler.on_enable(&mut ctx);
         handler.on_commit(&mut ctx);
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), first_id);
         ctx.last_sender_id = second_id;
         handler.on_enable(&mut ctx);
         handler.on_commit(&mut ctx);
@@ -3479,6 +3419,12 @@ mod tests {
         assert!(ctx.text_inputs[&first_id].host_activated);
         assert!(!ctx.text_inputs[&second_id].committed_enabled);
         assert!(!ctx.text_inputs[&second_id].host_activated);
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(41), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+            Some(first_id),
+            "a rejected sibling enable must not cancel the active input's repeat lease"
+        );
         assert!(!ctx.client_to_host_queue.iter().any(|message| {
             msg_sender(std::slice::from_ref(message), 0) == 11
                 && msg_opcode(std::slice::from_ref(message), 0) == 0
@@ -3587,7 +3533,8 @@ mod tests {
         }
 
         let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-        invalidate_for_keyboard_focus(state);
+        let active_surface = state.active_surface;
+        assert_eq!(state.apply_focus(active_surface), active_surface);
 
         assert_eq!(state.guest_commit_serial, 17);
         assert!(state.host_activated);
@@ -3852,6 +3799,27 @@ mod tests {
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
             guest_id
+        );
+    }
+
+    #[test]
+    fn destroying_inactive_sibling_preserves_active_repeat_lease() {
+        let (mut ctx, _, active_id) = setup_v1_ctx();
+        let sibling_id = 21;
+        ctx.shadow_table.map_id(sibling_id, 11);
+        ctx.text_inputs.insert(
+            sibling_id,
+            crate::state::TextInputState::new(11, None, 0, Some(900)),
+        );
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), active_id);
+
+        ctx.last_sender_id = sibling_id;
+        assert_eq!(TextInputV3Handler.on_destroy(&mut ctx), Action::Drop);
+
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(41), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+            Some(active_id)
         );
     }
 
@@ -5090,10 +5058,7 @@ mod tests {
             v1_handler.on_preedit_string(&mut ctx, 1, &String::new(), &String::new()),
             Action::Drop
         );
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "an empty preedit without a physical Backspace must not arm fallback"
-        );
+        assert!(!ime_repeat_active_for_seat(&ctx, 0));
 
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = 30;
@@ -5164,15 +5129,11 @@ mod tests {
 
     #[test]
     fn held_backspace_fallback_rejects_unmapped_guest_keyboard() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
+        let (mut ctx, _, _) = setup_v1_ctx();
         // A stale route can survive a malformed/reordered bind, but without a
         // host keyboard there is no physical key or compositor time domain from
         // which a synthetic pair may safely be generated.
         ctx.keyboard_to_seat.insert(40, 0);
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
         ctx.last_sender_id = 30;
 
         let mut handler = ExtendedTextInputV1Handler;
@@ -5188,16 +5149,13 @@ mod tests {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
         state.current_preedit = "가".to_string();
-        state.empty_preedit_repeat_active = true;
+        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
         ctx.last_sender_id = host_v1_id;
 
         let mut handler = TextInputV1Handler;
         handler.on_preedit_string(&mut ctx, 1, &String::new(), &"확정".to_string());
 
-        assert!(
-            !ctx.text_inputs[&guest_id].empty_preedit_repeat_active,
-            "a non-empty commit must not leave the synthetic repeat armed"
-        );
+        assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 
     #[test]

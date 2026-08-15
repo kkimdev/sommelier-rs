@@ -18,6 +18,9 @@ use std::collections::HashMap;
 
 use super::{serial_is_after, HostId};
 
+const MAX_PENDING_IME_DELETES: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
     pub host_ext_id: Option<u32>,
@@ -57,11 +60,356 @@ pub struct TextInputState {
     /// `commit_string` event.
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
-    /// The proxy has entered the IME-consumed Backspace repeat path. This can
-    /// be armed by physical key state or by a non-empty-to-empty preedit
-    /// transition when Exo consumes the key event entirely.
-    pub empty_preedit_repeat_active: bool,
     pub host_activated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuestCommitPlan {
+    pub host_v1_id: u32,
+    pub host_ext_id: Option<u32>,
+    pub guest_seat: u32,
+    pub serial: u32,
+    pub enabled: bool,
+    pub enable_conflict: bool,
+    pub resets_composition: bool,
+    pub surrounding_text: Option<Option<(String, i32, i32)>>,
+    pub has_surrounding_text: bool,
+    pub content_type: Option<(u32, u32)>,
+    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostPreeditPlan {
+    pub guest_seat: u32,
+    pub done_serial: u32,
+    pub had_preedit: bool,
+    pub selection: Option<(u32, u32)>,
+    pub cursor: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostCommitPlan {
+    pub guest_seat: u32,
+    pub done_serial: u32,
+    pub had_preedit: bool,
+    pub deletes: Vec<(u32, u32)>,
+    pub cursor_position: Option<(i32, i32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreeditRegionPlan {
+    pub guest_seat: u32,
+    pub surrounding_text: String,
+    pub surrounding_cursor: i32,
+    pub done_serial: u32,
+    pub selection: Option<(u32, u32)>,
+    pub cursor: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfirmPreeditPlan {
+    pub guest_seat: u32,
+    pub done_serial: u32,
+    pub preedit_text: String,
+}
+
+impl TextInputState {
+    pub fn new(
+        host_v1_id: u32,
+        host_ext_id: Option<u32>,
+        guest_seat: u32,
+        active_surface: Option<u32>,
+    ) -> Self {
+        Self {
+            host_v1_id,
+            host_ext_id,
+            guest_seat,
+            active_surface,
+            pending_enabled: false,
+            committed_enabled: false,
+            enabled_dirty: false,
+            pending_surrounding_text: None,
+            committed_surrounding_text: None,
+            surrounding_text_dirty: false,
+            content_hint: 0,
+            content_purpose: 0,
+            committed_content_type: None,
+            content_type_dirty: false,
+            cursor_rect: None,
+            cursor_rect_dirty: false,
+            text_change_cause: 0,
+            current_preedit: String::new(),
+            guest_commit_serial: 0,
+            pending_preedit_cursor: None,
+            pending_preedit_selection: None,
+            pending_deletes: Vec::new(),
+            pending_cursor_position: None,
+            host_activated: false,
+        }
+    }
+
+    /// Apply a keyboard-focus generation boundary.
+    ///
+    /// text-input-v3 requires the client to resend enable and editor state
+    /// after every enter. The guest commit serial and host activation marker
+    /// deliberately survive so the bridge can deactivate the previous host
+    /// generation with the correct transaction ordering.
+    pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
+        let previous_surface = self.active_surface;
+        self.pending_enabled = false;
+        self.committed_enabled = false;
+        self.enabled_dirty = false;
+        self.pending_surrounding_text = None;
+        self.committed_surrounding_text = None;
+        self.surrounding_text_dirty = false;
+        self.content_hint = 0;
+        self.content_purpose = 0;
+        self.committed_content_type = None;
+        self.content_type_dirty = false;
+        self.cursor_rect = None;
+        self.cursor_rect_dirty = false;
+        self.text_change_cause = 0;
+        self.clear_host_composition();
+        self.active_surface = active_surface;
+        previous_surface
+    }
+
+    /// Move the object to its final disabled target before host reconciliation.
+    pub fn begin_destroy(&mut self) {
+        self.committed_enabled = false;
+        self.active_surface = None;
+    }
+
+    /// Start a new text-input-v3 enable or disable transaction.
+    ///
+    /// Both requests reset the pending editor state. Committed state remains
+    /// untouched until [`Self::finish_guest_commit`] publishes a fully encoded
+    /// host transaction.
+    pub fn begin_enabled_transaction(&mut self, enabled: bool) {
+        self.pending_enabled = enabled;
+        self.enabled_dirty = true;
+        self.pending_surrounding_text = None;
+        self.surrounding_text_dirty = true;
+        self.content_hint = 0;
+        self.content_purpose = 0;
+        self.content_type_dirty = true;
+        self.cursor_rect = None;
+        self.cursor_rect_dirty = true;
+        self.text_change_cause = 0;
+    }
+
+    pub fn set_surrounding_text(&mut self, text: String, cursor: i32, anchor: i32) {
+        self.pending_surrounding_text = Some((text, cursor, anchor));
+        self.surrounding_text_dirty = true;
+    }
+
+    pub fn set_text_change_cause(&mut self, cause: u32) {
+        self.text_change_cause = cause;
+    }
+
+    pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
+        self.content_hint = hint;
+        self.content_purpose = purpose;
+        self.content_type_dirty =
+            self.enabled_dirty || self.committed_content_type != Some((hint, purpose));
+    }
+
+    pub fn set_cursor_rect(&mut self, rect: (i32, i32, i32, i32)) {
+        self.cursor_rect = Some(rect);
+        self.cursor_rect_dirty = true;
+    }
+
+    /// Snapshot the next guest commit without mutating committed state.
+    ///
+    /// The handler owns this plan while encoding every host message. Dropping
+    /// the plan on an encoding failure leaves the state byte-for-byte
+    /// unchanged; only [`Self::finish_guest_commit`] advances the transaction.
+    pub(crate) fn prepare_guest_commit(&self, enable_conflict: bool) -> GuestCommitPlan {
+        let resets_composition = self.enabled_dirty;
+        let enabled = if resets_composition && !enable_conflict {
+            self.pending_enabled
+        } else {
+            self.committed_enabled
+        };
+        let effective_surrounding_text = if self.surrounding_text_dirty {
+            &self.pending_surrounding_text
+        } else {
+            &self.committed_surrounding_text
+        };
+        GuestCommitPlan {
+            host_v1_id: self.host_v1_id,
+            host_ext_id: self.host_ext_id,
+            guest_seat: self.guest_seat,
+            serial: self.guest_commit_serial.wrapping_add(1),
+            enabled,
+            enable_conflict,
+            resets_composition,
+            surrounding_text: self
+                .surrounding_text_dirty
+                .then(|| self.pending_surrounding_text.clone()),
+            has_surrounding_text: effective_surrounding_text.is_some(),
+            content_type: self
+                .content_type_dirty
+                .then_some((self.content_hint, self.content_purpose)),
+            cursor_rect: self
+                .cursor_rect_dirty
+                .then_some(self.cursor_rect.unwrap_or((0, 0, 0, 0))),
+        }
+    }
+
+    /// Publish a previously encoded guest commit plan.
+    pub(crate) fn finish_guest_commit(&mut self, plan: GuestCommitPlan) {
+        debug_assert_eq!(plan.host_v1_id, self.host_v1_id);
+        debug_assert_eq!(plan.host_ext_id, self.host_ext_id);
+        debug_assert_eq!(plan.guest_seat, self.guest_seat);
+        debug_assert_eq!(
+            plan.serial,
+            self.guest_commit_serial.wrapping_add(1),
+            "guest commit plans must be finished exactly once and in order"
+        );
+
+        self.guest_commit_serial = plan.serial;
+        if plan.resets_composition {
+            if plan.enable_conflict {
+                self.pending_enabled = self.committed_enabled;
+            } else {
+                self.pending_enabled = plan.enabled;
+                self.committed_enabled = plan.enabled;
+            }
+            self.enabled_dirty = false;
+            self.clear_host_composition();
+        }
+        if let Some(surrounding_text) = plan.surrounding_text {
+            self.surrounding_text_dirty = false;
+            self.committed_surrounding_text = surrounding_text;
+        }
+        if let Some(content_type) = plan.content_type {
+            self.content_type_dirty = false;
+            self.committed_content_type = Some(content_type);
+        }
+        if plan.cursor_rect.is_some() {
+            self.cursor_rect_dirty = false;
+        }
+        self.text_change_cause = 0;
+    }
+
+    pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
+        self.pending_preedit_selection = Some((index, length));
+    }
+
+    pub fn record_preedit_cursor(&mut self, index: i32) {
+        self.pending_preedit_cursor = Some(index);
+    }
+
+    pub fn record_cursor_position(&mut self, index: i32, anchor: i32) {
+        self.pending_cursor_position = Some((index, anchor));
+    }
+
+    pub fn record_delete(&mut self, before: u32, after: u32) -> bool {
+        if self.pending_deletes.len() >= MAX_PENDING_IME_DELETES {
+            return false;
+        }
+        self.pending_deletes.push((before, after));
+        true
+    }
+
+    pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
+        self.host_activated.then_some(HostPreeditPlan {
+            guest_seat: self.guest_seat,
+            done_serial: self.guest_commit_serial,
+            had_preedit: !self.current_preedit.is_empty(),
+            selection: self.pending_preedit_selection,
+            cursor: self.pending_preedit_cursor,
+        })
+    }
+
+    pub(crate) fn finish_host_preedit(
+        &mut self,
+        plan: HostPreeditPlan,
+        text: String,
+        reset_commit_is_empty: bool,
+        backspace_held: bool,
+    ) -> bool {
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.selection, self.pending_preedit_selection);
+        debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
+        debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
+
+        self.pending_preedit_selection = None;
+        self.pending_preedit_cursor = None;
+        let arm_backspace_repeat =
+            text.is_empty() && plan.had_preedit && reset_commit_is_empty && backspace_held;
+        self.current_preedit = text;
+        arm_backspace_repeat
+    }
+
+    pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
+        self.host_activated.then(|| HostCommitPlan {
+            guest_seat: self.guest_seat,
+            done_serial: self.guest_commit_serial,
+            had_preedit: !self.current_preedit.is_empty(),
+            deletes: self.pending_deletes.clone(),
+            cursor_position: self.pending_cursor_position,
+        })
+    }
+
+    pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan) {
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.deletes, self.pending_deletes);
+        debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);
+        debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
+        self.clear_host_composition();
+    }
+
+    pub(crate) fn prepare_preedit_region(&self) -> Option<PreeditRegionPlan> {
+        if !self.host_activated {
+            return None;
+        }
+        let (surrounding_text, surrounding_cursor, _) = self.committed_surrounding_text.as_ref()?;
+        Some(PreeditRegionPlan {
+            guest_seat: self.guest_seat,
+            surrounding_text: surrounding_text.clone(),
+            surrounding_cursor: *surrounding_cursor,
+            done_serial: self.guest_commit_serial,
+            selection: self.pending_preedit_selection,
+            cursor: self.pending_preedit_cursor,
+        })
+    }
+
+    pub(crate) fn finish_preedit_region(&mut self, plan: PreeditRegionPlan, preedit_text: String) {
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.selection, self.pending_preedit_selection);
+        debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
+        self.pending_preedit_selection = None;
+        self.pending_preedit_cursor = None;
+        self.current_preedit = preedit_text;
+    }
+
+    pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
+        self.host_activated.then(|| ConfirmPreeditPlan {
+            guest_seat: self.guest_seat,
+            done_serial: self.guest_commit_serial,
+            preedit_text: self.current_preedit.clone(),
+        })
+    }
+
+    /// Close a host composition transaction after its complete guest message
+    /// sequence has been encoded.
+    pub(crate) fn finish_confirm_preedit(&mut self, plan: ConfirmPreeditPlan) {
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.preedit_text, self.current_preedit);
+        self.current_preedit.clear();
+        self.pending_preedit_cursor = None;
+        self.pending_preedit_selection = None;
+    }
+
+    fn clear_host_composition(&mut self) {
+        self.current_preedit.clear();
+        self.pending_preedit_cursor = None;
+        self.pending_preedit_selection = None;
+        self.pending_deletes.clear();
+        self.pending_cursor_position = None;
+    }
 }
 
 /// Provenance for one physical key generation observed through ChromeOS
@@ -188,6 +536,9 @@ struct KeyGeneration {
     /// peek channel or the regular wl_keyboard channel.
     physical_release_serial: Option<u32>,
     backspace_repeat_cancelled: bool,
+    /// The host IME consumed this held key and subsequent physical repeat
+    /// events belong to the same synthetic guest generation.
+    ime_repeat_owner: Option<u32>,
     guest_owner: Option<GuestKeyOwner>,
     guest_press_serial: Option<u32>,
     host_accelerator_suppressed: bool,
@@ -202,6 +553,7 @@ impl KeyGeneration {
             peek_press_serial: None,
             physical_release_serial: None,
             backspace_repeat_cancelled: false,
+            ime_repeat_owner: None,
             guest_owner: None,
             guest_press_serial: None,
             host_accelerator_suppressed: false,
@@ -212,6 +564,7 @@ impl KeyGeneration {
         self.physical_state != PhysicalKeyState::Held
             && self.peek.is_none()
             && !self.backspace_repeat_cancelled
+            && self.ime_repeat_owner.is_none()
             && self.guest_owner.is_none()
             && !self.host_accelerator_suppressed
     }
@@ -446,6 +799,7 @@ impl KeyGenerationRegistry {
                         generation.physical_release_serial = Some(serial);
                     }
                     generation.backspace_repeat_cancelled = false;
+                    generation.ime_repeat_owner = None;
                 }
                 // Match the previous physical/peek lifecycle: once no key on
                 // this keyboard remains held, old peek provenance is no longer
@@ -618,8 +972,9 @@ impl KeyGenerationRegistry {
 
     pub(crate) fn cancel_backspace_repeat(&mut self, keyboard: HostId, backspace: u32) {
         if self.physically_held(keyboard, backspace) {
-            self.ensure_generation(keyboard, backspace)
-                .backspace_repeat_cancelled = true;
+            let generation = self.ensure_generation(keyboard, backspace);
+            generation.backspace_repeat_cancelled = true;
+            generation.ime_repeat_owner = None;
         }
     }
 
@@ -628,6 +983,54 @@ impl KeyGenerationRegistry {
             .get(&keyboard)
             .and_then(|keys| keys.get(&backspace))
             .is_some_and(|generation| generation.backspace_repeat_cancelled)
+    }
+
+    pub(crate) fn arm_ime_repeat(
+        &mut self,
+        keyboard: HostId,
+        key: u32,
+        guest_text_input: u32,
+    ) -> bool {
+        let Some(generation) = self
+            .entries
+            .get_mut(&keyboard)
+            .and_then(|keys| keys.get_mut(&key))
+            .filter(|generation| {
+                generation.physical_state == PhysicalKeyState::Held
+                    && !generation.backspace_repeat_cancelled
+                    && generation
+                        .ime_repeat_owner
+                        .is_none_or(|owner| owner == guest_text_input)
+            })
+        else {
+            return false;
+        };
+        generation.ime_repeat_owner = Some(guest_text_input);
+        true
+    }
+
+    pub(crate) fn ime_repeat_active(&self, keyboard: HostId, key: u32) -> bool {
+        self.ime_repeat_owner(keyboard, key).is_some()
+    }
+
+    pub(crate) fn ime_repeat_owner(&self, keyboard: HostId, key: u32) -> Option<u32> {
+        self.entries
+            .get(&keyboard)
+            .and_then(|keys| keys.get(&key))
+            .and_then(|generation| generation.ime_repeat_owner)
+    }
+
+    pub(crate) fn cancel_backspace_repeat_for_owner(
+        &mut self,
+        keyboard: HostId,
+        backspace: u32,
+        guest_text_input: u32,
+    ) -> bool {
+        if self.ime_repeat_owner(keyboard, backspace) != Some(guest_text_input) {
+            return false;
+        }
+        self.cancel_backspace_repeat(keyboard, backspace);
+        true
     }
 
     pub(crate) fn guest_owner(&self, keyboard: HostId, key: u32) -> Option<GuestKeyOwner> {
@@ -1271,6 +1674,376 @@ impl TextInputActivationBarrierRegistry {
 mod tests {
     use super::*;
     use crate::state::Context;
+
+    #[test]
+    fn text_input_focus_boundary_resets_editor_state_only() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.pending_enabled = true;
+        state.committed_enabled = true;
+        state.enabled_dirty = true;
+        state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
+        state.committed_surrounding_text = Some(("committed".to_string(), 9, 9));
+        state.surrounding_text_dirty = true;
+        state.content_hint = 5;
+        state.content_purpose = 6;
+        state.committed_content_type = Some((5, 6));
+        state.content_type_dirty = true;
+        state.cursor_rect = Some((1, 2, 3, 4));
+        state.cursor_rect_dirty = true;
+        state.text_change_cause = 1;
+        state.current_preedit = "조합".to_string();
+        state.guest_commit_serial = 17;
+        state.pending_preedit_cursor = Some(3);
+        state.pending_preedit_selection = Some((0, 3));
+        state.pending_deletes.push((3, 0));
+        state.pending_cursor_position = Some((1, 1));
+        state.host_activated = true;
+
+        assert_eq!(state.apply_focus(Some(14)), Some(13));
+
+        let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
+        expected.guest_commit_serial = 17;
+        expected.host_activated = true;
+        assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn preparing_guest_commit_is_non_mutating_until_finish() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.committed_content_type = Some((1, 2));
+        state.begin_enabled_transaction(true);
+        state.set_surrounding_text("가나다".to_string(), 9, 9);
+        state.set_content_type(3, 4);
+        state.set_cursor_rect((1, 2, 3, 4));
+        state.set_text_change_cause(1);
+        let before = state.clone();
+
+        let plan = state.prepare_guest_commit(false);
+
+        assert_eq!(state, before);
+        assert_eq!(plan.serial, 1);
+        assert!(plan.enabled);
+        assert_eq!(
+            plan.surrounding_text,
+            Some(Some(("가나다".to_string(), 9, 9)))
+        );
+        assert_eq!(plan.content_type, Some((3, 4)));
+        assert_eq!(plan.cursor_rect, Some((1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn finishing_guest_commit_applies_exact_owned_snapshot() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.current_preedit = "이전".to_string();
+        state.pending_preedit_cursor = Some(3);
+        state.pending_deletes.push((3, 0));
+        state.begin_enabled_transaction(true);
+        state.set_surrounding_text("가나다".to_string(), 9, 9);
+        state.set_content_type(3, 4);
+        state.set_cursor_rect((1, 2, 3, 4));
+        state.set_text_change_cause(1);
+
+        let plan = state.prepare_guest_commit(false);
+        state.finish_guest_commit(plan);
+
+        assert_eq!(state.guest_commit_serial, 1);
+        assert!(state.pending_enabled);
+        assert!(state.committed_enabled);
+        assert!(!state.enabled_dirty);
+        assert_eq!(
+            state.committed_surrounding_text,
+            Some(("가나다".to_string(), 9, 9))
+        );
+        assert!(!state.surrounding_text_dirty);
+        assert_eq!(state.committed_content_type, Some((3, 4)));
+        assert!(!state.content_type_dirty);
+        assert!(!state.cursor_rect_dirty);
+        assert_eq!(state.text_change_cause, 0);
+        assert!(state.current_preedit.is_empty());
+        assert!(state.pending_preedit_cursor.is_none());
+        assert!(state.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn enable_replays_same_content_type_but_ordinary_repeat_is_clean() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.committed_content_type = Some((3, 4));
+
+        state.set_content_type(3, 4);
+        assert_eq!(state.prepare_guest_commit(false).content_type, None);
+
+        state.begin_enabled_transaction(true);
+        state.set_content_type(3, 4);
+        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
+    }
+
+    #[test]
+    fn rejected_enable_advances_serial_and_closes_composition() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.current_preedit = "가".to_string();
+        state.pending_deletes.push((3, 0));
+        state.begin_enabled_transaction(true);
+
+        let plan = state.prepare_guest_commit(true);
+        assert!(!plan.enabled);
+        state.finish_guest_commit(plan);
+
+        assert_eq!(state.guest_commit_serial, 1);
+        assert!(!state.pending_enabled);
+        assert!(!state.committed_enabled);
+        assert!(!state.enabled_dirty);
+        assert!(state.current_preedit.is_empty());
+        assert!(state.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn guest_commit_serial_wraps_to_zero() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        state.guest_commit_serial = u32::MAX;
+
+        let plan = state.prepare_guest_commit(false);
+        assert_eq!(plan.serial, 0);
+        state.finish_guest_commit(plan);
+        assert_eq!(state.guest_commit_serial, 0);
+    }
+
+    #[test]
+    fn host_preedit_metadata_is_consumed_only_after_finish() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        assert!(state.prepare_host_preedit().is_none());
+        state.host_activated = true;
+        state.guest_commit_serial = 7;
+        state.current_preedit = "가".to_string();
+        state.record_preedit_selection(0, 3);
+        state.record_preedit_cursor(3);
+        let before = state.clone();
+
+        let plan = state.prepare_host_preedit().expect("active host input");
+        assert_eq!(state, before);
+        assert_eq!(plan.done_serial, 7);
+        assert!(plan.had_preedit);
+        assert_eq!(plan.selection, Some((0, 3)));
+        assert_eq!(plan.cursor, Some(3));
+
+        state.finish_host_preedit(plan, "각".to_string(), true, true);
+        assert_eq!(state.current_preedit, "각");
+        assert!(state.pending_preedit_selection.is_none());
+        assert!(state.pending_preedit_cursor.is_none());
+    }
+
+    #[test]
+    fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        state.host_activated = true;
+        state.guest_commit_serial = 7;
+        state.current_preedit = "가".to_string();
+        state.record_preedit_selection(0, 3);
+        state.record_preedit_cursor(3);
+        assert!(state.record_delete(3, 0));
+        state.record_cursor_position(1, 1);
+        let before = state.clone();
+
+        let plan = state.prepare_host_commit().expect("active host input");
+        assert_eq!(
+            state, before,
+            "preparing an event must not consume metadata"
+        );
+        assert_eq!(plan.deletes, vec![(3, 0)]);
+        assert_eq!(plan.cursor_position, Some((1, 1)));
+
+        state.finish_host_commit(plan);
+        assert!(state.current_preedit.is_empty());
+        assert!(state.pending_preedit_selection.is_none());
+        assert!(state.pending_preedit_cursor.is_none());
+        assert!(state.pending_deletes.is_empty());
+        assert!(state.pending_cursor_position.is_none());
+
+        let next = state.prepare_host_commit().expect("still active");
+        assert!(!next.had_preedit);
+        assert!(next.deletes.is_empty());
+        assert!(next.cursor_position.is_none());
+    }
+
+    #[test]
+    fn confirming_preedit_closes_only_preedit_metadata() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        state.host_activated = true;
+        state.current_preedit = "가".to_string();
+        state.record_preedit_selection(0, 3);
+        state.record_preedit_cursor(3);
+        assert!(state.record_delete(3, 0));
+        state.record_cursor_position(1, 1);
+
+        let plan = state.prepare_confirm_preedit().expect("active host input");
+        state.finish_confirm_preedit(plan);
+
+        let next_preedit = state.prepare_host_preedit().expect("still active");
+        assert!(!next_preedit.had_preedit);
+        assert!(next_preedit.selection.is_none());
+        assert!(next_preedit.cursor.is_none());
+        let next_commit = state.prepare_host_commit().expect("still active");
+        assert_eq!(next_commit.deletes, vec![(3, 0)]);
+        assert_eq!(next_commit.cursor_position, Some((1, 1)));
+    }
+
+    #[test]
+    fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        state.host_activated = true;
+        for index in 0..MAX_PENDING_IME_DELETES {
+            assert!(state.record_delete(index as u32, 0));
+        }
+        assert!(!state.record_delete(u32::MAX, u32::MAX));
+
+        let plan = state.prepare_host_commit().expect("active host input");
+        assert_eq!(plan.deletes.len(), MAX_PENDING_IME_DELETES);
+        state.finish_host_commit(plan);
+        assert!(state.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn ime_repeat_lease_is_generation_and_keyboard_scoped() {
+        let keyboard_a = HostId(10);
+        let keyboard_b = HostId(11);
+        let key = 14;
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(keyboard_a, key, 1);
+        registry.observe_physical_state(keyboard_b, key, 1);
+
+        assert!(registry.arm_ime_repeat(keyboard_a, key, 40));
+        assert!(registry.ime_repeat_active(keyboard_a, key));
+        assert_eq!(registry.ime_repeat_owner(keyboard_a, key), Some(40));
+        assert!(!registry.ime_repeat_active(keyboard_b, key));
+
+        registry.observe_physical_state(keyboard_a, key, 0);
+        assert!(!registry.ime_repeat_active(keyboard_a, key));
+        assert!(registry.arm_ime_repeat(keyboard_b, key, 41));
+        registry.clear_keyboard(keyboard_a);
+        assert!(registry.ime_repeat_active(keyboard_b, key));
+        assert_eq!(registry.ime_repeat_owner(keyboard_b, key), Some(41));
+
+        assert!(!registry.cancel_backspace_repeat_for_owner(keyboard_b, key, 40));
+        assert!(registry.ime_repeat_active(keyboard_b, key));
+        assert!(registry.cancel_backspace_repeat_for_owner(keyboard_b, key, 41));
+        assert!(!registry.ime_repeat_active(keyboard_b, key));
+        assert!(!registry.arm_ime_repeat(keyboard_b, key, 41));
+    }
+
+    #[test]
+    fn text_input_lifecycle_short_traces_preserve_commit_atomicity() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Focus,
+            Leave,
+            Enable,
+            Disable,
+            Surrounding,
+            ContentType,
+            CursorRect,
+            Commit,
+            FailedCommit,
+            Destroy,
+        }
+
+        const STEPS: [Step; 10] = [
+            Step::Focus,
+            Step::Leave,
+            Step::Enable,
+            Step::Disable,
+            Step::Surrounding,
+            Step::ContentType,
+            Step::CursorRect,
+            Step::Commit,
+            Step::FailedCommit,
+            Step::Destroy,
+        ];
+
+        fn walk(state: TextInputState, depth: usize) {
+            if depth == 0 {
+                return;
+            }
+            for step in STEPS {
+                let mut next = state.clone();
+                match step {
+                    Step::Focus | Step::Leave => {
+                        let serial = next.guest_commit_serial;
+                        let host_activated = next.host_activated;
+                        let surface = matches!(step, Step::Focus).then_some(13);
+                        next.apply_focus(surface);
+                        let mut expected = TextInputState::new(10, Some(11), 12, surface);
+                        expected.guest_commit_serial = serial;
+                        expected.host_activated = host_activated;
+                        assert_eq!(next, expected);
+                    }
+                    Step::Enable | Step::Disable if next.active_surface.is_some() => {
+                        next.begin_enabled_transaction(matches!(step, Step::Enable));
+                        assert!(next.enabled_dirty);
+                        assert!(next.surrounding_text_dirty);
+                        assert!(next.content_type_dirty);
+                        assert!(next.cursor_rect_dirty);
+                    }
+                    Step::Surrounding if next.active_surface.is_some() => {
+                        next.set_surrounding_text("가".to_string(), 3, 3);
+                        assert!(next.surrounding_text_dirty);
+                    }
+                    Step::ContentType if next.active_surface.is_some() => {
+                        next.set_content_type(3, 4);
+                    }
+                    Step::CursorRect if next.active_surface.is_some() => {
+                        next.set_cursor_rect((1, 2, 3, 4));
+                        assert!(next.cursor_rect_dirty);
+                    }
+                    Step::Commit if next.active_surface.is_some() => {
+                        let previous_serial = next.guest_commit_serial;
+                        let plan = next.prepare_guest_commit(false);
+                        let resets_composition = plan.resets_composition;
+                        let commits_surrounding = plan.surrounding_text.is_some();
+                        let commits_content_type = plan.content_type.is_some();
+                        let commits_cursor_rect = plan.cursor_rect.is_some();
+                        next.finish_guest_commit(plan);
+                        assert_eq!(next.guest_commit_serial, previous_serial.wrapping_add(1));
+                        if resets_composition {
+                            assert!(!next.enabled_dirty);
+                            assert!(next.current_preedit.is_empty());
+                            assert!(next.pending_deletes.is_empty());
+                        }
+                        if commits_surrounding {
+                            assert!(!next.surrounding_text_dirty);
+                        }
+                        if commits_content_type {
+                            assert!(!next.content_type_dirty);
+                        }
+                        if commits_cursor_rect {
+                            assert!(!next.cursor_rect_dirty);
+                        }
+                    }
+                    Step::FailedCommit if next.active_surface.is_some() => {
+                        let before = next.clone();
+                        let _unencodable_plan = next.prepare_guest_commit(false);
+                        assert_eq!(
+                            next, before,
+                            "dropping an unencoded plan must not advance any state"
+                        );
+                    }
+                    Step::Destroy => {
+                        let serial = next.guest_commit_serial;
+                        let host_activated = next.host_activated;
+                        next.begin_destroy();
+                        assert_eq!(next.guest_commit_serial, serial);
+                        assert_eq!(next.host_activated, host_activated);
+                        assert!(!next.committed_enabled);
+                        assert!(next.active_surface.is_none());
+                    }
+                    _ => {}
+                }
+                walk(next, depth - 1);
+            }
+        }
+
+        let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
+        initial.host_activated = true;
+        walk(initial, 4);
+    }
 
     #[test]
     fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
@@ -2128,6 +2901,7 @@ mod tests {
             peek_press_serial: Option<u32>,
             physical_release_serial: Option<u32>,
             backspace_repeat_cancelled: bool,
+            ime_repeat_owner: Option<u32>,
             guest_owner: Option<GuestKeyOwner>,
             guest_press_serial: Option<u32>,
             host_accelerator_suppressed: bool,
@@ -2138,6 +2912,7 @@ mod tests {
                 self.physical_state != PhysicalKeyState::Held
                     && self.peek.is_none()
                     && !self.backspace_repeat_cancelled
+                    && self.ime_repeat_owner.is_none()
                     && self.guest_owner.is_none()
                     && !self.host_accelerator_suppressed
             }
@@ -2229,6 +3004,7 @@ mod tests {
                         generation.physical_release_serial = Some(serial);
                     }
                     generation.backspace_repeat_cancelled = false;
+                    generation.ime_repeat_owner = None;
                 }
                 if !self
                     .keys
@@ -2275,6 +3051,8 @@ mod tests {
             RefreshPeek(u32),
             InvalidatePeek(u32),
             CancelRepeat(u32),
+            ArmImeRepeat(u32, u32),
+            CancelRepeatOwner(u32, u32),
             SuppressAccelerator(u32),
             TakeAcceleratorSuppression(u32),
             ClaimOwner(u32, GuestKeyOwner),
@@ -2301,6 +3079,10 @@ mod tests {
             Operation::RefreshPeek(KEY_A),
             Operation::InvalidatePeek(KEY_B),
             Operation::CancelRepeat(KEY_A),
+            Operation::ArmImeRepeat(KEY_A, 77),
+            Operation::ArmImeRepeat(KEY_A, 78),
+            Operation::CancelRepeatOwner(KEY_A, 77),
+            Operation::CancelRepeatOwner(KEY_A, 78),
             Operation::SuppressAccelerator(KEY_B),
             Operation::TakeAcceleratorSuppression(KEY_B),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::Physical),
@@ -2373,7 +3155,39 @@ mod tests {
                             generation.physical_state == PhysicalKeyState::Held
                         }) {
                             generation.backspace_repeat_cancelled = true;
+                            generation.ime_repeat_owner = None;
                         }
+                    }
+                    Operation::ArmImeRepeat(key, owner) => {
+                        let actual = registry.arm_ime_repeat(keyboard, key, owner);
+                        let expected = model.keys.get_mut(&key).is_some_and(|generation| {
+                            if generation.physical_state == PhysicalKeyState::Held
+                                && !generation.backspace_repeat_cancelled
+                                && generation
+                                    .ime_repeat_owner
+                                    .is_none_or(|current| current == owner)
+                            {
+                                generation.ime_repeat_owner = Some(owner);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        assert_eq!(actual, expected);
+                    }
+                    Operation::CancelRepeatOwner(key, owner) => {
+                        let actual =
+                            registry.cancel_backspace_repeat_for_owner(keyboard, key, owner);
+                        let expected = model.keys.get_mut(&key).is_some_and(|generation| {
+                            if generation.ime_repeat_owner == Some(owner) {
+                                generation.backspace_repeat_cancelled = true;
+                                generation.ime_repeat_owner = None;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        assert_eq!(actual, expected);
                     }
                     Operation::SuppressAccelerator(key) => {
                         registry.suppress_host_accelerator(keyboard, key);
@@ -2536,6 +3350,7 @@ mod tests {
                         actual.backspace_repeat_cancelled,
                         expected.backspace_repeat_cancelled
                     );
+                    assert_eq!(actual.ime_repeat_owner, expected.ime_repeat_owner);
                     assert_eq!(actual.guest_owner, expected.guest_owner);
                     assert_eq!(actual.guest_press_serial, expected.guest_press_serial);
                     assert_eq!(

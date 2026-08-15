@@ -1204,7 +1204,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
@@ -2195,14 +2194,18 @@ mod tests {
         map_keyboard(&mut ctx, 10, 100, 1000, 1);
         map_keyboard(&mut ctx, 11, 101, 1001, 2);
         add_active_text_input(&mut ctx, 40, 1, 2000);
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
 
         // The IME consumed Backspace on keyboard 100.
         ctx.last_sender_id = 1000;
         handler.on_peek_key(&mut ctx, 1, 500, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED);
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(100), EVDEV_KEY_BACKSPACE, 40));
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 500, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
+            Action::Drop
+        );
 
         // A simultaneous Backspace on keyboard 101 must not be swallowed just
         // because keyboard 100 has an active IME repeat.
@@ -3160,10 +3163,9 @@ mod tests {
 
         // Exo later consumes repeat confirmations. The real release still
         // has to reach the guest to close the press/release pair.
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(100), EVDEV_KEY_BACKSPACE, 40));
         assert_eq!(
             handler.on_key(&mut ctx, 2, 501, EVDEV_KEY_BACKSPACE, WL_KEY_RELEASED),
             Action::Forward
@@ -3182,10 +3184,9 @@ mod tests {
             WL_KEY_PRESSED,
         );
         assert!(ctx.claim_guest_key(HostId(100), EVDEV_KEY_BACKSPACE, GuestKeyOwner::Physical));
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(100), EVDEV_KEY_BACKSPACE, 40));
 
         ctx.last_sender_id = 100;
         assert_eq!(
@@ -3197,7 +3198,9 @@ mod tests {
                 .physically_held(HostId(100), EVDEV_KEY_BACKSPACE),
             "pressing another key must not falsify the physical Backspace state"
         );
-        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(
+            !crate::handler::text_input::backspace_repeat_active_for_keyboard(&ctx, HostId(100))
+        );
 
         ctx.last_sender_id = 2000;
         assert_eq!(
@@ -3241,10 +3244,9 @@ mod tests {
             EVDEV_KEY_BACKSPACE,
             WL_KEY_PRESSED,
         );
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(100), EVDEV_KEY_BACKSPACE, 40));
 
         // A newer key cancels the IME repeat while the physical Backspace
         // remains held.
@@ -3921,7 +3923,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
@@ -4015,7 +4016,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
@@ -4104,7 +4104,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: true,
                 host_activated: true,
             },
         );
@@ -4117,7 +4116,6 @@ mod tests {
         assert!(ctx
             .key_generations
             .backspace_repeat_cancelled(HostId(other_host_keyboard), EVDEV_KEY_BACKSPACE));
-        assert!(ctx.text_inputs[&guest_text_input].empty_preedit_repeat_active);
         assert!(ctx.host_to_client_queue.is_empty());
     }
 
@@ -4171,7 +4169,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
@@ -4253,7 +4250,6 @@ mod tests {
                     pending_preedit_selection: None,
                     pending_deletes: Vec::new(),
                     pending_cursor_position: None,
-                    empty_preedit_repeat_active: false,
                     host_activated: true,
                 },
             );
@@ -4337,7 +4333,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: vec![(3, 0)],
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: true,
                 host_activated: true,
             },
         );
@@ -4378,7 +4373,9 @@ mod tests {
         assert!(ctx
             .key_generations
             .backspace_repeat_cancelled(HostId(10), EVDEV_KEY_BACKSPACE));
-        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(
+            !crate::handler::text_input::backspace_repeat_active_for_keyboard(&ctx, HostId(10))
+        );
 
         ctx.last_sender_id = 10;
         // The previous physical Backspace session ended before the new
@@ -4392,10 +4389,6 @@ mod tests {
         assert!(!ctx
             .key_generations
             .physically_held(HostId(10), EVDEV_KEY_BACKSPACE));
-        ctx.text_inputs
-            .get_mut(&40)
-            .unwrap()
-            .empty_preedit_repeat_active = true;
         ctx.extended_keyboard_to_keyboard
             .insert(HostId(100), HostId(10));
         ctx.last_sender_id = 100;
@@ -4403,6 +4396,9 @@ mod tests {
             handler.on_peek_key(&mut ctx, 6, 14, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
             Action::Drop
         );
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(10), EVDEV_KEY_BACKSPACE, 40));
         ctx.last_sender_id = 10;
         assert_eq!(
             handler.on_key(&mut ctx, 6, 14, EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED),
@@ -4421,7 +4417,9 @@ mod tests {
         assert!(!ctx
             .key_generations
             .physically_held(HostId(10), EVDEV_KEY_BACKSPACE));
-        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(
+            !crate::handler::text_input::backspace_repeat_active_for_keyboard(&ctx, HostId(10))
+        );
     }
 
     #[test]
@@ -4436,7 +4434,11 @@ mod tests {
         add_active_text_input(&mut ctx, 40, 7, 50);
         let state = ctx.text_inputs.get_mut(&40).expect("text input");
         state.active_surface = Some(20);
-        state.empty_preedit_repeat_active = true;
+        ctx.key_generations
+            .observe_physical_state(HostId(10), EVDEV_KEY_BACKSPACE, WL_KEY_PRESSED);
+        assert!(ctx
+            .key_generations
+            .arm_ime_repeat(HostId(10), EVDEV_KEY_BACKSPACE, 40));
 
         // The old keyboard object reports leave for surface 21 after surface
         // 20 is already focused. This event must not tear down seat-level IME
@@ -4444,7 +4446,7 @@ mod tests {
         ctx.last_sender_id = 10;
         assert_eq!(handler.on_leave(&mut ctx, 1, 31), Action::Drop);
         assert_eq!(ctx.keyboard_focus.surface_for_seat(7), Some(20));
-        assert!(ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(crate::handler::text_input::backspace_repeat_active_for_keyboard(&ctx, HostId(10)));
         assert!(
             ctx.host_to_client_queue.is_empty(),
             "stale leave must not emit a text-input leave"
@@ -4454,7 +4456,9 @@ mod tests {
         ctx.last_sender_id = 10;
         assert_eq!(handler.on_leave(&mut ctx, 2, 30), Action::Forward);
         assert_eq!(ctx.keyboard_focus.surface_for_seat(7), None);
-        assert!(!ctx.text_inputs[&40].empty_preedit_repeat_active);
+        assert!(
+            !crate::handler::text_input::backspace_repeat_active_for_keyboard(&ctx, HostId(10))
+        );
     }
 
     #[test]

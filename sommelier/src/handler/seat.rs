@@ -143,7 +143,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );

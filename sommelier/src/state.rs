@@ -32,9 +32,10 @@ use log::warn;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, KeyGenerationRegistry,
-    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance, SeatFocusChange,
-    TextInputActivationBarrierRegistry, TextInputState,
+    ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
+    GuestKeyOwner, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry, KeyboardFocus,
+    KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance, PreeditRegionPlan,
+    SeatFocusChange, TextInputActivationBarrierRegistry, TextInputState,
 };
 pub(crate) use self::render::{
     BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,

@@ -1452,7 +1452,9 @@ mod tests {
     const HOST_KEYBOARD: u32 = 100;
     const HOST_EXTENDED_KEYBOARD: u32 = 1_000;
     const GUEST_TEXT_INPUT: u32 = 40;
+    const GUEST_TEXT_INPUT_MANAGER: u32 = 41;
     const HOST_TEXT_INPUT: u32 = 140;
+    const HOST_TEXT_INPUT_MANAGER: u32 = 141;
     const HOST_EXTENDED_TEXT_INPUT: u32 = 2_000;
     const GUEST_SEAT: u32 = 1;
     const HOST_SEAT: u32 = 902;
@@ -1520,6 +1522,96 @@ mod tests {
         (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
     }
 
+    fn register_raw_surface(ctx: &mut Context, guest_surface: u32, host_surface: u32) {
+        ctx.shadow_table.map_id(guest_surface, host_surface);
+        ctx.shadow_table
+            .track_interface_with_version(guest_surface, "wl_surface".to_string(), 1);
+        ctx.shadow_table.track_host_interface_with_version(
+            host_surface,
+            "wl_surface".to_string(),
+            1,
+        );
+    }
+
+    fn raw_keyboard_enter(serial: u32, host_surface: u32) -> Vec<u8> {
+        use crate::protocols::wayland::wl_keyboard;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(serial);
+        event.write_u32(host_surface);
+        event.write_array(&[]);
+        event.build_message(HOST_KEYBOARD, wl_keyboard::EVT_ENTER)
+    }
+
+    fn raw_keyboard_leave(serial: u32, host_surface: u32) -> Vec<u8> {
+        use crate::protocols::wayland::wl_keyboard;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(serial);
+        event.write_u32(host_surface);
+        event.build_message(HOST_KEYBOARD, wl_keyboard::EVT_LEAVE)
+    }
+
+    fn raw_text_input_request(opcode: u16) -> Vec<u8> {
+        MessageBuilder::new().build_message(GUEST_TEXT_INPUT, opcode)
+    }
+
+    fn raw_text_input_request_for(guest_text_input: u32, opcode: u16) -> Vec<u8> {
+        MessageBuilder::new().build_message(guest_text_input, opcode)
+    }
+
+    fn raw_peek_key(serial: u32, time: u32, key: u32, state: u32) -> Vec<u8> {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(serial);
+        event.write_u32(time);
+        event.write_u32(key);
+        event.write_u32(state);
+        event.build_message(
+            HOST_EXTENDED_KEYBOARD,
+            zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+        )
+    }
+
+    fn raw_preedit(host_text_input: u32, serial: u32, text: &str) -> Vec<u8> {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(serial);
+        event.write_string(text);
+        event.write_string("");
+        event.build_message(host_text_input, zwp_text_input_v1::EVT_PREEDIT_STRING)
+    }
+
+    fn raw_commit_string(host_text_input: u32, serial: u32, text: &str) -> Vec<u8> {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(serial);
+        event.write_string(text);
+        event.build_message(host_text_input, zwp_text_input_v1::EVT_COMMIT_STRING)
+    }
+
+    fn raw_confirm_preedit() -> Vec<u8> {
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(1);
+        event.build_message(
+            HOST_EXTENDED_TEXT_INPUT,
+            zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+        )
+    }
+
+    fn raw_callback_done(callback_id: u32) -> Vec<u8> {
+        use crate::protocols::wayland::wl_callback;
+
+        let mut event = MessageBuilder::new();
+        event.write_u32(0);
+        event.build_message(callback_id, wl_callback::EVT_DONE)
+    }
+
     fn setup_raw_ime_dispatch() -> (Context, SommelierHandler) {
         use crate::state::{HostId, TextInputState};
 
@@ -1567,6 +1659,17 @@ mod tests {
             "wl_surface".to_string(),
             1,
         );
+        ctx.host_text_input_manager_v1_id = Some(HOST_TEXT_INPUT_MANAGER);
+        ctx.shadow_table.track_host_interface_with_version(
+            HOST_TEXT_INPUT_MANAGER,
+            "zwp_text_input_manager_v1".to_string(),
+            1,
+        );
+        ctx.shadow_table.track_interface_with_version(
+            GUEST_TEXT_INPUT_MANAGER,
+            "zwp_text_input_manager_v3".to_string(),
+            1,
+        );
 
         ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
         ctx.shadow_table.track_interface_with_version(
@@ -1610,12 +1713,263 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
 
         (ctx, SommelierHandler::new())
+    }
+
+    fn arm_raw_backspace_repeat(
+        ctx: &mut Context,
+        handler: &mut SommelierHandler,
+        host_text_input: u32,
+        guest_text_input: u32,
+    ) {
+        use crate::state::HostId;
+
+        dispatch_raw_event(
+            handler,
+            ctx,
+            "zcr_extended_keyboard_v1",
+            raw_peek_key(700, 1_234, KEY_BACKSPACE, KEY_PRESSED),
+        );
+        for text in ["가", ""] {
+            dispatch_raw_event(
+                handler,
+                ctx,
+                "zwp_text_input_v1",
+                raw_preedit(host_text_input, 1, text),
+            );
+        }
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            Some(guest_text_input)
+        );
+    }
+
+    #[test]
+    fn raw_confirm_preedit_preserves_delete_until_commit_string() {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_preedit(HOST_TEXT_INPUT, 1, "가"),
+        );
+
+        let mut delete = MessageBuilder::new();
+        delete.write_i32(-3);
+        delete.write_u32(3);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            delete.build_message(
+                HOST_TEXT_INPUT,
+                zwp_text_input_v1::EVT_DELETE_SURROUNDING_TEXT,
+            ),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+
+        ctx.host_to_client_queue.clear();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_commit_string(HOST_TEXT_INPUT, 1, "나"),
+        );
+
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        assert_eq!(
+            opcode(&ctx.host_to_client_queue[0]),
+            zwp_text_input_v3::EVT_DELETE_SURROUNDING_TEXT
+        );
+        assert_eq!(
+            opcode(&ctx.host_to_client_queue[1]),
+            zwp_text_input_v3::EVT_COMMIT_STRING
+        );
+        assert_eq!(
+            opcode(&ctx.host_to_client_queue[2]),
+            zwp_text_input_v3::EVT_DONE
+        );
+        let mut delete = WireMessage::new(
+            GUEST_TEXT_INPUT,
+            zwp_text_input_v3::EVT_DELETE_SURROUNDING_TEXT,
+            &ctx.host_to_client_queue[0].0[8..],
+            &[],
+        );
+        assert_eq!(delete.read_u32().unwrap(), 3);
+        assert_eq!(delete.read_u32().unwrap(), 0);
+        assert!(delete.is_payload_consumed());
+    }
+
+    #[test]
+    fn raw_sibling_lifecycle_preserves_active_repeat_owner() {
+        use crate::protocols::text_input_unstable_v3::{
+            zwp_text_input_manager_v3, zwp_text_input_v3,
+        };
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::state::HostId;
+
+        const SIBLING_TEXT_INPUT: u32 = 42;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        arm_raw_backspace_repeat(&mut ctx, &mut handler, HOST_TEXT_INPUT, GUEST_TEXT_INPUT);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+
+        let mut create = MessageBuilder::new();
+        create.write_u32(SIBLING_TEXT_INPUT);
+        create.write_u32(GUEST_SEAT);
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_manager_v3",
+            create.build_message(
+                GUEST_TEXT_INPUT_MANAGER,
+                zwp_text_input_manager_v3::REQ_GET_TEXT_INPUT,
+            ),
+        )
+        .is_none());
+        for request in [zwp_text_input_v3::REQ_ENABLE, zwp_text_input_v3::REQ_COMMIT] {
+            assert!(dispatch_raw_request_result(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v3",
+                raw_text_input_request_for(SIBLING_TEXT_INPUT, request),
+            )
+            .is_none());
+        }
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request_for(SIBLING_TEXT_INPUT, zwp_text_input_v3::REQ_DESTROY),
+        )
+        .is_none());
+
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            Some(GUEST_TEXT_INPUT),
+            "a rejected enable and destroy on a sibling must not cancel the active lease"
+        );
+
+        ctx.host_to_client_queue.clear();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        assert_eq!(sender(&ctx.host_to_client_queue[0]), GUEST_KEYBOARD);
+        assert_eq!(opcode(&ctx.host_to_client_queue[0]), wl_keyboard::EVT_KEY);
+        assert_eq!(sender(&ctx.host_to_client_queue[1]), GUEST_KEYBOARD);
+        assert_eq!(opcode(&ctx.host_to_client_queue[1]), wl_keyboard::EVT_KEY);
+        assert_eq!(sender(&ctx.host_to_client_queue[2]), GUEST_TEXT_INPUT);
+        assert_eq!(
+            opcode(&ctx.host_to_client_queue[2]),
+            zwp_text_input_v3::EVT_DONE
+        );
+    }
+
+    #[test]
+    fn raw_destroy_recreate_does_not_inherit_repeat_owner() {
+        use crate::protocols::text_input_unstable_v3::{
+            zwp_text_input_manager_v3, zwp_text_input_v3,
+        };
+        use crate::state::HostId;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        arm_raw_backspace_repeat(&mut ctx, &mut handler, HOST_TEXT_INPUT, GUEST_TEXT_INPUT);
+
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_DESTROY),
+        )
+        .is_none());
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            None,
+            "destroy must retire the lease before the guest ID becomes reusable"
+        );
+
+        let mut recreate = MessageBuilder::new();
+        recreate.write_u32(GUEST_TEXT_INPUT);
+        recreate.write_u32(GUEST_SEAT);
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_manager_v3",
+            recreate.build_message(
+                GUEST_TEXT_INPUT_MANAGER,
+                zwp_text_input_manager_v3::REQ_GET_TEXT_INPUT,
+            ),
+        )
+        .is_none());
+        let replacement_host_id = ctx.text_inputs[&GUEST_TEXT_INPUT].host_v1_id;
+        assert_ne!(replacement_host_id, HOST_TEXT_INPUT);
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            None,
+            "the replacement object must not inherit the old numeric ID's lease"
+        );
+
+        for request in [zwp_text_input_v3::REQ_ENABLE, zwp_text_input_v3::REQ_COMMIT] {
+            assert!(dispatch_raw_request_result(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v3",
+                raw_text_input_request(request),
+            )
+            .is_none());
+        }
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            raw_peek_key(701, 1_300, KEY_BACKSPACE, KEY_RELEASED),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            raw_peek_key(702, 1_400, KEY_BACKSPACE, KEY_PRESSED),
+        );
+        for text in ["나", ""] {
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v1",
+                raw_preedit(replacement_host_id, 1, text),
+            );
+        }
+        assert_eq!(
+            ctx.key_generations
+                .ime_repeat_owner(HostId(HOST_KEYBOARD), KEY_BACKSPACE),
+            Some(GUEST_TEXT_INPUT),
+            "a fresh physical generation may establish a new replacement-object lease"
+        );
     }
 
     #[test]
@@ -2123,6 +2477,349 @@ mod tests {
                     || u32::from_ne_bytes(message.0[8..12].try_into().unwrap()) != callback_id.0
             }),
             "internal callback teardown must never expose its host-only ID"
+        );
+    }
+
+    #[test]
+    fn raw_ime_trace_drops_old_korean_composition_and_repeat_across_focus_barrier() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+
+        const NEXT_GUEST_SURFACE: u32 = 910;
+        const NEXT_HOST_SURFACE: u32 = 911;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        register_raw_surface(&mut ctx, NEXT_GUEST_SURFACE, NEXT_HOST_SURFACE);
+
+        let mut held_space = MessageBuilder::new();
+        held_space.write_u32(700);
+        held_space.write_u32(1_000);
+        held_space.write_u32(KEY_SPACE);
+        held_space.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            held_space.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_preedit(HOST_TEXT_INPUT, 1, "가"),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_commit_string(HOST_TEXT_INPUT, 1, "가 "),
+        );
+        ctx.host_to_client_queue.clear();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            3,
+            "the old focused generation must repeat before the focus boundary"
+        );
+
+        ctx.host_to_client_queue.clear();
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_leave(701, HOST_SURFACE),
+        )
+        .is_some());
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+            .expect("focus loss must install a deactivation barrier");
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_enter(702, NEXT_HOST_SURFACE),
+        )
+        .is_some());
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_ENABLE),
+        )
+        .is_none());
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_COMMIT),
+        )
+        .is_none());
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+
+        ctx.host_to_client_queue.clear();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_preedit(HOST_TEXT_INPUT, 1, "오래된 조합"),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_commit_string(HOST_TEXT_INPUT, 1, "오래된 확정"),
+        );
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            raw_confirm_preedit(),
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "old composition and held-key recovery must stay behind the focus barrier"
+        );
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_callback",
+            raw_callback_done(callback_id.0),
+        );
+        assert!(
+            ctx.text_input_activation_barriers
+                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+                .is_none(),
+            "the old callback must be consumed even after guest ID reuse"
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_preedit(HOST_TEXT_INPUT, 2, "새 조합"),
+        );
+        assert!(
+            ctx.host_to_client_queue.iter().any(|message| {
+                sender(message) == GUEST_TEXT_INPUT
+                    && opcode(message) == zwp_text_input_v3::EVT_PREEDIT_STRING
+            }),
+            "the new focused generation must accept composition after the barrier"
+        );
+        assert!(ctx.host_to_client_queue.iter().all(|message| {
+            sender(message) != GUEST_TEXT_INPUT
+                || opcode(message) != zwp_text_input_v3::EVT_COMMIT_STRING
+        }));
+    }
+
+    #[test]
+    fn raw_ime_trace_destroy_recreate_ignores_old_callback_generation() {
+        use crate::protocols::text_input_unstable_v3::{
+            zwp_text_input_manager_v3, zwp_text_input_v3,
+        };
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        {
+            let state = ctx.text_inputs.get_mut(&GUEST_TEXT_INPUT).unwrap();
+            state.committed_enabled = false;
+            state.active_surface = None;
+        }
+        crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+            .expect("deactivation must install the old generation callback");
+
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_DESTROY),
+        )
+        .is_none());
+        assert!(!ctx.text_inputs.contains_key(&GUEST_TEXT_INPUT));
+
+        let mut recreate = MessageBuilder::new();
+        recreate.write_u32(GUEST_TEXT_INPUT);
+        recreate.write_u32(GUEST_SEAT);
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_manager_v3",
+            recreate.build_message(
+                GUEST_TEXT_INPUT_MANAGER,
+                zwp_text_input_manager_v3::REQ_GET_TEXT_INPUT,
+            ),
+        )
+        .is_none());
+        let replacement_host_id = ctx.text_inputs[&GUEST_TEXT_INPUT].host_v1_id;
+        assert_ne!(replacement_host_id, HOST_TEXT_INPUT);
+
+        for request in [zwp_text_input_v3::REQ_ENABLE, zwp_text_input_v3::REQ_COMMIT] {
+            assert!(dispatch_raw_request_result(
+                &mut handler,
+                &mut ctx,
+                "zwp_text_input_v3",
+                raw_text_input_request(request),
+            )
+            .is_none());
+        }
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+
+        ctx.client_to_host_queue.clear();
+        ctx.host_to_client_queue.clear();
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_callback",
+            raw_callback_done(callback_id.0),
+        );
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert_eq!(
+            ctx.text_inputs[&GUEST_TEXT_INPUT].host_v1_id,
+            replacement_host_id
+        );
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "the old callback must not reconcile or reactivate the replacement object"
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "the host-only old callback must not leak into the replacement guest lifecycle"
+        );
+
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            raw_preedit(replacement_host_id, 2, "새 객체"),
+        );
+        assert!(
+            !ctx.host_to_client_queue.is_empty(),
+            "the replacement host generation must remain live after the stale callback"
+        );
+    }
+
+    #[test]
+    fn raw_ime_trace_uncommitted_enable_disable_never_crosses_focus_generation() {
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+
+        const SECOND_GUEST_SURFACE: u32 = 910;
+        const SECOND_HOST_SURFACE: u32 = 911;
+        const THIRD_GUEST_SURFACE: u32 = 920;
+        const THIRD_HOST_SURFACE: u32 = 921;
+
+        let (mut ctx, mut handler) = setup_raw_ime_dispatch();
+        register_raw_surface(&mut ctx, SECOND_GUEST_SURFACE, SECOND_HOST_SURFACE);
+        register_raw_surface(&mut ctx, THIRD_GUEST_SURFACE, THIRD_HOST_SURFACE);
+
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_DISABLE),
+        )
+        .is_none());
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].committed_enabled);
+
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_leave(800, HOST_SURFACE),
+        )
+        .is_some());
+        let callback_id = ctx
+            .text_input_activation_barriers
+            .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+            .expect("focus loss must deactivate the committed old generation");
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_enter(801, SECOND_HOST_SURFACE),
+        )
+        .is_some());
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "wl_callback",
+            raw_callback_done(callback_id.0),
+        );
+        assert!(
+            ctx.text_input_activation_barriers
+                .callback_for(GUEST_TEXT_INPUT, HOST_TEXT_INPUT)
+                .is_none(),
+            "callback.done must consume the old focus barrier"
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+
+        ctx.client_to_host_queue.clear();
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_COMMIT),
+        )
+        .is_none());
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| sender(message) != HOST_TEXT_INPUT || opcode(message) != 0),
+            "the uncommitted disable from the old focus must not become a new activation"
+        );
+
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_ENABLE),
+        )
+        .is_none());
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].committed_enabled);
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_leave(802, SECOND_HOST_SURFACE),
+        )
+        .is_some());
+        assert!(dispatch_raw_event_result(
+            &mut handler,
+            &mut ctx,
+            "wl_keyboard",
+            raw_keyboard_enter(803, THIRD_HOST_SURFACE),
+        )
+        .is_some());
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
+
+        ctx.client_to_host_queue.clear();
+        assert!(dispatch_raw_request_result(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v3",
+            raw_text_input_request(zwp_text_input_v3::REQ_COMMIT),
+        )
+        .is_none());
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_activated);
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| sender(message) != HOST_TEXT_INPUT || opcode(message) != 0),
+            "the uncommitted enable from the previous focus must not cross generations"
         );
     }
 

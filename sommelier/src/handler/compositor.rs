@@ -1365,7 +1365,6 @@ mod tests {
             pending_preedit_selection: Some((0, 1)),
             pending_deletes: vec![(1, 1)],
             pending_cursor_position: Some((1, 1)),
-            empty_preedit_repeat_active: true,
             host_activated: true,
         }
     }
@@ -4009,7 +4008,6 @@ mod tests {
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
-                empty_preedit_repeat_active: false,
                 host_activated: true,
             },
         );
