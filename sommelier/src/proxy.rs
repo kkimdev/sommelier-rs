@@ -1072,6 +1072,260 @@ mod tests {
     }
 
     #[test]
+    fn raw_proxy_dispatch_repeats_held_space_after_korean_commit() {
+        use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+        use crate::protocols::wayland::wl_keyboard;
+        use crate::state::{HostId, TextInputState};
+
+        const GUEST_KEYBOARD: u32 = 10;
+        const HOST_KEYBOARD: u32 = 100;
+        const HOST_EXTENDED_KEYBOARD: u32 = 1_000;
+        const GUEST_TEXT_INPUT: u32 = 40;
+        const HOST_TEXT_INPUT: u32 = 140;
+        const HOST_EXTENDED_TEXT_INPUT: u32 = 2_000;
+        const GUEST_SEAT: u32 = 1;
+        const GUEST_SURFACE: u32 = 900;
+        const KEY_SPACE: u32 = 57;
+        const KEY_RELEASED: u32 = 0;
+        const KEY_PRESSED: u32 = 1;
+
+        fn dispatch_raw_event(
+            handler: &mut SommelierHandler,
+            ctx: &mut Context,
+            interface: &str,
+            message: Vec<u8>,
+        ) {
+            let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
+            let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
+            let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+            assert_eq!(
+                Client::dispatch_event(handler, ctx, interface, &mut wire),
+                Ok(None),
+                "raw host event must be consumed by the proxy handler"
+            );
+            assert!(
+                wire.is_payload_consumed(),
+                "proxy dispatch must consume the complete raw event payload"
+            );
+        }
+
+        fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+            u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+        }
+
+        fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+            (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+        }
+
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = SommelierHandler::new();
+
+        ctx.shadow_table.map_id(GUEST_KEYBOARD, HOST_KEYBOARD);
+        ctx.shadow_table.track_interface_with_version(
+            GUEST_KEYBOARD,
+            "wl_keyboard".to_string(),
+            10,
+        );
+        ctx.shadow_table.set_host_version(HOST_KEYBOARD, 10);
+        ctx.shadow_table.track_host_interface_with_version(
+            HOST_EXTENDED_KEYBOARD,
+            "zcr_extended_keyboard_v1".to_string(),
+            2,
+        );
+        ctx.keyboard_to_seat.insert(GUEST_KEYBOARD, GUEST_SEAT);
+        ctx.keyboard_to_extended_keyboard
+            .insert(HostId(HOST_KEYBOARD), HostId(HOST_EXTENDED_KEYBOARD));
+        ctx.extended_keyboard_to_keyboard
+            .insert(HostId(HOST_EXTENDED_KEYBOARD), HostId(HOST_KEYBOARD));
+        ctx.keyboard_repeatable_keys
+            .entry(HostId(HOST_KEYBOARD))
+            .or_default()
+            .insert(KEY_SPACE);
+        ctx.active_surface_for_seat
+            .insert(GUEST_SEAT, GUEST_SURFACE);
+        ctx.keyboard_active_surfaces
+            .insert(HostId(HOST_KEYBOARD), GUEST_SURFACE);
+
+        ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
+        ctx.shadow_table.track_interface_with_version(
+            GUEST_TEXT_INPUT,
+            "zwp_text_input_v3".to_string(),
+            1,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            HOST_TEXT_INPUT,
+            "zwp_text_input_v1".to_string(),
+            1,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            HOST_EXTENDED_TEXT_INPUT,
+            "zcr_extended_text_input_v1".to_string(),
+            11,
+        );
+        ctx.text_inputs.insert(
+            GUEST_TEXT_INPUT,
+            TextInputState {
+                host_v1_id: HOST_TEXT_INPUT,
+                host_ext_id: Some(HOST_EXTENDED_TEXT_INPUT),
+                guest_seat: GUEST_SEAT,
+                active_surface: Some(GUEST_SURFACE),
+                pending_enabled: true,
+                committed_enabled: true,
+                enabled_dirty: false,
+                pending_surrounding_text: None,
+                committed_surrounding_text: Some(("가".to_string(), 3, 3)),
+                surrounding_text_dirty: false,
+                content_hint: 0,
+                content_purpose: 0,
+                committed_content_type: None,
+                content_type_dirty: false,
+                cursor_rect: None,
+                cursor_rect_dirty: false,
+                text_change_cause: 0,
+                current_preedit: String::new(),
+                guest_commit_serial: 1,
+                pending_preedit_cursor: None,
+                pending_preedit_selection: None,
+                pending_deletes: Vec::new(),
+                pending_cursor_position: None,
+                empty_preedit_repeat_active: false,
+                host_activated: true,
+            },
+        );
+
+        let mut peek_press = MessageBuilder::new();
+        peek_press.write_u32(700);
+        peek_press.write_u32(1_234);
+        peek_press.write_u32(KEY_SPACE);
+        peek_press.write_u32(KEY_PRESSED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_press.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+
+        let mut preedit = MessageBuilder::new();
+        preedit.write_u32(1);
+        preedit.write_string("가");
+        preedit.write_string("");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            preedit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_PREEDIT_STRING),
+        );
+
+        let mut commit = MessageBuilder::new();
+        commit.write_u32(1);
+        commit.write_string("가 ");
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zwp_text_input_v1",
+            commit.build_message(HOST_TEXT_INPUT, zwp_text_input_v1::EVT_COMMIT_STRING),
+        );
+
+        let initial_commits: Vec<_> = ctx
+            .host_to_client_queue
+            .iter()
+            .filter(|message| {
+                sender(message) == GUEST_TEXT_INPUT
+                    && opcode(message) == zwp_text_input_v3::EVT_COMMIT_STRING
+            })
+            .collect();
+        assert_eq!(
+            initial_commits.len(),
+            1,
+            "the initial Space must commit exactly one string"
+        );
+        let mut initial_commit = WireMessage::new(
+            GUEST_TEXT_INPUT,
+            zwp_text_input_v3::EVT_COMMIT_STRING,
+            &initial_commits[0].0[8..],
+            &[],
+        );
+        assert_eq!(initial_commit.read_string().unwrap(), "가 ");
+        assert!(initial_commit.is_payload_consumed());
+
+        ctx.host_to_client_queue.clear();
+        for _ in 0..3 {
+            let mut confirm = MessageBuilder::new();
+            confirm.write_u32(1);
+            dispatch_raw_event(
+                &mut handler,
+                &mut ctx,
+                "zcr_extended_text_input_v1",
+                confirm.build_message(
+                    HOST_EXTENDED_TEXT_INPUT,
+                    zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+                ),
+            );
+        }
+
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            9,
+            "each repeat confirmation must emit press, release, and done"
+        );
+        for transaction in ctx.host_to_client_queue.chunks_exact(3) {
+            for (message, expected_state) in
+                transaction[..2].iter().zip([KEY_PRESSED, KEY_RELEASED])
+            {
+                assert_eq!(sender(message), GUEST_KEYBOARD);
+                assert_eq!(opcode(message), wl_keyboard::EVT_KEY);
+                let mut key =
+                    WireMessage::new(GUEST_KEYBOARD, wl_keyboard::EVT_KEY, &message.0[8..], &[]);
+                key.read_u32().unwrap();
+                assert_eq!(key.read_u32().unwrap(), 1_234);
+                assert_eq!(key.read_u32().unwrap(), KEY_SPACE);
+                assert_eq!(key.read_u32().unwrap(), expected_state);
+                assert!(key.is_payload_consumed());
+            }
+            assert_eq!(sender(&transaction[2]), GUEST_TEXT_INPUT);
+            assert_eq!(opcode(&transaction[2]), zwp_text_input_v3::EVT_DONE);
+        }
+
+        ctx.host_to_client_queue.clear();
+        let mut peek_release = MessageBuilder::new();
+        peek_release.write_u32(701);
+        peek_release.write_u32(1_300);
+        peek_release.write_u32(KEY_SPACE);
+        peek_release.write_u32(KEY_RELEASED);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_keyboard_v1",
+            peek_release.build_message(
+                HOST_EXTENDED_KEYBOARD,
+                zcr_extended_keyboard_v1::EVT_PEEK_KEY,
+            ),
+        );
+
+        let mut confirm_after_release = MessageBuilder::new();
+        confirm_after_release.write_u32(1);
+        dispatch_raw_event(
+            &mut handler,
+            &mut ctx,
+            "zcr_extended_text_input_v1",
+            confirm_after_release.build_message(
+                HOST_EXTENDED_TEXT_INPUT,
+                zcr_extended_text_input_v1::EVT_CONFIRM_PREEDIT,
+            ),
+        );
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "release and a later confirmation must not emit guest input"
+        );
+    }
+
+    #[test]
     fn synthetic_manager_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 20;
