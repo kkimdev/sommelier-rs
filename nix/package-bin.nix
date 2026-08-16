@@ -23,7 +23,7 @@ let
 in
 stdenv.mkDerivation rec {
   pname = "sommelier-rs-bin";
-  version = "0.2.4";
+  version = "0.2.5";
 
   src = fetchurl {
     url = "https://github.com/kkimdev/sommelier-rs/releases/download/virtwl-v${version}/sommelier_rs_virtwl-v${version}-${targetCpu}";
