@@ -290,6 +290,8 @@ impl ShadowTable {
                     | "wl_shm_pool"
                     | "zwp_text_input_manager_v3"
                     | "zwp_linux_dmabuf_feedback_v1"
+                    | "gtk_shell1"
+                    | "gtk_surface1"
             )
         )
     }
@@ -689,6 +691,22 @@ pub struct DmabufCapabilityState {
     pub ready: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct GtkShellState {
+    /// Activation token supplied by GTK for windows created through this
+    /// shell binding. ChromeOS validates the token before granting focus.
+    pub startup_id: Option<String>,
+    /// Synthetic gtk_surface1 objects created from this shell binding.
+    pub surfaces: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtkSurfaceState {
+    pub shell_id: u32,
+    pub wl_surface_id: u32,
+    pub host_zaura_surface_id: Option<u32>,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -841,6 +859,9 @@ pub struct Context {
     pub host_dmabuf_generation: Option<u64>,
     /// Host-only wl_callback IDs used as capability-discovery barriers.
     pub dmabuf_capability_callbacks: HashMap<u32, u64>,
+    /// Host sync callbacks that make a synthetic GTK shell binding visible
+    /// only after the internal Aura shell bind has reached the compositor.
+    pub gtk_shell_capability_callbacks: HashMap<u32, u32>,
     /// Host callback generations that drain stale text-input events before
     /// reactivation of a reused v1 object.
     pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
@@ -861,6 +882,10 @@ pub struct Context {
     pub vm_identifier: String,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
     pub wl_surface_to_zaura_surface: HashMap<u32, u32>,
+    /// Synthetic GTK shell bindings and their activation token state.
+    pub gtk_shells: HashMap<u32, GtkShellState>,
+    /// Synthetic GTK surfaces associated with guest wl_surface objects.
+    pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
     /// Tracks xdg_surface → wl_surface associations (guest IDs).
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
     /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
@@ -1222,6 +1247,7 @@ impl Context {
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,
             dmabuf_capability_callbacks: HashMap::new(),
+            gtk_shell_capability_callbacks: HashMap::new(),
             text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
@@ -1231,6 +1257,8 @@ impl Context {
             host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             wl_surface_to_zaura_surface: HashMap::new(),
+            gtk_shells: HashMap::new(),
+            gtk_surfaces: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),

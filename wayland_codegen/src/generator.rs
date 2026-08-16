@@ -819,7 +819,8 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                             if #name != 0
                                 && (ctx.shadow_table.is_pending_destroy_guest(#name)
                                     || !ctx.shadow_table.guest_object_matches(#name, #interface)
-                                    || ctx.shadow_table.get_host_id(#name).is_none())
+                                    || (ctx.shadow_table.get_host_id(#name).is_none()
+                                        && !ctx.shadow_table.is_local_only_guest_object(#name)))
                             {
                                 return Err(ProtocolError::InvalidObjectId(#name));
                             }
@@ -828,7 +829,8 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                         validations.push(quote! {
                             if ctx.shadow_table.is_pending_destroy_guest(#name)
                                 || !ctx.shadow_table.guest_object_matches(#name, #interface)
-                                || ctx.shadow_table.get_host_id(#name).is_none()
+                                || (ctx.shadow_table.get_host_id(#name).is_none()
+                                    && !ctx.shadow_table.is_local_only_guest_object(#name))
                             {
                                 return Err(ProtocolError::InvalidObjectId(#name));
                             }

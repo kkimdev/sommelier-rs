@@ -134,6 +134,7 @@ struct SommelierHandler {
     display: crate::handler::display::DisplayHandler,
     registry: crate::handler::registry::RegistryHandler,
     compositor: crate::handler::compositor::CompositorHandler,
+    gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
     callback: crate::handler::callback::CallbackHandler,
     shm: crate::handler::shm::ShmHandler,
     linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
@@ -154,6 +155,7 @@ impl SommelierHandler {
             display: crate::handler::display::DisplayHandler,
             registry: crate::handler::registry::RegistryHandler,
             compositor: crate::handler::compositor::CompositorHandler,
+            gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
             callback: crate::handler::callback::CallbackHandler,
             shm: crate::handler::shm::ShmHandler,
             linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
@@ -335,6 +337,8 @@ impl Client {
             protocols::keyboard_extension_unstable_v1::dispatch_request(
                 interface, msg, handler, ctx,
             )
+        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::gtk::dispatch_request(interface, msg, handler, ctx)
         } else {
             Ok(None)
         }
@@ -371,6 +375,8 @@ impl Client {
         } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
         {
             protocols::keyboard_extension_unstable_v1::dispatch_event(interface, msg, handler, ctx)
+        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::gtk::dispatch_event(interface, msg, handler, ctx)
         } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
             // Silently drop events for internally-bound aura_shell objects.
             // We only use these interfaces to send requests (set_application_id
@@ -410,6 +416,8 @@ impl Client {
         } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
         {
             protocols::keyboard_extension_unstable_v1::consume_event(interface, msg)
+        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::gtk::consume_event(interface, msg)
         } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
             protocols::aura_shell::consume_event(interface, msg)
         } else {
@@ -1520,6 +1528,53 @@ mod tests {
 
     fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
         (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+    }
+
+    #[test]
+    fn raw_gtk_surface_request_is_consumed_and_translated_to_aura() {
+        const GTK_SHELL: u32 = 40;
+        const GTK_SURFACE: u32 = 41;
+        const GUEST_SURFACE: u32 = 42;
+        const HOST_SURFACE: u32 = 142;
+        const AURA_SHELL: u32 = 240;
+
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table
+            .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
+        ctx.gtk_shells
+            .insert(GTK_SHELL, crate::state::GtkShellState::default());
+        register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
+        ctx.host_zaura_shell_id = Some(AURA_SHELL);
+        ctx.host_zaura_shell_version = 38;
+        ctx.shadow_table.track_host_interface_with_version(
+            AURA_SHELL,
+            "zaura_shell".to_string(),
+            38,
+        );
+        let mut request = MessageBuilder::new();
+        request.write_u32(GTK_SURFACE);
+        request.write_u32(GUEST_SURFACE);
+        let request =
+            request.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_GET_GTK_SURFACE);
+
+        let mut handler = SommelierHandler::new();
+        assert!(
+            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", request).is_none()
+        );
+        assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[0..4].try_into().unwrap()),
+            AURA_SHELL
+        );
+
+        let mut bell = MessageBuilder::new();
+        bell.write_u32(GTK_SURFACE);
+        let bell = bell.build_message(GTK_SHELL, protocols::gtk::gtk_shell1::REQ_SYSTEM_BELL);
+        assert!(
+            dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", bell).is_none(),
+            "a local gtk_surface object must be accepted by a local no-op request"
+        );
     }
 
     fn register_raw_surface(ctx: &mut Context, guest_surface: u32, host_surface: u32) {
@@ -3624,6 +3679,13 @@ protocols::keyboard_extension_unstable_v1::impl_sommelier_delegates!(SommelierHa
     zcr_extended_keyboard_v1: keyboard
 });
 impl protocols::keyboard_extension_unstable_v1::ProtocolHandler for SommelierHandler {}
+
+// GTK shell protocol, translated to ChromeOS Aura surface metadata.
+protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
+    gtk_shell1: gtk_shell,
+    gtk_surface1: gtk_shell
+});
+impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
 pub async fn run(
     display: &str,

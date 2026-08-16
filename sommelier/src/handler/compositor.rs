@@ -196,11 +196,11 @@ fn map_surface_damage(rect: DamageRect) -> DamageRect {
     )
 }
 
-fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
+pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
     format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
 }
 
-fn wayland_string_fits_message(value: &str) -> bool {
+pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
     // A string is encoded as a u32 length (including NUL), the bytes, and
     // 32-bit padding. Keep the complete message within Wayland's 16-bit
     // length field before handing it to MessageBuilder.
@@ -214,6 +214,47 @@ fn wayland_string_fits_message(value: &str) -> bool {
         .checked_add(4)
         .and_then(|header_and_length| header_and_length.checked_add(padded_length))
         .is_some_and(|total| total <= 0xffff)
+}
+
+/// Create or reuse the host Aura object associated with a guest wl_surface.
+///
+/// XDG and GTK metadata both target the same host surface. Exo rejects a
+/// second `zaura_surface` for one `wl_surface`, so all metadata paths must
+/// share this mapping.
+pub(crate) fn ensure_host_zaura_surface(
+    ctx: &mut Context,
+    wl_surface_guest_id: u32,
+) -> Option<u32> {
+    let wl_surface_host_id = ctx.shadow_table.get_host_id(wl_surface_guest_id)?;
+    if let Some(&zaura_surface_host_id) = ctx.wl_surface_to_zaura_surface.get(&wl_surface_host_id) {
+        return Some(zaura_surface_host_id);
+    }
+
+    let zaura_shell_host_id = ctx.host_zaura_shell_id?;
+    let zaura_surface_host_id = ctx.shadow_table.allocate_host_id();
+    ctx.shadow_table.track_host_interface_with_version(
+        zaura_surface_host_id,
+        "zaura_surface".to_string(),
+        ctx.host_zaura_shell_version,
+    );
+
+    let mut builder = crate::wire::MessageBuilder::new();
+    builder.write_u32(zaura_surface_host_id);
+    builder.write_u32(wl_surface_host_id);
+    let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE) else {
+        log::warn!(
+            "Unable to encode Aura surface request for wl_surface {}",
+            wl_surface_guest_id
+        );
+        ctx.shadow_table
+            .remove_host_interface(zaura_surface_host_id);
+        return None;
+    };
+
+    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.wl_surface_to_zaura_surface
+        .insert(wl_surface_host_id, zaura_surface_host_id);
+    Some(zaura_surface_host_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -693,6 +734,20 @@ impl WlSurfaceHandler for CompositorHandler {
                 // numeric ID reservation until connection teardown.
                 ctx.shadow_table
                     .retire_host_interface(zaura_surface_host_id);
+            }
+        }
+        let gtk_surface_ids = ctx
+            .gtk_surfaces
+            .iter()
+            .filter_map(|(&gtk_surface_id, state)| {
+                (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for gtk_surface_id in gtk_surface_ids {
+            if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
+                if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
+                    shell.surfaces.remove(&gtk_surface_id);
+                }
             }
         }
         // The generated dispatcher cannot express the ordering required by
@@ -1223,70 +1278,34 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(&wl_surface_guest_id) = ctx.xdg_toplevel_to_wl_surface.get(&xdg_toplevel_id) {
-            if let Some(wl_surface_host_id) = ctx.shadow_table.get_host_id(wl_surface_guest_id) {
-                // Lazily create a host zaura_surface for this wl_surface, or reuse
-                // an existing one. This avoids overhead for surfaces that never
-                // set an app ID (subsurfaces, popups, etc.).
-                let zaura_surface_host_id = if let Some(&existing_zaura_id) =
-                    ctx.wl_surface_to_zaura_surface.get(&wl_surface_host_id)
-                {
-                    existing_zaura_id
-                } else if let Some(zaura_shell_host_id) = ctx.host_zaura_shell_id {
-                    let zaura_surface_host_id = ctx.shadow_table.allocate_host_id();
-                    ctx.shadow_table.track_host_interface_with_version(
-                        zaura_surface_host_id,
-                        "zaura_surface".to_string(),
-                        ctx.host_zaura_shell_version,
-                    );
-
-                    let mut builder = crate::wire::MessageBuilder::new();
-                    builder.write_u32(zaura_surface_host_id);
-                    builder.write_u32(wl_surface_host_id);
-
-                    let Ok(msg) =
-                        builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE)
-                    else {
-                        log::warn!(
-                            "Dropping aura surface request for xdg_toplevel {}",
-                            xdg_toplevel_id
-                        );
-                        return Action::Drop;
-                    };
-                    ctx.client_to_host_queue.push((msg, Vec::new()));
-
-                    ctx.wl_surface_to_zaura_surface
-                        .insert(wl_surface_host_id, zaura_surface_host_id);
-
-                    zaura_surface_host_id
-                } else {
-                    0
-                };
-
+            if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
+            {
                 let zaura_surface_version = ctx
                     .shadow_table
                     .host_object_version(zaura_surface_host_id)
                     .unwrap_or(ctx.host_zaura_shell_version);
-                if zaura_surface_host_id != 0 && zaura_surface_version >= 5 {
-                    let mut builder = crate::wire::MessageBuilder::new();
-                    builder.write_string(&formatted_app_id);
-
-                    let Ok(msg) =
-                        builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
-                    else {
-                        log::warn!(
-                            "Dropping oversized aura application ID for xdg_toplevel {}",
-                            xdg_toplevel_id
-                        );
-                        return Action::Drop;
-                    };
-                    ctx.client_to_host_queue.push((msg, Vec::new()));
-                    log::debug!(
-                        "Set application ID to {} (formatted: {}) on zaura_surface (host_id={})",
-                        app_id,
-                        formatted_app_id,
-                        zaura_surface_host_id
-                    );
+                if zaura_surface_version < 5 {
+                    return Action::Drop;
                 }
+                let mut builder = crate::wire::MessageBuilder::new();
+                builder.write_string(&formatted_app_id);
+
+                let Ok(msg) =
+                    builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
+                else {
+                    log::warn!(
+                        "Dropping oversized aura application ID for xdg_toplevel {}",
+                        xdg_toplevel_id
+                    );
+                    return Action::Drop;
+                };
+                ctx.client_to_host_queue.push((msg, Vec::new()));
+                log::debug!(
+                    "Set application ID to {} (formatted: {}) on zaura_surface (host_id={})",
+                    app_id,
+                    formatted_app_id,
+                    zaura_surface_host_id
+                );
             }
         }
         Action::Drop

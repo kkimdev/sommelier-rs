@@ -20,6 +20,7 @@ use crate::handler::shm::{
 };
 use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
+use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
@@ -28,7 +29,7 @@ use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, HostGlobal, HostId, PendingDmabufGlobal};
+use crate::state::{Context, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -314,6 +315,31 @@ fn queue_dmabuf_capability_barrier(ctx: &mut Context, generation: u64) -> bool {
     }
 }
 
+fn queue_gtk_shell_capability_barrier(ctx: &mut Context, gtk_shell_id: u32) -> bool {
+    let callback_id = ctx.shadow_table.allocate_host_id();
+    ctx.shadow_table
+        .track_host_interface_with_version(callback_id, "wl_callback".to_string(), 1);
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(callback_id);
+    match builder.try_build_message(1, wl_display::REQ_SYNC) {
+        Ok(message) => {
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.gtk_shell_capability_callbacks
+                .insert(callback_id, gtk_shell_id);
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Unable to encode GTK shell capability barrier for object {}: {}",
+                gtk_shell_id,
+                error
+            );
+            ctx.shadow_table.remove_host_interface(callback_id);
+            false
+        }
+    }
+}
+
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
     ctx.host_dmabuf_global_name == Some(name)
         || ctx.host_shm_global_name == Some(name)
@@ -465,6 +491,7 @@ fn guest_bind_is_allowed(
         || DMABUF_ALLOWED.contains(&interface)
         || VIEWPORTER_ALLOWED.contains(&interface)
         || TEXT_INPUT_ALLOWED.contains(&interface)
+        || GTK_ALLOWED.contains(&interface)
         || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
         || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
         || interface == "wl_data_device_manager";
@@ -843,17 +870,22 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // wl_registry object. Sommelier has one internal aura shell
                 // binding per connection, so a later registry must not bind
                 // another host object or overwrite the shared routing state.
-                ctx.hidden_host_globals.insert(name, interface.clone());
-                record_registry_global_visibility(ctx, name, false);
+                ctx.host_globals.insert(
+                    name,
+                    HostGlobal {
+                        interface: "gtk_shell1".to_string(),
+                        version: 1,
+                    },
+                );
+                let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+                record_registry_global_visibility(ctx, name, visible);
                 return Action::Drop;
             }
-            ctx.hidden_host_globals.insert(name, interface.clone());
-            record_registry_global_visibility(ctx, name, false);
             // Bind zaura_shell internally for ChromeOS shelf integration.
             // We use this to create zaura_surface objects and set application
-            // IDs so the shelf can match windows to .desktop entries.
-            // Not exposed to the guest; capped at v38 (need v5 for
-            // set_application_id, v38 for release destructor).
+            // IDs and GTK startup IDs. The host-specific global is replaced
+            // at the guest boundary with gtk_shell1, using the same numeric
+            // registry name so its global_remove lifecycle remains paired.
             let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, 38);
             ctx.host_zaura_shell_id = Some(host_id);
@@ -864,6 +896,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 "zaura_shell".to_string(),
                 bound_version,
             );
+            ctx.host_globals.insert(
+                name,
+                HostGlobal {
+                    interface: "gtk_shell1".to_string(),
+                    version: 1,
+                },
+            );
+            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+            record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
             queue_internal_bind(
@@ -1097,6 +1138,18 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 *version,
             );
             return Action::Drop;
+        } else if interface == "gtk_shell1" {
+            ctx.shadow_table.track_interface_with_version(
+                *guest_new_id,
+                interface.clone(),
+                *version,
+            );
+            ctx.gtk_shells
+                .insert(*guest_new_id, GtkShellState::default());
+            if !queue_gtk_shell_capability_barrier(ctx, *guest_new_id) {
+                ctx.fatal_protocol_error = true;
+            }
+            return Action::Drop;
         }
 
         // Translation logic for other interfaces
@@ -1192,11 +1245,14 @@ mod tests {
         advertised_global_version, keyboard_extension_version, queue_dmabuf_capability_barrier,
         should_bind_internal_dmabuf, RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
     };
+    use crate::handler::callback::CallbackHandler;
     use crate::handler::linux_dmabuf::LinuxDmabufHandler;
     use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
+    use crate::protocols::gtk::gtk_shell1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
+    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_fixes::WlFixesHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::state::{Context, HostGlobal, HostId};
@@ -1311,6 +1367,69 @@ mod tests {
             u32::from_ne_bytes(message[0..4].try_into().unwrap()),
             11,
             "the synthetic event must target the second guest registry"
+        );
+    }
+
+    #[test]
+    fn aura_global_exposes_local_gtk_shell_to_every_registry() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(10, 100);
+        ctx.shadow_table.map_id(11, 101);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+        ctx.shadow_table
+            .track_interface_with_version(11, "wl_registry".to_string(), 1);
+        let mut handler = RegistryHandler;
+        let aura = "zaura_shell".to_string();
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        let global = &ctx.host_to_client_queue[0].0;
+        assert_eq!(u32::from_ne_bytes(global[0..4].try_into().unwrap()), 10);
+        let mut wire = crate::wire::WireMessage::new(10, 0, &global[8..], &[]);
+        assert_eq!(wire.read_u32().unwrap(), 7);
+        assert_eq!(wire.read_string().unwrap(), "gtk_shell1");
+        assert_eq!(wire.read_u32().unwrap(), 1);
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[0..4].try_into().unwrap()),
+            11
+        );
+
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = 10;
+        assert_eq!(
+            handler.on_bind(&mut ctx, 7, &("gtk_shell1".to_string(), 1, 50)),
+            Action::Drop
+        );
+        assert!(ctx.shadow_table.is_local_only_guest_object(50));
+        assert!(ctx.gtk_shells.contains_key(&50));
+        assert!(ctx.host_to_client_queue.is_empty());
+        let callback_id = ctx
+            .gtk_shell_capability_callbacks
+            .iter()
+            .find_map(|(&callback_id, &shell_id)| (shell_id == 50).then_some(callback_id))
+            .expect("GTK capability callback");
+        ctx.last_sender_id = callback_id;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        let capabilities = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(capabilities[0..4].try_into().unwrap()),
+            50
+        );
+        assert_eq!(
+            u16::from_ne_bytes(capabilities[4..6].try_into().unwrap()),
+            gtk_shell1::EVT_CAPABILITIES
+        );
+        assert_eq!(
+            u32::from_ne_bytes(capabilities[8..12].try_into().unwrap()),
+            0
         );
     }
 
@@ -1951,7 +2070,7 @@ mod tests {
             .track_host_interface(surface_id, "zaura_surface".to_string());
         ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
 
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Drop);
+        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_ne!(ctx.shadow_table.allocate_host_id(), shell_id);
         assert_ne!(ctx.shadow_table.allocate_host_id(), surface_id);
         assert_eq!(
@@ -1991,7 +2110,7 @@ mod tests {
             .track_host_interface(surface_id, "zaura_surface".to_string());
         ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
 
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Drop);
+        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_eq!(ctx.host_zaura_shell_id, None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(

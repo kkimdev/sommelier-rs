@@ -44,6 +44,26 @@ impl WlCallbackHandler for CallbackHandler {
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
             return Action::Drop;
         }
+        if let Some(gtk_shell_id) = ctx.gtk_shell_capability_callbacks.remove(&host_id) {
+            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
+                log::warn!(
+                    "GTK shell capability callback {} was not tracked as host-only",
+                    host_id
+                );
+            }
+            if ctx.gtk_shells.contains_key(&gtk_shell_id)
+                && ctx.shadow_table.is_local_only_guest_object(gtk_shell_id)
+            {
+                let mut builder = MessageBuilder::new();
+                builder.write_u32(0);
+                if let Ok(message) = builder
+                    .try_build_message(gtk_shell_id, protocols::gtk::gtk_shell1::EVT_CAPABILITIES)
+                {
+                    ctx.host_to_client_queue.push((message, Vec::new()));
+                }
+            }
+            return Action::Drop;
+        }
         let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);
 
         if guest_id != 0 {

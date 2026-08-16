@@ -157,4 +157,20 @@ mod tests {
             "version failures must be reported as protocol errors"
         );
     }
+
+    #[test]
+    fn test_request_object_validation_accepts_local_only_objects() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path = manifest_dir.join("../third_party/protocols/gtk-shell.xml");
+        let protocol = parse(protocol_path).expect("Failed to parse gtk-shell.xml");
+        let code = generator::generate(&protocol);
+        let compact = without_whitespace(&code);
+
+        assert!(
+            compact.contains(
+                "get_host_id(surface).is_none()&&!ctx.shadow_table.is_local_only_guest_object(surface)"
+            ),
+            "typed object arguments must accept synthetic local-only objects for local handlers"
+        );
+    }
 }
