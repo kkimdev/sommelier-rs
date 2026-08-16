@@ -17,8 +17,8 @@ let
       or (throw "Unsupported system architecture: ${stdenv.hostPlatform.system}");
 
   hashMap = {
-    x86_64 = "sha256-Y9qtH2k2ztnpOMMcOsSeVVXyZNAwedW5uUUj2Dg/uF4=";
-    aarch64 = "sha256-2lhuQK5qxUkKUbH7x3pJxXYngFdhIDVTVM8WTZjr2vU=";
+    x86_64 = "sha256-W4Utwr0GU3ByZyJLnqRz82XHaguW3U0JQNPUxlhTEFs=";
+    aarch64 = "sha256-NEjAXjnczVwN5nSWTcXVZdOJw+AihZ6+sxdSP3BTNlg=";
   };
 in
 stdenv.mkDerivation rec {
