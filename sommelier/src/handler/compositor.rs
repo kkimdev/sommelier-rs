@@ -222,10 +222,6 @@ fn map_surface_damage(rect: DamageRect) -> DamageRect {
     )
 }
 
-pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
-    format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
-}
-
 pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
     // A string is encoded as a u32 length (including NUL), the bytes, and
     // 32-bit padding. Keep the complete message within Wayland's 16-bit
@@ -913,20 +909,8 @@ impl WlSurfaceHandler for CompositorHandler {
                     .retire_host_interface(zaura_surface_host_id);
             }
         }
-        let gtk_surface_ids = ctx
-            .gtk_surfaces
-            .iter()
-            .filter_map(|(&gtk_surface_id, state)| {
-                (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
-            })
-            .collect::<Vec<_>>();
-        for gtk_surface_id in gtk_surface_ids {
-            if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
-                if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
-                    shell.surfaces.remove(&gtk_surface_id);
-                }
-            }
-        }
+        ctx.window_placement
+            .take_gtk_surfaces_for_wl_surface(wl_surface_guest_id);
         // The generated dispatcher cannot express the ordering required by
         // the aura-shell integration: zaura_surface.release must precede the
         // paired wl_surface destructor.
@@ -1516,7 +1500,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             };
             application_id
         } else {
-            native_wayland_app_id(&ctx.vm_identifier, app_id)
+            ctx.window_placement.native_wayland_app_id(app_id)
         };
         if !wayland_string_fits_message(&formatted_app_id) {
             log::warn!(
@@ -1731,7 +1715,7 @@ mod tests {
         ctx.shadow_table
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
         ctx.window_placement
-            .set_aura_shell_binding(zaura_shell_host, None, 38);
+            .set_aura_shell_binding_for_test(zaura_shell_host, 38);
         assert!(ctx
             .window_placement
             .remember_xdg_surface(xdg_surface_id, wl_surface_guest));
@@ -2213,7 +2197,7 @@ mod tests {
     fn set_app_id_noop_when_version_below_5() {
         let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.window_placement
-            .set_aura_shell_binding(zaura_shell_host, None, 4);
+            .set_aura_shell_binding_for_test(zaura_shell_host, 4);
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;
@@ -4951,7 +4935,7 @@ mod tests {
     fn old_aura_surface_stays_reserved_without_release_request() {
         let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.window_placement
-            .set_aura_shell_binding(zaura_shell_host, None, 37);
+            .set_aura_shell_binding_for_test(zaura_shell_host, 37);
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;

@@ -379,23 +379,14 @@ impl KeyboardHandler {
             );
             return false;
         };
-        let Some((output_host_id, output)) = ctx.primary_output() else {
+        let Some((output_host_id, (x, y, width, height))) =
+            ctx.window_placement.bounds_for_rect(shortcut.rect)
+        else {
             log::debug!(
-                "window shortcut {:?} ignored: no usable output for xdg_toplevel {}",
+                "window shortcut {:?} ignored: no usable output or invalid rectangle for \
+                 xdg_toplevel {}",
                 shortcut,
                 guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some((x, y, width, height)) = shortcut.rect.to_bounds(
-            output
-                .work_area()
-                .expect("primary_output only returns an output with a work area"),
-        ) else {
-            log::debug!(
-                "window shortcut {:?} ignored: invalid output geometry {:?}",
-                shortcut,
-                output
             );
             return false;
         };
@@ -1693,7 +1684,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);
@@ -1826,7 +1817,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);
@@ -1902,7 +1893,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);
@@ -1986,7 +1977,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);
@@ -2073,7 +2064,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);
@@ -2121,7 +2112,7 @@ mod tests {
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
         ctx.window_placement
             .update_output_mode(output, true, 3840, 2160);

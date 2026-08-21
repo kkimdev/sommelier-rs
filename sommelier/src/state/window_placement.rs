@@ -22,13 +22,13 @@ limitations under the License.
 //! keeps backend selection, origin prediction, barrier retirement, and ARC
 //! application-ID lifetime consistent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use log::warn;
 
-use crate::window_shortcuts::{ShortcutConfig, ShortcutConfigHandle};
+use crate::window_shortcuts::{NormalizedRect, ShortcutConfig, ShortcutConfigHandle};
 
 /// Application-ID policy used for compositor-owned window operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -177,6 +177,7 @@ impl OutputState {
 
 /// Application-ID namespace used by the ARC bounds backend.
 pub(crate) const ARC_SESSION_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.session";
+const DEFAULT_VM_IDENTIFIER: &str = "termina";
 
 // ARC parses the numeric suffix with a signed 32-bit `%d`. Keep generated
 // values positive and well below INT32_MAX while partitioning the range by
@@ -195,6 +196,16 @@ fn next_arc_session_id() -> u32 {
     ARC_SESSION_ID_BASE + 1 + pid_component * ARC_SESSION_ID_SERIAL_SLOT_COUNT + serial
 }
 
+/// Resolve the VM namespace used in ChromeOS guest application IDs.
+///
+/// An exported-but-empty environment variable is equivalent to an unset one,
+/// matching ChromiumOS Sommelier's fallback to the standard Crostini VM name.
+pub(crate) fn resolve_vm_identifier(value: Option<String>) -> String {
+    value
+        .filter(|identifier| !identifier.is_empty())
+        .unwrap_or_else(|| DEFAULT_VM_IDENTIFIER.to_string())
+}
+
 #[derive(Debug, Default)]
 struct ToplevelPlacementState {
     /// Last authoritative or predicted screen-space origin.
@@ -203,11 +214,32 @@ struct ToplevelPlacementState {
     pending_origin: Option<(i32, i32)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy)]
 struct AuraShellBinding {
-    host_id: Option<u32>,
-    global_name: Option<u32>,
+    host_id: u32,
+    global_name: u32,
     version: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputRecord {
+    host_id: u32,
+    state: OutputState,
+}
+
+#[derive(Debug, Default)]
+struct GtkShellState {
+    /// Activation token supplied by GTK for windows created through this
+    /// shell binding. ChromeOS validates the token before granting focus.
+    startup_id: Option<String>,
+    /// Synthetic gtk_surface1 objects created from this shell binding.
+    surfaces: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GtkSurfaceState {
+    shell_id: u32,
+    wl_surface_id: u32,
 }
 
 /// All mutable state owned by the window-placement feature.
@@ -220,7 +252,8 @@ struct AuraShellBinding {
 pub(crate) struct WindowPlacementState {
     mode: WindowPlacementMode,
     shortcut_config: ShortcutConfigHandle,
-    aura_shell: AuraShellBinding,
+    vm_identifier: String,
+    aura_shell: Option<AuraShellBinding>,
     arc_session_application_ids: HashMap<u32, String>,
     aura_surface_by_wl_surface: HashMap<u32, u32>,
     wl_surface_by_aura_surface: HashMap<u32, u32>,
@@ -233,8 +266,10 @@ pub(crate) struct WindowPlacementState {
     toplevels: HashMap<u32, ToplevelPlacementState>,
     barrier_to_toplevel: HashMap<u32, u32>,
     active_barrier_by_toplevel: HashMap<u32, u32>,
-    output_host_ids: Vec<u32>,
-    output_states: HashMap<u32, OutputState>,
+    outputs: Vec<OutputRecord>,
+    gtk_shells: HashMap<u32, GtkShellState>,
+    gtk_surfaces: HashMap<u32, GtkSurfaceState>,
+    gtk_shell_capability_callbacks: HashMap<u32, u32>,
 }
 
 impl WindowPlacementState {
@@ -295,18 +330,23 @@ impl WindowPlacementState {
                     == Some(wl_surface_guest_id)
             }
         ));
-        debug_assert_eq!(
-            self.output_host_ids
+        debug_assert!(self.outputs.iter().enumerate().all(|(index, output)| {
+            self.outputs[..index]
                 .iter()
-                .filter(|host_id| self.output_states.contains_key(host_id))
-                .count(),
-            self.output_host_ids.len()
-        );
-        debug_assert_eq!(self.output_host_ids.len(), self.output_states.len());
-        debug_assert!(self
-            .output_states
-            .keys()
-            .all(|host_id| self.output_host_ids.contains(host_id)));
+                .all(|previous| previous.host_id != output.host_id)
+        }));
+        debug_assert!(self.gtk_shells.iter().all(|(shell_id, shell)| {
+            shell.surfaces.iter().all(|surface_id| {
+                self.gtk_surfaces
+                    .get(surface_id)
+                    .is_some_and(|surface| surface.shell_id == *shell_id)
+            })
+        }));
+        debug_assert!(self.gtk_surfaces.iter().all(|(surface_id, surface)| {
+            self.gtk_shells
+                .get(&surface.shell_id)
+                .is_some_and(|shell| shell.surfaces.contains(surface_id))
+        }));
         debug_assert!(self.toplevels.keys().all(|zaura_toplevel_host_id| {
             self.xdg_toplevel_by_aura_toplevel
                 .contains_key(zaura_toplevel_host_id)
@@ -323,7 +363,11 @@ impl WindowPlacementState {
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
-        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled())
+        Self::with_shortcut_config(
+            mode,
+            ShortcutConfigHandle::disabled(),
+            DEFAULT_VM_IDENTIFIER.to_string(),
+        )
     }
 
     /// Create placement state with the process-wide immutable binding handle.
@@ -333,11 +377,13 @@ impl WindowPlacementState {
     pub(crate) fn with_shortcut_config(
         mode: WindowPlacementMode,
         shortcut_config: ShortcutConfigHandle,
+        vm_identifier: String,
     ) -> Self {
         Self {
             mode,
             shortcut_config,
-            aura_shell: AuraShellBinding::default(),
+            vm_identifier,
+            aura_shell: None,
             arc_session_application_ids: HashMap::new(),
             aura_surface_by_wl_surface: HashMap::new(),
             wl_surface_by_aura_surface: HashMap::new(),
@@ -350,8 +396,10 @@ impl WindowPlacementState {
             toplevels: HashMap::new(),
             barrier_to_toplevel: HashMap::new(),
             active_barrier_by_toplevel: HashMap::new(),
-            output_host_ids: Vec::new(),
-            output_states: HashMap::new(),
+            outputs: Vec::new(),
+            gtk_shells: HashMap::new(),
+            gtk_surfaces: HashMap::new(),
+            gtk_shell_capability_callbacks: HashMap::new(),
         }
     }
 
@@ -377,17 +425,26 @@ impl WindowPlacementState {
 
     /// Return the internally bound Aura shell manager, if one is live.
     pub(crate) const fn aura_shell_id(&self) -> Option<u32> {
-        self.aura_shell.host_id
+        match self.aura_shell {
+            Some(binding) => Some(binding.host_id),
+            None => None,
+        }
     }
 
     /// Return the negotiated version of the internally bound Aura shell.
     pub(crate) const fn aura_shell_version(&self) -> u32 {
-        self.aura_shell.version
+        match self.aura_shell {
+            Some(binding) => binding.version,
+            None => 0,
+        }
     }
 
     /// Return the host registry global that produced the Aura shell binding.
     pub(crate) const fn aura_shell_global_name(&self) -> Option<u32> {
-        self.aura_shell.global_name
+        match self.aura_shell {
+            Some(binding) => Some(binding.global_name),
+            None => None,
+        }
     }
 
     /// Publish one complete Aura shell binding generation.
@@ -395,38 +452,51 @@ impl WindowPlacementState {
     /// Keeping ID, source global, and version in one record prevents a global
     /// replacement from accidentally retaining the old version or routing
     /// requests through an object whose manager has already been released.
-    pub(crate) fn set_aura_shell_binding(
-        &mut self,
-        host_id: u32,
-        global_name: Option<u32>,
-        version: u32,
-    ) {
-        self.aura_shell = AuraShellBinding {
-            host_id: Some(host_id),
+    pub(crate) fn set_aura_shell_binding(&mut self, host_id: u32, global_name: u32, version: u32) {
+        self.aura_shell = Some(AuraShellBinding {
+            host_id,
             global_name,
             version,
-        };
+        });
         self.debug_assert_consistent();
     }
 
     /// Retire the Aura shell only when the named global owns the live binding.
     pub(crate) fn take_aura_shell_for_global(&mut self, global_name: u32) -> Option<(u32, u32)> {
-        if self.aura_shell.global_name != Some(global_name) {
+        if self.aura_shell?.global_name != global_name {
             return None;
         }
-        let binding = std::mem::take(&mut self.aura_shell);
+        let binding = self.aura_shell.take()?;
         self.debug_assert_consistent();
-        binding.host_id.map(|host_id| (host_id, binding.version))
+        Some((binding.host_id, binding.version))
     }
 
     #[cfg(test)]
     pub(crate) fn clear_aura_shell_for_test(&mut self) {
-        self.aura_shell = AuraShellBinding::default();
+        self.aura_shell = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_aura_shell_binding_for_test(&mut self, host_id: u32, version: u32) {
+        self.aura_shell = Some(AuraShellBinding {
+            host_id,
+            global_name: 0,
+            version,
+        });
+        self.debug_assert_consistent();
     }
 
     /// Take one immutable binding generation for a key event.
     pub(crate) fn shortcut_config_snapshot(&self) -> Arc<ShortcutConfig> {
         self.shortcut_config.snapshot()
+    }
+
+    /// Format a native Wayland application ID in ChromeOS' Guest OS namespace.
+    pub(crate) fn native_wayland_app_id(&self, app_id: &str) -> String {
+        format!(
+            "org.chromium.guest_os.{}.wayland.{}",
+            self.vm_identifier, app_id
+        )
     }
 
     /// Replace the shared binding handle. Production reloads replace the
@@ -437,14 +507,173 @@ impl WindowPlacementState {
         self.shortcut_config = shortcut_config;
     }
 
-    /// Register a host output once and create its geometry record.
-    pub(crate) fn remember_output(&mut self, host_output_id: u32) -> bool {
-        if self.output_states.contains_key(&host_output_id) {
+    /// Register one synthetic GTK shell binding.
+    #[must_use = "duplicate GTK shell IDs must not replace live protocol state"]
+    pub(crate) fn remember_gtk_shell(&mut self, shell_id: u32) -> bool {
+        if self.gtk_shells.contains_key(&shell_id) {
             return false;
         }
-        self.output_host_ids.push(host_output_id);
-        self.output_states
-            .insert(host_output_id, OutputState::default());
+        self.gtk_shells.insert(shell_id, GtkShellState::default());
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Return the startup ID and child-surface IDs owned by a GTK shell.
+    pub(crate) fn gtk_shell_startup_and_surfaces(
+        &self,
+        shell_id: u32,
+    ) -> Option<(Option<String>, Vec<u32>)> {
+        let shell = self.gtk_shells.get(&shell_id)?;
+        let mut surfaces = shell.surfaces.iter().copied().collect::<Vec<_>>();
+        surfaces.sort_unstable();
+        Some((shell.startup_id.clone(), surfaces))
+    }
+
+    /// Update a shell's startup ID and return its current child surfaces.
+    pub(crate) fn update_gtk_shell_startup_id(
+        &mut self,
+        shell_id: u32,
+        startup_id: Option<String>,
+    ) -> Option<Vec<u32>> {
+        let shell = self.gtk_shells.get_mut(&shell_id)?;
+        shell.startup_id = startup_id;
+        let mut surfaces = shell.surfaces.iter().copied().collect::<Vec<_>>();
+        surfaces.sort_unstable();
+        self.debug_assert_consistent();
+        Some(surfaces)
+    }
+
+    /// Return the wl_surface backing one synthetic GTK surface.
+    pub(crate) fn wl_surface_for_gtk_surface(&self, gtk_surface_id: u32) -> Option<u32> {
+        self.gtk_surfaces
+            .get(&gtk_surface_id)
+            .map(|surface| surface.wl_surface_id)
+    }
+
+    /// Register a GTK surface and link it to its owning shell.
+    #[must_use = "the GTK surface association may conflict with a live object"]
+    pub(crate) fn remember_gtk_surface(
+        &mut self,
+        gtk_surface_id: u32,
+        shell_id: u32,
+        wl_surface_id: u32,
+    ) -> bool {
+        if !self.gtk_shells.contains_key(&shell_id)
+            || self
+                .gtk_surfaces
+                .get(&gtk_surface_id)
+                .is_some_and(|existing| {
+                    *existing
+                        != (GtkSurfaceState {
+                            shell_id,
+                            wl_surface_id,
+                        })
+                })
+        {
+            return false;
+        }
+        self.gtk_surfaces.insert(
+            gtk_surface_id,
+            GtkSurfaceState {
+                shell_id,
+                wl_surface_id,
+            },
+        );
+        self.gtk_shells
+            .get_mut(&shell_id)
+            .expect("GTK shell was checked above")
+            .surfaces
+            .insert(gtk_surface_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Remove one GTK surface and its reverse shell membership.
+    fn take_gtk_surface(&mut self, gtk_surface_id: u32) -> Option<GtkSurfaceState> {
+        let surface = self.gtk_surfaces.remove(&gtk_surface_id)?;
+        if let Some(shell) = self.gtk_shells.get_mut(&surface.shell_id) {
+            shell.surfaces.remove(&gtk_surface_id);
+        }
+        self.debug_assert_consistent();
+        Some(surface)
+    }
+
+    /// Remove every synthetic GTK surface backed by one wl_surface.
+    pub(crate) fn take_gtk_surfaces_for_wl_surface(&mut self, wl_surface_id: u32) -> Vec<u32> {
+        let mut surface_ids = self
+            .gtk_surfaces
+            .iter()
+            .filter_map(|(&gtk_surface_id, surface)| {
+                (surface.wl_surface_id == wl_surface_id).then_some(gtk_surface_id)
+            })
+            .collect::<Vec<_>>();
+        surface_ids.sort_unstable();
+        for gtk_surface_id in &surface_ids {
+            self.take_gtk_surface(*gtk_surface_id);
+        }
+        self.debug_assert_consistent();
+        surface_ids
+    }
+
+    /// Return whether a synthetic GTK shell is still registered.
+    pub(crate) fn has_gtk_shell(&self, shell_id: u32) -> bool {
+        self.gtk_shells.contains_key(&shell_id)
+    }
+
+    /// Register a host capability barrier for one GTK shell.
+    #[must_use = "a callback ID may only be registered once"]
+    pub(crate) fn register_gtk_shell_capability_callback(
+        &mut self,
+        callback_host_id: u32,
+        shell_id: u32,
+    ) -> bool {
+        if self
+            .gtk_shell_capability_callbacks
+            .contains_key(&callback_host_id)
+            || !self.gtk_shells.contains_key(&shell_id)
+        {
+            return false;
+        }
+        self.gtk_shell_capability_callbacks
+            .insert(callback_host_id, shell_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Retire and resolve a completed GTK shell capability barrier.
+    pub(crate) fn take_gtk_shell_capability_callback(
+        &mut self,
+        callback_host_id: u32,
+    ) -> Option<u32> {
+        let shell_id = self
+            .gtk_shell_capability_callbacks
+            .remove(&callback_host_id)?;
+        self.debug_assert_consistent();
+        Some(shell_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gtk_shell_capability_callback_for_test(&self, shell_id: u32) -> Option<u32> {
+        self.gtk_shell_capability_callbacks.iter().find_map(
+            |(&callback_host_id, &registered_shell_id)| {
+                (registered_shell_id == shell_id).then_some(callback_host_id)
+            },
+        )
+    }
+
+    /// Register a host output once and create its geometry record.
+    pub(crate) fn remember_output(&mut self, host_output_id: u32) -> bool {
+        if self
+            .outputs
+            .iter()
+            .any(|output| output.host_id == host_output_id)
+        {
+            return false;
+        }
+        self.outputs.push(OutputRecord {
+            host_id: host_output_id,
+            state: OutputState::default(),
+        });
         self.debug_assert_consistent();
         true
     }
@@ -460,15 +689,23 @@ impl WindowPlacementState {
         width: i32,
         height: i32,
     ) {
-        if !self.output_states.contains_key(&host_output_id) {
-            self.output_host_ids.push(host_output_id);
-            self.output_states
-                .insert(host_output_id, OutputState::default());
-        }
-        let output = self
-            .output_states
-            .get_mut(&host_output_id)
-            .expect("output record was inserted above");
+        let output = if let Some(output) = self
+            .outputs
+            .iter_mut()
+            .find(|output| output.host_id == host_output_id)
+        {
+            &mut output.state
+        } else {
+            self.outputs.push(OutputRecord {
+                host_id: host_output_id,
+                state: OutputState::default(),
+            });
+            &mut self
+                .outputs
+                .last_mut()
+                .expect("output record was inserted above")
+                .state
+        };
         if current || output.mode_width == 0 || output.mode_height == 0 {
             output.mode_width = width;
             output.mode_height = height;
@@ -478,25 +715,49 @@ impl WindowPlacementState {
 
     /// Update the scale advertised by one output.
     pub(crate) fn update_output_scale(&mut self, host_output_id: u32, scale: i32) {
-        if !self.output_states.contains_key(&host_output_id) {
-            self.output_host_ids.push(host_output_id);
-            self.output_states
-                .insert(host_output_id, OutputState::default());
-        }
-        let output = self
-            .output_states
-            .get_mut(&host_output_id)
-            .expect("output record was inserted above");
+        let output = if let Some(output) = self
+            .outputs
+            .iter_mut()
+            .find(|output| output.host_id == host_output_id)
+        {
+            &mut output.state
+        } else {
+            self.outputs.push(OutputRecord {
+                host_id: host_output_id,
+                state: OutputState::default(),
+            });
+            &mut self
+                .outputs
+                .last_mut()
+                .expect("output record was inserted above")
+                .state
+        };
         output.scale = scale;
         self.debug_assert_consistent();
     }
 
     /// Return the first usable output in stable host-advertisement order.
     pub(crate) fn primary_output(&self) -> Option<(u32, OutputState)> {
-        self.output_host_ids.iter().find_map(|&host_id| {
-            let state = *self.output_states.get(&host_id)?;
-            state.work_area().map(|_| (host_id, state))
+        self.outputs.iter().find_map(|output| {
+            output
+                .state
+                .work_area()
+                .map(|_| (output.host_id, output.state))
         })
+    }
+
+    /// Convert a normalized shortcut rectangle using the first usable output.
+    ///
+    /// Output selection and work-area conversion belong to placement state so
+    /// handlers cannot accidentally apply a rectangle against a stale or
+    /// differently scaled output record.
+    pub(crate) fn bounds_for_rect(
+        &self,
+        rect: NormalizedRect,
+    ) -> Option<(u32, (i32, i32, i32, i32))> {
+        let (host_id, output) = self.primary_output()?;
+        let bounds = rect.to_bounds(output.work_area()?)?;
+        Some((host_id, bounds))
     }
 
     /// Record the xdg_surface → wl_surface role association.
@@ -937,6 +1198,22 @@ mod tests {
     }
 
     #[test]
+    fn vm_identifier_defaults_and_native_ids_are_owned_by_placement_state() {
+        assert_eq!(resolve_vm_identifier(None), "termina");
+        assert_eq!(resolve_vm_identifier(Some(String::new())), "termina");
+        assert_eq!(
+            resolve_vm_identifier(Some("penguin".to_string())),
+            "penguin"
+        );
+
+        let state = WindowPlacementState::default();
+        assert_eq!(
+            state.native_wayland_app_id("com.example.Terminal"),
+            "org.chromium.guest_os.termina.wayland.com.example.Terminal"
+        );
+    }
+
+    #[test]
     fn mode_capabilities_match_backend() {
         let disabled = WindowPlacementMode::disabled();
         let arc_bounds =
@@ -1143,12 +1420,16 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(
+            state.bounds_for_rect(NormalizedRect::new(0.0, 0.0, 0.5, 0.5)),
+            Some((50, (0, 0, 960, 540)))
+        );
     }
 
     #[test]
     fn aura_shell_binding_teardown_is_owned_by_global_generation() {
         let mut state = WindowPlacementState::default();
-        state.set_aura_shell_binding(24, Some(7), 38);
+        state.set_aura_shell_binding(24, 7, 38);
 
         assert_eq!(state.aura_shell_id(), Some(24));
         assert_eq!(state.aura_shell_global_name(), Some(7));
@@ -1166,5 +1447,44 @@ mod tests {
         assert_eq!(state.aura_shell_id(), None);
         assert_eq!(state.aura_shell_global_name(), None);
         assert_eq!(state.aura_shell_version(), 0);
+    }
+
+    #[test]
+    fn gtk_shell_and_surface_state_has_one_authoritative_bidirectional_link() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_gtk_shell(10));
+        assert!(!state.remember_gtk_shell(10));
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((None, Vec::new()))
+        );
+        assert!(!state.remember_gtk_surface(11, 99, 20));
+        assert!(state.remember_gtk_surface(11, 10, 20));
+        assert!(!state.remember_gtk_surface(11, 10, 21));
+        assert!(state.remember_gtk_surface(12, 10, 20));
+        assert_eq!(state.wl_surface_for_gtk_surface(11), Some(20));
+
+        assert_eq!(
+            state.update_gtk_shell_startup_id(10, Some("startup".to_string())),
+            Some(vec![11, 12])
+        );
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((Some("startup".to_string()), vec![11, 12]))
+        );
+
+        assert!(state.register_gtk_shell_capability_callback(40, 10));
+        assert!(!state.register_gtk_shell_capability_callback(40, 10));
+        assert_eq!(state.gtk_shell_capability_callback_for_test(10), Some(40));
+        assert_eq!(state.take_gtk_shell_capability_callback(40), Some(10));
+        assert_eq!(state.gtk_shell_capability_callback_for_test(10), None);
+
+        assert_eq!(state.take_gtk_surfaces_for_wl_surface(20), vec![11, 12]);
+        assert_eq!(state.wl_surface_for_gtk_surface(11), None);
+        assert_eq!(state.wl_surface_for_gtk_surface(12), None);
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((Some("startup".to_string()), Vec::new()))
+        );
     }
 }

@@ -46,9 +46,9 @@ pub(crate) use self::render::{
     SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
-pub(crate) use self::window_placement::ARC_SESSION_APPLICATION_ID_PREFIX;
+pub(crate) use self::window_placement::{OutputState, ARC_SESSION_APPLICATION_ID_PREFIX};
 pub(crate) use self::window_placement::{
-    OutputState, WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
+    WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -700,21 +700,6 @@ pub struct DmabufCapabilityState {
     pub ready: bool,
 }
 
-#[derive(Debug, Default)]
-pub struct GtkShellState {
-    /// Activation token supplied by GTK for windows created through this
-    /// shell binding. ChromeOS validates the token before granting focus.
-    pub startup_id: Option<String>,
-    /// Synthetic gtk_surface1 objects created from this shell binding.
-    pub surfaces: HashSet<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GtkSurfaceState {
-    pub shell_id: u32,
-    pub wl_surface_id: u32,
-}
-
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -866,9 +851,6 @@ pub struct Context {
     pub host_dmabuf_generation: Option<u64>,
     /// Host-only wl_callback IDs used as capability-discovery barriers.
     pub dmabuf_capability_callbacks: HashMap<u32, u64>,
-    /// Host sync callbacks that make a synthetic GTK shell binding visible
-    /// only after the internal Aura shell bind has reached the compositor.
-    pub gtk_shell_capability_callbacks: HashMap<u32, u32>,
     /// Host callback generations that drain stale text-input events before
     /// reactivation of a reused v1 object.
     pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
@@ -880,15 +862,9 @@ pub struct Context {
     pub dmabuf_guest_generations: HashMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
-    /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
-    pub vm_identifier: String,
     /// Single source of truth for placement backend selection and all
     /// compositor-owned placement state.
     pub(crate) window_placement: WindowPlacementState,
-    /// Synthetic GTK shell bindings and their activation token state.
-    pub gtk_shells: HashMap<u32, GtkShellState>,
-    /// Synthetic GTK surfaces associated with guest wl_surface objects.
-    pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1186,8 +1162,13 @@ impl Context {
             }
         };
 
-        let window_placement =
-            WindowPlacementState::with_shortcut_config(placement_mode, shortcut_config);
+        let vm_identifier =
+            window_placement::resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
+        let window_placement = WindowPlacementState::with_shortcut_config(
+            placement_mode,
+            shortcut_config,
+            vm_identifier,
+        );
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1248,16 +1229,12 @@ impl Context {
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,
             dmabuf_capability_callbacks: HashMap::new(),
-            gtk_shell_capability_callbacks: HashMap::new(),
             text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
             xdg_decoration,
-            vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             window_placement,
-            gtk_shells: HashMap::new(),
-            gtk_surfaces: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1304,22 +1281,6 @@ impl Context {
             .set_shortcut_config(ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid()));
         ctx
     }
-
-    /// Return the first output with a usable mode.
-    pub fn primary_output(&self) -> Option<(u32, OutputState)> {
-        self.window_placement.primary_output()
-    }
-}
-
-/// Resolve the VM namespace used in ChromeOS application IDs.
-///
-/// An exported-but-empty environment variable is equivalent to an unset one.
-/// This mirrors ChromiumOS Sommelier's `strlen(vm_id) != 0` fallback and keeps
-/// generated IDs valid (`org.chromium.guest_os.termina.wayland.<app-id>`).
-fn resolve_vm_identifier(value: Option<String>) -> String {
-    value
-        .filter(|identifier| !identifier.is_empty())
-        .unwrap_or_else(|| "termina".to_string())
 }
 
 impl Default for Context {
@@ -1678,16 +1639,6 @@ mod tests {
             "the acknowledged ID may be reused after delete_id"
         );
         assert!(!table.consume_host_delete_id(40));
-    }
-
-    #[test]
-    fn empty_or_missing_vm_identifier_defaults_to_termina() {
-        assert_eq!(resolve_vm_identifier(None), "termina");
-        assert_eq!(resolve_vm_identifier(Some(String::new())), "termina");
-        assert_eq!(
-            resolve_vm_identifier(Some("penguin".to_string())),
-            "penguin"
-        );
     }
 
     #[test]
