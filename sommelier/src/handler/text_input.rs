@@ -2823,7 +2823,12 @@ mod tests {
             HostId(host_keyboard_id)
         ));
         let mut key_serials = Vec::new();
-        for messages in ctx.host_to_client_queue.chunks_exact(3) {
+        let (transactions, remainder) = ctx.host_to_client_queue.as_chunks::<3>();
+        assert!(
+            remainder.is_empty(),
+            "synthetic key transactions must have three messages"
+        );
+        for messages in transactions {
             assert_eq!(msg_sender(messages, 0), 40);
             assert_eq!(msg_opcode(messages, 0), 3);
             assert_eq!(msg_sender(&messages[1..], 0), 40);

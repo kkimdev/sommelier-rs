@@ -243,15 +243,15 @@ impl KeyboardHandler {
         host_keyboard_id: HostId,
         keys: &[u8],
     ) {
-        let mut chunks = keys.chunks_exact(std::mem::size_of::<u32>());
+        let (chunks, remainder) = keys.as_chunks::<4>();
         let pressed_keys: std::collections::HashSet<_> = chunks
-            .by_ref()
-            .map(|chunk| u32::from_ne_bytes(chunk.try_into().expect("u32-sized key chunk")))
+            .iter()
+            .map(|chunk| u32::from_ne_bytes(*chunk))
             .collect();
-        if !chunks.remainder().is_empty() {
+        if !remainder.is_empty() {
             log::warn!(
                 "wl_keyboard.enter keys array has {} trailing byte(s)",
-                chunks.remainder().len()
+                remainder.len()
             );
         }
 
@@ -2948,7 +2948,12 @@ mod tests {
 
         assert_eq!(ctx.host_to_client_queue.len(), 9);
         let mut serials = std::collections::HashSet::new();
-        for transaction in ctx.host_to_client_queue.chunks_exact(3) {
+        let (transactions, remainder) = ctx.host_to_client_queue.as_chunks::<3>();
+        assert!(
+            remainder.is_empty(),
+            "synthetic key transactions must have three messages"
+        );
+        for transaction in transactions {
             for (message, expected_state) in transaction[..2]
                 .iter()
                 .zip([WL_KEY_PRESSED, WL_KEY_RELEASED])

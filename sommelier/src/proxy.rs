@@ -2210,7 +2210,12 @@ mod tests {
             9,
             "each repeat confirmation must emit press, release, and done"
         );
-        for transaction in ctx.host_to_client_queue.chunks_exact(3) {
+        let (transactions, remainder) = ctx.host_to_client_queue.as_chunks::<3>();
+        assert!(
+            remainder.is_empty(),
+            "synthetic key transactions must have three messages"
+        );
+        for transaction in transactions {
             for (message, expected_state) in
                 transaction[..2].iter().zip([KEY_PRESSED, KEY_RELEASED])
             {
