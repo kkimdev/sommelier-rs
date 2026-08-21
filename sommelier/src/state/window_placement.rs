@@ -23,11 +23,11 @@ limitations under the License.
 //! application-ID lifetime consistent.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use log::warn;
 
+use crate::arc_task_ids::ArcTaskIdAllocator;
 use crate::window_shortcuts::{NormalizedRect, ShortcutConfig, ShortcutConfigHandle};
 
 /// Application-ID policy used for compositor-owned window operations.
@@ -36,7 +36,7 @@ pub(crate) enum WindowHostPolicy {
     /// Keep the normal Crostini/guest application namespace.
     #[default]
     Guest,
-    /// Use the ARC-session namespace required by the direct bounds policy.
+    /// Use the ARC task-compatible namespace required by the direct bounds policy.
     Arc,
 }
 
@@ -180,34 +180,11 @@ impl OutputState {
     }
 }
 
-/// Application-ID namespace used by the ARC bounds backend.
-pub(crate) const ARC_SESSION_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.session";
+/// Prefix for the numeric ARC task-form application IDs used by placement.
+pub(crate) const ARC_TASK_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.";
+#[cfg(test)]
+pub(crate) use crate::arc_task_ids::{ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START};
 const DEFAULT_VM_IDENTIFIER: &str = "termina";
-
-// ARC parses the numeric suffix with a signed 32-bit `%d`. Keep generated
-// values positive and well below INT32_MAX while partitioning the range by
-// process ID and a process-wide serial. The serial is intentionally global so
-// multiple Context instances in one process cannot reuse an ID concurrently.
-//
-// This allocator is the one deliberate process-wide exception to
-// `WindowPlacementState`'s lifecycle ownership: it only reserves a fresh
-// numeric identity. The live identity-to-surface mapping remains in each
-// connection's state and is retired by `take_aura_surface_for_wl_surface`.
-// Keeping allocation process-wide avoids collisions between simultaneous
-// client contexts; moving it into each state would restart the serial for
-// every connection and make active ARC application IDs collide.
-const ARC_SESSION_ID_BASE: u32 = 1_000_000_000;
-const ARC_SESSION_ID_PID_MASK: u32 = (1 << 14) - 1;
-const ARC_SESSION_ID_SERIAL_MASK: u32 = (1 << 14) - 1;
-const ARC_SESSION_ID_SERIAL_SLOT_COUNT: u32 = ARC_SESSION_ID_SERIAL_MASK + 1;
-static NEXT_ARC_SESSION_ID_SERIAL: AtomicU32 = AtomicU32::new(0);
-
-fn next_arc_session_id() -> u32 {
-    let pid_component = std::process::id() & ARC_SESSION_ID_PID_MASK;
-    let serial =
-        NEXT_ARC_SESSION_ID_SERIAL.fetch_add(1, Ordering::Relaxed) & ARC_SESSION_ID_SERIAL_MASK;
-    ARC_SESSION_ID_BASE + 1 + pid_component * ARC_SESSION_ID_SERIAL_SLOT_COUNT + serial
-}
 
 /// Resolve the VM namespace used in ChromeOS guest application IDs.
 ///
@@ -426,8 +403,9 @@ pub(crate) struct WindowPlacementState {
     mode: WindowPlacementMode,
     shortcut_config: ShortcutConfigHandle,
     vm_identifier: String,
+    arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
     aura_shell: Option<AuraShellBinding>,
-    arc_session_application_ids: HashMap<u32, String>,
+    arc_application_ids: HashMap<u32, String>,
     aura_surface_links: BidirectionalLinks,
     aura_toplevel_links: BidirectionalLinks,
     xdg_surface_links: BidirectionalLinks,
@@ -484,7 +462,7 @@ impl WindowPlacementState {
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
-        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled())
+        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled(), None)
     }
 
     /// Create placement state with the process-wide immutable binding handle.
@@ -494,14 +472,23 @@ impl WindowPlacementState {
     pub(crate) fn with_shortcut_config(
         mode: WindowPlacementMode,
         shortcut_config: ShortcutConfigHandle,
+        arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
     ) -> Self {
         let vm_identifier = resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
+        #[cfg(test)]
+        let arc_task_allocator = if mode.uses_arc_policy() {
+            arc_task_allocator
+                .or_else(|| Some(ArcTaskIdAllocator::for_test(2_000_000_000, 2_000_000_999)))
+        } else {
+            arc_task_allocator
+        };
         Self {
             mode,
             shortcut_config,
             vm_identifier,
+            arc_task_allocator,
             aura_shell: None,
-            arc_session_application_ids: HashMap::new(),
+            arc_application_ids: HashMap::new(),
             aura_surface_links: BidirectionalLinks::default(),
             aura_toplevel_links: BidirectionalLinks::default(),
             xdg_surface_links: BidirectionalLinks::default(),
@@ -971,30 +958,35 @@ impl WindowPlacementState {
         toplevels
     }
 
-    /// Return the stable ARC application ID for one guest wl_surface.
+    /// Return the stable ARC task-form application ID for one guest surface.
     ///
     /// The mapping lasts until [`Self::take_aura_surface_for_wl_surface`] is
     /// called. XDG and GTK metadata paths therefore cannot disagree while the
     /// surface is alive. The result is `None` when the ARC host policy is not
-    /// selected.
-    pub(crate) fn arc_session_application_id(
-        &mut self,
-        wl_surface_guest_id: u32,
-    ) -> Option<String> {
+    /// selected or when no process-wide task block is available.
+    pub(crate) fn arc_policy_application_id(&mut self, wl_surface_guest_id: u32) -> Option<String> {
         if !self.uses_arc_policy() {
             return None;
         }
-        Some(
-            self.arc_session_application_ids
-                .entry(wl_surface_guest_id)
-                .or_insert_with(|| {
-                    format!(
-                        "{ARC_SESSION_APPLICATION_ID_PREFIX}.{}",
-                        next_arc_session_id()
-                    )
-                })
-                .clone(),
-        )
+        if let Some(application_id) = self.arc_application_ids.get(&wl_surface_guest_id) {
+            return Some(application_id.clone());
+        }
+
+        let allocator = self.arc_task_allocator.as_ref()?;
+        let task_id = match allocator.allocate() {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                warn!(
+                    "Unable to allocate an ARC task ID for guest surface {}: {}",
+                    wl_surface_guest_id, error
+                );
+                return None;
+            }
+        };
+        let application_id = format!("{ARC_TASK_APPLICATION_ID_PREFIX}{task_id}");
+        self.arc_application_ids
+            .insert(wl_surface_guest_id, application_id.clone());
+        Some(application_id)
     }
 
     /// Remove the ARC identity and Aura-surface link for a destroyed surface.
@@ -1009,8 +1001,7 @@ impl WindowPlacementState {
         wl_surface_guest_id: u32,
         wl_surface_host_id: u32,
     ) -> Option<u32> {
-        self.arc_session_application_ids
-            .remove(&wl_surface_guest_id);
+        self.arc_application_ids.remove(&wl_surface_guest_id);
         let zaura_surface_host_id = self.aura_surface_links.remove_forward(wl_surface_host_id);
         self.debug_assert_consistent();
         zaura_surface_host_id
@@ -1229,6 +1220,10 @@ impl WindowPlacementState {
 
     #[cfg(test)]
     pub(crate) fn set_mode_for_test(&mut self, mode: WindowPlacementMode) {
+        if mode.uses_arc_policy() && self.arc_task_allocator.is_none() {
+            self.arc_task_allocator =
+                Some(ArcTaskIdAllocator::for_test(2_000_000_000, 2_000_000_999));
+        }
         self.mode = mode;
     }
 }
@@ -1357,26 +1352,48 @@ mod tests {
             WindowHostPolicy::Guest,
             WindowGeometryMethod::SelfParent,
         ));
-        assert_eq!(state.arc_session_application_id(10), None);
+        assert_eq!(state.arc_policy_application_id(10), None);
     }
 
     #[test]
-    fn arc_session_ids_are_stable_until_surface_release() {
+    fn arc_policy_id_is_stable_per_surface_and_unique_within_a_process_block() {
         let mut state = WindowPlacementState::new(WindowPlacementMode::new(
             WindowHostPolicy::Arc,
             WindowGeometryMethod::Bounds,
         ));
         let first = state
-            .arc_session_application_id(10)
+            .arc_policy_application_id(10)
             .expect("ARC backend should allocate an application ID");
-        assert_eq!(state.arc_session_application_id(10), Some(first.clone()));
-        let suffix = first
-            .strip_prefix(&format!("{ARC_SESSION_APPLICATION_ID_PREFIX}."))
-            .expect("ARC session prefix");
-        assert!(suffix.parse::<u32>().expect("numeric ARC session ID") > ARC_SESSION_ID_BASE);
+        let second = state
+            .arc_policy_application_id(11)
+            .expect("ARC backend should allocate a second application ID");
+        assert_ne!(first, second);
+        assert!(first.starts_with(ARC_TASK_APPLICATION_ID_PREFIX));
+        assert!(second.starts_with(ARC_TASK_APPLICATION_ID_PREFIX));
+        assert_eq!(state.arc_policy_application_id(10), Some(first.clone()));
+        assert_eq!(state.arc_policy_application_id(11), Some(second));
 
         assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
-        assert_ne!(state.arc_session_application_id(10), Some(first));
+        let replacement = state
+            .arc_policy_application_id(10)
+            .expect("released surface can receive a new ID");
+        assert_ne!(replacement, first);
+    }
+
+    #[test]
+    fn arc_policy_id_stays_inside_the_private_task_pool() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
+        let application_id = state
+            .arc_policy_application_id(10)
+            .expect("ARC backend should allocate a task-form application ID");
+        let task_id = application_id
+            .strip_prefix(ARC_TASK_APPLICATION_ID_PREFIX)
+            .expect("ARC task-form prefix");
+        let task_id = task_id.parse::<u32>().expect("numeric ARC task ID");
+        assert!((ARC_TASK_ID_POOL_START..=ARC_TASK_ID_POOL_END).contains(&task_id));
     }
 
     #[test]

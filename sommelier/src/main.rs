@@ -25,6 +25,7 @@ use crate::window_shortcuts::{ShortcutConfig, ShortcutConfigHandle};
 
 mod accelerator;
 mod allocator;
+mod arc_task_ids;
 mod connection;
 mod handler;
 mod proxy;
@@ -273,6 +274,18 @@ async fn main() {
     }
     let shortcut_config_handle = ShortcutConfigHandle::new(shortcut_config);
 
+    let arc_task_allocator = if placement_mode.uses_arc_policy() {
+        match arc_task_ids::ArcTaskIdAllocator::acquire() {
+            Ok(allocator) => Some(allocator),
+            Err(error) => {
+                log::error!("Unable to reserve an ARC task ID block: {}", error);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
     }
@@ -295,6 +308,7 @@ async fn main() {
             shortcut_config: shortcut_config_handle,
             shortcut_config_path,
             host_accelerators,
+            arc_task_allocator,
         },
     )
     .await;

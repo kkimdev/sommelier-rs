@@ -160,7 +160,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         let application_id = if ctx.window_placement.uses_arc_policy() {
             let Some(application_id) = ctx
                 .window_placement
-                .arc_session_application_id(wl_surface_guest_id)
+                .arc_policy_application_id(wl_surface_guest_id)
             else {
                 log::warn!(
                     "ARC placement mode changed before GTK app ID allocation for surface {}",
@@ -370,13 +370,22 @@ mod tests {
         assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
         let expected_application_id = ctx
             .window_placement
-            .arc_session_application_id(WL_SURFACE_GUEST)
-            .expect("ARC backend should allocate a session application ID");
+            .arc_policy_application_id(WL_SURFACE_GUEST)
+            .expect("ARC backend should allocate a compatibility application ID");
         assert_eq!(
             nullable_string(message).as_deref(),
             Some(expected_application_id.as_str())
         );
-        assert!(expected_application_id.starts_with("org.chromium.arc.session."));
+        assert!(expected_application_id.starts_with("org.chromium.arc."));
+        let task_id = expected_application_id
+            .strip_prefix("org.chromium.arc.")
+            .expect("ARC task-form application ID")
+            .parse::<u32>()
+            .expect("numeric ARC task ID");
+        assert!(
+            (crate::state::ARC_TASK_ID_POOL_START..=crate::state::ARC_TASK_ID_POOL_END)
+                .contains(&task_id)
+        );
     }
 
     #[test]

@@ -1442,7 +1442,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
                 // ID and a later GTK D-Bus metadata update can reuse it.
                 let _ = ctx
                     .window_placement
-                    .arc_session_application_id(wl_surface_id);
+                    .arc_policy_application_id(wl_surface_id);
             }
             // The generated dispatcher installs the guest→host mapping after
             // this callback, so the proxy retries Aura-child creation after
@@ -1516,14 +1516,14 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         let aura_app_id = if ctx.window_placement.uses_arc_policy() {
             let Some(wl_surface_guest_id) = wl_surface_guest_id else {
                 log::warn!(
-                    "Cannot allocate ARC session ID for xdg_toplevel {} without its wl_surface",
+                    "Cannot allocate ARC policy ID for xdg_toplevel {} without its wl_surface",
                     xdg_toplevel_id
                 );
                 return Action::Drop;
             };
             let Some(application_id) = ctx
                 .window_placement
-                .arc_session_application_id(wl_surface_guest_id)
+                .arc_policy_application_id(wl_surface_guest_id)
             else {
                 log::warn!(
                     "ARC placement mode changed before app ID allocation for xdg_toplevel {}",
@@ -1712,9 +1712,9 @@ mod tests {
     use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
-    use crate::state::ARC_SESSION_APPLICATION_ID_PREFIX;
     use crate::state::{
         BufferState, Context, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
+        ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START,
     };
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::{Arc, RwLock};
@@ -2210,8 +2210,8 @@ mod tests {
     }
 
     #[test]
-    fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+    fn set_app_id_uses_pr2_arc_identity_and_wire_sequence() {
+        let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.window_placement
             .set_mode_for_test(crate::state::WindowPlacementMode::new(
                 crate::state::WindowHostPolicy::Arc,
@@ -2224,19 +2224,49 @@ mod tests {
             handler.on_set_app_id(&mut ctx, &"com.example.Terminal".to_string()),
             Action::Drop
         );
-        let message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_SET_APPLICATION_ID)
-            .expect("ARC application ID request");
-        let payload = &message.0[8..];
+
+        // PR #2's working runtime sequence is:
+        //   xdg_toplevel.set_app_id(native guest ID)
+        //   zaura_shell.get_aura_surface(...)
+        //   zaura_surface.set_application_id(ARC compatibility ID)
+        // The rewritten handler returns Drop because it queues the translated
+        // XDG request itself; assert the complete queue rather than merely
+        // searching for the final ARC string.
+        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        let xdg_message = &ctx.client_to_host_queue[0].0;
+        assert_eq!(msg_sender(xdg_message), xdg_toplevel_id + 100);
+        assert_eq!(msg_opcode(xdg_message), REQ_SET_APP_ID);
+        let xdg_payload = &xdg_message[8..];
+        let xdg_len = u32::from_ne_bytes(xdg_payload[0..4].try_into().unwrap()) as usize;
+        let xdg_app_id =
+            std::str::from_utf8(&xdg_payload[4..4 + xdg_len - 1]).expect("valid guest app ID");
+        assert_eq!(
+            xdg_app_id,
+            ctx.window_placement
+                .native_wayland_app_id("com.example.Terminal")
+        );
+
+        let get_surface = &ctx.client_to_host_queue[1].0;
+        assert_eq!(msg_sender(get_surface), zaura_shell_host);
+        assert_eq!(msg_opcode(get_surface), REQ_GET_AURA_SURFACE);
+
+        let set_aura_id = &ctx.client_to_host_queue[2].0;
+        assert_eq!(msg_opcode(set_aura_id), REQ_SET_APPLICATION_ID);
+        let aura_surface_host = msg_sender(set_aura_id);
+        assert_eq!(
+            Some(aura_surface_host),
+            ctx.window_placement
+                .aura_surface_for_wl_surface(wl_surface_host)
+        );
+        let payload = &set_aura_id[8..];
         let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let app_id = std::str::from_utf8(&payload[4..4 + str_len - 1]).unwrap();
-        assert!(app_id.starts_with(format!("{ARC_SESSION_APPLICATION_ID_PREFIX}.").as_str()));
-        let suffix = app_id
-            .strip_prefix(format!("{ARC_SESSION_APPLICATION_ID_PREFIX}.").as_str())
-            .unwrap();
-        assert!(suffix.parse::<u32>().is_ok());
+        let app_id =
+            std::str::from_utf8(&payload[4..4 + str_len - 1]).expect("valid ARC application ID");
+        let task_id = app_id
+            .strip_prefix(ARC_TASK_APPLICATION_ID_PREFIX)
+            .expect("ARC task-form application ID");
+        let task_id = task_id.parse::<u32>().expect("numeric ARC task ID");
+        assert!((ARC_TASK_ID_POOL_START..=ARC_TASK_ID_POOL_END).contains(&task_id));
     }
 
     #[test]
@@ -2270,7 +2300,7 @@ mod tests {
                 .native_wayland_app_id("com.example.Terminal")
         );
         assert!(
-            !xdg_app_id.starts_with(format!("{ARC_SESSION_APPLICATION_ID_PREFIX}.").as_str()),
+            !xdg_app_id.starts_with("org.chromium.arc."),
             "ARC policy must not relabel the host XDG role"
         );
     }
