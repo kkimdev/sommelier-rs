@@ -29,6 +29,9 @@ use self::render::RenderBufferRegistry;
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
+#[cfg(test)]
+use crate::window_shortcuts::ShortcutConfig;
+use crate::window_shortcuts::ShortcutConfigHandle;
 use log::warn;
 
 #[allow(unused_imports)]
@@ -44,7 +47,9 @@ pub(crate) use self::render::{
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_SESSION_APPLICATION_ID_PREFIX;
-pub(crate) use self::window_placement::{WindowPlacementMode, WindowPlacementState};
+pub(crate) use self::window_placement::{
+    WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
+};
 
 /// A Wayland object ID allocated by the **guest** (client) side.
 ///
@@ -922,6 +927,9 @@ pub struct Context {
     /// Single source of truth for placement backend selection and all
     /// compositor-owned placement state.
     pub(crate) window_placement: WindowPlacementState,
+    /// Shared immutable shortcut bindings, replaced only after a validated
+    /// runtime reload.
+    pub(crate) shortcut_config: ShortcutConfigHandle,
     /// Host wl_output IDs advertised to the guest.
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
@@ -1206,6 +1214,22 @@ impl Context {
     }
 
     pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
+        Self::new_with_options(
+            gpu_accel,
+            xdg_decoration,
+            WindowPlacementMode::from_environment(),
+            ShortcutConfigHandle::disabled(),
+            crate::accelerator::from_environment(),
+        )
+    }
+
+    pub(crate) fn new_with_options(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        placement_mode: WindowPlacementMode,
+        shortcut_config: ShortcutConfigHandle,
+        accelerators: Vec<crate::accelerator::Accelerator>,
+    ) -> Self {
         // Initialize allocator
         let allocator = match Allocator::new() {
             Ok(alloc) => Some(alloc),
@@ -1215,22 +1239,7 @@ impl Context {
             }
         };
 
-        let accelerators_env = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
-        let accelerators = match crate::accelerator::parse_accelerators(&accelerators_env) {
-            Ok(list) => list,
-            Err(e) => {
-                // A malformed accelerator config should not crash the proxy — that
-                // would break every app in the container. Degrade to no filtering
-                // (all keys forwarded to guest) and log a clear error.
-                warn!(
-                    "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
-                     Accelerator filtering disabled.",
-                    accelerators_env, e
-                );
-                Vec::new()
-            }
-        };
-        let window_placement = WindowPlacementState::new(WindowPlacementMode::from_environment());
+        let window_placement = WindowPlacementState::new(placement_mode);
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1302,6 +1311,7 @@ impl Context {
             host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             window_placement,
+            shortcut_config,
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
             gtk_shells: HashMap::new(),
@@ -1349,7 +1359,8 @@ impl Context {
         // Keep unit tests deterministic even when the developer's shell uses
         // the runtime-only ARC bounds workaround for an isolated proxy.
         ctx.window_placement
-            .set_mode_for_test(WindowPlacementMode::Disabled);
+            .set_mode_for_test(WindowPlacementMode::disabled());
+        ctx.shortcut_config = ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid());
         ctx
     }
 

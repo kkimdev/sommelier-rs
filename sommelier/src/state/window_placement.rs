@@ -27,31 +27,69 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::warn;
 
-/// Backend selected for the opt-in window-placement shortcuts.
+/// Application-ID policy used for compositor-owned window operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum WindowPlacementMode {
-    /// Keep normal Sommelier behavior and forward all shortcut keys.
+pub(crate) enum WindowHostPolicy {
+    /// Keep the normal Crostini/guest application namespace.
     #[default]
-    Disabled,
-    /// Use `zaura_toplevel.set_window_bounds` with an ARC-session identity.
-    ArcBounds,
-    /// Use the unsupported `zaura_surface.set_parent(self, ...)` probe.
+    Guest,
+    /// Use the ARC-session namespace required by the direct bounds policy.
+    Arc,
+}
+
+/// Geometry operation used for compositor-owned window shortcuts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WindowGeometryMethod {
+    /// Do not consume or execute Sommelier-owned window shortcuts.
+    #[default]
+    None,
+    /// Send `zaura_toplevel.set_window_bounds`.
+    Bounds,
+    /// Send the unsupported position-only self-parent probe.
     SelfParent,
 }
 
+/// Independent host-policy and geometry selections for window shortcuts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WindowPlacementMode {
+    pub(crate) host_policy: WindowHostPolicy,
+    pub(crate) geometry_method: WindowGeometryMethod,
+}
+
 impl WindowPlacementMode {
-    /// Resolve the mutually exclusive backend from the two environment flags.
-    ///
-    /// ARC bounds take precedence if both flags are present because it is the
-    /// only backend that carries a requested width and height.
-    pub(crate) const fn from_flags(arc_bounds_enabled: bool, self_parent_enabled: bool) -> Self {
-        if arc_bounds_enabled {
-            Self::ArcBounds
-        } else if self_parent_enabled {
-            Self::SelfParent
-        } else {
-            Self::Disabled
+    pub(crate) const fn new(
+        host_policy: WindowHostPolicy,
+        geometry_method: WindowGeometryMethod,
+    ) -> Self {
+        Self {
+            host_policy,
+            geometry_method,
         }
+    }
+
+    pub(crate) const fn disabled() -> Self {
+        Self::new(WindowHostPolicy::Guest, WindowGeometryMethod::None)
+    }
+
+    /// Resolve the legacy environment flags for compatibility paths.
+    ///
+    /// The production binary uses explicit CLI values. Keeping this adapter
+    /// preserves deterministic behavior for older in-process callers while
+    /// making the two axes explicit internally.
+    pub(crate) const fn from_flags(arc_bounds_enabled: bool, self_parent_enabled: bool) -> Self {
+        let host_policy = if arc_bounds_enabled {
+            WindowHostPolicy::Arc
+        } else {
+            WindowHostPolicy::Guest
+        };
+        let geometry_method = if arc_bounds_enabled {
+            WindowGeometryMethod::Bounds
+        } else if self_parent_enabled {
+            WindowGeometryMethod::SelfParent
+        } else {
+            WindowGeometryMethod::None
+        };
+        Self::new(host_policy, geometry_method)
     }
 
     /// Resolve the backend from the process environment once at startup.
@@ -77,19 +115,24 @@ impl WindowPlacementMode {
         mode
     }
 
-    /// Return whether this backend consumes the placement shortcuts.
+    /// Return whether this geometry method consumes placement shortcuts.
     pub(crate) const fn handles_shortcuts(self) -> bool {
-        !matches!(self, Self::Disabled)
+        !matches!(self.geometry_method, WindowGeometryMethod::None)
     }
 
-    /// Return whether this backend uses the ARC application namespace.
-    pub(crate) const fn uses_arc_bounds(self) -> bool {
-        matches!(self, Self::ArcBounds)
+    /// Return whether the ARC application namespace is selected.
+    pub(crate) const fn uses_arc_policy(self) -> bool {
+        matches!(self.host_policy, WindowHostPolicy::Arc)
+    }
+
+    /// Return whether direct Aura bounds are selected.
+    pub(crate) const fn uses_bounds(self) -> bool {
+        matches!(self.geometry_method, WindowGeometryMethod::Bounds)
     }
 
     /// Return whether this backend runs the position-only self-parent probe.
     pub(crate) const fn uses_self_parent(self) -> bool {
-        matches!(self, Self::SelfParent)
+        matches!(self.geometry_method, WindowGeometryMethod::SelfParent)
     }
 }
 
@@ -209,9 +252,14 @@ impl WindowPlacementState {
         self.mode.handles_shortcuts()
     }
 
+    /// Return whether this connection uses the ARC application namespace.
+    pub(crate) const fn uses_arc_policy(&self) -> bool {
+        self.mode.uses_arc_policy()
+    }
+
     /// Return whether this connection uses direct Aura bounds.
-    pub(crate) const fn uses_arc_bounds(&self) -> bool {
-        self.mode.uses_arc_bounds()
+    pub(crate) const fn uses_bounds(&self) -> bool {
+        self.mode.uses_bounds()
     }
 
     /// Return whether this connection uses the experimental self-parent path.
@@ -223,13 +271,12 @@ impl WindowPlacementState {
     ///
     /// The mapping lasts until [`Self::remove_surface`] is called, so XDG and
     /// GTK metadata paths cannot disagree while the surface is alive. The
-    /// result is `None` when the direct ARC backend is not selected, preventing
-    /// callers from allocating policy metadata for the self-parent experiment.
+    /// result is `None` when the ARC host policy is not selected.
     pub(crate) fn arc_session_application_id(
         &mut self,
         wl_surface_guest_id: u32,
     ) -> Option<String> {
-        if !self.uses_arc_bounds() {
+        if !self.uses_arc_policy() {
             return None;
         }
         Some(
@@ -516,7 +563,7 @@ impl WindowPlacementState {
 
 impl Default for WindowPlacementState {
     fn default() -> Self {
-        Self::new(WindowPlacementMode::Disabled)
+        Self::new(WindowPlacementMode::disabled())
     }
 }
 
@@ -528,42 +575,55 @@ mod tests {
     fn backend_flags_are_mutually_exclusive_with_arc_precedence() {
         assert_eq!(
             WindowPlacementMode::from_flags(false, false),
-            WindowPlacementMode::Disabled
+            WindowPlacementMode::new(WindowHostPolicy::Guest, WindowGeometryMethod::None)
         );
         assert_eq!(
             WindowPlacementMode::from_flags(true, false),
-            WindowPlacementMode::ArcBounds
+            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
         );
         assert_eq!(
             WindowPlacementMode::from_flags(false, true),
-            WindowPlacementMode::SelfParent
+            WindowPlacementMode::new(WindowHostPolicy::Guest, WindowGeometryMethod::SelfParent)
         );
         assert_eq!(
             WindowPlacementMode::from_flags(true, true),
-            WindowPlacementMode::ArcBounds
+            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
         );
     }
 
     #[test]
     fn mode_capabilities_match_backend() {
-        assert!(!WindowPlacementMode::Disabled.handles_shortcuts());
-        assert!(WindowPlacementMode::ArcBounds.handles_shortcuts());
-        assert!(WindowPlacementMode::SelfParent.handles_shortcuts());
-        assert!(WindowPlacementMode::ArcBounds.uses_arc_bounds());
-        assert!(WindowPlacementMode::SelfParent.uses_self_parent());
-        assert!(!WindowPlacementMode::Disabled.uses_arc_bounds());
-        assert!(!WindowPlacementMode::Disabled.uses_self_parent());
+        let disabled = WindowPlacementMode::disabled();
+        let arc_bounds =
+            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds);
+        let self_parent =
+            WindowPlacementMode::new(WindowHostPolicy::Guest, WindowGeometryMethod::SelfParent);
+        assert!(!disabled.handles_shortcuts());
+        assert!(arc_bounds.handles_shortcuts());
+        assert!(self_parent.handles_shortcuts());
+        assert!(arc_bounds.uses_arc_policy());
+        assert!(arc_bounds.uses_bounds());
+        assert!(self_parent.uses_self_parent());
+        assert!(!disabled.uses_arc_policy());
+        assert!(!disabled.uses_bounds());
+        assert!(!disabled.uses_self_parent());
     }
 
     #[test]
     fn non_arc_backends_cannot_allocate_arc_metadata() {
-        let mut state = WindowPlacementState::new(WindowPlacementMode::SelfParent);
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
         assert_eq!(state.arc_session_application_id(10), None);
     }
 
     #[test]
     fn arc_session_ids_are_stable_until_surface_release() {
-        let mut state = WindowPlacementState::new(WindowPlacementMode::ArcBounds);
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
         let first = state
             .arc_session_application_id(10)
             .expect("ARC backend should allocate an application ID");

@@ -16,13 +16,15 @@ limitations under the License.
 
 use crate::connection::WaylandConnection;
 use crate::protocols;
-use crate::state::{Context, ShadowTable};
+use crate::state::{Context, ShadowTable, WindowPlacementMode};
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::window_shortcuts::{ShortcutConfig, ShortcutConfigHandle};
 use crate::wire::{ProtocolError, WireMessage};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::io;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::{IntoRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -172,6 +174,49 @@ impl SommelierHandler {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ProxyRuntimeConfig {
+    pub(crate) placement_mode: WindowPlacementMode,
+    pub(crate) shortcut_config: ShortcutConfigHandle,
+    pub(crate) shortcut_config_path: Option<PathBuf>,
+    pub(crate) host_accelerators: Arc<Vec<crate::accelerator::Accelerator>>,
+}
+
+impl ProxyRuntimeConfig {
+    /// Reload the configured path without disturbing the last valid snapshot.
+    fn reload_shortcuts(&self) {
+        let Some(path) = self.shortcut_config_path.as_deref() else {
+            log::debug!("Ignoring SIGHUP: no window shortcut config path was supplied");
+            return;
+        };
+        match ShortcutConfig::load_from_path(path, self.host_accelerators.as_ref()) {
+            Ok(config) => {
+                if !config.is_empty() && !self.placement_mode.handles_shortcuts() {
+                    log::error!(
+                        "Keeping the previous window shortcut configuration; \
+                         {} contains bindings but the geometry method is disabled",
+                        path.display()
+                    );
+                    return;
+                }
+                self.shortcut_config.replace(config);
+                log::info!(
+                    "Reloaded window shortcut configuration from {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "Keeping the previous window shortcut configuration; \
+                     reload of {} failed: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+}
+
 struct Client {
     client_conn: WaylandConnection,
     host_conn: WaylandConnection,
@@ -180,6 +225,7 @@ struct Client {
 }
 
 impl Client {
+    #[cfg(test)]
     fn new(
         client_conn: WaylandConnection,
         host_conn: WaylandConnection,
@@ -190,6 +236,27 @@ impl Client {
             client_conn,
             host_conn,
             ctx: Context::new(gpu_accel, xdg_decoration),
+            handler: SommelierHandler::new(),
+        }
+    }
+
+    fn new_with_runtime(
+        client_conn: WaylandConnection,
+        host_conn: WaylandConnection,
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        runtime: &ProxyRuntimeConfig,
+    ) -> Self {
+        Self {
+            client_conn,
+            host_conn,
+            ctx: Context::new_with_options(
+                gpu_accel,
+                xdg_decoration,
+                runtime.placement_mode,
+                runtime.shortcut_config.clone(),
+                runtime.host_accelerators.as_ref().clone(),
+            ),
             handler: SommelierHandler::new(),
         }
     }
@@ -552,7 +619,7 @@ impl Client {
                 if is_xdg_surface_get_toplevel && packet.len() >= 12 {
                     let guest_xdg_toplevel_id =
                         u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                    if self.ctx.window_placement.uses_arc_bounds() {
+                    if self.ctx.window_placement.handles_shortcuts() {
                         let _ = crate::handler::compositor::ensure_zaura_toplevel(
                             &mut self.ctx,
                             guest_xdg_toplevel_id,
@@ -778,6 +845,89 @@ mod tests {
     use crate::wire::MessageBuilder;
     use std::fs;
     use std::io::Write;
+
+    fn temporary_shortcut_config_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sommelier-window-shortcuts-{label}-{}-{nonce}.toml",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn shortcut_reload_replaces_valid_config_and_preserves_last_good_on_error() {
+        let path = temporary_shortcut_config_path("reload");
+        fs::write(
+            &path,
+            r#"
+version = 1
+[[bindings]]
+chord = "<Alt>q"
+action = "window.place"
+rect = [0.0, 0.0, 0.5, 0.5]
+"#,
+        )
+        .expect("write valid shortcut config");
+
+        let handle = ShortcutConfigHandle::disabled();
+        let runtime = ProxyRuntimeConfig {
+            placement_mode: WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ),
+            shortcut_config: handle.clone(),
+            shortcut_config_path: Some(path.clone()),
+            host_accelerators: Arc::new(Vec::new()),
+        };
+        runtime.reload_shortcuts();
+        let loaded = handle.snapshot();
+        assert!(loaded
+            .find(crate::accelerator::parse_accelerator("<Alt>q").unwrap())
+            .is_some());
+
+        fs::write(&path, "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\n")
+            .expect("write invalid shortcut config");
+        let previous = handle.snapshot();
+        runtime.reload_shortcuts();
+        assert!(
+            Arc::ptr_eq(&previous, &handle.snapshot()),
+            "invalid reload must retain the last known-good generation"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shortcut_reload_rejects_bindings_when_geometry_is_disabled() {
+        let path = temporary_shortcut_config_path("disabled");
+        fs::write(
+            &path,
+            r#"
+version = 1
+[[bindings]]
+chord = "<Alt>q"
+action = "window.place"
+rect = [0.0, 0.0, 0.5, 0.5]
+"#,
+        )
+        .expect("write shortcut config");
+
+        let handle = ShortcutConfigHandle::disabled();
+        let runtime = ProxyRuntimeConfig {
+            placement_mode: WindowPlacementMode::disabled(),
+            shortcut_config: handle.clone(),
+            shortcut_config_path: Some(path.clone()),
+            host_accelerators: Arc::new(Vec::new()),
+        };
+        runtime.reload_shortcuts();
+        assert!(
+            handle.snapshot().is_empty(),
+            "disabled geometry must reject bindings during reload"
+        );
+        let _ = fs::remove_file(path);
+    }
 
     #[tokio::test]
     async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
@@ -3713,6 +3863,7 @@ pub async fn run(
     gpu_accel: bool,
     xdg_decoration: bool,
     virtio_wayland: Option<String>,
+    runtime: ProxyRuntimeConfig,
 ) {
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
@@ -3744,10 +3895,16 @@ pub async fn run(
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
     let local = tokio::task::LocalSet::new();
+    let mut reload_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("SIGHUP handler must be installable");
     local
         .run_until(async move {
             loop {
-                match listener.accept().await {
+                tokio::select! {
+                _ = reload_signal.recv() => {
+                    runtime.reload_shortcuts();
+                }
+                accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
                         log::info!("New client connected");
 
@@ -3812,8 +3969,13 @@ pub async fn run(
                         };
 
                         if let Some(host_conn) = host_conn {
-                            let mut client =
-                                Client::new(client_conn, host_conn, gpu_accel, xdg_decoration);
+                            let mut client = Client::new_with_runtime(
+                                client_conn,
+                                host_conn,
+                                gpu_accel,
+                                xdg_decoration,
+                                &runtime,
+                            );
                             if let Some(channel) = virtwayland_channel_ref {
                                 client.ctx.virtwayland_channel = Some(channel);
                             }
@@ -3829,6 +3991,7 @@ pub async fn run(
                     Err(e) => {
                         log::error!("Accept error: {}", e);
                     }
+                }
                 }
             }
         })

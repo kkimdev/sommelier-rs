@@ -145,6 +145,29 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
     Ok(result)
 }
 
+/// Read the legacy host-accelerator policy once for the proxy runtime.
+///
+/// Malformed host policy is intentionally non-fatal for compatibility with
+/// the existing Sommelier behavior: an invalid value disables host filtering
+/// and forwards ordinary keys to the guest. Window-shortcut configuration is
+/// validated separately and treats an overlap with the successfully parsed
+/// host list as a hard configuration error.
+pub(crate) fn from_environment() -> Vec<Accelerator> {
+    let value = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
+    match parse_accelerators(&value) {
+        Ok(list) => list,
+        Err(error) => {
+            log::warn!(
+                "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
+                 Accelerator filtering disabled.",
+                value,
+                error
+            );
+            Vec::new()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,9 +40,9 @@ therefore does not create a genuine ARC restore session.
 
 ## IDs in the current rewrite
 
-When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is enabled, the rewrite allocates one
-stable ID for each guest `wl_surface`. XDG and GTK metadata paths reuse that
-same string, and the mapping is removed when the surface is destroyed:
+When `--window-host-policy=arc` is selected, the rewrite allocates one stable
+ID for each guest `wl_surface`. XDG and GTK metadata paths reuse that same
+string, and the mapping is removed when the surface is destroyed:
 
 ```text
 org.chromium.arc.session.<generated_id>
