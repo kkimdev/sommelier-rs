@@ -34,56 +34,56 @@ stable ID for every window of an application. A restore session ID is a
 temporary pre-task identity that participates in ghost/restore mapping.
 
 Both recognized forms can enter ARC classification, but their downstream
-lifecycle is different. The current rewrite uses the session spelling for
-per-surface uniqueness; it does not perform the Android restore handshake and
-therefore does not create a genuine ARC restore session.
+lifecycle is different. The current rewrite deliberately uses the task
+spelling for compatibility; it does not perform the Android task handshake and
+therefore does not create a genuine ARC task.
 
 ## IDs in the current rewrite
 
-When `--window-host-policy=arc` is selected, the rewrite allocates one stable
-ID for each guest `wl_surface`. The fabricated ID is sent only through the
-Aura metadata path (`zaura_surface.set_application_id`) and GTK's Aura
-metadata path. The host XDG role keeps Sommelier's normal
-`org.chromium.guest_os.<vm>.wayland.<app>` identity; this prevents ordinary XDG
-shelf, restore, and role bookkeeping from being misclassified as ARC:
+When `--window-host-policy=arc` is selected, Sommelier reserves one numeric
+block before it accepts clients. The block is claimed by an exclusive
+filesystem lock under:
 
 ```text
-org.chromium.arc.session.<generated_id>
+$XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<start>-<end>.lock
 ```
 
-The split is intentional: `zaura_toplevel.set_window_bounds` is authorized
-from the Aura surface's policy metadata on the tested host, while the XDG role
-still needs its native guest namespace.
+The block files are deliberately retained after process exit. The kernel
+releases the `flock` automatically when the owning process closes its
+descriptor; deleting a locked pathname could let another process create a
+different inode and accidentally hold the same numeric range concurrently.
 
-The allocator in `sommelier/src/state/window_placement.rs` currently uses:
+The current private best-effort pool is:
 
 ```text
-base          = 1,000,000,000
-pid_component = process_id & 0x3fff
-serial        = atomic_process_serial & 0x3fff
-generated_id  = base + 1 + pid_component * 16,384 + serial
+2,000,000,000 .. 2,147,483,646
 ```
 
-The process-wide serial prevents two `Context` instances in one process from
-immediately reusing an ID. This is better than the old fixed
-`org.chromium.arc.2147483647` value because separate surfaces no longer share
-one fabricated identity.
+Every guest surface receives the next numeric suffix from the process block:
 
-This allocator is still only best effort:
+```text
+org.chromium.arc.<allocated_task_id>
+```
 
-- The 14-bit PID component can repeat after PID reuse or across process
-  restarts.
-- The 14-bit serial wraps after 16,384 allocations.
-- IDs are not persisted, so a stale host window can outlive the allocator that
-  created its ID.
-- The numeric range overlaps the range owned by Chrome's real ARC restore
-  allocator, so `.session.*` has no collision-free fabricated pool.
-- The `+1` offset keeps every generated value strictly above
-  `1,000,000,000`, which is the lower boundary used by restore helpers when
-  classifying ghost/session IDs.
+The same ID is reused by the corresponding XDG/Aura and GTK metadata paths
+for that surface. Separate Sommelier processes contend on the same block
+files, so they cannot select the same block while both are alive. `INT_MAX` is
+excluded because `org.chromium.arc.2147483647` was the exact PR #2/custom-host
+compatibility sentinel; it is retained only as historical evidence, not as a
+general allocation endpoint.
+
+The host XDG role keeps Sommelier's normal
+`org.chromium.guest_os.<vm>.wayland.<app>` identity. This split prevents
+ordinary XDG shelf, restore, and role bookkeeping from being misclassified as
+ARC. The allocator is still only a convention: ChromeOS does not provide a
+query through this Wayland path, so Sommelier cannot prove that a fabricated
+number is absent from Android's own task table.
 
 The feature remains opt-in because changing the namespace enables ARC-specific
-host behavior beyond bounds placement.
+host behavior beyond bounds placement. A process that loses its host windows
+without a corresponding compositor teardown could make a newly reused block
+overlap stale metadata; the block scheme therefore assumes normal Wayland
+connection teardown.
 
 ## The real ARC task-ID allocator
 
@@ -99,12 +99,75 @@ skipped, and allocation wraps within the user's range. Chromium's host parser
 generally converts the decimal suffix into an ARC task identity; it does not
 create a real Android task for an arbitrary number.
 
-If a future implementation needs a fabricated task-form ID, keep a unique
-positive private pool below `INT_MAX` (for example
-`2,000,000,000..2,147,483,646`), avoid `0`, negative values, and `INT_MAX`, and
-never reuse an ID while its host window may still exist. This is a namespace
-convention, not a guarantee against future ChromeOS changes or ARC tracker
-collisions.
+The allocator research was more specific than “pick a random large integer”:
+
+1. `getNextTaskIdForUser(user_id)` starts in that user's
+   `[user_id * PER_USER_RANGE, (user_id + 1) * PER_USER_RANGE)` interval
+   (user 0 normally starts at 1), advances through the interval, skips task
+   IDs that are still active/recent, and wraps within the interval. The value
+   is therefore an Android task identity allocated by the Android task
+   supervisor, not a globally unique application name.
+2. Low values in the user-0 interval (`1..99,999`) are the most semantically
+   genuine but also have the highest chance of colliding with a real ARC task.
+   Values below `1,000,000,000` are still task candidates; being below the
+   restore threshold does not make them a private pool.
+3. A high positive pool such as `2,000,000,000..2,147,483,646` was considered
+   as a best-effort fabricated task pool because it is far from normal AOSP
+   per-user allocation and leaves headroom below signed `INT_MAX`. It is not
+   guaranteed safe: ChromeOS can change its tracker, another producer can use
+   the range, and the host does not ask Android whether the number belongs to
+   the guest.
+4. `0`, negative values, and values that overflow the host's signed 32-bit
+   parser are invalid candidates. `INT_MAX` is also not a generally safe
+   allocator endpoint. The exact `org.chromium.arc.2147483647` value is kept
+   only because PR #2 and the custom host proved that compatibility sentinel
+   stable; that observation must not be generalized into an ARC allocation
+   rule.
+
+The current block allocator follows the minimum safe convention available
+without a host capability: it reserves a positive private pool, never reuses
+an ID within a live process block, and coordinates all local Sommelier
+instances through `flock`. A real host capability remains preferable because
+only ARC/Android can establish global task ownership.
+
+## Rejected experiment: fabricated ARC session IDs
+
+The rewrite briefly used one `org.chromium.arc.session.<id>` value per guest
+surface. The historical allocator was:
+
+```text
+base          = 1,000,000,000
+pid_component = process_id & 0x3fff
+serial        = process_wide_atomic_serial & 0x3fff
+generated_id  = base + 1 + pid_component * 16,384 + serial
+```
+
+The process-wide serial avoided immediate reuse between simultaneous
+`Context` instances, while the live ID-to-surface map remained connection-owned
+and was retired with the surface. This gave local uniqueness, not global
+ownership:
+
+- the 14-bit PID component repeats after PID reuse, across process restarts, or
+  across independent hosts;
+- the 14-bit serial wraps after 16,384 allocations;
+- IDs are not persisted, so a stale host window can outlive the allocator that
+  created its ID;
+- the range overlaps Chrome's real ARC restore/session allocator, so there is
+  no collision-free fabricated `.session.*` pool;
+- a low `.session.*` value is worse, because values below
+  `1,000,000,000` can be classified as ordinary task candidates rather than
+  restore/ghost candidates.
+
+On the meaningful `/dev/wl0` runtime, `--window-host-policy=arc
+--window-geometry-method=none` was enough to make the host UI/compositor
+restart, even though no shortcut or bounds request was enabled. No core dump
+was observed. This was the strongest available evidence that the
+`.session.*` namespace itself (or its restore metadata path), not
+`set_window_bounds`, was destabilizing the custom host. The experiment was
+therefore rolled back to the PR #2 task-form compatibility ID.
+
+This section is retained as a rejected experiment so that a future contributor
+does not reintroduce the allocator merely because it appears more unique.
 
 ## Restore-session threshold
 
