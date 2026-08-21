@@ -1157,6 +1157,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
+        if interface == "wl_output" {
+            ctx.output_host_ids.push(host_new_id);
+            ctx.output_states.entry(host_new_id).or_default();
+        }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
         // guest metadata at v4 so feedback requests are accepted locally,
