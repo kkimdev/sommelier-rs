@@ -604,10 +604,32 @@ The window-placement path now keeps the ARC application ID when a GTK client sen
 `gtk_surface1.set_dbus_properties`. That request can arrive after
 `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
 Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
-returned to its old `800x600` geometry. The ARC ID is shared by the GTK and XDG
-paths through one constant and both paths have regression coverage. The workaround
+returned to its old `800x600` geometry. A unique ARC session ID is shared by the
+GTK and XDG paths for each wl_surface, and both paths have regression coverage. The workaround
 and its compositor-owned shortcuts are disabled unless
 `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set.
+
+An isolated `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT=1` probe is also available.
+It sends `zaura_surface.set_parent` with the same surface as both child and
+parent, records a host-stream barrier, and intentionally preserves the current
+surface size. The proxy now converts target screen coordinates to
+parent-content-relative coordinates using the latest Aura origin and consumes
+shortcuts received before that origin is available. This still is not a
+placement backend: Exo explicitly rejects the transient cycle, and the
+resulting movement is an unsupported side effect that can remain
+unpredictable or destabilize a custom host build. It is independent of the ARC
+policy flag, but the ARC-session geometry backend wins if both flags are set.
+It must only be used with a uniquely named test display and never on the shared
+system Sommelier instance.
+
+All mutable placement state now lives in
+`sommelier/src/state/window_placement.rs`: one backend mode is resolved at
+startup, Aura surface/toplevel associations are one-to-one, one per-toplevel
+record owns the authoritative/predicted origin, and one barrier registry owns
+callback supersession and retirement. Compositor, keyboard, GTK, registry, and
+callback handlers use that API instead of updating parallel maps on `Context`.
+Fallible state mutators are `#[must_use]`, and debug builds validate the
+reverse-map and teardown invariants after each mutation.
 
 Alt+A and Alt+D now use the same direct
 `unset fullscreen/maximized/snap → zaura_toplevel.set_window_bounds → sync`
@@ -618,11 +640,24 @@ Verification:
 
 - `cargo fmt --all -- --check`, `cargo check -p sommelier`, and
   `cargo clippy -p sommelier --all-targets -- -D warnings` pass.
-- `cargo test -p sommelier -- --test-threads=1`: 540 passed, 1 ignored.
-- `cargo build --release -p sommelier` produced the tested binary at
-  `target/release/sommelier`.
+- `cargo test -p sommelier --all-targets -- --test-threads=1`: 555 passed,
+  1 ignored; the ignored GUI smoke test requires a live Wayland compositor.
+- `cargo build --release -p sommelier -p sommelier-test-gui` produced the
+  tested binaries at `target/release/`.
+- The repository-wide `bun run verify` currently reports 1,853 passing
+  assertions and 9 pre-existing monorepo failures (nested Biome configuration,
+  missing Typst/Astro assets, and existing hygiene/shebang findings); none
+  points to this Sommelier worktree.
 - The isolated release proxy was restarted on
   `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records both
-  GTK and Ghostty application IDs as `org.chromium.arc.2147483647`.
+  GTK and Ghostty application IDs in the unique
+  `org.chromium.arc.session.<id>` namespace.
+- A separate release proxy on
+  `/run/user/1000/wayland-codex-self-parent` accepted the test GUI and
+  delivered all nine Alt shortcuts. The self-parent requests moved the window
+  by an unexpected parent-content-relative offset while preserving its size.
+  The proxy and GUI were stopped after the probe; subsequent host-UI
+  instability was reported, so this backend must remain disabled by default
+  and is not a production placement mechanism.
 - A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
   as flaky; each passed alone and in the serialized full suite.
