@@ -48,7 +48,7 @@ pub(crate) use self::render::{
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_SESSION_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
-    WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
+    OutputState, WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -715,42 +715,6 @@ pub struct GtkSurfaceState {
     pub wl_surface_id: u32,
 }
 
-/// Host output geometry used for compositor-owned window layout requests.
-///
-/// `wl_output.mode` reports pixel dimensions while Aura window bounds use
-/// logical screen coordinates. `scale` converts the former into the latter;
-/// output insets remove shelf/non-work-area margins when they are known.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OutputState {
-    pub mode_width: i32,
-    pub mode_height: i32,
-    pub scale: i32,
-    pub insets_top: i32,
-    pub insets_left: i32,
-    pub insets_bottom: i32,
-    pub insets_right: i32,
-}
-
-impl OutputState {
-    pub fn work_area(self) -> Option<(i32, i32, i32, i32)> {
-        let scale = self.scale.max(1);
-        let width = self.mode_width.checked_div(scale)?;
-        let height = self.mode_height.checked_div(scale)?;
-        let x = self.insets_left;
-        let y = self.insets_top;
-        let width = width
-            .checked_sub(self.insets_left)?
-            .checked_sub(self.insets_right)?;
-        let height = height
-            .checked_sub(self.insets_top)?
-            .checked_sub(self.insets_bottom)?;
-        if width <= 0 || height <= 0 {
-            return None;
-        }
-        Some((x, y, width, height))
-    }
-}
-
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -794,7 +758,6 @@ pub struct Context {
     pub host_text_input_manager_v1_global_name: Option<u32>,
     pub host_text_input_extension_v1_global_name: Option<u32>,
     pub host_keyboard_extension_global_name: Option<u32>,
-    pub host_zaura_shell_global_name: Option<u32>,
     /// Formats observed from the host's SHM or dmabuf capability events that
     /// the SHM bridge can actually copy. ARGB/XRGB are always available per
     /// the wl_shm contract; optional formats are added only after the host
@@ -917,31 +880,15 @@ pub struct Context {
     pub dmabuf_guest_generations: HashMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
-    /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
-    pub host_zaura_shell_id: Option<u32>,
-    /// Bound version of zaura_shell (capped at 38 in registry). Used to guard
-    /// opcodes that require specific protocol versions.
-    pub host_zaura_shell_version: u32,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
     /// Single source of truth for placement backend selection and all
     /// compositor-owned placement state.
     pub(crate) window_placement: WindowPlacementState,
-    /// Shared immutable shortcut bindings, replaced only after a validated
-    /// runtime reload.
-    pub(crate) shortcut_config: ShortcutConfigHandle,
-    /// Host wl_output IDs advertised to the guest.
-    pub output_host_ids: Vec<u32>,
-    /// Output mode/scale/insets keyed by host wl_output ID.
-    pub output_states: HashMap<u32, OutputState>,
     /// Synthetic GTK shell bindings and their activation token state.
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
-    /// Tracks xdg_surface → wl_surface associations (guest IDs).
-    pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
-    /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
-    pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1239,7 +1186,8 @@ impl Context {
             }
         };
 
-        let window_placement = WindowPlacementState::new(placement_mode);
+        let window_placement =
+            WindowPlacementState::with_shortcut_config(placement_mode, shortcut_config);
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1267,7 +1215,6 @@ impl Context {
             host_text_input_manager_v1_global_name: None,
             host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_zaura_shell_global_name: None,
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),
@@ -1307,17 +1254,10 @@ impl Context {
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
             xdg_decoration,
-            host_zaura_shell_id: None,
-            host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             window_placement,
-            shortcut_config,
-            output_host_ids: Vec::new(),
-            output_states: HashMap::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
-            xdg_surface_to_wl_surface: HashMap::new(),
-            xdg_toplevel_to_wl_surface: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1360,16 +1300,14 @@ impl Context {
         // the runtime-only ARC bounds workaround for an isolated proxy.
         ctx.window_placement
             .set_mode_for_test(WindowPlacementMode::disabled());
-        ctx.shortcut_config = ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid());
+        ctx.window_placement
+            .set_shortcut_config(ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid()));
         ctx
     }
 
     /// Return the first output with a usable mode.
     pub fn primary_output(&self) -> Option<(u32, OutputState)> {
-        self.output_host_ids.iter().find_map(|&host_id| {
-            let state = *self.output_states.get(&host_id)?;
-            state.work_area().map(|_| (host_id, state))
-        })
+        self.window_placement.primary_output()
     }
 }
 

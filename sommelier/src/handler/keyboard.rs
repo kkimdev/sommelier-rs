@@ -306,11 +306,9 @@ impl KeyboardHandler {
         {
             return None;
         }
-        ctx.xdg_toplevel_to_wl_surface
-            .iter()
-            .find_map(|(&xdg_toplevel_id, &surface_id)| {
-                (surface_id == active_surface).then_some((xdg_toplevel_id, surface_id))
-            })
+        ctx.window_placement
+            .xdg_toplevel_for_wl_surface(active_surface)
+            .map(|xdg_toplevel_id| (xdg_toplevel_id, active_surface))
     }
 
     fn window_shortcut(
@@ -430,7 +428,7 @@ impl KeyboardHandler {
             let zaura_surface_version = ctx
                 .shadow_table
                 .host_object_version(zaura_surface_id)
-                .unwrap_or(ctx.host_zaura_shell_version);
+                .unwrap_or(ctx.window_placement.aura_shell_version());
             if zaura_surface_version < 2 {
                 log::warn!(
                     "window layout {:?}: self-parent probe requires zaura_surface v2, got v{}",
@@ -1078,7 +1076,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // decision internally consistent. Repeat/release deliberately consult
         // the key owner instead of resolving the chord again, so a reload
         // cannot strand a key whose press was already consumed.
-        let config = ctx.shortcut_config.snapshot();
+        let config = ctx.window_placement.shortcut_config_snapshot();
         let shortcut = (state == WL_KEY_PRESSED)
             .then(|| self.window_shortcut(host_keyboard_id, key, &config))
             .flatten();
@@ -1642,7 +1640,11 @@ mod tests {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
             assert!(
                 handler
-                    .window_shortcut(HostId(5), key, &ctx.shortcut_config.snapshot())
+                    .window_shortcut(
+                        HostId(5),
+                        key,
+                        &ctx.window_placement.shortcut_config_snapshot(),
+                    )
                     .is_some(),
                 "configured nine-grid shortcut should match keysym {sym:#x}"
             );
@@ -1656,7 +1658,7 @@ mod tests {
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        let config = ctx.shortcut_config.snapshot();
+        let config = ctx.window_placement.shortcut_config_snapshot();
 
         handler.modifiers.insert(HostId(5), 0);
         assert_eq!(handler.window_shortcut(HostId(5), key, &config), None);
@@ -1687,20 +1689,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
         ctx.last_sender_id = host_keyboard;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         handler
@@ -1825,20 +1822,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
 
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
@@ -1906,20 +1898,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
 
         for (shortcut, expected_x) in [
             (test_shortcut("<Alt>a"), 0),
@@ -1995,20 +1982,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
         let zaura_toplevel_id =
             crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");
@@ -2087,20 +2069,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
         let _zaura_toplevel_id =
             crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");
@@ -2140,20 +2117,15 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 1,
-                ..Default::default()
-            },
-        );
+        ctx.window_placement.set_aura_shell_binding(24, None, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
         let zaura_toplevel_id =
             crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");

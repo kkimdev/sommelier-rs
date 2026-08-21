@@ -29,7 +29,7 @@ fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option
     let version = ctx
         .shadow_table
         .host_object_version(zaura_surface_id)
-        .unwrap_or(ctx.host_zaura_shell_version);
+        .unwrap_or(ctx.window_placement.aura_shell_version());
     if version < 4 {
         return;
     }
@@ -150,7 +150,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         let version = ctx
             .shadow_table
             .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.host_zaura_shell_version);
+            .unwrap_or(ctx.window_placement.aura_shell_version());
         if version < 5 {
             return Action::Drop;
         }
@@ -234,8 +234,8 @@ mod tests {
             "wl_surface".to_string(),
             4,
         );
-        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
-        ctx.host_zaura_shell_version = 38;
+        ctx.window_placement
+            .set_aura_shell_binding(ZAURA_SHELL_HOST, None, 38);
         ctx.shadow_table.track_host_interface_with_version(
             ZAURA_SHELL_HOST,
             "zaura_shell".to_string(),

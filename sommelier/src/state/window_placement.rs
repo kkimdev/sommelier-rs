@@ -24,8 +24,11 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use log::warn;
+
+use crate::window_shortcuts::{ShortcutConfig, ShortcutConfigHandle};
 
 /// Application-ID policy used for compositor-owned window operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,6 +139,42 @@ impl WindowPlacementMode {
     }
 }
 
+/// Host output geometry used by compositor-owned window layout requests.
+///
+/// `wl_output.mode` reports pixel dimensions while Aura window bounds use
+/// logical screen coordinates. `scale` converts the former into the latter;
+/// output insets remove shelf/non-work-area margins when they are known.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OutputState {
+    pub(crate) mode_width: i32,
+    pub(crate) mode_height: i32,
+    pub(crate) scale: i32,
+    pub(crate) insets_top: i32,
+    pub(crate) insets_left: i32,
+    pub(crate) insets_bottom: i32,
+    pub(crate) insets_right: i32,
+}
+
+impl OutputState {
+    pub(crate) fn work_area(self) -> Option<(i32, i32, i32, i32)> {
+        let scale = self.scale.max(1);
+        let width = self.mode_width.checked_div(scale)?;
+        let height = self.mode_height.checked_div(scale)?;
+        let x = self.insets_left;
+        let y = self.insets_top;
+        let width = width
+            .checked_sub(self.insets_left)?
+            .checked_sub(self.insets_right)?;
+        let height = height
+            .checked_sub(self.insets_top)?
+            .checked_sub(self.insets_bottom)?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((x, y, width, height))
+    }
+}
+
 /// Application-ID namespace used by the ARC bounds backend.
 pub(crate) const ARC_SESSION_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.session";
 
@@ -164,6 +203,13 @@ struct ToplevelPlacementState {
     pending_origin: Option<(i32, i32)>,
 }
 
+#[derive(Debug, Default)]
+struct AuraShellBinding {
+    host_id: Option<u32>,
+    global_name: Option<u32>,
+    version: u32,
+}
+
 /// All mutable state owned by the window-placement feature.
 ///
 /// The maps are private by design. In particular, callers must not update an
@@ -173,14 +219,22 @@ struct ToplevelPlacementState {
 #[derive(Debug)]
 pub(crate) struct WindowPlacementState {
     mode: WindowPlacementMode,
+    shortcut_config: ShortcutConfigHandle,
+    aura_shell: AuraShellBinding,
     arc_session_application_ids: HashMap<u32, String>,
     aura_surface_by_wl_surface: HashMap<u32, u32>,
     wl_surface_by_aura_surface: HashMap<u32, u32>,
     aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
     xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
+    xdg_surface_by_id: HashMap<u32, u32>,
+    xdg_surface_by_wl_surface: HashMap<u32, u32>,
+    wl_surface_by_xdg_toplevel: HashMap<u32, u32>,
+    xdg_toplevel_by_wl_surface: HashMap<u32, u32>,
     toplevels: HashMap<u32, ToplevelPlacementState>,
     barrier_to_toplevel: HashMap<u32, u32>,
     active_barrier_by_toplevel: HashMap<u32, u32>,
+    output_host_ids: Vec<u32>,
+    output_states: HashMap<u32, OutputState>,
 }
 
 impl WindowPlacementState {
@@ -218,6 +272,41 @@ impl WindowPlacementState {
                     == Some(zaura_toplevel_host_id)
             }
         ));
+        debug_assert!(self.xdg_surface_by_id.iter().all(
+            |(xdg_surface_guest_id, wl_surface_guest_id)| {
+                self.xdg_surface_by_wl_surface.get(wl_surface_guest_id)
+                    == Some(xdg_surface_guest_id)
+            }
+        ));
+        debug_assert!(self.xdg_surface_by_wl_surface.iter().all(
+            |(wl_surface_guest_id, xdg_surface_guest_id)| {
+                self.xdg_surface_by_id.get(xdg_surface_guest_id) == Some(wl_surface_guest_id)
+            }
+        ));
+        debug_assert!(self.wl_surface_by_xdg_toplevel.iter().all(
+            |(xdg_toplevel_guest_id, wl_surface_guest_id)| {
+                self.xdg_toplevel_by_wl_surface.get(wl_surface_guest_id)
+                    == Some(xdg_toplevel_guest_id)
+            }
+        ));
+        debug_assert!(self.xdg_toplevel_by_wl_surface.iter().all(
+            |(wl_surface_guest_id, xdg_toplevel_guest_id)| {
+                self.wl_surface_by_xdg_toplevel.get(xdg_toplevel_guest_id)
+                    == Some(wl_surface_guest_id)
+            }
+        ));
+        debug_assert_eq!(
+            self.output_host_ids
+                .iter()
+                .filter(|host_id| self.output_states.contains_key(host_id))
+                .count(),
+            self.output_host_ids.len()
+        );
+        debug_assert_eq!(self.output_host_ids.len(), self.output_states.len());
+        debug_assert!(self
+            .output_states
+            .keys()
+            .all(|host_id| self.output_host_ids.contains(host_id)));
         debug_assert!(self.toplevels.keys().all(|zaura_toplevel_host_id| {
             self.xdg_toplevel_by_aura_toplevel
                 .contains_key(zaura_toplevel_host_id)
@@ -234,16 +323,35 @@ impl WindowPlacementState {
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
+        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled())
+    }
+
+    /// Create placement state with the process-wide immutable binding handle.
+    ///
+    /// The handle is shared by every client connection, while all geometry,
+    /// object associations, and lifecycle state remain connection-local.
+    pub(crate) fn with_shortcut_config(
+        mode: WindowPlacementMode,
+        shortcut_config: ShortcutConfigHandle,
+    ) -> Self {
         Self {
             mode,
+            shortcut_config,
+            aura_shell: AuraShellBinding::default(),
             arc_session_application_ids: HashMap::new(),
             aura_surface_by_wl_surface: HashMap::new(),
             wl_surface_by_aura_surface: HashMap::new(),
             aura_toplevel_by_xdg_toplevel: HashMap::new(),
             xdg_toplevel_by_aura_toplevel: HashMap::new(),
+            xdg_surface_by_id: HashMap::new(),
+            xdg_surface_by_wl_surface: HashMap::new(),
+            wl_surface_by_xdg_toplevel: HashMap::new(),
+            xdg_toplevel_by_wl_surface: HashMap::new(),
             toplevels: HashMap::new(),
             barrier_to_toplevel: HashMap::new(),
             active_barrier_by_toplevel: HashMap::new(),
+            output_host_ids: Vec::new(),
+            output_states: HashMap::new(),
         }
     }
 
@@ -265,6 +373,243 @@ impl WindowPlacementState {
     /// Return whether this connection uses the experimental self-parent path.
     pub(crate) const fn uses_self_parent(&self) -> bool {
         self.mode.uses_self_parent()
+    }
+
+    /// Return the internally bound Aura shell manager, if one is live.
+    pub(crate) const fn aura_shell_id(&self) -> Option<u32> {
+        self.aura_shell.host_id
+    }
+
+    /// Return the negotiated version of the internally bound Aura shell.
+    pub(crate) const fn aura_shell_version(&self) -> u32 {
+        self.aura_shell.version
+    }
+
+    /// Return the host registry global that produced the Aura shell binding.
+    pub(crate) const fn aura_shell_global_name(&self) -> Option<u32> {
+        self.aura_shell.global_name
+    }
+
+    /// Publish one complete Aura shell binding generation.
+    ///
+    /// Keeping ID, source global, and version in one record prevents a global
+    /// replacement from accidentally retaining the old version or routing
+    /// requests through an object whose manager has already been released.
+    pub(crate) fn set_aura_shell_binding(
+        &mut self,
+        host_id: u32,
+        global_name: Option<u32>,
+        version: u32,
+    ) {
+        self.aura_shell = AuraShellBinding {
+            host_id: Some(host_id),
+            global_name,
+            version,
+        };
+        self.debug_assert_consistent();
+    }
+
+    /// Retire the Aura shell only when the named global owns the live binding.
+    pub(crate) fn take_aura_shell_for_global(&mut self, global_name: u32) -> Option<(u32, u32)> {
+        if self.aura_shell.global_name != Some(global_name) {
+            return None;
+        }
+        let binding = std::mem::take(&mut self.aura_shell);
+        self.debug_assert_consistent();
+        binding.host_id.map(|host_id| (host_id, binding.version))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_aura_shell_for_test(&mut self) {
+        self.aura_shell = AuraShellBinding::default();
+    }
+
+    /// Take one immutable binding generation for a key event.
+    pub(crate) fn shortcut_config_snapshot(&self) -> Arc<ShortcutConfig> {
+        self.shortcut_config.snapshot()
+    }
+
+    /// Replace the shared binding handle. Production reloads replace the
+    /// handle's immutable generation; this setter exists for deterministic
+    /// in-process fixtures that construct a complete state directly.
+    #[cfg(test)]
+    pub(crate) fn set_shortcut_config(&mut self, shortcut_config: ShortcutConfigHandle) {
+        self.shortcut_config = shortcut_config;
+    }
+
+    /// Register a host output once and create its geometry record.
+    pub(crate) fn remember_output(&mut self, host_output_id: u32) -> bool {
+        if self.output_states.contains_key(&host_output_id) {
+            return false;
+        }
+        self.output_host_ids.push(host_output_id);
+        self.output_states
+            .insert(host_output_id, OutputState::default());
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Update the current mode for one output.
+    ///
+    /// Non-current mode events are ignored after the first mode is known, as
+    /// required by Wayland's output mode advertisement semantics.
+    pub(crate) fn update_output_mode(
+        &mut self,
+        host_output_id: u32,
+        current: bool,
+        width: i32,
+        height: i32,
+    ) {
+        if !self.output_states.contains_key(&host_output_id) {
+            self.output_host_ids.push(host_output_id);
+            self.output_states
+                .insert(host_output_id, OutputState::default());
+        }
+        let output = self
+            .output_states
+            .get_mut(&host_output_id)
+            .expect("output record was inserted above");
+        if current || output.mode_width == 0 || output.mode_height == 0 {
+            output.mode_width = width;
+            output.mode_height = height;
+        }
+        self.debug_assert_consistent();
+    }
+
+    /// Update the scale advertised by one output.
+    pub(crate) fn update_output_scale(&mut self, host_output_id: u32, scale: i32) {
+        if !self.output_states.contains_key(&host_output_id) {
+            self.output_host_ids.push(host_output_id);
+            self.output_states
+                .insert(host_output_id, OutputState::default());
+        }
+        let output = self
+            .output_states
+            .get_mut(&host_output_id)
+            .expect("output record was inserted above");
+        output.scale = scale;
+        self.debug_assert_consistent();
+    }
+
+    /// Return the first usable output in stable host-advertisement order.
+    pub(crate) fn primary_output(&self) -> Option<(u32, OutputState)> {
+        self.output_host_ids.iter().find_map(|&host_id| {
+            let state = *self.output_states.get(&host_id)?;
+            state.work_area().map(|_| (host_id, state))
+        })
+    }
+
+    /// Record the xdg_surface → wl_surface role association.
+    #[must_use = "the XDG surface association may conflict with a live role"]
+    pub(crate) fn remember_xdg_surface(
+        &mut self,
+        xdg_surface_guest_id: u32,
+        wl_surface_guest_id: u32,
+    ) -> bool {
+        if self
+            .xdg_surface_by_id
+            .get(&xdg_surface_guest_id)
+            .is_some_and(|existing| *existing != wl_surface_guest_id)
+            || self
+                .xdg_surface_by_wl_surface
+                .get(&wl_surface_guest_id)
+                .is_some_and(|existing| *existing != xdg_surface_guest_id)
+        {
+            return false;
+        }
+        self.xdg_surface_by_id
+            .insert(xdg_surface_guest_id, wl_surface_guest_id);
+        self.xdg_surface_by_wl_surface
+            .insert(wl_surface_guest_id, xdg_surface_guest_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Resolve an xdg_surface to its backing wl_surface.
+    pub(crate) fn wl_surface_for_xdg_surface(&self, xdg_surface_guest_id: u32) -> Option<u32> {
+        self.xdg_surface_by_id.get(&xdg_surface_guest_id).copied()
+    }
+
+    /// Remove an xdg_surface association.
+    pub(crate) fn take_xdg_surface(&mut self, xdg_surface_guest_id: u32) -> Option<u32> {
+        let wl_surface_guest_id = self.xdg_surface_by_id.remove(&xdg_surface_guest_id)?;
+        self.xdg_surface_by_wl_surface.remove(&wl_surface_guest_id);
+        self.debug_assert_consistent();
+        Some(wl_surface_guest_id)
+    }
+
+    /// Record the xdg_toplevel → wl_surface role association.
+    #[must_use = "the XDG toplevel association may conflict with a live role"]
+    pub(crate) fn remember_xdg_toplevel(
+        &mut self,
+        xdg_toplevel_guest_id: u32,
+        wl_surface_guest_id: u32,
+    ) -> bool {
+        if self
+            .wl_surface_by_xdg_toplevel
+            .get(&xdg_toplevel_guest_id)
+            .is_some_and(|existing| *existing != wl_surface_guest_id)
+            || self
+                .xdg_toplevel_by_wl_surface
+                .get(&wl_surface_guest_id)
+                .is_some_and(|existing| *existing != xdg_toplevel_guest_id)
+        {
+            return false;
+        }
+        self.wl_surface_by_xdg_toplevel
+            .insert(xdg_toplevel_guest_id, wl_surface_guest_id);
+        self.xdg_toplevel_by_wl_surface
+            .insert(wl_surface_guest_id, xdg_toplevel_guest_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Resolve an xdg_toplevel to its backing wl_surface.
+    pub(crate) fn wl_surface_for_xdg_toplevel(&self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+        self.wl_surface_by_xdg_toplevel
+            .get(&xdg_toplevel_guest_id)
+            .copied()
+    }
+
+    /// Find the XDG toplevel currently associated with a wl_surface.
+    pub(crate) fn xdg_toplevel_for_wl_surface(&self, wl_surface_guest_id: u32) -> Option<u32> {
+        self.xdg_toplevel_by_wl_surface
+            .get(&wl_surface_guest_id)
+            .copied()
+    }
+
+    /// Remove one xdg_toplevel role association.
+    pub(crate) fn take_xdg_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+        let wl_surface_guest_id = self
+            .wl_surface_by_xdg_toplevel
+            .remove(&xdg_toplevel_guest_id)?;
+        self.xdg_toplevel_by_wl_surface.remove(&wl_surface_guest_id);
+        self.debug_assert_consistent();
+        Some(wl_surface_guest_id)
+    }
+
+    /// Remove all XDG role links for one wl_surface and return its toplevels.
+    ///
+    /// The caller releases each returned Aura child after this state
+    /// transition, so a malformed destroy ordering cannot leave stale links
+    /// that route a later app-id request to an unrelated surface.
+    pub(crate) fn take_xdg_links_for_wl_surface(&mut self, wl_surface_guest_id: u32) -> Vec<u32> {
+        if let Some(xdg_surface_guest_id) =
+            self.xdg_surface_by_wl_surface.remove(&wl_surface_guest_id)
+        {
+            self.xdg_surface_by_id.remove(&xdg_surface_guest_id);
+        }
+        let toplevels = self
+            .xdg_toplevel_by_wl_surface
+            .remove(&wl_surface_guest_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        for xdg_toplevel_guest_id in &toplevels {
+            self.wl_surface_by_xdg_toplevel
+                .remove(xdg_toplevel_guest_id);
+        }
+        self.debug_assert_consistent();
+        toplevels
     }
 
     /// Return the stable ARC application ID for one guest wl_surface.
@@ -743,5 +1088,83 @@ mod tests {
         assert_eq!(state.origin(77), None);
         assert_eq!(state.pending_origin(77), None);
         assert_eq!(state.barrier_for_callback(40), None);
+    }
+
+    #[test]
+    fn xdg_role_associations_are_one_to_one_and_teardown_is_bidirectional() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(!state.remember_xdg_surface(11, 20));
+        assert!(!state.remember_xdg_surface(10, 21));
+        assert_eq!(state.wl_surface_for_xdg_surface(10), Some(20));
+
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert!(!state.remember_xdg_toplevel(31, 20));
+        assert!(!state.remember_xdg_toplevel(30, 21));
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), Some(30));
+
+        assert_eq!(state.take_xdg_toplevel(30), Some(20));
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
+        assert_eq!(state.take_xdg_surface(10), Some(20));
+        assert_eq!(state.wl_surface_for_xdg_surface(10), None);
+    }
+
+    #[test]
+    fn surface_link_teardown_removes_all_role_directions() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert_eq!(state.take_xdg_links_for_wl_surface(20), vec![30]);
+        assert_eq!(state.wl_surface_for_xdg_surface(10), None);
+        assert_eq!(state.wl_surface_for_xdg_toplevel(30), None);
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
+        assert_eq!(state.take_xdg_links_for_wl_surface(20), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn output_registry_is_idempotent_and_ignores_non_current_modes() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_output(50));
+        assert!(!state.remember_output(50));
+        state.update_output_mode(50, true, 3840, 2160);
+        state.update_output_mode(50, false, 1920, 1080);
+        state.update_output_scale(50, 2);
+        assert_eq!(
+            state.primary_output(),
+            Some((
+                50,
+                OutputState {
+                    mode_width: 3840,
+                    mode_height: 2160,
+                    scale: 2,
+                    ..Default::default()
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn aura_shell_binding_teardown_is_owned_by_global_generation() {
+        let mut state = WindowPlacementState::default();
+        state.set_aura_shell_binding(24, Some(7), 38);
+
+        assert_eq!(state.aura_shell_id(), Some(24));
+        assert_eq!(state.aura_shell_global_name(), Some(7));
+        assert_eq!(state.aura_shell_version(), 38);
+        assert_eq!(
+            state.take_aura_shell_for_global(8),
+            None,
+            "a stale generation must not release the current shell"
+        );
+        assert_eq!(state.aura_shell_id(), Some(24));
+        assert_eq!(state.aura_shell_global_name(), Some(7));
+        assert_eq!(state.aura_shell_version(), 38);
+
+        assert_eq!(state.take_aura_shell_for_global(7), Some((24, 38)));
+        assert_eq!(state.aura_shell_id(), None);
+        assert_eq!(state.aura_shell_global_name(), None);
+        assert_eq!(state.aura_shell_version(), 0);
     }
 }

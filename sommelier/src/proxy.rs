@@ -1708,8 +1708,8 @@ rect = [0.0, 0.0, 0.5, 0.5]
         ctx.gtk_shells
             .insert(GTK_SHELL, crate::state::GtkShellState::default());
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
-        ctx.host_zaura_shell_id = Some(AURA_SHELL);
-        ctx.host_zaura_shell_version = 38;
+        ctx.window_placement
+            .set_aura_shell_binding(AURA_SHELL, None, 38);
         ctx.shadow_table.track_host_interface_with_version(
             AURA_SHELL,
             "zaura_shell".to_string(),

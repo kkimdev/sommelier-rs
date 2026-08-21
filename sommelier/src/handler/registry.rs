@@ -346,7 +346,7 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx.host_text_input_manager_v1_global_name == Some(name)
         || ctx.host_text_input_extension_v1_global_name == Some(name)
         || ctx.host_keyboard_extension_global_name == Some(name)
-        || ctx.host_zaura_shell_global_name == Some(name)
+        || ctx.window_placement.aura_shell_global_name() == Some(name)
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -412,11 +412,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // is released. Keep both maps and the child dispatch registrations so
         // queued peek_key events remain routable after the manager disappears.
     }
-    if ctx.host_zaura_shell_global_name == Some(name) {
-        let shell_version = ctx.host_zaura_shell_version;
-        let shell_id = ctx.host_zaura_shell_id.take();
-        ctx.host_zaura_shell_global_name = None;
-        ctx.host_zaura_shell_version = 0;
+    if let Some((shell_id, shell_version)) = ctx.window_placement.take_aura_shell_for_global(name) {
         // `global_remove` invalidates only the advertised global name. Already
         // created `zaura_surface` children have their own protocol lifetime
         // and remain usable until their owning wl_surface is destroyed. Keep
@@ -428,14 +424,12 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // Release only the internally bound manager, matching ChromiumOS'
         // registry remover. New children cannot be created until a replacement
         // shell global is advertised and rebound.
-        if let Some(host_id) = shell_id {
-            if shell_version >= 38 {
-                let message = MessageBuilder::new().build_message(host_id, ZAURA_SHELL_RELEASE);
-                ctx.client_to_host_queue.push((message, Vec::new()));
-                ctx.shadow_table.mark_pending_destroy_host(host_id);
-            } else {
-                ctx.shadow_table.retire_host_interface(host_id);
-            }
+        if shell_version >= 38 {
+            let message = MessageBuilder::new().build_message(shell_id, ZAURA_SHELL_RELEASE);
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.shadow_table.mark_pending_destroy_host(shell_id);
+        } else {
+            ctx.shadow_table.retire_host_interface(shell_id);
         }
     }
     ctx.hidden_host_globals.remove(&name);
@@ -865,7 +859,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             return Action::Drop;
         } else if interface == "zaura_shell" {
-            if ctx.host_zaura_shell_id.is_some() {
+            if ctx.window_placement.aura_shell_id().is_some() {
                 // The host compositor sends the same global list to every
                 // wl_registry object. Sommelier has one internal aura shell
                 // binding per connection, so a later registry must not bind
@@ -888,9 +882,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // registry name so its global_remove lifecycle remains paired.
             let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, 38);
-            ctx.host_zaura_shell_id = Some(host_id);
-            ctx.host_zaura_shell_global_name = Some(name);
-            ctx.host_zaura_shell_version = bound_version;
+            ctx.window_placement
+                .set_aura_shell_binding(host_id, Some(name), bound_version);
             ctx.shadow_table.track_host_interface_with_version(
                 host_id,
                 "zaura_shell".to_string(),
@@ -1158,8 +1151,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
         if interface == "wl_output" {
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
+            ctx.window_placement.remember_output(host_new_id);
         }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
@@ -2068,7 +2060,10 @@ mod tests {
         let shell = "zaura_shell".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &shell, 37), Action::Drop);
-        let shell_id = ctx.host_zaura_shell_id.expect("legacy aura shell");
+        let shell_id = ctx
+            .window_placement
+            .aura_shell_id()
+            .expect("legacy aura shell");
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
@@ -2108,14 +2103,17 @@ mod tests {
         let shell = "zaura_shell".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &shell, 38), Action::Drop);
-        let shell_id = ctx.host_zaura_shell_id.expect("aura shell binding");
+        let shell_id = ctx
+            .window_placement
+            .aura_shell_id()
+            .expect("aura shell binding");
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
         assert!(ctx.window_placement.remember_aura_surface(50, surface_id));
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(ctx.host_zaura_shell_id, None);
+        assert_eq!(ctx.window_placement.aura_shell_id(), None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(
             ctx.window_placement.aura_surface_for_wl_surface(50),
