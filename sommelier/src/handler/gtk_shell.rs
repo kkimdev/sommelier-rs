@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::handler::compositor::{
     ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
+    ARC_APPLICATION_ID,
 };
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
@@ -148,7 +149,18 @@ impl GtkSurface1Handler for GtkShellHandler {
             return Action::Drop;
         }
 
-        let application_id = native_wayland_app_id(&ctx.vm_identifier, application_id);
+        // `zaura_surface.set_application_id` is also the metadata Exo uses
+        // when deciding whether a window is allowed to receive arbitrary
+        // `zaura_toplevel.set_window_bounds` requests.  The compositor-owned
+        // layout path opts the surface into ARC policy (the same ID is sent
+        // from xdg_toplevel.set_app_id); GTK applications can send their
+        // D-Bus properties after that xdg request, so do not overwrite the
+        // ARC ID with the normal Crostini namespace.
+        let application_id = if ctx.window_bounds_as_arc {
+            ARC_APPLICATION_ID.to_string()
+        } else {
+            native_wayland_app_id(&ctx.vm_identifier, application_id)
+        };
         if !wayland_string_fits_message(&application_id) {
             log::warn!(
                 "Dropping oversized GTK application ID for gtk_surface1 {}",
@@ -316,6 +328,37 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
+        let mut ctx = setup_ctx();
+        ctx.window_bounds_as_arc = true;
+        ctx.last_sender_id = GTK_SHELL;
+        let mut handler = GtkShellHandler;
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        ctx.client_to_host_queue.clear();
+        ctx.last_sender_id = GTK_SURFACE;
+
+        assert_eq!(
+            handler.on_set_dbus_properties(
+                &mut ctx,
+                &Some("com.example.Terminal".to_string()),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+            ),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let message = &ctx.client_to_host_queue[0].0;
+        assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
+        assert_eq!(
+            nullable_string(message).as_deref(),
+            Some(ARC_APPLICATION_ID)
         );
     }
 

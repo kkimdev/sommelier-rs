@@ -210,11 +210,19 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the ARC application namespace required for compositor-owned window bounds placement. |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
+
+When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set, Sommelier handles
+`Alt+Q/W/E/A/S/D/Z/X/C` for a focused XDG toplevel and places it in the
+corresponding top-left, top, top-right, left, full-screen, right, bottom-left,
+bottom, or bottom-right work-area region. The variable is intentionally
+opt-in because it changes the ChromeOS window-policy namespace; key/action
+configuration will be separated from this policy switch in a follow-up.
 
 ## CI and release workflow
 
