@@ -215,7 +215,7 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. |
+| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. `arc` rewrites IDs even when geometry is `none`; use `guest + none` for a completely inactive feature. |
 | `--window-geometry-method none\|bounds\|self-parent` | Startup-only geometry operation; defaults to `none`. `self-parent` is experimental and position-only. |
 | `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
 

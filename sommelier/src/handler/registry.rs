@@ -891,8 +891,16 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // registry name so its global_remove lifecycle remains paired.
             let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, 38);
-            ctx.window_placement
-                .set_aura_shell_binding(host_id, name, bound_version);
+            if !ctx
+                .window_placement
+                .set_aura_shell_binding(host_id, name, bound_version)
+            {
+                log::error!(
+                    "Refusing to replace the live Aura shell binding for global {}",
+                    name
+                );
+                return Action::Drop;
+            }
             ctx.shadow_table.track_host_interface_with_version(
                 host_id,
                 "zaura_shell".to_string(),
@@ -909,7 +917,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            let bound = queue_internal_bind(
                 ctx,
                 registry_host_id,
                 name,
@@ -917,6 +925,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
+            if !bound {
+                // Do not leave a manager generation that can suppress every
+                // future re-advertisement after its host bind failed.
+                let _ = ctx.window_placement.take_aura_shell_for_global(name);
+                ctx.shadow_table.remove_host_interface(host_id);
+                ctx.host_globals.remove(&name);
+                ctx.fatal_protocol_error = true;
+                return Action::Drop;
+            }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
             return Action::Drop;
@@ -1161,8 +1178,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
-        if interface == "wl_output" {
-            ctx.window_placement.remember_output(host_new_id);
+        if interface == "wl_output" && !ctx.window_placement.remember_output(host_new_id) {
+            log::error!(
+                "Refusing duplicate placement output binding for host ID {}",
+                host_new_id
+            );
+            ctx.shadow_table.remove_id(*guest_new_id);
+            return Action::Drop;
         }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
@@ -1184,6 +1206,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
             // Do not leave a guest→host mapping behind when the registry
             // itself has already been destroyed or was never mapped.
+            if interface == "wl_output" {
+                let _ = ctx.window_placement.take_output(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
@@ -1200,6 +1225,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
+            if interface == "wl_output" {
+                // The placement record was created before the bind request so
+                // host mode/scale events can be accepted immediately. If the
+                // request cannot be encoded, roll that record back together
+                // with the guest/host mapping.
+                let _ = ctx.window_placement.take_output(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
@@ -1509,6 +1541,30 @@ mod tests {
             "invalid wl_registry.bind must report a fatal wl_display.error"
         );
         assert!(ctx.fatal_protocol_error);
+    }
+
+    #[test]
+    fn output_bind_without_registry_mapping_rolls_back_placement_state() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.host_globals.insert(
+            7,
+            HostGlobal {
+                interface: "wl_output".to_string(),
+                version: 3,
+            },
+        );
+        ctx.last_sender_id = 10;
+
+        let mut handler = RegistryHandler;
+        let bind = ("wl_output".to_string(), 3, 20);
+        assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
+        assert_eq!(
+            ctx.window_placement.primary_output(),
+            None,
+            "a failed registry bind must not leave output geometry alive"
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert_eq!(ctx.shadow_table.get_interface(20), None);
     }
 
     #[test]

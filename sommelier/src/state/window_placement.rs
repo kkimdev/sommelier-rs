@@ -124,6 +124,11 @@ impl WindowPlacementMode {
     }
 
     /// Return whether the ARC application namespace is selected.
+    ///
+    /// This policy is intentionally independent from geometry selection:
+    /// `arc + none` still rewrites application IDs but does not consume
+    /// shortcuts. Use `guest + none` for a completely inactive placement
+    /// feature.
     pub(crate) const fn uses_arc_policy(self) -> bool {
         matches!(self.host_policy, WindowHostPolicy::Arc)
     }
@@ -183,6 +188,14 @@ const DEFAULT_VM_IDENTIFIER: &str = "termina";
 // values positive and well below INT32_MAX while partitioning the range by
 // process ID and a process-wide serial. The serial is intentionally global so
 // multiple Context instances in one process cannot reuse an ID concurrently.
+//
+// This allocator is the one deliberate process-wide exception to
+// `WindowPlacementState`'s lifecycle ownership: it only reserves a fresh
+// numeric identity. The live identity-to-surface mapping remains in each
+// connection's state and is retired by `take_aura_surface_for_wl_surface`.
+// Keeping allocation process-wide avoids collisions between simultaneous
+// client contexts; moving it into each state would restart the serial for
+// every connection and make active ARC application IDs collide.
 const ARC_SESSION_ID_BASE: u32 = 1_000_000_000;
 const ARC_SESSION_ID_PID_MASK: u32 = (1 << 14) - 1;
 const ARC_SESSION_ID_SERIAL_MASK: u32 = (1 << 14) - 1;
@@ -200,7 +213,7 @@ fn next_arc_session_id() -> u32 {
 ///
 /// An exported-but-empty environment variable is equivalent to an unset one,
 /// matching ChromiumOS Sommelier's fallback to the standard Crostini VM name.
-pub(crate) fn resolve_vm_identifier(value: Option<String>) -> String {
+fn resolve_vm_identifier(value: Option<String>) -> String {
     value
         .filter(|identifier| !identifier.is_empty())
         .unwrap_or_else(|| DEFAULT_VM_IDENTIFIER.to_string())
@@ -242,6 +255,166 @@ struct GtkSurfaceState {
     wl_surface_id: u32,
 }
 
+/// One-to-one association with both lookup directions owned together.
+///
+/// Placement lifecycle code frequently needs to resolve either side of a
+/// guest/host relationship. Keeping the two maps behind this type prevents a
+/// caller from updating one direction without the reverse direction and makes
+/// conflict handling identical for every association kind.
+#[derive(Debug, Default)]
+struct BidirectionalLinks {
+    forward: HashMap<u32, u32>,
+    reverse: HashMap<u32, u32>,
+}
+
+impl BidirectionalLinks {
+    /// Insert an association if both IDs are unused or already paired.
+    #[must_use = "a conflicting association must not replace live state"]
+    fn insert(&mut self, forward_id: u32, reverse_id: u32) -> bool {
+        match (
+            self.forward.get(&forward_id).copied(),
+            self.reverse.get(&reverse_id).copied(),
+        ) {
+            (None, None) => {
+                self.forward.insert(forward_id, reverse_id);
+                self.reverse.insert(reverse_id, forward_id);
+                true
+            }
+            (Some(existing_reverse), Some(existing_forward))
+                if existing_reverse == reverse_id && existing_forward == forward_id =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve the reverse-side ID for one forward-side ID.
+    fn get_forward(&self, forward_id: u32) -> Option<u32> {
+        self.forward.get(&forward_id).copied()
+    }
+
+    /// Resolve the forward-side ID for one reverse-side ID.
+    fn get_reverse(&self, reverse_id: u32) -> Option<u32> {
+        self.reverse.get(&reverse_id).copied()
+    }
+
+    /// Remove an association by its forward-side ID.
+    fn remove_forward(&mut self, forward_id: u32) -> Option<u32> {
+        let reverse_id = self.forward.remove(&forward_id)?;
+        self.reverse.remove(&reverse_id);
+        Some(reverse_id)
+    }
+
+    /// Remove an association by its reverse-side ID.
+    fn remove_reverse(&mut self, reverse_id: u32) -> Option<u32> {
+        let forward_id = self.reverse.remove(&reverse_id)?;
+        self.forward.remove(&forward_id);
+        Some(forward_id)
+    }
+
+    /// Return whether both lookup directions contain exactly the same pairs.
+    fn is_consistent(&self) -> bool {
+        self.forward.len() == self.reverse.len()
+            && self
+                .forward
+                .iter()
+                .all(|(forward_id, reverse_id)| self.reverse.get(reverse_id) == Some(forward_id))
+            && self
+                .reverse
+                .iter()
+                .all(|(reverse_id, forward_id)| self.forward.get(forward_id) == Some(reverse_id))
+    }
+}
+
+/// Ordered host-sync callbacks retained for placement requests.
+///
+/// A toplevel may have several callbacks in flight when the user presses
+/// shortcuts quickly. `by_callback` retains every callback until its terminal
+/// host event, while `active_by_toplevel` identifies the newest callback for
+/// each toplevel. The callback establishes host-stream ordering; it does not
+/// suppress `xdg_toplevel.configure` events. Keeping these maps behind one
+/// owner prevents stale callback completion from clearing newer placement
+/// bookkeeping.
+#[derive(Debug, Default)]
+struct PlacementBarrierRegistry {
+    by_callback: HashMap<u32, u32>,
+    active_by_toplevel: HashMap<u32, u32>,
+}
+
+impl PlacementBarrierRegistry {
+    /// Return whether a callback ID is already retained by this registry.
+    fn contains_callback(&self, callback_id: u32) -> bool {
+        self.by_callback.contains_key(&callback_id)
+    }
+
+    /// Retain a callback and make it the latest sync for its toplevel.
+    ///
+    /// An existing active callback is intentionally superseded but remains in
+    /// `by_callback` until its host-side terminal event arrives.
+    fn register(&mut self, callback_id: u32, toplevel_id: u32) -> bool {
+        if self.contains_callback(callback_id) {
+            return false;
+        }
+        self.by_callback.insert(callback_id, toplevel_id);
+        self.active_by_toplevel.insert(toplevel_id, callback_id);
+        true
+    }
+
+    /// Complete one callback and return the toplevel it guarded.
+    ///
+    /// Only the callback that is still active for that toplevel may clear the
+    /// active entry; an older superseded callback remains callback-owned until
+    /// its own completion without disturbing the newer barrier.
+    fn complete(&mut self, callback_id: u32) -> Option<u32> {
+        let toplevel_id = self.by_callback.remove(&callback_id)?;
+        if self.active_by_toplevel.get(&toplevel_id) == Some(&callback_id) {
+            self.active_by_toplevel.remove(&toplevel_id);
+        }
+        Some(toplevel_id)
+    }
+
+    /// Clear the latest pending sync for a released toplevel.
+    ///
+    /// Retained callbacks are deliberately left untouched because the host
+    /// may still emit their terminal events and their numeric IDs remain
+    /// reserved until then.
+    fn release_toplevel(&mut self, toplevel_id: u32) {
+        self.active_by_toplevel.remove(&toplevel_id);
+    }
+
+    /// Return whether a toplevel currently has a pending sync callback.
+    fn has_pending(&self, toplevel_id: u32) -> bool {
+        self.active_by_toplevel.contains_key(&toplevel_id)
+    }
+
+    /// Return whether no callback ownership remains.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_callback.is_empty() && self.active_by_toplevel.is_empty()
+    }
+
+    /// Check the forward/reverse barrier invariants.
+    fn is_consistent(&self, is_live_toplevel: impl Fn(u32) -> bool) -> bool {
+        self.active_by_toplevel
+            .iter()
+            .all(|(toplevel_id, callback_id)| {
+                self.by_callback.get(callback_id) == Some(toplevel_id)
+                    && is_live_toplevel(*toplevel_id)
+            })
+    }
+
+    #[cfg(test)]
+    fn callback_for(&self, callback_id: u32) -> Option<u32> {
+        self.by_callback.get(&callback_id).copied()
+    }
+
+    #[cfg(test)]
+    fn active_callback_for(&self, toplevel_id: u32) -> Option<u32> {
+        self.active_by_toplevel.get(&toplevel_id).copied()
+    }
+}
+
 /// All mutable state owned by the window-placement feature.
 ///
 /// The maps are private by design. In particular, callers must not update an
@@ -255,17 +428,12 @@ pub(crate) struct WindowPlacementState {
     vm_identifier: String,
     aura_shell: Option<AuraShellBinding>,
     arc_session_application_ids: HashMap<u32, String>,
-    aura_surface_by_wl_surface: HashMap<u32, u32>,
-    wl_surface_by_aura_surface: HashMap<u32, u32>,
-    aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
-    xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
-    xdg_surface_by_id: HashMap<u32, u32>,
-    xdg_surface_by_wl_surface: HashMap<u32, u32>,
-    wl_surface_by_xdg_toplevel: HashMap<u32, u32>,
-    xdg_toplevel_by_wl_surface: HashMap<u32, u32>,
+    aura_surface_links: BidirectionalLinks,
+    aura_toplevel_links: BidirectionalLinks,
+    xdg_surface_links: BidirectionalLinks,
+    xdg_toplevel_links: BidirectionalLinks,
     toplevels: HashMap<u32, ToplevelPlacementState>,
-    barrier_to_toplevel: HashMap<u32, u32>,
-    active_barrier_by_toplevel: HashMap<u32, u32>,
+    barriers: PlacementBarrierRegistry,
     outputs: Vec<OutputRecord>,
     gtk_shells: HashMap<u32, GtkShellState>,
     gtk_surfaces: HashMap<u32, GtkSurfaceState>,
@@ -281,55 +449,10 @@ impl WindowPlacementState {
     /// builds instead of silently corrupting a later destructor path.
     #[inline]
     fn debug_assert_consistent(&self) {
-        debug_assert!(self.aura_surface_by_wl_surface.iter().all(
-            |(wl_surface_host_id, zaura_surface_host_id)| {
-                self.wl_surface_by_aura_surface.get(zaura_surface_host_id)
-                    == Some(wl_surface_host_id)
-            }
-        ));
-        debug_assert!(self.wl_surface_by_aura_surface.iter().all(
-            |(zaura_surface_host_id, wl_surface_host_id)| {
-                self.aura_surface_by_wl_surface.get(wl_surface_host_id)
-                    == Some(zaura_surface_host_id)
-            }
-        ));
-        debug_assert!(self.aura_toplevel_by_xdg_toplevel.iter().all(
-            |(xdg_toplevel_guest_id, zaura_toplevel_host_id)| {
-                self.xdg_toplevel_by_aura_toplevel
-                    .get(zaura_toplevel_host_id)
-                    == Some(xdg_toplevel_guest_id)
-            }
-        ));
-        debug_assert!(self.xdg_toplevel_by_aura_toplevel.iter().all(
-            |(zaura_toplevel_host_id, xdg_toplevel_guest_id)| {
-                self.aura_toplevel_by_xdg_toplevel
-                    .get(xdg_toplevel_guest_id)
-                    == Some(zaura_toplevel_host_id)
-            }
-        ));
-        debug_assert!(self.xdg_surface_by_id.iter().all(
-            |(xdg_surface_guest_id, wl_surface_guest_id)| {
-                self.xdg_surface_by_wl_surface.get(wl_surface_guest_id)
-                    == Some(xdg_surface_guest_id)
-            }
-        ));
-        debug_assert!(self.xdg_surface_by_wl_surface.iter().all(
-            |(wl_surface_guest_id, xdg_surface_guest_id)| {
-                self.xdg_surface_by_id.get(xdg_surface_guest_id) == Some(wl_surface_guest_id)
-            }
-        ));
-        debug_assert!(self.wl_surface_by_xdg_toplevel.iter().all(
-            |(xdg_toplevel_guest_id, wl_surface_guest_id)| {
-                self.xdg_toplevel_by_wl_surface.get(wl_surface_guest_id)
-                    == Some(xdg_toplevel_guest_id)
-            }
-        ));
-        debug_assert!(self.xdg_toplevel_by_wl_surface.iter().all(
-            |(wl_surface_guest_id, xdg_toplevel_guest_id)| {
-                self.wl_surface_by_xdg_toplevel.get(xdg_toplevel_guest_id)
-                    == Some(wl_surface_guest_id)
-            }
-        ));
+        debug_assert!(self.aura_surface_links.is_consistent());
+        debug_assert!(self.aura_toplevel_links.is_consistent());
+        debug_assert!(self.xdg_surface_links.is_consistent());
+        debug_assert!(self.xdg_toplevel_links.is_consistent());
         debug_assert!(self.outputs.iter().enumerate().all(|(index, output)| {
             self.outputs[..index]
                 .iter()
@@ -348,26 +471,20 @@ impl WindowPlacementState {
                 .is_some_and(|shell| shell.surfaces.contains(surface_id))
         }));
         debug_assert!(self.toplevels.keys().all(|zaura_toplevel_host_id| {
-            self.xdg_toplevel_by_aura_toplevel
-                .contains_key(zaura_toplevel_host_id)
+            self.aura_toplevel_links
+                .get_reverse(*zaura_toplevel_host_id)
+                .is_some()
         }));
-        debug_assert!(self.active_barrier_by_toplevel.iter().all(
-            |(zaura_toplevel_host_id, callback_host_id)| {
-                self.barrier_to_toplevel.get(callback_host_id) == Some(zaura_toplevel_host_id)
-                    && self
-                        .xdg_toplevel_by_aura_toplevel
-                        .contains_key(zaura_toplevel_host_id)
-            }
-        ));
+        debug_assert!(self.barriers.is_consistent(|zaura_toplevel_host_id| {
+            self.aura_toplevel_links
+                .get_reverse(zaura_toplevel_host_id)
+                .is_some()
+        }));
     }
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
-        Self::with_shortcut_config(
-            mode,
-            ShortcutConfigHandle::disabled(),
-            DEFAULT_VM_IDENTIFIER.to_string(),
-        )
+        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled())
     }
 
     /// Create placement state with the process-wide immutable binding handle.
@@ -377,25 +494,20 @@ impl WindowPlacementState {
     pub(crate) fn with_shortcut_config(
         mode: WindowPlacementMode,
         shortcut_config: ShortcutConfigHandle,
-        vm_identifier: String,
     ) -> Self {
+        let vm_identifier = resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
         Self {
             mode,
             shortcut_config,
             vm_identifier,
             aura_shell: None,
             arc_session_application_ids: HashMap::new(),
-            aura_surface_by_wl_surface: HashMap::new(),
-            wl_surface_by_aura_surface: HashMap::new(),
-            aura_toplevel_by_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_by_aura_toplevel: HashMap::new(),
-            xdg_surface_by_id: HashMap::new(),
-            xdg_surface_by_wl_surface: HashMap::new(),
-            wl_surface_by_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_by_wl_surface: HashMap::new(),
+            aura_surface_links: BidirectionalLinks::default(),
+            aura_toplevel_links: BidirectionalLinks::default(),
+            xdg_surface_links: BidirectionalLinks::default(),
+            xdg_toplevel_links: BidirectionalLinks::default(),
             toplevels: HashMap::new(),
-            barrier_to_toplevel: HashMap::new(),
-            active_barrier_by_toplevel: HashMap::new(),
+            barriers: PlacementBarrierRegistry::default(),
             outputs: Vec::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
@@ -452,13 +564,27 @@ impl WindowPlacementState {
     /// Keeping ID, source global, and version in one record prevents a global
     /// replacement from accidentally retaining the old version or routing
     /// requests through an object whose manager has already been released.
-    pub(crate) fn set_aura_shell_binding(&mut self, host_id: u32, global_name: u32, version: u32) {
+    ///
+    /// A live generation cannot be replaced in place. The caller must retire
+    /// the old generation first so its host object and child lifetimes remain
+    /// reachable until their protocol teardown completes.
+    #[must_use = "a live Aura shell generation must not be overwritten"]
+    pub(crate) fn set_aura_shell_binding(
+        &mut self,
+        host_id: u32,
+        global_name: u32,
+        version: u32,
+    ) -> bool {
+        if self.aura_shell.is_some() {
+            return false;
+        }
         self.aura_shell = Some(AuraShellBinding {
             host_id,
             global_name,
             version,
         });
         self.debug_assert_consistent();
+        true
     }
 
     /// Retire the Aura shell only when the named global owns the live binding.
@@ -662,6 +788,7 @@ impl WindowPlacementState {
     }
 
     /// Register a host output once and create its geometry record.
+    #[must_use = "a duplicate output must not be forwarded"]
     pub(crate) fn remember_output(&mut self, host_output_id: u32) -> bool {
         if self
             .outputs
@@ -678,6 +805,35 @@ impl WindowPlacementState {
         true
     }
 
+    /// Retire one host output after the guest releases its wl_output object.
+    ///
+    /// Host output events can still be queued between the guest release
+    /// request and the host's `wl_display.delete_id`. Removing the record at
+    /// the request boundary, and making later updates ignore unknown IDs,
+    /// prevents a stale event from resurrecting a released output as the
+    /// primary placement target.
+    #[must_use = "the caller must account for an untracked output release"]
+    pub(crate) fn take_output(&mut self, host_output_id: u32) -> bool {
+        let Some(index) = self
+            .outputs
+            .iter()
+            .position(|output| output.host_id == host_output_id)
+        else {
+            return false;
+        };
+        self.outputs.remove(index);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Return a mutable output record only while its host object is live.
+    fn output_state_mut(&mut self, host_output_id: u32) -> Option<&mut OutputState> {
+        self.outputs
+            .iter_mut()
+            .find(|output| output.host_id == host_output_id)
+            .map(|output| &mut output.state)
+    }
+
     /// Update the current mode for one output.
     ///
     /// Non-current mode events are ignored after the first mode is known, as
@@ -689,22 +845,8 @@ impl WindowPlacementState {
         width: i32,
         height: i32,
     ) {
-        let output = if let Some(output) = self
-            .outputs
-            .iter_mut()
-            .find(|output| output.host_id == host_output_id)
-        {
-            &mut output.state
-        } else {
-            self.outputs.push(OutputRecord {
-                host_id: host_output_id,
-                state: OutputState::default(),
-            });
-            &mut self
-                .outputs
-                .last_mut()
-                .expect("output record was inserted above")
-                .state
+        let Some(output) = self.output_state_mut(host_output_id) else {
+            return;
         };
         if current || output.mode_width == 0 || output.mode_height == 0 {
             output.mode_width = width;
@@ -715,22 +857,8 @@ impl WindowPlacementState {
 
     /// Update the scale advertised by one output.
     pub(crate) fn update_output_scale(&mut self, host_output_id: u32, scale: i32) {
-        let output = if let Some(output) = self
-            .outputs
-            .iter_mut()
-            .find(|output| output.host_id == host_output_id)
-        {
-            &mut output.state
-        } else {
-            self.outputs.push(OutputRecord {
-                host_id: host_output_id,
-                state: OutputState::default(),
-            });
-            &mut self
-                .outputs
-                .last_mut()
-                .expect("output record was inserted above")
-                .state
+        let Some(output) = self.output_state_mut(host_output_id) else {
+            return;
         };
         output.scale = scale;
         self.debug_assert_consistent();
@@ -767,34 +895,26 @@ impl WindowPlacementState {
         xdg_surface_guest_id: u32,
         wl_surface_guest_id: u32,
     ) -> bool {
-        if self
-            .xdg_surface_by_id
-            .get(&xdg_surface_guest_id)
-            .is_some_and(|existing| *existing != wl_surface_guest_id)
-            || self
-                .xdg_surface_by_wl_surface
-                .get(&wl_surface_guest_id)
-                .is_some_and(|existing| *existing != xdg_surface_guest_id)
+        if !self
+            .xdg_surface_links
+            .insert(xdg_surface_guest_id, wl_surface_guest_id)
         {
             return false;
         }
-        self.xdg_surface_by_id
-            .insert(xdg_surface_guest_id, wl_surface_guest_id);
-        self.xdg_surface_by_wl_surface
-            .insert(wl_surface_guest_id, xdg_surface_guest_id);
         self.debug_assert_consistent();
         true
     }
 
     /// Resolve an xdg_surface to its backing wl_surface.
     pub(crate) fn wl_surface_for_xdg_surface(&self, xdg_surface_guest_id: u32) -> Option<u32> {
-        self.xdg_surface_by_id.get(&xdg_surface_guest_id).copied()
+        self.xdg_surface_links.get_forward(xdg_surface_guest_id)
     }
 
     /// Remove an xdg_surface association.
     pub(crate) fn take_xdg_surface(&mut self, xdg_surface_guest_id: u32) -> Option<u32> {
-        let wl_surface_guest_id = self.xdg_surface_by_id.remove(&xdg_surface_guest_id)?;
-        self.xdg_surface_by_wl_surface.remove(&wl_surface_guest_id);
+        let wl_surface_guest_id = self
+            .xdg_surface_links
+            .remove_forward(xdg_surface_guest_id)?;
         self.debug_assert_consistent();
         Some(wl_surface_guest_id)
     }
@@ -806,45 +926,31 @@ impl WindowPlacementState {
         xdg_toplevel_guest_id: u32,
         wl_surface_guest_id: u32,
     ) -> bool {
-        if self
-            .wl_surface_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .is_some_and(|existing| *existing != wl_surface_guest_id)
-            || self
-                .xdg_toplevel_by_wl_surface
-                .get(&wl_surface_guest_id)
-                .is_some_and(|existing| *existing != xdg_toplevel_guest_id)
+        if !self
+            .xdg_toplevel_links
+            .insert(xdg_toplevel_guest_id, wl_surface_guest_id)
         {
             return false;
         }
-        self.wl_surface_by_xdg_toplevel
-            .insert(xdg_toplevel_guest_id, wl_surface_guest_id);
-        self.xdg_toplevel_by_wl_surface
-            .insert(wl_surface_guest_id, xdg_toplevel_guest_id);
         self.debug_assert_consistent();
         true
     }
 
     /// Resolve an xdg_toplevel to its backing wl_surface.
     pub(crate) fn wl_surface_for_xdg_toplevel(&self, xdg_toplevel_guest_id: u32) -> Option<u32> {
-        self.wl_surface_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .copied()
+        self.xdg_toplevel_links.get_forward(xdg_toplevel_guest_id)
     }
 
     /// Find the XDG toplevel currently associated with a wl_surface.
     pub(crate) fn xdg_toplevel_for_wl_surface(&self, wl_surface_guest_id: u32) -> Option<u32> {
-        self.xdg_toplevel_by_wl_surface
-            .get(&wl_surface_guest_id)
-            .copied()
+        self.xdg_toplevel_links.get_reverse(wl_surface_guest_id)
     }
 
     /// Remove one xdg_toplevel role association.
     pub(crate) fn take_xdg_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
         let wl_surface_guest_id = self
-            .wl_surface_by_xdg_toplevel
-            .remove(&xdg_toplevel_guest_id)?;
-        self.xdg_toplevel_by_wl_surface.remove(&wl_surface_guest_id);
+            .xdg_toplevel_links
+            .remove_forward(xdg_toplevel_guest_id)?;
         self.debug_assert_consistent();
         Some(wl_surface_guest_id)
     }
@@ -855,29 +961,22 @@ impl WindowPlacementState {
     /// transition, so a malformed destroy ordering cannot leave stale links
     /// that route a later app-id request to an unrelated surface.
     pub(crate) fn take_xdg_links_for_wl_surface(&mut self, wl_surface_guest_id: u32) -> Vec<u32> {
-        if let Some(xdg_surface_guest_id) =
-            self.xdg_surface_by_wl_surface.remove(&wl_surface_guest_id)
-        {
-            self.xdg_surface_by_id.remove(&xdg_surface_guest_id);
-        }
+        self.xdg_surface_links.remove_reverse(wl_surface_guest_id);
         let toplevels = self
-            .xdg_toplevel_by_wl_surface
-            .remove(&wl_surface_guest_id)
+            .xdg_toplevel_links
+            .remove_reverse(wl_surface_guest_id)
             .into_iter()
             .collect::<Vec<_>>();
-        for xdg_toplevel_guest_id in &toplevels {
-            self.wl_surface_by_xdg_toplevel
-                .remove(xdg_toplevel_guest_id);
-        }
         self.debug_assert_consistent();
         toplevels
     }
 
     /// Return the stable ARC application ID for one guest wl_surface.
     ///
-    /// The mapping lasts until [`Self::remove_surface`] is called, so XDG and
-    /// GTK metadata paths cannot disagree while the surface is alive. The
-    /// result is `None` when the ARC host policy is not selected.
+    /// The mapping lasts until [`Self::take_aura_surface_for_wl_surface`] is
+    /// called. XDG and GTK metadata paths therefore cannot disagree while the
+    /// surface is alive. The result is `None` when the ARC host policy is not
+    /// selected.
     pub(crate) fn arc_session_application_id(
         &mut self,
         wl_surface_guest_id: u32,
@@ -898,34 +997,28 @@ impl WindowPlacementState {
         )
     }
 
-    /// Remove all placement metadata owned by a destroyed guest surface.
+    /// Remove the ARC identity and Aura-surface link for a destroyed surface.
     ///
     /// The guest ID owns the ARC application ID while the host ID owns the
     /// Aura-surface association. Requiring both IDs keeps their lifetimes
     /// coupled at the only teardown boundary that has authoritative ownership
     /// of both objects.
     #[must_use = "the returned Aura surface ID identifies host teardown work"]
-    pub(crate) fn remove_surface(
+    pub(crate) fn take_aura_surface_for_wl_surface(
         &mut self,
         wl_surface_guest_id: u32,
         wl_surface_host_id: u32,
     ) -> Option<u32> {
         self.arc_session_application_ids
             .remove(&wl_surface_guest_id);
-        let zaura_surface_host_id = self.aura_surface_by_wl_surface.remove(&wl_surface_host_id);
-        if let Some(zaura_surface_host_id) = zaura_surface_host_id {
-            self.wl_surface_by_aura_surface
-                .remove(&zaura_surface_host_id);
-        }
+        let zaura_surface_host_id = self.aura_surface_links.remove_forward(wl_surface_host_id);
         self.debug_assert_consistent();
         zaura_surface_host_id
     }
 
     /// Return the Aura surface associated with a host wl_surface.
     pub(crate) fn aura_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
-        self.aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .copied()
+        self.aura_surface_links.get_forward(wl_surface_host_id)
     }
 
     /// Record the one-to-one Aura surface association for a host wl_surface.
@@ -939,30 +1032,19 @@ impl WindowPlacementState {
         wl_surface_host_id: u32,
         zaura_surface_host_id: u32,
     ) -> bool {
-        if self
-            .aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .is_some_and(|existing| *existing != zaura_surface_host_id)
-            || self
-                .wl_surface_by_aura_surface
-                .get(&zaura_surface_host_id)
-                .is_some_and(|existing| *existing != wl_surface_host_id)
+        if !self
+            .aura_surface_links
+            .insert(wl_surface_host_id, zaura_surface_host_id)
         {
             return false;
         }
-        self.aura_surface_by_wl_surface
-            .insert(wl_surface_host_id, zaura_surface_host_id);
-        self.wl_surface_by_aura_surface
-            .insert(zaura_surface_host_id, wl_surface_host_id);
         self.debug_assert_consistent();
         true
     }
 
     /// Return the Aura toplevel associated with a guest xdg_toplevel.
     pub(crate) fn aura_toplevel_for_xdg_toplevel(&self, xdg_toplevel_guest_id: u32) -> Option<u32> {
-        self.aura_toplevel_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .copied()
+        self.aura_toplevel_links.get_forward(xdg_toplevel_guest_id)
     }
 
     /// Record a one-to-one xdg_toplevel ↔ Aura toplevel association.
@@ -976,23 +1058,12 @@ impl WindowPlacementState {
         xdg_toplevel_guest_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> bool {
-        let existing_host = self
-            .aura_toplevel_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .copied();
-        let existing_guest = self
-            .xdg_toplevel_by_aura_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied();
-        if existing_host.is_some_and(|existing| existing != zaura_toplevel_host_id)
-            || existing_guest.is_some_and(|existing| existing != xdg_toplevel_guest_id)
+        if !self
+            .aura_toplevel_links
+            .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id)
         {
             return false;
         }
-        self.aura_toplevel_by_xdg_toplevel
-            .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id);
-        self.xdg_toplevel_by_aura_toplevel
-            .insert(zaura_toplevel_host_id, xdg_toplevel_guest_id);
         self.debug_assert_consistent();
         true
     }
@@ -1005,10 +1076,8 @@ impl WindowPlacementState {
     #[must_use = "the returned Aura toplevel ID identifies host teardown work"]
     pub(crate) fn take_aura_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
         let zaura_toplevel_host_id = self
-            .aura_toplevel_by_xdg_toplevel
-            .remove(&xdg_toplevel_guest_id)?;
-        self.xdg_toplevel_by_aura_toplevel
-            .remove(&zaura_toplevel_host_id);
+            .aura_toplevel_links
+            .remove_forward(xdg_toplevel_guest_id)?;
         self.release_toplevel(zaura_toplevel_host_id);
         self.debug_assert_consistent();
         Some(zaura_toplevel_host_id)
@@ -1019,9 +1088,7 @@ impl WindowPlacementState {
         &self,
         zaura_toplevel_host_id: u32,
     ) -> Option<u32> {
-        self.xdg_toplevel_by_aura_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied()
+        self.aura_toplevel_links.get_reverse(zaura_toplevel_host_id)
     }
 
     /// Return the latest screen-space origin for an Aura toplevel.
@@ -1051,9 +1118,10 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         origin: (i32, i32),
     ) -> bool {
-        if !self
-            .xdg_toplevel_by_aura_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
@@ -1076,9 +1144,10 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         target_origin: (i32, i32),
     ) -> bool {
-        if !self
-            .xdg_toplevel_by_aura_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
@@ -1096,11 +1165,10 @@ impl WindowPlacementState {
     /// reserved until its terminal `delete_id`.
     fn release_toplevel(&mut self, zaura_toplevel_host_id: u32) {
         self.toplevels.remove(&zaura_toplevel_host_id);
-        self.active_barrier_by_toplevel
-            .remove(&zaura_toplevel_host_id);
+        self.barriers.release_toplevel(zaura_toplevel_host_id);
     }
 
-    /// Register a newly queued host sync callback as the active barrier.
+    /// Register a newly queued host sync callback as the latest pending sync.
     ///
     /// A callback ID must be globally unique for the connection. Returning
     /// `false` instead of overwriting an existing entry keeps an older
@@ -1111,17 +1179,19 @@ impl WindowPlacementState {
         callback_host_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> bool {
-        if self.barrier_to_toplevel.contains_key(&callback_host_id)
-            || !self
-                .xdg_toplevel_by_aura_toplevel
-                .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
-        self.barrier_to_toplevel
-            .insert(callback_host_id, zaura_toplevel_host_id);
-        self.active_barrier_by_toplevel
-            .insert(zaura_toplevel_host_id, callback_host_id);
+        if !self
+            .barriers
+            .register(callback_host_id, zaura_toplevel_host_id)
+        {
+            return false;
+        }
         self.debug_assert_consistent();
         true
     }
@@ -1129,36 +1199,32 @@ impl WindowPlacementState {
     /// Retire a completed barrier and clear it only if it is still newest.
     #[must_use = "the returned Aura toplevel identifies which placement completed"]
     pub(crate) fn complete_barrier(&mut self, callback_host_id: u32) -> Option<u32> {
-        let zaura_toplevel_host_id = self.barrier_to_toplevel.remove(&callback_host_id)?;
-        if self.active_barrier_by_toplevel.get(&zaura_toplevel_host_id) == Some(&callback_host_id) {
-            self.active_barrier_by_toplevel
-                .remove(&zaura_toplevel_host_id);
-        }
+        let zaura_toplevel_host_id = self.barriers.complete(callback_host_id)?;
         self.debug_assert_consistent();
         Some(zaura_toplevel_host_id)
     }
 
-    /// Return whether a placement barrier currently gates this toplevel.
-    pub(crate) fn has_active_barrier(&self, zaura_toplevel_host_id: u32) -> bool {
-        self.active_barrier_by_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+    /// Return whether a placement sync callback is pending for this toplevel.
+    ///
+    /// The callback only establishes host-stream ordering. Configure events
+    /// continue to be forwarded; origin prediction handles stale positions.
+    pub(crate) fn has_pending_barrier(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.barriers.has_pending(zaura_toplevel_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn barrier_for_callback(&self, callback_host_id: u32) -> Option<u32> {
-        self.barrier_to_toplevel.get(&callback_host_id).copied()
+        self.barriers.callback_for(callback_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn active_barrier_for_toplevel(&self, zaura_toplevel_host_id: u32) -> Option<u32> {
-        self.active_barrier_by_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied()
+        self.barriers.active_callback_for(zaura_toplevel_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn has_any_barriers(&self) -> bool {
-        !self.barrier_to_toplevel.is_empty() || !self.active_barrier_by_toplevel.is_empty()
+        !self.barriers.is_empty()
     }
 
     #[cfg(test)]
@@ -1176,6 +1242,58 @@ impl Default for WindowPlacementState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bidirectional_links_are_atomic_and_reject_conflicts() {
+        let mut links = BidirectionalLinks::default();
+        assert!(links.insert(1, 10));
+        assert!(links.is_consistent());
+        assert_eq!(links.get_forward(1), Some(10));
+        assert_eq!(links.get_reverse(10), Some(1));
+
+        assert!(links.insert(1, 10));
+        assert!(!links.insert(1, 11));
+        assert!(!links.insert(2, 10));
+        assert!(links.is_consistent());
+
+        assert_eq!(links.remove_reverse(10), Some(1));
+        assert!(links.is_consistent());
+        assert_eq!(links.remove_forward(1), None);
+
+        links.forward.insert(3, 30);
+        assert!(!links.is_consistent());
+        assert!(!links.insert(3, 30));
+        assert!(!links.is_consistent());
+    }
+
+    #[test]
+    fn placement_barriers_retain_superseded_callbacks_until_completion() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        assert!(barriers.register(40, 77));
+        assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
+        assert_eq!(barriers.active_callback_for(77), Some(40));
+
+        assert!(barriers.register(41, 77));
+        assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.callback_for(40), Some(77));
+        assert_eq!(barriers.callback_for(41), Some(77));
+
+        assert!(!barriers.register(41, 88));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.complete(40), Some(77));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.complete(41), Some(77));
+        assert!(barriers.is_empty());
+
+        let mut released = PlacementBarrierRegistry::default();
+        assert!(released.register(50, 99));
+        assert!(!released.is_consistent(|_| false));
+        released.release_toplevel(99);
+        assert!(released.is_consistent(|_| false));
+        assert_eq!(released.complete(50), Some(99));
+        assert!(released.is_empty());
+    }
 
     #[test]
     fn backend_flags_are_mutually_exclusive_with_arc_precedence() {
@@ -1207,9 +1325,11 @@ mod tests {
         );
 
         let state = WindowPlacementState::default();
+        let expected_vm_identifier =
+            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
         assert_eq!(
             state.native_wayland_app_id("com.example.Terminal"),
-            "org.chromium.guest_os.termina.wayland.com.example.Terminal"
+            format!("org.chromium.guest_os.{expected_vm_identifier}.wayland.com.example.Terminal")
         );
     }
 
@@ -1255,7 +1375,7 @@ mod tests {
             .expect("ARC session prefix");
         assert!(suffix.parse::<u32>().expect("numeric ARC session ID") > ARC_SESSION_ID_BASE);
 
-        assert_eq!(state.remove_surface(10, 20), None);
+        assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
         assert_ne!(state.arc_session_application_id(10), Some(first));
     }
 
@@ -1269,7 +1389,7 @@ mod tests {
         assert!(state.remember_aura_surface(51, 61));
         assert!(!state.remember_aura_surface(51, 60));
         assert!(!state.remember_aura_surface(52, 61));
-        assert_eq!(state.remove_surface(10, 50), Some(60));
+        assert_eq!(state.take_aura_surface_for_wl_surface(10, 50), Some(60));
         assert_eq!(state.aura_surface_for_wl_surface(50), None);
         assert!(state.remember_aura_surface(52, 60));
 
@@ -1298,7 +1418,7 @@ mod tests {
         assert_eq!(state.take_aura_toplevel(11), Some(71));
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(71), None);
         assert_eq!(state.origin(71), None);
-        assert!(!state.has_active_barrier(71));
+        assert!(!state.has_pending_barrier(71));
         assert_eq!(state.barrier_for_callback(80), Some(71));
     }
 
@@ -1324,7 +1444,7 @@ mod tests {
         assert_eq!(state.take_aura_toplevel(10), Some(77));
 
         assert_eq!(state.origin(77), None);
-        assert!(!state.has_active_barrier(77));
+        assert!(!state.has_pending_barrier(77));
         assert_eq!(state.barrier_for_callback(40), Some(77));
         assert_eq!(state.complete_barrier(40), Some(77));
     }
@@ -1427,9 +1547,27 @@ mod tests {
     }
 
     #[test]
+    fn released_outputs_cannot_be_resurrected_by_delayed_events() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_output(50));
+        state.update_output_mode(50, true, 3840, 2160);
+        state.update_output_scale(50, 1);
+        assert!(state.take_output(50));
+        assert_eq!(state.primary_output(), None);
+
+        // A host mode/scale event can be queued before delete_id reaches the
+        // proxy. It must not recreate placement state for the retired object.
+        state.update_output_mode(50, true, 1920, 1080);
+        state.update_output_scale(50, 2);
+        assert_eq!(state.primary_output(), None);
+        assert!(!state.take_output(50));
+    }
+
+    #[test]
     fn aura_shell_binding_teardown_is_owned_by_global_generation() {
         let mut state = WindowPlacementState::default();
-        state.set_aura_shell_binding(24, 7, 38);
+        assert!(state.set_aura_shell_binding(24, 7, 38));
+        assert!(!state.set_aura_shell_binding(25, 8, 38));
 
         assert_eq!(state.aura_shell_id(), Some(24));
         assert_eq!(state.aura_shell_global_name(), Some(7));
@@ -1447,6 +1585,11 @@ mod tests {
         assert_eq!(state.aura_shell_id(), None);
         assert_eq!(state.aura_shell_global_name(), None);
         assert_eq!(state.aura_shell_version(), 0);
+
+        assert!(state.set_aura_shell_binding(25, 8, 37));
+        assert_eq!(state.aura_shell_id(), Some(25));
+        assert_eq!(state.aura_shell_global_name(), Some(8));
+        assert_eq!(state.aura_shell_version(), 37);
     }
 
     #[test]

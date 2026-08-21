@@ -41,12 +41,19 @@ therefore does not create a genuine ARC restore session.
 ## IDs in the current rewrite
 
 When `--window-host-policy=arc` is selected, the rewrite allocates one stable
-ID for each guest `wl_surface`. XDG and GTK metadata paths reuse that same
-string, and the mapping is removed when the surface is destroyed:
+ID for each guest `wl_surface`. The fabricated ID is sent only through the
+Aura metadata path (`zaura_surface.set_application_id`) and GTK's Aura
+metadata path. The host XDG role keeps Sommelier's normal
+`org.chromium.guest_os.<vm>.wayland.<app>` identity; this prevents ordinary XDG
+shelf, restore, and role bookkeeping from being misclassified as ARC:
 
 ```text
 org.chromium.arc.session.<generated_id>
 ```
+
+The split is intentional: `zaura_toplevel.set_window_bounds` is authorized
+from the Aura surface's policy metadata on the tested host, while the XDG role
+still needs its native guest namespace.
 
 The allocator in `sommelier/src/state/window_placement.rs` currently uses:
 
