@@ -1705,11 +1705,10 @@ rect = [0.0, 0.0, 0.5, 0.5]
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table
             .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
-        ctx.gtk_shells
-            .insert(GTK_SHELL, crate::state::GtkShellState::default());
+        assert!(ctx.window_placement.remember_gtk_shell(GTK_SHELL));
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
         ctx.window_placement
-            .set_aura_shell_binding(AURA_SHELL, None, 38);
+            .set_aura_shell_binding_for_test(AURA_SHELL, 38);
         ctx.shadow_table.track_host_interface_with_version(
             AURA_SHELL,
             "zaura_shell".to_string(),
@@ -1725,7 +1724,10 @@ rect = [0.0, 0.0, 0.5, 0.5]
         assert!(
             dispatch_raw_request_result(&mut handler, &mut ctx, "gtk_shell1", request).is_none()
         );
-        assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
+        assert_eq!(
+            ctx.window_placement.wl_surface_for_gtk_surface(GTK_SURFACE),
+            Some(GUEST_SURFACE)
+        );
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         assert_eq!(
             u32::from_ne_bytes(ctx.client_to_host_queue[0].0[0..4].try_into().unwrap()),

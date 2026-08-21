@@ -29,7 +29,7 @@ use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal};
+use crate::state::{Context, HostGlobal, HostId, PendingDmabufGlobal};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -323,9 +323,18 @@ fn queue_gtk_shell_capability_barrier(ctx: &mut Context, gtk_shell_id: u32) -> b
     builder.write_u32(callback_id);
     match builder.try_build_message(1, wl_display::REQ_SYNC) {
         Ok(message) => {
+            if !ctx
+                .window_placement
+                .register_gtk_shell_capability_callback(callback_id, gtk_shell_id)
+            {
+                log::error!(
+                    "Refusing duplicate GTK shell capability callback {}",
+                    callback_id
+                );
+                ctx.shadow_table.remove_host_interface(callback_id);
+                return false;
+            }
             ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.gtk_shell_capability_callbacks
-                .insert(callback_id, gtk_shell_id);
             true
         }
         Err(error) => {
@@ -883,7 +892,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, 38);
             ctx.window_placement
-                .set_aura_shell_binding(host_id, Some(name), bound_version);
+                .set_aura_shell_binding(host_id, name, bound_version);
             ctx.shadow_table.track_host_interface_with_version(
                 host_id,
                 "zaura_shell".to_string(),
@@ -1137,8 +1146,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 interface.clone(),
                 *version,
             );
-            ctx.gtk_shells
-                .insert(*guest_new_id, GtkShellState::default());
+            if !ctx.window_placement.remember_gtk_shell(*guest_new_id) {
+                log::warn!("Refusing duplicate GTK shell object {}", guest_new_id);
+                return Action::Drop;
+            }
             if !queue_gtk_shell_capability_barrier(ctx, *guest_new_id) {
                 ctx.fatal_protocol_error = true;
             }
@@ -1404,12 +1415,11 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.shadow_table.is_local_only_guest_object(50));
-        assert!(ctx.gtk_shells.contains_key(&50));
+        assert!(ctx.window_placement.has_gtk_shell(50));
         assert!(ctx.host_to_client_queue.is_empty());
         let callback_id = ctx
-            .gtk_shell_capability_callbacks
-            .iter()
-            .find_map(|(&callback_id, &shell_id)| (shell_id == 50).then_some(callback_id))
+            .window_placement
+            .gtk_shell_capability_callback_for_test(50)
             .expect("GTK capability callback");
         ctx.last_sender_id = callback_id;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);

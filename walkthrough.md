@@ -693,3 +693,25 @@ Verification for this implementation:
 - `bun run verify` was executed from the enclosing monorepo: 1,853 assertions
   passed and 9 unrelated baseline checks failed (nested Biome configuration,
   missing Typst/Astro assets, and existing hygiene/shebang findings).
+
+## 2026-08-21 — placement-state ownership review
+
+The follow-up refactor makes `WindowPlacementState` the single owner for all
+placement-adjacent lifecycle metadata: the complete Aura-shell generation,
+ordered output records and work-area conversion, VM/application-ID formatting,
+XDG/Aura associations, GTK shell/surface links, capability barriers, origin
+predictions, and placement barriers. `Context` no longer exposes parallel
+placement maps or metadata fields to handlers. GTK surface IDs are returned in
+stable order so startup-token updates do not depend on `HashSet` iteration.
+The reverse-link assertions remain in the owner and every mutator preserves
+them.
+
+Verification from the review worktree:
+
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 571
+  passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
+  smoke test is also ignored because it requires a live compositor.
+- `cargo check --workspace --all-targets` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `cargo fmt --all -- --check`, `cargo build --release -p sommelier
+  -p sommelier-test-gui`, and `git diff --check` passed.
