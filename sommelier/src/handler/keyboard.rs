@@ -411,10 +411,10 @@ impl KeyboardHandler {
             return false;
         };
 
-        // The self-parent path is a position-only experiment. If both
-        // experimental flags are present, prefer the ARC-session bounds path:
-        // it is the only path that carries width/height and therefore the
-        // only one that can implement a real grid resize.
+        // The self-parent path uses the custom host's position workaround,
+        // then sends the regular Aura bounds request for the requested size.
+        // `set_parent` has no width/height arguments, so both requests are
+        // required for a complete grid placement.
         if ctx.window_placement.uses_self_parent() {
             let zaura_surface_version = ctx
                 .shadow_table
@@ -481,6 +481,27 @@ impl KeyboardHandler {
                 );
                 return true;
             }
+            // Clear compositor-owned state before either placement request.
+            // A snapped/maximized/fullscreen window may otherwise retain its
+            // old size even when the following bounds request is accepted.
+            Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
+
+            // Exo's self-parent path does not accept a size: OnSetParent()
+            // preserves the widget's current size. Resize while the surface
+            // is still top-level, at its known current origin, so the custom
+            // host can authorize the bounds request before the parent probe.
+            // Sending the target x/y here would move the window once through
+            // bounds and then move it again through set_parent.
+            let mut bounds_builder = MessageBuilder::new();
+            bounds_builder.write_i32(origin_x);
+            bounds_builder.write_i32(origin_y);
+            bounds_builder.write_i32(width);
+            bounds_builder.write_i32(height);
+            bounds_builder.write_u32(output_host_id);
+            let bounds_message =
+                bounds_builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
+            ctx.client_to_host_queue.push((bounds_message, Vec::new()));
+
             // This deliberately uses the same surface as both child and
             // parent. Chromium's Exo implementation rejects the transient
             // cycle, but still runs the coordinate calculation; the probe is
@@ -493,6 +514,7 @@ impl KeyboardHandler {
             builder.write_i32(relative_y);
             let message = builder.build_message(zaura_surface_id, REQ_SET_PARENT);
             ctx.client_to_host_queue.push((message, Vec::new()));
+
             if !crate::handler::compositor::queue_window_placement_barrier(ctx, zaura_toplevel_id) {
                 log::warn!(
                     "window layout {:?}: failed to queue host sync barrier for self-parent probe",
@@ -512,12 +534,17 @@ impl KeyboardHandler {
                 relative_x,
                 relative_y
             );
-            log::warn!(
-                "window layout {:?}: self-parent is position-only; requested grid size \
-                 {}x{} is not sent because zaura_surface.set_parent has no size argument",
+            log::info!(
+                "window layout {:?}: self-parent resize-then-move sent \
+                 current_origin=({}, {}) target_screen_bounds=({}, {}, {}, {}) output={}",
                 shortcut,
+                origin_x,
+                origin_y,
+                x,
+                y,
                 width,
-                height
+                height,
+                output_host_id
             );
             return true;
         }
@@ -529,6 +556,56 @@ impl KeyboardHandler {
             );
             return false;
         }
+
+        let transient_restore_id = if ctx.window_placement.uses_transient_arc_id() {
+            let Some(native_application_id) = ctx
+                .window_placement
+                .native_application_id(guest_wl_surface_id)
+            else {
+                log::warn!(
+                    "window layout {:?}: transient ARC mode has no native application ID \
+                     for wl_surface {}",
+                    shortcut,
+                    guest_wl_surface_id
+                );
+                return false;
+            };
+            let Some(arc_application_id) = ctx
+                .window_placement
+                .arc_policy_application_id(guest_wl_surface_id)
+            else {
+                log::warn!(
+                    "window layout {:?}: transient ARC mode has no allocated task ID \
+                     for wl_surface {}",
+                    shortcut,
+                    guest_wl_surface_id
+                );
+                return false;
+            };
+            if !crate::handler::compositor::queue_zaura_application_id(
+                ctx,
+                zaura_surface_id,
+                &arc_application_id,
+            ) {
+                log::warn!(
+                    "window layout {:?}: unable to install transient ARC ID on \
+                     zaura_surface {}",
+                    shortcut,
+                    zaura_surface_id
+                );
+                return false;
+            }
+            log::debug!(
+                "window layout {:?}: transient ARC ID {} installed before bounds; \
+                 native ID {} will be restored after the host sync",
+                shortcut,
+                arc_application_id,
+                native_application_id,
+            );
+            Some(native_application_id)
+        } else {
+            None
+        };
 
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
         let mut builder = MessageBuilder::new();
@@ -545,6 +622,28 @@ impl KeyboardHandler {
                 shortcut,
                 zaura_toplevel_id
             );
+        }
+        if let Some(native_application_id) = transient_restore_id {
+            if !crate::handler::compositor::queue_zaura_application_id(
+                ctx,
+                zaura_surface_id,
+                &native_application_id,
+            ) {
+                log::warn!(
+                    "window layout {:?}: unable to restore native application ID {} \
+                     on zaura_surface {} after bounds",
+                    shortcut,
+                    native_application_id,
+                    zaura_surface_id
+                );
+            } else {
+                log::debug!(
+                    "window layout {:?}: queued native application ID {} after \
+                     placement barrier",
+                    shortcut,
+                    native_application_id
+                );
+            }
         }
         log::info!(
             "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
@@ -1683,6 +1782,10 @@ mod tests {
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
+        ctx.window_placement.remember_native_application_id(
+            surface,
+            "org.chromium.guest_os.test.wayland.com.example.Terminal".to_string(),
+        );
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
@@ -1816,6 +1919,10 @@ mod tests {
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
+        ctx.window_placement.remember_native_application_id(
+            surface,
+            "org.chromium.guest_os.test.wayland.com.example.Terminal".to_string(),
+        );
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
@@ -1849,6 +1956,10 @@ mod tests {
                 crate::protocols::wayland::wl_display::REQ_SYNC,
             ]
         );
+        assert!(
+            !opcodes.contains(&crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID),
+            "placement must not rewrite a stable ARC task application ID"
+        );
         let bounds = ctx
             .client_to_host_queue
             .iter()
@@ -1868,6 +1979,86 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
         assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 3840);
         assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
+    }
+
+    #[test]
+    fn transient_arc_placement_restores_native_identity_after_sync() {
+        let keyboard = 10u32;
+        let host_keyboard = 5u32;
+        let seat = 11u32;
+        let surface = 12u32;
+        let host_surface = 22u32;
+        let xdg_toplevel = 13u32;
+        let host_xdg_toplevel = 23u32;
+        let output = 25u32;
+        let native_id = "org.chromium.guest_os.test.wayland.com.example.Terminal";
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_mode_for_test(
+            crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            )
+            .with_arc_id_lifetime(crate::state::WindowArcIdLifetime::Transient),
+        );
+        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
+        ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel, surface));
+        ctx.window_placement
+            .remember_native_application_id(surface, native_id.to_string());
+        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
+        ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
+        assert!(ctx.window_placement.remember_output(output));
+        ctx.window_placement
+            .update_output_mode(output, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output, 1);
+
+        assert!(KeyboardHandler::apply_window_layout(
+            &mut ctx,
+            HostId(host_keyboard),
+            test_shortcut("<Alt>q"),
+        ));
+        let opcodes = ctx
+            .client_to_host_queue
+            .iter()
+            .map(message_opcode)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            opcodes,
+            vec![
+                crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
+                crate::protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES,
+                crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE,
+                crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID,
+                REQ_UNSET_FULLSCREEN,
+                REQ_UNSET_MAXIMIZED,
+                REQ_UNSET_SNAP,
+                REQ_SET_WINDOW_BOUNDS,
+                crate::protocols::wayland::wl_display::REQ_SYNC,
+                crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID,
+            ]
+        );
+        let app_id_messages = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| {
+                message_opcode(message)
+                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(app_id_messages.len(), 2);
+        let first_payload = &app_id_messages[0].0[8..];
+        let first_len = u32::from_ne_bytes(first_payload[0..4].try_into().unwrap()) as usize;
+        let first_id =
+            std::str::from_utf8(&first_payload[4..4 + first_len - 1]).expect("valid ARC ID");
+        assert!(first_id.starts_with("org.chromium.arc."));
+        let final_payload = &app_id_messages[1].0[8..];
+        let final_len = u32::from_ne_bytes(final_payload[0..4].try_into().unwrap()) as usize;
+        let final_id =
+            std::str::from_utf8(&final_payload[4..4 + final_len - 1]).expect("valid native ID");
+        assert_eq!(final_id, native_id);
     }
 
     #[test]
@@ -1892,6 +2083,10 @@ mod tests {
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
+        ctx.window_placement.remember_native_application_id(
+            surface,
+            "org.chromium.guest_os.test.wayland.com.example.Terminal".to_string(),
+        );
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.window_placement.set_aura_shell_binding_for_test(24, 38);
         assert!(ctx.window_placement.remember_output(output));
@@ -1955,7 +2150,7 @@ mod tests {
     }
 
     #[test]
-    fn self_parent_probe_queues_self_parent_without_bounds_request() {
+    fn self_parent_probe_queues_self_parent_and_bounds_request() {
         let keyboard = 10u32;
         let host_keyboard = 5u32;
         let seat = 11u32;
@@ -2022,13 +2217,48 @@ mod tests {
             i32::from_ne_bytes(parent_request.0[16..20].try_into().unwrap()),
             -200
         );
+        let opcodes = ctx
+            .client_to_host_queue
+            .iter()
+            .map(message_opcode)
+            .collect::<Vec<_>>();
         assert!(
-            !ctx.client_to_host_queue.iter().any(|(message, _)| {
+            opcodes.ends_with(&[
+                REQ_UNSET_FULLSCREEN,
+                REQ_UNSET_MAXIMIZED,
+                REQ_UNSET_SNAP,
+                REQ_SET_WINDOW_BOUNDS,
+                REQ_SET_PARENT,
+                crate::protocols::wayland::wl_display::REQ_SYNC,
+            ]),
+            "self-parent placement must clear state, resize in place, move, then sync"
+        );
+        let bounds_request = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|(message, _)| {
                 let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
                 u32::from_ne_bytes(message[0..4].try_into().unwrap()) == zaura_toplevel_id
                     && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
-            }),
-            "self-parent probe must not also send set_window_bounds"
+            })
+            .expect("self-parent bounds request");
+        assert_eq!(
+            i32::from_ne_bytes(bounds_request.0[8..12].try_into().unwrap()),
+            100,
+            "bounds-first must preserve the known current x while resizing"
+        );
+        assert_eq!(
+            i32::from_ne_bytes(bounds_request.0[12..16].try_into().unwrap()),
+            200,
+            "bounds-first must preserve the known current y while resizing"
+        );
+        assert_eq!(
+            i32::from_ne_bytes(bounds_request.0[16..20].try_into().unwrap()),
+            1920
+        );
+        assert_eq!(
+            i32::from_ne_bytes(bounds_request.0[20..24].try_into().unwrap()),
+            1080
         );
         assert_eq!(
             ctx.window_placement.origin(zaura_toplevel_id),

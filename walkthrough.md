@@ -598,16 +598,17 @@ path, root hygiene/prohibited-file/absolute-path findings, and pre-existing
 shebang or executable-bit findings. None points to the Sommelier or Nix
 changes.
 
-## 2026-08-21 — GTK ARC metadata and direct left/right placement
+## 2026-08-21 — Historical GTK ARC metadata and direct left/right placement
 
-The window-placement path now keeps the ARC application ID when a GTK client sends
-`gtk_surface1.set_dbus_properties`. That request can arrive after
-`xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
-Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
-returned to its old `800x600` geometry. A compatibility ARC task-form ID is
-shared by the GTK and Aura paths, while the host XDG role remains in the normal
-guest namespace. The previously attempted per-surface ARC session ID was
-removed after it restarted the host compositor even with geometry disabled.
+At this earlier point, the window-placement path kept the ARC application ID
+when a GTK client sent `gtk_surface1.set_dbus_properties`. That request can
+arrive after `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata
+with the normal Crostini namespace, so ChromeOS rejected arbitrary Aura bounds
+and the window returned to its old `800x600` geometry. A compatibility ARC
+task-form ID was shared by the GTK and Aura paths, while the host XDG role
+remained in the normal guest namespace. The previously attempted per-surface
+ARC session ID was removed after it restarted the host compositor even with
+geometry disabled.
 At that point the workaround was still selected by
 `SOMMELIER_WINDOW_BOUNDS_AS_ARC`; the current implementation uses explicit CLI
 policy and geometry options instead.
@@ -685,7 +686,8 @@ interception. A CLI-selected file is validated before accepting clients.
 Sending `SIGHUP` reloads that same path atomically into all current and future
 client contexts; malformed or conflicting reloads retain the last-known-good
 generation. `SOMMELIER_ACCELERATORS` conflicts are hard errors. The
-self-parent method remains experimental and position-only.
+self-parent method remained experimental and position-only in that
+implementation snapshot.
 
 Verification for this implementation:
 
@@ -719,9 +721,64 @@ Verification from the review worktree:
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
 
-## 2026-08-21 — preserve the native XDG identity in ARC bounds mode
+## 2026-08-22 — Historical self-parent resize follow-up
 
-The ARC bounds workaround now changes only the Aura application identity.
+The earlier self-parent experiment intentionally sent only
+`zaura_surface.set_parent`, so it moved the window while preserving its old
+size. The first resize follow-up kept that custom position probe but completed
+each shortcut with the same screen-coordinate
+`zaura_toplevel.set_window_bounds` request used by the direct backend:
+
+```text
+unset fullscreen/maximized/snap
+set_parent(relative_x, relative_y)
+set_window_bounds(screen_x, screen_y, width, height, output)
+sync
+```
+
+The bounds request is necessary because `set_parent` has no size arguments.
+That ordering was later found insufficient on the custom host: the position
+side effect worked, but the post-parent bounds request was rejected.
+
+## 2026-08-22 — Self-parent resize authorization correction
+
+The first implementation of the sequence above still selected the Guest OS
+application policy for the `set-parent` backend. On the custom host that
+allowed the self-parent side effect to move the window, but ChromeOS rejected
+the accompanying `set_window_bounds` size change; `zaura_toplevel.configure`
+continued to report the original `800x600` bounds. This was a policy failure,
+not a wire-encoding failure.
+
+The named `set-parent` backend now selects the persistent task-form ARC Aura
+identity (`org.chromium.arc.<task_id>`) together with the self-parent probe.
+The host XDG role remains the normal
+`org.chromium.guest_os.<vm>.wayland.<app>` identity. Persistent task metadata
+is intentional here: the transient ARC variant caused an IME focus reset after
+the first shortcut, while `.session.*` metadata had already been observed to
+destabilize the host compositor. A manually selected Guest + self-parent mode
+is retained only as a position-only diagnostic probe.
+
+## 2026-08-22 — Self-parent bounds-first resize fix
+
+The production `set-parent` sequence now clears compositor-owned state, resizes
+the top-level window at its last authoritative screen origin, and only then
+uses the self-parent probe for the target position:
+
+```text
+unset fullscreen/maximized/snap
+set_window_bounds(current_x, current_y, width, height, output)
+set_parent(relative_x, relative_y)
+sync
+```
+
+The regression test first failed against the old parent-first order and now
+asserts both the wire order and the requested 1920x1080 dimensions. Keeping
+the current origin in the bounds request avoids an intermediate move; the
+subsequent parent request is solely responsible for the target position.
+
+## 2026-08-21 — Historical preserve the native XDG identity in ARC bounds mode
+
+The earlier ARC bounds workaround changed only the Aura application identity.
 `xdg_toplevel.set_app_id` continues to use the normal guest namespace, while
 `zaura_surface.set_application_id` and GTK Aura metadata use the per-surface
 `org.chromium.arc.session.<id>` identity. This matches the established
@@ -735,6 +792,32 @@ failed against the previous rewrite and passes after the split.
   assertions and 9 unrelated baseline failures (nested Biome configuration,
   missing Typst assets, missing Astro/Slidev tooling or paths, and existing
   hygiene/permission findings).
+
+## 2026-08-22 — Historical transient ARC identity experiment
+
+This experiment kept the native Guest OS application ID on the
+Aura surface during normal operation, including XDG and GTK metadata updates.
+The allocated numeric `org.chromium.arc.<task_id>` value is retained only as a
+placement capability. For each bounds shortcut, Sommelier queues one ordered
+host sequence:
+
+```text
+set_application_id(ARC task ID)
+set_window_bounds(...)
+set_application_id(native Guest OS ID)
+wl_display.sync(...)
+```
+
+This preserves the earlier task-ID allocator and the `/dev/wl0` observations
+while avoiding a persistent ARC shelf/icon identity. Unit coverage asserts the
+exact sequence and verifies that the native ID is restored after every
+placement.
+
+It is retained as a comparison path, but is not the named `set-parent`
+backend: changing the Aura identity around a shortcut caused an IME focus
+reset on the custom host. The current `set-parent` backend keeps the
+task-form ARC identity persistent while using `set_parent` for its position
+probe and `set_window_bounds` for its size.
 
 ## 2026-08-21 — bidirectional placement-link ownership
 

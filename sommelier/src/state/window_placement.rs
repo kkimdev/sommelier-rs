@@ -40,6 +40,25 @@ pub(crate) enum WindowHostPolicy {
     Arc,
 }
 
+/// Lifetime and shell-identity behavior of the ARC compatibility ID.
+///
+/// The modes are deliberately explicit because ChromeOS keeps several ARC
+/// properties sticky after `set_application_id` resolves an ARC ID.  The
+/// default persistent mode is the only behavior already verified to preserve
+/// placement and IME on the custom host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WindowArcIdLifetime {
+    /// Keep the ARC task-form ID on the Aura surface for the window lifetime.
+    #[default]
+    Persistent,
+    /// Install the native ID initially, switch to ARC around each placement,
+    /// and restore the native shell ID after the bounds request.
+    Transient,
+    /// Install ARC properties once, then restore the native shell ID while
+    /// retaining the host's ARC policy properties for later bounds requests.
+    PersistentNativeShell,
+}
+
 /// Geometry operation used for compositor-owned window shortcuts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum WindowGeometryMethod {
@@ -48,7 +67,13 @@ pub(crate) enum WindowGeometryMethod {
     None,
     /// Send `zaura_toplevel.set_window_bounds`.
     Bounds,
-    /// Send the unsupported position-only self-parent probe.
+    /// Resize at the current origin, then send the experimental self-parent
+    /// position probe.
+    ///
+    /// The bounds half still needs an application-ID policy that ChromeOS
+    /// authorizes for arbitrary geometry. The named `set-parent` CLI backend
+    /// therefore combines this method with the persistent ARC task policy;
+    /// `guest + self-parent` remains available as a position-only probe.
     SelfParent,
 }
 
@@ -57,6 +82,7 @@ pub(crate) enum WindowGeometryMethod {
 pub(crate) struct WindowPlacementMode {
     pub(crate) host_policy: WindowHostPolicy,
     pub(crate) geometry_method: WindowGeometryMethod,
+    pub(crate) arc_id_lifetime: WindowArcIdLifetime,
 }
 
 impl WindowPlacementMode {
@@ -67,7 +93,16 @@ impl WindowPlacementMode {
         Self {
             host_policy,
             geometry_method,
+            arc_id_lifetime: WindowArcIdLifetime::Persistent,
         }
+    }
+
+    pub(crate) const fn with_arc_id_lifetime(
+        mut self,
+        arc_id_lifetime: WindowArcIdLifetime,
+    ) -> Self {
+        self.arc_id_lifetime = arc_id_lifetime;
+        self
     }
 
     pub(crate) const fn disabled() -> Self {
@@ -103,9 +138,9 @@ impl WindowPlacementMode {
 
         if self_parent_enabled {
             warn!(
-                "SOMMELIER_WINDOW_BOUNDS_SELF_PARENT is experimental and \
-                 position-only; it cannot resize windows and may be unstable on \
-                 custom ChromeOS hosts"
+                "SOMMELIER_WINDOW_BOUNDS_SELF_PARENT is experimental; it resizes \
+                 at the current origin before the self-parent position probe and \
+                 may be unstable on custom ChromeOS hosts"
             );
         }
         if arc_bounds_enabled && self_parent_enabled {
@@ -126,11 +161,21 @@ impl WindowPlacementMode {
     /// Return whether the ARC application namespace is selected.
     ///
     /// This policy is intentionally independent from geometry selection:
-    /// `arc + none` still rewrites application IDs but does not consume
-    /// shortcuts. Use `guest + none` for a completely inactive placement
-    /// feature.
+    /// `arc + none` still installs the task-form compatibility ID on Aura but
+    /// does not consume shortcuts. Use `guest + none` for a completely
+    /// inactive placement feature.
     pub(crate) const fn uses_arc_policy(self) -> bool {
         matches!(self.host_policy, WindowHostPolicy::Arc)
+    }
+
+    /// Return the configured ARC application-ID lifetime behavior.
+    pub(crate) const fn arc_id_lifetime(self) -> WindowArcIdLifetime {
+        self.arc_id_lifetime
+    }
+
+    /// Return whether the ARC ID is only used around a bounds request.
+    pub(crate) const fn uses_transient_arc_id(self) -> bool {
+        matches!(self.arc_id_lifetime, WindowArcIdLifetime::Transient)
     }
 
     /// Return whether direct Aura bounds are selected.
@@ -138,7 +183,7 @@ impl WindowPlacementMode {
         matches!(self.geometry_method, WindowGeometryMethod::Bounds)
     }
 
-    /// Return whether this backend runs the position-only self-parent probe.
+    /// Return whether this backend runs the self-parent position-and-bounds path.
     pub(crate) const fn uses_self_parent(self) -> bool {
         matches!(self.geometry_method, WindowGeometryMethod::SelfParent)
     }
@@ -405,6 +450,14 @@ pub(crate) struct WindowPlacementState {
     vm_identifier: String,
     arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
     aura_shell: Option<AuraShellBinding>,
+    /// Latest native Guest OS application ID for each guest surface.
+    ///
+    /// The XDG role always retains this identity even when the Aura surface
+    /// uses the persistent ARC task-form compatibility ID. Keeping the value
+    /// here documents the two namespaces and leaves a safe restore target for
+    /// future host capabilities without changing the current placement wire
+    /// sequence.
+    native_application_ids: HashMap<u32, String>,
     arc_application_ids: HashMap<u32, String>,
     aura_surface_links: BidirectionalLinks,
     aura_toplevel_links: BidirectionalLinks,
@@ -488,6 +541,7 @@ impl WindowPlacementState {
             vm_identifier,
             arc_task_allocator,
             aura_shell: None,
+            native_application_ids: HashMap::new(),
             arc_application_ids: HashMap::new(),
             aura_surface_links: BidirectionalLinks::default(),
             aura_toplevel_links: BidirectionalLinks::default(),
@@ -510,6 +564,16 @@ impl WindowPlacementState {
     /// Return whether this connection uses the ARC application namespace.
     pub(crate) const fn uses_arc_policy(&self) -> bool {
         self.mode.uses_arc_policy()
+    }
+
+    /// Return the configured ARC application-ID lifetime behavior.
+    pub(crate) const fn arc_id_lifetime(&self) -> WindowArcIdLifetime {
+        self.mode.arc_id_lifetime()
+    }
+
+    /// Return whether placement must install and then restore ARC metadata.
+    pub(crate) const fn uses_transient_arc_id(&self) -> bool {
+        self.mode.uses_transient_arc_id()
     }
 
     /// Return whether this connection uses direct Aura bounds.
@@ -610,6 +674,27 @@ impl WindowPlacementState {
             "org.chromium.guest_os.{}.wayland.{}",
             self.vm_identifier, app_id
         )
+    }
+
+    /// Remember the native Guest OS application ID for one guest surface.
+    ///
+    /// The value is updated whenever XDG or GTK reports a new application
+    /// identity. ARC placement leaves this value on the host XDG role while
+    /// the Aura surface uses its stable task-form identity.
+    pub(crate) fn remember_native_application_id(
+        &mut self,
+        wl_surface_guest_id: u32,
+        application_id: String,
+    ) {
+        self.native_application_ids
+            .insert(wl_surface_guest_id, application_id);
+    }
+
+    /// Return the latest native Guest OS application ID for one surface.
+    pub(crate) fn native_application_id(&self, wl_surface_guest_id: u32) -> Option<String> {
+        self.native_application_ids
+            .get(&wl_surface_guest_id)
+            .cloned()
     }
 
     /// Replace the shared binding handle. Production reloads replace the
@@ -1001,6 +1086,7 @@ impl WindowPlacementState {
         wl_surface_guest_id: u32,
         wl_surface_host_id: u32,
     ) -> Option<u32> {
+        self.native_application_ids.remove(&wl_surface_guest_id);
         self.arc_application_ids.remove(&wl_surface_guest_id);
         let zaura_surface_host_id = self.aura_surface_links.remove_forward(wl_surface_host_id);
         self.debug_assert_consistent();
@@ -1326,6 +1412,18 @@ mod tests {
             state.native_wayland_app_id("com.example.Terminal"),
             format!("org.chromium.guest_os.{expected_vm_identifier}.wayland.com.example.Terminal")
         );
+
+        let mut state = WindowPlacementState::default();
+        state.remember_native_application_id(
+            10,
+            "org.chromium.guest_os.termina.wayland.com.example.Terminal".to_string(),
+        );
+        assert_eq!(
+            state.native_application_id(10).as_deref(),
+            Some("org.chromium.guest_os.termina.wayland.com.example.Terminal")
+        );
+        assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
+        assert_eq!(state.native_application_id(10), None);
     }
 
     #[test]

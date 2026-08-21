@@ -311,6 +311,82 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
+/// Queue a nullable Aura application ID update for a live host surface.
+///
+/// The request is valid only on `zaura_surface` version 5 or newer. The
+/// helper is shared by XDG and GTK metadata handling so both paths apply the
+/// same version and message-size checks.
+pub(crate) fn queue_zaura_application_id(
+    ctx: &mut Context,
+    zaura_surface_id: u32,
+    application_id: &str,
+) -> bool {
+    let version = ctx
+        .shadow_table
+        .host_object_version(zaura_surface_id)
+        .unwrap_or(ctx.window_placement.aura_shell_version());
+    if version < 5 || !wayland_string_fits_message(application_id) {
+        return false;
+    }
+
+    let mut builder = crate::wire::MessageBuilder::new();
+    builder.write_nullable_string(Some(application_id));
+    match builder.try_build_message(zaura_surface_id, REQ_SET_APPLICATION_ID) {
+        Ok(message) => {
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Unable to encode Aura application ID for zaura_surface {}: {}",
+                zaura_surface_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Queue the Aura identity selected by the placement policy.
+///
+/// `persistent-native-shell` intentionally queues two updates. ChromeOS
+/// applies ARC authorization properties on the first update, while the second
+/// update restores the native shell application ID used by Crostini shelf
+/// matching. The host currently does not clear ARC properties on that second
+/// update; this is why the mode is experimental and must not become the
+/// default without runtime verification.
+pub(crate) fn queue_policy_application_id(
+    ctx: &mut Context,
+    zaura_surface_id: u32,
+    native_application_id: &str,
+    arc_application_id: Option<&str>,
+) -> bool {
+    if !ctx.window_placement.uses_arc_policy() {
+        return queue_zaura_application_id(ctx, zaura_surface_id, native_application_id);
+    }
+
+    let Some(arc_application_id) = arc_application_id else {
+        log::warn!(
+            "ARC policy has no allocated task ID for zaura_surface {}",
+            zaura_surface_id
+        );
+        return false;
+    };
+
+    match ctx.window_placement.arc_id_lifetime() {
+        crate::state::WindowArcIdLifetime::Persistent => {
+            queue_zaura_application_id(ctx, zaura_surface_id, arc_application_id)
+        }
+        crate::state::WindowArcIdLifetime::Transient => {
+            queue_zaura_application_id(ctx, zaura_surface_id, native_application_id)
+        }
+        crate::state::WindowArcIdLifetime::PersistentNativeShell => {
+            queue_zaura_application_id(ctx, zaura_surface_id, arc_application_id)
+                && queue_zaura_application_id(ctx, zaura_surface_id, native_application_id)
+        }
+    }
+}
+
 /// Create or reuse the internal Aura toplevel associated with a guest
 /// `xdg_toplevel`. The object is needed for screen-coordinate bounds requests.
 pub(crate) fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
@@ -1499,10 +1575,11 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         let wl_surface_guest_id = ctx
             .window_placement
             .wl_surface_for_xdg_toplevel(xdg_toplevel_id);
-        // Keep the host XDG role in Sommelier's normal guest namespace. Exo
-        // uses this identity for ordinary shelf, restore, and role handling;
-        // only the Aura surface needs the opt-in ARC policy identity that
-        // permits direct bounds placement.
+        // Keep the XDG role in Sommelier's normal Guest OS namespace for shelf
+        // and restore matching. In ARC mode the Aura surface uses the
+        // task-form compatibility ID continuously: changing this metadata
+        // around a bounds request makes Exo emit a leave/enter focus cycle,
+        // which resets ChromeOS IME state after the first shortcut.
         let xdg_app_id = ctx.window_placement.native_wayland_app_id(app_id);
         if !wayland_string_fits_message(&xdg_app_id) {
             log::warn!(
@@ -1513,7 +1590,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             return Action::Drop;
         }
 
-        let aura_app_id = if ctx.window_placement.uses_arc_policy() {
+        let arc_app_id = if ctx.window_placement.uses_arc_policy() {
             let Some(wl_surface_guest_id) = wl_surface_guest_id else {
                 log::warn!(
                     "Cannot allocate ARC policy ID for xdg_toplevel {} without its wl_surface",
@@ -1531,11 +1608,30 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 );
                 return Action::Drop;
             };
-            application_id
+            Some(application_id)
         } else {
-            xdg_app_id.clone()
+            None
         };
-        if !wayland_string_fits_message(&aura_app_id) {
+        if let Some(arc_app_id) = arc_app_id.as_deref() {
+            if !wayland_string_fits_message(arc_app_id) {
+                log::warn!(
+                    "Dropping oversized Aura application ID for xdg_toplevel {} ({} bytes)",
+                    xdg_toplevel_id,
+                    arc_app_id.len()
+                );
+                return Action::Drop;
+            }
+        }
+        let aura_app_id = match ctx.window_placement.arc_id_lifetime() {
+            crate::state::WindowArcIdLifetime::Persistent
+            | crate::state::WindowArcIdLifetime::PersistentNativeShell
+                if ctx.window_placement.uses_arc_policy() =>
+            {
+                arc_app_id.as_deref().unwrap_or(&xdg_app_id)
+            }
+            _ => &xdg_app_id,
+        };
+        if !wayland_string_fits_message(aura_app_id) {
             log::warn!(
                 "Dropping oversized Aura application ID for xdg_toplevel {} ({} bytes)",
                 xdg_toplevel_id,
@@ -1545,9 +1641,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         }
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
-        // shelf/application matching. Keep this request in the normal guest
-        // namespace even when the Aura surface uses the experimental ARC
-        // bounds policy.
+        // shelf/application matching. Keep this request in the normal Guest OS
+        // namespace even when the Aura surface uses the ARC bounds policy.
         let mut builder = crate::wire::MessageBuilder::new();
         builder.write_string(&xdg_app_id);
         let Ok(message) = builder.try_build_message(xdg_toplevel_host_id, REQ_SET_APP_ID) else {
@@ -1561,6 +1656,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = wl_surface_guest_id {
+            ctx.window_placement
+                .remember_native_application_id(wl_surface_guest_id, xdg_app_id.clone());
             if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
             {
                 let zaura_surface_version = ctx
@@ -1570,19 +1667,14 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 if zaura_surface_version < 5 {
                     return Action::Drop;
                 }
-                let mut builder = crate::wire::MessageBuilder::new();
-                builder.write_string(&aura_app_id);
-
-                let Ok(msg) =
-                    builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
-                else {
-                    log::warn!(
-                        "Dropping oversized Aura application ID for xdg_toplevel {}",
-                        xdg_toplevel_id
-                    );
+                if !queue_policy_application_id(
+                    ctx,
+                    zaura_surface_host_id,
+                    &xdg_app_id,
+                    arc_app_id.as_deref(),
+                ) {
                     return Action::Drop;
-                };
-                ctx.client_to_host_queue.push((msg, Vec::new()));
+                }
                 log::debug!(
                     "Set application ID to {} (XDG: {}, Aura: {}) on zaura_surface (host_id={})",
                     app_id,
@@ -2210,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn set_app_id_uses_pr2_arc_identity_and_wire_sequence() {
+    fn set_app_id_keeps_arc_task_identity_on_aura_surface() {
         let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.window_placement
             .set_mode_for_test(crate::state::WindowPlacementMode::new(
@@ -2225,10 +2317,13 @@ mod tests {
             Action::Drop
         );
 
-        // PR #2's working runtime sequence is:
+        // The steady-state sequence is:
         //   xdg_toplevel.set_app_id(native guest ID)
         //   zaura_shell.get_aura_surface(...)
-        //   zaura_surface.set_application_id(ARC compatibility ID)
+        //   zaura_surface.set_application_id(ARC task ID)
+        //
+        // The task-form ID remains stable so placement does not cause an
+        // additional Aura app-ID transition and IME focus reset.
         // The rewritten handler returns Drop because it queues the translated
         // XDG request itself; assert the complete queue rather than merely
         // searching for the final ARC string.
@@ -2262,11 +2357,91 @@ mod tests {
         let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
         let app_id =
             std::str::from_utf8(&payload[4..4 + str_len - 1]).expect("valid ARC application ID");
-        let task_id = app_id
+        let arc_id = ctx
+            .window_placement
+            .arc_policy_application_id(100)
+            .expect("ARC task ID allocated for placement");
+        assert_eq!(app_id, arc_id);
+        let task_id = arc_id
             .strip_prefix(ARC_TASK_APPLICATION_ID_PREFIX)
             .expect("ARC task-form application ID");
         let task_id = task_id.parse::<u32>().expect("numeric ARC task ID");
         assert!((ARC_TASK_ID_POOL_START..=ARC_TASK_ID_POOL_END).contains(&task_id));
+    }
+
+    #[test]
+    fn transient_arc_mode_keeps_native_aura_identity_until_placement() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.window_placement.set_mode_for_test(
+            crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            )
+            .with_arc_id_lifetime(crate::state::WindowArcIdLifetime::Transient),
+        );
+        ctx.last_sender_id = xdg_toplevel_id;
+
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_set_app_id(&mut ctx, &"com.example.Terminal".to_string()),
+            Action::Drop
+        );
+        let message = ctx
+            .client_to_host_queue
+            .last()
+            .expect("transient mode still sets an Aura application ID");
+        let payload = &message.0[8..];
+        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let aura_app_id =
+            std::str::from_utf8(&payload[4..4 + str_len - 1]).expect("valid native application ID");
+        assert_eq!(
+            aura_app_id,
+            ctx.window_placement
+                .native_wayland_app_id("com.example.Terminal")
+        );
+    }
+
+    #[test]
+    fn persistent_native_shell_mode_queues_arc_then_native_identity() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.window_placement.set_mode_for_test(
+            crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            )
+            .with_arc_id_lifetime(crate::state::WindowArcIdLifetime::PersistentNativeShell),
+        );
+        ctx.last_sender_id = xdg_toplevel_id;
+
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_set_app_id(&mut ctx, &"com.example.Terminal".to_string()),
+            Action::Drop
+        );
+        let aura_messages = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|(message, _)| msg_opcode(message) == REQ_SET_APPLICATION_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aura_messages.len(),
+            2,
+            "ARC authorization must be followed by native shell restoration"
+        );
+        let arc_payload = &aura_messages[0].0[8..];
+        let arc_len = u32::from_ne_bytes(arc_payload[0..4].try_into().unwrap()) as usize;
+        let arc_app_id =
+            std::str::from_utf8(&arc_payload[4..4 + arc_len - 1]).expect("valid ARC ID");
+        assert!(arc_app_id.starts_with(ARC_TASK_APPLICATION_ID_PREFIX));
+        let native_payload = &aura_messages[1].0[8..];
+        let native_len = u32::from_ne_bytes(native_payload[0..4].try_into().unwrap()) as usize;
+        let native_app_id =
+            std::str::from_utf8(&native_payload[4..4 + native_len - 1]).expect("valid native ID");
+        assert_eq!(
+            native_app_id,
+            ctx.window_placement
+                .native_wayland_app_id("com.example.Terminal")
+        );
     }
 
     #[test]

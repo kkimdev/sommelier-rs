@@ -51,7 +51,8 @@ pub(crate) use self::window_placement::{
     OutputState, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START,
 };
 pub(crate) use self::window_placement::{
-    WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
+    WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode,
+    WindowPlacementState,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.

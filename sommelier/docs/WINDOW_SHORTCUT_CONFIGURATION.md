@@ -44,9 +44,23 @@ When the option is present, Sommelier reads and validates the file before it
 starts accepting guest clients. A malformed explicit startup config is a
 startup error; it must not silently disable only some bindings.
 
-`self-parent` remains experimental. It can move a window on hosts that support
-the custom probe, but `zaura_surface.set_parent` has no width or height
-arguments and therefore cannot implement a resize.
+`self-parent` remains experimental. It first sends
+`zaura_toplevel.set_window_bounds` at the current known origin with the
+requested width/height, then uses the custom position probe to move the
+already-resized window to the target. The two requests are required because
+`zaura_surface.set_parent` has no width or height arguments and can cause a
+later bounds request to be rejected. On this custom host, the bounds half is
+authorized only when the Aura surface carries the numeric ARC task-form ID.
+Therefore the tested `set-parent` backend is equivalent to:
+
+```text
+--window-host-policy=arc --window-geometry-method=self-parent
+```
+
+It keeps that task-form ID persistent so changing application identity around a
+shortcut does not reset IME focus. A manually selected
+`--window-host-policy=guest --window-geometry-method=self-parent` remains a
+position-only probe and may leave the old window size in place.
 
 ## Config file format
 
@@ -110,9 +124,11 @@ outside the work area. The whole file is rejected rather than partially
 applied.
 
 For `bounds`, all four rectangle components are applied. For the
-experimental `self-parent` method, only the calculated x/y position can be
-sent; width and height are ignored and a warning is emitted. This does not
-change the config format, so the same file can be tested with either backend.
+experimental `self-parent` method, the current known x/y plus the requested
+width/height are sent by `set_window_bounds` first; the calculated target x/y
+is then sent by `set_parent`. This does not change the config format, so the
+same file can be tested with either backend, provided the ARC policy is
+enabled when resize is required.
 
 ## Runtime reload
 
@@ -209,7 +225,8 @@ for the initial `SIGHUP` implementation.
 
 - [x] Use `--window-shortcuts-config` as the explicit config path.
 - [x] Use normalized work-area geometry instead of pixel coordinates.
-- [x] Keep `self-parent` position-only and experimental.
+- [x] Keep `self-parent` experimental while pairing its position probe with a
+  bounds request for resize.
 - [x] Preserve the last known-good bindings after an invalid reload.
 - [x] Reject overlap with `SOMMELIER_ACCELERATORS`.
 - [x] Defer a control socket until runtime path selection is required.

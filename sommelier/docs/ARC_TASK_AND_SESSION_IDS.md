@@ -65,25 +65,53 @@ Every guest surface receives the next numeric suffix from the process block:
 org.chromium.arc.<allocated_task_id>
 ```
 
-The same ID is reused by the corresponding XDG/Aura and GTK metadata paths
-for that surface. Separate Sommelier processes contend on the same block
-files, so they cannot select the same block while both are alive. `INT_MAX` is
-excluded because `org.chromium.arc.2147483647` was the exact PR #2/custom-host
-compatibility sentinel; it is retained only as historical evidence, not as a
-general allocation endpoint.
+The ID is retained in placement state and is installed on the Aura surface as
+the steady-state compatibility identity. The host XDG role remains the native
+Guest OS ID. The ordered metadata stream is:
+
+```text
+zaura_surface.set_application_id(org.chromium.arc.<allocated_task_id>)
+```
+
+Placement then sends only:
+
+```text
+zaura_toplevel.set_window_bounds(...)
+wl_display.sync(...)
+```
+
+Separate Sommelier processes contend on the same block files, so they cannot
+select the same block while both are alive. `INT_MAX` is excluded because
+`org.chromium.arc.2147483647` was the exact PR #2/custom-host compatibility
+sentinel; it is retained only as historical evidence, not as a general
+allocation endpoint. A generated task ID is unique within the live Sommelier
+block, but it is still not a genuine Android task identity.
 
 The host XDG role keeps Sommelier's normal
 `org.chromium.guest_os.<vm>.wayland.<app>` identity. This split prevents
-ordinary XDG shelf, restore, and role bookkeeping from being misclassified as
-ARC. The allocator is still only a convention: ChromeOS does not provide a
-query through this Wayland path, so Sommelier cannot prove that a fabricated
+ordinary XDG role/restore bookkeeping from being classified as ARC. Aura shelf
+or icon classification may still be generic because the compatibility task ID
+is visible there; this is the current trade-off for stable placement and IME
+behavior. The allocator is still only a convention: ChromeOS does not provide
+a query through this Wayland path, so Sommelier cannot prove that a fabricated
 number is absent from Android's own task table.
 
-The feature remains opt-in because changing the namespace enables ARC-specific
-host behavior beyond bounds placement. A process that loses its host windows
-without a corresponding compositor teardown could make a newly reused block
-overlap stale metadata; the block scheme therefore assumes normal Wayland
-connection teardown.
+The named `--window-placement-backend=set-parent` mode uses this same
+persistent task-form Aura identity and the experimental
+`zaura_surface.set_parent` probe. It first sends
+`zaura_toplevel.set_window_bounds(current_x, current_y, width, height, output)`
+while the window is still top-level, then sends `set_parent` for the target
+position. This order matters because `set_parent` supplies no size and a
+later bounds request may be rejected. The persistent ARC identity is still
+required for the bounds request to change width and height. The host XDG
+identity remains native, and no `org.chromium.arc.session.*` value is
+generated.
+
+The feature remains opt-in because the persistent task-form namespace enables
+ARC-specific host behavior beyond bounds placement. A process that loses its
+host windows without a corresponding compositor teardown could make a newly
+reused block overlap stale metadata; the block scheme therefore assumes normal
+Wayland connection teardown.
 
 ## The real ARC task-ID allocator
 

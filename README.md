@@ -215,8 +215,9 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. `arc` rewrites IDs even when geometry is `none`; use `guest + none` for a completely inactive feature. |
-| `--window-geometry-method none\|bounds\|self-parent` | Startup-only geometry operation; defaults to `none`. `self-parent` is experimental and position-only. |
+| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. `arc` uses the numeric `org.chromium.arc.<task_id>` Aura identity required for arbitrary bounds. |
+| `--window-geometry-method none\|bounds\|self-parent` | Startup-only geometry operation; defaults to `none`. `self-parent` is experimental and resizes at the current origin with `set_window_bounds` before moving with `set_parent`; with `guest` policy it is position-only on the custom host. |
+| `--window-placement-backend set-parent\|transient-arc\|persistent` | Select a tested policy/geometry combination. `set-parent` means persistent ARC task authorization plus the self-parent position probe and bounds request; it does not use `.session.*` IDs. |
 | `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
 
 Window shortcuts are disabled by default. To enable ordinary work-area
