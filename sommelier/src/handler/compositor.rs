@@ -165,6 +165,25 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             .update_output_scale(ctx.last_sender_id, factor);
         Action::Forward
     }
+
+    fn on_release(&mut self, ctx: &mut Context) -> Action {
+        let guest_output_id = crate::state::GuestId::from_request_sender(ctx);
+        let Some(host_output_id) = ctx.shadow_table.host_id_of(guest_output_id) else {
+            log::debug!(
+                "wl_output.release for unmapped guest output {}",
+                guest_output_id.0
+            );
+            return Action::Forward;
+        };
+        if !ctx.window_placement.take_output(host_output_id.0) {
+            log::debug!(
+                "wl_output.release for untracked host output {} (guest {})",
+                host_output_id.0,
+                guest_output_id.0
+            );
+        }
+        Action::Forward
+    }
 }
 // ChromiumOS reserves headroom around the i32 damage range before applying
 // compositor scaling. This keeps the host compositor's x + width arithmetic
@@ -887,7 +906,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // Clean up any host-side zaura_surface we created for this wl_surface.
         if let Some(zaura_surface_host_id) = ctx
             .window_placement
-            .remove_surface(wl_surface_guest_id, wl_surface_host_id)
+            .take_aura_surface_for_wl_surface(wl_surface_guest_id, wl_surface_host_id)
         {
             let zaura_surface_version = ctx
                 .shadow_table
@@ -1480,7 +1499,21 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         let wl_surface_guest_id = ctx
             .window_placement
             .wl_surface_for_xdg_toplevel(xdg_toplevel_id);
-        let formatted_app_id = if ctx.window_placement.uses_arc_policy() {
+        // Keep the host XDG role in Sommelier's normal guest namespace. Exo
+        // uses this identity for ordinary shelf, restore, and role handling;
+        // only the Aura surface needs the opt-in ARC policy identity that
+        // permits direct bounds placement.
+        let xdg_app_id = ctx.window_placement.native_wayland_app_id(app_id);
+        if !wayland_string_fits_message(&xdg_app_id) {
+            log::warn!(
+                "Dropping oversized XDG application ID for xdg_toplevel {} ({} bytes)",
+                xdg_toplevel_id,
+                xdg_app_id.len()
+            );
+            return Action::Drop;
+        }
+
+        let aura_app_id = if ctx.window_placement.uses_arc_policy() {
             let Some(wl_surface_guest_id) = wl_surface_guest_id else {
                 log::warn!(
                     "Cannot allocate ARC session ID for xdg_toplevel {} without its wl_surface",
@@ -1500,26 +1533,26 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             };
             application_id
         } else {
-            ctx.window_placement.native_wayland_app_id(app_id)
+            xdg_app_id.clone()
         };
-        if !wayland_string_fits_message(&formatted_app_id) {
+        if !wayland_string_fits_message(&aura_app_id) {
             log::warn!(
-                "Dropping oversized application ID for xdg_toplevel {} ({} bytes)",
+                "Dropping oversized Aura application ID for xdg_toplevel {} ({} bytes)",
                 xdg_toplevel_id,
-                formatted_app_id.len()
+                aura_app_id.len()
             );
             return Action::Drop;
         }
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
-        // shelf/application matching. Keep that request namespaced as in the
-        // reference Sommelier path rather than forwarding the guest's
-        // unqualified ID directly.
+        // shelf/application matching. Keep this request in the normal guest
+        // namespace even when the Aura surface uses the experimental ARC
+        // bounds policy.
         let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_string(&formatted_app_id);
+        builder.write_string(&xdg_app_id);
         let Ok(message) = builder.try_build_message(xdg_toplevel_host_id, REQ_SET_APP_ID) else {
             log::warn!(
-                "Dropping oversized namespaced app ID for xdg_toplevel {}",
+                "Dropping oversized XDG application ID for xdg_toplevel {}",
                 xdg_toplevel_id
             );
             return Action::Drop;
@@ -1538,22 +1571,23 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                     return Action::Drop;
                 }
                 let mut builder = crate::wire::MessageBuilder::new();
-                builder.write_string(&formatted_app_id);
+                builder.write_string(&aura_app_id);
 
                 let Ok(msg) =
                     builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
                 else {
                     log::warn!(
-                        "Dropping oversized aura application ID for xdg_toplevel {}",
+                        "Dropping oversized Aura application ID for xdg_toplevel {}",
                         xdg_toplevel_id
                     );
                     return Action::Drop;
                 };
                 ctx.client_to_host_queue.push((msg, Vec::new()));
                 log::debug!(
-                    "Set application ID to {} (formatted: {}) on zaura_surface (host_id={})",
+                    "Set application ID to {} (XDG: {}, Aura: {}) on zaura_surface (host_id={})",
                     app_id,
-                    formatted_app_id,
+                    xdg_app_id,
+                    aura_app_id,
                     zaura_surface_host_id
                 );
             }
@@ -1594,17 +1628,17 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
             );
         }
 
-        let barrier_active = ctx.window_placement.has_active_barrier(host_id);
+        let barrier_pending = ctx.window_placement.has_pending_barrier(host_id);
         log::debug!(
             "zaura_toplevel.configure host={} guest={} bounds={}x{} origin=({}, {}) \
-             barrier_active={}",
+             barrier_pending={}",
             host_id,
             guest_xdg_toplevel_id,
             width,
             height,
             _x,
             _y,
-            barrier_active
+            barrier_pending
         );
 
         let mut builder = crate::wire::MessageBuilder::new();
@@ -1643,19 +1677,19 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
                 y
             );
         }
-        let barrier_active = ctx.window_placement.has_active_barrier(host_id);
+        let barrier_pending = ctx.window_placement.has_pending_barrier(host_id);
         log::debug!(
-            "zaura_toplevel.origin_change host={} origin=({}, {}) barrier_active={}",
+            "zaura_toplevel.origin_change host={} origin=({}, {}) barrier_pending={}",
             host_id,
             x,
             y,
-            barrier_active
+            barrier_pending
         );
 
         // xdg_toplevel has no origin-change event. A subsequent Aura
-        // configure carries the authoritative size/state, and the window
-        // placement path only needs the barrier to suppress stale host
-        // notifications while Exo catches up.
+        // configure carries the authoritative size/state. The sync callback
+        // only orders host processing; origin prediction above decides
+        // whether an intermediate position should be recorded.
         Action::Drop
     }
 }
@@ -1674,6 +1708,7 @@ mod tests {
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+    use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
@@ -1724,6 +1759,30 @@ mod tests {
             .remember_xdg_toplevel(xdg_toplevel_id, wl_surface_guest));
 
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
+    }
+
+    #[test]
+    fn wl_output_release_retires_placement_geometry() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_guest_id = 10;
+        let output_host_id = 50;
+        ctx.shadow_table.map_id(output_guest_id, output_host_id);
+        assert!(ctx.window_placement.remember_output(output_host_id));
+        ctx.window_placement
+            .update_output_mode(output_host_id, true, 3840, 2160);
+        ctx.window_placement.update_output_scale(output_host_id, 1);
+        ctx.last_sender_id = output_guest_id;
+
+        assert_eq!(
+            WlOutputHandler::on_release(&mut CompositorHandler, &mut ctx),
+            Action::Forward
+        );
+        assert_eq!(ctx.window_placement.primary_output(), None);
+
+        // A delayed event after release must not recreate the retired output.
+        ctx.window_placement
+            .update_output_mode(output_host_id, true, 1920, 1080);
+        assert_eq!(ctx.window_placement.primary_output(), None);
     }
 
     fn active_text_input_state(
@@ -2178,6 +2237,42 @@ mod tests {
             .strip_prefix(format!("{ARC_SESSION_APPLICATION_ID_PREFIX}.").as_str())
             .unwrap();
         assert!(suffix.parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn arc_policy_keeps_xdg_app_id_in_guest_namespace() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
+        ctx.last_sender_id = xdg_toplevel_id;
+
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_set_app_id(&mut ctx, &"com.example.Terminal".to_string()),
+            Action::Drop
+        );
+
+        let xdg_message = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|(message, _)| msg_opcode(message) == REQ_SET_APP_ID)
+            .expect("host XDG app ID request");
+        let xdg_payload = &xdg_message.0[8..];
+        let xdg_len = u32::from_ne_bytes(xdg_payload[0..4].try_into().unwrap()) as usize;
+        let xdg_app_id =
+            std::str::from_utf8(&xdg_payload[4..4 + xdg_len - 1]).expect("valid XDG app ID");
+        assert_eq!(
+            xdg_app_id,
+            ctx.window_placement
+                .native_wayland_app_id("com.example.Terminal")
+        );
+        assert!(
+            !xdg_app_id.starts_with(format!("{ARC_SESSION_APPLICATION_ID_PREFIX}.").as_str()),
+            "ARC policy must not relabel the host XDG role"
+        );
     }
 
     #[test]

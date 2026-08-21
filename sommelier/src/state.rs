@@ -1162,13 +1162,8 @@ impl Context {
             }
         };
 
-        let vm_identifier =
-            window_placement::resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
-        let window_placement = WindowPlacementState::with_shortcut_config(
-            placement_mode,
-            shortcut_config,
-            vm_identifier,
-        );
+        let window_placement =
+            WindowPlacementState::with_shortcut_config(placement_mode, shortcut_config);
 
         Self {
             shadow_table: ShadowTable::new(),

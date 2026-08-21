@@ -651,9 +651,10 @@ Verification:
   missing Typst/Astro assets, and existing hygiene/shebang findings); none
   points to this Sommelier worktree.
 - The isolated release proxy was restarted on
-  `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records both
+  `/run/user/1000/wayland-codex-ghostty-rewrite`; its Aura metadata path records
   GTK and Ghostty application IDs in the unique
-  `org.chromium.arc.session.<id>` namespace.
+  `org.chromium.arc.session.<id>` namespace, while each host XDG role remains
+  in the normal `org.chromium.guest_os.<vm>.wayland.<app>` namespace.
 - A separate release proxy on
   `/run/user/1000/wayland-codex-self-parent` accepted the test GUI and
   delivered all nine Alt shortcuts. The self-parent requests moved the window
@@ -711,6 +712,64 @@ Verification from the review worktree:
 - `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 571
   passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
   smoke test is also ignored because it requires a live compositor.
+- `cargo check --workspace --all-targets` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `cargo fmt --all -- --check`, `cargo build --release -p sommelier
+  -p sommelier-test-gui`, and `git diff --check` passed.
+
+## 2026-08-21 — preserve the native XDG identity in ARC bounds mode
+
+The ARC bounds workaround now changes only the Aura application identity.
+`xdg_toplevel.set_app_id` continues to use the normal guest namespace, while
+`zaura_surface.set_application_id` and GTK Aura metadata use the per-surface
+`org.chromium.arc.session.<id>` identity. This matches the established
+ChromiumOS Sommelier split and avoids routing the host XDG role through ARC
+restore/task classification.
+
+The regression test
+`handler::compositor::tests::arc_policy_keeps_xdg_app_id_in_guest_namespace`
+failed against the previous rewrite and passes after the split.
+- The enclosing monorepo `bun run verify` completed with 1853 passing
+  assertions and 9 unrelated baseline failures (nested Biome configuration,
+  missing Typst assets, missing Astro/Slidev tooling or paths, and existing
+  hygiene/permission findings).
+
+## 2026-08-21 — bidirectional placement-link ownership
+
+The placement-state follow-up now stores every guest/host association in a
+private `BidirectionalLinks` value. Aura-surface, Aura-toplevel, XDG-surface,
+and XDG-toplevel maps are inserted and removed atomically, reject conflicting
+rebindings without mutating live state, and share one consistency invariant.
+Output mode and scale updates also use one state-owned insertion path.
+`SOMMELIER_VM_IDENTIFIER` resolution is performed when the placement state is
+constructed, keeping application-ID namespace ownership out of `Context`.
+The wl-surface teardown API is named
+`take_aura_surface_for_wl_surface` to make its host-side ownership explicit.
+Placement callbacks are retained and superseded through a private
+`PlacementBarrierRegistry`, so stale completions cannot clear a newer active
+barrier. Aura-shell binding generations also reject live replacement until the
+old global has been retired. Output records are retired at `wl_output.release`
+and delayed mode/scale events cannot recreate them. The release handler resolves
+the guest output ID back to its distinct host ID before retiring that record;
+the regression fixture uses different guest/host IDs to cover this boundary.
+An output `global_remove` does not retire an already-bound output object:
+Wayland keeps that object valid until the client releases it, so placement state
+follows the bound-object lifetime rather than the advertisement lifetime.
+Failed output binds roll back both the guest/host mapping and the placement
+record before reporting the protocol failure.
+The process-wide ARC serial allocator is documented as an allocation-only
+exception: live ARC identity mappings remain connection-owned and are retired
+with their surface.
+
+Regression coverage includes atomic conflict rejection and both-direction
+teardown; the VM namespace test derives its expected value from the active
+environment so it remains deterministic in configured CI shells.
+
+Final verification from this worktree:
+
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 577
+  passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
+  smoke test is ignored because it requires a live compositor.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
