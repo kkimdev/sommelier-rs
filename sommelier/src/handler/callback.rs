@@ -64,6 +64,21 @@ impl WlCallbackHandler for CallbackHandler {
             }
             return Action::Drop;
         }
+        if let Some(zaura_toplevel_id) = ctx.window_bounds_barriers.remove(&host_id) {
+            // A sync callback is host-only and terminal at `done`. Keep its
+            // numeric ID reserved until the host's subsequent delete_id, but
+            // stop treating duplicate/stale events as live callbacks.
+            if ctx.active_window_bounds_barriers.get(&zaura_toplevel_id) == Some(&host_id) {
+                ctx.active_window_bounds_barriers.remove(&zaura_toplevel_id);
+            }
+            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
+                log::warn!(
+                    "window-bounds barrier callback {} was not tracked as host-only",
+                    host_id
+                );
+            }
+            return Action::Drop;
+        }
         let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);
 
         if guest_id != 0 {
@@ -169,5 +184,76 @@ mod tests {
         );
         assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_id));
         assert!(ctx.shadow_table.is_host_id_available(host_id));
+    }
+
+    #[test]
+    fn window_bounds_barrier_completes_and_reserves_callback_until_delete_id() {
+        let zaura_toplevel_id = 77;
+        let callback_id = 40;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            callback_id,
+            "wl_callback".to_string(),
+            1,
+        );
+        ctx.window_bounds_barriers
+            .insert(callback_id, zaura_toplevel_id);
+        ctx.active_window_bounds_barriers
+            .insert(zaura_toplevel_id, callback_id);
+        ctx.last_sender_id = callback_id;
+
+        let mut handler = CallbackHandler;
+        assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
+        assert!(ctx.window_bounds_barriers.is_empty());
+        assert!(ctx.active_window_bounds_barriers.is_empty());
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
+        assert!(!ctx.shadow_table.is_host_id_available(callback_id));
+
+        ctx.last_sender_id = 1;
+        assert_eq!(
+            DisplayHandler.on_delete_id(&mut ctx, callback_id),
+            Action::Drop
+        );
+        assert!(ctx.shadow_table.is_host_id_available(callback_id));
+    }
+
+    #[test]
+    fn stale_window_bounds_barrier_does_not_clear_newer_barrier() {
+        let zaura_toplevel_id = 77;
+        let old_callback_id = 40;
+        let new_callback_id = 41;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        for callback_id in [old_callback_id, new_callback_id] {
+            ctx.shadow_table.track_host_interface_with_version(
+                callback_id,
+                "wl_callback".to_string(),
+                1,
+            );
+        }
+        ctx.window_bounds_barriers
+            .insert(old_callback_id, zaura_toplevel_id);
+        ctx.window_bounds_barriers
+            .insert(new_callback_id, zaura_toplevel_id);
+        ctx.active_window_bounds_barriers
+            .insert(zaura_toplevel_id, new_callback_id);
+
+        let mut handler = CallbackHandler;
+        ctx.last_sender_id = old_callback_id;
+        assert_eq!(handler.on_done(&mut ctx, 1), Action::Drop);
+        assert_eq!(
+            ctx.active_window_bounds_barriers.get(&zaura_toplevel_id),
+            Some(&new_callback_id)
+        );
+        assert!(ctx
+            .shadow_table
+            .is_pending_destroy_host_only(old_callback_id));
+        assert!(ctx.window_bounds_barriers.contains_key(&new_callback_id));
+
+        ctx.last_sender_id = new_callback_id;
+        assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
+        assert!(ctx.active_window_bounds_barriers.is_empty());
+        assert!(ctx
+            .shadow_table
+            .is_pending_destroy_host_only(new_callback_id));
     }
 }

@@ -333,13 +333,17 @@ impl Client {
         };
 
         if family == protocols::ProtocolFamily::AuraShell {
-            // Silently drop events for internally-bound aura_shell objects.
-            // We only use these interfaces to send requests (set_application_id
-            // via zaura_surface), never to receive events. Consume the
-            // payload first because handle_msgs rejects any unconsumed bytes
-            // after dispatch; otherwise a valid host layout_mode event would
-            // tear down the client connection even though it is intentionally
-            // hidden from the guest.
+            if interface == "zaura_toplevel" {
+                return protocols::aura_shell::zaura_toplevel::dispatch_event(
+                    msg,
+                    &mut handler.compositor,
+                    ctx,
+                );
+            }
+
+            // Other Aura objects are bound internally and have no guest event
+            // path. Consume their payload so an event from one of these
+            // objects cannot tear down the client connection.
             msg.offset = msg.payload.len();
             return Ok(None);
         }
@@ -448,6 +452,9 @@ impl Client {
                 }
             };
 
+            let is_xdg_surface_get_toplevel = matches!(direction, Direction::ClientToHost)
+                && interface.as_deref() == Some("xdg_surface")
+                && opcode == crate::protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL;
             let mut consumed_fds = 0;
             let result = if let Some(interface) = interface {
                 let mut msg =
@@ -475,6 +482,16 @@ impl Client {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
                 };
+                if is_xdg_surface_get_toplevel && packet.len() >= 12 {
+                    let guest_xdg_toplevel_id =
+                        u32::from_ne_bytes(packet[8..12].try_into().unwrap());
+                    if self.ctx.window_bounds_as_arc {
+                        let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                            &mut self.ctx,
+                            guest_xdg_toplevel_id,
+                        );
+                    }
+                }
                 consumed_fds = msg.fd_offset;
                 if !msg.is_payload_consumed() {
                     log::error!(
@@ -3573,6 +3590,7 @@ protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
     wl_data_offer: data_device,
     wl_keyboard: keyboard,
     wl_seat: seat,
+    wl_output: compositor,
     wl_fixes: registry
 });
 impl protocols::wayland::ProtocolHandler for SommelierHandler {}
