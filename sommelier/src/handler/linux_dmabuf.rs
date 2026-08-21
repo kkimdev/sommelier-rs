@@ -2848,9 +2848,11 @@ mod tests {
             },
             rewritten.len() as isize
         );
-        let words: Vec<u32> = rewritten
-            .chunks_exact(4)
-            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+        let (chunks, remainder) = rewritten.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let words: Vec<u32> = chunks
+            .iter()
+            .map(|chunk| u32::from_ne_bytes(*chunk))
             .collect();
         assert_eq!(words, entries);
         assert_eq!(ctx.feedback_index_maps[&10].get(&0), Some(&0));
