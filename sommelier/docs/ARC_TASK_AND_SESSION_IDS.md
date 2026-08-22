@@ -25,7 +25,7 @@ ARC prefix must not be treated as proof of trust.
 | Application ID | Real ChromeOS meaning | Suitable for placement? |
 | --- | --- | --- |
 | `org.chromium.arc.<task_id>` | An Android ARC task identity | Semantically the closest form, but a fabricated value is still not a real task |
-| `org.chromium.arc.session.<session_id>` | An `app_restore` ARC restore-session/ghost identity | Not semantically correct for an ordinary live window; used by this experiment only because the host policy recognizes it |
+| `org.chromium.arc.session.<session_id>` | An `app_restore` ARC restore-session/ghost identity | Historical rejected experiment; the host recognized the namespace, but it is not semantically correct for an ordinary live window |
 | `org.chromium.arc.session2.*` | No documented special namespace | Do not invent or depend on it |
 
 The suffix is parsed as a signed decimal integer. UUIDs and names such as

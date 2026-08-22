@@ -15,15 +15,12 @@ limitations under the License.
 */
 
 use crate::handler::display::queue_protocol_error;
-use crate::protocols::aura_shell::zaura_shell::{
-    REQ_GET_AURA_SURFACE, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
+use crate::handler::placement::{
+    ensure_host_zaura_surface, ensure_zaura_toplevel, queue_policy_application_id,
+    release_zaura_toplevel, wayland_string_fits_message,
 };
-use crate::protocols::aura_shell::zaura_surface::{
-    REQ_RELEASE, REQ_SET_APPLICATION_ID, REQ_SET_PARENT,
-};
-use crate::protocols::aura_shell::zaura_toplevel::REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL;
+use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
-use crate::protocols::wayland::wl_display::REQ_SYNC;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
@@ -240,332 +237,6 @@ fn map_surface_damage(rect: DamageRect) -> DamageRect {
         (right - left).max(1) as i32,
         (bottom - top).max(1) as i32,
     )
-}
-
-pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
-    // A string is encoded as a u32 length (including NUL), the bytes, and
-    // 32-bit padding. Keep the complete message within Wayland's 16-bit
-    // length field before handing it to MessageBuilder.
-    let Some(length_with_nul) = value.len().checked_add(1) else {
-        return false;
-    };
-    let Some(padded_length) = length_with_nul.checked_add(3).map(|len| len & !3) else {
-        return false;
-    };
-    8usize
-        .checked_add(4)
-        .and_then(|header_and_length| header_and_length.checked_add(padded_length))
-        .is_some_and(|total| total <= 0xffff)
-}
-
-/// Create or reuse the host Aura object associated with a guest wl_surface.
-///
-/// XDG and GTK metadata both target the same host surface. Exo rejects a
-/// second `zaura_surface` for one `wl_surface`, so all metadata paths must
-/// share this mapping.
-pub(crate) fn ensure_host_zaura_surface(
-    ctx: &mut Context,
-    wl_surface_guest_id: u32,
-) -> Option<u32> {
-    let wl_surface_host_id = ctx.shadow_table.get_host_id(wl_surface_guest_id)?;
-    if let Some(zaura_surface_host_id) = ctx
-        .window_placement
-        .aura_surface_for_wl_surface(wl_surface_host_id)
-    {
-        return Some(zaura_surface_host_id);
-    }
-
-    let zaura_shell_host_id = ctx.window_placement.aura_shell_id()?;
-    let zaura_surface_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        zaura_surface_host_id,
-        "zaura_surface".to_string(),
-        ctx.window_placement.aura_shell_version(),
-    );
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(zaura_surface_host_id);
-    builder.write_u32(wl_surface_host_id);
-    let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE) else {
-        log::warn!(
-            "Unable to encode Aura surface request for wl_surface {}",
-            wl_surface_guest_id
-        );
-        ctx.shadow_table
-            .remove_host_interface(zaura_surface_host_id);
-        return None;
-    };
-
-    if !ctx
-        .window_placement
-        .remember_aura_surface(wl_surface_host_id, zaura_surface_host_id)
-    {
-        log::error!(
-            "Refusing to replace Aura surface mapping for host wl_surface {}",
-            wl_surface_host_id
-        );
-        ctx.shadow_table
-            .remove_host_interface(zaura_surface_host_id);
-        return None;
-    }
-    ctx.client_to_host_queue.push((message, Vec::new()));
-    Some(zaura_surface_host_id)
-}
-
-/// Queue a `zaura_surface.set_parent` request.
-///
-/// `parent_id = None` is the protocol's explicit unparent operation. Keeping
-/// this serializer in the compositor handler gives both the shortcut path and
-/// the asynchronous barrier completion path identical version and encoding
-/// checks.
-pub(crate) fn queue_zaura_surface_parent(
-    ctx: &mut Context,
-    zaura_surface_id: u32,
-    parent_id: Option<u32>,
-    x: i32,
-    y: i32,
-) -> bool {
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_surface_id)
-        .unwrap_or(ctx.window_placement.aura_shell_version());
-    if version < 2 {
-        return false;
-    }
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(parent_id.unwrap_or(0));
-    builder.write_i32(x);
-    builder.write_i32(y);
-    match builder.try_build_message(zaura_surface_id, REQ_SET_PARENT) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Unable to encode Aura parent update for zaura_surface {}: {}",
-                zaura_surface_id,
-                error
-            );
-            false
-        }
-    }
-}
-
-/// Queue a nullable Aura application ID update for a live host surface.
-///
-/// The request is valid only on `zaura_surface` version 5 or newer. The
-/// helper is shared by XDG and GTK metadata handling so both paths apply the
-/// same version and message-size checks.
-pub(crate) fn queue_zaura_application_id(
-    ctx: &mut Context,
-    zaura_surface_id: u32,
-    application_id: &str,
-) -> bool {
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_surface_id)
-        .unwrap_or(ctx.window_placement.aura_shell_version());
-    if version < 5 || !wayland_string_fits_message(application_id) {
-        return false;
-    }
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_nullable_string(Some(application_id));
-    match builder.try_build_message(zaura_surface_id, REQ_SET_APPLICATION_ID) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Unable to encode Aura application ID for zaura_surface {}: {}",
-                zaura_surface_id,
-                error
-            );
-            false
-        }
-    }
-}
-
-/// Queue the Aura identity selected by the placement policy.
-///
-/// `persistent-native-shell` intentionally queues two updates. ChromeOS
-/// applies ARC authorization properties on the first update, while the second
-/// update restores the native shell application ID used by Crostini shelf
-/// matching. The host currently does not clear ARC properties on that second
-/// update; this is why the mode is experimental and must not become the
-/// default without runtime verification.
-pub(crate) fn queue_policy_application_id(
-    ctx: &mut Context,
-    zaura_surface_id: u32,
-    native_application_id: &str,
-    arc_application_id: Option<&str>,
-) -> bool {
-    if !ctx.window_placement.uses_arc_policy() {
-        return queue_zaura_application_id(ctx, zaura_surface_id, native_application_id);
-    }
-
-    let Some(arc_application_id) = arc_application_id else {
-        log::warn!(
-            "ARC policy has no allocated task ID for zaura_surface {}",
-            zaura_surface_id
-        );
-        return false;
-    };
-
-    match ctx.window_placement.arc_id_lifetime() {
-        crate::state::WindowArcIdLifetime::Persistent => {
-            queue_zaura_application_id(ctx, zaura_surface_id, arc_application_id)
-        }
-        crate::state::WindowArcIdLifetime::Transient => {
-            queue_zaura_application_id(ctx, zaura_surface_id, native_application_id)
-        }
-        crate::state::WindowArcIdLifetime::PersistentNativeShell => {
-            queue_zaura_application_id(ctx, zaura_surface_id, arc_application_id)
-                && queue_zaura_application_id(ctx, zaura_surface_id, native_application_id)
-        }
-    }
-}
-
-/// Create or reuse the internal Aura toplevel associated with a guest
-/// `xdg_toplevel`. The object is needed for screen-coordinate bounds requests.
-pub(crate) fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
-    if let Some(existing_id) = ctx
-        .window_placement
-        .aura_toplevel_for_xdg_toplevel(xdg_toplevel_guest_id)
-    {
-        return Some(existing_id);
-    }
-
-    let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
-    let zaura_shell_host_id = ctx.window_placement.aura_shell_id()?;
-    if ctx.window_placement.aura_shell_version() < 29 {
-        return None;
-    }
-
-    let zaura_toplevel_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        zaura_toplevel_host_id,
-        "zaura_toplevel".to_string(),
-        ctx.window_placement.aura_shell_version(),
-    );
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(zaura_toplevel_host_id);
-    builder.write_u32(xdg_toplevel_host_id);
-    let Ok(get_message) =
-        builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL)
-    else {
-        ctx.shadow_table
-            .remove_host_interface(zaura_toplevel_host_id);
-        return None;
-    };
-    let Ok(coordinate_message) = crate::wire::MessageBuilder::new().try_build_message(
-        zaura_toplevel_host_id,
-        crate::protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES,
-    ) else {
-        ctx.shadow_table
-            .remove_host_interface(zaura_toplevel_host_id);
-        return None;
-    };
-    if !ctx
-        .window_placement
-        .remember_aura_toplevel(xdg_toplevel_guest_id, zaura_toplevel_host_id)
-    {
-        log::error!(
-            "Refusing to replace existing Aura toplevel mapping for xdg_toplevel {}",
-            xdg_toplevel_guest_id
-        );
-        ctx.shadow_table
-            .remove_host_interface(zaura_toplevel_host_id);
-        return None;
-    }
-    ctx.client_to_host_queue.push((get_message, Vec::new()));
-    ctx.client_to_host_queue
-        .push((coordinate_message, Vec::new()));
-    Some(zaura_toplevel_host_id)
-}
-
-pub(crate) fn release_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
-    let Some(zaura_toplevel_host_id) = ctx
-        .window_placement
-        .take_aura_toplevel(xdg_toplevel_guest_id)
-    else {
-        return;
-    };
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_toplevel_host_id)
-        .unwrap_or(ctx.window_placement.aura_shell_version());
-    if version >= 38 {
-        let message = crate::wire::MessageBuilder::new()
-            .build_message(zaura_toplevel_host_id, REQ_RELEASE_AURA_TOPLEVEL);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-        // Keep the host ID reserved until the compositor acknowledges the
-        // destructor with wl_display.delete_id. Removing it immediately
-        // would allow a recycled ID to receive the late acknowledgement.
-        ctx.shadow_table
-            .mark_pending_destroy_host(zaura_toplevel_host_id);
-    } else {
-        // Older aura-shell versions do not expose a destructor. Retire the
-        // dispatch metadata but keep the numeric ID reserved for the rest of
-        // the connection so stale host events cannot target a recycled
-        // object.
-        ctx.shadow_table
-            .retire_host_interface(zaura_toplevel_host_id);
-    }
-}
-
-/// Queue a host `wl_display.sync` immediately after a window-placement
-/// request.
-///
-/// Exo can emit a configure for the old bounds before it has processed the
-/// placement request. The callback is an ordered host-stream barrier: once
-/// `done` arrives, all events generated by requests before the sync have
-/// already been delivered. Keep the callback host ID reserved through its
-/// subsequent `wl_display.delete_id`, just like the other internal barriers.
-pub(crate) fn queue_window_placement_barrier(
-    ctx: &mut Context,
-    zaura_toplevel_host_id: u32,
-    self_parent_surface_id: Option<u32>,
-) -> bool {
-    let callback_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        callback_host_id,
-        "wl_callback".to_string(),
-        1,
-    );
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(callback_host_id);
-    let Ok(message) = builder.try_build_message(1, REQ_SYNC) else {
-        log::warn!(
-            "Unable to encode window-placement barrier for zaura_toplevel {}",
-            zaura_toplevel_host_id
-        );
-        ctx.shadow_table.remove_host_interface(callback_host_id);
-        return false;
-    };
-
-    // A new shortcut supersedes the previous barrier for this toplevel. The
-    // old callback remains tracked until its terminal event so its host ID
-    // cannot be recycled while Exo still has the object alive.
-    if !ctx.window_placement.register_barrier(
-        callback_host_id,
-        zaura_toplevel_host_id,
-        self_parent_surface_id,
-    ) {
-        log::error!(
-            "Refusing to replace existing window-placement barrier callback {}",
-            callback_host_id
-        );
-        ctx.shadow_table.remove_host_interface(callback_host_id);
-        return false;
-    }
-    ctx.client_to_host_queue.push((message, Vec::new()));
-    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1634,56 +1305,6 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             return Action::Drop;
         }
 
-        let arc_app_id = if ctx.window_placement.uses_arc_policy() {
-            let Some(wl_surface_guest_id) = wl_surface_guest_id else {
-                log::warn!(
-                    "Cannot allocate ARC policy ID for xdg_toplevel {} without its wl_surface",
-                    xdg_toplevel_id
-                );
-                return Action::Drop;
-            };
-            let Some(application_id) = ctx
-                .window_placement
-                .arc_policy_application_id(wl_surface_guest_id)
-            else {
-                log::warn!(
-                    "ARC placement mode changed before app ID allocation for xdg_toplevel {}",
-                    xdg_toplevel_id
-                );
-                return Action::Drop;
-            };
-            Some(application_id)
-        } else {
-            None
-        };
-        if let Some(arc_app_id) = arc_app_id.as_deref() {
-            if !wayland_string_fits_message(arc_app_id) {
-                log::warn!(
-                    "Dropping oversized Aura application ID for xdg_toplevel {} ({} bytes)",
-                    xdg_toplevel_id,
-                    arc_app_id.len()
-                );
-                return Action::Drop;
-            }
-        }
-        let aura_app_id = match ctx.window_placement.arc_id_lifetime() {
-            crate::state::WindowArcIdLifetime::Persistent
-            | crate::state::WindowArcIdLifetime::PersistentNativeShell
-                if ctx.window_placement.uses_arc_policy() =>
-            {
-                arc_app_id.as_deref().unwrap_or(&xdg_app_id)
-            }
-            _ => &xdg_app_id,
-        };
-        if !wayland_string_fits_message(aura_app_id) {
-            log::warn!(
-                "Dropping oversized Aura application ID for xdg_toplevel {} ({} bytes)",
-                xdg_toplevel_id,
-                aura_app_id.len()
-            );
-            return Action::Drop;
-        }
-
         // The host xdg_toplevel carries the app ID used by ordinary Exo
         // shelf/application matching. Keep this request in the normal Guest OS
         // namespace even when the Aura surface uses the ARC bounds policy.
@@ -1700,30 +1321,26 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = wl_surface_guest_id {
+            // XDG accepted the native identity above, so retain it even when
+            // the optional Aura policy path is not available yet. A later
+            // Aura binding may still need the latest native ID for transient
+            // cleanup.
             ctx.window_placement
                 .remember_native_application_id(wl_surface_guest_id, xdg_app_id.clone());
             if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
             {
-                let zaura_surface_version = ctx
-                    .shadow_table
-                    .host_object_version(zaura_surface_host_id)
-                    .unwrap_or(ctx.window_placement.aura_shell_version());
-                if zaura_surface_version < 5 {
-                    return Action::Drop;
-                }
                 if !queue_policy_application_id(
                     ctx,
                     zaura_surface_host_id,
+                    wl_surface_guest_id,
                     &xdg_app_id,
-                    arc_app_id.as_deref(),
                 ) {
                     return Action::Drop;
                 }
                 log::debug!(
-                    "Set application ID to {} (XDG: {}, Aura: {}) on zaura_surface (host_id={})",
+                    "Set application ID to {} (XDG: {}) on zaura_surface (host_id={})",
                     app_id,
                     xdg_app_id,
-                    aura_app_id,
                     zaura_surface_host_id
                 );
             }
@@ -1834,6 +1451,7 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 mod tests {
     use super::*;
     use crate::handler::display::DisplayHandler;
+    use crate::handler::placement::queue_window_placement_barrier;
     use crate::protocols::aura_shell::zaura_shell::{
         REQ_GET_AURA_SURFACE, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
     };
@@ -4130,7 +3748,7 @@ mod tests {
         );
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_RELEASE_AURA_TOPLEVEL
+            crate::protocols::aura_shell::zaura_toplevel::REQ_RELEASE
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));

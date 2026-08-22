@@ -628,7 +628,7 @@ It must only be used with a uniquely named test display and never on the shared
 system Sommelier instance.
 
 All mutable placement state now lives in
-`sommelier/src/state/window_placement.rs`: one backend mode is resolved at
+`sommelier/src/state/window_placement/mod.rs`: one backend mode is resolved at
 startup, Aura surface/toplevel associations are one-to-one, one per-toplevel
 record owns the authoritative/predicted origin, and one barrier registry owns
 callback supersession and retirement. Compositor, keyboard, GTK, registry, and
@@ -718,14 +718,52 @@ Verification from the review worktree:
   smoke test is also ignored because it requires a live compositor.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `RUSTDOCFLAGS='-D warnings' cargo doc -p sommelier --no-deps` passed with no
+  broken intra-documentation links.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
+
+## 2026-08-22 — Test-fixture allocator probe removal
+
+The exhaustive render-buffer state tests were unexpectedly dominated by their
+fixture setup rather than by the state machine. `Context::new_for_test()` was
+calling the production constructor, which probes every DRM render node and
+constructs a GBM allocator for every generated trace. The two exhaustive
+tests create 15,625 and 46,656 contexts respectively, so this repeated
+hardware probing made the suite appear hung and produced a test-runner timeout
+event.
+
+The production constructor still performs the normal allocator probe. The
+test-only constructor now injects `None` for the allocator through a shared
+constructor helper; these unit tests exercise ID mapping and render-buffer
+lifecycle, not GBM allocation. No transition count or assertion was removed.
+The previously slow `host_buffer_use_matches_all_short_transition_sequences`
+test now completes in about 2.3 seconds, and the full workspace suite completes
+with 613 Sommelier tests passed, one ignored, 12 sample-GUI tests passed, and
+six Wayland-codegen tests passed.
+
+## 2026-08-22 — Final placement validation and timing
+
+The wire adapter now revalidates the prepared plan's XDG/Aura associations and
+the three host object interfaces immediately before queueing. A stale
+`zaura_surface` that is already pending destruction is rejected without
+publishing a wire request or registering a placement barrier. Keyboard fixtures
+now register the same XDG interface metadata as production dispatch, so the
+regression tests exercise the real lifecycle invariant instead of bypassing it.
+
+The final serialized workspace run passed 615 Sommelier tests, one ignored, 12
+sample-GUI tests, and six Wayland-codegen tests. The Sommelier test body took
+about 7.8 seconds; the longest exhaustive state-model test took about 2.3
+seconds. `cargo check --workspace --all-targets`, strict Clippy, formatting,
+`git diff --check`, and the release build also passed. For local iteration, the
+same matrix is stable with `--test-threads=4` and completes in about 3.2
+seconds of test execution.
 
 ## 2026-08-22 — placement runtime and request-plan ownership cleanup
 
 The placement refactor now has one process-wide
 `WindowPlacementRuntime` owned by
-`sommelier/src/state/window_placement.rs`. It contains the selected backend,
+`sommelier/src/state/window_placement/runtime.rs`. It contains the selected backend,
 the reloadable shortcut-generation handle, host accelerator policy, VM
 namespace, and process-shared ARC task allocator. Each connection receives an
 `Arc` reference to that runtime; its `WindowPlacementState` owns only
@@ -835,20 +873,45 @@ host sequence:
 ```text
 set_application_id(ARC task ID)
 set_window_bounds(...)
-set_application_id(native Guest OS ID)
 wl_display.sync(...)
+sync.done -> set_application_id(native Guest OS ID)
 ```
 
-This preserves the earlier task-ID allocator and the `/dev/wl0` observations
-while avoiding a persistent ARC shelf/icon identity. Unit coverage asserts the
-exact sequence and verifies that the native ID is restored after every
-placement.
+The native identity is deliberately queued only from the `sync.done` callback,
+so the restore cannot race the bounds request or be mistaken for part of the
+pre-barrier wire sequence. This preserves the earlier task-ID allocator and
+the `/dev/wl0` observations while avoiding a persistent ARC shelf/icon
+identity. Unit coverage asserts the exact sequence and verifies that the
+native ID is restored after every placement.
 
 It is retained as a comparison path, but is not the named `set-parent`
 backend: changing the Aura identity around a shortcut caused an IME focus
 reset on the custom host. The current `set-parent` backend keeps the
 task-form ARC identity persistent while using `set_parent` for its position
 probe and `set_window_bounds` for its size.
+
+## 2026-08-22 — Historical transient ARC nullable-parent follow-up
+
+The transient comparison path now tests a complete post-barrier cleanup:
+
+```text
+set_application_id(ARC task ID)
+set_window_bounds(...)
+wl_display.sync
+sync.done -> set_parent(NULL, 0, 0)
+sync.done -> set_application_id(native Guest OS ID)
+```
+
+This explicitly releases any parent relationship before returning to the
+native Guest OS identity. The restore uses the latest native ID recorded for
+the surface at barrier completion, rather than a stale placement-time copy.
+The order is covered by unit tests, and the path requires `zaura_surface`
+version 5 or newer: v2 provides nullable `set_parent`, while v5 is also
+needed for the temporary `set_application_id` update. It remains experimental
+because
+the custom host may move the window again or reset IME focus when the nullable
+parent and application identity are changed. Runtime verification must use an
+isolated `/dev/wl0` proxy; the primary Sommelier instance is not a test target.
 
 ## 2026-08-21 — bidirectional placement-link ownership
 
@@ -895,12 +958,36 @@ compatibility sentinel and is excluded from the allocator. The per-surface
 rejected experiment, including the `/dev/wl0` host-compositor restart observed
 with `arc + none`.
 
-Final verification from this worktree:
+Final verification before the identity-map consolidation:
 
-- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 577
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 618
   passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
   smoke test is ignored because it requires a live compositor.
+- The parallel workspace run (`--test-threads=4`) also passed with 618 tests
+  successful and one ignored.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
+- Placement plans now have an explicit lifecycle-pairing invariant check;
+  malformed target/cleanup/identity combinations are rejected before any
+  host wire message or barrier state is created.
+
+## 2026-08-22 — identity ownership consolidation and timing recheck
+
+The placement state now stores native and ARC application IDs for each guest
+surface in one `SurfaceApplicationState` record instead of two independent
+maps. The record is removed together with the Aura-surface association during
+surface teardown, keeping the two identity lifetimes atomic. The duplicate
+output-geometry tests were moved into `plan.rs`, which owns the pure
+`OutputState` value and its invariants.
+
+After that change the workspace matrix passed 617 Sommelier tests with one
+ignored test, 12 sample-GUI tests, and six Wayland-codegen tests. The serialized
+test bodies took 7.76 seconds (the same cached matrix took 2.67–2.71 seconds
+with `--test-threads=4`; a cold compile adds roughly ten seconds). Two
+descriptor-lifetime tests were hardened to compare `/proc/self/fd` targets,
+eliminating false failures caused by numeric FD reuse in parallel tests.
+`cargo check`,
+strict Clippy, rustdoc with warnings denied, the release build, formatting, and
+`git diff --check` all passed. No `/dev/wl0` runtime test was run in this pass.

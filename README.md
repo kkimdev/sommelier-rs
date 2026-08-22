@@ -215,7 +215,7 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-placement-backend set-parent\|transient-arc\|persistent` | Explicitly opt into a placement backend. `set-parent` is the supported custom-host experiment: persistent `org.chromium.arc.<task_id>` Aura authorization plus a bounds-first self-parent position probe. The other values are comparison experiments. |
+| `--window-placement-backend set-parent\|transient-arc\|persistent` | Explicitly opt into a placement backend. `set-parent` is the supported custom-host experiment: persistent `org.chromium.arc.<task_id>` Aura authorization plus a bounds-first self-parent position probe. `transient-arc` additionally probes nullable-parent cleanup and native-ID restoration after the barrier; the other values are comparison experiments. |
 | `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
 
 Window shortcuts and all placement geometry are disabled by default. To opt in
@@ -248,15 +248,16 @@ them. Use the explicit options above, and never enable the experimental
 
 ## Design notes
 
-- `sommelier/src/state/window_placement.rs` is the single owner of the
+- `sommelier/src/state/window_placement/mod.rs` is the single owner of the
   process-wide placement runtime, backend selection, validated placement plans,
   wl_surface/Aura associations, per-toplevel origins, self-parent convergence,
-  ARC task IDs, and host-sync barrier lifetimes. Each connection's
-  `WindowPlacementState` owns only its lifecycle maps and shares the immutable
-  runtime; handlers serialize plans but cannot choose a backend or mutate those
-  maps directly. Association/origin/barrier mutators are fallible and
-  `#[must_use]`, and debug builds assert the reverse-map and teardown
-  invariants after every mutation.
+  ARC task IDs, and host-sync barrier lifetimes. Its `runtime.rs`, `plan.rs`,
+  and `support.rs` children contain only the corresponding value types and
+  lifecycle primitives. Each connection's `WindowPlacementState` owns only its
+  lifecycle maps and shares the immutable runtime; handlers serialize plans but
+  cannot choose a backend or mutate those maps directly. Association/origin/
+  barrier mutators are fallible and `#[must_use]`, and debug builds assert the
+  reverse-map and teardown invariants after every mutation.
 - [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md) documents ARC task IDs, restore-session IDs, and the allocator used by this experiment.
 - [`sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md`](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md) documents ChromeOS accelerator acknowledgement and shortcut inhibition.
 - [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md) documents the inline shortcut schema and runtime reload contract.

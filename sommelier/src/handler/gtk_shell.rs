@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::compositor::{
+use crate::handler::placement::{
     ensure_host_zaura_surface, queue_policy_application_id, wayland_string_fits_message,
 };
 use crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID;
@@ -144,13 +144,6 @@ impl GtkSurface1Handler for GtkShellHandler {
         let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
             return Action::Drop;
         };
-        let version = ctx
-            .shadow_table
-            .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.window_placement.aura_shell_version());
-        if version < 5 {
-            return Action::Drop;
-        }
 
         let native_application_id = ctx.window_placement.native_wayland_app_id(application_id);
         if !wayland_string_fits_message(&native_application_id) {
@@ -160,52 +153,23 @@ impl GtkSurface1Handler for GtkShellHandler {
             );
             return Action::Drop;
         }
-        ctx.window_placement
-            .remember_native_application_id(wl_surface_guest_id, native_application_id.clone());
-        let arc_application_id = if ctx.window_placement.uses_arc_policy() {
-            let Some(aura_application_id) = ctx
-                .window_placement
-                .arc_policy_application_id(wl_surface_guest_id)
-            else {
-                log::warn!(
-                    "ARC placement mode changed before GTK app ID allocation for surface {}",
-                    ctx.last_sender_id
-                );
-                return Action::Drop;
-            };
-            Some(aura_application_id)
-        } else {
-            None
-        };
-        let aura_application_id = match ctx.window_placement.arc_id_lifetime() {
-            crate::state::WindowArcIdLifetime::Persistent
-            | crate::state::WindowArcIdLifetime::PersistentNativeShell
-                if ctx.window_placement.uses_arc_policy() =>
-            {
-                arc_application_id
-                    .as_deref()
-                    .unwrap_or(native_application_id.as_str())
-            }
-            _ => native_application_id.as_str(),
-        };
-        if !wayland_string_fits_message(aura_application_id) {
-            log::warn!(
-                "Dropping oversized GTK Aura application ID for gtk_surface1 {}",
-                ctx.last_sender_id
-            );
-            return Action::Drop;
-        }
         if !queue_policy_application_id(
             ctx,
             zaura_surface_id,
+            wl_surface_guest_id,
             &native_application_id,
-            arc_application_id.as_deref(),
         ) {
             log::warn!(
                 "Unable to queue GTK application ID for gtk_surface1 {}",
                 ctx.last_sender_id
             );
+            return Action::Drop;
         }
+        // Publish the native identity only after its host Aura request was
+        // accepted. A failed request must not make a later transient cleanup
+        // restore an ID the host never received.
+        ctx.window_placement
+            .remember_native_application_id(wl_surface_guest_id, native_application_id);
         Action::Drop
     }
 

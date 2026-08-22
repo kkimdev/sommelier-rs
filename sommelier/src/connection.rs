@@ -482,10 +482,13 @@ mod tests {
         let read_fd = pipe_fds[0];
         // Put the descriptor under test outside the low range used by the
         // parallel test harness. Otherwise another test can reuse the number
-        // between Drop and the fcntl assertion, making a correct close look
-        // like a leak.
+        // between Drop and the postcondition check. The assertion below uses
+        // the procfs target rather than requiring EBADF, so a legitimate
+        // unrelated descriptor reuse cannot look like a leak.
         let pending_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(pending_fd >= 1000);
+        let pending_target =
+            fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
         unsafe {
             libc::close(pipe_fds[1]);
         }
@@ -493,13 +496,13 @@ mod tests {
         connection.read_fds.push(pending_fd);
         drop(connection);
 
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        let fd_state = unsafe { libc::fcntl(pending_fd, libc::F_GETFD) };
-        assert_eq!(fd_state, -1);
-        let errno = unsafe { *libc::__errno_location() };
-        assert_eq!(errno, libc::EBADF);
+        let current = fs::read_link(format!("/proc/self/fd/{pending_fd}"));
+        assert!(
+            current
+                .as_ref()
+                .map_or(true, |current| current != &pending_target),
+            "dropping a connection must close every received descriptor"
+        );
     }
 
     #[test]

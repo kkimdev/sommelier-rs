@@ -96,7 +96,10 @@ impl ArcTaskIdAllocator {
     /// without changing the production random-selection path.
     fn acquire_in_directory(directory: &Path, start_index: u32) -> io::Result<Arc<Self>> {
         for offset in 0..ARC_TASK_ID_BLOCK_COUNT {
-            let index = (start_index + offset) % ARC_TASK_ID_BLOCK_COUNT;
+            // `start_index` comes from `/dev/urandom`; use wrapping addition
+            // before reducing into the small block-index domain so a debug
+            // build cannot panic when the random word is near `u32::MAX`.
+            let index = start_index.wrapping_add(offset) % ARC_TASK_ID_BLOCK_COUNT;
             let (start_id, end_id) = block_bounds(index);
             let path = directory.join(format!("{start_id}-{end_id}.lock"));
             let mut options = OpenOptions::new();
@@ -283,6 +286,19 @@ mod tests {
             .expect("released flock can be reused");
         assert_eq!(reclaimed.block_range(), first_range);
         drop(reclaimed);
+        fs::remove_dir_all(directory).expect("remove test lock directory");
+    }
+
+    #[test]
+    fn block_probe_wraps_random_start_index_without_overflow() {
+        let directory = temporary_directory("random-index-wrap");
+        let allocator = ArcTaskIdAllocator::acquire_in_directory(&directory, u32::MAX)
+            .expect("a high random start index must wrap through the block table");
+        assert_eq!(
+            allocator.block_range(),
+            block_bounds(u32::MAX % ARC_TASK_ID_BLOCK_COUNT)
+        );
+        drop(allocator);
         fs::remove_dir_all(directory).expect("remove test lock directory");
     }
 }
