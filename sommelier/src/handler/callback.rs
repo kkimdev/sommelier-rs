@@ -67,7 +67,23 @@ impl WlCallbackHandler for CallbackHandler {
             }
             return Action::Drop;
         }
-        if ctx.window_placement.complete_barrier(host_id).is_some() {
+        if let Some(completion) = ctx.window_placement.complete_barrier(host_id) {
+            if let Some(zaura_surface_id) = completion.self_parent_surface_id {
+                if !crate::handler::compositor::queue_zaura_surface_parent(
+                    ctx,
+                    zaura_surface_id,
+                    None,
+                    0,
+                    0,
+                ) {
+                    log::warn!(
+                        "Unable to clear self-parent placement for zaura_surface {} \
+                         after barrier on zaura_toplevel {}",
+                        zaura_surface_id,
+                        completion.toplevel_id
+                    );
+                }
+            }
             // A sync callback is host-only and terminal at `done`. Keep its
             // numeric ID reserved until the host's subsequent delete_id, but
             // stop treating duplicate/stale events as live callbacks.
@@ -129,6 +145,7 @@ impl WlCallbackHandler for CallbackHandler {
 mod tests {
     use super::CallbackHandler;
     use crate::handler::display::DisplayHandler;
+    use crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::Context;
@@ -201,7 +218,7 @@ mod tests {
             .remember_aura_toplevel(100, zaura_toplevel_id));
         assert!(ctx
             .window_placement
-            .register_barrier(callback_id, zaura_toplevel_id));
+            .register_barrier(callback_id, zaura_toplevel_id, None));
         ctx.last_sender_id = callback_id;
 
         let mut handler = CallbackHandler;
@@ -219,8 +236,56 @@ mod tests {
     }
 
     #[test]
+    fn active_self_parent_barrier_queues_explicit_unparent_after_done() {
+        let zaura_toplevel_id = 77;
+        let zaura_surface_id = 55;
+        let callback_id = 40;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            callback_id,
+            "wl_callback".to_string(),
+            1,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            zaura_surface_id,
+            "zaura_surface".to_string(),
+            2,
+        );
+        assert!(ctx
+            .window_placement
+            .remember_aura_toplevel(100, zaura_toplevel_id));
+        assert!(ctx.window_placement.register_barrier(
+            callback_id,
+            zaura_toplevel_id,
+            Some(zaura_surface_id)
+        ));
+        ctx.last_sender_id = callback_id;
+
+        let mut handler = CallbackHandler;
+        assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let unparent = &ctx.client_to_host_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(unparent[0..4].try_into().unwrap()),
+            zaura_surface_id
+        );
+        assert_eq!(
+            u16::from_ne_bytes(unparent[4..6].try_into().unwrap()),
+            REQ_SET_PARENT
+        );
+        assert_eq!(
+            u32::from_ne_bytes(unparent[8..12].try_into().unwrap()),
+            0,
+            "the parent object must be null when the probe is released"
+        );
+        assert_eq!(i32::from_ne_bytes(unparent[12..16].try_into().unwrap()), 0);
+        assert_eq!(i32::from_ne_bytes(unparent[16..20].try_into().unwrap()), 0);
+    }
+
+    #[test]
     fn stale_window_placement_barrier_does_not_clear_newer_barrier() {
         let zaura_toplevel_id = 77;
+        let zaura_surface_id = 55;
         let old_callback_id = 40;
         let new_callback_id = 41;
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -231,19 +296,32 @@ mod tests {
                 1,
             );
         }
+        ctx.shadow_table.track_host_interface_with_version(
+            zaura_surface_id,
+            "zaura_surface".to_string(),
+            2,
+        );
         assert!(ctx
             .window_placement
             .remember_aura_toplevel(100, zaura_toplevel_id));
-        assert!(ctx
-            .window_placement
-            .register_barrier(old_callback_id, zaura_toplevel_id));
-        assert!(ctx
-            .window_placement
-            .register_barrier(new_callback_id, zaura_toplevel_id));
+        assert!(ctx.window_placement.register_barrier(
+            old_callback_id,
+            zaura_toplevel_id,
+            Some(zaura_surface_id)
+        ));
+        assert!(ctx.window_placement.register_barrier(
+            new_callback_id,
+            zaura_toplevel_id,
+            Some(zaura_surface_id)
+        ));
 
         let mut handler = CallbackHandler;
         ctx.last_sender_id = old_callback_id;
         assert_eq!(handler.on_done(&mut ctx, 1), Action::Drop);
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "a superseded barrier must not clear the newer self-parent probe"
+        );
         assert_eq!(
             ctx.window_placement
                 .active_barrier_for_toplevel(zaura_toplevel_id),
@@ -260,6 +338,13 @@ mod tests {
         ctx.last_sender_id = new_callback_id;
         assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
         assert!(!ctx.window_placement.has_any_barriers());
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            1,
+            "only the active barrier may queue the unparent request"
+        );
+        let unparent = &ctx.client_to_host_queue[0].0;
+        assert_eq!(u32::from_ne_bytes(unparent[8..12].try_into().unwrap()), 0);
         assert!(ctx
             .shadow_table
             .is_pending_destroy_host_only(new_callback_id));
