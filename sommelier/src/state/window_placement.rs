@@ -23,10 +23,12 @@ limitations under the License.
 //! application-ID lifetime consistent.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use log::warn;
 
+use crate::accelerator::Accelerator;
 use crate::arc_task_ids::ArcTaskIdAllocator;
 use crate::window_shortcuts::{NormalizedRect, ShortcutConfig, ShortcutConfigHandle};
 
@@ -186,6 +188,207 @@ impl WindowPlacementMode {
     /// Return whether this backend runs the self-parent position-and-bounds path.
     pub(crate) const fn uses_self_parent(self) -> bool {
         matches!(self.geometry_method, WindowGeometryMethod::SelfParent)
+    }
+}
+
+/// Process-wide immutable placement configuration and shared runtime handles.
+///
+/// A Sommelier process may serve several guest connections. Configuration and
+/// resources that must be identical for every connection therefore live here,
+/// while [`WindowPlacementState`] owns only connection-local protocol
+/// lifetimes. The shortcut handle is internally generation-based so SIGHUP can
+/// publish a new validated snapshot without replacing this owner.
+#[derive(Debug, Clone)]
+pub(crate) struct WindowPlacementRuntime {
+    mode: WindowPlacementMode,
+    shortcut_config: ShortcutConfigHandle,
+    shortcut_config_path: Option<PathBuf>,
+    host_accelerators: Arc<Vec<Accelerator>>,
+    arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
+    vm_identifier: String,
+}
+
+pub(crate) type WindowPlacementRuntimeHandle = Arc<WindowPlacementRuntime>;
+
+/// Result of a SIGHUP shortcut-configuration reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortcutReloadResult {
+    NoPath,
+    Reloaded,
+    RejectedWhileDisabled,
+    Invalid,
+}
+
+impl WindowPlacementRuntime {
+    /// Construct the one process-wide placement runtime.
+    pub(crate) fn new(
+        mode: WindowPlacementMode,
+        shortcut_config: ShortcutConfigHandle,
+        shortcut_config_path: Option<PathBuf>,
+        host_accelerators: Arc<Vec<Accelerator>>,
+        arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
+    ) -> WindowPlacementRuntimeHandle {
+        #[cfg(test)]
+        let arc_task_allocator = if mode.uses_arc_policy() {
+            arc_task_allocator
+                .or_else(|| Some(ArcTaskIdAllocator::for_test(2_000_000_000, 2_000_000_999)))
+        } else {
+            arc_task_allocator
+        };
+        let arc_task_allocator = mode
+            .uses_arc_policy()
+            .then_some(arc_task_allocator)
+            .flatten();
+
+        Arc::new(Self {
+            mode,
+            shortcut_config,
+            shortcut_config_path,
+            host_accelerators,
+            arc_task_allocator,
+            vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+        })
+    }
+
+    /// Construct the runtime used by in-process/default contexts.
+    pub(crate) fn from_environment() -> WindowPlacementRuntimeHandle {
+        Self::new(
+            WindowPlacementMode::from_environment(),
+            ShortcutConfigHandle::disabled(),
+            None,
+            Arc::new(crate::accelerator::from_environment()),
+            None,
+        )
+    }
+
+    /// Return the process-wide placement mode.
+    pub(crate) const fn mode(&self) -> WindowPlacementMode {
+        self.mode
+    }
+
+    /// Return the currently published immutable shortcut generation.
+    pub(crate) fn shortcut_config_snapshot(&self) -> Arc<ShortcutConfig> {
+        self.shortcut_config.snapshot()
+    }
+
+    /// Return the host accelerators used to reject conflicting bindings and
+    /// suppress host-owned shortcuts.
+    pub(crate) fn host_accelerators(&self) -> &[Accelerator] {
+        self.host_accelerators.as_ref()
+    }
+
+    /// Allocate one task ID from the process-owned block.
+    pub(crate) fn allocate_arc_task_id(&self) -> std::io::Result<u32> {
+        self.arc_task_allocator
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ARC task allocator is disabled"))
+            .and_then(|allocator| allocator.allocate())
+    }
+
+    /// Reload the optional shortcut file as one complete generation.
+    ///
+    /// Invalid input leaves the last known-good snapshot untouched. The typed
+    /// result lets callers distinguish an absent path from rejected input
+    /// without reimplementing reload policy outside this owner.
+    pub(crate) fn reload_shortcuts(&self) -> ShortcutReloadResult {
+        let Some(path) = self.shortcut_config_path.as_deref() else {
+            log::debug!("Ignoring SIGHUP: no window shortcut config path was supplied");
+            return ShortcutReloadResult::NoPath;
+        };
+        match ShortcutConfig::load_from_path(path, self.host_accelerators.as_ref()) {
+            Ok(config) => {
+                if !config.is_empty() && !self.mode.handles_shortcuts() {
+                    log::error!(
+                        "Keeping the previous window shortcut configuration; \
+                         {} contains bindings but the geometry method is disabled",
+                        path.display()
+                    );
+                    return ShortcutReloadResult::RejectedWhileDisabled;
+                }
+                self.shortcut_config.replace(config);
+                log::info!(
+                    "Reloaded window shortcut configuration from {}",
+                    path.display()
+                );
+                ShortcutReloadResult::Reloaded
+            }
+            Err(error) => {
+                log::error!(
+                    "Keeping the previous window shortcut configuration; \
+                     reload of {} failed: {}",
+                    path.display(),
+                    error
+                );
+                ShortcutReloadResult::Invalid
+            }
+        }
+    }
+
+    /// Reuse the runtime's current immutable inputs with a test-only mode.
+    #[cfg(test)]
+    fn with_mode_for_test(
+        &self,
+        mode: WindowPlacementMode,
+        shortcut_config: ShortcutConfigHandle,
+    ) -> WindowPlacementRuntimeHandle {
+        Self::new(
+            mode,
+            shortcut_config,
+            self.shortcut_config_path.clone(),
+            self.host_accelerators.clone(),
+            self.arc_task_allocator.clone(),
+        )
+    }
+}
+
+/// Geometry operation selected for one accepted shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowPlacementGeometry {
+    /// Send a direct Aura bounds request.
+    Bounds,
+    /// Resize at the current origin and then issue the self-parent probe.
+    SelfParent {
+        current_origin: (i32, i32),
+        relative_position: (i32, i32),
+    },
+}
+
+/// Native/ARC identity transition required by transient ARC placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransientArcIdentity {
+    pub(crate) arc_application_id: String,
+    pub(crate) native_application_id: String,
+}
+
+/// Fully validated placement operation returned by the state owner.
+///
+/// Handlers serialize this value into protocol messages but do not choose the
+/// geometry backend, allocate ARC IDs, or mutate predicted origins themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowPlacementPlan {
+    pub(crate) output_host_id: u32,
+    pub(crate) bounds: (i32, i32, i32, i32),
+    pub(crate) geometry: WindowPlacementGeometry,
+    pub(crate) transient_arc_identity: Option<TransientArcIdentity>,
+}
+
+/// Why a shortcut could not produce a placement plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowPlacementPlanError {
+    Disabled,
+    NoUsableOutput,
+    UnsupportedGeometry,
+    UnsupportedSurfaceVersion,
+    OriginUnknown,
+    CoordinateOverflow,
+    NativeApplicationIdMissing,
+    ArcTaskIdUnavailable,
+}
+
+impl WindowPlacementPlanError {
+    /// Whether the keyboard event must be consumed while state catches up.
+    pub(crate) const fn consumes_shortcut(self) -> bool {
+        matches!(self, Self::OriginUnknown)
     }
 }
 
@@ -360,8 +563,26 @@ impl BidirectionalLinks {
 /// bookkeeping.
 #[derive(Debug, Default)]
 struct PlacementBarrierRegistry {
-    by_callback: HashMap<u32, u32>,
+    by_callback: HashMap<u32, PlacementBarrierRecord>,
     active_by_toplevel: HashMap<u32, u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlacementBarrierRecord {
+    toplevel_id: u32,
+    /// Surface that received a self-parent request and must be unparented
+    /// after this barrier, if this callback is still the active placement.
+    self_parent_surface_id: Option<u32>,
+}
+
+/// Result of completing one placement barrier.
+///
+/// A stale callback still returns a completion so its host object can finish
+/// its lifecycle, but it does not carry cleanup for a superseded placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlacementBarrierCompletion {
+    pub(crate) toplevel_id: u32,
+    pub(crate) self_parent_surface_id: Option<u32>,
 }
 
 impl PlacementBarrierRegistry {
@@ -374,26 +595,42 @@ impl PlacementBarrierRegistry {
     ///
     /// An existing active callback is intentionally superseded but remains in
     /// `by_callback` until its host-side terminal event arrives.
-    fn register(&mut self, callback_id: u32, toplevel_id: u32) -> bool {
+    fn register(
+        &mut self,
+        callback_id: u32,
+        toplevel_id: u32,
+        self_parent_surface_id: Option<u32>,
+    ) -> bool {
         if self.contains_callback(callback_id) {
             return false;
         }
-        self.by_callback.insert(callback_id, toplevel_id);
+        self.by_callback.insert(
+            callback_id,
+            PlacementBarrierRecord {
+                toplevel_id,
+                self_parent_surface_id,
+            },
+        );
         self.active_by_toplevel.insert(toplevel_id, callback_id);
         true
     }
 
-    /// Complete one callback and return the toplevel it guarded.
+    /// Complete one callback and return the cleanup for the active placement.
     ///
     /// Only the callback that is still active for that toplevel may clear the
     /// active entry; an older superseded callback remains callback-owned until
-    /// its own completion without disturbing the newer barrier.
-    fn complete(&mut self, callback_id: u32) -> Option<u32> {
-        let toplevel_id = self.by_callback.remove(&callback_id)?;
-        if self.active_by_toplevel.get(&toplevel_id) == Some(&callback_id) {
-            self.active_by_toplevel.remove(&toplevel_id);
+    /// its own completion without disturbing the newer barrier or unparenting
+    /// the newer placement.
+    fn complete(&mut self, callback_id: u32) -> Option<PlacementBarrierCompletion> {
+        let record = self.by_callback.remove(&callback_id)?;
+        let is_active = self.active_by_toplevel.get(&record.toplevel_id) == Some(&callback_id);
+        if is_active {
+            self.active_by_toplevel.remove(&record.toplevel_id);
         }
-        Some(toplevel_id)
+        Some(PlacementBarrierCompletion {
+            toplevel_id: record.toplevel_id,
+            self_parent_surface_id: is_active.then_some(record.self_parent_surface_id).flatten(),
+        })
     }
 
     /// Clear the latest pending sync for a released toplevel.
@@ -421,14 +658,18 @@ impl PlacementBarrierRegistry {
         self.active_by_toplevel
             .iter()
             .all(|(toplevel_id, callback_id)| {
-                self.by_callback.get(callback_id) == Some(toplevel_id)
+                self.by_callback
+                    .get(callback_id)
+                    .is_some_and(|record| record.toplevel_id == *toplevel_id)
                     && is_live_toplevel(*toplevel_id)
             })
     }
 
     #[cfg(test)]
     fn callback_for(&self, callback_id: u32) -> Option<u32> {
-        self.by_callback.get(&callback_id).copied()
+        self.by_callback
+            .get(&callback_id)
+            .map(|record| record.toplevel_id)
     }
 
     #[cfg(test)]
@@ -445,10 +686,7 @@ impl PlacementBarrierRegistry {
 /// barrier mapping without retiring its active-to-toplevel entry.
 #[derive(Debug)]
 pub(crate) struct WindowPlacementState {
-    mode: WindowPlacementMode,
-    shortcut_config: ShortcutConfigHandle,
-    vm_identifier: String,
-    arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
+    runtime: WindowPlacementRuntimeHandle,
     aura_shell: Option<AuraShellBinding>,
     /// Latest native Guest OS application ID for each guest surface.
     ///
@@ -515,31 +753,22 @@ impl WindowPlacementState {
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
-        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled(), None)
+        Self::with_runtime(WindowPlacementRuntime::new(
+            mode,
+            ShortcutConfigHandle::disabled(),
+            None,
+            Arc::new(Vec::new()),
+            None,
+        ))
     }
 
-    /// Create placement state with the process-wide immutable binding handle.
+    /// Create placement state with the process-wide runtime owner.
     ///
-    /// The handle is shared by every client connection, while all geometry,
+    /// The runtime is shared by every client connection, while all geometry,
     /// object associations, and lifecycle state remain connection-local.
-    pub(crate) fn with_shortcut_config(
-        mode: WindowPlacementMode,
-        shortcut_config: ShortcutConfigHandle,
-        arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
-    ) -> Self {
-        let vm_identifier = resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
-        #[cfg(test)]
-        let arc_task_allocator = if mode.uses_arc_policy() {
-            arc_task_allocator
-                .or_else(|| Some(ArcTaskIdAllocator::for_test(2_000_000_000, 2_000_000_999)))
-        } else {
-            arc_task_allocator
-        };
+    pub(crate) fn with_runtime(runtime: WindowPlacementRuntimeHandle) -> Self {
         Self {
-            mode,
-            shortcut_config,
-            vm_identifier,
-            arc_task_allocator,
+            runtime,
             aura_shell: None,
             native_application_ids: HashMap::new(),
             arc_application_ids: HashMap::new(),
@@ -557,33 +786,33 @@ impl WindowPlacementState {
     }
 
     /// Return the most recent mode-independent shortcut capability.
-    pub(crate) const fn handles_shortcuts(&self) -> bool {
-        self.mode.handles_shortcuts()
+    pub(crate) fn handles_shortcuts(&self) -> bool {
+        self.runtime.mode().handles_shortcuts()
     }
 
     /// Return whether this connection uses the ARC application namespace.
-    pub(crate) const fn uses_arc_policy(&self) -> bool {
-        self.mode.uses_arc_policy()
+    pub(crate) fn uses_arc_policy(&self) -> bool {
+        self.runtime.mode().uses_arc_policy()
     }
 
     /// Return the configured ARC application-ID lifetime behavior.
-    pub(crate) const fn arc_id_lifetime(&self) -> WindowArcIdLifetime {
-        self.mode.arc_id_lifetime()
+    pub(crate) fn arc_id_lifetime(&self) -> WindowArcIdLifetime {
+        self.runtime.mode().arc_id_lifetime()
     }
 
     /// Return whether placement must install and then restore ARC metadata.
-    pub(crate) const fn uses_transient_arc_id(&self) -> bool {
-        self.mode.uses_transient_arc_id()
+    pub(crate) fn uses_transient_arc_id(&self) -> bool {
+        self.runtime.mode().uses_transient_arc_id()
     }
 
     /// Return whether this connection uses direct Aura bounds.
-    pub(crate) const fn uses_bounds(&self) -> bool {
-        self.mode.uses_bounds()
+    pub(crate) fn uses_bounds(&self) -> bool {
+        self.runtime.mode().uses_bounds()
     }
 
     /// Return whether this connection uses the experimental self-parent path.
-    pub(crate) const fn uses_self_parent(&self) -> bool {
-        self.mode.uses_self_parent()
+    pub(crate) fn uses_self_parent(&self) -> bool {
+        self.runtime.mode().uses_self_parent()
     }
 
     /// Return the internally bound Aura shell manager, if one is live.
@@ -665,14 +894,19 @@ impl WindowPlacementState {
 
     /// Take one immutable binding generation for a key event.
     pub(crate) fn shortcut_config_snapshot(&self) -> Arc<ShortcutConfig> {
-        self.shortcut_config.snapshot()
+        self.runtime.shortcut_config_snapshot()
+    }
+
+    /// Return the process-wide host accelerator policy.
+    pub(crate) fn host_accelerators(&self) -> &[Accelerator] {
+        self.runtime.host_accelerators()
     }
 
     /// Format a native Wayland application ID in ChromeOS' Guest OS namespace.
     pub(crate) fn native_wayland_app_id(&self, app_id: &str) -> String {
         format!(
             "org.chromium.guest_os.{}.wayland.{}",
-            self.vm_identifier, app_id
+            self.runtime.vm_identifier, app_id
         )
     }
 
@@ -695,14 +929,6 @@ impl WindowPlacementState {
         self.native_application_ids
             .get(&wl_surface_guest_id)
             .cloned()
-    }
-
-    /// Replace the shared binding handle. Production reloads replace the
-    /// handle's immutable generation; this setter exists for deterministic
-    /// in-process fixtures that construct a complete state directly.
-    #[cfg(test)]
-    pub(crate) fn set_shortcut_config(&mut self, shortcut_config: ShortcutConfigHandle) {
-        self.shortcut_config = shortcut_config;
     }
 
     /// Register one synthetic GTK shell binding.
@@ -960,6 +1186,98 @@ impl WindowPlacementState {
         Some((host_id, bounds))
     }
 
+    /// Validate and prepare one shortcut placement.
+    ///
+    /// This is the only state operation that turns a user rectangle into a
+    /// backend-specific operation. It owns output selection, origin
+    /// validation, and transient ARC identity allocation; callers only encode
+    /// the returned plan and enqueue the sync barrier before committing it.
+    pub(crate) fn prepare_placement(
+        &mut self,
+        rect: NormalizedRect,
+        zaura_toplevel_host_id: u32,
+        wl_surface_guest_id: u32,
+        zaura_surface_version: u32,
+    ) -> Result<WindowPlacementPlan, WindowPlacementPlanError> {
+        if !self.handles_shortcuts() {
+            return Err(WindowPlacementPlanError::Disabled);
+        }
+        let Some((output_host_id, bounds)) = self.bounds_for_rect(rect) else {
+            return Err(WindowPlacementPlanError::NoUsableOutput);
+        };
+        if self.uses_self_parent() && self.uses_transient_arc_id() {
+            return Err(WindowPlacementPlanError::UnsupportedGeometry);
+        }
+
+        let geometry = if self.uses_self_parent() {
+            if zaura_surface_version < 2 {
+                return Err(WindowPlacementPlanError::UnsupportedSurfaceVersion);
+            }
+            let Some(current_origin) = self.origin(zaura_toplevel_host_id) else {
+                return Err(WindowPlacementPlanError::OriginUnknown);
+            };
+            let Some(relative_x) = bounds.0.checked_sub(current_origin.0) else {
+                return Err(WindowPlacementPlanError::CoordinateOverflow);
+            };
+            let Some(relative_y) = bounds.1.checked_sub(current_origin.1) else {
+                return Err(WindowPlacementPlanError::CoordinateOverflow);
+            };
+            WindowPlacementGeometry::SelfParent {
+                current_origin,
+                relative_position: (relative_x, relative_y),
+            }
+        } else if self.uses_bounds() {
+            WindowPlacementGeometry::Bounds
+        } else {
+            return Err(WindowPlacementPlanError::UnsupportedGeometry);
+        };
+
+        let transient_arc_identity = if self.uses_transient_arc_id() {
+            let Some(native_application_id) = self.native_application_id(wl_surface_guest_id)
+            else {
+                return Err(WindowPlacementPlanError::NativeApplicationIdMissing);
+            };
+            let Some(arc_application_id) = self.arc_policy_application_id(wl_surface_guest_id)
+            else {
+                return Err(WindowPlacementPlanError::ArcTaskIdUnavailable);
+            };
+            Some(TransientArcIdentity {
+                arc_application_id,
+                native_application_id,
+            })
+        } else {
+            None
+        };
+
+        Ok(WindowPlacementPlan {
+            output_host_id,
+            bounds,
+            geometry,
+            transient_arc_identity,
+        })
+    }
+
+    /// Commit the state transition represented by an already-queued plan.
+    ///
+    /// Preparation intentionally does not publish a predicted origin. This
+    /// keeps a failed identity/message encoding from leaving lifecycle state
+    /// that claims a request was sent. Direct bounds have no local transition;
+    /// self-parent plans publish the target only after their wire sequence is
+    /// queued.
+    #[must_use = "a self-parent prediction may target a released toplevel"]
+    pub(crate) fn commit_placement_plan(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        plan: &WindowPlacementPlan,
+    ) -> bool {
+        match plan.geometry {
+            WindowPlacementGeometry::Bounds => true,
+            WindowPlacementGeometry::SelfParent { .. } => {
+                self.predict_origin(zaura_toplevel_host_id, (plan.bounds.0, plan.bounds.1))
+            }
+        }
+    }
+
     /// Record the xdg_surface → wl_surface role association.
     #[must_use = "the XDG surface association may conflict with a live role"]
     pub(crate) fn remember_xdg_surface(
@@ -1057,8 +1375,7 @@ impl WindowPlacementState {
             return Some(application_id.clone());
         }
 
-        let allocator = self.arc_task_allocator.as_ref()?;
-        let task_id = match allocator.allocate() {
+        let task_id = match self.runtime.allocate_arc_task_id() {
             Ok(task_id) => task_id,
             Err(error) => {
                 warn!(
@@ -1255,6 +1572,7 @@ impl WindowPlacementState {
         &mut self,
         callback_host_id: u32,
         zaura_toplevel_host_id: u32,
+        self_parent_surface_id: Option<u32>,
     ) -> bool {
         if self
             .aura_toplevel_links
@@ -1263,22 +1581,26 @@ impl WindowPlacementState {
         {
             return false;
         }
-        if !self
-            .barriers
-            .register(callback_host_id, zaura_toplevel_host_id)
-        {
+        if !self.barriers.register(
+            callback_host_id,
+            zaura_toplevel_host_id,
+            self_parent_surface_id,
+        ) {
             return false;
         }
         self.debug_assert_consistent();
         true
     }
 
-    /// Retire a completed barrier and clear it only if it is still newest.
-    #[must_use = "the returned Aura toplevel identifies which placement completed"]
-    pub(crate) fn complete_barrier(&mut self, callback_host_id: u32) -> Option<u32> {
-        let zaura_toplevel_host_id = self.barriers.complete(callback_host_id)?;
+    /// Retire a completed barrier and return cleanup only if it is still newest.
+    #[must_use = "the returned completion identifies which placement finished"]
+    pub(crate) fn complete_barrier(
+        &mut self,
+        callback_host_id: u32,
+    ) -> Option<PlacementBarrierCompletion> {
+        let completion = self.barriers.complete(callback_host_id)?;
         self.debug_assert_consistent();
-        Some(zaura_toplevel_host_id)
+        Some(completion)
     }
 
     /// Return whether a placement sync callback is pending for this toplevel.
@@ -1306,11 +1628,10 @@ impl WindowPlacementState {
 
     #[cfg(test)]
     pub(crate) fn set_mode_for_test(&mut self, mode: WindowPlacementMode) {
-        if mode.uses_arc_policy() && self.arc_task_allocator.is_none() {
-            self.arc_task_allocator =
-                Some(ArcTaskIdAllocator::for_test(2_000_000_000, 2_000_000_999));
-        }
-        self.mode = mode;
+        self.runtime = self.runtime.with_mode_for_test(
+            mode,
+            ShortcutConfigHandle::new(self.runtime.shortcut_config_snapshot()),
+        );
     }
 }
 
@@ -1350,30 +1671,68 @@ mod tests {
     #[test]
     fn placement_barriers_retain_superseded_callbacks_until_completion() {
         let mut barriers = PlacementBarrierRegistry::default();
-        assert!(barriers.register(40, 77));
+        assert!(barriers.register(40, 77, None));
         assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
         assert_eq!(barriers.active_callback_for(77), Some(40));
 
-        assert!(barriers.register(41, 77));
+        assert!(barriers.register(41, 77, None));
         assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
         assert_eq!(barriers.active_callback_for(77), Some(41));
         assert_eq!(barriers.callback_for(40), Some(77));
         assert_eq!(barriers.callback_for(41), Some(77));
 
-        assert!(!barriers.register(41, 88));
+        assert!(!barriers.register(41, 88, None));
         assert_eq!(barriers.active_callback_for(77), Some(41));
-        assert_eq!(barriers.complete(40), Some(77));
+        assert_eq!(
+            barriers
+                .complete(40)
+                .map(|completion| completion.toplevel_id),
+            Some(77)
+        );
         assert_eq!(barriers.active_callback_for(77), Some(41));
-        assert_eq!(barriers.complete(41), Some(77));
+        assert_eq!(
+            barriers
+                .complete(41)
+                .map(|completion| completion.toplevel_id),
+            Some(77)
+        );
         assert!(barriers.is_empty());
 
         let mut released = PlacementBarrierRegistry::default();
-        assert!(released.register(50, 99));
+        assert!(released.register(50, 99, None));
         assert!(!released.is_consistent(|_| false));
         released.release_toplevel(99);
         assert!(released.is_consistent(|_| false));
-        assert_eq!(released.complete(50), Some(99));
+        assert_eq!(
+            released
+                .complete(50)
+                .map(|completion| completion.toplevel_id),
+            Some(99)
+        );
         assert!(released.is_empty());
+    }
+
+    #[test]
+    fn only_active_barrier_returns_self_parent_cleanup() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        assert!(barriers.register(40, 77, Some(55)));
+        assert!(barriers.register(41, 77, Some(55)));
+
+        assert_eq!(
+            barriers
+                .complete(40)
+                .expect("superseded callback must complete")
+                .self_parent_surface_id,
+            None,
+            "stale completion must not unparent the newer placement"
+        );
+        assert_eq!(
+            barriers
+                .complete(41)
+                .expect("active callback must complete")
+                .self_parent_surface_id,
+            Some(55)
+        );
     }
 
     #[test]
@@ -1442,6 +1801,96 @@ mod tests {
         assert!(!disabled.uses_arc_policy());
         assert!(!disabled.uses_bounds());
         assert!(!disabled.uses_self_parent());
+    }
+
+    fn state_with_output(mode: WindowPlacementMode) -> WindowPlacementState {
+        let mut state = WindowPlacementState::new(mode);
+        assert!(state.remember_output(50));
+        state.update_output_mode(50, true, 3840, 2160);
+        state.update_output_scale(50, 1);
+        state
+    }
+
+    #[test]
+    fn placement_plan_is_the_single_backend_decision_point() {
+        let mut bounds = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
+        assert!(bounds.remember_aura_toplevel(10, 70));
+        let direct = bounds
+            .prepare_placement(NormalizedRect::new(0.5, 0.0, 0.5, 1.0), 70, 20, 1)
+            .expect("direct bounds plan should be valid");
+        assert_eq!(direct.output_host_id, 50);
+        assert_eq!(direct.bounds, (1920, 0, 1920, 2160));
+        assert_eq!(direct.geometry, WindowPlacementGeometry::Bounds);
+        assert_eq!(direct.transient_arc_identity, None);
+
+        let mut self_parent = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::SelfParent,
+        ));
+        assert!(self_parent.remember_aura_toplevel(10, 70));
+        assert!(self_parent.record_origin(70, (100, 200)));
+        let probe = self_parent
+            .prepare_placement(NormalizedRect::new(0.0, 0.0, 0.5, 0.5), 70, 20, 2)
+            .expect("self-parent plan should be valid");
+        assert_eq!(
+            probe.geometry,
+            WindowPlacementGeometry::SelfParent {
+                current_origin: (100, 200),
+                relative_position: (-100, -200),
+            }
+        );
+        assert_eq!(self_parent.pending_origin(70), None);
+        assert!(self_parent.commit_placement_plan(70, &probe));
+        assert_eq!(self_parent.pending_origin(70), Some((0, 0)));
+    }
+
+    #[test]
+    fn placement_plan_preserves_transient_identity_and_consumes_until_origin() {
+        let mut transient = state_with_output(
+            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
+                .with_arc_id_lifetime(WindowArcIdLifetime::Transient),
+        );
+        assert!(transient.remember_aura_toplevel(10, 70));
+        transient.remember_native_application_id(20, "org.chromium.guest_os.native".to_string());
+        let plan = transient
+            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), 70, 20, 1)
+            .expect("transient plan should allocate both identities");
+        let identity = plan
+            .transient_arc_identity
+            .expect("transient plan should carry restore identity");
+        assert_eq!(
+            identity.native_application_id,
+            "org.chromium.guest_os.native"
+        );
+        assert!(identity
+            .arc_application_id
+            .starts_with(ARC_TASK_APPLICATION_ID_PREFIX));
+
+        let mut waiting = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::SelfParent,
+        ));
+        assert!(waiting.remember_aura_toplevel(10, 70));
+        let error = waiting
+            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), 70, 20, 2)
+            .expect_err("self-parent must wait for the first authoritative origin");
+        assert_eq!(error, WindowPlacementPlanError::OriginUnknown);
+        assert!(error.consumes_shortcut());
+
+        let mut released = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::SelfParent,
+        ));
+        assert!(released.remember_aura_toplevel(10, 70));
+        assert!(released.record_origin(70, (100, 200)));
+        let plan = released
+            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), 70, 20, 2)
+            .expect("plan preparation should not mutate the role");
+        assert_eq!(released.take_aura_toplevel(10), Some(70));
+        assert!(!released.commit_placement_plan(70, &plan));
     }
 
     #[test]
@@ -1529,7 +1978,7 @@ mod tests {
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(70), None);
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(71), Some(11));
         assert!(state.record_origin(71, (8, 9)));
-        assert!(state.register_barrier(80, 71));
+        assert!(state.register_barrier(80, 71, None));
         assert_eq!(state.take_aura_toplevel(11), Some(71));
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(71), None);
         assert_eq!(state.origin(71), None);
@@ -1555,25 +2004,40 @@ mod tests {
         let mut state = WindowPlacementState::default();
         assert!(state.remember_aura_toplevel(10, 77));
         assert!(state.record_origin(77, (10, 20)));
-        assert!(state.register_barrier(40, 77));
+        assert!(state.register_barrier(40, 77, None));
         assert_eq!(state.take_aura_toplevel(10), Some(77));
 
         assert_eq!(state.origin(77), None);
         assert!(!state.has_pending_barrier(77));
         assert_eq!(state.barrier_for_callback(40), Some(77));
-        assert_eq!(state.complete_barrier(40), Some(77));
+        assert_eq!(
+            state
+                .complete_barrier(40)
+                .map(|completion| completion.toplevel_id),
+            Some(77)
+        );
     }
 
     #[test]
     fn stale_barrier_completion_does_not_clear_newer_active_barrier() {
         let mut state = WindowPlacementState::default();
         assert!(state.remember_aura_toplevel(10, 77));
-        assert!(state.register_barrier(40, 77));
-        assert!(state.register_barrier(41, 77));
+        assert!(state.register_barrier(40, 77, None));
+        assert!(state.register_barrier(41, 77, None));
 
-        assert_eq!(state.complete_barrier(40), Some(77));
+        assert_eq!(
+            state
+                .complete_barrier(40)
+                .map(|completion| completion.toplevel_id),
+            Some(77)
+        );
         assert_eq!(state.active_barrier_for_toplevel(77), Some(41));
-        assert_eq!(state.complete_barrier(41), Some(77));
+        assert_eq!(
+            state
+                .complete_barrier(41)
+                .map(|completion| completion.toplevel_id),
+            Some(77)
+        );
         assert!(!state.has_any_barriers());
     }
 
@@ -1581,8 +2045,8 @@ mod tests {
     fn duplicate_barrier_callback_id_is_rejected_without_mutation() {
         let mut state = WindowPlacementState::default();
         assert!(state.remember_aura_toplevel(10, 77));
-        assert!(state.register_barrier(40, 77));
-        assert!(!state.register_barrier(40, 88));
+        assert!(state.register_barrier(40, 77, None));
+        assert!(!state.register_barrier(40, 88, None));
         assert_eq!(state.barrier_for_callback(40), Some(77));
         assert_eq!(state.active_barrier_for_toplevel(77), Some(40));
         assert_eq!(state.active_barrier_for_toplevel(88), None);
@@ -1596,7 +2060,7 @@ mod tests {
 
         assert!(!state.record_origin(77, (1, 2)));
         assert!(!state.predict_origin(77, (3, 4)));
-        assert!(!state.register_barrier(40, 77));
+        assert!(!state.register_barrier(40, 77, None));
         assert_eq!(state.origin(77), None);
         assert_eq!(state.pending_origin(77), None);
         assert_eq!(state.barrier_for_callback(40), None);

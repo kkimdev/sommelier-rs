@@ -18,23 +18,30 @@ whether Sommelier can carry out that action on the host.
   requests, and raw ARC IDs are not configuration values.
 - Backend selection is startup-only. Reloading shortcuts must not change the
   ARC/guest policy or the geometry method of already-connected clients.
+- The supported public startup surface has one backend switch and one explicit
+  config-path switch. Lower-level policy/geometry/lifetime axes are hidden
+  compatibility options reserved for development experiments.
 
 ## Startup interface
 
-The policy and geometry axes are independent:
+The supported interface is:
 
 ```text
---window-host-policy=guest|arc
---window-geometry-method=none|bounds|self-parent
+--window-placement-backend=set-parent|transient-arc|persistent
 --window-shortcuts-config PATH       # optional
 ```
 
-The default is equivalent to:
+The default is no backend and no config file:
 
 ```text
---window-host-policy=guest
---window-geometry-method=none
+no placement backend
+no shortcut file read
 ```
+
+`--window-host-policy`, `--window-geometry-method`, and
+`--window-arc-id-lifetime` still exist as hidden compatibility switches for
+focused host experiments. They are not required for normal use and should not
+be combined with `--window-placement-backend`.
 
 When `--window-shortcuts-config` is omitted, Sommelier does not open, stat, or
 watch a shortcut config file. The process still starts normally, but no
@@ -51,14 +58,20 @@ already-resized window to the target. The two requests are required because
 `zaura_surface.set_parent` has no width or height arguments and can cause a
 later bounds request to be rejected. On this custom host, the bounds half is
 authorized only when the Aura surface carries the numeric ARC task-form ID.
-Therefore the tested `set-parent` backend is equivalent to:
+Internally, the tested `set-parent` backend is equivalent to:
 
 ```text
 --window-host-policy=arc --window-geometry-method=self-parent
 ```
 
 It keeps that task-form ID persistent so changing application identity around a
-shortcut does not reset IME focus. A manually selected
+shortcut does not reset IME focus. The self-parent request itself is emitted
+only for a shortcut. Its sync barrier is completed before Sommelier sends the
+protocol's nullable-parent form (`set_parent(NULL, 0, 0)`), so the custom
+same-surface cycle is not intentionally kept as a parent relationship. A
+superseded or released toplevel does not receive stale cleanup from an older
+barrier.
+A manually selected
 `--window-host-policy=guest --window-geometry-method=self-parent` remains a
 position-only probe and may leave the old window size in place.
 

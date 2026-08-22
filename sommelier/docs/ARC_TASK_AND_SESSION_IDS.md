@@ -40,9 +40,11 @@ therefore does not create a genuine ARC task.
 
 ## IDs in the current rewrite
 
-When `--window-host-policy=arc` is selected, Sommelier reserves one numeric
-block before it accepts clients. The block is claimed by an exclusive
-filesystem lock under:
+When the public `--window-placement-backend` selects an ARC-backed mode
+(`set-parent`, `transient-arc`, or `persistent`), Sommelier reserves one
+numeric block before it accepts clients. The lower-level
+`--window-host-policy=arc` spelling is retained only as a hidden development
+switch. The block is claimed by an exclusive filesystem lock under:
 
 ```text
 $XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<start>-<end>.lock
@@ -102,12 +104,13 @@ persistent task-form Aura identity and the experimental
 `zaura_toplevel.set_window_bounds(current_x, current_y, width, height, output)`
 while the window is still top-level, then sends `set_parent` for the target
 position. This order matters because `set_parent` supplies no size and a
-later bounds request may be rejected. The persistent ARC identity is still
-required for the bounds request to change width and height. The host XDG
-identity remains native, and no `org.chromium.arc.session.*` value is
-generated.
+later bounds request may be rejected. After the ordered sync barrier completes,
+Sommelier sends `set_parent(NULL, 0, 0)` to release the self-parent probe. The
+persistent ARC identity is still required for the bounds request to change
+width and height. The host XDG identity remains native, and no
+`org.chromium.arc.session.*` value is generated.
 
-The feature remains opt-in because the persistent task-form namespace enables
+The feature remains opt-in because the task-form namespace enables
 ARC-specific host behavior beyond bounds placement. A process that loses its
 host windows without a corresponding compositor teardown could make a newly
 reused block overlap stale metadata; the block scheme therefore assumes normal

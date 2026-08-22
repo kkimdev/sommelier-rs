@@ -18,8 +18,9 @@ use crate::handler::display::queue_protocol_error;
 use crate::protocols::aura_shell::zaura_shell::{
     REQ_GET_AURA_SURFACE, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
 };
-use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
-use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
+use crate::protocols::aura_shell::zaura_surface::{
+    REQ_RELEASE, REQ_SET_APPLICATION_ID, REQ_SET_PARENT,
+};
 use crate::protocols::aura_shell::zaura_toplevel::REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_display::REQ_SYNC;
@@ -311,6 +312,47 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
+/// Queue a `zaura_surface.set_parent` request.
+///
+/// `parent_id = None` is the protocol's explicit unparent operation. Keeping
+/// this serializer in the compositor handler gives both the shortcut path and
+/// the asynchronous barrier completion path identical version and encoding
+/// checks.
+pub(crate) fn queue_zaura_surface_parent(
+    ctx: &mut Context,
+    zaura_surface_id: u32,
+    parent_id: Option<u32>,
+    x: i32,
+    y: i32,
+) -> bool {
+    let version = ctx
+        .shadow_table
+        .host_object_version(zaura_surface_id)
+        .unwrap_or(ctx.window_placement.aura_shell_version());
+    if version < 2 {
+        return false;
+    }
+
+    let mut builder = crate::wire::MessageBuilder::new();
+    builder.write_u32(parent_id.unwrap_or(0));
+    builder.write_i32(x);
+    builder.write_i32(y);
+    match builder.try_build_message(zaura_surface_id, REQ_SET_PARENT) {
+        Ok(message) => {
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "Unable to encode Aura parent update for zaura_surface {}: {}",
+                zaura_surface_id,
+                error
+            );
+            false
+        }
+    }
+}
+
 /// Queue a nullable Aura application ID update for a live host surface.
 ///
 /// The request is valid only on `zaura_surface` version 5 or newer. The
@@ -487,6 +529,7 @@ pub(crate) fn release_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u
 pub(crate) fn queue_window_placement_barrier(
     ctx: &mut Context,
     zaura_toplevel_host_id: u32,
+    self_parent_surface_id: Option<u32>,
 ) -> bool {
     let callback_host_id = ctx.shadow_table.allocate_host_id();
     ctx.shadow_table.track_host_interface_with_version(
@@ -509,10 +552,11 @@ pub(crate) fn queue_window_placement_barrier(
     // A new shortcut supersedes the previous barrier for this toplevel. The
     // old callback remains tracked until its terminal event so its host ID
     // cannot be recycled while Exo still has the object alive.
-    if !ctx
-        .window_placement
-        .register_barrier(callback_host_id, zaura_toplevel_host_id)
-    {
+    if !ctx.window_placement.register_barrier(
+        callback_host_id,
+        zaura_toplevel_host_id,
+        self_parent_surface_id,
+    ) {
         log::error!(
             "Refusing to replace existing window-placement barrier callback {}",
             callback_host_id
@@ -4103,7 +4147,7 @@ mod tests {
         let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
 
-        assert!(queue_window_placement_barrier(&mut ctx, aura_id));
+        assert!(queue_window_placement_barrier(&mut ctx, aura_id, None));
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
         assert_eq!(msg_sender(message), 1);
@@ -4236,7 +4280,7 @@ mod tests {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
-        assert!(queue_window_placement_barrier(&mut ctx, aura_id));
+        assert!(queue_window_placement_barrier(&mut ctx, aura_id, None));
         ctx.last_sender_id = aura_id;
 
         let action =

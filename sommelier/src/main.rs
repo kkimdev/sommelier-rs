@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::state::{
     WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode,
+    WindowPlacementRuntime,
 };
 use crate::window_shortcuts::{ShortcutConfig, ShortcutConfigHandle};
 
@@ -108,25 +109,19 @@ struct Args {
     #[arg(long, value_enum)]
     window_placement_backend: Option<PlacementBackendArg>,
 
-    /// Select the application-ID policy used by window shortcuts.
-    ///
-    /// This is a lower-level option. Prefer `--window-placement-backend` when
-    /// selecting one of the supported combinations.
-    #[arg(long, value_enum)]
+    /// Internal experiment: select the application-ID policy used by window
+    /// shortcuts. Prefer `--window-placement-backend`.
+    #[arg(long, value_enum, hide = true)]
     window_host_policy: Option<HostPolicyArg>,
 
-    /// Select the geometry operation used by window shortcuts.
-    ///
-    /// This is a lower-level option. The default is `none`, which leaves
-    /// placement shortcuts disabled.
-    #[arg(long, value_enum)]
+    /// Internal experiment: select the geometry operation used by window
+    /// shortcuts. The default is `none`, which leaves placement disabled.
+    #[arg(long, value_enum, hide = true)]
     window_geometry_method: Option<GeometryMethodArg>,
 
-    /// Select how the ARC compatibility ID is kept on Aura windows.
-    ///
-    /// This is a lower-level option. `persistent` is the default when the
-    /// three lower-level axes are used directly.
-    #[arg(long, value_enum)]
+    /// Internal experiment: select how the ARC compatibility ID is kept on
+    /// Aura windows. Prefer `--window-placement-backend`.
+    #[arg(long, value_enum, hide = true)]
     window_arc_id_lifetime: Option<ArcIdLifetimeArg>,
 
     /// Read window shortcut bindings from PATH. No config is read by default.
@@ -341,19 +336,21 @@ async fn main() {
     // Clean up old socket
     let _ = std::fs::remove_file(&socket_path);
 
+    let placement_runtime = WindowPlacementRuntime::new(
+        placement_mode,
+        shortcut_config_handle,
+        shortcut_config_path,
+        host_accelerators,
+        arc_task_allocator,
+    );
+
     proxy::run(
         &socket_path,
         local_compositor,
         gpu_accel,
         xdg_decoration,
         virtio_wl,
-        proxy::ProxyRuntimeConfig {
-            placement_mode,
-            shortcut_config: shortcut_config_handle,
-            shortcut_config_path,
-            host_accelerators,
-            arc_task_allocator,
-        },
+        placement_runtime,
     )
     .await;
 }
@@ -362,6 +359,14 @@ mod test_xkb;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_placement_is_disabled() {
+        assert_eq!(
+            resolve_placement_mode(None, None, None, None).expect("default mode should resolve"),
+            WindowPlacementMode::disabled()
+        );
+    }
 
     #[test]
     fn set_parent_backend_keeps_arc_authorization_for_bounds() {

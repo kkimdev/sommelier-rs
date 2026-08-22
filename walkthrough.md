@@ -721,6 +721,33 @@ Verification from the review worktree:
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
 
+## 2026-08-22 — placement runtime and request-plan ownership cleanup
+
+The placement refactor now has one process-wide
+`WindowPlacementRuntime` owned by
+`sommelier/src/state/window_placement.rs`. It contains the selected backend,
+the reloadable shortcut-generation handle, host accelerator policy, VM
+namespace, and process-shared ARC task allocator. Each connection receives an
+`Arc` reference to that runtime; its `WindowPlacementState` owns only
+connection-local links, origins, outputs, GTK associations, and barriers.
+`Context` and `ProxyRuntime` no longer carry parallel copies of placement
+configuration.
+
+Keyboard handling now asks the state owner for a validated
+`WindowPlacementPlan`. The plan selects direct bounds versus the
+bounds-first/self-parent sequence, calculates relative coordinates, and
+allocates transient ARC identity when applicable. The keyboard handler
+serializes that plan, queues the barrier, and then asks the state owner to
+commit the origin prediction; it cannot independently choose a geometry
+backend or mutate placement maps.
+
+The public CLI is intentionally small: placement is disabled unless both
+`--window-placement-backend` and `--window-shortcuts-config PATH` are supplied.
+The older policy/geometry/lifetime axis switches remain hidden compatibility
+options for development experiments. SIGHUP reload is implemented by the
+placement runtime and returns a typed result while preserving the last valid
+generation on errors.
+
 ## 2026-08-22 — Historical self-parent resize follow-up
 
 The earlier self-parent experiment intentionally sent only
@@ -769,12 +796,16 @@ unset fullscreen/maximized/snap
 set_window_bounds(current_x, current_y, width, height, output)
 set_parent(relative_x, relative_y)
 sync
+set_parent(NULL, 0, 0)   # queued after sync.done
 ```
 
 The regression test first failed against the old parent-first order and now
 asserts both the wire order and the requested 1920x1080 dimensions. Keeping
 the current origin in the bounds request avoids an intermediate move; the
-subsequent parent request is solely responsible for the target position.
+subsequent parent request is solely responsible for the target position. The
+nullable-parent request is emitted only after the barrier callback proves that
+the movement has reached the host, and stale superseded barriers cannot emit
+cleanup for a newer placement.
 
 ## 2026-08-21 — Historical preserve the native XDG identity in ARC bounds mode
 

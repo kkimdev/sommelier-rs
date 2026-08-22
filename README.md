@@ -215,22 +215,23 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. `arc` uses the numeric `org.chromium.arc.<task_id>` Aura identity required for arbitrary bounds. |
-| `--window-geometry-method none\|bounds\|self-parent` | Startup-only geometry operation; defaults to `none`. `self-parent` is experimental and resizes at the current origin with `set_window_bounds` before moving with `set_parent`; with `guest` policy it is position-only on the custom host. |
-| `--window-placement-backend set-parent\|transient-arc\|persistent` | Select a tested policy/geometry combination. `set-parent` means persistent ARC task authorization plus the self-parent position probe and bounds request; it does not use `.session.*` IDs. |
+| `--window-placement-backend set-parent\|transient-arc\|persistent` | Explicitly opt into a placement backend. `set-parent` is the supported custom-host experiment: persistent `org.chromium.arc.<task_id>` Aura authorization plus a bounds-first self-parent position probe. The other values are comparison experiments. |
 | `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
 
-Window shortcuts are disabled by default. To enable ordinary work-area
-placement, select a geometry method and provide a config file:
+Window shortcuts and all placement geometry are disabled by default. To opt in
+to the tested backend, provide both the backend and a config file:
 
 ```bash
 ./target/release/sommelier \
   --virtio-wl /dev/wl0 \
-  --window-host-policy arc \
-  --window-geometry-method bounds \
+  --window-placement-backend set-parent \
   --window-shortcuts-config "$HOME/.config/sommelier/window-shortcuts.toml" \
   wayland-2
 ```
+
+The lower-level `--window-host-policy`, `--window-geometry-method`, and
+`--window-arc-id-lifetime` switches remain hidden compatibility switches for
+development experiments; they are not part of the supported user interface.
 
 The inline TOML schema, nine-grid example, validation rules, and `SIGHUP`
 reload procedure are documented in
@@ -247,12 +248,15 @@ them. Use the explicit options above, and never enable the experimental
 
 ## Design notes
 
-- `sommelier/src/state/window_placement.rs` is the single owner of backend
-  selection, wl_surface/Aura associations, per-toplevel origins, self-parent
-  convergence, ARC session IDs, and host-sync barrier lifetimes; handlers
-  cannot mutate those maps directly. Association/origin/barrier mutators are
-  fallible and `#[must_use]`, and debug builds assert the reverse-map and
-  teardown invariants after every mutation.
+- `sommelier/src/state/window_placement.rs` is the single owner of the
+  process-wide placement runtime, backend selection, validated placement plans,
+  wl_surface/Aura associations, per-toplevel origins, self-parent convergence,
+  ARC task IDs, and host-sync barrier lifetimes. Each connection's
+  `WindowPlacementState` owns only its lifecycle maps and shares the immutable
+  runtime; handlers serialize plans but cannot choose a backend or mutate those
+  maps directly. Association/origin/barrier mutators are fallible and
+  `#[must_use]`, and debug builds assert the reverse-map and teardown
+  invariants after every mutation.
 - [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md) documents ARC task IDs, restore-session IDs, and the allocator used by this experiment.
 - [`sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md`](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md) documents ChromeOS accelerator acknowledgement and shortcut inhibition.
 - [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md) documents the inline shortcut schema and runtime reload contract.
