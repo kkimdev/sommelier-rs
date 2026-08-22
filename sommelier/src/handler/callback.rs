@@ -68,19 +68,13 @@ impl WlCallbackHandler for CallbackHandler {
             return Action::Drop;
         }
         if let Some(completion) = ctx.window_placement.complete_barrier(host_id) {
-            if let Some(zaura_surface_id) = completion.self_parent_surface_id {
-                if !crate::handler::compositor::queue_zaura_surface_parent(
-                    ctx,
-                    zaura_surface_id,
-                    None,
-                    0,
-                    0,
-                ) {
+            if let Some(cleanup) = completion.cleanup.as_ref() {
+                if !crate::handler::placement::queue_barrier_cleanup(ctx, cleanup) {
                     log::warn!(
-                        "Unable to clear self-parent placement for zaura_surface {} \
-                         after barrier on zaura_toplevel {}",
-                        zaura_surface_id,
-                        completion.toplevel_id
+                        "Unable to apply placement cleanup after barrier on \
+                         zaura_toplevel {}: {:?}",
+                        completion.toplevel_id,
+                        cleanup
                     );
                 }
             }
@@ -145,10 +139,11 @@ impl WlCallbackHandler for CallbackHandler {
 mod tests {
     use super::CallbackHandler;
     use crate::handler::display::DisplayHandler;
+    use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::state::Context;
+    use crate::state::{Context, PlacementBarrierCleanup};
     use crate::wire::Action;
 
     #[test]
@@ -257,7 +252,7 @@ mod tests {
         assert!(ctx.window_placement.register_barrier(
             callback_id,
             zaura_toplevel_id,
-            Some(zaura_surface_id)
+            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id })
         ));
         ctx.last_sender_id = callback_id;
 
@@ -280,6 +275,66 @@ mod tests {
         );
         assert_eq!(i32::from_ne_bytes(unparent[12..16].try_into().unwrap()), 0);
         assert_eq!(i32::from_ne_bytes(unparent[16..20].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn transient_arc_cleanup_unparents_before_restoring_native_identity() {
+        let zaura_toplevel_id = 77;
+        let zaura_surface_id = 55;
+        let callback_id = 40;
+        let native_id = "org.chromium.guest_os.termina.wayland.test";
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            callback_id,
+            "wl_callback".to_string(),
+            1,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            zaura_surface_id,
+            "zaura_surface".to_string(),
+            5,
+        );
+        assert!(ctx
+            .window_placement
+            .remember_aura_toplevel(100, zaura_toplevel_id));
+        ctx.window_placement
+            .remember_native_application_id(100, native_id.to_string());
+        assert!(ctx.window_placement.register_barrier(
+            callback_id,
+            zaura_toplevel_id,
+            Some(
+                PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
+                    zaura_surface_id,
+                    wl_surface_guest_id: 100,
+                }
+            )
+        ));
+        let newer_native_id = "org.chromium.guest_os.termina.wayland.updated";
+        ctx.window_placement
+            .remember_native_application_id(100, newer_native_id.to_string());
+        ctx.last_sender_id = callback_id;
+
+        let mut handler = CallbackHandler;
+        assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(
+            u16::from_ne_bytes(ctx.client_to_host_queue[0].0[4..6].try_into().unwrap()),
+            REQ_SET_PARENT
+        );
+        assert_eq!(
+            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[8..12].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u16::from_ne_bytes(ctx.client_to_host_queue[1].0[4..6].try_into().unwrap()),
+            REQ_SET_APPLICATION_ID
+        );
+        let payload = &ctx.client_to_host_queue[1].0[8..];
+        let length = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            std::str::from_utf8(&payload[4..4 + length - 1]).unwrap(),
+            newer_native_id
+        );
     }
 
     #[test]
@@ -307,12 +362,12 @@ mod tests {
         assert!(ctx.window_placement.register_barrier(
             old_callback_id,
             zaura_toplevel_id,
-            Some(zaura_surface_id)
+            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id })
         ));
         assert!(ctx.window_placement.register_barrier(
             new_callback_id,
             zaura_toplevel_id,
-            Some(zaura_surface_id)
+            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id })
         ));
 
         let mut handler = CallbackHandler;

@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::compositor::{ensure_host_zaura_surface, wayland_string_fits_message};
-use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
+use crate::handler::placement::{
+    ensure_host_zaura_surface, queue_policy_application_id, wayland_string_fits_message,
+};
+use crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID;
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::state::Context;
@@ -142,53 +144,32 @@ impl GtkSurface1Handler for GtkShellHandler {
         let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
             return Action::Drop;
         };
-        let version = ctx
-            .shadow_table
-            .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.window_placement.aura_shell_version());
-        if version < 5 {
-            return Action::Drop;
-        }
 
-        // `zaura_surface.set_application_id` is also the metadata Exo uses
-        // when deciding whether a window is allowed to receive arbitrary
-        // `zaura_toplevel.set_window_bounds` requests.  The compositor-owned
-        // layout path opts the surface into ARC policy (the same ID is sent
-        // from xdg_toplevel.set_app_id); GTK applications can send their
-        // D-Bus properties after that xdg request, so do not overwrite the
-        // ARC ID with the normal Crostini namespace.
-        let application_id = if ctx.window_placement.uses_arc_policy() {
-            let Some(application_id) = ctx
-                .window_placement
-                .arc_policy_application_id(wl_surface_guest_id)
-            else {
-                log::warn!(
-                    "ARC placement mode changed before GTK app ID allocation for surface {}",
-                    ctx.last_sender_id
-                );
-                return Action::Drop;
-            };
-            application_id
-        } else {
-            ctx.window_placement.native_wayland_app_id(application_id)
-        };
-        if !wayland_string_fits_message(&application_id) {
+        let native_application_id = ctx.window_placement.native_wayland_app_id(application_id);
+        if !wayland_string_fits_message(&native_application_id) {
             log::warn!(
                 "Dropping oversized GTK application ID for gtk_surface1 {}",
                 ctx.last_sender_id
             );
             return Action::Drop;
         }
-        let mut builder = MessageBuilder::new();
-        builder.write_nullable_string(Some(&application_id));
-        match builder.try_build_message(zaura_surface_id, REQ_SET_APPLICATION_ID) {
-            Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
-            Err(error) => log::warn!(
-                "Unable to encode GTK application ID for gtk_surface1 {}: {}",
-                ctx.last_sender_id,
-                error
-            ),
+        if !queue_policy_application_id(
+            ctx,
+            zaura_surface_id,
+            wl_surface_guest_id,
+            &native_application_id,
+        ) {
+            log::warn!(
+                "Unable to queue GTK application ID for gtk_surface1 {}",
+                ctx.last_sender_id
+            );
+            return Action::Drop;
         }
+        // Publish the native identity only after its host Aura request was
+        // accepted. A failed request must not make a later transient cleanup
+        // restore an ID the host never received.
+        ctx.window_placement
+            .remember_native_application_id(wl_surface_guest_id, native_application_id);
         Action::Drop
     }
 
@@ -209,6 +190,7 @@ impl GtkSurface1Handler for GtkShellHandler {
 mod tests {
     use super::*;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
+    use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::wire::WireMessage;
 
     const GTK_SHELL: u32 = 10;
@@ -340,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
+    fn dbus_application_id_keeps_arc_task_identity_on_aura_surface() {
         let mut ctx = setup_ctx();
         ctx.window_placement
             .set_mode_for_test(crate::state::WindowPlacementMode::new(
@@ -371,12 +353,11 @@ mod tests {
         let expected_application_id = ctx
             .window_placement
             .arc_policy_application_id(WL_SURFACE_GUEST)
-            .expect("ARC backend should allocate a compatibility application ID");
+            .expect("ARC task ID allocated for placement");
         assert_eq!(
             nullable_string(message).as_deref(),
             Some(expected_application_id.as_str())
         );
-        assert!(expected_application_id.starts_with("org.chromium.arc."));
         let task_id = expected_application_id
             .strip_prefix("org.chromium.arc.")
             .expect("ARC task-form application ID")

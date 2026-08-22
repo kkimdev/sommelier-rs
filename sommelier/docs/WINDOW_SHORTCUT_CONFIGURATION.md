@@ -53,6 +53,33 @@ the custom probe, but `zaura_surface.set_parent` has no width or height
 arguments and therefore cannot implement a resize. Explicitly selecting
 `--window-geometry-method=none` disables placement after the gate is enabled.
 
+The comparison backend `--window-placement-backend=transient-arc` uses a
+different cleanup sequence:
+
+```text
+set_application_id(ARC task ID)
+set_window_bounds(...)
+wl_display.sync
+sync.done -> set_parent(NULL, 0, 0)
+sync.done -> set_application_id(native Guest OS ID)
+```
+
+The nullable-parent request is deliberately sent before restoring the native
+identity. Sommelier resolves the latest native ID from the surface state when
+the barrier completes, so an app-ID update that arrives while the bounds
+request is in flight is not overwritten by an old snapshot. This is an
+experimental host-compatibility probe: ChromeOS may
+recompute the window's placement or reset IME focus when either the parent or
+the Aura application ID changes. The backend therefore requires
+`zaura_surface` version 5 or newer: v2 provides nullable `set_parent`, while
+v5 provides `set_application_id`, which is also needed to install the
+temporary ARC identity. It must be tested independently on `/dev/wl0`; it is
+not the default `set-parent` backend.
+
+If the guest surface is destroyed before `sync.done`, the cleanup path drops
+both post-barrier requests instead of sending them to the released Aura object;
+the host ID remains reserved for its normal `delete_id` lifecycle.
+
 ## Config file format
 
 The file is TOML. A binding contains its accelerator, action, and geometry in
