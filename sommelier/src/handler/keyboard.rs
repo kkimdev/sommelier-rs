@@ -2174,6 +2174,19 @@ mod tests {
                 ctx.window_placement.note_guest_surface_commit(surface),
                 "guest ack and commit must open the resize phase"
             );
+            if let Some(zaura_toplevel_id) = ctx
+                .window_placement
+                .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
+            {
+                if let Some(origin) = ctx.window_placement.origin(zaura_toplevel_id) {
+                    let _ = crate::handler::placement::queue_pending_self_parent_move(
+                        ctx,
+                        zaura_toplevel_id,
+                        origin,
+                        None,
+                    );
+                }
+            }
         };
         acknowledge_synthetic_resize(&mut ctx);
         let zaura_surface_id = ctx
@@ -2366,15 +2379,15 @@ mod tests {
         );
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
-            None,
-            "a changed deferred rectangle must also wait for the \
-             previous self-parent origin to settle"
+            Some((1920, 2160)),
+            "the changed deferred rectangle may start after the cleanup \
+             barrier settles the previous parent generation"
         );
         assert_eq!(
             ctx.window_placement
                 .deferred_self_parent_target(zaura_toplevel_id),
-            Some((1920, 0, 1920, 2160)),
-            "the changed target remains deferred until final origin"
+            None,
+            "the changed target must be promoted exactly once after cleanup"
         );
 
         ctx.last_sender_id = zaura_toplevel_id;
@@ -2390,7 +2403,7 @@ mod tests {
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
             Some((1920, 2160)),
-            "the changed target starts only after final origin confirmation"
+            "a late origin must not cancel the promoted resize"
         );
 
         acknowledge_synthetic_resize(&mut ctx);

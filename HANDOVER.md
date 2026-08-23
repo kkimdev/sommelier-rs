@@ -78,6 +78,29 @@
   `third_party/protocols/remote-shell-unstable-v2.xml`. It keeps the global
   host-only, maps guest XDG roles to official remote-surface requests, and
   never fabricates ARC IDs.
+- All placement backends, hidden compatibility axes, and shortcut config
+  loading now require the explicit `--experimental-window-placement` gate.
+  Without that flag the production mode is `WindowPlacementMode::disabled()`;
+  this is the safe default because the self-parent and ARC paths are not yet
+  runtime-stable on the custom `/dev/wl0` host.
+
+### Follow-up PR boundary map
+
+The former PR #8 is not a mergeable review unit. Its `ca3b6a7` commit contains
+three coupled slices:
+
+| Slice | Primary files | Required shared hunks |
+| --- | --- | --- |
+| Generation-safe placement | `state/window_placement/transaction.rs`, `state/window_placement/mod.rs`, `state/window_placement/plan.rs`, `state/window_placement/support.rs`, `handler/placement.rs`, `handler/compositor.rs`, `handler/callback.rs` | synthetic XDG configure/commit acknowledgement, origin gating, barrier generation ownership |
+| IME/focus recovery | `state/input.rs`, `handler/text_input.rs`, `handler/keyboard.rs`, plus placement/callback cleanup hooks | placement IME preflight, host activation replay, per-keyboard delayed-leave guards |
+| Remote-shell-v2 | `third_party/protocols/remote-shell-unstable-v2.xml`, `build.rs`, `handler/remote_shell.rs`, registry/proxy/compositor/GTK/placement/state wiring | host-only global binding, synthetic XDG facade, remote bounds request and teardown |
+
+These slices cannot be cherry-picked by whole file: `handler/compositor.rs`,
+`handler/placement.rs`, `state/window_placement/mod.rs`, and `state.rs` contain
+both lifecycle and backend wiring. Reconstruct each slice from `bbf880b` with
+path-aware hunks, then run the complete serial Nix check on every resulting
+branch. Keep remote-shell last because it depends on the shared placement
+adapter but is not available on the current `/dev/wl0` host.
 
 ## Known issues and debt
 
@@ -91,6 +114,11 @@
   client; this is a host capability limitation, not a fallback to Aura
   placement. A host with remote-shell access is still required for end-to-end
   geometry/IME validation.
+- The self-parent placement lifecycle remains experimental and has a known
+  runtime failure mode: a shortcut can apply the new size while delaying the
+  position request until a later focus/configure event. The unit reducer tests
+  cover ordering and stale generations, but they do not prove immediate
+  convergence on the custom host. Do not enable it in the shared service.
 - The separate `monorepo-public` Nix package still needs the personal release
   URL and SRI hashes updated to `virtwl-v0.2.1-r1`.
 - Upstream review and eventual rebase/cherry-pick coordination remain
@@ -98,11 +126,27 @@
 
 ## Next steps
 
-1. Update the Nix binary derivation with the `virtwl-v0.2.1-r1` assets and
+1. Keep PR #4 limited to the first coherent slice:
+   `8a6c5f4` + `4002264` + `822a990` + `090126e`, plus the explicit
+   `--experimental-window-placement` gate. This contains the opt-in
+   configurable shortcut contract and the minimum Aura lifecycle it needs.
+2. Stack the remaining work as separately reviewable PRs:
+   - placement-state ownership and application-ID hardening:
+     `25b45f1` + `0efacc1` + `a1be802`;
+   - process-shared ARC task-ID block allocation: `0a54eb7`;
+   - self-parent ordering and barrier cleanup: `afc6128` + `942f82a`;
+   - placement lifecycle modularization: `bbf880b`;
+   - generation-safe placement transactions and IME/focus recovery:
+     the non-remote portions of `ca3b6a7`;
+   - host-only remote-shell-v2 backend: the remote protocol and wiring
+     portions of `ca3b6a7`.
+   The last two slices must be cut from the final tree rather than cherry-picked
+   file-by-file, because `ca3b6a7` changes shared handler/state files.
+3. Update the Nix binary derivation with the `virtwl-v0.2.1-r1` assets and
    verified hashes.
-2. Continue Crostini manual testing through the `wayland-2` service.
-3. Keep protocol and IME regressions covered by the serial test suite.
-4. Run the repository `/commit` workflow to stage the permanent placement
+4. Continue Crostini manual testing through the `wayland-2` service.
+5. Keep protocol and IME regressions covered by the serial test suite.
+6. Run the repository `/commit` workflow to stage the permanent placement
    modules and publish the verified changes; keep `_local/` runtime logs
    untracked.
 

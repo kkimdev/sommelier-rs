@@ -779,9 +779,10 @@ serializes that plan, queues the barrier, and then asks the state owner to
 commit the origin prediction; it cannot independently choose a geometry
 backend or mutate placement maps.
 
-The public CLI is intentionally small: the native `set-parent` backend is the
-default mode, but placement shortcuts remain disabled until
-`--window-shortcuts-config PATH` is supplied. The older
+The public CLI is intentionally small: production startup now keeps placement
+fully disabled. The native `set-parent` backend is selected only after
+`--experimental-window-placement` is supplied; shortcuts additionally require
+`--window-shortcuts-config PATH`. The older
 `--window-host-policy`, `--window-geometry-method`, and
 `--window-arc-id-lifetime` switches remain hidden compatibility options for
 development experiments. SIGHUP reload is implemented by the placement

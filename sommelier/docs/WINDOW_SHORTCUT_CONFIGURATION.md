@@ -27,18 +27,27 @@ whether Sommelier can carry out that action on the host.
 The supported interface is:
 
 ```text
+--experimental-window-placement
 --window-placement-backend=set-parent|transient-arc|persistent|remote-shell-v2
 --window-shortcuts-config PATH       # optional
 ```
 
-The default backend is the native Guest OS identity plus the experimental
-self-parent geometry path. The shortcut feature itself remains inactive until
-an explicit config file is supplied:
+Window placement is disabled unless `--experimental-window-placement` is
+present. The gate is required even when selecting no backend; it prevents the
+current experimental protocol paths from changing the production default.
+After the gate is enabled, the default backend is the native Guest OS identity
+plus the experimental self-parent geometry path. The shortcut feature itself
+remains inactive until an explicit config file is supplied:
 
 ```text
-native Guest OS identity + XDG resize/self-parent placement
+native Guest OS identity + XDG resize/self-parent placement (experimental gate)
 no shortcut file read
 ```
+
+Passing a backend, a hidden compatibility axis, or a config path without the
+gate is a startup error. This is intentional: a malformed or unstable
+placement implementation must not be reachable through an accidental service
+configuration.
 
 `--window-host-policy`, `--window-geometry-method`, and
 `--window-arc-id-lifetime` still exist as hidden compatibility switches for

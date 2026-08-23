@@ -524,6 +524,35 @@ impl PlacementTransaction {
         true
     }
 
+    /// Settle the target origin after the nullable-unparent cleanup barrier.
+    ///
+    /// Some ChromeOS hosts process the self-parent request and its NULL-parent
+    /// cleanup without emitting a final `origin_change`.  The barrier is
+    /// ordered after the parent request, so the requested target is the only
+    /// safe origin available at this point.  This method is deliberately
+    /// restricted to `CleanupPending` with a completed cleanup barrier; a
+    /// stale callback cannot settle a resize or a newer generation.
+    pub(super) fn settle_origin_after_cleanup_barrier(&mut self) -> bool {
+        let SelfParentPhase::CleanupPending {
+            generation,
+            target,
+            surface_id,
+            origin_acknowledged: false,
+            cleanup_barrier_pending: false,
+        } = self.phase
+        else {
+            return false;
+        };
+        self.phase = SelfParentPhase::CleanupPending {
+            generation,
+            target,
+            surface_id,
+            origin_acknowledged: true,
+            cleanup_barrier_pending: false,
+        };
+        true
+    }
+
     /// Abort a resize phase before any move or cleanup barrier was queued.
     ///
     /// This is used when the wire adapter loses the role between plan
@@ -540,14 +569,18 @@ impl PlacementTransaction {
     }
 
     /// Feed a host origin event into the transaction.
+    ///
+    /// Once a self-parent cleanup has completed, the host may continue to
+    /// emit animation/focus `origin_change` events from the old parent
+    /// generation. Keep the settled target as the authoritative baseline
+    /// until the next placement generation starts; accepting one matching
+    /// coordinate and clearing the guard would allow a later animation frame
+    /// to rebase the next shortcut.
     pub(super) fn note_origin(&mut self, origin: PlacementPoint) -> OriginResult {
         match self.phase {
             SelfParentPhase::Idle => {
-                if let Some(guarded_origin) = self.completed_origin_guard {
-                    if guarded_origin != origin {
-                        return OriginResult::Ignored;
-                    }
-                    self.completed_origin_guard = None;
+                if self.completed_origin_guard.is_some() {
+                    return OriginResult::Ignored;
                 }
                 OriginResult::Accepted {
                     transaction_complete: false,
@@ -644,11 +677,13 @@ impl PlacementTransaction {
 
     /// Abort cleanup without pretending that an origin was observed.
     pub(super) fn abort_cleanup(&mut self) -> bool {
-        let SelfParentPhase::CleanupPending { target, .. } = self.phase else {
+        if !matches!(self.phase, SelfParentPhase::CleanupPending { .. }) {
             return false;
-        };
-        self.last_completed_target = Some(target);
-        self.completed_origin_guard = Some((target.0, target.1));
+        }
+        // Cleanup failure is not a successful placement. Do not publish the
+        // target as completed: callers must be able to retry the same
+        // rectangle, and no post-completion origin guard is justified when
+        // the host may never have applied the move.
         self.deferred_target = None;
         self.phase = SelfParentPhase::Idle;
         true
@@ -720,6 +755,7 @@ fn is_acceptable_size(
 mod tests {
     use super::{
         ConfigureToken, HostResizeResult, OriginResult, PlacementTransaction, ResizeGateResult,
+        SelfParentPhase,
     };
 
     const TARGET: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
@@ -831,5 +867,125 @@ mod tests {
             }
         );
         assert!(transaction.complete());
+    }
+
+    #[test]
+    fn cleanup_barrier_can_settle_when_host_omits_origin_change() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert!(transaction.settle_origin_after_cleanup_barrier());
+        assert!(transaction.origin_settled());
+        assert_eq!(
+            transaction.note_origin((400, 500)),
+            OriginResult::Ignored,
+            "a later focus coordinate must not rebase the settled target"
+        );
+        assert!(transaction.complete());
+    }
+
+    #[test]
+    fn cleanup_barrier_settlement_requires_the_active_completed_generation() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(
+            !transaction.settle_origin_after_cleanup_barrier(),
+            "the cleanup barrier must be acknowledged before fallback settlement"
+        );
+        assert!(transaction.complete_cleanup_barrier());
+        assert!(transaction.settle_origin_after_cleanup_barrier());
+        assert!(
+            !transaction.settle_origin_after_cleanup_barrier(),
+            "a completed fallback must not be applied twice"
+        );
+    }
+
+    #[test]
+    fn completed_origin_guard_survives_matching_then_late_animation_origin() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert!(transaction.settle_origin_after_cleanup_barrier());
+        assert!(transaction.complete());
+
+        // A matching late event is not evidence that host animation has ended.
+        // A later frame must remain unable to rebase the next shortcut.
+        assert_eq!(transaction.note_origin((0, 0)), OriginResult::Ignored);
+        assert_eq!(transaction.note_origin((785, 541)), OriginResult::Ignored);
+    }
+
+    #[test]
+    fn starting_a_new_generation_releases_the_completed_origin_guard() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert!(transaction.settle_origin_after_cleanup_barrier());
+        assert!(transaction.complete());
+
+        let next_target = (1920, 0, 1920, 1080);
+        transaction.begin_resize(next_target, 44, (1920, 1080));
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Ignored,
+            "active resize phases still reject untrusted animation origins"
+        );
+        assert!(transaction.abort_resize());
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            },
+            "the next generation explicitly releases the old post-cleanup guard"
+        );
+    }
+
+    #[test]
+    fn aborted_cleanup_does_not_mark_target_as_completed_or_block_retry() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.assume_move_pending(TARGET, 44);
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.abort_cleanup());
+        assert_eq!(transaction.phase(), SelfParentPhase::Idle);
+        assert_eq!(
+            transaction.last_completed_target(),
+            None,
+            "a failed cleanup is not a completed placement"
+        );
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            },
+            "failed cleanup must not leave a permanent origin guard"
+        );
+        assert_eq!(transaction.begin_resize(TARGET, 44, (1920, 1080)), 2);
     }
 }

@@ -2445,19 +2445,19 @@ mod tests {
         );
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
-            None,
-            "a deferred target must not be promoted from a fabricated cleanup origin"
+            Some((1920, 2160)),
+            "the cleanup barrier is sufficient to promote a deferred target \
+             when the host omits origin_change"
         );
         assert_eq!(
             ctx.window_placement
                 .deferred_self_parent_target(zaura_toplevel_id),
-            Some((1920, 0, 1920, 2160)),
-            "the latest target waits for the host's final origin event"
+            None,
+            "the promoted target must not remain deferred after cleanup"
         );
 
-        // The NULL-parent barrier does not itself provide an absolute
-        // position.  Once the host reports the final origin, the deferred
-        // target may be promoted and its resize phase can start.
+        // A late intermediate coordinate from the old parent generation must
+        // not rebase the newly promoted resize phase.
         ctx.last_sender_id = zaura_toplevel_id;
         assert_eq!(
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
@@ -2471,7 +2471,7 @@ mod tests {
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
             Some((1920, 2160)),
-            "the final host origin should release the deferred resize"
+            "a late origin must not cancel the promoted resize"
         );
         assert_eq!(
             ctx.window_placement

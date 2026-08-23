@@ -2078,22 +2078,28 @@ impl WindowPlacementState {
         true
     }
 
-    /// Report whether cleanup is complete without fabricating a host origin.
+    /// Settle cleanup when the host omitted the final `origin_change`.
     ///
-    /// The nullable-unparent and IME sync callbacks establish ordering on the
-    /// host stream, but they do not carry the widget's final screen position.
-    /// Promoting `pending_origin` here used to make the next shortcut compute
-    /// its relative delta from a prediction.  A delayed `configure` or focus
-    /// event could then overwrite that prediction and move the window again.
-    ///
-    /// Keep this method as an explicit no-op compatibility boundary for the
-    /// callback adapter: only a matching host `origin_change` (or the origin
-    /// in a matching resize acknowledgement) may settle a self-parent
-    /// transaction.
-    #[must_use = "cleanup completion never authorizes a fabricated origin"]
+    /// The follow-up barrier is queued after the self-parent request and its
+    /// nullable-unparent cleanup. Once that barrier completes, the requested
+    /// target is the only origin available for the next relative placement.
+    /// Keep the prediction scoped to the active cleanup generation and update
+    /// the authoritative baseline together with the reducer phase; ordinary
+    /// focus/configure events cannot then rebase it.
+    #[must_use = "the cleanup generation may have already been superseded"]
     pub(crate) fn settle_self_parent_after_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
-        let _ = zaura_toplevel_host_id;
-        false
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.settle_origin_after_cleanup_barrier() {
+            return false;
+        }
+        let Some(target) = state.transaction.active_target() else {
+            return false;
+        };
+        state.origin = Some((target.0, target.1));
+        self.debug_assert_consistent();
+        true
     }
 
     #[cfg(test)]
@@ -2583,23 +2589,20 @@ mod tests {
             )
             .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
         self_parent.finish_self_parent_move(70);
+        assert!(self_parent.complete_self_parent_cleanup_barrier(70));
         assert!(
-            !self_parent.settle_self_parent_after_cleanup(70),
-            "cleanup ordering must not fabricate a host origin"
+            self_parent.settle_self_parent_after_cleanup(70),
+            "the cleanup barrier must settle hosts that omit origin_change"
         );
         assert_eq!(
             self_parent.origin(70),
-            Some((100, 200)),
-            "the pre-move origin remains the only authoritative baseline until \
-             the host reports the new origin"
+            Some((0, 0)),
+            "the requested target is the only safe fallback after the parent \
+             and NULL-parent barriers have crossed the host stream"
         );
-        assert!(
-            !self_parent.complete_self_parent_cleanup(70),
-            "cleanup cannot complete before the target origin is acknowledged"
-        );
-        // The host may deliver the final origin notification after the
-        // nullable-unparent cleanup. A duplicate shortcut in that interval
-        // must remain deferred rather than enqueueing another probe.
+        assert!(self_parent.complete_self_parent_cleanup(70));
+        // A duplicate shortcut after cleanup must be deduplicated against the
+        // settled target rather than enqueueing another probe.
         assert!(self_parent
             .prepare_placement(
                 &probe_shadow,
@@ -2608,9 +2611,12 @@ mod tests {
                 NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
             )
             .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
-        assert!(self_parent.record_origin(70, (0, 0)));
-        assert!(self_parent.complete_self_parent_cleanup_barrier(70));
-        assert!(self_parent.complete_self_parent_cleanup(70));
+        // A later focus/configure coordinate cannot rebase the settled
+        // placement. The host omitted the target origin event, so it is
+        // treated as a stale event from the prior parent generation.
+        assert!(!self_parent.record_origin(70, (500, 700)));
+        assert_eq!(self_parent.origin(70), Some((0, 0)));
+        assert!(!self_parent.record_origin(70, (0, 0)));
         assert!(self_parent
             .prepare_placement(
                 &probe_shadow,
@@ -2764,12 +2770,32 @@ mod tests {
             state.origin(target.zaura_toplevel_host_id()),
             Some(original_origin)
         );
-        // Once the host confirms the final origin, cleanup can retire the
-        // transaction and normal external origin updates are accepted again.
+        // A matching late event is not evidence that host animation has
+        // ended. The post-cleanup guard must remain armed through subsequent
+        // focus/configure events.
+        // The matching origin is still accepted while the cleanup barrier is
+        // pending; it only acknowledges the active transaction. Once cleanup
+        // completes, the persistent guard below rejects all late events.
         assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
         assert!(state.complete_self_parent_cleanup_barrier(target.zaura_toplevel_host_id()));
         assert!(state.complete_self_parent_cleanup(target.zaura_toplevel_host_id()));
-        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert_eq!(state.origin(target.zaura_toplevel_host_id()), Some((0, 0)));
+
+        // Starting a different generation explicitly releases the guard. A
+        // failed generation must not poison later ordinary origin tracking.
+        let next = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
+            .expect("a different shortcut should supersede the completed target");
+        assert!(state.commit_placement_plan(&next));
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert!(state.abort_self_parent_resize(target.zaura_toplevel_host_id()));
         assert!(state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
         assert_eq!(
             state.origin(target.zaura_toplevel_host_id()),

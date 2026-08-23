@@ -100,6 +100,15 @@ struct Args {
     #[arg(long)]
     virtio_wl: Option<String>,
 
+    /// Enable the experimental compositor-owned window-placement subsystem.
+    ///
+    /// Without this gate Sommelier keeps the upstream behavior and rejects
+    /// every placement-specific option. The gate is intentionally separate
+    /// from backend selection so a future backend can remain opt-in without
+    /// changing the production default.
+    #[arg(long)]
+    experimental_window_placement: bool,
+
     /// Select one complete window-placement backend.
     ///
     /// This is the convenient switch for runtime experiments:
@@ -195,11 +204,28 @@ impl PlacementBackendArg {
 }
 
 fn resolve_placement_mode(
+    experimental_enabled: bool,
+    config_path_supplied: bool,
     backend: Option<PlacementBackendArg>,
     host_policy: Option<HostPolicyArg>,
     geometry_method: Option<GeometryMethodArg>,
     arc_id_lifetime: Option<ArcIdLifetimeArg>,
 ) -> Result<WindowPlacementMode, String> {
+    if !experimental_enabled {
+        if config_path_supplied
+            || backend.is_some()
+            || host_policy.is_some()
+            || geometry_method.is_some()
+            || arc_id_lifetime.is_some()
+        {
+            return Err("window placement is experimental; pass \
+                 --experimental-window-placement before selecting a backend or \
+                 config file"
+                .to_string());
+        }
+        return Ok(WindowPlacementMode::disabled());
+    }
+
     if backend.is_some()
         && (host_policy.is_some() || geometry_method.is_some() || arc_id_lifetime.is_some())
     {
@@ -274,7 +300,14 @@ async fn main() {
     let gpu_accel = args.gpu_accel;
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
+    let placement_options_supplied = args.window_placement_backend.is_some()
+        || args.window_host_policy.is_some()
+        || args.window_geometry_method.is_some()
+        || args.window_arc_id_lifetime.is_some()
+        || args.window_shortcuts_config.is_some();
     let placement_mode = match resolve_placement_mode(
+        args.experimental_window_placement,
+        args.window_shortcuts_config.is_some(),
         args.window_placement_backend,
         args.window_host_policy,
         args.window_geometry_method,
@@ -286,6 +319,12 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if args.experimental_window_placement && !placement_options_supplied {
+        log::info!(
+            "Experimental window placement is enabled with its default \
+             set-parent backend, but no shortcut config was supplied"
+        );
+    }
     if let Some(backend) = args.window_placement_backend {
         log::info!("Using window placement backend: {backend:?}");
     }
@@ -393,9 +432,41 @@ mod tests {
     #[test]
     fn default_placement_uses_native_set_parent() {
         assert_eq!(
-            resolve_placement_mode(None, None, None, None).expect("default mode should resolve"),
+            resolve_placement_mode(true, false, None, None, None, None)
+                .expect("experimental default mode should resolve"),
             PlacementBackendArg::SetParent.mode()
         );
+    }
+
+    #[test]
+    fn production_default_keeps_window_placement_disabled() {
+        assert_eq!(
+            resolve_placement_mode(false, false, None, None, None, None)
+                .expect("production default should resolve"),
+            WindowPlacementMode::disabled()
+        );
+    }
+
+    #[test]
+    fn placement_options_require_the_experimental_gate() {
+        let error = resolve_placement_mode(
+            false,
+            false,
+            Some(PlacementBackendArg::SetParent),
+            None,
+            None,
+            None,
+        )
+        .expect_err("placement backend must be gated");
+        assert!(error.contains("--experimental-window-placement"));
+    }
+
+    #[test]
+    fn shortcut_config_requires_the_experimental_gate() {
+        let error = resolve_placement_mode(false, true, None, None, None, None)
+            .expect_err("shortcut config must be gated");
+        assert!(error.contains("--experimental-window-placement"));
+        assert!(error.contains("config"));
     }
 
     #[test]
@@ -431,6 +502,8 @@ mod tests {
     #[test]
     fn placement_backend_rejects_mixed_axis_overrides() {
         let error = resolve_placement_mode(
+            true,
+            false,
             Some(PlacementBackendArg::SetParent),
             Some(HostPolicyArg::Arc),
             None,

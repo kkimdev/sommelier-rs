@@ -218,17 +218,17 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-placement-backend set-parent\|transient-arc\|persistent\|remote-shell-v2` | Select a placement backend. The default is `set-parent`: it keeps the native Guest OS identity, applies size through the normal XDG configure/commit handshake, and uses the experimental self-parent probe for position. `transient-arc` authorizes one direct Aura bounds request with an ARC task ID, then restores the native identity; `persistent` retains the ARC task ID for the window lifetime; `remote-shell-v2` uses the host's official `zcr_remote_shell_v2` role and is opt-in/experimental. |
-| `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
+| `--experimental-window-placement` | Required gate for every compositor-owned placement option. Without it, the production default is unchanged and placement-specific options are rejected. |
+| `--window-placement-backend set-parent\|transient-arc\|persistent\|remote-shell-v2` | Select a placement backend after enabling the experimental gate. `set-parent` keeps the native Guest OS identity, applies size through the normal XDG configure/commit handshake, and uses the experimental self-parent probe for position. `transient-arc` authorizes one direct Aura bounds request with an ARC task ID, then restores the native identity; `persistent` retains the ARC task ID for the window lifetime; `remote-shell-v2` uses the host's official `zcr_remote_shell_v2` role. |
+| `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied and the experimental gate is enabled. |
 
-Window shortcuts are disabled until a config file is explicitly supplied. With
-no backend option, the native `set-parent` backend is selected, but no
-placement request is sent while the binding set is empty. To enable the tested
-nine-grid bindings, provide the config file:
+Window placement is disabled by default. To enable the tested nine-grid
+bindings, pass the experimental gate and provide the config file:
 
 ```bash
 ./target/release/sommelier \
   --virtio-wl /dev/wl0 \
+  --experimental-window-placement \
   --window-shortcuts-config "$HOME/.config/sommelier/window-shortcuts.toml" \
   wayland-2
 ```
@@ -247,8 +247,9 @@ error because the host and Sommelier cannot safely own the same chord.
 The older `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
 `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT` environment switches are retained only
 for legacy in-process compatibility paths; the production CLI no longer reads
-them. Use the explicit options above, and never enable the experimental
-`self-parent` method on the shared system Sommelier instance.
+them. The hidden compatibility axes and every backend remain behind the same
+explicit experimental gate. Never enable this feature on the shared system
+Sommelier instance until a host-level runtime test has passed.
 
 `remote-shell-v2` is a separate host-managed path. It does not allocate ARC
 task IDs or send `zaura_toplevel.set_window_bounds`; Sommelier creates a
