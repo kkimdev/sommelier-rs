@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::handler::compositor::{
     ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
-    ARC_APPLICATION_ID,
 };
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
@@ -78,7 +77,6 @@ impl GtkShell1Handler for GtkShellHandler {
             GtkSurfaceState {
                 shell_id,
                 wl_surface_id,
-                host_zaura_surface_id,
             },
         );
         if let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) {
@@ -100,17 +98,22 @@ impl GtkShell1Handler for GtkShellHandler {
             return Action::Drop;
         };
         shell.startup_id.clone_from(startup_id);
-        let zaura_surface_ids = shell
-            .surfaces
-            .iter()
-            .filter_map(|surface_id| {
-                ctx.gtk_surfaces
-                    .get(surface_id)
-                    .and_then(|surface| surface.host_zaura_surface_id)
-            })
-            .collect::<std::collections::HashSet<_>>();
-        for zaura_surface_id in zaura_surface_ids {
-            queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
+        let startup_id = shell.startup_id.clone();
+        let gtk_surface_ids = shell.surfaces.iter().copied().collect::<Vec<_>>();
+        let mut aura_surface_ids = std::collections::HashSet::new();
+        for gtk_surface_id in gtk_surface_ids {
+            let Some(wl_surface_id) = ctx
+                .gtk_surfaces
+                .get(&gtk_surface_id)
+                .map(|surface| surface.wl_surface_id)
+            else {
+                continue;
+            };
+            if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
+                if aura_surface_ids.insert(zaura_surface_id) {
+                    queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
+                }
+            }
         }
         Action::Drop
     }
@@ -134,11 +137,14 @@ impl GtkSurface1Handler for GtkShellHandler {
         let Some(application_id) = application_id.as_deref() else {
             return Action::Drop;
         };
-        let Some(zaura_surface_id) = ctx
+        let Some(wl_surface_guest_id) = ctx
             .gtk_surfaces
             .get(&ctx.last_sender_id)
-            .and_then(|surface| surface.host_zaura_surface_id)
+            .map(|surface| surface.wl_surface_id)
         else {
+            return Action::Drop;
+        };
+        let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
             return Action::Drop;
         };
         let version = ctx
@@ -156,8 +162,18 @@ impl GtkSurface1Handler for GtkShellHandler {
         // from xdg_toplevel.set_app_id); GTK applications can send their
         // D-Bus properties after that xdg request, so do not overwrite the
         // ARC ID with the normal Crostini namespace.
-        let application_id = if ctx.window_bounds_as_arc {
-            ARC_APPLICATION_ID.to_string()
+        let application_id = if ctx.window_placement.uses_arc_bounds() {
+            let Some(application_id) = ctx
+                .window_placement
+                .arc_session_application_id(wl_surface_guest_id)
+            else {
+                log::warn!(
+                    "ARC placement mode changed before GTK app ID allocation for surface {}",
+                    ctx.last_sender_id
+                );
+                return Action::Drop;
+            };
+            application_id
         } else {
             native_wayland_app_id(&ctx.vm_identifier, application_id)
         };
@@ -334,7 +350,8 @@ mod tests {
     #[test]
     fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
         let mut ctx = setup_ctx();
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::ArcBounds);
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
@@ -356,10 +373,15 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
         assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
+        let expected_application_id = ctx
+            .window_placement
+            .arc_session_application_id(WL_SURFACE_GUEST)
+            .expect("ARC backend should allocate a session application ID");
         assert_eq!(
             nullable_string(message).as_deref(),
-            Some(ARC_APPLICATION_ID)
+            Some(expected_application_id.as_str())
         );
+        assert!(expected_application_id.starts_with("org.chromium.arc.session."));
     }
 
     #[test]
@@ -382,8 +404,10 @@ mod tests {
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
         );
         assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));
-        assert!(!ctx
-            .wl_surface_to_zaura_surface
-            .contains_key(&WL_SURFACE_HOST));
+        assert_eq!(
+            ctx.window_placement
+                .aura_surface_for_wl_surface(WL_SURFACE_HOST),
+            None
+        );
     }
 }

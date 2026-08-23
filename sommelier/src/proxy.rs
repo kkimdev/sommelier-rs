@@ -552,7 +552,7 @@ impl Client {
                 if is_xdg_surface_get_toplevel && packet.len() >= 12 {
                     let guest_xdg_toplevel_id =
                         u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                    if self.ctx.window_bounds_as_arc {
+                    if self.ctx.window_placement.uses_arc_bounds() {
                         let _ = crate::handler::compositor::ensure_zaura_toplevel(
                             &mut self.ctx,
                             guest_xdg_toplevel_id,

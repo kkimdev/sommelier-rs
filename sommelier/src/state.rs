@@ -16,6 +16,7 @@ limitations under the License.
 
 mod input;
 mod render;
+mod window_placement;
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{OwnedFd, RawFd};
@@ -41,6 +42,9 @@ pub(crate) use self::render::{
     BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
     SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
+#[cfg(test)]
+pub(crate) use self::window_placement::ARC_SESSION_APPLICATION_ID_PREFIX;
+pub(crate) use self::window_placement::{WindowPlacementMode, WindowPlacementState};
 
 /// A Wayland object ID allocated by the **guest** (client) side.
 ///
@@ -704,7 +708,6 @@ pub struct GtkShellState {
 pub struct GtkSurfaceState {
     pub shell_id: u32,
     pub wl_surface_id: u32,
-    pub host_zaura_surface_id: Option<u32>,
 }
 
 /// Host output geometry used for compositor-owned window layout requests.
@@ -916,15 +919,13 @@ pub struct Context {
     pub host_zaura_shell_version: u32,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
-    /// Experimental host-policy workaround: identify the host surface as an
-    /// ARC window so Exo permits `zaura_toplevel.set_window_bounds`.
-    pub window_bounds_as_arc: bool,
+    /// Single source of truth for placement backend selection and all
+    /// compositor-owned placement state.
+    pub(crate) window_placement: WindowPlacementState,
     /// Host wl_output IDs advertised to the guest.
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
     pub output_states: HashMap<u32, OutputState>,
-    /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
-    pub wl_surface_to_zaura_surface: HashMap<u32, u32>,
     /// Synthetic GTK shell bindings and their activation token state.
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
@@ -933,17 +934,6 @@ pub struct Context {
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
     /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
     pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
-    /// Maps guest xdg_toplevel IDs → host zaura_toplevel IDs.
-    pub xdg_toplevel_to_zaura_toplevel: HashMap<u32, u32>,
-    /// Host callback IDs queued after `zaura_toplevel.set_window_bounds`,
-    /// keyed by callback ID → Aura toplevel ID. A callback.done is the
-    /// compositor-side barrier proving that all preceding bounds requests and
-    /// configure events have been processed.
-    pub window_bounds_barriers: HashMap<u32, u32>,
-    /// The newest bounds barrier for each Aura toplevel. Older callbacks stay
-    /// in `window_bounds_barriers` until their terminal `done`/`delete_id`
-    /// sequence arrives, but no longer gate configure handling.
-    pub active_window_bounds_barriers: HashMap<u32, u32>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1240,6 +1230,7 @@ impl Context {
                 Vec::new()
             }
         };
+        let window_placement = WindowPlacementState::new(WindowPlacementMode::from_environment());
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1310,17 +1301,13 @@ impl Context {
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
-            window_bounds_as_arc: std::env::var_os("SOMMELIER_WINDOW_BOUNDS_AS_ARC").is_some(),
+            window_placement,
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
-            wl_surface_to_zaura_surface: HashMap::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
-            xdg_toplevel_to_zaura_toplevel: HashMap::new(),
-            window_bounds_barriers: HashMap::new(),
-            active_window_bounds_barriers: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1361,7 +1348,8 @@ impl Context {
         ctx.accelerators = accelerators;
         // Keep unit tests deterministic even when the developer's shell uses
         // the runtime-only ARC bounds workaround for an isolated proxy.
-        ctx.window_bounds_as_arc = false;
+        ctx.window_placement
+            .set_mode_for_test(WindowPlacementMode::Disabled);
         ctx
     }
 

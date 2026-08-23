@@ -2072,14 +2072,14 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
+        assert!(ctx.window_placement.remember_aura_surface(50, surface_id));
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_ne!(ctx.shadow_table.allocate_host_id(), shell_id);
         assert_ne!(ctx.shadow_table.allocate_host_id(), surface_id);
         assert_eq!(
-            ctx.wl_surface_to_zaura_surface.get(&50),
-            Some(&surface_id),
+            ctx.window_placement.aura_surface_for_wl_surface(50),
+            Some(surface_id),
             "legacy aura children also survive global removal"
         );
         assert_eq!(
@@ -2112,14 +2112,14 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
+        assert!(ctx.window_placement.remember_aura_surface(50, surface_id));
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_eq!(ctx.host_zaura_shell_id, None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(
-            ctx.wl_surface_to_zaura_surface.get(&50),
-            Some(&surface_id),
+            ctx.window_placement.aura_surface_for_wl_surface(50),
+            Some(surface_id),
             "global removal must not destroy an existing aura child"
         );
         assert_eq!(
