@@ -92,13 +92,22 @@ struct Args {
     #[arg(long)]
     virtio_wl: Option<String>,
 
-    /// Select the application-ID policy used by window shortcuts.
-    #[arg(long, value_enum, default_value_t = HostPolicyArg::Guest)]
-    window_host_policy: HostPolicyArg,
+    /// Enable the experimental compositor-owned window-placement subsystem.
+    ///
+    /// Without this gate Sommelier preserves the upstream behavior and rejects
+    /// every placement-specific option or config path.
+    #[arg(long)]
+    experimental_window_placement: bool,
 
-    /// Select the geometry operation used by window shortcuts.
-    #[arg(long, value_enum, default_value_t = GeometryMethodArg::None)]
-    window_geometry_method: GeometryMethodArg,
+    /// Internal experiment: select the application-ID policy used by window
+    /// shortcuts. Prefer the explicit experimental gate and config contract.
+    #[arg(long, value_enum, hide = true)]
+    window_host_policy: Option<HostPolicyArg>,
+
+    /// Internal experiment: select the geometry operation used by window
+    /// shortcuts. Prefer the explicit experimental gate and config contract.
+    #[arg(long, value_enum, hide = true)]
+    window_geometry_method: Option<GeometryMethodArg>,
 
     /// Read window shortcut bindings from PATH. No config is read by default.
     #[arg(long, value_name = "PATH")]
@@ -122,6 +131,48 @@ enum GeometryMethodArg {
     SelfParent,
 }
 
+/// Resolve the startup placement policy without allowing an accidental
+/// production opt-in.
+///
+/// The public configuration surface is intentionally two-stage: the explicit
+/// experimental gate must be present, and the shortcut file is optional. Once
+/// gated, an otherwise unspecified policy uses native Guest identity plus the
+/// self-parent experiment; an explicitly supplied hidden axis remains honored
+/// for focused host testing.
+fn resolve_placement_mode(
+    experimental_enabled: bool,
+    config_path_supplied: bool,
+    host_policy: Option<HostPolicyArg>,
+    geometry_method: Option<GeometryMethodArg>,
+) -> Result<WindowPlacementMode, String> {
+    if !experimental_enabled {
+        if config_path_supplied || host_policy.is_some() || geometry_method.is_some() {
+            return Err("window placement is experimental; pass \
+                 --experimental-window-placement before selecting a placement \
+                 policy or config file"
+                .to_string());
+        }
+        return Ok(WindowPlacementMode::disabled());
+    }
+
+    let host_policy_value = match host_policy.unwrap_or(HostPolicyArg::Guest) {
+        HostPolicyArg::Guest => WindowHostPolicy::Guest,
+        HostPolicyArg::Arc => WindowHostPolicy::Arc,
+    };
+    let geometry_method_value = match geometry_method {
+        Some(GeometryMethodArg::None) => WindowGeometryMethod::None,
+        Some(GeometryMethodArg::Bounds) => WindowGeometryMethod::Bounds,
+        Some(GeometryMethodArg::SelfParent) => WindowGeometryMethod::SelfParent,
+        None if host_policy.is_none() => WindowGeometryMethod::SelfParent,
+        None => WindowGeometryMethod::None,
+    };
+
+    Ok(WindowPlacementMode::new(
+        host_policy_value,
+        geometry_method_value,
+    ))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
@@ -133,16 +184,28 @@ async fn main() {
     let gpu_accel = args.gpu_accel;
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
-    let host_policy = match args.window_host_policy {
-        HostPolicyArg::Guest => WindowHostPolicy::Guest,
-        HostPolicyArg::Arc => WindowHostPolicy::Arc,
+    let placement_mode = match resolve_placement_mode(
+        args.experimental_window_placement,
+        args.window_shortcuts_config.is_some(),
+        args.window_host_policy,
+        args.window_geometry_method,
+    ) {
+        Ok(mode) => mode,
+        Err(error) => {
+            log::error!("{error}");
+            std::process::exit(2);
+        }
     };
-    let geometry_method = match args.window_geometry_method {
-        GeometryMethodArg::None => WindowGeometryMethod::None,
-        GeometryMethodArg::Bounds => WindowGeometryMethod::Bounds,
-        GeometryMethodArg::SelfParent => WindowGeometryMethod::SelfParent,
-    };
-    let placement_mode = WindowPlacementMode::new(host_policy, geometry_method);
+    if args.experimental_window_placement
+        && args.window_host_policy.is_none()
+        && args.window_geometry_method.is_none()
+        && args.window_shortcuts_config.is_none()
+    {
+        log::info!(
+            "Experimental window placement is enabled with its default \
+             native Guest/self-parent policy, but no shortcut config was supplied"
+        );
+    }
     if placement_mode.uses_self_parent() {
         log::warn!(
             "--window-geometry-method=self-parent is experimental and position-only; \
@@ -156,7 +219,16 @@ async fn main() {
         );
     }
 
-    let host_accelerators = Arc::new(crate::accelerator::from_environment());
+    let host_accelerators = match crate::accelerator::try_from_environment() {
+        Ok(accelerators) => Arc::new(accelerators),
+        Err(error) => {
+            log::error!(
+                "Invalid SOMMELIER_ACCELERATORS; refusing to start: {}",
+                error
+            );
+            std::process::exit(2);
+        }
+    };
     let shortcut_config_path = args.window_shortcuts_config.map(|path| {
         if path.is_absolute() {
             path
@@ -179,7 +251,7 @@ async fn main() {
     if !shortcut_config.is_empty() && !placement_mode.handles_shortcuts() {
         log::error!(
             "window shortcut config contains bindings, but \
-             --window-geometry-method=none disables window placement"
+             the selected geometry method disables window placement"
         );
         std::process::exit(2);
     }
@@ -212,3 +284,53 @@ async fn main() {
     .await;
 }
 mod test_xkb;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_default_keeps_placement_disabled() {
+        assert_eq!(
+            resolve_placement_mode(false, false, None, None)
+                .expect("production default should resolve"),
+            WindowPlacementMode::disabled()
+        );
+    }
+
+    #[test]
+    fn placement_options_require_the_experimental_gate() {
+        let error = resolve_placement_mode(
+            false,
+            true,
+            Some(HostPolicyArg::Guest),
+            Some(GeometryMethodArg::SelfParent),
+        )
+        .expect_err("placement options must be gated");
+        assert!(error.contains("--experimental-window-placement"));
+    }
+
+    #[test]
+    fn gated_default_uses_native_guest_self_parent() {
+        let mode =
+            resolve_placement_mode(true, false, None, None).expect("gated default should resolve");
+        assert_eq!(
+            mode,
+            WindowPlacementMode::new(WindowHostPolicy::Guest, WindowGeometryMethod::SelfParent)
+        );
+    }
+
+    #[test]
+    fn explicit_none_remains_disabled_after_gate() {
+        assert_eq!(
+            resolve_placement_mode(
+                true,
+                false,
+                Some(HostPolicyArg::Guest),
+                Some(GeometryMethodArg::None),
+            )
+            .expect("explicit disabled policy should resolve"),
+            WindowPlacementMode::disabled()
+        );
+    }
+}

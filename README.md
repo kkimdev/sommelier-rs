@@ -215,16 +215,18 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-host-policy guest\|arc` | Startup-only application-ID policy for placement shortcuts; defaults to `guest`. |
-| `--window-geometry-method none\|bounds\|self-parent` | Startup-only geometry operation; defaults to `none`. `self-parent` is experimental and position-only. |
-| `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
+| `--experimental-window-placement` | Required opt-in gate for every compositor-owned placement option. |
+| `--window-host-policy guest\|arc` | Hidden startup-only application-ID policy for placement experiments. |
+| `--window-geometry-method none\|bounds\|self-parent` | Hidden startup-only geometry operation. With only the experimental gate, native Guest/self-parent is selected; `none` explicitly disables placement. |
+| `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option and the experimental gate are supplied. |
 
-Window shortcuts are disabled by default. To enable ordinary work-area
-placement, select a geometry method and provide a config file:
+Window placement is disabled by default. To enable ordinary work-area
+placement, pass the experimental gate and provide a config file:
 
 ```bash
 ./target/release/sommelier \
   --virtio-wl /dev/wl0 \
+  --experimental-window-placement \
   --window-host-policy arc \
   --window-geometry-method bounds \
   --window-shortcuts-config "$HOME/.config/sommelier/window-shortcuts.toml" \
@@ -237,6 +239,15 @@ reload procedure are documented in
 Reloading a malformed file keeps the last known-good generation. A binding
 that overlaps a parsed `SOMMELIER_ACCELERATORS` entry is a hard startup/reload
 error because the host and Sommelier cannot safely own the same chord.
+`SOMMELIER_ACCELERATORS` is parsed once during startup; a malformed value is a
+startup error (exit status 2), never an empty-list fallback. Changing that
+environment variable requires restarting the proxy; `SIGHUP` only reloads the
+explicit shortcut file.
+
+Passing a placement axis or config path without the experimental gate is a
+startup error. The gate alone selects native Guest identity plus the
+self-parent experiment, but no shortcut is active until a config path is
+provided.
 
 The older `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
 `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT` environment switches are retained only

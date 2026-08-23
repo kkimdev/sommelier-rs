@@ -24,16 +24,20 @@ whether Sommelier can carry out that action on the host.
 The policy and geometry axes are independent:
 
 ```text
+--experimental-window-placement
 --window-host-policy=guest|arc
 --window-geometry-method=none|bounds|self-parent
 --window-shortcuts-config PATH       # optional
 ```
 
-The default is equivalent to:
+Window placement is disabled unless `--experimental-window-placement` is
+present. Passing a placement axis or config path without the gate is a startup
+error. With the gate and no hidden axis overrides, the default is equivalent
+to:
 
 ```text
 --window-host-policy=guest
---window-geometry-method=none
+--window-geometry-method=self-parent
 ```
 
 When `--window-shortcuts-config` is omitted, Sommelier does not open, stat, or
@@ -46,7 +50,8 @@ startup error; it must not silently disable only some bindings.
 
 `self-parent` remains experimental. It can move a window on hosts that support
 the custom probe, but `zaura_surface.set_parent` has no width or height
-arguments and therefore cannot implement a resize.
+arguments and therefore cannot implement a resize. Explicitly selecting
+`--window-geometry-method=none` disables placement after the gate is enabled.
 
 ## Config file format
 
@@ -155,6 +160,10 @@ captured.
 `SOMMELIER_ACCELERATORS` remains separate. It describes which accelerators the
 host should handle; it is not the action/geometry configuration and is not
 changed by shortcut reload.
+The environment list is parsed once at startup. If it is malformed, Sommelier
+exits with status 2 rather than silently treating the list as empty. Changing
+the host accelerator environment therefore requires a proxy restart; `SIGHUP`
+only reparses the explicit shortcut file.
 
 A shortcut binding must not overlap a parsed `SOMMELIER_ACCELERATORS` entry.
 The two settings have deliberately different owners: the shortcut config
@@ -166,6 +175,7 @@ The conflict behavior is therefore:
 
 | Situation | Result |
 | --- | --- |
+| Malformed `SOMMELIER_ACCELERATORS` at startup | Startup fails with exit status 2 |
 | Startup config overlaps a host accelerator | Startup fails and names every conflicting chord |
 | Reloaded config overlaps a host accelerator | Reload fails; last-known-good bindings remain active |
 | No overlap | Both policies operate independently |
