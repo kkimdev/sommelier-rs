@@ -23,9 +23,17 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 
 use super::plan::{OutputState, PlacementBarrierCleanup};
+use super::transaction::PlacementTransaction;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AuraShellBinding {
+    pub(super) host_id: u32,
+    pub(super) global_name: u32,
+    pub(super) version: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RemoteShellBinding {
     pub(super) host_id: u32,
     pub(super) global_name: u32,
     pub(super) version: u32,
@@ -39,10 +47,14 @@ pub(super) struct OutputRecord {
 
 #[derive(Debug, Default)]
 pub(super) struct ToplevelPlacementState {
-    /// Last authoritative or predicted screen-space origin.
+    /// Last authoritative screen-space origin observed from Aura.
     pub(super) origin: Option<(i32, i32)>,
-    /// Newest self-parent target waiting for a matching host notification.
-    pub(super) pending_origin: Option<(i32, i32)>,
+    /// Reducer-owned placement transaction. All phase, generation, deferred
+    /// target, and cleanup state lives here; handlers can only feed events
+    /// through the methods exposed by `WindowPlacementState`.
+    pub(super) transaction: PlacementTransaction,
+    /// Last size accepted from an authoritative host configure.
+    pub(super) observed_size: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +70,18 @@ pub(super) struct GtkShellState {
 pub(super) struct GtkSurfaceState {
     pub(super) shell_id: u32,
     pub(super) wl_surface_id: u32,
+}
+
+/// The complete state transition produced when an XDG toplevel role dies.
+///
+/// The placement owner removes the XDG role, its Aura child, and all
+/// per-toplevel origin/barrier state before returning this record. The handler
+/// only serializes the optional Aura release request; it cannot forget one
+/// half of the lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct XdgToplevelRelease {
+    pub(crate) wl_surface_guest_id: u32,
+    pub(crate) zaura_toplevel_host_id: Option<u32>,
 }
 
 /// All application identities associated with one guest `wl_surface`.
@@ -132,6 +156,10 @@ impl BidirectionalLinks {
                 .iter()
                 .all(|(reverse_id, forward_id)| self.forward.get(forward_id) == Some(reverse_id))
     }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.forward.is_empty()
+    }
 }
 
 /// Ordered host-sync callbacks retained for placement requests.
@@ -145,6 +173,12 @@ pub(super) struct PlacementBarrierRegistry {
 struct PlacementBarrierRecord {
     toplevel_id: u32,
     cleanup: Option<PlacementBarrierCleanup>,
+    generation: Option<u64>,
+    /// Optional diagnostic operation ID carried across asynchronous barriers.
+    ///
+    /// The ID is deliberately metadata only: it never participates in
+    /// lifecycle decisions or host protocol serialization.
+    trace_id: Option<u64>,
 }
 
 /// Result of completing one placement barrier.
@@ -152,6 +186,8 @@ struct PlacementBarrierRecord {
 pub(crate) struct PlacementBarrierCompletion {
     pub(crate) toplevel_id: u32,
     pub(crate) cleanup: Option<PlacementBarrierCleanup>,
+    pub(crate) trace_id: Option<u64>,
+    pub(crate) generation: Option<u64>,
 }
 
 impl PlacementBarrierRegistry {
@@ -162,11 +198,42 @@ impl PlacementBarrierRegistry {
     /// Retain a callback and make it the latest sync for its toplevel.
     ///
     /// A superseded callback remains retained until its terminal host event.
+    #[cfg(test)]
     pub(super) fn register(
         &mut self,
         callback_id: u32,
         toplevel_id: u32,
         cleanup: Option<PlacementBarrierCleanup>,
+    ) -> bool {
+        self.register_with_trace(callback_id, toplevel_id, cleanup, None)
+    }
+
+    /// Retain a callback and attach an optional diagnostic operation ID.
+    ///
+    /// The trace ID is not part of the placement state machine. It exists so
+    /// an asynchronous `wl_callback.done` can be connected to the exact wire
+    /// batch that created it in runtime logs.
+    #[cfg(test)]
+    pub(super) fn register_with_trace(
+        &mut self,
+        callback_id: u32,
+        toplevel_id: u32,
+        cleanup: Option<PlacementBarrierCleanup>,
+        trace_id: Option<u64>,
+    ) -> bool {
+        self.register_with_generation(callback_id, toplevel_id, cleanup, None, trace_id)
+    }
+
+    /// Retain a callback together with the placement generation that created
+    /// it. A callback from an older generation may still need to be retired,
+    /// but it must never run cleanup against a newer transaction.
+    pub(super) fn register_with_generation(
+        &mut self,
+        callback_id: u32,
+        toplevel_id: u32,
+        cleanup: Option<PlacementBarrierCleanup>,
+        generation: Option<u64>,
+        trace_id: Option<u64>,
     ) -> bool {
         if self.contains_callback(callback_id) {
             return false;
@@ -176,6 +243,8 @@ impl PlacementBarrierRegistry {
             PlacementBarrierRecord {
                 toplevel_id,
                 cleanup,
+                generation,
+                trace_id,
             },
         );
         self.active_by_toplevel.insert(toplevel_id, callback_id);
@@ -192,6 +261,8 @@ impl PlacementBarrierRegistry {
         Some(PlacementBarrierCompletion {
             toplevel_id: record.toplevel_id,
             cleanup: is_active.then_some(record.cleanup).flatten(),
+            trace_id: record.trace_id,
+            generation: record.generation,
         })
     }
 

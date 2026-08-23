@@ -139,6 +139,7 @@ fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
 struct SommelierHandler {
     display: crate::handler::display::DisplayHandler,
     registry: crate::handler::registry::RegistryHandler,
+    remote_shell: crate::handler::remote_shell::RemoteShellHandler,
     compositor: crate::handler::compositor::CompositorHandler,
     gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
     callback: crate::handler::callback::CallbackHandler,
@@ -160,6 +161,7 @@ impl SommelierHandler {
         Self {
             display: crate::handler::display::DisplayHandler,
             registry: crate::handler::registry::RegistryHandler,
+            remote_shell: crate::handler::remote_shell::RemoteShellHandler,
             compositor: crate::handler::compositor::CompositorHandler,
             gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
             callback: crate::handler::callback::CallbackHandler,
@@ -365,6 +367,13 @@ impl Client {
             )
         } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
             protocols::gtk::dispatch_request(interface, msg, handler, ctx)
+        } else if protocols::remote_shell_unstable_v2::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::remote_shell_unstable_v2::dispatch_request(
+                interface,
+                msg,
+                &mut handler.remote_shell,
+                ctx,
+            )
         } else {
             Ok(None)
         }
@@ -410,10 +419,23 @@ impl Client {
                     &mut handler.compositor,
                     ctx,
                 )
+            } else if interface == "zaura_output" {
+                protocols::aura_shell::zaura_output::dispatch_event(
+                    msg,
+                    &mut handler.compositor,
+                    ctx,
+                )
             } else {
                 msg.offset = msg.payload.len();
                 Ok(None)
             }
+        } else if protocols::remote_shell_unstable_v2::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::remote_shell_unstable_v2::dispatch_event(
+                interface,
+                msg,
+                &mut handler.remote_shell,
+                ctx,
+            )
         } else {
             Ok(None)
         }
@@ -447,6 +469,8 @@ impl Client {
             protocols::gtk::consume_event(interface, msg)
         } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
             protocols::aura_shell::consume_event(interface, msg)
+        } else if protocols::remote_shell_unstable_v2::ALLOWED_INTERFACES.contains(&interface) {
+            protocols::remote_shell_unstable_v2::consume_event(interface, msg)
         } else {
             log::error!(
                 "Cannot consume event for unsupported interface {} (id={}, opcode={})",
@@ -545,6 +569,11 @@ impl Client {
                 }
             };
 
+            // Generated request handlers run before the guest→host mapping for
+            // a newly created xdg_toplevel is installed. Keep this one
+            // placement-specific post-dispatch retry narrow: it is required
+            // only for get_toplevel, and it must not become a general
+            // dispatcher lifecycle hook.
             let is_xdg_surface_get_toplevel = matches!(direction, Direction::ClientToHost)
                 && interface.as_deref() == Some("xdg_surface")
                 && opcode == crate::protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL;
@@ -575,10 +604,12 @@ impl Client {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
                 };
-                if is_xdg_surface_get_toplevel && packet.len() >= 12 {
+                if res.is_ok() && is_xdg_surface_get_toplevel && packet.len() >= 12 {
                     let guest_xdg_toplevel_id =
                         u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                    if self.ctx.window_placement.handles_shortcuts() {
+                    if self.ctx.window_placement.handles_shortcuts()
+                        && !self.ctx.window_placement.uses_remote_shell()
+                    {
                         let _ = crate::handler::placement::ensure_zaura_toplevel(
                             &mut self.ctx,
                             guest_xdg_toplevel_id,
@@ -1899,6 +1930,7 @@ rect = [0.0, 0.0, 0.5, 0.5]
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 

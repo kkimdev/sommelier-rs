@@ -17,6 +17,7 @@ limitations under the License.
 use crate::handler::placement::{
     ensure_host_zaura_surface, queue_policy_application_id, wayland_string_fits_message,
 };
+use crate::handler::remote_shell;
 use crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID;
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
@@ -75,12 +76,19 @@ impl GtkShell1Handler for GtkShellHandler {
             );
             return Action::Drop;
         }
-        let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
             1,
         );
+        if ctx.window_placement.uses_remote_shell() {
+            // Remote-shell roles own the window metadata directly. Creating
+            // an Aura child here would reintroduce the policy path that this
+            // backend is intended to avoid; startup IDs have no remote-shell
+            // equivalent and are intentionally ignored.
+            return Action::Drop;
+        }
+        let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
         if let Some(zaura_surface_id) = host_zaura_surface_id {
             queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
         }
@@ -99,6 +107,11 @@ impl GtkShell1Handler for GtkShellHandler {
             );
             return Action::Drop;
         };
+        if ctx.window_placement.uses_remote_shell() {
+            // zcr_remote_surface_v2 has no startup-id request. The remote
+            // window's app ID/title are the supported identity metadata.
+            return Action::Drop;
+        }
         let mut aura_surface_ids = std::collections::HashSet::new();
         for gtk_surface_id in gtk_surface_ids {
             let Some(wl_surface_id) = ctx
@@ -141,6 +154,37 @@ impl GtkSurface1Handler for GtkShellHandler {
         else {
             return Action::Drop;
         };
+        if ctx.window_placement.uses_remote_shell() {
+            let Some(xdg_toplevel_id) = ctx
+                .window_placement
+                .xdg_toplevel_for_wl_surface(wl_surface_guest_id)
+            else {
+                log::debug!(
+                    "Ignoring remote-shell GTK app ID before XDG role exists for wl_surface {}",
+                    wl_surface_guest_id
+                );
+                return Action::Drop;
+            };
+            let Some(remote_surface_id) = ctx
+                .window_placement
+                .remote_surface_for_xdg_toplevel(xdg_toplevel_id)
+            else {
+                return Action::Drop;
+            };
+            let native_application_id = ctx.window_placement.native_wayland_app_id(application_id);
+            if !wayland_string_fits_message(&native_application_id)
+                || !remote_shell::queue_remote_app_id(
+                    ctx,
+                    remote_surface_id,
+                    &native_application_id,
+                )
+            {
+                return Action::Drop;
+            }
+            ctx.window_placement
+                .remember_native_application_id(wl_surface_guest_id, native_application_id);
+            return Action::Drop;
+        }
         let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
             return Action::Drop;
         };
@@ -191,6 +235,8 @@ mod tests {
     use super::*;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
+    use crate::protocols::remote_shell_unstable_v2::zcr_remote_surface_v2::REQ_SET_APP_ID as REQ_REMOTE_SET_APP_ID;
+    use crate::state::{WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode};
     use crate::wire::WireMessage;
 
     const GTK_SHELL: u32 = 10;
@@ -313,6 +359,101 @@ mod tests {
         assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
         assert_eq!(
             nullable_string(message).as_deref(),
+            Some(
+                ctx.window_placement
+                    .native_wayland_app_id("com.example.Terminal")
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn remote_shell_gtk_metadata_avoids_aura_and_uses_remote_surface() {
+        let mut ctx = setup_ctx();
+        ctx.window_placement
+            .set_mode_for_test(WindowPlacementMode::new(
+                WindowHostPolicy::Guest,
+                WindowGeometryMethod::RemoteShell,
+            ));
+        let xdg_surface_guest = 30;
+        let xdg_toplevel_guest = 31;
+        let xdg_surface_host = 130;
+        let xdg_toplevel_host = 131;
+        let remote_surface_host = 140;
+        ctx.shadow_table.map_id(xdg_surface_guest, xdg_surface_host);
+        ctx.shadow_table.track_interface_with_version(
+            xdg_surface_guest,
+            "xdg_surface".to_string(),
+            3,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            xdg_surface_host,
+            "xdg_surface".to_string(),
+            3,
+        );
+        ctx.shadow_table
+            .map_id(xdg_toplevel_guest, xdg_toplevel_host);
+        ctx.shadow_table.track_interface_with_version(
+            xdg_toplevel_guest,
+            "xdg_toplevel".to_string(),
+            3,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            xdg_toplevel_host,
+            "xdg_toplevel".to_string(),
+            3,
+        );
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_surface_guest, WL_SURFACE_GUEST));
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(xdg_toplevel_guest, WL_SURFACE_GUEST));
+        assert!(ctx
+            .window_placement
+            .remember_remote_surface(WL_SURFACE_HOST, remote_surface_host));
+        assert!(ctx
+            .window_placement
+            .remember_remote_toplevel(xdg_toplevel_guest, remote_surface_host));
+        ctx.shadow_table.track_host_interface_with_version(
+            remote_surface_host,
+            "zcr_remote_surface_v2".to_string(),
+            6,
+        );
+
+        ctx.last_sender_id = GTK_SHELL;
+        let mut handler = GtkShellHandler;
+        assert_eq!(
+            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST),
+            Action::Drop
+        );
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            ctx.window_placement
+                .aura_surface_for_wl_surface(WL_SURFACE_HOST),
+            None
+        );
+
+        ctx.last_sender_id = GTK_SURFACE;
+        assert_eq!(
+            handler.on_set_dbus_properties(
+                &mut ctx,
+                &Some("com.example.Terminal".to_string()),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+            ),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        assert_eq!(
+            opcode(&ctx.client_to_host_queue[0].0),
+            REQ_REMOTE_SET_APP_ID
+        );
+        assert_eq!(
+            nullable_string(&ctx.client_to_host_queue[0].0).as_deref(),
             Some(
                 ctx.window_placement
                     .native_wayland_app_id("com.example.Terminal")

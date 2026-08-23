@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Source: Chromium third_party/wayland-protocols/unstable/remote-shell/
+  remote-shell-unstable-v2.xml
+  https://raw.githubusercontent.com/chromium/chromium/main/third_party/wayland-protocols/unstable/remote-shell/remote-shell-unstable-v2.xml
+  Fetched: 2026-08-23
+
+  This vendored definition intentionally keeps the complete request/event
+  ordering for the two interfaces used by Sommelier. Wayland opcodes are
+  positional: omitting an earlier request would change set_bounds_in_output
+  from the ChromeOS opcode (37).
+-->
+<protocol name="remote_shell_unstable_v2">
+  <copyright>
+    Copyright 2021 The Chromium Authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+  <interface name="zcr_remote_shell_v2" version="6">
+    <request name="destroy" type="destructor"/>
+    <request name="get_remote_surface">
+      <arg name="id" type="new_id" interface="zcr_remote_surface_v2"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="container" type="uint"/>
+    </request>
+    <request name="get_notification_surface">
+      <arg name="id" type="new_id" interface="zcr_notification_surface_v2"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="notification_key" type="string"/>
+    </request>
+    <event name="default_device_scale_factor" since="1">
+      <arg name="scale" type="int"/>
+    </event>
+    <request name="get_input_method_surface" since="1">
+      <arg name="id" type="new_id" interface="zcr_input_method_surface_v2"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <request name="get_toast_surface" since="1">
+      <arg name="id" type="new_id" interface="zcr_toast_surface_v2"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <event name="layout_mode" since="1">
+      <arg name="layout_mode" type="uint"/>
+    </event>
+    <request name="get_remote_output" since="1">
+      <arg name="id" type="new_id" interface="zcr_remote_output_v2"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+    <event name="desktop_focus_state_changed" since="1">
+      <arg name="focus_state" type="uint"/>
+    </event>
+  </interface>
+
+  <interface name="zcr_remote_surface_v2" version="6">
+    <request name="destroy" type="destructor"/>
+    <request name="set_app_id">
+      <arg name="app_id" type="string"/>
+    </request>
+    <request name="set_title">
+      <arg name="title" type="string"/>
+    </request>
+    <request name="set_top_inset">
+      <arg name="height" type="int"/>
+    </request>
+    <request name="maximize"/>
+    <request name="minimize"/>
+    <request name="restore"/>
+    <request name="fullscreen"/>
+    <request name="pin">
+      <arg name="trusted" type="int"/>
+    </request>
+    <request name="unpin"/>
+    <request name="set_system_modal"/>
+    <request name="unset_system_modal"/>
+    <request name="set_rectangular_surface_shadow">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+    <request name="set_systemui_visibility">
+      <arg name="visibility" type="uint"/>
+    </request>
+    <request name="set_always_on_top"/>
+    <request name="unset_always_on_top"/>
+    <request name="set_orientation">
+      <arg name="orientation" type="int"/>
+    </request>
+    <request name="start_move">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+    <request name="set_can_maximize"/>
+    <request name="unset_can_maximize"/>
+    <request name="set_min_size">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+    <request name="set_max_size">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+    <request name="set_snapped_to_left"/>
+    <request name="set_snapped_to_right"/>
+    <request name="start_resize">
+      <arg name="resize_direction" type="uint"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
+    <request name="set_frame">
+      <arg name="type" type="uint"/>
+    </request>
+    <request name="set_frame_buttons">
+      <arg name="visible_buttons" type="uint"/>
+      <arg name="enabled_buttons" type="uint"/>
+    </request>
+    <request name="set_extra_title">
+      <arg name="extra_title" type="string"/>
+    </request>
+    <request name="set_orientation_lock">
+      <arg name="orientation_lock" type="uint"/>
+    </request>
+    <request name="pip"/>
+    <request name="set_aspect_ratio">
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+    <request name="set_accessibility_id">
+      <arg name="id" type="int"/>
+    </request>
+    <request name="set_pip_original_window"/>
+    <request name="unset_pip_original_window"/>
+    <request name="set_system_gesture_exclusion">
+      <arg name="region" type="object" interface="wl_region" allow-null="true"/>
+    </request>
+    <request name="set_resize_lock"/>
+    <request name="unset_resize_lock"/>
+    <request name="set_bounds_in_output" since="1">
+      <arg name="output" type="object" interface="wl_output"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+    <request name="set_resize_lock_type" since="2">
+      <arg name="type" type="uint"/>
+    </request>
+    <request name="set_float" since="3"/>
+    <request name="set_scale_factor" since="4">
+      <arg name="scale_factor_as_uint" type="uint"/>
+    </request>
+    <request name="set_window_corner_radii" since="5">
+      <arg name="upper_left_radius" type="uint"/>
+      <arg name="upper_right_radius" type="uint"/>
+      <arg name="lower_right_radius" type="uint"/>
+      <arg name="lower_left_radius" type="uint"/>
+    </request>
+    <request name="set_shadow_corner_radii" since="6">
+      <arg name="upper_left_radius" type="uint"/>
+      <arg name="upper_right_radius" type="uint"/>
+      <arg name="lower_right_radius" type="uint"/>
+      <arg name="lower_left_radius" type="uint"/>
+    </request>
+
+    <event name="close"/>
+    <event name="state_type_changed">
+      <arg name="state_type" type="uint"/>
+    </event>
+    <event name="window_geometry_changed" since="1">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+    <event name="bounds_changed" since="1">
+      <arg name="display_id_hi" type="uint"/>
+      <arg name="display_id_lo" type="uint"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="bounds_change_reason" type="uint"/>
+    </event>
+    <event name="drag_started" since="1">
+      <arg name="direction" type="uint"/>
+    </event>
+    <event name="drag_finished" since="1">
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="canceled" type="int"/>
+    </event>
+    <event name="change_zoom_level" since="1">
+      <arg name="change" type="int"/>
+    </event>
+    <event name="bounds_changed_in_output" since="1">
+      <arg name="output" type="object" interface="wl_output"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="bounds_change_reason" type="uint"/>
+    </event>
+  </interface>
+</protocol>

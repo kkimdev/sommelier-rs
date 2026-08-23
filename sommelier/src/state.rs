@@ -40,7 +40,8 @@ pub(crate) use self::input::{
     ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
     GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
-    PreeditRegionPlan, SeatFocusChange, TextInputActivationBarrierRegistry, TextInputState,
+    PlacementImeState, PreeditRegionPlan, SeatFocusChange, TextInputActivationBarrierRegistry,
+    TextInputReplayBarrierRegistry, TextInputState,
 };
 pub(crate) use self::render::{
     BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
@@ -49,14 +50,13 @@ pub(crate) use self::render::{
 #[cfg(test)]
 pub(crate) use self::window_placement::ShortcutReloadResult;
 pub(crate) use self::window_placement::{
-    PlacementBarrierCleanup, PlacementTarget, WindowArcIdLifetime, WindowGeometryMethod,
-    WindowHostPolicy, WindowPlacementGeometry, WindowPlacementMode, WindowPlacementPlan,
-    WindowPlacementPlanError, WindowPlacementRuntime, WindowPlacementRuntimeHandle,
-    WindowPlacementState,
+    PlacementBarrierCleanup, WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy,
+    WindowPlacementGeometry, WindowPlacementMode, WindowPlacementPlan, WindowPlacementPlanError,
+    WindowPlacementRuntime, WindowPlacementRuntimeHandle, WindowPlacementState, XdgToplevelRelease,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::{
-    TransientArcIdentity, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END,
+    PlacementTarget, TransientArcIdentity, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END,
     ARC_TASK_ID_POOL_START,
 };
 
@@ -862,6 +862,19 @@ pub struct Context {
     /// Host callback generations that drain stale text-input events before
     /// reactivation of a reused v1 object.
     pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
+    /// Host callback generations that prove a fresh v1 activation reached Exo
+    /// before the placement path replays editor state.
+    pub text_input_replay_barriers: TextInputReplayBarrierRegistry,
+    /// Monotonic `commit_state` serials sent to host text-input-v1 objects.
+    ///
+    /// The guest text-input-v3 serial is owned by the guest protocol and must
+    /// be echoed in `done` events. Host v1 commit-state serials are a separate
+    /// generation: an internal placement refresh can replay the same committed
+    /// editor state without receiving a new guest commit, so reusing the guest
+    /// serial can make Exo treat the replay as stale. Keep this map keyed by
+    /// host object ID; host v1 objects are connection-owned and never reused
+    /// after their guest pairing is retired.
+    host_text_input_commit_serials: HashMap<u32, u32>,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
@@ -1116,6 +1129,31 @@ impl Context {
             .transition_guest_key(host_keyboard_id, key, event)
     }
 
+    /// Allocate the next host v1 `commit_state` serial for one text-input
+    /// object.
+    ///
+    /// The first serial follows `preferred` so ordinary v3 traffic retains its
+    /// historical wire values. Subsequent allocations are independent of the
+    /// guest v3 serial and therefore remain fresh when an internal placement
+    /// barrier replays an already-committed editor state.
+    pub(crate) fn next_host_text_input_commit_serial(
+        &mut self,
+        host_v1_id: u32,
+        preferred: u32,
+    ) -> u32 {
+        match self.host_text_input_commit_serials.entry(host_v1_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(preferred);
+                preferred
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let next = entry.get().wrapping_add(1);
+                entry.insert(next);
+                next
+            }
+        }
+    }
+
     /// Claim delivery ownership for a key that currently has no guest owner.
     ///
     /// Returning `false` leaves the existing owner untouched. Callers can
@@ -1240,6 +1278,8 @@ impl Context {
             host_dmabuf_generation: None,
             dmabuf_capability_callbacks: HashMap::new(),
             text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
+            text_input_replay_barriers: TextInputReplayBarrierRegistry::default(),
+            host_text_input_commit_serials: HashMap::new(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
@@ -1698,16 +1738,33 @@ mod tests {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         assert!(page_size > 0);
         let page_size = page_size as usize;
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
+        // Use a private fixed address so another parallel test cannot
+        // immediately reuse the hole after `PoolState::drop`. A plain
+        // `mmap(NULL, ...)` followed by `mincore` is racy: once the pool is
+        // unmapped, the kernel may hand the same address to a different test
+        // before this assertion runs.
+        let mut mapped = libc::MAP_FAILED;
+        for hint in [
+            0x4000_0000_0000usize,
+            0x5000_0000_0000,
+            0x6000_0000_0000,
+            0x7000_0000_0000,
+        ] {
+            let candidate = unsafe {
+                libc::mmap(
+                    hint as *mut libc::c_void,
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if candidate != libc::MAP_FAILED {
+                mapped = candidate;
+                break;
+            }
+        }
         assert_ne!(mapped, libc::MAP_FAILED);
 
         let mut pipe_fds = [-1; 2];
@@ -1740,13 +1797,29 @@ mod tests {
             libc::close(pipe_fds[1]);
         }
 
-        errno_reset();
+        // Reclaiming the exact address with MAP_FIXED_NOREPLACE is atomic
+        // with respect to other mmap calls. If PoolState leaked the mapping,
+        // this fails with EEXIST instead of accidentally observing a fresh
+        // unrelated mapping.
+        let replacement = unsafe {
+            libc::mmap(
+                mapped,
+                page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
         assert_eq!(
-            unsafe { libc::mincore(mapped, page_size, &mut residency) },
-            -1,
+            replacement, mapped,
             "PoolState::drop must unmap a poisoned pool"
         );
-        assert_eq!(errno_value(), libc::ENOMEM);
+        assert_eq!(
+            unsafe { libc::munmap(replacement, page_size) },
+            0,
+            "test replacement mapping must be released"
+        );
     }
 
     #[test]
@@ -2297,15 +2370,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn errno_reset() {
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-    }
-
-    fn errno_value() -> i32 {
-        unsafe { *libc::__errno_location() }
     }
 }

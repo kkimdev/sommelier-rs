@@ -41,8 +41,9 @@ therefore does not create a genuine ARC task.
 ## IDs in the current rewrite
 
 When the public `--window-placement-backend` selects an ARC-backed mode
-(`set-parent`, `transient-arc`, or `persistent`), Sommelier reserves one
-numeric block before it accepts clients. The lower-level
+(`transient-arc` or `persistent`), Sommelier reserves one numeric block before
+it accepts clients. The native `set-parent` backend does not allocate or
+install an ARC identity. The lower-level
 `--window-host-policy=arc` spelling is retained only as a hidden development
 switch. The block is claimed by an exclusive filesystem lock under:
 
@@ -98,17 +99,15 @@ behavior. The allocator is still only a convention: ChromeOS does not provide
 a query through this Wayland path, so Sommelier cannot prove that a fabricated
 number is absent from Android's own task table.
 
-The named `--window-placement-backend=set-parent` mode uses this same
-persistent task-form Aura identity and the experimental
-`zaura_surface.set_parent` probe. It first sends
-`zaura_toplevel.set_window_bounds(current_x, current_y, width, height, output)`
-while the window is still top-level, then sends `set_parent` for the target
-position. This order matters because `set_parent` supplies no size and a
-later bounds request may be rejected. After the ordered sync barrier completes,
-Sommelier sends `set_parent(NULL, 0, 0)` to release the self-parent probe. The
-persistent ARC identity is still required for the bounds request to change
-width and height. The host XDG identity remains native, and no
-`org.chromium.arc.session.*` value is generated.
+The named `--window-placement-backend=set-parent` mode deliberately keeps the
+native Guest OS identity and uses the experimental `zaura_surface.set_parent`
+probe only for position. Size is negotiated through the normal XDG
+`configure`/`ack_configure`/`commit` path, with a host-side
+`xdg_surface.set_window_geometry` request. After the host has acknowledged the
+size and the self-parent position phase, Sommelier sends
+`set_parent(NULL, 0, 0)` to release the probe. No ARC task/session identity is
+allocated or installed in this mode, so the normal shelf icon and IME
+classification remain intact.
 
 The feature remains opt-in because the task-form namespace enables
 ARC-specific host behavior beyond bounds placement. A process that loses its
@@ -160,6 +159,38 @@ without a host capability: it reserves a positive private pool, never reuses
 an ID within a live process block, and coordinates all local Sommelier
 instances through `flock`. A real host capability remains preferable because
 only ARC/Android can establish global task ownership.
+
+## ChromiumOS property-lifetime finding (2026-08-22)
+
+The transient sequence is not a reversible policy transaction on the current
+ChromiumOS Exo implementation. `ShellSurfaceBase::SetApplicationId()` invokes
+`WMHelper::PopulateAppProperties()` on the existing Aura window. The ARC
+resolver adds `kAppTypeKey=ARC_APP`, restore/ghost properties, and
+`aura::client::kSkipImeProcessing=true` when it sees
+`org.chromium.arc.<task_id>`. The resolver has no inverse operation that
+removes those properties when a later native Guest OS ID is supplied; it only
+adds properties for recognized namespaces.
+
+Therefore:
+
+```text
+Guest ID -> ARC task ID -> Guest ID
+```
+
+restores the application-ID string but can leave the Aura window classified as
+ARC and keep the IME-skip property set. `components/exo/keyboard.cc` checks
+that property before running the normal `ConsumedByIme()` path, which matches
+the observed “English works, Korean composition stops after one placement”
+failure. Deactivate/activate replay inside Sommelier cannot clear a host Aura
+property that the Wayland protocol does not expose.
+
+This is why the transient backend must remain an experiment until a host-side
+property-clearing API is available. The persistent task-form backend avoids the
+mid-life identity transition (and has been the IME-stable comparison), but its
+fabricated task identity can degrade shelf/icon matching. The native Guest
+`set-parent` backend preserves IME and icon identity but cannot be assumed to
+resize: `ChromeSecurityDelegate::CanSetBounds()` returns `IGNORE` for a
+non-ARC window.
 
 ## Rejected experiment: fabricated ARC session IDs
 
@@ -227,6 +258,9 @@ Chromium ARC parsing and host classification:
 
 - [`chromeos/ash/experiences/arc/arc_util.cc`](https://chromium.googlesource.com/chromium/src/+/main/chromeos/ash/experiences/arc/arc_util.cc)
 - [`chrome/browser/ui/ash/shelf/app_service/exo_app_type_resolver.cc`](https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ui/ash/shelf/app_service/exo_app_type_resolver.cc)
+- [`components/exo/shell_surface_base.cc`](https://chromium.googlesource.com/chromium/src/+/main/components/exo/shell_surface_base.cc)
+- [`components/exo/keyboard.cc`](https://chromium.googlesource.com/chromium/src/+/main/components/exo/keyboard.cc)
+- [`chrome/browser/ash/exo/chrome_security_delegate.cc`](https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ash/exo/chrome_security_delegate.cc)
 
 ARC restore/session handling:
 

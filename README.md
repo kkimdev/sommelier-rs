@@ -166,6 +166,9 @@ cargo build --release
 # Test
 cargo test --workspace --all-targets -- --test-threads=1
 
+# Fast local iteration (the CI/release command above remains serialized)
+cargo test --workspace --all-targets -- --test-threads=4
+
 # Verify formatting and lints
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -215,16 +218,17 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-placement-backend set-parent\|transient-arc\|persistent` | Explicitly opt into a placement backend. `set-parent` is the supported custom-host experiment: persistent `org.chromium.arc.<task_id>` Aura authorization plus a bounds-first self-parent position probe. `transient-arc` additionally probes nullable-parent cleanup and native-ID restoration after the barrier; the other values are comparison experiments. |
+| `--window-placement-backend set-parent\|transient-arc\|persistent\|remote-shell-v2` | Select a placement backend. The default is `set-parent`: it keeps the native Guest OS identity, applies size through the normal XDG configure/commit handshake, and uses the experimental self-parent probe for position. `transient-arc` authorizes one direct Aura bounds request with an ARC task ID, then restores the native identity; `persistent` retains the ARC task ID for the window lifetime; `remote-shell-v2` uses the host's official `zcr_remote_shell_v2` role and is opt-in/experimental. |
 | `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option is supplied. |
 
-Window shortcuts and all placement geometry are disabled by default. To opt in
-to the tested backend, provide both the backend and a config file:
+Window shortcuts are disabled until a config file is explicitly supplied. With
+no backend option, the native `set-parent` backend is selected, but no
+placement request is sent while the binding set is empty. To enable the tested
+nine-grid bindings, provide the config file:
 
 ```bash
 ./target/release/sommelier \
   --virtio-wl /dev/wl0 \
-  --window-placement-backend set-parent \
   --window-shortcuts-config "$HOME/.config/sommelier/window-shortcuts.toml" \
   wayland-2
 ```
@@ -246,6 +250,15 @@ for legacy in-process compatibility paths; the production CLI no longer reads
 them. Use the explicit options above, and never enable the experimental
 `self-parent` method on the shared system Sommelier instance.
 
+`remote-shell-v2` is a separate host-managed path. It does not allocate ARC
+task IDs or send `zaura_toplevel.set_window_bounds`; Sommelier creates a
+`zcr_remote_surface_v2` role for each XDG surface, forwards app/title metadata,
+and uses the protocol's `set_bounds_in_output` request. The host must advertise
+`zcr_remote_shell_v2` to the Sommelier connection. If the host hides that global
+(for example, its security delegate does not grant remote-shell access), the
+opt-in proxy reports the missing capability and closes that client rather than
+silently falling back to another backend.
+
 ## Design notes
 
 - `sommelier/src/state/window_placement/mod.rs` is the single owner of the
@@ -253,11 +266,14 @@ them. Use the explicit options above, and never enable the experimental
   wl_surface/Aura associations, per-toplevel origins, self-parent convergence,
   ARC task IDs, and host-sync barrier lifetimes. Its `runtime.rs`, `plan.rs`,
   and `support.rs` children contain only the corresponding value types and
-  lifecycle primitives. Each connection's `WindowPlacementState` owns only its
-  lifecycle maps and shares the immutable runtime; handlers serialize plans but
-  cannot choose a backend or mutate those maps directly. Association/origin/
-  barrier mutators are fallible and `#[must_use]`, and debug builds assert the
-  reverse-map and teardown invariants after every mutation.
+  lifecycle primitives. `runtime.rs` collapses the hidden host-policy,
+  geometry, and ARC-lifetime inputs into one closed `WindowPlacementMode`, so
+  invalid combinations cannot be represented after startup validation. Each
+  connection's `WindowPlacementState` owns only its lifecycle maps and shares
+  the immutable runtime; handlers serialize plans but cannot choose a backend
+  or mutate those maps directly. Association/origin/barrier mutators are
+  fallible and `#[must_use]`, and debug builds assert the reverse-map and
+  teardown invariants after every mutation.
 - [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md) documents ARC task IDs, restore-session IDs, and the allocator used by this experiment.
 - [`sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md`](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md) documents ChromeOS accelerator acknowledgement and shortcut inhibition.
 - [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md) documents the inline shortcut schema and runtime reload contract.

@@ -97,6 +97,22 @@ pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
     }
 }
 
+/// Retire a guest object whose proxy facade has a synthetic host mapping.
+///
+/// The remote-shell backend gives its local XDG facade host-side IDs so the
+/// normal placement join can validate one complete target. Those host IDs do
+/// not represent real compositor objects, so no host destructor or
+/// `wl_display.delete_id` can acknowledge them. Queue the guest-side
+/// acknowledgement and release both synthetic mappings atomically.
+pub(crate) fn queue_mapped_local_delete_id(ctx: &mut Context, guest_id: u32) {
+    if ctx.shadow_table.get_interface(guest_id).is_some()
+        && ctx.shadow_table.get_host_id(guest_id).is_some()
+        && queue_guest_delete_id(ctx, guest_id)
+    {
+        ctx.shadow_table.remove_id(guest_id);
+    }
+}
+
 fn queue_message(
     queue: &mut Vec<(Vec<u8>, Vec<std::os::unix::io::RawFd>)>,
     sender_id: u32,
@@ -320,6 +336,26 @@ mod tests {
         assert!(
             ctx.host_to_client_queue[0].0.len() <= 0xffff,
             "the bounded diagnostic must fit Wayland's message length field"
+        );
+    }
+
+    #[test]
+    fn mapped_local_delete_retires_synthetic_facade_and_acknowledges_guest() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.shadow_table
+            .track_interface_with_version(20, "xdg_toplevel".to_string(), 3);
+        ctx.shadow_table
+            .track_host_interface_with_version(200, "xdg_toplevel".to_string(), 3);
+
+        queue_mapped_local_delete_id(&mut ctx, 20);
+
+        assert_eq!(ctx.shadow_table.get_interface(20), None);
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
+            20
         );
     }
 }

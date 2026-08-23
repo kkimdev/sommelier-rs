@@ -68,8 +68,24 @@ impl WlCallbackHandler for CallbackHandler {
             return Action::Drop;
         }
         if let Some(completion) = ctx.window_placement.complete_barrier(host_id) {
+            log::info!(
+                "[placement#{}] host wl_callback.done callback={} data={} \
+                 toplevel={} cleanup={:?}",
+                completion
+                    .trace_id
+                    .map_or_else(|| "?".to_string(), |trace_id| trace_id.to_string()),
+                host_id,
+                callback_data,
+                completion.toplevel_id,
+                completion.cleanup
+            );
             if let Some(cleanup) = completion.cleanup.as_ref() {
-                if !crate::handler::placement::queue_barrier_cleanup(ctx, cleanup) {
+                if !crate::handler::placement::queue_barrier_cleanup_with_trace(
+                    ctx,
+                    completion.toplevel_id,
+                    cleanup,
+                    completion.trace_id,
+                ) {
                     log::warn!(
                         "Unable to apply placement cleanup after barrier on \
                          zaura_toplevel {}: {:?}",
@@ -146,6 +162,11 @@ mod tests {
     use crate::state::{Context, PlacementBarrierCleanup};
     use crate::wire::Action;
 
+    fn register_aura_toplevel(ctx: &mut Context) {
+        assert!(ctx.window_placement.remember_xdg_surface(200, 101));
+        assert!(ctx.window_placement.remember_xdg_toplevel(100, 101));
+    }
+
     #[test]
     fn internal_dmabuf_callback_completes_exact_generation() {
         let callback_id = 40;
@@ -208,6 +229,7 @@ mod tests {
             "wl_callback".to_string(),
             1,
         );
+        register_aura_toplevel(&mut ctx);
         assert!(ctx
             .window_placement
             .remember_aura_toplevel(100, zaura_toplevel_id));
@@ -246,6 +268,7 @@ mod tests {
             "zaura_surface".to_string(),
             2,
         );
+        register_aura_toplevel(&mut ctx);
         assert!(ctx
             .window_placement
             .remember_aura_toplevel(100, zaura_toplevel_id));
@@ -278,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_arc_cleanup_unparents_before_restoring_native_identity() {
+    fn transient_arc_cleanup_restores_native_identity_without_unparenting() {
         let zaura_toplevel_id = 77;
         let zaura_surface_id = 55;
         let callback_id = 40;
@@ -294,6 +317,7 @@ mod tests {
             "zaura_surface".to_string(),
             5,
         );
+        register_aura_toplevel(&mut ctx);
         assert!(ctx
             .window_placement
             .remember_aura_toplevel(100, zaura_toplevel_id));
@@ -302,12 +326,10 @@ mod tests {
         assert!(ctx.window_placement.register_barrier(
             callback_id,
             zaura_toplevel_id,
-            Some(
-                PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
-                    zaura_surface_id,
-                    wl_surface_guest_id: 100,
-                }
-            )
+            Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+                zaura_surface_id,
+                wl_surface_guest_id: 100,
+            })
         ));
         let newer_native_id = "org.chromium.guest_os.termina.wayland.updated";
         ctx.window_placement
@@ -316,24 +338,36 @@ mod tests {
 
         let mut handler = CallbackHandler;
         assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            2,
+            "native identity restoration must carry a separate sync barrier"
+        );
         assert_eq!(
             u16::from_ne_bytes(ctx.client_to_host_queue[0].0[4..6].try_into().unwrap()),
-            REQ_SET_PARENT
-        );
-        assert_eq!(
-            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[8..12].try_into().unwrap()),
-            0
-        );
-        assert_eq!(
-            u16::from_ne_bytes(ctx.client_to_host_queue[1].0[4..6].try_into().unwrap()),
             REQ_SET_APPLICATION_ID
         );
-        let payload = &ctx.client_to_host_queue[1].0[8..];
+        let payload = &ctx.client_to_host_queue[0].0[8..];
         let length = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
         assert_eq!(
             std::str::from_utf8(&payload[4..4 + length - 1]).unwrap(),
             newer_native_id
+        );
+        let identity_callback_id = u32::from_ne_bytes(
+            ctx.client_to_host_queue[1].0[8..12]
+                .try_into()
+                .expect("identity sync callback payload"),
+        );
+        assert_eq!(
+            ctx.window_placement
+                .barrier_for_callback(identity_callback_id),
+            Some(zaura_toplevel_id)
+        );
+        ctx.last_sender_id = identity_callback_id;
+        assert_eq!(handler.on_done(&mut ctx, 1), Action::Drop);
+        assert!(
+            !ctx.window_placement.has_any_barriers(),
+            "identity barrier cleanup must complete before the next IME phase"
         );
     }
 
@@ -356,6 +390,7 @@ mod tests {
             "zaura_surface".to_string(),
             2,
         );
+        register_aura_toplevel(&mut ctx);
         assert!(ctx
             .window_placement
             .remember_aura_toplevel(100, zaura_toplevel_id));

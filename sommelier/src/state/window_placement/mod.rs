@@ -25,19 +25,24 @@ limitations under the License.
 mod plan;
 mod runtime;
 mod support;
+mod transaction;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use log::warn;
 
+use super::ShadowTable;
 use crate::accelerator::Accelerator;
-use crate::window_shortcuts::{NormalizedRect, ShortcutConfig, ShortcutConfigHandle};
+#[cfg(test)]
+use crate::window_shortcuts::ShortcutConfigHandle;
+use crate::window_shortcuts::{NormalizedRect, ShortcutConfig};
 
 use self::support::{
     AuraShellBinding, BidirectionalLinks, GtkShellState, GtkSurfaceState, OutputRecord,
-    PlacementBarrierRegistry, SurfaceApplicationState, ToplevelPlacementState,
+    PlacementBarrierRegistry, RemoteShellBinding, SurfaceApplicationState, ToplevelPlacementState,
 };
+use self::transaction::{ConfigureToken, HostResizeResult, OriginResult, SelfParentPhase};
 
 pub(crate) use self::plan::{
     OutputState, PlacementBarrierCleanup, PlacementTarget, TransientArcIdentity,
@@ -53,7 +58,24 @@ pub(crate) use self::runtime::{
     WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode,
     WindowPlacementRuntime, WindowPlacementRuntimeHandle, ARC_TASK_APPLICATION_ID_PREFIX,
 };
-pub(crate) use self::support::PlacementBarrierCompletion;
+pub(crate) use self::support::{PlacementBarrierCompletion, XdgToplevelRelease};
+
+/// Host surface, authoritative origin, and relative self-parent delta that
+/// become available after the resize phase is acknowledged.
+pub(crate) type PendingSelfParentMove = (u32, (i32, i32), (i32, i32));
+/// Deferred self-parent target plus the host surface and origin needed to
+/// serialize its next parent request.
+pub(crate) type DeferredSelfParentMove = (u32, (i32, i32), (i32, i32), (i32, i32, i32, i32));
+
+/// Maximum client-size adjustment ChromeOS may make for a decorated window.
+///
+/// `zaura_toplevel.configure` reports the client rectangle, while placement
+/// targets are expressed in screen/work-area coordinates. A decorated window
+/// can therefore report a slightly smaller client size than the requested
+/// work-area height. The custom host observed a 48 px adjustment; this bound
+/// leaves room for frame variants without accepting an unrelated stale
+/// configure from a previous half/full-screen size.
+const MAX_HOST_CLIENT_SIZE_ADJUSTMENT: i32 = 256;
 
 /// All mutable state owned by the window-placement feature.
 ///
@@ -65,6 +87,7 @@ pub(crate) use self::support::PlacementBarrierCompletion;
 pub(crate) struct WindowPlacementState {
     runtime: WindowPlacementRuntimeHandle,
     aura_shell: Option<AuraShellBinding>,
+    remote_shell: Option<RemoteShellBinding>,
     /// Native and compatibility application IDs for each guest surface.
     ///
     /// The XDG role always retains the native identity even when the Aura
@@ -73,8 +96,23 @@ pub(crate) struct WindowPlacementState {
     application_ids: HashMap<u32, SurfaceApplicationState>,
     aura_surface_links: BidirectionalLinks,
     aura_toplevel_links: BidirectionalLinks,
+    /// Host `wl_output` to its internal `zaura_output` child.
+    ///
+    /// ChromeOS publishes the usable work-area in the child's `insets`
+    /// event.  Keep this association separate from guest-facing output
+    /// mappings because the Aura child is host-only.
+    aura_output_links: BidirectionalLinks,
+    remote_surface_links: BidirectionalLinks,
+    remote_toplevel_links: BidirectionalLinks,
     xdg_surface_links: BidirectionalLinks,
     xdg_toplevel_links: BidirectionalLinks,
+    /// Synthetic `xdg_surface.configure` serials sent to a guest client.
+    ///
+    /// These serials are deliberately kept separate from host serials.  A
+    /// guest acknowledgement for one of them is consumed locally because no
+    /// matching configure exists in the host compositor.
+    synthetic_xdg_configure_serials: HashMap<u32, HashSet<u32>>,
+    next_synthetic_xdg_configure_serial: u32,
     toplevels: HashMap<u32, ToplevelPlacementState>,
     barriers: PlacementBarrierRegistry,
     outputs: Vec<OutputRecord>,
@@ -94,6 +132,9 @@ impl WindowPlacementState {
     fn debug_assert_consistent(&self) {
         debug_assert!(self.aura_surface_links.is_consistent());
         debug_assert!(self.aura_toplevel_links.is_consistent());
+        debug_assert!(self.aura_output_links.is_consistent());
+        debug_assert!(self.remote_surface_links.is_consistent());
+        debug_assert!(self.remote_toplevel_links.is_consistent());
         debug_assert!(self.xdg_surface_links.is_consistent());
         debug_assert!(self.xdg_toplevel_links.is_consistent());
         debug_assert!(self.outputs.iter().enumerate().all(|(index, output)| {
@@ -126,6 +167,7 @@ impl WindowPlacementState {
     }
 
     /// Create empty placement state for one connection.
+    #[cfg(test)]
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
         Self::with_runtime(WindowPlacementRuntime::new(
             mode,
@@ -144,11 +186,17 @@ impl WindowPlacementState {
         Self {
             runtime,
             aura_shell: None,
+            remote_shell: None,
             application_ids: HashMap::new(),
             aura_surface_links: BidirectionalLinks::default(),
             aura_toplevel_links: BidirectionalLinks::default(),
+            aura_output_links: BidirectionalLinks::default(),
+            remote_surface_links: BidirectionalLinks::default(),
+            remote_toplevel_links: BidirectionalLinks::default(),
             xdg_surface_links: BidirectionalLinks::default(),
             xdg_toplevel_links: BidirectionalLinks::default(),
+            synthetic_xdg_configure_serials: HashMap::new(),
+            next_synthetic_xdg_configure_serial: 0xf000_0000,
             toplevels: HashMap::new(),
             barriers: PlacementBarrierRegistry::default(),
             outputs: Vec::new(),
@@ -161,6 +209,11 @@ impl WindowPlacementState {
     /// Return the most recent mode-independent shortcut capability.
     pub(crate) fn handles_shortcuts(&self) -> bool {
         self.runtime.mode().handles_shortcuts()
+    }
+
+    /// Return the immutable process-wide placement mode for diagnostics.
+    pub(crate) fn mode(&self) -> WindowPlacementMode {
+        self.runtime.mode()
     }
 
     /// Return whether this connection uses the ARC application namespace.
@@ -188,6 +241,10 @@ impl WindowPlacementState {
         self.runtime.mode().uses_self_parent()
     }
 
+    pub(crate) fn uses_remote_shell(&self) -> bool {
+        self.runtime.mode().uses_remote_shell()
+    }
+
     /// Return the internally bound Aura shell manager, if one is live.
     pub(crate) const fn aura_shell_id(&self) -> Option<u32> {
         match self.aura_shell {
@@ -210,6 +267,56 @@ impl WindowPlacementState {
             Some(binding) => Some(binding.global_name),
             None => None,
         }
+    }
+
+    /// Return the internally bound remote-shell manager, if one is live.
+    pub(crate) const fn remote_shell_id(&self) -> Option<u32> {
+        match self.remote_shell {
+            Some(binding) => Some(binding.host_id),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn remote_shell_version(&self) -> u32 {
+        match self.remote_shell {
+            Some(binding) => binding.version,
+            None => 0,
+        }
+    }
+
+    pub(crate) const fn remote_shell_global_name(&self) -> Option<u32> {
+        match self.remote_shell {
+            Some(binding) => Some(binding.global_name),
+            None => None,
+        }
+    }
+
+    #[must_use = "a live remote-shell generation must not be overwritten"]
+    pub(crate) fn set_remote_shell_binding(
+        &mut self,
+        host_id: u32,
+        global_name: u32,
+        version: u32,
+    ) -> bool {
+        if self.remote_shell.is_some() {
+            return false;
+        }
+        self.remote_shell = Some(RemoteShellBinding {
+            host_id,
+            global_name,
+            version,
+        });
+        self.debug_assert_consistent();
+        true
+    }
+
+    pub(crate) fn take_remote_shell_for_global(&mut self, global_name: u32) -> Option<(u32, u32)> {
+        if self.remote_shell?.global_name != global_name {
+            return None;
+        }
+        let binding = self.remote_shell.take()?;
+        self.debug_assert_consistent();
+        Some((binding.host_id, binding.version))
     }
 
     /// Publish one complete Aura shell binding generation.
@@ -500,6 +607,102 @@ impl WindowPlacementState {
         true
     }
 
+    /// Return all live host output IDs.
+    ///
+    /// The registry adapter uses this snapshot when the internally-bound Aura
+    /// shell arrives after a guest has already bound an output. Returning an
+    /// owned vector avoids holding a state borrow while new host child objects
+    /// are allocated.
+    pub(crate) fn output_host_ids(&self) -> Vec<u32> {
+        self.outputs.iter().map(|output| output.host_id).collect()
+    }
+
+    /// Associate an internal `zaura_output` child with its host `wl_output`.
+    #[must_use = "a duplicate or conflicting Aura output child must not be used"]
+    pub(crate) fn remember_aura_output(
+        &mut self,
+        wl_output_host_id: u32,
+        zaura_output_host_id: u32,
+    ) -> bool {
+        let known_output = self
+            .outputs
+            .iter()
+            .any(|output| output.host_id == wl_output_host_id);
+        if !known_output
+            || self
+                .aura_output_links
+                .get_forward(wl_output_host_id)
+                .is_some()
+        {
+            return self.aura_output_links.get_forward(wl_output_host_id)
+                == Some(zaura_output_host_id);
+        }
+        let inserted = self
+            .aura_output_links
+            .insert(wl_output_host_id, zaura_output_host_id);
+        self.debug_assert_consistent();
+        inserted
+    }
+
+    /// Resolve the internal Aura output child for one host output.
+    pub(crate) fn aura_output_for_output(&self, wl_output_host_id: u32) -> Option<u32> {
+        self.aura_output_links.get_forward(wl_output_host_id)
+    }
+
+    /// Remove and return the internal Aura output child for one host output.
+    ///
+    /// The caller owns the corresponding host-only `zaura_output.release`
+    /// request. Removing the association first makes delayed inset events
+    /// harmless while the release is in flight.
+    pub(crate) fn take_aura_output_for_output(&mut self, wl_output_host_id: u32) -> Option<u32> {
+        let zaura_output_host_id = self.aura_output_links.remove_forward(wl_output_host_id)?;
+        self.debug_assert_consistent();
+        Some(zaura_output_host_id)
+    }
+
+    /// Apply a ChromeOS work-area inset event to its associated output.
+    ///
+    /// `zaura_output.insets` is already expressed in logical screen
+    /// coordinates, so it is stored without output-scale conversion.
+    #[must_use = "insets from an unknown or retired Aura output are stale"]
+    pub(crate) fn update_output_insets(
+        &mut self,
+        zaura_output_host_id: u32,
+        top: i32,
+        left: i32,
+        bottom: i32,
+        right: i32,
+    ) -> bool {
+        let Some(wl_output_host_id) = self.aura_output_links.get_reverse(zaura_output_host_id)
+        else {
+            return false;
+        };
+        let Some(output) = self
+            .outputs
+            .iter_mut()
+            .find(|output| output.host_id == wl_output_host_id)
+        else {
+            return false;
+        };
+        if [top, left, bottom, right].iter().any(|inset| *inset < 0) {
+            log::warn!(
+                "Ignoring negative zaura_output.insets for output {}: top={} left={} bottom={} right={}",
+                wl_output_host_id,
+                top,
+                left,
+                bottom,
+                right
+            );
+            return false;
+        }
+        output.state.insets_top = top;
+        output.state.insets_left = left;
+        output.state.insets_bottom = bottom;
+        output.state.insets_right = right;
+        self.debug_assert_consistent();
+        true
+    }
+
     /// Return a mutable output record only while its host object is live.
     fn output_state_mut(&mut self, host_output_id: u32) -> Option<&mut OutputState> {
         self.outputs
@@ -522,10 +725,20 @@ impl WindowPlacementState {
         let Some(output) = self.output_state_mut(host_output_id) else {
             return;
         };
+        let previous = *output;
         if current || output.mode_width == 0 || output.mode_height == 0 {
             output.mode_width = width;
             output.mode_height = height;
         }
+        log::debug!(
+            "placement output mode host={} current={} incoming={}x{} previous={:?} now={:?}",
+            host_output_id,
+            current,
+            width,
+            height,
+            previous,
+            *output
+        );
         self.debug_assert_consistent();
     }
 
@@ -534,7 +747,15 @@ impl WindowPlacementState {
         let Some(output) = self.output_state_mut(host_output_id) else {
             return;
         };
+        let previous = *output;
         output.scale = scale;
+        log::debug!(
+            "placement output scale host={} incoming={} previous={:?} now={:?}",
+            host_output_id,
+            scale,
+            previous,
+            *output
+        );
         self.debug_assert_consistent();
     }
 
@@ -562,25 +783,113 @@ impl WindowPlacementState {
         Some((host_id, bounds))
     }
 
+    /// Resolve one focused guest role into the complete placement target.
+    ///
+    /// Guest/host object mappings come from the shadow table, while the
+    /// placement-specific Aura/XDG associations come from this state owner.
+    /// Keeping the join here prevents a protocol adapter from accidentally
+    /// combining IDs belonging to different surfaces.
+    fn resolve_target(
+        &self,
+        shadow_table: &ShadowTable,
+        guest_xdg_toplevel_id: u32,
+        guest_wl_surface_id: u32,
+    ) -> Option<PlacementTarget> {
+        if !shadow_table.guest_object_matches(guest_xdg_toplevel_id, "xdg_toplevel")
+            || !shadow_table.guest_object_matches(guest_wl_surface_id, "wl_surface")
+            || self.wl_surface_for_xdg_toplevel(guest_xdg_toplevel_id) != Some(guest_wl_surface_id)
+        {
+            return None;
+        }
+        let host_xdg_toplevel_id = shadow_table.get_host_id(guest_xdg_toplevel_id)?;
+        let wl_surface_host_id = shadow_table.get_host_id(guest_wl_surface_id)?;
+        if !shadow_table.host_object_matches(host_xdg_toplevel_id, "xdg_toplevel")
+            || !shadow_table.host_object_matches(wl_surface_host_id, "wl_surface")
+        {
+            return None;
+        }
+        let (zaura_toplevel_host_id, zaura_surface_host_id, zaura_surface_version) = if self
+            .uses_remote_shell()
+        {
+            let remote_surface_host_id = self.remote_surface_for_wl_surface(wl_surface_host_id)?;
+            (
+                0,
+                remote_surface_host_id,
+                shadow_table
+                    .host_object_version(remote_surface_host_id)
+                    .unwrap_or(self.remote_shell_version()),
+            )
+        } else {
+            let zaura_toplevel_host_id =
+                self.aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)?;
+            let zaura_surface_host_id = self.aura_surface_for_wl_surface(wl_surface_host_id)?;
+            let zaura_surface_version = shadow_table
+                .host_object_version(zaura_surface_host_id)
+                .unwrap_or(self.aura_shell_version());
+            (
+                zaura_toplevel_host_id,
+                zaura_surface_host_id,
+                zaura_surface_version,
+            )
+        };
+
+        Some(PlacementTarget::new(
+            guest_xdg_toplevel_id,
+            guest_wl_surface_id,
+            wl_surface_host_id,
+            host_xdg_toplevel_id,
+            zaura_toplevel_host_id,
+            zaura_surface_host_id,
+            zaura_surface_version,
+        ))
+    }
+
     /// Verify that a plan still refers to the same live role associations
     /// used when it was prepared.
     ///
     /// The wire adapter calls this immediately before serialization as a
-    /// defensive boundary. Keeping the check here prevents a caller from
-    /// pairing IDs from different surfaces or replaying a plan after teardown
-    /// without duplicating the association invariant outside the owner.
-    pub(crate) fn target_is_current(&self, target: PlacementTarget) -> bool {
-        self.xdg_toplevel_links
-            .get_forward(target.guest_xdg_toplevel_id)
-            == Some(target.wl_surface_guest_id)
+    /// defensive boundary. Keeping the guest/host mapping and placement-link
+    /// checks here prevents a caller from pairing IDs from different surfaces
+    /// or replaying a plan after teardown.
+    pub(crate) fn plan_is_current(
+        &self,
+        shadow_table: &ShadowTable,
+        plan: &WindowPlacementPlan,
+    ) -> bool {
+        let target = plan.target();
+        shadow_table.guest_object_matches(target.guest_xdg_toplevel_id(), "xdg_toplevel")
+            && shadow_table.guest_object_matches(target.wl_surface_guest_id(), "wl_surface")
             && self
-                .aura_toplevel_links
-                .get_forward(target.guest_xdg_toplevel_id)
-                == Some(target.zaura_toplevel_host_id)
-            && self
-                .aura_surface_links
-                .get_forward(target.wl_surface_host_id)
-                == Some(target.zaura_surface_host_id)
+                .xdg_toplevel_links
+                .get_forward(target.guest_xdg_toplevel_id())
+                == Some(target.wl_surface_guest_id())
+            && if self.uses_remote_shell() {
+                target.zaura_toplevel_host_id() == 0
+                    && self.remote_surface_for_wl_surface(target.wl_surface_host_id())
+                        == Some(target.zaura_surface_host_id())
+            } else {
+                self.aura_toplevel_links
+                    .get_forward(target.guest_xdg_toplevel_id())
+                    == Some(target.zaura_toplevel_host_id())
+                    && self
+                        .aura_surface_links
+                        .get_forward(target.wl_surface_host_id())
+                        == Some(target.zaura_surface_host_id())
+            }
+            && shadow_table.get_host_id(target.guest_xdg_toplevel_id())
+                == Some(target.host_xdg_toplevel_id())
+            && shadow_table.get_host_id(target.wl_surface_guest_id())
+                == Some(target.wl_surface_host_id())
+            && shadow_table.host_object_matches(target.host_xdg_toplevel_id(), "xdg_toplevel")
+            && shadow_table.host_object_matches(target.wl_surface_host_id(), "wl_surface")
+            && if self.uses_remote_shell() {
+                shadow_table
+                    .host_object_matches(target.zaura_surface_host_id(), "zcr_remote_surface_v2")
+            } else {
+                shadow_table.host_object_matches(target.zaura_toplevel_host_id(), "zaura_toplevel")
+                    && shadow_table
+                        .host_object_matches(target.zaura_surface_host_id(), "zaura_surface")
+            }
     }
 
     /// Validate and prepare one shortcut placement.
@@ -592,34 +901,54 @@ impl WindowPlacementState {
     /// and barrier have been queued.
     pub(crate) fn prepare_placement(
         &mut self,
+        shadow_table: &ShadowTable,
+        guest_xdg_toplevel_id: u32,
+        guest_wl_surface_id: u32,
         rect: NormalizedRect,
-        target: PlacementTarget,
     ) -> Result<WindowPlacementPlan, WindowPlacementPlanError> {
         if !self.handles_shortcuts() {
             return Err(WindowPlacementPlanError::Disabled);
         }
-        if !self.target_is_current(target) {
-            return Err(WindowPlacementPlanError::TargetUnavailable);
-        }
+        let target = self
+            .resolve_target(shadow_table, guest_xdg_toplevel_id, guest_wl_surface_id)
+            .ok_or(WindowPlacementPlanError::TargetUnavailable)?;
         let Some((output_host_id, bounds)) = self.bounds_for_rect(rect) else {
             return Err(WindowPlacementPlanError::NoUsableOutput);
         };
+        if self.uses_self_parent()
+            && self.is_self_parent_target_current(
+                target.zaura_toplevel_host_id(),
+                (bounds.0, bounds.1, bounds.2, bounds.3),
+            )
+        {
+            return Err(WindowPlacementPlanError::AlreadyAtTarget);
+        }
         if self.uses_self_parent() && self.uses_transient_arc_id() {
             return Err(WindowPlacementPlanError::UnsupportedGeometry);
+        }
+        if self.uses_remote_shell() {
+            return Ok(WindowPlacementPlan::new(
+                target,
+                output_host_id,
+                bounds,
+                WindowPlacementGeometry::RemoteShell,
+                None,
+                None,
+            ));
         }
         // Transient placement needs both nullable set_parent (v2) for
         // cleanup and set_application_id (v5) for the temporary ARC task
         // identity. Reject the whole plan before allocating/queueing anything
         // when the latter capability is unavailable.
-        if self.uses_transient_arc_id() && target.zaura_surface_version < 5 {
+        if self.uses_transient_arc_id() && target.zaura_surface_version() < 5 {
             return Err(WindowPlacementPlanError::UnsupportedSurfaceVersion);
         }
 
         let geometry = if self.uses_self_parent() {
-            if target.zaura_surface_version < 2 {
+            if target.zaura_surface_version() < 2 {
                 return Err(WindowPlacementPlanError::UnsupportedSurfaceVersion);
             }
-            let Some(current_origin) = self.origin(target.zaura_toplevel_host_id) else {
+            let Some(current_origin) = self.origin(target.zaura_toplevel_host_id()) else {
                 return Err(WindowPlacementPlanError::OriginUnknown);
             };
             let Some(relative_x) = bounds.0.checked_sub(current_origin.0) else {
@@ -640,45 +969,45 @@ impl WindowPlacementState {
 
         let transient_arc_identity = if self.uses_transient_arc_id() {
             if self
-                .native_application_id(target.wl_surface_guest_id)
+                .native_application_id(target.wl_surface_guest_id())
                 .is_none()
             {
                 return Err(WindowPlacementPlanError::NativeApplicationIdMissing);
             }
             let Some(arc_application_id) =
-                self.arc_policy_application_id(target.wl_surface_guest_id)
+                self.arc_policy_application_id(target.wl_surface_guest_id())
             else {
                 return Err(WindowPlacementPlanError::ArcTaskIdUnavailable);
             };
-            Some(TransientArcIdentity {
+            Some(TransientArcIdentity::new(
                 arc_application_id,
-                wl_surface_guest_id: target.wl_surface_guest_id,
-            })
+                target.wl_surface_guest_id(),
+            ))
         } else {
             None
         };
 
         let barrier_cleanup = if self.uses_self_parent() {
             Some(PlacementBarrierCleanup::Unparent {
-                zaura_surface_id: target.zaura_surface_host_id,
+                zaura_surface_id: target.zaura_surface_host_id(),
             })
         } else {
             transient_arc_identity.as_ref().map(|identity| {
-                PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
-                    zaura_surface_id: target.zaura_surface_host_id,
-                    wl_surface_guest_id: identity.wl_surface_guest_id,
+                PlacementBarrierCleanup::RestoreNativeApplicationId {
+                    zaura_surface_id: target.zaura_surface_host_id(),
+                    wl_surface_guest_id: identity.wl_surface_guest_id(),
                 }
             })
         };
 
-        Ok(WindowPlacementPlan {
+        Ok(WindowPlacementPlan::new(
             target,
             output_host_id,
             bounds,
             geometry,
             transient_arc_identity,
             barrier_cleanup,
-        })
+        ))
     }
 
     /// Commit the state transition represented by an already-queued plan.
@@ -686,16 +1015,57 @@ impl WindowPlacementState {
     /// Preparation intentionally does not publish a predicted origin. This
     /// keeps a failed identity/message encoding from leaving lifecycle state
     /// that claims a request was sent. Direct bounds have no local transition;
-    /// self-parent plans publish the target only after their wire sequence is
-    /// queued.
+    /// self-parent plans arm a resize/position state machine only after their
+    /// first wire phase is queued.
     #[must_use = "a self-parent prediction may target a released toplevel"]
     pub(crate) fn commit_placement_plan(&mut self, plan: &WindowPlacementPlan) -> bool {
-        match plan.geometry {
-            WindowPlacementGeometry::Bounds => true,
-            WindowPlacementGeometry::SelfParent { .. } => self.predict_origin(
-                plan.target.zaura_toplevel_host_id,
-                (plan.bounds.0, plan.bounds.1),
-            ),
+        self.commit_placement_plan_with_configure(plan, None)
+    }
+
+    /// Commit a placement plan and, for a self-parent resize, bind the exact
+    /// synthetic configure token before publishing the wire batch.
+    ///
+    /// The optional token is supplied only by the wire adapter after all
+    /// messages have been encoded successfully. Binding it here makes the
+    /// reducer live before the guest can observe the configure, eliminating
+    /// the previous queue-first/state-second race.
+    pub(crate) fn commit_placement_plan_with_configure(
+        &mut self,
+        plan: &WindowPlacementPlan,
+        configure: Option<(u32, u32)>,
+    ) -> bool {
+        match plan.geometry() {
+            WindowPlacementGeometry::Bounds | WindowPlacementGeometry::RemoteShell => true,
+            WindowPlacementGeometry::SelfParent { .. } => {
+                let toplevel_id = plan.target().zaura_toplevel_host_id();
+                let target = (
+                    plan.bounds().0,
+                    plan.bounds().1,
+                    plan.bounds().2,
+                    plan.bounds().3,
+                );
+                if self.self_parent_transaction_active(toplevel_id) {
+                    // A transaction is already on the host stream. Retain
+                    // only the newest user target; the event-driven phase
+                    // transition will publish it after the current resize or
+                    // cleanup barrier completes.
+                    return self.defer_self_parent_target(toplevel_id, target);
+                }
+                if !self.arm_self_parent_target(
+                    toplevel_id,
+                    plan.target().zaura_surface_host_id(),
+                    target,
+                ) {
+                    return false;
+                }
+                if let Some((xdg_surface_id, serial)) = configure {
+                    if !self.gate_resize_on_guest_commit(toplevel_id, xdg_surface_id, serial) {
+                        let _ = self.abort_self_parent_resize(toplevel_id);
+                        return false;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -721,8 +1091,196 @@ impl WindowPlacementState {
         self.xdg_surface_links.get_forward(xdg_surface_guest_id)
     }
 
+    /// Resolve the xdg_surface role associated with a guest wl_surface.
+    ///
+    /// The reverse lookup is used when a compositor-owned placement needs to
+    /// send a synthetic configure event to the client.  Keeping this
+    /// association in the same bidirectional table prevents a configure from
+    /// being sent to an unrelated role after object-ID reuse.
+    pub(crate) fn xdg_surface_for_wl_surface(&self, wl_surface_guest_id: u32) -> Option<u32> {
+        self.xdg_surface_links.get_reverse(wl_surface_guest_id)
+    }
+
+    /// Allocate a serial from the proxy-owned configure namespace.
+    ///
+    /// Wayland serials are opaque, but host serials are normally low and
+    /// monotonically increasing.  Reserving the high `0xf...` range keeps
+    /// locally generated acknowledgements distinguishable from host
+    /// acknowledgements while the pending set prevents reuse within a live
+    /// xdg_surface.
+    pub(crate) fn allocate_synthetic_xdg_configure_serial(
+        &mut self,
+        xdg_surface_guest_id: u32,
+    ) -> Option<u32> {
+        self.xdg_surface_links.get_forward(xdg_surface_guest_id)?;
+
+        for _ in 0..0x1000 {
+            let serial = self.next_synthetic_xdg_configure_serial;
+            self.next_synthetic_xdg_configure_serial =
+                self.next_synthetic_xdg_configure_serial.wrapping_add(1);
+            if self.next_synthetic_xdg_configure_serial < 0xf000_0000 {
+                self.next_synthetic_xdg_configure_serial = 0xf000_0000;
+            }
+            let pending = self
+                .synthetic_xdg_configure_serials
+                .entry(xdg_surface_guest_id)
+                .or_default();
+            if pending.insert(serial) {
+                self.debug_assert_consistent();
+                return Some(serial);
+            }
+        }
+
+        log::warn!(
+            "Unable to allocate a synthetic xdg_surface.configure serial for guest xdg_surface {}",
+            xdg_surface_guest_id
+        );
+        None
+    }
+
+    /// Consume one proxy-owned configure acknowledgement.
+    pub(crate) fn consume_synthetic_xdg_configure_serial(
+        &mut self,
+        xdg_surface_guest_id: u32,
+        serial: u32,
+    ) -> bool {
+        let Some(pending) = self
+            .synthetic_xdg_configure_serials
+            .get_mut(&xdg_surface_guest_id)
+        else {
+            return false;
+        };
+        let consumed = pending.remove(&serial);
+        if pending.is_empty() {
+            self.synthetic_xdg_configure_serials
+                .remove(&xdg_surface_guest_id);
+        }
+        if consumed {
+            if let Some(wl_surface_guest_id) = self.wl_surface_for_xdg_surface(xdg_surface_guest_id)
+            {
+                if let Some(xdg_toplevel_guest_id) =
+                    self.xdg_toplevel_for_wl_surface(wl_surface_guest_id)
+                {
+                    if let Some(zaura_toplevel_host_id) =
+                        self.aura_toplevel_links.get_forward(xdg_toplevel_guest_id)
+                    {
+                        if let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) {
+                            let _ = state
+                                .transaction
+                                .note_client_ack(xdg_surface_guest_id, serial);
+                        }
+                    }
+                }
+            }
+            self.debug_assert_consistent();
+        }
+        consumed
+    }
+
+    /// Release one synthetic configure serial when its wire batch was
+    /// discarded before publication.
+    pub(crate) fn cancel_synthetic_xdg_configure_serial(
+        &mut self,
+        xdg_surface_guest_id: u32,
+        serial: u32,
+    ) {
+        let Some(pending) = self
+            .synthetic_xdg_configure_serials
+            .get_mut(&xdg_surface_guest_id)
+        else {
+            return;
+        };
+        pending.remove(&serial);
+        if pending.is_empty() {
+            self.synthetic_xdg_configure_serials
+                .remove(&xdg_surface_guest_id);
+        }
+        self.debug_assert_consistent();
+    }
+
+    /// Record a guest commit for a surface after a proxy-owned configure.
+    ///
+    /// The host geometry request may produce a same-size Aura configure before
+    /// the guest has committed the synthetic size. Requiring both events
+    /// prevents focus/activation configures from advancing the position phase.
+    pub(crate) fn note_guest_surface_commit(&mut self, wl_surface_guest_id: u32) -> bool {
+        let Some(xdg_toplevel_guest_id) = self.xdg_toplevel_for_wl_surface(wl_surface_guest_id)
+        else {
+            return false;
+        };
+        let Some(zaura_toplevel_host_id) =
+            self.aura_toplevel_links.get_forward(xdg_toplevel_guest_id)
+        else {
+            return false;
+        };
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let _ = state.transaction.note_client_commit();
+        let marked = state.transaction.client_gate_complete()
+            || matches!(
+                state.transaction.phase(),
+                SelfParentPhase::ResizePending {
+                    expected_size: None,
+                    ..
+                }
+            );
+        self.debug_assert_consistent();
+        marked
+    }
+
+    /// Bind the synthetic configure token to the newly armed resize phase.
+    ///
+    /// The token is generated before the wire batch is published, then bound
+    /// only after the state transition succeeds. Acknowledgements and commits
+    /// are matched against this exact serial, so an old generation cannot
+    /// satisfy a newer resize merely because it targets the same surface.
+    pub(crate) fn gate_resize_on_guest_commit(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        xdg_surface_guest_id: u32,
+        configure_serial: u32,
+    ) -> bool {
+        let Some(wl_surface_guest_id) = self.wl_surface_for_xdg_surface(xdg_surface_guest_id)
+        else {
+            return false;
+        };
+        let Some(xdg_toplevel_guest_id) = self.xdg_toplevel_for_wl_surface(wl_surface_guest_id)
+        else {
+            return false;
+        };
+        if self.aura_toplevel_links.get_forward(xdg_toplevel_guest_id)
+            != Some(zaura_toplevel_host_id)
+        {
+            return false;
+        }
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.bind_configure(ConfigureToken {
+            xdg_surface_id: xdg_surface_guest_id,
+            serial: configure_serial,
+        }) {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Drop all pending synthetic configure serials for a destroyed role.
+    pub(crate) fn clear_synthetic_xdg_configures(&mut self, xdg_surface_guest_id: u32) {
+        let removed_serials = self
+            .synthetic_xdg_configure_serials
+            .remove(&xdg_surface_guest_id)
+            .is_some();
+        if removed_serials {
+            self.debug_assert_consistent();
+        }
+    }
+
     /// Remove an xdg_surface association.
     pub(crate) fn take_xdg_surface(&mut self, xdg_surface_guest_id: u32) -> Option<u32> {
+        self.clear_synthetic_xdg_configures(xdg_surface_guest_id);
         let wl_surface_guest_id = self
             .xdg_surface_links
             .remove_forward(xdg_surface_guest_id)?;
@@ -731,12 +1289,23 @@ impl WindowPlacementState {
     }
 
     /// Record the xdg_toplevel → wl_surface role association.
+    ///
+    /// The parent `xdg_surface` link must already be live. This mirrors the
+    /// protocol's `get_xdg_surface → get_toplevel` ordering and prevents a
+    /// synthetic role from outliving or bypassing its parent association.
     #[must_use = "the XDG toplevel association may conflict with a live role"]
     pub(crate) fn remember_xdg_toplevel(
         &mut self,
         xdg_toplevel_guest_id: u32,
         wl_surface_guest_id: u32,
     ) -> bool {
+        if self
+            .xdg_surface_links
+            .get_reverse(wl_surface_guest_id)
+            .is_none()
+        {
+            return false;
+        }
         if !self
             .xdg_toplevel_links
             .insert(xdg_toplevel_guest_id, wl_surface_guest_id)
@@ -757,29 +1326,50 @@ impl WindowPlacementState {
         self.xdg_toplevel_links.get_reverse(wl_surface_guest_id)
     }
 
-    /// Remove one xdg_toplevel role association.
-    pub(crate) fn take_xdg_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+    /// Remove one XDG toplevel role and all placement-owned child state.
+    ///
+    /// This is the only single-role teardown entry point. Removing the XDG
+    /// link, its Aura child, origin prediction, and active barrier together
+    /// means a handler cannot accidentally leave one half of the role alive.
+    #[must_use = "the returned record identifies host-side teardown work"]
+    pub(crate) fn take_xdg_toplevel_for_destroy(
+        &mut self,
+        xdg_toplevel_guest_id: u32,
+    ) -> Option<XdgToplevelRelease> {
         let wl_surface_guest_id = self
             .xdg_toplevel_links
             .remove_forward(xdg_toplevel_guest_id)?;
+        let zaura_toplevel_host_id = self.take_aura_toplevel(xdg_toplevel_guest_id);
         self.debug_assert_consistent();
-        Some(wl_surface_guest_id)
+        Some(XdgToplevelRelease {
+            wl_surface_guest_id,
+            zaura_toplevel_host_id,
+        })
     }
 
-    /// Remove all XDG role links for one wl_surface and return its toplevels.
+    /// Remove the XDG role links for one wl_surface and their child state.
     ///
-    /// The caller releases each returned Aura child after this state
-    /// transition, so a malformed destroy ordering cannot leave stale links
-    /// that route a later app-id request to an unrelated surface.
-    pub(crate) fn take_xdg_links_for_wl_surface(&mut self, wl_surface_guest_id: u32) -> Vec<u32> {
+    /// Wayland permits only one role per surface, so the result is optional
+    /// rather than a collection. The caller serializes the returned Aura
+    /// release after this complete state transition. Origin prediction and
+    /// active barriers are retired before any later client ID reuse can route
+    /// an event to this surface.
+    #[must_use = "the returned record identifies host-side teardown work"]
+    pub(crate) fn take_xdg_links_for_wl_surface(
+        &mut self,
+        wl_surface_guest_id: u32,
+    ) -> Option<XdgToplevelRelease> {
+        if let Some(xdg_surface_guest_id) = self.xdg_surface_for_wl_surface(wl_surface_guest_id) {
+            self.clear_synthetic_xdg_configures(xdg_surface_guest_id);
+        }
         self.xdg_surface_links.remove_reverse(wl_surface_guest_id);
-        let toplevels = self
-            .xdg_toplevel_links
-            .remove_reverse(wl_surface_guest_id)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let xdg_toplevel_guest_id = self.xdg_toplevel_links.remove_reverse(wl_surface_guest_id);
+        let release = xdg_toplevel_guest_id.map(|xdg_toplevel_guest_id| XdgToplevelRelease {
+            wl_surface_guest_id,
+            zaura_toplevel_host_id: self.take_aura_toplevel(xdg_toplevel_guest_id),
+        });
         self.debug_assert_consistent();
-        toplevels
+        release
     }
 
     /// Return the stable ARC task-form application ID for one guest surface.
@@ -821,24 +1411,166 @@ impl WindowPlacementState {
     /// Remove the ARC identity and Aura-surface link for a destroyed surface.
     ///
     /// The guest ID owns the ARC application ID while the host ID owns the
-    /// Aura-surface association. Requiring both IDs keeps their lifetimes
-    /// coupled at the only teardown boundary that has authoritative ownership
-    /// of both objects.
+    /// Aura-surface association. The identity is removed only after the host
+    /// association resolved from the authoritative shadow table is removed,
+    /// keeping both lifetimes coupled at the teardown boundary that owns both
+    /// objects. A stale or mismatched host mapping leaves the application
+    /// record intact instead of clearing a newer surface generation's
+    /// identity.
     #[must_use = "the returned Aura surface ID identifies host teardown work"]
     pub(crate) fn take_aura_surface_for_wl_surface(
         &mut self,
+        shadow_table: &ShadowTable,
         wl_surface_guest_id: u32,
-        wl_surface_host_id: u32,
     ) -> Option<u32> {
-        self.application_ids.remove(&wl_surface_guest_id);
+        let wl_surface_host_id = shadow_table.get_host_id(wl_surface_guest_id)?;
         let zaura_surface_host_id = self.aura_surface_links.remove_forward(wl_surface_host_id);
+        if zaura_surface_host_id.is_some() {
+            self.application_ids.remove(&wl_surface_guest_id);
+        }
         self.debug_assert_consistent();
         zaura_surface_host_id
+    }
+
+    /// Remove application identities for a surface that never acquired an
+    /// Aura-surface child.
+    ///
+    /// ARC identity allocation can happen when an XDG role is created, before
+    /// the first metadata request has caused `zaura_shell.get_aura_surface`.
+    /// Once the guest `wl_surface` is actually destroyed, there is no host
+    /// object left that could own that record. This explicit orphan path is
+    /// intentionally separate from [`Self::take_aura_surface_for_wl_surface`]:
+    /// the latter resolves the host surface through the shadow table, while
+    /// this method is called only from the authoritative `wl_surface.destroy`
+    /// path after that lookup returned no Aura link.
+    pub(crate) fn take_orphaned_application_state_for_surface_destroy(
+        &mut self,
+        wl_surface_guest_id: u32,
+    ) {
+        self.application_ids.remove(&wl_surface_guest_id);
+        self.debug_assert_consistent();
     }
 
     /// Return the Aura surface associated with a host wl_surface.
     pub(crate) fn aura_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
         self.aura_surface_links.get_forward(wl_surface_host_id)
+    }
+
+    /// Record the host wl_surface → host remote_surface role created by the
+    /// opt-in remote-shell backend.
+    #[must_use = "the remote surface association may conflict with a live role"]
+    pub(crate) fn remember_remote_surface(
+        &mut self,
+        wl_surface_host_id: u32,
+        remote_surface_host_id: u32,
+    ) -> bool {
+        if !self
+            .remote_surface_links
+            .insert(wl_surface_host_id, remote_surface_host_id)
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    pub(crate) fn remote_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
+        self.remote_surface_links.get_forward(wl_surface_host_id)
+    }
+
+    /// Return whether any remote-surface role still owns the manager.
+    ///
+    /// `zcr_remote_shell_v2.destroy` is illegal while one of its child
+    /// `zcr_remote_surface_v2` roles is alive. Global removal therefore needs
+    /// this lifecycle check before retiring the hidden manager binding.
+    pub(crate) fn has_remote_surfaces(&self) -> bool {
+        !self.remote_surface_links.is_empty()
+    }
+
+    pub(crate) fn take_remote_surface_for_wl_surface(
+        &mut self,
+        wl_surface_host_id: u32,
+    ) -> Option<u32> {
+        let remote_surface_host_id = self
+            .remote_surface_links
+            .remove_forward(wl_surface_host_id)?;
+        self.remote_toplevel_links
+            .remove_reverse(remote_surface_host_id);
+        self.debug_assert_consistent();
+        Some(remote_surface_host_id)
+    }
+
+    #[must_use = "the remote toplevel association may conflict with a live role"]
+    pub(crate) fn remember_remote_toplevel(
+        &mut self,
+        xdg_toplevel_guest_id: u32,
+        remote_surface_host_id: u32,
+    ) -> bool {
+        if !self
+            .remote_toplevel_links
+            .insert(xdg_toplevel_guest_id, remote_surface_host_id)
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    pub(crate) fn remote_surface_for_xdg_toplevel(
+        &self,
+        xdg_toplevel_guest_id: u32,
+    ) -> Option<u32> {
+        self.remote_toplevel_links
+            .get_forward(xdg_toplevel_guest_id)
+    }
+
+    pub(crate) fn xdg_toplevel_for_remote_surface(
+        &self,
+        remote_surface_host_id: u32,
+    ) -> Option<u32> {
+        self.remote_toplevel_links
+            .get_reverse(remote_surface_host_id)
+    }
+
+    pub(crate) fn take_remote_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+        let remote_surface_host_id = self
+            .remote_toplevel_links
+            .remove_forward(xdg_toplevel_guest_id)?;
+        self.debug_assert_consistent();
+        Some(remote_surface_host_id)
+    }
+
+    /// Resolve an Aura surface back to its live guest `wl_surface`.
+    ///
+    /// Cleanup callbacks retain only the host Aura child ID. Resolving the
+    /// reverse link here keeps the text-input repair keyed by the authoritative
+    /// guest surface instead of duplicating that association in barrier data.
+    pub(crate) fn guest_wl_surface_for_aura_surface(
+        &self,
+        shadow_table: &ShadowTable,
+        zaura_surface_host_id: u32,
+    ) -> Option<u32> {
+        let wl_surface_host_id = self.aura_surface_links.get_reverse(zaura_surface_host_id)?;
+        shadow_table.get_guest_id(wl_surface_host_id)
+    }
+
+    /// Return the negotiated Aura-surface version for one guest surface.
+    ///
+    /// This read-only diagnostic keeps host-version lookup beside the
+    /// guest-surface/Aura association instead of making a protocol adapter
+    /// reconstruct the relationship from independent IDs.
+    pub(crate) fn aura_surface_version_for_guest_surface(
+        &self,
+        shadow_table: &ShadowTable,
+        wl_surface_guest_id: u32,
+    ) -> Option<u32> {
+        let wl_surface_host_id = shadow_table.get_host_id(wl_surface_guest_id)?;
+        let zaura_surface_host_id = self.aura_surface_for_wl_surface(wl_surface_host_id)?;
+        Some(
+            shadow_table
+                .host_object_version(zaura_surface_host_id)
+                .unwrap_or(self.aura_shell_version()),
+        )
     }
 
     /// Record the one-to-one Aura surface association for a host wl_surface.
@@ -869,6 +1601,10 @@ impl WindowPlacementState {
 
     /// Record a one-to-one xdg_toplevel ↔ Aura toplevel association.
     ///
+    /// The guest XDG role must already be registered. Aura children are
+    /// created only for live XDG roles, so rejecting an unparented child here
+    /// keeps host-only objects from becoming unreachable during teardown.
+    ///
     /// Returns `false` when either side is already associated with a
     /// different object. Replacing a live association would orphan the old
     /// host object and make its destructor impossible to route.
@@ -878,6 +1614,13 @@ impl WindowPlacementState {
         xdg_toplevel_guest_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> bool {
+        if self
+            .xdg_toplevel_links
+            .get_forward(xdg_toplevel_guest_id)
+            .is_none()
+        {
+            return false;
+        }
         if !self
             .aura_toplevel_links
             .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id)
@@ -894,7 +1637,7 @@ impl WindowPlacementState {
     /// barrier state. Older barriers remain callback-owned until their
     /// terminal host lifecycle event.
     #[must_use = "the returned Aura toplevel ID identifies host teardown work"]
-    pub(crate) fn take_aura_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+    fn take_aura_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
         let zaura_toplevel_host_id = self
             .aura_toplevel_links
             .remove_forward(xdg_toplevel_guest_id)?;
@@ -918,11 +1661,451 @@ impl WindowPlacementState {
             .and_then(|state| state.origin)
     }
 
+    /// Return the client size still waiting for host geometry application.
+    ///
+    /// A pending size is scoped to one live Aura toplevel.  It is cleared only
+    /// after the host reports the requested dimensions, so an intermediate
+    /// configure cannot resize the guest back to the old native window size.
+    pub(crate) fn pending_resize_size(&self, zaura_toplevel_host_id: u32) -> Option<(i32, i32)> {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .and_then(|state| match state.transaction.phase() {
+                SelfParentPhase::ResizePending { expected_size, .. } => expected_size,
+                _ => None,
+            })
+    }
+
+    /// Return whether a self-parent rectangle is already in flight or has
+    /// completed without an intervening external geometry change.
+    fn is_self_parent_target_current(
+        &self,
+        zaura_toplevel_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> bool {
+        let Some(state) = self.toplevels.get(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if state.transaction.deferred_target() == Some(target) {
+            return true;
+        }
+        // If a newer target is already deferred, a repeat of the active
+        // rectangle is meaningful: it cancels that deferred update and
+        // restores the currently executing transaction as the latest user
+        // choice. Only suppress the active target when no newer choice exists.
+        if state.transaction.active_target() == Some(target)
+            && state.transaction.deferred_target().is_none()
+        {
+            return true;
+        }
+        // `last_completed_target` is recorded only after the operation has
+        // reached its settled origin. The requested rectangle is therefore
+        // the correct deduplication key even when a decorated host reports a
+        // client size slightly smaller than the work-area target.
+        state.transaction.last_completed_target() == Some(target)
+    }
+
+    /// Return whether one self-parent transaction still owns this toplevel.
+    ///
+    /// The active target remains retained through the nullable-unparent and
+    /// host-IME follow-up barriers. This makes a shortcut received during
+    /// cleanup a deferred update rather than a second wire transaction.
+    pub(crate) fn self_parent_transaction_active(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .is_some_and(|state| !matches!(state.transaction.phase(), SelfParentPhase::Idle))
+    }
+
+    /// Replace the deferred target with the newest requested rectangle.
+    fn defer_self_parent_target(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.defer_target(target) {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Return the newest target waiting behind the current resize/cleanup.
+    pub(crate) fn deferred_self_parent_target(
+        &self,
+        zaura_toplevel_host_id: u32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .and_then(|state| state.transaction.deferred_target())
+    }
+
+    /// Resolve the relative parent delta for a deferred target without
+    /// changing the active transaction. This is used to build the next
+    /// parent request before atomically promoting the target in state.
+    pub(crate) fn deferred_self_parent_move(
+        &self,
+        zaura_toplevel_host_id: u32,
+        _fallback_origin: (i32, i32),
+    ) -> Option<DeferredSelfParentMove> {
+        let state = self.toplevels.get(&zaura_toplevel_host_id)?;
+        let target = state.transaction.deferred_target()?;
+        // A caller-provided event coordinate is not a source of truth.  It
+        // may be an intermediate focus/animation origin, so never use it to
+        // synthesize an absolute placement delta when the last authoritative
+        // Aura observation is unavailable.
+        let current_origin = state.origin?;
+        let relative = (
+            target.0.checked_sub(current_origin.0)?,
+            target.1.checked_sub(current_origin.1)?,
+        );
+        match state.transaction.phase() {
+            SelfParentPhase::ResizePending {
+                expected_size: None,
+                ..
+            }
+            | SelfParentPhase::CleanupPending {
+                origin_acknowledged: true,
+                cleanup_barrier_pending: false,
+                ..
+            } => {}
+            _ => return None,
+        }
+        let surface_id = state.transaction.active_surface()?;
+        Some((surface_id, current_origin, relative, target))
+    }
+
+    /// Return the size currently represented by the active target.
+    pub(crate) fn active_self_parent_size(
+        &self,
+        zaura_toplevel_host_id: u32,
+    ) -> Option<(i32, i32)> {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .and_then(|state| {
+                state
+                    .transaction
+                    .active_target()
+                    .map(|target| (target.2, target.3))
+            })
+    }
+
+    /// Return the Aura surface retained by the active self-parent operation.
+    pub(crate) fn pending_surface_for_toplevel(&self, zaura_toplevel_host_id: u32) -> Option<u32> {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .and_then(|state| state.transaction.active_surface())
+    }
+
+    /// Promote a deferred target whose size is already acknowledged by the
+    /// host. The caller can immediately ask for
+    /// [`Self::pending_self_parent_move`].
+    pub(crate) fn promote_deferred_self_parent_target(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.promote_deferred(target, None) {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Promote a deferred target whose size still needs a host XDG
+    /// configure. The caller publishes that configure/geometry pair before
+    /// invoking this method.
+    pub(crate) fn promote_deferred_self_parent_resize(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state
+            .transaction
+            .promote_deferred(target, Some((target.2, target.3)))
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Finish a self-parent transaction that has no deferred target after the
+    /// follow-up barrier.
+    pub(crate) fn complete_self_parent_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let completed = state.transaction.complete();
+        if completed {
+            self.debug_assert_consistent();
+        }
+        completed
+    }
+
+    /// Abort a cleanup transition after a follow-up wire operation could not
+    /// be encoded. This is a defensive terminal path for teardown or a
+    /// released host object; it leaves the state internally idle rather than
+    /// allowing a permanently active transaction to consume every shortcut.
+    pub(crate) fn abort_self_parent_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let aborted = state.transaction.abort_cleanup();
+        if aborted {
+            self.debug_assert_consistent();
+        }
+        aborted
+    }
+
+    /// Roll back a resize phase whose encoded configure cannot be published.
+    pub(crate) fn abort_self_parent_resize(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let aborted = state.transaction.abort_resize();
+        if aborted {
+            self.debug_assert_consistent();
+        }
+        aborted
+    }
+
+    /// Arm the two-phase native self-parent operation after its resize wire
+    /// batch has been published.
+    #[must_use = "the target was rejected because the Aura toplevel is not live"]
+    pub(crate) fn arm_self_parent_target(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        zaura_surface_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> bool {
+        if target.2 <= 0
+            || target.3 <= 0
+            || self
+                .aura_toplevel_links
+                .get_reverse(zaura_toplevel_host_id)
+                .is_none()
+            || self
+                .aura_surface_links
+                .get_reverse(zaura_surface_host_id)
+                .is_none()
+        {
+            return false;
+        }
+        let state = self.toplevels.entry(zaura_toplevel_host_id).or_default();
+        state
+            .transaction
+            .begin_resize(target, zaura_surface_host_id, (target.2, target.3));
+        // Unit-level callers model the client commit implicitly. The wire
+        // adapter binds a real configure token immediately after queueing and
+        // resets this gate until the guest acknowledges and commits.
+        let _ = state.transaction.assume_client_ready();
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Accept the host configure that reflects the requested client size.
+    ///
+    /// Returns `false` for a stale/intermediate size or an unowned toplevel.
+    /// A small host-side decoration adjustment is accepted as the effective
+    /// client size; unrelated previous sizes remain suppressed.
+    #[cfg(test)]
+    #[must_use = "the size was stale or the Aura toplevel is not live"]
+    pub(crate) fn accept_pending_resize(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        reported_size: (i32, i32),
+    ) -> bool {
+        let origin = self.origin(zaura_toplevel_host_id).unwrap_or((0, 0));
+        self.accept_pending_resize_at_origin(zaura_toplevel_host_id, reported_size, origin)
+            && self.pending_resize_size(zaura_toplevel_host_id).is_none()
+    }
+
+    /// Feed a host configure with its actual screen origin into the placement
+    /// reducer. Keeping size and origin together prevents a host-first
+    /// acknowledgement from being paired with a stale baseline.
+    pub(crate) fn accept_pending_resize_at_origin(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        reported_size: (i32, i32),
+        origin: (i32, i32),
+    ) -> bool {
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
+        {
+            return false;
+        }
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return true;
+        };
+        let phase_before_configure = state.transaction.phase();
+        state.observed_size = Some(reported_size);
+        let result = state.transaction.note_host_resize(
+            reported_size,
+            origin,
+            MAX_HOST_CLIENT_SIZE_ADJUSTMENT,
+        );
+        self.debug_assert_consistent();
+        if !matches!(result, HostResizeResult::Ignored) {
+            return true;
+        }
+
+        // An Aura configure is also the host's normal state/resize signal.
+        // Only reject it when a native self-parent transaction is actively
+        // waiting for its requested size.  Once that transaction has moved
+        // past the resize gate, or when no placement is active, the configure
+        // must continue through the normal XDG translation path.
+        matches!(
+            phase_before_configure,
+            SelfParentPhase::Idle
+                | SelfParentPhase::MovePending { .. }
+                | SelfParentPhase::CleanupPending { .. }
+        )
+    }
+
+    /// Return the self-parent move that becomes eligible once the host has
+    /// acknowledged the requested size. The current origin is always read
+    /// from authoritative host state; no predicted screen coordinate is used.
+    pub(crate) fn pending_self_parent_move(
+        &self,
+        zaura_toplevel_host_id: u32,
+        _fallback_origin: (i32, i32),
+    ) -> Option<PendingSelfParentMove> {
+        let state = self.toplevels.get(&zaura_toplevel_host_id)?;
+        let SelfParentPhase::ResizePending {
+            target,
+            surface_id,
+            expected_size: None,
+            ..
+        } = state.transaction.phase()
+        else {
+            return None;
+        };
+        // Do not fall back to the origin carried by the current configure:
+        // that coordinate can describe an activation animation rather than
+        // the window's settled screen position.
+        let current_origin = state.origin?;
+        let relative = (
+            target.0.checked_sub(current_origin.0)?,
+            target.1.checked_sub(current_origin.1)?,
+        );
+        Some((surface_id, current_origin, relative))
+    }
+
+    /// Mark the self-parent request as published. A failed wire encoding can
+    /// leave the resize phase retryable by simply not calling this method.
+    #[must_use = "the toplevel may have been released"]
+    pub(crate) fn mark_self_parent_move_queued(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let SelfParentPhase::ResizePending { target, .. } = state.transaction.phase() else {
+            return false;
+        };
+        if !state
+            .transaction
+            .mark_move_queued(state.origin.unwrap_or((0, 0)), target)
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Retire the active self-parent target after its nullable unparent
+    /// cleanup has been queued. This is the deduplication boundary for the
+    /// next identical shortcut.
+    ///
+    /// A newer shortcut may have entered the resize phase while the older
+    /// target's host barrier was in flight. In that case the state no longer
+    /// has a queued parent move for the barrier being completed; clearing it
+    /// would discard the newer target and make its later configure a no-op.
+    /// Treat that callback as stale and leave the newer transaction intact.
+    pub(crate) fn finish_self_parent_move(&mut self, zaura_toplevel_host_id: u32) {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return;
+        };
+        let _ = state.transaction.begin_cleanup();
+        self.debug_assert_consistent();
+    }
+
+    /// Return whether the active self-parent operation has reached its target
+    /// screen origin.
+    pub(crate) fn self_parent_origin_settled(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .is_some_and(|state| state.transaction.origin_settled())
+    }
+
+    /// Return whether nullable-unparent cleanup has completed its first
+    /// barrier while the placement state is still active.
+    pub(crate) fn self_parent_cleanup_pending(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .is_some_and(|state| {
+                matches!(
+                    state.transaction.phase(),
+                    SelfParentPhase::CleanupPending { .. }
+                )
+            })
+    }
+
+    /// Mark the follow-up NULL-parent/IME barrier as host-complete.
+    ///
+    /// An origin event can race this callback. Keeping the bit in the phase
+    /// prevents `complete_self_parent_cleanup` from retiring the transaction
+    /// before both acknowledgements have arrived.
+    pub(crate) fn complete_self_parent_cleanup_barrier(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.complete_cleanup_barrier() {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Report whether cleanup is complete without fabricating a host origin.
+    ///
+    /// The nullable-unparent and IME sync callbacks establish ordering on the
+    /// host stream, but they do not carry the widget's final screen position.
+    /// Promoting `pending_origin` here used to make the next shortcut compute
+    /// its relative delta from a prediction.  A delayed `configure` or focus
+    /// event could then overwrite that prediction and move the window again.
+    ///
+    /// Keep this method as an explicit no-op compatibility boundary for the
+    /// callback adapter: only a matching host `origin_change` (or the origin
+    /// in a matching resize acknowledgement) may settle a self-parent
+    /// transaction.
+    #[must_use = "cleanup completion never authorizes a fabricated origin"]
+    pub(crate) fn settle_self_parent_after_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let _ = zaura_toplevel_host_id;
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_origin(&self, zaura_toplevel_host_id: u32) -> Option<(i32, i32)> {
         self.toplevels
             .get(&zaura_toplevel_host_id)
-            .and_then(|state| state.pending_origin)
+            .and_then(|state| {
+                state
+                    .transaction
+                    .active_target()
+                    .map(|target| (target.0, target.1))
+            })
     }
 
     /// Record a host origin if it is authoritative for the current request.
@@ -946,19 +2129,40 @@ impl WindowPlacementState {
             return false;
         }
         let state = self.toplevels.entry(zaura_toplevel_host_id).or_default();
-        if let Some(target) = state.pending_origin {
-            if target != origin {
-                return false;
+        let accepted = match state.transaction.phase() {
+            SelfParentPhase::ResizePending {
+                expected_size: Some(_),
+                ..
+            } => {
+                // Before the matching size configure, retain the first host
+                // baseline and reject focus/activation coordinates.
+                state.origin.is_none() || state.origin == Some(origin)
             }
-            state.pending_origin = None;
+            SelfParentPhase::ResizePending {
+                expected_size: None,
+                ..
+            } => {
+                // The resize has been acknowledged, but the parent move has
+                // not necessarily been queued yet. Do not let an
+                // animation/widget coordinate from an unrelated configure
+                // replace the settled baseline.
+                state.origin == Some(origin)
+            }
+            _ => matches!(
+                state.transaction.note_origin(origin),
+                OriginResult::Accepted { .. }
+            ),
+        };
+        if accepted {
+            state.origin = Some(origin);
         }
-        state.origin = Some(origin);
         self.debug_assert_consistent();
-        true
+        accepted
     }
 
     /// Predict the origin after a self-parent request.
     #[must_use = "the prediction was rejected because the Aura toplevel is not live"]
+    #[cfg(test)]
     pub(crate) fn predict_origin(
         &mut self,
         zaura_toplevel_host_id: u32,
@@ -973,7 +2177,9 @@ impl WindowPlacementState {
         }
         let state = self.toplevels.entry(zaura_toplevel_host_id).or_default();
         state.origin = Some(target_origin);
-        state.pending_origin = Some(target_origin);
+        state
+            .transaction
+            .assume_move_pending((target_origin.0, target_origin.1, 0, 0), 0);
         self.debug_assert_consistent();
         true
     }
@@ -993,12 +2199,28 @@ impl WindowPlacementState {
     /// A callback ID must be globally unique for the connection. Returning
     /// `false` instead of overwriting an existing entry keeps an older
     /// callback's terminal lifecycle reachable.
+    #[cfg(test)]
     #[must_use = "the barrier was rejected and must not be queued"]
     pub(crate) fn register_barrier(
         &mut self,
         callback_host_id: u32,
         zaura_toplevel_host_id: u32,
         cleanup: Option<PlacementBarrierCleanup>,
+    ) -> bool {
+        self.register_barrier_with_trace(callback_host_id, zaura_toplevel_host_id, cleanup, None)
+    }
+
+    /// Register a placement barrier and carry an optional runtime trace ID.
+    ///
+    /// The trace ID is diagnostic metadata only. It does not alter barrier
+    /// supersession, cleanup ownership, or callback lifetime.
+    #[must_use = "the barrier was rejected and must not be queued"]
+    pub(crate) fn register_barrier_with_trace(
+        &mut self,
+        callback_host_id: u32,
+        zaura_toplevel_host_id: u32,
+        cleanup: Option<PlacementBarrierCleanup>,
+        trace_id: Option<u64>,
     ) -> bool {
         if self
             .aura_toplevel_links
@@ -1007,10 +2229,17 @@ impl WindowPlacementState {
         {
             return false;
         }
-        if !self
-            .barriers
-            .register(callback_host_id, zaura_toplevel_host_id, cleanup)
-        {
+        let generation = self
+            .toplevels
+            .get(&zaura_toplevel_host_id)
+            .and_then(|state| state.transaction.active_generation());
+        if !self.barriers.register_with_generation(
+            callback_host_id,
+            zaura_toplevel_host_id,
+            cleanup,
+            generation,
+            trace_id,
+        ) {
             return false;
         }
         self.debug_assert_consistent();
@@ -1023,7 +2252,24 @@ impl WindowPlacementState {
         &mut self,
         callback_host_id: u32,
     ) -> Option<PlacementBarrierCompletion> {
-        let completion = self.barriers.complete(callback_host_id)?;
+        let mut completion = self.barriers.complete(callback_host_id)?;
+        if let Some(generation) = completion.generation {
+            let current_generation = self
+                .toplevels
+                .get(&completion.toplevel_id)
+                .and_then(|state| state.transaction.active_generation());
+            if current_generation != Some(generation) {
+                log::debug!(
+                    "discarding stale placement cleanup callback={} toplevel={} \
+                     generation={} current={:?}",
+                    callback_host_id,
+                    completion.toplevel_id,
+                    generation,
+                    current_generation
+                );
+                completion.cleanup = None;
+            }
+        }
         self.debug_assert_consistent();
         Some(completion)
     }
@@ -1060,6 +2306,7 @@ impl WindowPlacementState {
     }
 }
 
+#[cfg(test)]
 impl Default for WindowPlacementState {
     fn default() -> Self {
         Self::new(WindowPlacementMode::disabled())
@@ -1069,6 +2316,12 @@ impl Default for WindowPlacementState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shadow_for_surface(guest_surface_id: u32, host_surface_id: u32) -> ShadowTable {
+        let mut shadow_table = ShadowTable::new();
+        shadow_table.map_id(guest_surface_id, host_surface_id);
+        shadow_table
+    }
 
     #[test]
     fn backend_flags_are_mutually_exclusive_with_arc_precedence() {
@@ -1112,11 +2365,15 @@ mod tests {
             10,
             "org.chromium.guest_os.termina.wayland.com.example.Terminal".to_string(),
         );
+        assert!(state.remember_aura_surface(20, 30));
         assert_eq!(
             state.native_application_id(10).as_deref(),
             Some("org.chromium.guest_os.termina.wayland.com.example.Terminal")
         );
-        assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
+        assert_eq!(
+            state.take_aura_surface_for_wl_surface(&shadow_for_surface(10, 20), 10),
+            Some(30)
+        );
         assert_eq!(state.native_application_id(10), None);
     }
 
@@ -1146,27 +2403,106 @@ mod tests {
         state
     }
 
-    fn placement_target(zaura_surface_version: u32) -> PlacementTarget {
-        PlacementTarget {
-            guest_xdg_toplevel_id: 10,
-            wl_surface_guest_id: 20,
-            wl_surface_host_id: 30,
-            host_xdg_toplevel_id: 60,
-            zaura_toplevel_host_id: 70,
-            zaura_surface_host_id: 80,
-            zaura_surface_version,
-        }
+    #[test]
+    fn aura_output_insets_define_the_host_work_area() {
+        let mut state = state_with_output(WindowPlacementMode::disabled());
+        assert!(state.remember_aura_output(50, 60));
+        assert!(state.update_output_insets(60, 0, 0, 48, 0));
+        assert_eq!(
+            state.primary_output(),
+            Some((
+                50,
+                OutputState {
+                    mode_width: 3840,
+                    mode_height: 2160,
+                    scale: 1,
+                    insets_top: 0,
+                    insets_left: 0,
+                    insets_bottom: 48,
+                    insets_right: 0,
+                },
+            ))
+        );
+        assert_eq!(
+            state.bounds_for_rect(NormalizedRect::new(0.0, 0.0, 1.0, 1.0)),
+            Some((50, (0, 0, 3840, 2112)))
+        );
     }
 
-    fn register_target(state: &mut WindowPlacementState, target: PlacementTarget) {
-        assert!(
-            state.remember_xdg_toplevel(target.guest_xdg_toplevel_id, target.wl_surface_guest_id)
-        );
+    #[test]
+    fn stale_or_negative_aura_output_insets_are_ignored() {
+        let mut state = state_with_output(WindowPlacementMode::disabled());
+        assert!(state.remember_aura_output(50, 60));
+        assert!(!state.update_output_insets(61, 0, 0, 48, 0));
+        assert!(!state.update_output_insets(60, 0, 0, -1, 0));
+        assert_eq!(state.primary_output().unwrap().1.insets_bottom, 0);
+        assert_eq!(state.take_aura_output_for_output(50), Some(60));
+        assert!(!state.update_output_insets(60, 0, 0, 48, 0));
+    }
+
+    fn placement_target(zaura_surface_version: u32) -> PlacementTarget {
+        PlacementTarget::new(10, 20, 30, 60, 70, 80, zaura_surface_version)
+    }
+
+    fn register_target(state: &mut WindowPlacementState, target: PlacementTarget) -> ShadowTable {
+        assert!(state.remember_xdg_surface(
+            target.guest_xdg_toplevel_id() + 1000,
+            target.wl_surface_guest_id()
+        ));
         assert!(state
-            .remember_aura_toplevel(target.guest_xdg_toplevel_id, target.zaura_toplevel_host_id));
-        assert!(
-            state.remember_aura_surface(target.wl_surface_host_id, target.zaura_surface_host_id)
+            .remember_xdg_toplevel(target.guest_xdg_toplevel_id(), target.wl_surface_guest_id()));
+        assert!(state.remember_aura_toplevel(
+            target.guest_xdg_toplevel_id(),
+            target.zaura_toplevel_host_id()
+        ));
+        assert!(state
+            .remember_aura_surface(target.wl_surface_host_id(), target.zaura_surface_host_id()));
+        let mut shadow_table = ShadowTable::new();
+        shadow_table.map_id(
+            target.guest_xdg_toplevel_id(),
+            target.host_xdg_toplevel_id(),
         );
+        shadow_table.map_id(target.wl_surface_guest_id(), target.wl_surface_host_id());
+        shadow_table.track_interface_with_version(
+            target.guest_xdg_toplevel_id(),
+            "xdg_toplevel".to_string(),
+            6,
+        );
+        shadow_table.track_interface_with_version(
+            target.wl_surface_guest_id(),
+            "wl_surface".to_string(),
+            6,
+        );
+        shadow_table.track_host_interface_with_version(
+            target.host_xdg_toplevel_id(),
+            "xdg_toplevel".to_string(),
+            6,
+        );
+        shadow_table.track_host_interface_with_version(
+            target.wl_surface_host_id(),
+            "wl_surface".to_string(),
+            6,
+        );
+        shadow_table.track_host_interface_with_version(
+            target.zaura_toplevel_host_id(),
+            "zaura_toplevel".to_string(),
+            38,
+        );
+        shadow_table.track_host_interface_with_version(
+            target.zaura_surface_host_id(),
+            "zaura_surface".to_string(),
+            target.zaura_surface_version(),
+        );
+        shadow_table
+    }
+
+    fn register_xdg_role(
+        state: &mut WindowPlacementState,
+        xdg_toplevel_id: u32,
+        wl_surface_id: u32,
+    ) {
+        assert!(state.remember_xdg_surface(xdg_toplevel_id + 1000, wl_surface_id));
+        assert!(state.remember_xdg_toplevel(xdg_toplevel_id, wl_surface_id));
     }
 
     #[test]
@@ -1176,70 +2512,386 @@ mod tests {
             WindowGeometryMethod::Bounds,
         ));
         let direct_target = placement_target(1);
-        register_target(&mut bounds, direct_target);
+        let direct_shadow = register_target(&mut bounds, direct_target);
         let direct = bounds
-            .prepare_placement(NormalizedRect::new(0.5, 0.0, 0.5, 1.0), direct_target)
+            .prepare_placement(
+                &direct_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
             .expect("direct bounds plan should be valid");
-        assert_eq!(direct.output_host_id, 50);
-        assert_eq!(direct.bounds, (1920, 0, 1920, 2160));
-        assert_eq!(direct.geometry, WindowPlacementGeometry::Bounds);
-        assert_eq!(direct.transient_arc_identity, None);
-        assert_eq!(direct.barrier_cleanup, None);
+        assert_eq!(direct.output_host_id(), 50);
+        assert_eq!(direct.bounds(), (1920, 0, 1920, 2160));
+        assert_eq!(direct.geometry(), WindowPlacementGeometry::Bounds);
+        assert_eq!(direct.transient_arc_identity(), None);
+        assert_eq!(direct.barrier_cleanup(), None);
 
         let mut self_parent = state_with_output(WindowPlacementMode::new(
             WindowHostPolicy::Arc,
             WindowGeometryMethod::SelfParent,
         ));
         let probe_target = placement_target(2);
-        register_target(&mut self_parent, probe_target);
+        let probe_shadow = register_target(&mut self_parent, probe_target);
         assert!(self_parent.record_origin(70, (100, 200)));
         let probe = self_parent
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 0.5, 0.5), probe_target)
+            .prepare_placement(
+                &probe_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
             .expect("self-parent plan should be valid");
         assert_eq!(
-            probe.geometry,
+            probe.geometry(),
             WindowPlacementGeometry::SelfParent {
                 current_origin: (100, 200),
                 relative_position: (-100, -200),
             }
         );
         assert_eq!(
-            probe.barrier_cleanup,
-            Some(PlacementBarrierCleanup::Unparent {
+            probe.barrier_cleanup(),
+            Some(&PlacementBarrierCleanup::Unparent {
                 zaura_surface_id: 80
             })
         );
         assert_eq!(self_parent.pending_origin(70), None);
         assert!(self_parent.commit_placement_plan(&probe));
         assert_eq!(self_parent.pending_origin(70), Some((0, 0)));
+        assert_eq!(self_parent.pending_resize_size(70), Some((1920, 1080)));
+        assert!(self_parent
+            .prepare_placement(
+                &probe_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
+        assert!(!self_parent.accept_pending_resize(70, (800, 600)));
+        assert!(self_parent.accept_pending_resize(70, (1920, 1080)));
+        assert_eq!(
+            self_parent.pending_self_parent_move(70, (100, 200)),
+            Some((80, (100, 200), (-100, -200)))
+        );
+        assert!(self_parent.mark_self_parent_move_queued(70));
+        assert!(self_parent
+            .prepare_placement(
+                &probe_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
+        self_parent.finish_self_parent_move(70);
+        assert!(
+            !self_parent.settle_self_parent_after_cleanup(70),
+            "cleanup ordering must not fabricate a host origin"
+        );
+        assert_eq!(
+            self_parent.origin(70),
+            Some((100, 200)),
+            "the pre-move origin remains the only authoritative baseline until \
+             the host reports the new origin"
+        );
+        assert!(
+            !self_parent.complete_self_parent_cleanup(70),
+            "cleanup cannot complete before the target origin is acknowledged"
+        );
+        // The host may deliver the final origin notification after the
+        // nullable-unparent cleanup. A duplicate shortcut in that interval
+        // must remain deferred rather than enqueueing another probe.
+        assert!(self_parent
+            .prepare_placement(
+                &probe_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
+        assert!(self_parent.record_origin(70, (0, 0)));
+        assert!(self_parent.complete_self_parent_cleanup_barrier(70));
+        assert!(self_parent.complete_self_parent_cleanup(70));
+        assert!(self_parent
+            .prepare_placement(
+                &probe_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
+    }
+
+    #[test]
+    fn placement_target_resolution_rejects_an_unrelated_surface() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
+        let target = placement_target(5);
+        let shadow_table = register_target(&mut state, target);
+
+        assert_eq!(
+            state.prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id() + 1,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            ),
+            Err(WindowPlacementPlanError::TargetUnavailable)
+        );
+    }
+
+    #[test]
+    fn resize_configure_does_not_rebase_self_parent_origin() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(6);
+        let shadow_table = register_target(&mut state, target);
+        let original_origin = (100, 200);
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), original_origin));
+        let plan = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("self-parent target should be valid");
+        assert!(state.commit_placement_plan(&plan));
+
+        // A focus/activation configure can report a stale screen origin while
+        // the synthetic resize is still pending. It must not replace the
+        // baseline used to calculate the relative parent request.
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (1920, 1080)));
+        assert_eq!(
+            state.origin(target.zaura_toplevel_host_id()),
+            Some(original_origin)
+        );
+        assert_eq!(
+            state.pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin),
+            None,
+            "the resize must be acknowledged before the parent phase"
+        );
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 1080)));
+        assert!(
+            !state.record_origin(target.zaura_toplevel_host_id(), (1520, 756)),
+            "a resize-time animation coordinate must not rebase the settled origin"
+        );
+        assert_eq!(
+            state.pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin),
+            Some((
+                target.zaura_surface_host_id(),
+                original_origin,
+                (-100, -200)
+            ))
+        );
+    }
+
+    #[test]
+    fn resize_configure_origin_does_not_replace_settled_baseline() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(16);
+        let shadow_table = register_target(&mut state, target);
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0),));
+        let plan = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
+            .expect("self-parent target should be valid");
+        assert!(state.commit_placement_plan(&plan));
+
+        // The host may report an animation/widget coordinate while applying
+        // the size. It must not replace the settled baseline used for the
+        // parent delta.
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2160),));
+        assert_eq!(
+            state.pending_self_parent_move(target.zaura_toplevel_host_id(), (0, 0)),
+            Some((target.zaura_surface_host_id(), (0, 0), (1920, 0),)),
+            "the parent delta must use the last settled host origin"
+        );
+    }
+
+    #[test]
+    fn late_origin_after_cleanup_does_not_rebase_idle_self_parent() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(9);
+        let shadow_table = register_target(&mut state, target);
+        let original_origin = (100, 200);
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), original_origin));
+        let plan = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("self-parent target should be valid");
+        assert!(state.commit_placement_plan(&plan));
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 1080),));
+        assert!(state
+            .pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin)
+            .is_some());
+        assert!(state.mark_self_parent_move_queued(target.zaura_toplevel_host_id()));
+        state.finish_self_parent_move(target.zaura_toplevel_host_id());
+        assert!(
+            !state.settle_self_parent_after_cleanup(target.zaura_toplevel_host_id()),
+            "cleanup must not promote a predicted origin"
+        );
+        assert!(
+            !state.complete_self_parent_cleanup(target.zaura_toplevel_host_id()),
+            "cleanup must wait for host origin acknowledgement"
+        );
+        assert_eq!(
+            state.origin(target.zaura_toplevel_host_id()),
+            Some(original_origin)
+        );
+
+        // A delayed animation/focus event from the old parent generation must
+        // not become the baseline for the next shortcut.
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert_eq!(
+            state.origin(target.zaura_toplevel_host_id()),
+            Some(original_origin)
+        );
+        // Once the host confirms the final origin, cleanup can retire the
+        // transaction and normal external origin updates are accepted again.
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(state.complete_self_parent_cleanup_barrier(target.zaura_toplevel_host_id()));
+        assert!(state.complete_self_parent_cleanup(target.zaura_toplevel_host_id()));
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert_eq!(
+            state.origin(target.zaura_toplevel_host_id()),
+            Some((500, 700))
+        );
+    }
+
+    #[test]
+    fn stale_self_parent_cleanup_preserves_a_newer_resize_transaction() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(8);
+        let shadow_table = register_target(&mut state, target);
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (100, 200)));
+
+        let first = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("first self-parent target should be valid");
+        assert!(state.commit_placement_plan(&first));
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 1080),));
+        assert!(state
+            .pending_self_parent_move(target.zaura_toplevel_host_id(), (100, 200))
+            .is_some());
+        assert!(state.mark_self_parent_move_queued(target.zaura_toplevel_host_id()));
+
+        // The second shortcut supersedes the first while its unparent barrier
+        // is still in flight. It is retained as a deferred target; no second
+        // resize transaction is published until the cleanup barrier.
+        let second = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
+            .expect("newer self-parent target should supersede the first");
+        assert!(state.commit_placement_plan(&second));
+        assert_eq!(
+            state.pending_origin(target.zaura_toplevel_host_id()),
+            Some((0, 0))
+        );
+        assert_eq!(
+            state.pending_resize_size(target.zaura_toplevel_host_id()),
+            None
+        );
+        assert_eq!(
+            state.deferred_self_parent_target(target.zaura_toplevel_host_id()),
+            Some((1920, 0, 1920, 2160))
+        );
+
+        // The old barrier completion must not erase the deferred target.
+        state.finish_self_parent_move(target.zaura_toplevel_host_id());
+        assert_eq!(
+            state.pending_origin(target.zaura_toplevel_host_id()),
+            Some((0, 0))
+        );
+        assert_eq!(
+            state.pending_resize_size(target.zaura_toplevel_host_id()),
+            None
+        );
+        assert!(
+            !state.promote_deferred_self_parent_resize(
+                target.zaura_toplevel_host_id(),
+                (1920, 0, 1920, 2160),
+            ),
+            "a deferred target must wait for the first move's final origin"
+        );
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(state.complete_self_parent_cleanup_barrier(target.zaura_toplevel_host_id()));
+        assert!(state.promote_deferred_self_parent_resize(
+            target.zaura_toplevel_host_id(),
+            (1920, 0, 1920, 2160),
+        ));
+        assert_eq!(
+            state.pending_origin(target.zaura_toplevel_host_id()),
+            Some((1920, 0))
+        );
+        assert_eq!(
+            state.pending_resize_size(target.zaura_toplevel_host_id()),
+            Some((1920, 2160))
+        );
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2112),));
+        assert!(state
+            .pending_self_parent_move(target.zaura_toplevel_host_id(), (100, 200))
+            .is_some());
     }
 
     #[test]
     fn placement_plan_preserves_transient_identity_and_consumes_until_origin() {
-        let mut transient = state_with_output(
-            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
-                .with_arc_id_lifetime(WindowArcIdLifetime::Transient),
-        );
+        let mut transient = state_with_output(WindowPlacementMode::arc_bounds(
+            WindowArcIdLifetime::Transient,
+        ));
         let transient_target = placement_target(5);
-        register_target(&mut transient, transient_target);
+        let transient_shadow = register_target(&mut transient, transient_target);
         transient.remember_native_application_id(20, "org.chromium.guest_os.native".to_string());
         let plan = transient
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), transient_target)
+            .prepare_placement(
+                &transient_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            )
             .expect("transient plan should allocate both identities");
         let identity = plan
-            .transient_arc_identity
+            .transient_arc_identity()
             .expect("transient plan should carry restore identity");
         assert!(identity
-            .arc_application_id
+            .arc_application_id()
             .starts_with(ARC_TASK_APPLICATION_ID_PREFIX));
         assert_eq!(
-            plan.barrier_cleanup,
-            Some(
-                PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
-                    zaura_surface_id: 80,
-                    wl_surface_guest_id: 20,
-                }
-            )
+            plan.barrier_cleanup(),
+            Some(&PlacementBarrierCleanup::RestoreNativeApplicationId {
+                zaura_surface_id: 80,
+                wl_surface_guest_id: 20,
+            })
         );
 
         let mut waiting = state_with_output(WindowPlacementMode::new(
@@ -1247,9 +2899,14 @@ mod tests {
             WindowGeometryMethod::SelfParent,
         ));
         let waiting_target = placement_target(2);
-        register_target(&mut waiting, waiting_target);
+        let waiting_shadow = register_target(&mut waiting, waiting_target);
         let error = waiting
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), waiting_target)
+            .prepare_placement(
+                &waiting_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            )
             .expect_err("self-parent must wait for the first authoritative origin");
         assert_eq!(error, WindowPlacementPlanError::OriginUnknown);
         assert!(error.consumes_shortcut());
@@ -1259,10 +2916,15 @@ mod tests {
             WindowGeometryMethod::SelfParent,
         ));
         let released_target = placement_target(2);
-        register_target(&mut released, released_target);
+        let released_shadow = register_target(&mut released, released_target);
         assert!(released.record_origin(70, (100, 200)));
         let plan = released
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), released_target)
+            .prepare_placement(
+                &released_shadow,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            )
             .expect("plan preparation should not mutate the role");
         assert_eq!(released.take_aura_toplevel(10), Some(70));
         assert!(!released.commit_placement_plan(&plan));
@@ -1270,30 +2932,38 @@ mod tests {
 
     #[test]
     fn transient_arc_requires_nullable_parent_capability() {
-        let mut transient = state_with_output(
-            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
-                .with_arc_id_lifetime(WindowArcIdLifetime::Transient),
-        );
+        let mut transient = state_with_output(WindowPlacementMode::arc_bounds(
+            WindowArcIdLifetime::Transient,
+        ));
         let target = placement_target(1);
-        register_target(&mut transient, target);
+        let shadow_table = register_target(&mut transient, target);
         transient.remember_native_application_id(20, "org.chromium.guest_os.native".to_string());
         let error = transient
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), target)
+            .prepare_placement(
+                &shadow_table,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            )
             .expect_err("transient cleanup must be rejected without set_parent");
         assert_eq!(error, WindowPlacementPlanError::UnsupportedSurfaceVersion);
     }
 
     #[test]
     fn transient_arc_requires_application_id_capability() {
-        let mut transient = state_with_output(
-            WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
-                .with_arc_id_lifetime(WindowArcIdLifetime::Transient),
-        );
+        let mut transient = state_with_output(WindowPlacementMode::arc_bounds(
+            WindowArcIdLifetime::Transient,
+        ));
         let target = placement_target(4);
-        register_target(&mut transient, target);
+        let shadow_table = register_target(&mut transient, target);
         transient.remember_native_application_id(20, "org.chromium.guest_os.native".to_string());
         let error = transient
-            .prepare_placement(NormalizedRect::new(0.0, 0.0, 1.0, 1.0), target)
+            .prepare_placement(
+                &shadow_table,
+                10,
+                20,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+            )
             .expect_err("transient ARC identity must not run without set_application_id v5");
         assert_eq!(error, WindowPlacementPlanError::UnsupportedSurfaceVersion);
     }
@@ -1325,7 +2995,11 @@ mod tests {
         assert_eq!(state.arc_policy_application_id(10), Some(first.clone()));
         assert_eq!(state.arc_policy_application_id(11), Some(second));
 
-        assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
+        assert!(state.remember_aura_surface(20, 30));
+        assert_eq!(
+            state.take_aura_surface_for_wl_surface(&shadow_for_surface(10, 20), 10),
+            Some(30)
+        );
         let replacement = state
             .arc_policy_application_id(10)
             .expect("released surface can receive a new ID");
@@ -1351,7 +3025,11 @@ mod tests {
         );
         assert_eq!(state.arc_policy_application_id(10), Some(arc_id.clone()));
 
-        let _ = state.take_aura_surface_for_wl_surface(10, 20);
+        assert!(state.remember_aura_surface(20, 30));
+        assert_eq!(
+            state.take_aura_surface_for_wl_surface(&shadow_for_surface(10, 20), 10),
+            Some(30)
+        );
         assert_eq!(state.native_application_id(10), None);
         let replacement = state
             .arc_policy_application_id(10)
@@ -1385,10 +3063,16 @@ mod tests {
         assert!(state.remember_aura_surface(51, 61));
         assert!(!state.remember_aura_surface(51, 60));
         assert!(!state.remember_aura_surface(52, 61));
-        assert_eq!(state.take_aura_surface_for_wl_surface(10, 50), Some(60));
+        state.remember_native_application_id(10, "native".to_string());
+        assert_eq!(
+            state.take_aura_surface_for_wl_surface(&shadow_for_surface(10, 50), 10),
+            Some(60)
+        );
         assert_eq!(state.aura_surface_for_wl_surface(50), None);
+        assert_eq!(state.native_application_id(10), None);
         assert!(state.remember_aura_surface(52, 60));
 
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 70));
         assert!(state.remember_aura_toplevel(10, 70));
         assert_eq!(state.aura_toplevel_for_xdg_toplevel(10), Some(70));
@@ -1406,6 +3090,7 @@ mod tests {
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(70), Some(10));
 
         assert_eq!(state.take_aura_toplevel(10), Some(70));
+        register_xdg_role(&mut state, 11, 101);
         assert!(state.remember_aura_toplevel(11, 71));
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(70), None);
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(71), Some(11));
@@ -1421,6 +3106,7 @@ mod tests {
     #[test]
     fn origin_prediction_rejects_stale_events_until_target_arrives() {
         let mut state = WindowPlacementState::default();
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 77));
         assert!(state.record_origin(77, (100, 200)));
         assert!(state.predict_origin(77, (0, 0)));
@@ -1434,6 +3120,7 @@ mod tests {
     #[test]
     fn releasing_toplevel_clears_origin_and_active_barrier_but_not_callback_ownership() {
         let mut state = WindowPlacementState::default();
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 77));
         assert!(state.record_origin(77, (10, 20)));
         assert!(state.register_barrier(40, 77, None));
@@ -1453,6 +3140,7 @@ mod tests {
     #[test]
     fn stale_barrier_completion_does_not_clear_newer_active_barrier() {
         let mut state = WindowPlacementState::default();
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 77));
         assert!(state.register_barrier(40, 77, None));
         assert!(state.register_barrier(41, 77, None));
@@ -1476,6 +3164,7 @@ mod tests {
     #[test]
     fn duplicate_barrier_callback_id_is_rejected_without_mutation() {
         let mut state = WindowPlacementState::default();
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 77));
         assert!(state.register_barrier(40, 77, None));
         assert!(!state.register_barrier(40, 88, None));
@@ -1487,6 +3176,7 @@ mod tests {
     #[test]
     fn released_toplevel_cannot_recreate_origin_or_barrier_state() {
         let mut state = WindowPlacementState::default();
+        register_xdg_role(&mut state, 10, 100);
         assert!(state.remember_aura_toplevel(10, 77));
         assert_eq!(state.take_aura_toplevel(10), Some(77));
 
@@ -1496,6 +3186,50 @@ mod tests {
         assert_eq!(state.origin(77), None);
         assert_eq!(state.pending_origin(77), None);
         assert_eq!(state.barrier_for_callback(40), None);
+    }
+
+    #[test]
+    fn mismatched_aura_surface_teardown_preserves_application_identity() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
+        state.remember_native_application_id(10, "org.chromium.guest_os.native".to_string());
+        let arc_id = state
+            .arc_policy_application_id(10)
+            .expect("ARC identity should be allocated");
+        assert!(state.remember_aura_surface(20, 30));
+
+        assert_eq!(
+            state.take_aura_surface_for_wl_surface(&shadow_for_surface(10, 21), 10),
+            None
+        );
+        assert_eq!(state.aura_surface_for_wl_surface(20), Some(30));
+        assert_eq!(
+            state.native_application_id(10).as_deref(),
+            Some("org.chromium.guest_os.native")
+        );
+        assert_eq!(state.arc_policy_application_id(10), Some(arc_id));
+    }
+
+    #[test]
+    fn orphaned_application_state_is_released_when_no_aura_surface_exists() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::Bounds,
+        ));
+        state.remember_native_application_id(10, "org.chromium.guest_os.native".to_string());
+        let arc_id = state
+            .arc_policy_application_id(10)
+            .expect("ARC identity should be allocated before Aura creation");
+
+        state.take_orphaned_application_state_for_surface_destroy(10);
+
+        assert_eq!(state.native_application_id(10), None);
+        let replacement = state
+            .arc_policy_application_id(10)
+            .expect("destroyed surface can allocate a replacement identity");
+        assert_ne!(replacement, arc_id);
     }
 
     #[test]
@@ -1513,22 +3247,146 @@ mod tests {
         assert!(!state.remember_xdg_toplevel(30, 21));
         assert_eq!(state.xdg_toplevel_for_wl_surface(20), Some(30));
 
-        assert_eq!(state.take_xdg_toplevel(30), Some(20));
+        let release = state
+            .take_xdg_toplevel_for_destroy(30)
+            .expect("live XDG role should have a teardown record");
+        assert_eq!(
+            release,
+            XdgToplevelRelease {
+                wl_surface_guest_id: 20,
+                zaura_toplevel_host_id: None,
+            }
+        );
         assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
         assert_eq!(state.take_xdg_surface(10), Some(20));
         assert_eq!(state.wl_surface_for_xdg_surface(10), None);
     }
 
     #[test]
-    fn surface_link_teardown_removes_all_role_directions() {
+    fn synthetic_xdg_configure_serials_are_high_and_scoped_to_surface() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::disabled());
+        assert!(state.remember_xdg_surface(10, 20));
+
+        let serial = state
+            .allocate_synthetic_xdg_configure_serial(10)
+            .expect("live xdg_surface should receive a synthetic serial");
+        assert!(serial >= 0xf000_0000);
+        assert!(!state.consume_synthetic_xdg_configure_serial(10, serial + 1));
+        assert!(state.consume_synthetic_xdg_configure_serial(10, serial));
+        assert!(!state.consume_synthetic_xdg_configure_serial(10, serial));
+    }
+
+    #[test]
+    fn stale_resize_ack_cannot_open_a_new_configure_generation() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(5);
+        let _shadow = register_target(&mut state, target);
+        assert!(state.arm_self_parent_target(
+            target.zaura_toplevel_host_id(),
+            target.zaura_surface_host_id(),
+            (0, 0, 1920, 1080),
+        ));
+        let xdg_surface_guest_id = target.guest_xdg_toplevel_id() + 1000;
+        let first_serial = state
+            .allocate_synthetic_xdg_configure_serial(xdg_surface_guest_id)
+            .expect("first synthetic serial");
+        assert!(state.gate_resize_on_guest_commit(
+            target.zaura_toplevel_host_id(),
+            xdg_surface_guest_id,
+            first_serial,
+        ));
+
+        // A newer shortcut replaces the active resize before the first
+        // configure acknowledgement arrives.
+        assert!(state.arm_self_parent_target(
+            target.zaura_toplevel_host_id(),
+            target.zaura_surface_host_id(),
+            (1920, 0, 1920, 2160),
+        ));
+        let second_serial = state
+            .allocate_synthetic_xdg_configure_serial(xdg_surface_guest_id)
+            .expect("second synthetic serial");
+        assert!(state.gate_resize_on_guest_commit(
+            target.zaura_toplevel_host_id(),
+            xdg_surface_guest_id,
+            second_serial,
+        ));
+
+        // The old ack plus a current commit must not satisfy the second
+        // generation.
+        assert!(state.consume_synthetic_xdg_configure_serial(xdg_surface_guest_id, first_serial));
+        assert!(!state.note_guest_surface_commit(target.wl_surface_guest_id()));
+        assert!(!state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2160)));
+
+        // Only the matching serial can arm the new configure generation.
+        assert!(state.consume_synthetic_xdg_configure_serial(xdg_surface_guest_id, second_serial));
+        // The old commit was intentionally ignored.  A current
+        // `ack_configure` therefore still needs its own client commit before
+        // the host resize acknowledgement can open the move phase.
+        assert!(state.note_guest_surface_commit(target.wl_surface_guest_id()));
+        assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2160)));
+    }
+
+    #[test]
+    fn destroying_xdg_surface_clears_pending_synthetic_serials() {
+        let mut state = WindowPlacementState::new(WindowPlacementMode::disabled());
+        assert!(state.remember_xdg_surface(10, 20));
+        let serial = state
+            .allocate_synthetic_xdg_configure_serial(10)
+            .expect("live xdg_surface should receive a synthetic serial");
+
+        assert_eq!(state.take_xdg_surface(10), Some(20));
+        assert!(!state.consume_synthetic_xdg_configure_serial(10, serial));
+        assert_eq!(state.xdg_surface_for_wl_surface(20), None);
+    }
+
+    #[test]
+    fn child_role_associations_require_their_parent_links() {
+        let mut state = WindowPlacementState::default();
+        assert!(!state.remember_xdg_toplevel(30, 20));
+        assert!(!state.remember_aura_toplevel(30, 70));
+
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert!(state.remember_aura_toplevel(30, 70));
+    }
+
+    #[test]
+    fn surface_link_teardown_removes_role_and_placement_state_atomically() {
         let mut state = WindowPlacementState::default();
         assert!(state.remember_xdg_surface(10, 20));
         assert!(state.remember_xdg_toplevel(30, 20));
-        assert_eq!(state.take_xdg_links_for_wl_surface(20), vec![30]);
+        assert!(state.remember_aura_toplevel(30, 70));
+        assert!(state.record_origin(70, (100, 200)));
+        assert!(state.predict_origin(70, (300, 400)));
+        assert_eq!(state.pending_origin(70), Some((300, 400)));
+        assert!(state.register_barrier(40, 70, None));
+        assert_eq!(
+            state.take_xdg_links_for_wl_surface(20),
+            Some(XdgToplevelRelease {
+                wl_surface_guest_id: 20,
+                zaura_toplevel_host_id: Some(70),
+            })
+        );
         assert_eq!(state.wl_surface_for_xdg_surface(10), None);
         assert_eq!(state.wl_surface_for_xdg_toplevel(30), None);
         assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
-        assert_eq!(state.take_xdg_links_for_wl_surface(20), Vec::<u32>::new());
+        assert_eq!(state.xdg_toplevel_for_aura_toplevel(70), None);
+        assert_eq!(state.origin(70), None);
+        assert_eq!(state.pending_origin(70), None);
+        assert!(!state.has_pending_barrier(70));
+        assert_eq!(state.barrier_for_callback(40), Some(70));
+        assert_eq!(
+            state
+                .complete_barrier(40)
+                .expect("stale callback remains callback-owned")
+                .cleanup,
+            None
+        );
+        assert_eq!(state.take_xdg_links_for_wl_surface(20), None);
     }
 
     #[test]

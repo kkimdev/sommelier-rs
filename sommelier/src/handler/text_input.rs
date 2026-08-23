@@ -604,12 +604,16 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             );
         }
 
-        log::trace!(
-            ">>> on_preedit_string: serial={}, text={:?}, commit={:?}, guest_id={}",
+        log::info!(
+            "[ime] host preedit_string: host_v1_id={} guest_id={} serial={} \
+             text={:?} commit={:?} had_preedit={} guest_done_serial={}",
+            host_id,
+            guest_id,
             serial,
             text,
             commit,
-            guest_id
+            plan.had_preedit,
+            plan.done_serial
         );
 
         // The v1 `commit` argument is the replacement text to use if this
@@ -690,11 +694,15 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             );
         }
 
-        log::trace!(
-            ">>> on_commit_string: serial={}, text={:?}, guest_id={}",
+        log::info!(
+            "[ime] host commit_string: host_v1_id={} guest_id={} serial={} \
+             text={:?} had_preedit={} guest_done_serial={}",
+            host_id,
+            guest_id,
             serial,
             text,
-            guest_id
+            plan.had_preedit,
+            plan.done_serial
         );
 
         let mut transaction = Vec::new();
@@ -869,14 +877,105 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
     }
 
     fn on_enter(&mut self, ctx: &mut Context, surface: u32) -> Action {
-        let _host_v1_id = ctx.last_sender_id;
-        log::info!(">>> on_enter: surface={}", surface);
+        let host_v1_id = ctx.last_sender_id;
+        log::info!(
+            "[ime] host text_input.enter: host_v1_id={}, surface={}",
+            host_v1_id,
+            surface
+        );
+
+        // A placement refresh deliberately waits for this host event before
+        // replaying the guest editor state.  `wl_display.sync.done` orders
+        // requests on the host stream, but it does not prove that Exo has
+        // installed the new input-method generation; `on_enter` does.
+        let matching_guest = ctx.text_inputs.iter().find_map(|(&guest_id, state)| {
+            if state.host_v1_id != host_v1_id {
+                return None;
+            }
+            let host_surface = state
+                .active_surface
+                .and_then(|guest_surface| ctx.shadow_table.get_host_id(guest_surface));
+            (host_surface == Some(surface)).then_some((guest_id, state.host_activation()))
+        });
+        log::info!(
+            "[ime] host text_input.enter resolution: host_v1_id={} surface={} matching={:?}",
+            host_v1_id,
+            surface,
+            matching_guest
+        );
+
+        if let Some((guest_id, activation)) = matching_guest {
+            if activation == HostActivationState::Active {
+                if ctx
+                    .text_input_replay_barriers
+                    .complete_on_host_enter(guest_id, host_v1_id)
+                {
+                    log::debug!(
+                        "Host text-input enter is ready; replaying editor state for guest {}",
+                        guest_id
+                    );
+                    queue_host_editor_state_replay(ctx, guest_id);
+                }
+            } else if ctx
+                .text_input_activation_barriers
+                .expects_replay(guest_id, host_v1_id)
+            {
+                // Keep the signal until the old generation's sync barrier
+                // completes and activation is queued.
+                ctx.text_input_replay_barriers
+                    .record_early_host_enter(guest_id, host_v1_id);
+            }
+        }
         Action::Drop
     }
 
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
         let host_v1_id = ctx.last_sender_id;
-        log::info!(">>> on_leave: host_v1_id={}", host_v1_id);
+        log::info!("[ime] host text_input.leave: host_v1_id={}", host_v1_id);
+        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_v1_id) else {
+            return Action::Drop;
+        };
+
+        // Exo can deliver a delayed leave for the host generation that was
+        // invalidated by a transient Aura identity change.  The guest still
+        // owns the same focused surface and has not sent a disable/leave, so
+        // dropping the event silently would leave the host IME inactive
+        // forever.  Re-enter the normal reset/deactivate/sync path instead of
+        // fabricating a guest text-input focus transition.
+        let Some((guest_seat, active_surface, committed_enabled, activation)) =
+            ctx.text_inputs.get(&guest_id).map(|state| {
+                (
+                    state.guest_seat,
+                    state.active_surface,
+                    state.committed_enabled,
+                    state.host_activation(),
+                )
+            })
+        else {
+            return Action::Drop;
+        };
+        let still_focused = active_surface.is_some_and(|surface| {
+            ctx.keyboard_focus.surface_for_seat(guest_seat) == Some(surface)
+        });
+        if activation == HostActivationState::Active && committed_enabled && still_focused {
+            let Some(host_seat) = ctx.shadow_table.get_host_id(guest_seat) else {
+                log::debug!(
+                    "[ime] cannot recover host leave for guest text input {}: \
+                     guest seat {} has no host mapping",
+                    guest_id,
+                    guest_seat
+                );
+                return Action::Drop;
+            };
+            log::info!(
+                "[ime] recovering focused host text-input generation after leave: \
+                 guest_text_input={} host_v1_id={} guest_surface={:?}",
+                guest_id,
+                host_v1_id,
+                active_surface
+            );
+            queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat, true, true);
+        }
         Action::Drop
     }
 
@@ -1321,8 +1420,32 @@ fn queue_host_deactivation_barrier(
     guest_id: u32,
     host_v1_id: u32,
     host_seat: u32,
+    replay_editor_state: bool,
+    allow_inactive: bool,
 ) -> bool {
     let callback_id = HostId(ctx.shadow_table.allocate_host_id());
+    log::info!(
+        "[ime] queue host deactivation barrier: callback={} guest_text_input={} \
+         host_v1_id={} host_seat={} replay_editor_state={} allow_inactive={}",
+        callback_id.0,
+        guest_id,
+        host_v1_id,
+        host_seat,
+        replay_editor_state,
+        allow_inactive
+    );
+
+    // A compositor-owned Aura identity transition can invalidate Exo's
+    // composition generation without changing the guest text-input-v3
+    // focus.  The v1 reset request is the protocol-defined way to tell the
+    // host IME to discard that generation.  Only placement refreshes use it;
+    // ordinary guest focus changes already have their own v3 transaction and
+    // must preserve the stock deactivate ordering.
+    let reset = if replay_editor_state {
+        Some(MessageBuilder::new().build_message(host_v1_id, zwp_text_input_v1::REQ_RESET))
+    } else {
+        None
+    };
 
     let mut deactivate = MessageBuilder::new();
     deactivate.write_u32(host_seat);
@@ -1348,10 +1471,12 @@ fn queue_host_deactivation_barrier(
 
     ctx.shadow_table
         .track_host_interface_with_version(callback_id.0, "wl_callback".to_string(), 1);
-    if !ctx
-        .text_input_activation_barriers
-        .install(callback_id, guest_id, host_v1_id)
-    {
+    if !ctx.text_input_activation_barriers.install(
+        callback_id,
+        guest_id,
+        host_v1_id,
+        replay_editor_state,
+    ) {
         log::error!("Text-input {} already has an activation barrier", guest_id);
         ctx.shadow_table.remove_host_interface(callback_id.0);
         ctx.fatal_protocol_error = true;
@@ -1363,21 +1488,276 @@ fn queue_host_deactivation_barrier(
         ctx.shadow_table.remove_host_interface(callback_id.0);
         return false;
     };
-    if !state.begin_host_draining(callback_id) {
+    let began_draining = if allow_inactive {
+        state.begin_host_draining(callback_id) || state.begin_host_refresh(callback_id)
+    } else {
+        state.begin_host_draining(callback_id)
+    };
+    if !began_draining {
         ctx.text_input_activation_barriers.complete(callback_id);
         ctx.shadow_table.remove_host_interface(callback_id.0);
         log::error!(
-            "Text-input {} was not active when its drain barrier was installed",
+            "Text-input {} could not enter the host drain/refresh state",
             guest_id
         );
         ctx.fatal_protocol_error = true;
         return false;
     }
 
-    // The ordered host stream is the proof: deactivate first, then sync.
+    // The ordered host stream is the proof: placement refresh resets the old
+    // composition first, then deactivates, then waits for sync.done.
+    if let Some(reset) = reset {
+        ctx.client_to_host_queue.push((reset, Vec::new()));
+    }
     // Draining rejects stale host events until callback.done.
     ctx.client_to_host_queue.push((deactivate, Vec::new()));
     ctx.client_to_host_queue.push((sync, Vec::new()));
+    true
+}
+
+/// Prepare the IME transition that must precede a transient ARC identity
+/// change.
+///
+/// Exo can invalidate the host v1 generation as soon as
+/// `zaura_surface.set_application_id` changes.  If the old v1 generation is
+/// still active at that point, a later deactivate/activate repair is not
+/// reliable on custom hosts.  Transient placement therefore drains every
+/// committed text-input object for the target surface before it queues the
+/// ARC identity request.  The caller appends the returned messages before any
+/// placement wire.
+///
+/// We intentionally do not synthesize a guest `text_input_v3.leave` here.
+/// Winit treats that event as a real focus loss and clears its `ime_allowed`
+/// flag before the matching synthetic `enter` can arrive.  The subsequent
+/// enter is then ignored by Winit and Korean composition remains disabled.
+/// Keeping the guest focus generation intact and sending only a post-cleanup
+/// `enter` lets Winit re-enable the already focused text field.
+///
+/// The local activation marker is changed only after every request is encoded,
+/// so an encoding failure cannot strand the state as inactive without the
+/// corresponding host request.
+pub(crate) struct PlacementImePreflight {
+    pub(crate) host_messages: Vec<(Vec<u8>, Vec<RawFd>)>,
+    pub(crate) guest_text_inputs: Vec<u32>,
+    pub(crate) guest_surface_id: u32,
+}
+
+pub(crate) fn prepare_placement_ime_deactivation(
+    ctx: &mut Context,
+    guest_surface_id: u32,
+) -> Option<PlacementImePreflight> {
+    let candidates = ctx
+        .text_inputs
+        .iter()
+        .filter_map(|(&guest_id, state)| {
+            // The Aura identity transition can invalidate Exo's host IME
+            // generation even while the guest editor is between v3
+            // enable/disable commits.  Keep a focused object in the
+            // placement-generation ledger regardless of its current
+            // committed enabled bit; a later enable must then perform an
+            // explicit host reset instead of relying on a stale activation.
+            (state.active_surface == Some(guest_surface_id)
+                && !state.placement_ime_pending_for(guest_surface_id))
+            .then_some((
+                guest_id,
+                state.host_v1_id,
+                state.guest_seat,
+                state.host_is_active(),
+                state.committed_enabled,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        log::info!(
+            "[ime] placement preflight: surface={} no committed active text-input generation",
+            guest_surface_id
+        );
+        return Some(PlacementImePreflight {
+            host_messages: Vec::new(),
+            guest_text_inputs: Vec::new(),
+            guest_surface_id,
+        });
+    }
+
+    let mut host_messages = Vec::with_capacity(candidates.len() * 2);
+    let mut guest_text_inputs = Vec::with_capacity(candidates.len());
+    for (guest_id, host_v1_id, guest_seat, host_active, committed_enabled) in candidates {
+        log::info!(
+            "[ime] placement preflight candidate: guest_text_input={} host_v1_id={} \
+             guest_seat={} host_active={} committed_enabled={} surface={}",
+            guest_id,
+            host_v1_id,
+            guest_seat,
+            host_active,
+            committed_enabled,
+            guest_surface_id
+        );
+        if host_active {
+            let Some(host_seat) = ctx.shadow_table.get_host_id(guest_seat) else {
+                log::warn!(
+                    "Cannot drain text input {} before transient placement: guest seat {} \
+                     has no host mapping",
+                    guest_id,
+                    guest_seat
+                );
+                return None;
+            };
+
+            let Ok(reset) =
+                MessageBuilder::new().try_build_message(host_v1_id, zwp_text_input_v1::REQ_RESET)
+            else {
+                log::warn!(
+                    "Unable to encode text-input reset for guest {} before transient placement",
+                    guest_id
+                );
+                return None;
+            };
+            let mut deactivate_builder = MessageBuilder::new();
+            deactivate_builder.write_u32(host_seat);
+            let Ok(deactivate) = deactivate_builder.try_build_message(host_v1_id, 1) else {
+                log::warn!(
+                    "Unable to encode text-input deactivation for guest {} before transient placement",
+                    guest_id
+                );
+                return None;
+            };
+
+            host_messages.push((reset, Vec::new()));
+            host_messages.push((deactivate, Vec::new()));
+        }
+        guest_text_inputs.push(guest_id);
+    }
+
+    // No state is mutated until the placement adapter has serialized its
+    // complete identity/bounds/barrier batch. This keeps a late encoding
+    // failure from marking the guest generation for re-entry without the
+    // host-side transition.
+    for &guest_id in &guest_text_inputs {
+        let Some(state) = ctx.text_inputs.get(&guest_id) else {
+            log::warn!(
+                "Text input {} disappeared while preparing transient placement",
+                guest_id
+            );
+            return None;
+        };
+        if state.active_surface != Some(guest_surface_id)
+            || state.placement_ime_pending_for(guest_surface_id)
+        {
+            log::warn!(
+                "Text input {} changed while preparing transient placement",
+                guest_id
+            );
+            return None;
+        }
+    }
+
+    log::debug!(
+        "[ime] draining {} committed text-input generation(s) before transient ARC placement on surface {}",
+        guest_text_inputs.len(),
+        guest_surface_id
+    );
+    Some(PlacementImePreflight {
+        host_messages,
+        guest_text_inputs,
+        guest_surface_id,
+    })
+}
+
+/// Prepare the local half of a transient IME generation refresh after the
+/// placement wire batch has been validated.
+///
+/// The guest remains entered on its surface. The committed editor projection
+/// is retained so the host-side generation can be reactivated and replayed
+/// after Aura identity restoration without fabricating a guest focus event.
+pub(crate) fn commit_placement_ime_preflight(
+    ctx: &mut Context,
+    preflight: PlacementImePreflight,
+) -> bool {
+    for &guest_id in &preflight.guest_text_inputs {
+        let Some(state) = ctx.text_inputs.get(&guest_id) else {
+            log::warn!(
+                "Text input {} disappeared while committing transient placement",
+                guest_id
+            );
+            return false;
+        };
+        if state.active_surface != Some(preflight.guest_surface_id)
+            || state.placement_ime_pending_for(preflight.guest_surface_id)
+        {
+            log::warn!(
+                "Text input {} changed before transient placement was published",
+                guest_id
+            );
+            return false;
+        }
+    }
+
+    for guest_id in preflight.guest_text_inputs {
+        let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
+            return false;
+        };
+        // Keep the current surface selected while the identity transition is
+        // in flight. The committed projection is retained for host replay
+        // after the identity barrier.
+        if !state.begin_placement_ime(preflight.guest_surface_id) {
+            log::warn!(
+                "Text input {} could not begin transient placement refresh",
+                guest_id
+            );
+            return false;
+        }
+        log::info!(
+            "[ime] placement preflight committed: guest_text_input={} host_v1_id={} \
+             host activation -> inactive, surface={}",
+            guest_id,
+            state.host_v1_id,
+            preflight.guest_surface_id
+        );
+        let _ = state.deactivate_host_without_barrier();
+        ctx.text_input_replay_barriers
+            .cancel_host_enter_replay(guest_id, state.host_v1_id);
+    }
+    true
+}
+
+/// Finish the local half of a transient placement marker.
+///
+/// The production transient path refreshes the host generation directly and
+/// does not synthesize a guest focus event. This helper remains available for
+/// callers that explicitly need to emit a guest enter.
+#[cfg(test)]
+pub(crate) fn resume_placement_ime_for_surface(ctx: &mut Context, guest_surface_id: u32) -> bool {
+    let guest_text_inputs = ctx
+        .text_inputs
+        .iter()
+        .filter_map(|(&guest_id, state)| {
+            state
+                .placement_ime_pending_for(guest_surface_id)
+                .then_some(guest_id)
+        })
+        .collect::<Vec<_>>();
+
+    for guest_id in guest_text_inputs {
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(guest_surface_id);
+        if !push_msg(&mut ctx.host_to_client_queue, guest_id, 0, builder) {
+            log::warn!(
+                "Unable to encode guest text-input enter for {} after transient placement",
+                guest_id
+            );
+            continue;
+        }
+        log::debug!(
+            "Queued synthetic text-input-v3 enter for guest {} surface {} after transient placement",
+            guest_id,
+            guest_surface_id
+        );
+        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+            let completed = state.complete_placement_ime(guest_surface_id);
+            debug_assert!(completed);
+        }
+    }
     true
 }
 
@@ -1385,10 +1765,19 @@ fn queue_host_deactivation_barrier(
 ///
 /// Returns `true` when `callback_id` belongs to this subsystem.
 pub(crate) fn complete_host_activation_barrier(ctx: &mut Context, callback_id: HostId) -> bool {
-    let Some((guest_id, host_v1_id)) = ctx.text_input_activation_barriers.complete(callback_id)
+    let Some((guest_id, host_v1_id, replay_editor_state)) =
+        ctx.text_input_activation_barriers.complete(callback_id)
     else {
         return false;
     };
+    log::info!(
+        "[ime] host text-input activation sync.done: callback={} guest_text_input={} \
+         host_v1_id={} replay_editor_state={}",
+        callback_id.0,
+        guest_id,
+        host_v1_id,
+        replay_editor_state
+    );
     if !ctx.shadow_table.mark_pending_destroy_host(callback_id.0) {
         log::warn!(
             "Text-input activation callback {} was not tracked as host-only",
@@ -1399,8 +1788,158 @@ pub(crate) fn complete_host_activation_barrier(ctx: &mut Context, callback_id: H
         state.host_v1_id == host_v1_id && state.complete_host_draining(callback_id)
     });
     if completed {
-        update_host_activation(ctx, guest_id);
+        if replay_editor_state {
+            // Arm before queueing activate.  The host `on_enter` event may
+            // arrive before or after this callback is observed by the proxy;
+            // the registry handles both orders.
+            let replay_immediately = ctx
+                .text_input_replay_barriers
+                .arm_for_host_enter(guest_id, host_v1_id);
+            update_host_activation(ctx, guest_id);
+            if replay_immediately
+                && ctx
+                    .text_inputs
+                    .get(&guest_id)
+                    .is_some_and(|state| state.host_is_active())
+            {
+                queue_host_editor_state_replay(ctx, guest_id);
+            }
+        } else {
+            update_host_activation(ctx, guest_id);
+        }
     }
+    true
+}
+
+/// Queue the latest committed editor state after an internal host-generation
+/// reset.
+///
+/// Host text-input-v1 drops its surrounding text, content type, cursor
+/// rectangle, and commit generation when it is deactivated. A placement
+/// transition is invisible to the guest text-input-v3 client, so the client
+/// will not send another commit for us. Replaying the committed state after
+/// the deferred `activate` request preserves the same ordering used by a
+/// normal initial activation and keeps composition-capable IMEs usable.
+fn queue_host_editor_state_replay(ctx: &mut Context, guest_id: u32) -> bool {
+    let Some((
+        host_v1_id,
+        host_ext_id,
+        host_ext_version,
+        committed_surrounding_text,
+        committed_content_type,
+        cursor_rect,
+        guest_commit_serial,
+        committed_enabled,
+        active_surface,
+    )) = ctx.text_inputs.get(&guest_id).map(|state| {
+        (
+            state.host_v1_id,
+            state.host_ext_id,
+            state
+                .host_ext_id
+                .and_then(|id| ctx.shadow_table.host_object_version(id))
+                .unwrap_or(u32::MAX),
+            state.committed_surrounding_text.clone(),
+            state.committed_content_type,
+            state.cursor_rect,
+            state.guest_commit_serial,
+            state.committed_enabled,
+            state.active_surface,
+        )
+    })
+    else {
+        return false;
+    };
+
+    if !committed_enabled || active_surface.is_none() {
+        return false;
+    }
+
+    let mut transaction = Vec::with_capacity(6);
+
+    // A host generation reset clears surrounding text even when the guest
+    // currently has no surrounding-text value. Explicitly send the empty
+    // value so Exo cannot retain editor state from the previous generation.
+    let mut surrounding = MessageBuilder::new();
+    if let Some((text, cursor, anchor)) = committed_surrounding_text.as_ref() {
+        surrounding.write_string(text);
+        surrounding.write_u32(*cursor as u32);
+        surrounding.write_u32(*anchor as u32);
+    } else {
+        surrounding.write_string("");
+        surrounding.write_u32(0);
+        surrounding.write_u32(0);
+    }
+    if !push_msg(&mut transaction, host_v1_id, 5, surrounding) {
+        return false;
+    }
+
+    if let Some((hint, purpose)) = committed_content_type {
+        let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
+            map_v3_content_type(hint, purpose);
+
+        if let Some(host_ext_id) = host_ext_id {
+            if extension_version_allows(host_ext_version, 9) {
+                let mut builder = MessageBuilder::new();
+                builder.write_u32(u32::from(committed_surrounding_text.is_some()));
+                if !push_msg(&mut transaction, host_ext_id, 7, builder) {
+                    return false;
+                }
+            }
+        }
+
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(v1_hint);
+        builder.write_u32(v1_purpose);
+        if !push_msg(&mut transaction, host_v1_id, 6, builder) {
+            return false;
+        }
+
+        if let Some(host_ext_id) = host_ext_id {
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(input_type);
+            builder.write_u32(input_mode);
+            builder.write_u32(input_flags);
+            builder.write_u32(learning_mode);
+            if extension_version_allows(host_ext_version, 8) {
+                builder.write_u32(1);
+                if !push_msg(&mut transaction, host_ext_id, 6, builder) {
+                    return false;
+                }
+            } else if extension_version_allows(host_ext_version, 2)
+                && !push_msg(&mut transaction, host_ext_id, 1, builder)
+            {
+                return false;
+            }
+        }
+    }
+
+    let (cursor_x, cursor_y, cursor_width, cursor_height) = cursor_rect.unwrap_or((0, 0, 0, 0));
+    let mut cursor = MessageBuilder::new();
+    cursor.write_i32(cursor_x);
+    cursor.write_i32(cursor_y);
+    cursor.write_i32(cursor_width);
+    cursor.write_i32(cursor_height);
+    if !push_msg(&mut transaction, host_v1_id, 7, cursor) {
+        return false;
+    }
+
+    let host_commit_serial =
+        ctx.next_host_text_input_commit_serial(host_v1_id, guest_commit_serial);
+    let mut commit = MessageBuilder::new();
+    commit.write_u32(host_commit_serial);
+    if !push_msg(&mut transaction, host_v1_id, 9, commit) {
+        return false;
+    }
+
+    log::debug!(
+        "Replaying committed editor state for text input {} with host commit serial {} \
+         (guest serial {})",
+        guest_id,
+        host_commit_serial,
+        guest_commit_serial,
+    );
+    ctx.client_to_host_queue.extend(transaction);
     true
 }
 
@@ -1418,6 +1957,9 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
         .active_surface
         .and_then(|surface| ctx.shadow_table.get_host_id(surface));
     let target_activated = state.committed_enabled && host_surface.is_some();
+    let placement_refresh_pending = state
+        .active_surface
+        .is_some_and(|surface| state.placement_ime_pending_for(surface));
 
     match (target_activated, state.host_activation()) {
         (true, HostActivationState::Inactive) | (false, HostActivationState::Active) => {}
@@ -1474,6 +2016,24 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     let host_surface = host_surface.unwrap_or(0);
 
     if target_activated {
+        if placement_refresh_pending && state.host_activation() == HostActivationState::Inactive {
+            log::info!(
+                "[ime] deferring activation for placement refresh: guest_text_input={} \
+                 host_v1_id={} host_surface={}",
+                guest_id,
+                host_v1_id,
+                host_surface
+            );
+            if queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat, true, true) {
+                let completed = ctx.text_inputs.get_mut(&guest_id).is_some_and(|state| {
+                    state
+                        .active_surface
+                        .is_some_and(|surface| state.complete_placement_ime(surface))
+                });
+                debug_assert!(completed);
+            }
+            return;
+        }
         log::info!(
                 "update_host_activation: activating text input v1 (guest_id={}, host_v1_id={}, host_surface={})",
                 guest_id,
@@ -1496,8 +2056,161 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
             guest_id,
             host_v1_id
         );
-        queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat);
+        queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat, false, false);
     }
+}
+
+/// Recycle host IME activation after a compositor-owned metadata transition.
+///
+/// Changing an Aura application's identity can make Exo discard the active
+/// IME generation without sending a Wayland keyboard focus transition. The
+/// proxy's focus state is therefore still `Active` even though the host no
+/// longer accepts composition events. A deactivate/sync barrier followed by
+/// the normal activation reconciler establishes a fresh host generation while
+/// preserving the guest text-input object's focus and committed editor state.
+///
+/// This is deliberately keyed by the focused guest surface instead of by a
+/// placement backend. It keeps the repair in the text-input state machine and
+/// lets placement request it only after its identity/parent cleanup has been
+/// ordered on the host stream.
+pub(crate) fn refresh_host_activation_for_surface(
+    ctx: &mut Context,
+    guest_surface_id: u32,
+) -> bool {
+    let candidates = ctx
+        .text_inputs
+        .iter()
+        .filter_map(|(&guest_id, state)| {
+            let placement_pending = state.placement_ime_pending_for(guest_surface_id);
+            if state.active_surface != Some(guest_surface_id)
+                || (!state.committed_enabled && !placement_pending)
+            {
+                return None;
+            }
+            match state.host_activation() {
+                HostActivationState::Active => Some((
+                    guest_id,
+                    state.host_v1_id,
+                    state.guest_seat,
+                    true,
+                    state.committed_enabled,
+                    placement_pending,
+                )),
+                // Transient placement drains the generation before changing
+                // Aura identity.  There is no deactivation barrier to wait
+                // for in this state; re-arm the replay and activate directly
+                // after the identity cleanup barrier.
+                HostActivationState::Inactive => Some((
+                    guest_id,
+                    state.host_v1_id,
+                    state.guest_seat,
+                    false,
+                    state.committed_enabled,
+                    placement_pending,
+                )),
+                HostActivationState::Draining { .. } => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut refreshed = false;
+    log::info!(
+        "[ime] refresh host activation after placement: surface={} candidates={}",
+        guest_surface_id,
+        candidates.len()
+    );
+    for (
+        guest_id,
+        host_v1_id,
+        guest_seat,
+        needs_deactivation,
+        committed_enabled,
+        placement_pending,
+    ) in candidates
+    {
+        let Some(host_seat) = ctx.shadow_table.get_host_id(guest_seat) else {
+            log::debug!(
+                "Cannot refresh text input {} after placement: guest seat {} \
+                 has no host mapping",
+                guest_id,
+                guest_seat
+            );
+            continue;
+        };
+        if needs_deactivation {
+            log::info!(
+                "[ime] refresh path requires second deactivation: guest_text_input={} \
+                 host_v1_id={} guest_seat={}",
+                guest_id,
+                host_v1_id,
+                guest_seat
+            );
+            if queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat, true, false) {
+                if placement_pending {
+                    let completed = ctx
+                        .text_inputs
+                        .get_mut(&guest_id)
+                        .is_some_and(|state| state.complete_placement_ime(guest_surface_id));
+                    debug_assert!(completed);
+                }
+                refreshed = true;
+            }
+            continue;
+        }
+
+        if !committed_enabled {
+            // The guest is focused but currently disabled.  Keep the
+            // placement marker until its next v3 enable/commit; the normal
+            // activation reconciler will then perform a reset/deactivate/sync
+            // barrier before activating the host generation.
+            log::info!(
+                "[ime] refresh deferred until guest enable: guest_text_input={} \
+                 host_v1_id={} surface={}",
+                guest_id,
+                host_v1_id,
+                guest_surface_id
+            );
+            continue;
+        }
+
+        // The host generation was deliberately made inactive before the ARC
+        // identity transition.  Wait for the post-cleanup host `enter` event
+        // before replaying editor state, just like the barrier path below.
+        let replay_immediately = ctx
+            .text_input_replay_barriers
+            .arm_for_host_enter(guest_id, host_v1_id);
+        update_host_activation(ctx, guest_id);
+        log::info!(
+            "[ime] refresh path reactivated host text input: guest_text_input={} \
+             host_v1_id={} replay_immediately={}",
+            guest_id,
+            host_v1_id,
+            replay_immediately
+        );
+        if replay_immediately
+            && ctx
+                .text_inputs
+                .get(&guest_id)
+                .is_some_and(|state| state.host_is_active())
+        {
+            queue_host_editor_state_replay(ctx, guest_id);
+        }
+        if ctx
+            .text_inputs
+            .get(&guest_id)
+            .is_some_and(|state| state.host_is_active())
+        {
+            if placement_pending {
+                let completed = ctx
+                    .text_inputs
+                    .get_mut(&guest_id)
+                    .is_some_and(|state| state.complete_placement_ime(guest_surface_id));
+                debug_assert!(completed);
+            }
+            refreshed = true;
+        }
+    }
+    refreshed
 }
 
 /// Project authoritative seat focus changes onto every text-input object.
@@ -1558,7 +2271,10 @@ fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32
             continue;
         };
 
+        let host_v1_id = state.host_v1_id;
         let previous_surface = state.apply_focus(current_surface);
+        ctx.text_input_replay_barriers
+            .cancel_host_enter_replay(guest_text_input_id, host_v1_id);
 
         // A stale local projection can already equal the authoritative target
         // even though the seat crossed a real focus boundary. Always
@@ -1648,7 +2364,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // Destruction is the final disabled transition. Route it through the
         // same activation reconciler as commit/focus changes so parent-seat
         // lifetime validation cannot drift between teardown paths.
-        let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
+        let (guest_seat, host_v1_id) = ctx
+            .text_inputs
+            .get(&guest_id)
+            .map(|state| (Some(state.guest_seat), state.host_v1_id))
+            .unwrap_or((None, 0));
+        if host_v1_id != 0 {
+            ctx.text_input_replay_barriers
+                .cancel_host_enter_replay(guest_id, host_v1_id);
+        }
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.begin_destroy();
         }
@@ -1837,6 +2561,12 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         else {
             return Action::Drop;
         };
+        let placement_refresh_pending = ctx
+            .text_inputs
+            .get(&guest_id)
+            .and_then(|state| state.active_surface)
+            .is_some_and(|surface| ctx.text_inputs[&guest_id].placement_ime_pending_for(surface));
+        let plan_enabled = plan.enabled;
         log::trace!(
             ">>> v3 on_commit: guest_id={}, serial={}, enabled={}, host_v1_id={}",
             guest_id,
@@ -1959,10 +2689,16 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             }
         }
 
-        log::debug!("  -> sending v1 commit_state(serial={})", plan.serial);
+        let host_commit_serial =
+            ctx.next_host_text_input_commit_serial(plan.host_v1_id, plan.serial);
+        log::debug!(
+            "  -> sending v1 commit_state(serial={}, guest_serial={})",
+            host_commit_serial,
+            plan.serial
+        );
         // commit_state: opcode 9
         let mut builder = MessageBuilder::new();
-        builder.write_u32(plan.serial);
+        builder.write_u32(host_commit_serial);
         if !push_msg(&mut transaction, plan.host_v1_id, 9, builder) {
             return Action::Drop;
         }
@@ -1985,8 +2721,18 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         }
 
-        update_host_activation(ctx, guest_id);
-        ctx.client_to_host_queue.extend(transaction);
+        // A placement recovery that was deferred while the guest editor was
+        // disabled must publish this v3 editor transaction before its
+        // reset/deactivate/sync barrier. Otherwise the barrier callback can
+        // reactivate the host generation before the newly committed editor
+        // state reaches Exo, leaving Korean composition disabled again.
+        if placement_refresh_pending && plan_enabled {
+            ctx.client_to_host_queue.extend(transaction);
+            update_host_activation(ctx, guest_id);
+        } else {
+            update_host_activation(ctx, guest_id);
+            ctx.client_to_host_queue.extend(transaction);
+        }
         Action::Drop
     }
 }
@@ -2113,9 +2859,47 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
         (ctx, host_v1_id, guest_id)
+    }
+
+    #[test]
+    fn late_host_leave_restarts_focused_ime_generation() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let mut handler = TextInputV1Handler;
+        ctx.keyboard_focus.set_for_test(HostId(99), 0, 900, 900);
+
+        // A transient Aura identity change can make Exo emit text-input.leave
+        // after the placement refresh has already reactivated the reused v1
+        // object.  The guest still owns the same focused surface, so this
+        // leave is stale rather than a guest focus boundary.
+        ctx.last_sender_id = host_v1_id;
+        assert_eq!(handler.on_leave(&mut ctx), Action::Drop);
+
+        assert!(
+            matches!(
+                ctx.text_inputs[&guest_id].host_activation(),
+                HostActivationState::Draining { .. }
+            ),
+            "a stale host leave must drain the generation before reactivation"
+        );
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            3,
+            "reset, deactivate, and sync must be ordered as one recovery"
+        );
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 0),
+            zwp_text_input_v1::REQ_RESET
+        );
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 1), 1);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), 1);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 2),
+            wl_display::REQ_SYNC
+        );
     }
 
     fn msg_done_serial(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
@@ -3241,6 +4025,224 @@ mod tests {
     }
 
     #[test]
+    fn placement_refresh_drains_and_reactivates_focused_host_text_input() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let focused_surface = ctx.text_inputs[&guest_id]
+            .active_surface
+            .expect("fixture must start focused");
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed_surrounding_text = Some(("editor".to_string(), 6, 6));
+            state.committed_content_type = Some((0, 13));
+            state.cursor_rect = Some((1, 2, 3, 4));
+            state.guest_commit_serial = 17;
+        }
+        // Model the v1 serial already consumed by the guest's last normal
+        // commit. The placement replay must advance it even though the guest
+        // v3 serial remains 17 and no new guest commit was received.
+        assert_eq!(ctx.next_host_text_input_commit_serial(host_v1_id, 17), 17);
+        ctx.shadow_table
+            .map_id(focused_surface, focused_surface + 1);
+        ctx.shadow_table
+            .track_interface(focused_surface, "wl_surface".to_string());
+
+        assert!(refresh_host_activation_for_surface(
+            &mut ctx,
+            focused_surface
+        ));
+        let callback_id = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("placement refresh must install a drain barrier");
+        assert!(!ctx.text_inputs[&guest_id].host_is_active());
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            3,
+            "placement refresh must reset before deactivation"
+        );
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), host_v1_id);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 0),
+            zwp_text_input_v1::REQ_RESET
+        );
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 1), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 1), 1);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), 1);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 2),
+            wl_display::REQ_SYNC
+        );
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(ctx.text_inputs[&guest_id].host_is_active());
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            4,
+            "refresh must wait for host text-input enter before replaying editor state"
+        );
+        let host_surface = ctx
+            .shadow_table
+            .get_host_id(focused_surface)
+            .expect("focused surface host mapping");
+        ctx.last_sender_id = host_v1_id;
+        let mut v1 = TextInputV1Handler;
+        assert_eq!(v1.on_enter(&mut ctx, host_surface), Action::Drop);
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            10,
+            "editor state must be replayed only after host text-input enter"
+        );
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 4), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 4), 5);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 5), 30);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 5), 7);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 6), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 6), 6);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 7), 30);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 7), 6);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 8), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 8), 7);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue, 9), host_v1_id);
+        assert_eq!(msg_opcode(&ctx.client_to_host_queue, 9), 9);
+        assert_eq!(
+            msg_done_serial(&ctx.client_to_host_queue, 9),
+            18,
+            "placement replay must use a fresh host v1 serial"
+        );
+    }
+
+    #[test]
+    fn placement_refresh_recovers_when_guest_was_disabled() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let focused_surface = ctx.text_inputs[&guest_id]
+            .active_surface
+            .expect("fixture must start focused");
+        let host_surface = focused_surface + 1;
+        ctx.shadow_table.map_id(focused_surface, host_surface);
+        ctx.shadow_table
+            .track_interface(focused_surface, "wl_surface".to_string());
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.pending_enabled = false;
+            state.committed_enabled = false;
+            state.host_activation = HostActivationState::Inactive;
+        }
+
+        // The identity transition still invalidates the host-side generation
+        // even though the guest had committed disable.  The marker must
+        // survive until the next v3 enable/commit.
+        let preflight = prepare_placement_ime_deactivation(&mut ctx, focused_surface)
+            .expect("focused text input should be tracked during placement");
+        assert_eq!(preflight.guest_text_inputs, vec![guest_id]);
+        assert!(preflight.host_messages.is_empty());
+        assert!(commit_placement_ime_preflight(&mut ctx, preflight));
+        assert!(ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface));
+        assert!(!refresh_host_activation_for_surface(
+            &mut ctx,
+            focused_surface
+        ));
+        assert!(
+            ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface),
+            "disabled guest must retain the marker for its next enable"
+        );
+
+        // Re-enable exactly as a real v3 client does.  The editor transaction
+        // must reach Exo before the placement reset/deactivate/sync barrier,
+        // otherwise host activation can race ahead of the new IME state.
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
+        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
+        let callback_id = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("re-enable must install a placement refresh barrier");
+        let commit_index = ctx
+            .client_to_host_queue
+            .iter()
+            .position(|message| {
+                msg_sender(std::slice::from_ref(message), 0) == host_v1_id
+                    && msg_opcode(std::slice::from_ref(message), 0)
+                        == zwp_text_input_v1::REQ_COMMIT_STATE
+            })
+            .expect("v3 enable must send commit_state");
+        let reset_index = ctx
+            .client_to_host_queue
+            .iter()
+            .position(|message| {
+                msg_sender(std::slice::from_ref(message), 0) == host_v1_id
+                    && msg_opcode(std::slice::from_ref(message), 0) == zwp_text_input_v1::REQ_RESET
+            })
+            .expect("placement recovery must reset the host generation");
+        assert!(
+            commit_index < reset_index,
+            "editor state must precede the placement reset barrier"
+        );
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(ctx.text_inputs[&guest_id].host_is_active());
+        assert!(!ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface));
+
+        ctx.last_sender_id = host_v1_id;
+        let mut v1 = TextInputV1Handler;
+        assert_eq!(v1.on_enter(&mut ctx, host_surface), Action::Drop);
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .filter(|message| {
+                    msg_sender(std::slice::from_ref(message), 0) == host_v1_id
+                        && msg_opcode(std::slice::from_ref(message), 0)
+                            == zwp_text_input_v1::REQ_COMMIT_STATE
+                })
+                .count()
+                >= 2,
+            "host enter must trigger a replay commit for Korean IME state"
+        );
+    }
+
+    #[test]
+    fn placement_refresh_is_cancelled_when_keyboard_focus_leaves_before_cleanup() {
+        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
+        let focused_surface = ctx.text_inputs[&guest_id]
+            .active_surface
+            .expect("fixture must start focused");
+
+        let preflight = prepare_placement_ime_deactivation(&mut ctx, focused_surface)
+            .expect("focused text input should be eligible for placement refresh");
+        assert!(commit_placement_ime_preflight(&mut ctx, preflight));
+        assert!(
+            ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface),
+            "placement must own one pending recovery generation"
+        );
+
+        // A host keyboard leave can arrive before the Aura cleanup barrier.
+        // The real focus transition must take ownership of the next guest
+        // enter, so the placement marker is cancelled instead of becoming a
+        // stale connection-wide re-entry request.
+        apply_keyboard_focus_changes(
+            &mut ctx,
+            &[SeatFocusChange {
+                guest_seat: 0,
+                previous_surface: Some(focused_surface),
+                current_surface: None,
+            }],
+        );
+        assert_eq!(ctx.text_inputs[&guest_id].active_surface, None);
+        assert!(
+            !ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface),
+            "focus leave must cancel placement recovery"
+        );
+
+        let queue_len = ctx.host_to_client_queue.len();
+        assert!(resume_placement_ime_for_surface(&mut ctx, focused_surface));
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            queue_len,
+            "cleanup must not synthesize an enter for a surface that already lost focus"
+        );
+    }
+
+    #[test]
     fn activation_barrier_orders_new_editor_transaction_before_activate() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let next_surface = 901;
@@ -3412,6 +4414,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: HostActivationState::Inactive,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
         let mut handler = TextInputV3Handler;
