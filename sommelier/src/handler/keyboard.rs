@@ -34,6 +34,23 @@ use crate::window_shortcuts::{ShortcutConfig, WindowShortcut};
 use crate::wire::Action;
 use xkbcommon::xkb;
 
+/// Focus generation that may emit a delayed host `wl_keyboard.leave` after a
+/// transient placement identity change.
+///
+/// The host can send leave/enter several seconds after the placement barrier
+/// has completed. Until the matching same-surface enter arrives, consuming the
+/// leave is the only way to keep the guest text-input focus generation alive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlacementFocusGuard {
+    guest_surface: u32,
+    host_surface: u32,
+    /// Transient placement changes the Aura identity twice: ARC task-form
+    /// installation, then native Guest OS restoration. Each transition can
+    /// produce its own delayed leave/enter pair.
+    remaining_recoveries: u8,
+    saw_leave: bool,
+}
+
 /// `wl_keyboard.key` state values (Wayland spec §wl_keyboard.key).
 pub(crate) const WL_KEY_PRESSED: u32 = 1;
 pub(crate) const WL_KEY_RELEASED: u32 = 0;
@@ -176,6 +193,11 @@ pub struct KeyboardHandler {
     /// Statically enforce `!Sync`: `KeyboardHandler` must never be shared
     /// across threads. `xkb::State` uses non-atomic interior mutation.
     _not_sync: std::marker::PhantomData<*mut ()>,
+    /// Per-resource guards for delayed leaves caused by transient ARC
+    /// placement. Keeping this in the keyboard handler makes the guard
+    /// connection-local and lets each keyboard resource complete its own
+    /// leave/enter cycle independently.
+    placement_focus_guards: std::collections::HashMap<HostId, PlacementFocusGuard>,
 }
 
 impl KeyboardHandler {
@@ -186,7 +208,142 @@ impl KeyboardHandler {
             states: std::collections::HashMap::new(),
             modifiers: std::collections::HashMap::new(),
             _not_sync: std::marker::PhantomData,
+            placement_focus_guards: std::collections::HashMap::new(),
         }
+    }
+
+    /// Arm a guard for every live keyboard resource owning `guest_surface`.
+    ///
+    /// A shortcut is delivered by one keyboard resource, but ChromeOS may
+    /// have several resources for the same seat. The delayed leave observed
+    /// in the runtime trace arrived on both resources, so guarding only the
+    /// shortcut sender leaves a second resource free to tear down IME focus.
+    fn arm_placement_focus_guards(&mut self, ctx: &Context, guest_surface: u32) {
+        if !ctx.window_placement.uses_transient_arc_id() {
+            return;
+        }
+        for host_keyboard in ctx.keyboard_focus.host_keyboards_for_surface(guest_surface) {
+            let Some(focus) = ctx.keyboard_focus.focus_for_keyboard(host_keyboard) else {
+                continue;
+            };
+            let guard = self
+                .placement_focus_guards
+                .entry(host_keyboard)
+                .and_modify(|guard| {
+                    // A second shortcut can be queued before the first host
+                    // identity cycle has settled. Preserve the current cycle
+                    // and add the two transitions belonging to the new
+                    // operation.
+                    if guard.guest_surface == guest_surface
+                        && guard.host_surface == focus.host_surface
+                    {
+                        guard.remaining_recoveries = guard.remaining_recoveries.saturating_add(2);
+                    }
+                })
+                .or_insert(PlacementFocusGuard {
+                    guest_surface,
+                    host_surface: focus.host_surface,
+                    remaining_recoveries: 2,
+                    saw_leave: false,
+                });
+            log::debug!(
+                "[placement-focus-guard] armed host_keyboard={} guest_surface={} host_surface={} \
+                 remaining_recoveries={}",
+                host_keyboard.0,
+                guest_surface,
+                focus.host_surface,
+                guard.remaining_recoveries
+            );
+        }
+    }
+
+    /// Observe a host enter while a placement guard is armed.
+    ///
+    /// A same-surface enter completes only the resource that previously
+    /// emitted a suppressed leave. An enter for a different surface is a real
+    /// focus transition and discards the guard so normal registry handling can
+    /// synthesize the balanced guest leave/enter.
+    fn observe_placement_enter(
+        &mut self,
+        host_keyboard: HostId,
+        guest_surface: u32,
+        host_surface: u32,
+    ) {
+        let Some(mut guard) = self.placement_focus_guards.get(&host_keyboard).copied() else {
+            return;
+        };
+        if guard.guest_surface == guest_surface && guard.host_surface == host_surface {
+            if guard.saw_leave {
+                guard.saw_leave = false;
+                guard.remaining_recoveries = guard.remaining_recoveries.saturating_sub(1);
+                if guard.remaining_recoveries == 0 {
+                    self.placement_focus_guards.remove(&host_keyboard);
+                    log::info!(
+                        "[placement-focus-guard] completed recovery host_keyboard={} \
+                         guest_surface={} host_surface={}",
+                        host_keyboard.0,
+                        guest_surface,
+                        host_surface
+                    );
+                } else {
+                    log::info!(
+                        "[placement-focus-guard] accepted recovery cycle host_keyboard={} \
+                         guest_surface={} host_surface={} remaining_recoveries={}",
+                        host_keyboard.0,
+                        guest_surface,
+                        host_surface,
+                        guard.remaining_recoveries
+                    );
+                    self.placement_focus_guards.insert(host_keyboard, guard);
+                }
+            }
+            return;
+        }
+        self.placement_focus_guards.remove(&host_keyboard);
+        log::info!(
+            "[placement-focus-guard] released for real focus transition host_keyboard={} \
+             old_guest_surface={} new_guest_surface={}",
+            host_keyboard.0,
+            guard.guest_surface,
+            guest_surface
+        );
+    }
+
+    /// Suppress a delayed leave belonging to the guarded focus generation.
+    ///
+    /// The registry is intentionally not mutated: the guest still owns this
+    /// surface until a same-surface recovery enter or a real different-surface
+    /// enter proves otherwise.
+    fn suppress_placement_leave(
+        &mut self,
+        ctx: &Context,
+        host_keyboard: HostId,
+        host_surface: u32,
+    ) -> bool {
+        let Some(guard) = self.placement_focus_guards.get_mut(&host_keyboard) else {
+            return false;
+        };
+        let matches_live_focus = ctx
+            .keyboard_focus
+            .focus_for_keyboard(host_keyboard)
+            .is_some_and(|focus| {
+                focus.guest_surface == guard.guest_surface
+                    && focus.host_surface == guard.host_surface
+                    && focus.host_surface == host_surface
+            });
+        if !matches_live_focus {
+            self.placement_focus_guards.remove(&host_keyboard);
+            return false;
+        }
+        guard.saw_leave = true;
+        log::info!(
+            "[placement-focus-guard] suppressed delayed leave host_keyboard={} \
+             guest_surface={} host_surface={}",
+            host_keyboard.0,
+            guard.guest_surface,
+            host_surface
+        );
+        true
     }
 
     fn guest_seat_for_host_keyboard(ctx: &Context, host_keyboard_id: HostId) -> Option<u32> {
@@ -680,6 +837,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             guest_surface: guest_surface_id,
             host_surface: surface,
         };
+        self.observe_placement_enter(host_keyboard_id, guest_surface_id, surface);
         if ctx.keyboard_focus.focus_for_keyboard(host_keyboard_id) == Some(focus) {
             // The C reference suppresses an enter when the resource already
             // owns this focus. Preserve physical pressed-key and XKB state as
@@ -745,6 +903,10 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             surface,
             guest_surface_id
         );
+
+        if self.suppress_placement_leave(ctx, host_keyboard_id, surface) {
+            return Action::Drop;
+        }
 
         let focus_update = ctx.keyboard_focus.leave(host_keyboard_id, surface);
         if !focus_update.accepted {
@@ -869,8 +1031,21 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             .then(|| self.window_shortcut(host_keyboard_id, key, &config))
             .flatten();
         let compositor_shortcut = match state {
-            WL_KEY_PRESSED => shortcut
-                .is_some_and(|shortcut| Self::apply_window_layout(ctx, host_keyboard_id, shortcut)),
+            WL_KEY_PRESSED => shortcut.is_some_and(|shortcut| {
+                let applied = Self::apply_window_layout(ctx, host_keyboard_id, shortcut);
+                if applied {
+                    // Only transient ARC identity changes have the delayed
+                    // host leave/enter behavior that can invalidate IME
+                    // focus. Native self-parent and persistent modes retain
+                    // their normal focus lifecycle.
+                    if let Some((_, guest_surface_id)) =
+                        Self::active_xdg_toplevel(ctx, host_keyboard_id)
+                    {
+                        self.arm_placement_focus_guards(ctx, guest_surface_id);
+                    }
+                }
+                applied
+            }),
             WL_KEY_REPEATED => {
                 ctx.guest_key_owner(host_keyboard_id, key)
                     == Some(GuestKeyOwner::CompositorShortcut)
@@ -987,7 +1162,11 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ) -> Action {
         log::trace!(
             ">>> wl_keyboard.on_modifiers: serial={}, depressed={:#x}, latched={:#x}, locked={:#x}, group={}",
-            _serial, mods_depressed, mods_latched, mods_locked, group
+            _serial,
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group
         );
         let host_keyboard_id = HostId::from_event_sender(ctx);
         if let Some(state) = self.states.get_mut(&host_keyboard_id) {
@@ -1051,6 +1230,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             }
             return Action::Forward;
         };
+        self.placement_focus_guards.remove(&host_keyboard_id);
         let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
         // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
         // All must be reset so that a re-created keyboard starts from a clean
@@ -1350,6 +1530,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
     }
@@ -1489,9 +1670,14 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1628,9 +1814,14 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1708,18 +1899,20 @@ mod tests {
         let output = 25u32;
         let native_id = "org.chromium.guest_os.test.wayland.com.example.Terminal";
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_mode_for_test(
-            crate::state::WindowPlacementMode::new(
-                crate::state::WindowHostPolicy::Arc,
-                crate::state::WindowGeometryMethod::Bounds,
-            )
-            .with_arc_id_lifetime(crate::state::WindowArcIdLifetime::Transient),
-        );
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::arc_bounds(
+                crate::state::WindowArcIdLifetime::Transient,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1810,36 +2003,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             parent_requests.len(),
-            1,
-            "transient ARC cleanup must emit one nullable-parent request"
-        );
-        assert_eq!(
-            message_first_u32(parent_requests[0]),
             0,
-            "transient ARC cleanup must use a null parent"
-        );
-        let parent_position = ctx
-            .client_to_host_queue
-            .iter()
-            .position(|message| {
-                message_opcode(message)
-                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT
-            })
-            .expect("null-parent request");
-        let restore_position = ctx
-            .client_to_host_queue
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| {
-                message_opcode(message)
-                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID
-            })
-            .nth(1)
-            .map(|(position, _)| position)
-            .expect("native identity restore");
-        assert!(
-            parent_position < restore_position,
-            "null-parent cleanup must be queued before native identity restore"
+            "bounds-based transient ARC cleanup must not emit set_parent(NULL)"
         );
     }
 
@@ -1861,9 +2026,14 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1934,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn self_parent_probe_queues_self_parent_and_bounds_request() {
+    fn self_parent_probe_resizes_then_defers_self_parent_until_configure() {
         let keyboard = 10u32;
         let host_keyboard = 5u32;
         let seat = 11u32;
@@ -1951,9 +2121,19 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        ctx.shadow_table.map_id(xdg_toplevel + 1000, 26);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel + 1000, "xdg_surface".to_string());
+        ctx.shadow_table
+            .track_host_interface_with_version(26, "xdg_surface".to_string(), 6);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1975,18 +2155,80 @@ mod tests {
             HostId(host_keyboard),
             test_shortcut("<Alt>q"),
         ));
-        let parent_request = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                (word2 & 0xffff) as u16 == REQ_SET_PARENT
-            })
-            .expect("self-parent request");
+        let acknowledge_synthetic_resize = |ctx: &mut Context| {
+            let serial = ctx
+                .host_to_client_queue
+                .iter()
+                .rev()
+                .find(|message| {
+                    message_sender(message) == xdg_toplevel + 1000
+                        && message_opcode(message)
+                            == crate::protocols::xdg_shell::xdg_surface::EVT_CONFIGURE
+                })
+                .map(message_first_u32)
+                .expect("synthetic resize configure");
+            assert!(ctx
+                .window_placement
+                .consume_synthetic_xdg_configure_serial(xdg_toplevel + 1000, serial));
+            assert!(
+                ctx.window_placement.note_guest_surface_commit(surface),
+                "guest ack and commit must open the resize phase"
+            );
+        };
+        acknowledge_synthetic_resize(&mut ctx);
         let zaura_surface_id = ctx
             .window_placement
             .aura_surface_for_wl_surface(host_surface)
             .expect("host zaura surface mapping");
+        let opcodes = ctx
+            .client_to_host_queue
+            .iter()
+            .map(message_opcode)
+            .collect::<Vec<_>>();
+        assert!(
+            opcodes.ends_with(&[REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED, REQ_UNSET_SNAP,]),
+            "self-parent placement must publish the resize phase first"
+        );
+        assert!(
+            !opcodes.contains(&REQ_SET_PARENT),
+            "position must wait for the matching host size configure"
+        );
+        assert!(
+            !ctx.client_to_host_queue.iter().any(|message| {
+                message_sender(message) == 1
+                    && message_opcode(message) == crate::protocols::wayland::wl_display::REQ_SYNC
+            }),
+            "the placement barrier belongs to the deferred position phase"
+        );
+        assert_eq!(
+            ctx.window_placement.origin(zaura_toplevel_id),
+            Some((100, 200)),
+            "the resize phase retains the authoritative host origin"
+        );
+        assert_eq!(
+            ctx.window_placement.pending_origin(zaura_toplevel_id),
+            Some((0, 0)),
+            "the requested origin remains pending until host confirmation"
+        );
+
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut crate::handler::compositor::CompositorHandler,
+                &mut ctx,
+                100,
+                200,
+                1920,
+                1080,
+                &[],
+            ),
+            Action::Drop
+        );
+        let parent_request = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| message_opcode(message) == REQ_SET_PARENT)
+            .expect("self-parent request after matching configure");
         assert_eq!(
             u32::from_ne_bytes(parent_request.0[0..4].try_into().unwrap()),
             zaura_surface_id
@@ -2002,59 +2244,6 @@ mod tests {
         assert_eq!(
             i32::from_ne_bytes(parent_request.0[16..20].try_into().unwrap()),
             -200
-        );
-        let opcodes = ctx
-            .client_to_host_queue
-            .iter()
-            .map(message_opcode)
-            .collect::<Vec<_>>();
-        assert!(
-            opcodes.ends_with(&[
-                REQ_UNSET_FULLSCREEN,
-                REQ_UNSET_MAXIMIZED,
-                REQ_UNSET_SNAP,
-                REQ_SET_WINDOW_BOUNDS,
-                REQ_SET_PARENT,
-                crate::protocols::wayland::wl_display::REQ_SYNC,
-            ]),
-            "self-parent placement must clear state, resize in place, move, then sync"
-        );
-        let bounds_request = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                u32::from_ne_bytes(message[0..4].try_into().unwrap()) == zaura_toplevel_id
-                    && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
-            })
-            .expect("self-parent bounds request");
-        assert_eq!(
-            i32::from_ne_bytes(bounds_request.0[8..12].try_into().unwrap()),
-            100,
-            "bounds-first must preserve the known current x while resizing"
-        );
-        assert_eq!(
-            i32::from_ne_bytes(bounds_request.0[12..16].try_into().unwrap()),
-            200,
-            "bounds-first must preserve the known current y while resizing"
-        );
-        assert_eq!(
-            i32::from_ne_bytes(bounds_request.0[16..20].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(
-            i32::from_ne_bytes(bounds_request.0[20..24].try_into().unwrap()),
-            1080
-        );
-        assert_eq!(
-            ctx.window_placement.origin(zaura_toplevel_id),
-            Some((0, 0)),
-            "a self-parent placement predicts the new contents origin"
-        );
-        assert_eq!(
-            ctx.window_placement.pending_origin(zaura_toplevel_id),
-            Some((0, 0)),
-            "the requested origin remains pending until host confirmation"
         );
         let callback_id = ctx
             .client_to_host_queue
@@ -2079,8 +2268,30 @@ mod tests {
             ctx.window_placement.barrier_for_callback(callback_id),
             Some(zaura_toplevel_id)
         );
+
+        // A newer shortcut can arrive after the first parent move but before
+        // its barrier completes. The newer resize must survive the older
+        // callback's unparent cleanup and reach its own position phase.
+        assert!(KeyboardHandler::apply_window_layout(
+            &mut ctx,
+            HostId(host_keyboard),
+            test_shortcut("<Alt>d"),
+        ));
+
         ctx.last_sender_id = callback_id;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert_eq!(
+            ctx.window_placement
+                .active_self_parent_size(zaura_toplevel_id),
+            Some((1920, 1080)),
+            "the first rectangle remains active while the newer size is deferred"
+        );
+        assert_eq!(
+            ctx.window_placement
+                .deferred_self_parent_target(zaura_toplevel_id),
+            Some((1920, 0, 1920, 2160)),
+            "the newer rectangle must remain queued behind cleanup"
+        );
 
         let parent_requests: Vec<_> = ctx
             .client_to_host_queue
@@ -2108,6 +2319,121 @@ mod tests {
             i32::from_ne_bytes(parent_requests[1].0[16..20].try_into().unwrap()),
             0
         );
+
+        // The first callback queues a second sync after NULL-parent and IME
+        // refresh. Complete that barrier before accepting the final host
+        // origin; an origin event alone must not advance the deferred resize.
+        let followup_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|(message, _)| {
+                u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 1
+                    && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+                        == crate::protocols::wayland::wl_display::REQ_SYNC
+            })
+            .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
+            .expect("self-parent cleanup follow-up barrier callback");
+        ctx.last_sender_id = followup_callback;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut crate::handler::compositor::CompositorHandler,
+                &mut ctx,
+                100,
+                200,
+                1920,
+                2160,
+                &[],
+            ),
+            Action::Drop
+        );
+        let parent_requests: Vec<_> = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|(message, _)| {
+                (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+                    == REQ_SET_PARENT
+            })
+            .collect();
+        assert_eq!(
+            parent_requests.len(),
+            2,
+            "the newer size must start a second resize phase before its \
+             self-parent move"
+        );
+        assert_eq!(
+            ctx.window_placement.pending_resize_size(zaura_toplevel_id),
+            None,
+            "a changed deferred rectangle must also wait for the \
+             previous self-parent origin to settle"
+        );
+        assert_eq!(
+            ctx.window_placement
+                .deferred_self_parent_target(zaura_toplevel_id),
+            Some((1920, 0, 1920, 2160)),
+            "the changed target remains deferred until final origin"
+        );
+
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut crate::handler::compositor::CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+            ),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.window_placement.pending_resize_size(zaura_toplevel_id),
+            Some((1920, 2160)),
+            "the changed target starts only after final origin confirmation"
+        );
+
+        acknowledge_synthetic_resize(&mut ctx);
+        // Once the host acknowledges the deferred size, the position phase is
+        // serialized exactly once.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut crate::handler::compositor::CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+                1920,
+                2160,
+                &[],
+            ),
+            Action::Drop
+        );
+        let parent_requests: Vec<_> = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|(message, _)| {
+                (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+                    == REQ_SET_PARENT
+            })
+            .collect();
+        assert_eq!(
+            parent_requests.len(),
+            3,
+            "the acknowledged deferred size must queue one self-parent move"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(parent_requests[2].0[8..12].try_into().unwrap()),
+            zaura_surface_id
+        );
+        assert_eq!(
+            i32::from_ne_bytes(parent_requests[2].0[12..16].try_into().unwrap()),
+            1920
+        );
+        assert_eq!(
+            i32::from_ne_bytes(parent_requests[2].0[16..20].try_into().unwrap()),
+            0
+        );
     }
 
     #[test]
@@ -2127,9 +2453,14 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, 23);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2161,7 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn self_parent_probe_rebases_following_shortcuts_on_target_origin() {
+    fn self_parent_probe_deduplicates_an_identical_pending_shortcut() {
         let keyboard = 10u32;
         let host_keyboard = 5u32;
         let seat = 11u32;
@@ -2177,9 +2508,19 @@ mod tests {
             ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table
+            .track_interface(surface, "wl_surface".to_string());
         ctx.shadow_table.map_id(xdg_toplevel, 23);
         ctx.shadow_table
             .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
+        ctx.shadow_table.map_id(xdg_toplevel + 1000, 26);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel + 1000, "xdg_surface".to_string());
+        ctx.shadow_table
+            .track_host_interface_with_version(26, "xdg_surface".to_string(), 6);
+        assert!(ctx
+            .window_placement
+            .remember_xdg_surface(xdg_toplevel + 1000, surface));
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2201,42 +2542,26 @@ mod tests {
             HostId(host_keyboard),
             test_shortcut("<Alt>q"),
         ));
+        let first_wire_len = ctx.client_to_host_queue.len();
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
-            test_shortcut("<Alt>c"),
+            test_shortcut("<Alt>q"),
         ));
-
-        let parent_requests: Vec<_> = ctx
-            .client_to_host_queue
-            .iter()
-            .filter(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                (word2 & 0xffff) as u16 == REQ_SET_PARENT
-            })
-            .collect();
-        assert_eq!(parent_requests.len(), 2);
         assert_eq!(
-            i32::from_ne_bytes(parent_requests[0].0[12..16].try_into().unwrap()),
-            -100
+            ctx.client_to_host_queue.len(),
+            first_wire_len,
+            "an identical target already in the resize phase must not enqueue a second batch"
+        );
+        assert!(
+            !ctx.client_to_host_queue
+                .iter()
+                .any(|message| message_opcode(message) == REQ_SET_PARENT),
+            "duplicate requests must not reach the position phase"
         );
         assert_eq!(
-            i32::from_ne_bytes(parent_requests[0].0[16..20].try_into().unwrap()),
-            -200
-        );
-        // The second request must be relative to the predicted (0, 0)
-        // contents origin, not the stale (100, 200) origin.
-        assert_eq!(
-            i32::from_ne_bytes(parent_requests[1].0[12..16].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(
-            i32::from_ne_bytes(parent_requests[1].0[16..20].try_into().unwrap()),
-            1080
-        );
-        assert_eq!(
-            ctx.window_placement.origin(zaura_toplevel_id),
-            Some((1920, 1080))
+            ctx.window_placement.pending_origin(zaura_toplevel_id),
+            Some((0, 0))
         );
     }
 
@@ -4395,6 +4720,90 @@ mod tests {
     }
 
     #[test]
+    fn transient_placement_suppresses_delayed_leave_for_every_keyboard_resource() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::arc_bounds(
+                crate::state::WindowArcIdLifetime::Transient,
+            ));
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        map_keyboard(&mut ctx, 11, 101, 1001, 1);
+        ctx.shadow_table.map_id(20, 200);
+        focus_keyboard(&mut ctx, 100, 1, 20);
+        focus_keyboard(&mut ctx, 101, 1, 20);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.host_to_client_queue.clear();
+
+        handler.arm_placement_focus_guards(&ctx, 20);
+        assert_eq!(handler.placement_focus_guards.len(), 2);
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_leave(&mut ctx, 1, 200), Action::Drop);
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_leave(&mut ctx, 2, 200), Action::Drop);
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(20));
+        assert!(
+            ctx.host_to_client_queue.is_empty(),
+            "suppressed placement leaves must not tear down guest IME focus"
+        );
+
+        // The host later re-enters the same surface. Each resource's enter
+        // clears only its own guard and remains a duplicate at the registry
+        // layer, so no synthetic guest focus churn is emitted.
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 3, 200, &[]), Action::Drop);
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_enter(&mut ctx, 4, 200, &[]), Action::Drop);
+        assert_eq!(
+            handler.placement_focus_guards.len(),
+            2,
+            "transient placement has a second ARC-restore identity cycle"
+        );
+
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_leave(&mut ctx, 5, 200), Action::Drop);
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_leave(&mut ctx, 6, 200), Action::Drop);
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 7, 200, &[]), Action::Drop);
+        ctx.last_sender_id = 101;
+        assert_eq!(handler.on_enter(&mut ctx, 8, 200, &[]), Action::Drop);
+        assert!(handler.placement_focus_guards.is_empty());
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(20));
+        assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    #[test]
+    fn transient_placement_guard_yields_to_real_focus_transition() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut handler = KeyboardHandler::new();
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::arc_bounds(
+                crate::state::WindowArcIdLifetime::Transient,
+            ));
+        map_keyboard(&mut ctx, 10, 100, 1000, 1);
+        ctx.shadow_table.map_id(20, 200);
+        ctx.shadow_table.map_id(21, 201);
+        focus_keyboard(&mut ctx, 100, 1, 20);
+        add_active_text_input(&mut ctx, 40, 1, 2000);
+        ctx.text_inputs
+            .get_mut(&40)
+            .expect("text input")
+            .active_surface = Some(20);
+        ctx.host_to_client_queue.clear();
+
+        handler.arm_placement_focus_guards(&ctx, 20);
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_enter(&mut ctx, 1, 201, &[]), Action::Forward);
+        assert!(handler.placement_focus_guards.is_empty());
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(21));
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[0]), 20);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[1]), 21);
+    }
+
+    #[test]
     fn duplicate_keyboard_enter_preserves_pressed_key_state() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let mut handler = KeyboardHandler::new();
@@ -4984,6 +5393,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 
@@ -5077,6 +5487,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 
@@ -5165,6 +5576,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 
@@ -5230,6 +5642,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 
@@ -5311,6 +5724,7 @@ mod tests {
                     pending_deletes: Vec::new(),
                     pending_cursor_position: None,
                     host_activation: crate::state::HostActivationState::Active,
+                    placement_ime: crate::state::PlacementImeState::None,
                 },
             );
         }
@@ -5394,6 +5808,7 @@ mod tests {
                 pending_deletes: vec![(3, 0)],
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
         ctx.last_sender_id = 10;

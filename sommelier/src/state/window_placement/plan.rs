@@ -30,13 +30,40 @@ pub(crate) enum WindowPlacementGeometry {
         current_origin: (i32, i32),
         relative_position: (i32, i32),
     },
+    /// Send a remote-shell v2 bounds request to the host-managed surface.
+    RemoteShell,
 }
 
 /// Native/ARC identity transition required by transient ARC placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransientArcIdentity {
-    pub(crate) arc_application_id: String,
-    pub(crate) wl_surface_guest_id: u32,
+    arc_application_id: String,
+    wl_surface_guest_id: u32,
+}
+
+impl TransientArcIdentity {
+    /// Construct the identity transition owned by the placement state.
+    pub(super) fn new(arc_application_id: String, wl_surface_guest_id: u32) -> Self {
+        Self {
+            arc_application_id,
+            wl_surface_guest_id,
+        }
+    }
+
+    /// Return the temporary ARC application ID to install on the Aura surface.
+    pub(crate) fn arc_application_id(&self) -> &str {
+        &self.arc_application_id
+    }
+
+    /// Return the guest surface whose native identity must be restored.
+    pub(crate) const fn wl_surface_guest_id(&self) -> u32 {
+        self.wl_surface_guest_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(arc_application_id: String, wl_surface_guest_id: u32) -> Self {
+        Self::new(arc_application_id, wl_surface_guest_id)
+    }
 }
 
 /// All object identities required to execute one placement operation.
@@ -46,13 +73,86 @@ pub(crate) struct TransientArcIdentity {
 /// surface with Aura objects belonging to another window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacementTarget {
-    pub(crate) guest_xdg_toplevel_id: u32,
-    pub(crate) wl_surface_guest_id: u32,
-    pub(crate) wl_surface_host_id: u32,
-    pub(crate) host_xdg_toplevel_id: u32,
-    pub(crate) zaura_toplevel_host_id: u32,
-    pub(crate) zaura_surface_host_id: u32,
-    pub(crate) zaura_surface_version: u32,
+    guest_xdg_toplevel_id: u32,
+    wl_surface_guest_id: u32,
+    wl_surface_host_id: u32,
+    host_xdg_toplevel_id: u32,
+    zaura_toplevel_host_id: u32,
+    zaura_surface_host_id: u32,
+    zaura_surface_version: u32,
+}
+
+impl PlacementTarget {
+    /// Construct one target after the placement state has resolved all live
+    /// guest/host associations.
+    pub(super) const fn new(
+        guest_xdg_toplevel_id: u32,
+        wl_surface_guest_id: u32,
+        wl_surface_host_id: u32,
+        host_xdg_toplevel_id: u32,
+        zaura_toplevel_host_id: u32,
+        zaura_surface_host_id: u32,
+        zaura_surface_version: u32,
+    ) -> Self {
+        Self {
+            guest_xdg_toplevel_id,
+            wl_surface_guest_id,
+            wl_surface_host_id,
+            host_xdg_toplevel_id,
+            zaura_toplevel_host_id,
+            zaura_surface_host_id,
+            zaura_surface_version,
+        }
+    }
+
+    pub(crate) const fn guest_xdg_toplevel_id(self) -> u32 {
+        self.guest_xdg_toplevel_id
+    }
+
+    pub(crate) const fn wl_surface_guest_id(self) -> u32 {
+        self.wl_surface_guest_id
+    }
+
+    pub(crate) const fn wl_surface_host_id(self) -> u32 {
+        self.wl_surface_host_id
+    }
+
+    pub(crate) const fn host_xdg_toplevel_id(self) -> u32 {
+        self.host_xdg_toplevel_id
+    }
+
+    pub(crate) const fn zaura_toplevel_host_id(self) -> u32 {
+        self.zaura_toplevel_host_id
+    }
+
+    pub(crate) const fn zaura_surface_host_id(self) -> u32 {
+        self.zaura_surface_host_id
+    }
+
+    pub(crate) const fn zaura_surface_version(self) -> u32 {
+        self.zaura_surface_version
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        guest_xdg_toplevel_id: u32,
+        wl_surface_guest_id: u32,
+        wl_surface_host_id: u32,
+        host_xdg_toplevel_id: u32,
+        zaura_toplevel_host_id: u32,
+        zaura_surface_host_id: u32,
+        zaura_surface_version: u32,
+    ) -> Self {
+        Self::new(
+            guest_xdg_toplevel_id,
+            wl_surface_guest_id,
+            wl_surface_host_id,
+            host_xdg_toplevel_id,
+            zaura_toplevel_host_id,
+            zaura_surface_host_id,
+            zaura_surface_version,
+        )
+    }
 }
 
 /// Cleanup serialized only after a placement barrier completes.
@@ -64,26 +164,106 @@ pub(crate) struct PlacementTarget {
 pub(crate) enum PlacementBarrierCleanup {
     /// Release the temporary self-parent relationship.
     Unparent { zaura_surface_id: u32 },
-    /// Release a temporary parent before restoring the native Guest OS ID.
-    UnparentAndRestoreNativeApplicationId {
+    /// Restore the native Guest OS ID after a transient ARC bounds request.
+    ///
+    /// The bounds backend does not install a parent relationship, so its
+    /// cleanup must not emit a speculative `set_parent(NULL)`. That request
+    /// can create an unnecessary host focus/IME generation transition.
+    RestoreNativeApplicationId {
         zaura_surface_id: u32,
         wl_surface_guest_id: u32,
     },
+    /// Refresh the focused host text-input generation after a metadata
+    /// transition has completed its own host-stream barrier.
+    ///
+    /// This is deliberately a separate cleanup phase.  Aura application-ID
+    /// changes are asynchronous host state transitions; sending
+    /// `text_input.deactivate` in the same batch can race the identity
+    /// transition and leave the host IME permanently unusable.
+    RefreshHostActivation { guest_surface_id: u32 },
 }
 
 /// Fully validated placement operation returned by the state owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowPlacementPlan {
-    pub(crate) target: PlacementTarget,
-    pub(crate) output_host_id: u32,
-    pub(crate) bounds: (i32, i32, i32, i32),
-    pub(crate) geometry: WindowPlacementGeometry,
-    pub(crate) transient_arc_identity: Option<TransientArcIdentity>,
+    target: PlacementTarget,
+    output_host_id: u32,
+    bounds: (i32, i32, i32, i32),
+    geometry: WindowPlacementGeometry,
+    transient_arc_identity: Option<TransientArcIdentity>,
     /// Cleanup to enqueue after the host barrier for this exact operation.
-    pub(crate) barrier_cleanup: Option<PlacementBarrierCleanup>,
+    barrier_cleanup: Option<PlacementBarrierCleanup>,
 }
 
 impl WindowPlacementPlan {
+    /// Construct a plan after the parent state has resolved all live IDs.
+    pub(super) fn new(
+        target: PlacementTarget,
+        output_host_id: u32,
+        bounds: (i32, i32, i32, i32),
+        geometry: WindowPlacementGeometry,
+        transient_arc_identity: Option<TransientArcIdentity>,
+        barrier_cleanup: Option<PlacementBarrierCleanup>,
+    ) -> Self {
+        Self {
+            target,
+            output_host_id,
+            bounds,
+            geometry,
+            transient_arc_identity,
+            barrier_cleanup,
+        }
+    }
+
+    /// Return the complete object-identity tuple resolved by placement state.
+    pub(crate) const fn target(&self) -> PlacementTarget {
+        self.target
+    }
+
+    /// Return the requested screen-space bounds.
+    pub(crate) const fn bounds(&self) -> (i32, i32, i32, i32) {
+        self.bounds
+    }
+
+    /// Return the host output receiving the bounds request.
+    pub(crate) const fn output_host_id(&self) -> u32 {
+        self.output_host_id
+    }
+
+    /// Return the geometry operation selected for this plan.
+    pub(crate) const fn geometry(&self) -> WindowPlacementGeometry {
+        self.geometry
+    }
+
+    /// Return the temporary identity transition, if this is transient ARC.
+    pub(crate) fn transient_arc_identity(&self) -> Option<&TransientArcIdentity> {
+        self.transient_arc_identity.as_ref()
+    }
+
+    /// Return cleanup that must be serialized after the matching host barrier.
+    pub(crate) fn barrier_cleanup(&self) -> Option<&PlacementBarrierCleanup> {
+        self.barrier_cleanup.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        target: PlacementTarget,
+        output_host_id: u32,
+        bounds: (i32, i32, i32, i32),
+        geometry: WindowPlacementGeometry,
+        transient_arc_identity: Option<TransientArcIdentity>,
+        barrier_cleanup: Option<PlacementBarrierCleanup>,
+    ) -> Self {
+        Self::new(
+            target,
+            output_host_id,
+            bounds,
+            geometry,
+            transient_arc_identity,
+            barrier_cleanup,
+        )
+    }
+
     /// Verify the internal pairing and sequencing invariants of one plan.
     ///
     /// Plans are normally constructed by the parent `WindowPlacementState`, but the
@@ -106,13 +286,13 @@ impl WindowPlacementPlan {
             (
                 WindowPlacementGeometry::Bounds,
                 Some(identity),
-                Some(PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
+                Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
                     zaura_surface_id,
                     wl_surface_guest_id,
                 }),
             ) => {
-                !identity.arc_application_id.is_empty()
-                    && identity.wl_surface_guest_id == self.target.wl_surface_guest_id
+                !identity.arc_application_id().is_empty()
+                    && identity.wl_surface_guest_id() == self.target.wl_surface_guest_id
                     && *zaura_surface_id == self.target.zaura_surface_host_id
                     && *wl_surface_guest_id == self.target.wl_surface_guest_id
             }
@@ -128,6 +308,7 @@ impl WindowPlacementPlan {
                     && current_origin.0.checked_add(relative_position.0) == Some(self.bounds.0)
                     && current_origin.1.checked_add(relative_position.1) == Some(self.bounds.1)
             }
+            (WindowPlacementGeometry::RemoteShell, None, None) => true,
             _ => false,
         }
     }
@@ -137,6 +318,10 @@ impl WindowPlacementPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowPlacementPlanError {
     Disabled,
+    /// The requested rectangle is already pending or is the last
+    /// authoritative rectangle completed by this backend. The shortcut is
+    /// still consumed, but no compositor wire request is necessary.
+    AlreadyAtTarget,
     NoUsableOutput,
     UnsupportedGeometry,
     UnsupportedSurfaceVersion,
@@ -150,7 +335,7 @@ pub(crate) enum WindowPlacementPlanError {
 impl WindowPlacementPlanError {
     /// Whether the keyboard event must be consumed while state catches up.
     pub(crate) const fn consumes_shortcut(self) -> bool {
-        matches!(self, Self::OriginUnknown)
+        matches!(self, Self::OriginUnknown | Self::AlreadyAtTarget)
     }
 }
 
@@ -198,26 +383,18 @@ mod tests {
     };
 
     fn target() -> PlacementTarget {
-        PlacementTarget {
-            guest_xdg_toplevel_id: 1,
-            wl_surface_guest_id: 2,
-            wl_surface_host_id: 3,
-            host_xdg_toplevel_id: 4,
-            zaura_toplevel_host_id: 5,
-            zaura_surface_host_id: 6,
-            zaura_surface_version: 5,
-        }
+        PlacementTarget::for_test(1, 2, 3, 4, 5, 6, 5)
     }
 
     fn base_plan() -> WindowPlacementPlan {
-        WindowPlacementPlan {
-            target: target(),
-            output_host_id: 7,
-            bounds: (100, 200, 800, 600),
-            geometry: WindowPlacementGeometry::Bounds,
-            transient_arc_identity: None,
-            barrier_cleanup: None,
-        }
+        WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 800, 600),
+            WindowPlacementGeometry::Bounds,
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -279,53 +456,76 @@ mod tests {
         });
         assert!(self_parent.is_well_formed());
 
-        let mut transient = base_plan();
-        transient.transient_arc_identity = Some(TransientArcIdentity {
-            arc_application_id: "org.chromium.arc.2000000001".to_string(),
-            wl_surface_guest_id: 2,
-        });
-        transient.barrier_cleanup = Some(
-            PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
+        let transient = WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 800, 600),
+            WindowPlacementGeometry::Bounds,
+            Some(TransientArcIdentity::for_test(
+                "org.chromium.arc.2000000001".to_string(),
+                2,
+            )),
+            Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
                 zaura_surface_id: 6,
                 wl_surface_guest_id: 2,
-            },
+            }),
         );
         assert!(transient.is_well_formed());
     }
 
     #[test]
     fn plan_invariants_reject_mismatched_lifecycle_data() {
-        let mut malformed = base_plan();
-        malformed.bounds.2 = 0;
-        assert!(!malformed.is_well_formed());
-
-        let mut malformed = base_plan();
-        malformed.barrier_cleanup = Some(PlacementBarrierCleanup::Unparent {
-            zaura_surface_id: 99,
-        });
-        assert!(!malformed.is_well_formed());
-
-        let mut malformed = base_plan();
-        malformed.transient_arc_identity = Some(TransientArcIdentity {
-            arc_application_id: "org.chromium.arc.2000000001".to_string(),
-            wl_surface_guest_id: 99,
-        });
-        malformed.barrier_cleanup = Some(
-            PlacementBarrierCleanup::UnparentAndRestoreNativeApplicationId {
-                zaura_surface_id: 6,
-                wl_surface_guest_id: 2,
-            },
+        let malformed = WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 0, 600),
+            WindowPlacementGeometry::Bounds,
+            None,
+            None,
         );
         assert!(!malformed.is_well_formed());
 
-        let mut malformed = base_plan();
-        malformed.geometry = WindowPlacementGeometry::SelfParent {
-            current_origin: (i32::MAX, 0),
-            relative_position: (1, 200),
-        };
-        malformed.barrier_cleanup = Some(PlacementBarrierCleanup::Unparent {
-            zaura_surface_id: 6,
-        });
+        let malformed = WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 800, 600),
+            WindowPlacementGeometry::Bounds,
+            None,
+            Some(PlacementBarrierCleanup::Unparent {
+                zaura_surface_id: 99,
+            }),
+        );
+        assert!(!malformed.is_well_formed());
+
+        let malformed = WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 800, 600),
+            WindowPlacementGeometry::Bounds,
+            Some(TransientArcIdentity::for_test(
+                "org.chromium.arc.2000000001".to_string(),
+                99,
+            )),
+            Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+                zaura_surface_id: 6,
+                wl_surface_guest_id: 2,
+            }),
+        );
+        assert!(!malformed.is_well_formed());
+
+        let malformed = WindowPlacementPlan::for_test(
+            target(),
+            7,
+            (100, 200, 800, 600),
+            WindowPlacementGeometry::SelfParent {
+                current_origin: (i32::MAX, 0),
+                relative_position: (1, 200),
+            },
+            None,
+            Some(PlacementBarrierCleanup::Unparent {
+                zaura_surface_id: 6,
+            }),
+        );
         assert!(!malformed.is_well_formed());
     }
 }
