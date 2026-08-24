@@ -28,10 +28,10 @@ use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
-use crate::arc_task_ids::ArcTaskIdAllocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 #[cfg(test)]
 use crate::window_shortcuts::ShortcutConfig;
+#[cfg(test)]
 use crate::window_shortcuts::ShortcutConfigHandle;
 use log::warn;
 
@@ -47,11 +47,15 @@ pub(crate) use self::render::{
     SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
+pub(crate) use self::window_placement::ShortcutReloadResult;
+#[cfg(test)]
 pub(crate) use self::window_placement::{
     OutputState, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START,
 };
 pub(crate) use self::window_placement::{
-    WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
+    WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy, WindowPlacementGeometry,
+    WindowPlacementMode, WindowPlacementPlanError, WindowPlacementRuntime,
+    WindowPlacementRuntimeHandle, WindowPlacementState,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -798,7 +802,6 @@ pub struct Context {
     /// synthesizes a wl_keyboard event.
     pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
     /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
-    pub accelerators: Vec<crate::accelerator::Accelerator>,
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
@@ -1140,23 +1143,17 @@ impl Context {
     }
 
     pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
-        Self::new_with_options(
+        Self::new_with_placement_runtime(
             gpu_accel,
             xdg_decoration,
-            WindowPlacementMode::from_environment(),
-            ShortcutConfigHandle::disabled(),
-            crate::accelerator::from_environment(),
-            None,
+            WindowPlacementRuntime::from_environment(),
         )
     }
 
-    pub(crate) fn new_with_options(
+    pub(crate) fn new_with_placement_runtime(
         gpu_accel: bool,
         xdg_decoration: bool,
-        placement_mode: WindowPlacementMode,
-        shortcut_config: ShortcutConfigHandle,
-        accelerators: Vec<crate::accelerator::Accelerator>,
-        arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
+        placement_runtime: WindowPlacementRuntimeHandle,
     ) -> Self {
         // Initialize allocator
         let allocator = match Allocator::new() {
@@ -1167,11 +1164,7 @@ impl Context {
             }
         };
 
-        let window_placement = WindowPlacementState::with_shortcut_config(
-            placement_mode,
-            shortcut_config,
-            arc_task_allocator,
-        );
+        let window_placement = WindowPlacementState::with_runtime(placement_runtime);
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1213,7 +1206,6 @@ impl Context {
             key_generations: KeyGenerationRegistry::default(),
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
-            accelerators,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1260,29 +1252,22 @@ impl Context {
         self.clipboard_pumps.retain(|pump| !pump.is_finished());
     }
 
-    /// Test-only constructor that overrides `SOMMELIER_ACCELERATORS` after construction.
-    ///
-    /// `Context::new` reads `SOMMELIER_ACCELERATORS` from the environment, so
-    /// using it in unit tests would make test outcomes depend on whether the
-    /// developer's shell has that variable set. This constructor calls `new()`
-    /// and then immediately replaces `ctx.accelerators` with the supplied list,
-    /// ensuring tests always run against a known accelerator configuration
-    /// regardless of the environment.
+    /// Test-only constructor that injects a deterministic host accelerator
+    /// policy and nine-grid placement configuration.
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        let mut ctx = Self::new(gpu_accel, xdg_decoration);
-        ctx.accelerators = accelerators;
-        // Keep unit tests deterministic even when the developer's shell uses
-        // the runtime-only ARC bounds workaround for an isolated proxy.
-        ctx.window_placement
-            .set_mode_for_test(WindowPlacementMode::disabled());
-        ctx.window_placement
-            .set_shortcut_config(ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid()));
-        ctx
+        let runtime = WindowPlacementRuntime::new(
+            WindowPlacementMode::disabled(),
+            ShortcutConfigHandle::new(ShortcutConfig::test_nine_grid()),
+            None,
+            Arc::new(accelerators),
+            None,
+        );
+        Self::new_with_placement_runtime(gpu_accel, xdg_decoration, runtime)
     }
 }
 
