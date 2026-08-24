@@ -52,6 +52,28 @@ The block files are deliberately retained after process exit. The kernel
 releases the `flock` automatically when the owning process closes its
 descriptor; deleting a locked pathname could let another process create a
 different inode and accidentally hold the same numeric range concurrently.
+The allocator also keeps a parent-side
+`$XDG_RUNTIME_DIR/.arc-task-blocks.guard` descriptor. Its
+generation marker stores only the stable device/inode pair for
+`arc-task-blocks`; timestamps are deliberately excluded because creating a
+normal lock file changes directory ctime. If the block directory is removed
+and recreated while another allocator is alive, the guard in the stable XDG
+runtime parent rejects the new generation instead of silently creating a
+second lock namespace. This also covers replacement of the whole
+`sommelier/` directory. Once all allocators release the guard, a later
+process may adopt the replacement directory. The guard directory and guard
+pathname are part of the trusted same-user runtime namespace: advisory
+`flock` cannot prevent a same-UID process from unlinking the guard inode itself
+and creating a replacement inode. Such deliberate cleanup can split the lock
+namespace and is outside the protection this user-space allocator can provide;
+production cleanup must leave the XDG runtime parent and its guard file in place
+while a proxy may be running.
+
+The runtime, `sommelier`, and `arc-task-blocks` directories must be absolute,
+owner-only directories. Existing lock files must be regular files owned by
+the effective user with mode `0600`; symlinks, FIFOs, unsafe permissions, and
+malformed generation markers fail closed rather than being followed or
+silently repaired.
 
 The current private best-effort pool is:
 

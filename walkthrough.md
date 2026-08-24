@@ -765,6 +765,12 @@ surface consumes the next ID in that block, while independent Sommelier
 instances contend on the same block files. The lock file remains after exit;
 the kernel releases the lock when the owning descriptor closes, avoiding an
 unlink/recreate inode race.
+The allocator additionally holds a parent-side generation guard in the stable
+`$XDG_RUNTIME_DIR` parent and compares only the block directory's device/inode
+identity. A timestamp is not part of the marker: normal lock-file creation
+changes directory ctime and would make a second valid allocator fail
+spuriously. Replacement block or `sommelier/` directories are rejected while
+an older guard is held, and unsafe paths or lock-file types fail closed.
 
 Regression coverage includes atomic conflict rejection and both-direction
 teardown; the VM namespace test derives its expected value from the active
@@ -783,9 +789,12 @@ with `arc + none`.
 
 Final verification from this worktree:
 
-- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 577
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 599
   passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
   smoke test is ignored because it requires a live compositor.
+- The allocator-focused suite passes 21 tests, including concurrent block
+  contention, directory replacement, malformed guard, symlink/FIFO, and
+  exhaustion cases.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
