@@ -162,7 +162,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         // from xdg_toplevel.set_app_id); GTK applications can send their
         // D-Bus properties after that xdg request, so do not overwrite the
         // ARC ID with the normal Crostini namespace.
-        let application_id = if ctx.window_placement.uses_arc_bounds() {
+        let application_id = if ctx.window_placement.uses_arc_policy() {
             let Some(application_id) = ctx
                 .window_placement
                 .arc_session_application_id(wl_surface_guest_id)
@@ -351,7 +351,10 @@ mod tests {
     fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
         let mut ctx = setup_ctx();
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::ArcBounds);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);

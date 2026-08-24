@@ -605,11 +605,13 @@ The window-placement path now keeps the ARC application ID when a GTK client sen
 `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
 Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
 returned to its old `800x600` geometry. A unique ARC session ID is shared by the
-GTK and XDG paths for each wl_surface, and both paths have regression coverage. The workaround
-and its compositor-owned shortcuts are disabled unless
-`SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set.
+GTK and XDG paths for each wl_surface, and both paths have regression coverage.
+At that point the workaround was still selected by
+`SOMMELIER_WINDOW_BOUNDS_AS_ARC`; the current implementation uses explicit CLI
+policy and geometry options instead.
 
-An isolated `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT=1` probe is also available.
+An isolated self-parent probe was also available through
+`SOMMELIER_WINDOW_BOUNDS_SELF_PARENT=1` at that stage.
 It sends `zaura_surface.set_parent` with the same surface as both child and
 parent, records a host-stream barrier, and intentionally preserves the current
 surface size. The proxy now converts target screen coordinates to
@@ -661,3 +663,33 @@ Verification:
   and is not a production placement mechanism.
 - A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
   as flaky; each passed alone and in the serialized full suite.
+
+## 2026-08-21 — Inline shortcut configuration and SIGHUP reload
+
+The nine hardcoded Alt bindings are now represented by an opt-in TOML file.
+Each binding contains its chord, `window.place` action, and normalized
+`[x, y, width, height]` rectangle inline; there are no named presets. The
+policy and geometry axes are independent:
+
+```text
+--window-host-policy=guest|arc
+--window-geometry-method=none|bounds|self-parent
+--window-shortcuts-config PATH
+```
+
+The default is `guest + none`, with no config file read and no shortcut
+interception. A CLI-selected file is validated before accepting clients.
+Sending `SIGHUP` reloads that same path atomically into all current and future
+client contexts; malformed or conflicting reloads retain the last-known-good
+generation. `SOMMELIER_ACCELERATORS` conflicts are hard errors. The
+self-parent method remains experimental and position-only.
+
+Verification for this implementation:
+
+- `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`, and
+  `cargo clippy --workspace --all-targets -- -D warnings` pass.
+- `cargo test --workspace --all-targets -- --test-threads=1`: 566 passed,
+  1 ignored; the ignored GUI smoke test requires a live Wayland compositor.
+- `bun run verify` was executed from the enclosing monorepo: 1,853 assertions
+  passed and 9 unrelated baseline checks failed (nested Biome configuration,
+  missing Typst/Astro assets, and existing hygiene/shebang findings).

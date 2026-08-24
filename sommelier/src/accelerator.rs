@@ -33,6 +33,7 @@ limitations under the License.
 //! accelerator. All other keys are acked as `HANDLED`, keeping them in the
 //! guest.
 
+use thiserror::Error;
 use xkbcommon::xkb;
 
 /// Modifier bitmask constants.
@@ -85,6 +86,21 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Errors raised while loading the host accelerator policy from the
+/// environment.
+///
+/// The legacy [`from_environment`] helper remains infallible for
+/// `Context::new` callers that construct test/in-process contexts.  The
+/// production entry point uses [`try_from_environment`] so a malformed
+/// `SOMMELIER_ACCELERATORS` value cannot silently disable host filtering.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum EnvironmentError {
+    #[error("invalid accelerator list: {0}")]
+    InvalidValue(#[from] ParseError),
+    #[error("value is not valid UTF-8")]
+    InvalidUtf8,
+}
+
 /// Parses a single token into an `Accelerator`, or returns a `ParseError`.
 pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> {
     let mut token = token.trim();
@@ -131,18 +147,67 @@ pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> 
 
 /// Parse a `SOMMELIER_ACCELERATORS`-style string into a list of accelerators.
 pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
+    // An explicitly empty environment value means “reserve no host
+    // accelerators”.  Once a comma is present, however, every list element
+    // must name a keysym.  Silently dropping `a,,b` or `a,` would turn a
+    // malformed host policy into a different policy and could make a
+    // Sommelier-owned shortcut appear to work intermittently.
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let mut result = Vec::new();
     for token in s.split(',') {
         let token = token.trim();
-        // Intentionally skip empty tokens so that trailing/double commas
-        // (e.g. "Super_L,") in user-provided configs are silently tolerated
-        // rather than rejected with a parse error.
         if token.is_empty() {
-            continue;
+            return Err(ParseError::InvalidKeysym("Empty keysym".to_string()));
         }
         result.push(parse_accelerator(token)?);
     }
     Ok(result)
+}
+
+/// Parse one `SOMMELIER_ACCELERATORS` value.
+///
+/// Keeping this conversion separate from environment access makes startup
+/// validation deterministic and lets tests exercise malformed values without
+/// mutating the process-wide environment.
+pub(crate) fn parse_environment_value(value: &str) -> Result<Vec<Accelerator>, EnvironmentError> {
+    parse_accelerators(value).map_err(EnvironmentError::InvalidValue)
+}
+
+/// Read and validate the host-accelerator policy for process startup.
+///
+/// An unset variable means that no host accelerators are reserved.  A value
+/// that cannot be decoded or parsed is an error: continuing with an empty
+/// list would silently change keyboard ownership and make configured
+/// shortcuts appear intermittently broken.
+pub(crate) fn try_from_environment() -> Result<Vec<Accelerator>, EnvironmentError> {
+    match std::env::var("SOMMELIER_ACCELERATORS") {
+        Ok(value) => parse_environment_value(&value),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(EnvironmentError::InvalidUtf8),
+    }
+}
+
+/// Read the legacy host-accelerator policy once for the proxy runtime.
+///
+/// Malformed host policy is intentionally non-fatal for compatibility with
+/// existing `Context::new` in-process callers: an invalid value disables host
+/// filtering and forwards ordinary keys to the guest. The production startup
+/// path must call [`try_from_environment`] instead. Window-shortcut
+/// configuration is validated separately and treats an overlap with the
+/// successfully parsed host list as a hard configuration error.
+pub(crate) fn from_environment() -> Vec<Accelerator> {
+    match try_from_environment() {
+        Ok(list) => list,
+        Err(error) => {
+            log::warn!(
+                "Invalid SOMMELIER_ACCELERATORS: {}. Accelerator filtering disabled.",
+                error
+            );
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +236,27 @@ mod tests {
     #[test]
     fn parse_empty_string() {
         assert!(parse_accelerators("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_empty_list_elements() {
+        for value in ["<Alt>a,", ",<Alt>a", "<Alt>a,,<Alt>b"] {
+            assert_eq!(
+                parse_accelerators(value),
+                Err(ParseError::InvalidKeysym("Empty keysym".to_string())),
+                "malformed accelerator list should be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_environment_value_is_rejected() {
+        assert_eq!(
+            parse_environment_value("invalid_key_name"),
+            Err(EnvironmentError::InvalidValue(ParseError::InvalidKeysym(
+                "invalid_key_name".to_string()
+            )))
+        );
     }
 
     #[test]

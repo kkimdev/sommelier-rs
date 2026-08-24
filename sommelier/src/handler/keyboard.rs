@@ -33,6 +33,7 @@ use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
+use crate::window_shortcuts::{ShortcutConfig, WindowShortcut};
 use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
 
@@ -66,19 +67,6 @@ const WL_KEYMAP_FORMAT_XKB_V1: u32 = 1;
 const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
 const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
 const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowLayoutAction {
-    TopLeft,
-    Top,
-    TopRight,
-    Left,
-    Fullscreen,
-    Right,
-    BottomLeft,
-    Bottom,
-    BottomRight,
-}
 
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
@@ -325,39 +313,30 @@ impl KeyboardHandler {
             })
     }
 
-    fn window_layout_action(
+    fn window_shortcut(
         &self,
         host_keyboard_id: HostId,
         key: u32,
-    ) -> Option<WindowLayoutAction> {
+        config: &ShortcutConfig,
+    ) -> Option<WindowShortcut> {
         let state = self.states.get(&host_keyboard_id)?;
         let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
         let xkb_raw_keycode = key.checked_add(8)?;
         let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
         log::trace!(
-            "window layout candidate: keyboard={} key={} sym={:#x} modifiers={:#x}",
+            "window shortcut candidate: keyboard={} key={} sym={:#x} modifiers={:#x}",
             host_keyboard_id.0,
             key,
             sym.raw(),
             modifiers
         );
-        if modifiers != crate::accelerator::ALT_MASK {
-            return None;
-        }
-        let action = match crate::accelerator::keysym_to_lower(sym.raw()) {
-            xkb::keysyms::KEY_q => Some(WindowLayoutAction::TopLeft),
-            xkb::keysyms::KEY_w => Some(WindowLayoutAction::Top),
-            xkb::keysyms::KEY_e => Some(WindowLayoutAction::TopRight),
-            xkb::keysyms::KEY_a => Some(WindowLayoutAction::Left),
-            xkb::keysyms::KEY_s => Some(WindowLayoutAction::Fullscreen),
-            xkb::keysyms::KEY_d => Some(WindowLayoutAction::Right),
-            xkb::keysyms::KEY_z => Some(WindowLayoutAction::BottomLeft),
-            xkb::keysyms::KEY_x => Some(WindowLayoutAction::Bottom),
-            xkb::keysyms::KEY_c => Some(WindowLayoutAction::BottomRight),
-            _ => None,
+        let accelerator = crate::accelerator::Accelerator {
+            modifiers,
+            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
         };
-        log::trace!("window layout candidate resolved to {:?}", action);
-        action
+        let shortcut = config.find(accelerator);
+        log::trace!("window shortcut candidate resolved to {:?}", shortcut);
+        shortcut
     }
 
     fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
@@ -372,44 +351,15 @@ impl KeyboardHandler {
         ctx.client_to_host_queue.push((message, Vec::new()));
     }
 
-    fn bounds_for_action(
-        action: WindowLayoutAction,
-        output: crate::state::OutputState,
-    ) -> Option<(i32, i32, i32, i32)> {
-        let (x, y, width, height) = output.work_area()?;
-        let half_width = width / 2;
-        let half_height = height / 2;
-        match action {
-            WindowLayoutAction::TopLeft => Some((x, y, half_width, half_height)),
-            WindowLayoutAction::Top => Some((x, y, width, half_height)),
-            WindowLayoutAction::TopRight => {
-                Some((x + half_width, y, width - half_width, half_height))
-            }
-            WindowLayoutAction::BottomLeft => {
-                Some((x, y + half_height, half_width, height - half_height))
-            }
-            WindowLayoutAction::Bottom => Some((x, y + half_height, width, height - half_height)),
-            WindowLayoutAction::BottomRight => Some((
-                x + half_width,
-                y + half_height,
-                width - half_width,
-                height - half_height,
-            )),
-            WindowLayoutAction::Left => Some((x, y, half_width, height)),
-            WindowLayoutAction::Fullscreen => Some((x, y, width, height)),
-            WindowLayoutAction::Right => Some((x + half_width, y, width - half_width, height)),
-        }
-    }
-
     fn apply_window_layout(
         ctx: &mut Context,
         host_keyboard_id: HostId,
-        action: WindowLayoutAction,
+        shortcut: WindowShortcut,
     ) -> bool {
         if !ctx.window_placement.handles_shortcuts() {
             log::trace!(
-                "window layout {:?} ignored: bounds placement experiments are disabled",
-                action
+                "window shortcut {:?} ignored: geometry method is disabled",
+                shortcut
             );
             return false;
         }
@@ -417,32 +367,36 @@ impl KeyboardHandler {
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
         else {
             log::debug!(
-                "window layout {:?} ignored: no active xdg_toplevel for keyboard {}",
-                action,
+                "window shortcut {:?} ignored: no active xdg_toplevel for keyboard {}",
+                shortcut,
                 host_keyboard_id.0
             );
             return false;
         };
         let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
             log::debug!(
-                "window layout {:?} ignored: guest xdg_toplevel {} has no host mapping",
-                action,
+                "window shortcut {:?} ignored: guest xdg_toplevel {} has no host mapping",
+                shortcut,
                 guest_xdg_toplevel_id
             );
             return false;
         };
         let Some((output_host_id, output)) = ctx.primary_output() else {
             log::debug!(
-                "window layout {:?} ignored: no usable output for xdg_toplevel {}",
-                action,
+                "window shortcut {:?} ignored: no usable output for xdg_toplevel {}",
+                shortcut,
                 guest_xdg_toplevel_id
             );
             return false;
         };
-        let Some((x, y, width, height)) = Self::bounds_for_action(action, output) else {
+        let Some((x, y, width, height)) = shortcut.rect.to_bounds(
+            output
+                .work_area()
+                .expect("primary_output only returns an output with a work area"),
+        ) else {
             log::debug!(
-                "window layout {:?} ignored: invalid output geometry {:?}",
-                action,
+                "window shortcut {:?} ignored: invalid output geometry {:?}",
+                shortcut,
                 output
             );
             return false;
@@ -451,8 +405,8 @@ impl KeyboardHandler {
             crate::handler::compositor::ensure_zaura_toplevel(ctx, guest_xdg_toplevel_id)
         else {
             log::debug!(
-                "window layout {:?} ignored: no zaura_toplevel for xdg_toplevel {}",
-                action,
+                "window shortcut {:?} ignored: no zaura_toplevel for xdg_toplevel {}",
+                shortcut,
                 guest_xdg_toplevel_id
             );
             return false;
@@ -461,8 +415,8 @@ impl KeyboardHandler {
             crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
         else {
             log::debug!(
-                "window layout {:?} ignored: no zaura_surface for wl_surface {}",
-                action,
+                "window shortcut {:?} ignored: no zaura_surface for wl_surface {}",
+                shortcut,
                 guest_wl_surface_id
             );
             return false;
@@ -480,7 +434,7 @@ impl KeyboardHandler {
             if zaura_surface_version < 2 {
                 log::warn!(
                     "window layout {:?}: self-parent probe requires zaura_surface v2, got v{}",
-                    action,
+                    shortcut,
                     zaura_surface_version
                 );
                 return false;
@@ -490,7 +444,7 @@ impl KeyboardHandler {
                 log::debug!(
                     "window layout {:?}: no screen origin is known for zaura_toplevel {}; \
                      consuming shortcut until configure/origin_change arrives",
-                    action,
+                    shortcut,
                     zaura_toplevel_id
                 );
                 // Do not forward an early Alt+layout key to the guest. Until
@@ -503,7 +457,7 @@ impl KeyboardHandler {
             let Some(relative_x) = x.checked_sub(origin_x) else {
                 log::warn!(
                     "window layout {:?}: x coordinate overflow converting target {} from origin {}",
-                    action,
+                    shortcut,
                     x,
                     origin_x
                 );
@@ -512,7 +466,7 @@ impl KeyboardHandler {
             let Some(relative_y) = y.checked_sub(origin_y) else {
                 log::warn!(
                     "window layout {:?}: y coordinate overflow converting target {} from origin {}",
-                    action,
+                    shortcut,
                     y,
                     origin_y
                 );
@@ -533,7 +487,7 @@ impl KeyboardHandler {
                 log::warn!(
                     "window layout {:?}: Aura toplevel {} was released before \
                      self-parent prediction",
-                    action,
+                    shortcut,
                     zaura_toplevel_id
                 );
                 return true;
@@ -553,14 +507,14 @@ impl KeyboardHandler {
             if !crate::handler::compositor::queue_window_placement_barrier(ctx, zaura_toplevel_id) {
                 log::warn!(
                     "window layout {:?}: failed to queue host sync barrier for self-parent probe",
-                    action
+                    shortcut
                 );
             }
             log::warn!(
                 "window layout {:?}: experimental self-parent probe sent for zaura_surface={} \
                  target_screen_position=({}, {}) origin=({}, {}) \
                  relative_position=({}, {})",
-                action,
+                shortcut,
                 zaura_surface_id,
                 x,
                 y,
@@ -572,11 +526,19 @@ impl KeyboardHandler {
             log::warn!(
                 "window layout {:?}: self-parent is position-only; requested grid size \
                  {}x{} is not sent because zaura_surface.set_parent has no size argument",
-                action,
+                shortcut,
                 width,
                 height
             );
             return true;
+        }
+
+        if !ctx.window_placement.uses_bounds() {
+            log::debug!(
+                "window shortcut {:?} ignored: geometry method does not support bounds",
+                shortcut
+            );
+            return false;
         }
 
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
@@ -591,13 +553,13 @@ impl KeyboardHandler {
         if !crate::handler::compositor::queue_window_placement_barrier(ctx, zaura_toplevel_id) {
             log::warn!(
                 "window layout {:?}: failed to queue host sync barrier for zaura_toplevel {}",
-                action,
+                shortcut,
                 zaura_toplevel_id
             );
         }
         log::info!(
             "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
-            action,
+            shortcut,
             guest_xdg_toplevel_id,
             zaura_toplevel_id,
             x,
@@ -1111,10 +1073,18 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
         }
 
-        let layout_action = self.window_layout_action(host_keyboard_id, key);
+        // Take one immutable snapshot for this event. A reload can replace the
+        // handle concurrently with key delivery; the snapshot keeps the press
+        // decision internally consistent. Repeat/release deliberately consult
+        // the key owner instead of resolving the chord again, so a reload
+        // cannot strand a key whose press was already consumed.
+        let config = ctx.shortcut_config.snapshot();
+        let shortcut = (state == WL_KEY_PRESSED)
+            .then(|| self.window_shortcut(host_keyboard_id, key, &config))
+            .flatten();
         let compositor_shortcut = match state {
-            WL_KEY_PRESSED => layout_action
-                .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
+            WL_KEY_PRESSED => shortcut
+                .is_some_and(|shortcut| Self::apply_window_layout(ctx, host_keyboard_id, shortcut)),
             WL_KEY_REPEATED => {
                 ctx.guest_key_owner(host_keyboard_id, key)
                     == Some(GuestKeyOwner::CompositorShortcut)
@@ -1543,6 +1513,14 @@ mod tests {
         None
     }
 
+    /// Return one binding from the nine-grid fixture used by placement tests.
+    fn test_shortcut(chord: &str) -> WindowShortcut {
+        let accelerator = crate::accelerator::parse_accelerator(chord).expect("valid test chord");
+        ShortcutConfig::test_nine_grid()
+            .find(accelerator)
+            .expect("test chord must be present in the nine-grid fixture")
+    }
+
     fn add_active_text_input(ctx: &mut Context, guest_id: u32, guest_seat: u32, host_ext_id: u32) {
         let host_v1_id = guest_id + 100;
         ctx.shadow_table.map_id(guest_id, host_v1_id);
@@ -1641,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn window_layout_actions_cover_nine_alt_keys() {
+    fn configured_shortcuts_cover_nine_alt_keys() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 5;
@@ -1650,92 +1628,156 @@ mod tests {
             .modifiers
             .insert(HostId(5), crate::accelerator::ALT_MASK);
 
-        let expected = [
-            (xkb::keysyms::KEY_q, WindowLayoutAction::TopLeft),
-            (xkb::keysyms::KEY_w, WindowLayoutAction::Top),
-            (xkb::keysyms::KEY_e, WindowLayoutAction::TopRight),
-            (xkb::keysyms::KEY_a, WindowLayoutAction::Left),
-            (xkb::keysyms::KEY_s, WindowLayoutAction::Fullscreen),
-            (xkb::keysyms::KEY_d, WindowLayoutAction::Right),
-            (xkb::keysyms::KEY_z, WindowLayoutAction::BottomLeft),
-            (xkb::keysyms::KEY_x, WindowLayoutAction::Bottom),
-            (xkb::keysyms::KEY_c, WindowLayoutAction::BottomRight),
-        ];
-        for (sym, action) in expected {
+        for sym in [
+            xkb::keysyms::KEY_q,
+            xkb::keysyms::KEY_w,
+            xkb::keysyms::KEY_e,
+            xkb::keysyms::KEY_a,
+            xkb::keysyms::KEY_s,
+            xkb::keysyms::KEY_d,
+            xkb::keysyms::KEY_z,
+            xkb::keysyms::KEY_x,
+            xkb::keysyms::KEY_c,
+        ] {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
-            assert_eq!(handler.window_layout_action(HostId(5), key), Some(action));
+            assert!(
+                handler
+                    .window_shortcut(HostId(5), key, &ctx.shortcut_config.snapshot())
+                    .is_some(),
+                "configured nine-grid shortcut should match keysym {sym:#x}"
+            );
         }
     }
 
     #[test]
-    fn window_layout_requires_exact_alt_modifier() {
+    fn configured_shortcuts_require_exact_alt_modifier() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        let config = ctx.shortcut_config.snapshot();
 
         handler.modifiers.insert(HostId(5), 0);
-        assert_eq!(handler.window_layout_action(HostId(5), key), None);
+        assert_eq!(handler.window_shortcut(HostId(5), key, &config), None);
         handler.modifiers.insert(
             HostId(5),
             crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
         );
-        assert_eq!(handler.window_layout_action(HostId(5), key), None);
+        assert_eq!(handler.window_shortcut(HostId(5), key, &config), None);
     }
 
     #[test]
-    fn window_layout_is_disabled_without_arc_bounds_policy() {
+    fn configured_shortcut_is_consumed_by_key_path_and_balanced_on_release() {
+        let keyboard = 10u32;
+        let host_keyboard = 5u32;
+        let seat = 11u32;
+        let surface = 12u32;
+        let host_surface = 22u32;
+        let xdg_toplevel = 13u32;
+        let host_xdg_toplevel = 23u32;
+        let output = 25u32;
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
+        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
+        ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
+        ctx.host_zaura_shell_id = Some(24);
+        ctx.host_zaura_shell_version = 38;
+        ctx.output_host_ids.push(output);
+        ctx.output_states.insert(
+            output,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 1,
+                ..Default::default()
+            },
+        );
+        ctx.last_sender_id = host_keyboard;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        handler
+            .modifiers
+            .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 0, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.guest_key_owner(HostId(host_keyboard), key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+        assert!(
+            ctx.client_to_host_queue.iter().any(|(message, _)| {
+                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
+                (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
+            }),
+            "configured press must queue a direct bounds request"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 0, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
+    }
+
+    #[test]
+    fn window_layout_is_disabled_without_geometry_method() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         assert!(!KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(5),
-            WindowLayoutAction::Fullscreen,
+            test_shortcut("<Alt>s"),
         ));
     }
 
     #[test]
-    fn grid_bounds_use_two_by_two_work_area_cells() {
-        let output = crate::state::OutputState {
-            mode_width: 3840,
-            mode_height: 2160,
-            scale: 1,
-            ..Default::default()
-        };
+    fn normalized_rect_bounds_use_two_by_two_work_area_cells() {
+        let work_area = (0, 0, 3840, 2160);
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopLeft, output),
+            test_shortcut("<Alt>q").rect.to_bounds(work_area),
             Some((0, 0, 1920, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Top, output),
+            test_shortcut("<Alt>w").rect.to_bounds(work_area),
             Some((0, 0, 3840, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopRight, output),
+            test_shortcut("<Alt>e").rect.to_bounds(work_area),
             Some((1920, 0, 1920, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Left, output),
+            test_shortcut("<Alt>a").rect.to_bounds(work_area),
             Some((0, 0, 1920, 2160))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, output),
+            test_shortcut("<Alt>s").rect.to_bounds(work_area),
             Some((0, 0, 3840, 2160))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomLeft, output),
+            test_shortcut("<Alt>z").rect.to_bounds(work_area),
             Some((0, 1080, 1920, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Bottom, output),
+            test_shortcut("<Alt>x").rect.to_bounds(work_area),
             Some((0, 1080, 3840, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomRight, output),
+            test_shortcut("<Alt>c").rect.to_bounds(work_area),
             Some((1920, 1080, 1920, 1080))
         );
         assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
+            test_shortcut("<Alt>d").rect.to_bounds(work_area),
             Some((1920, 0, 1920, 2160))
         );
     }
@@ -1776,7 +1818,10 @@ mod tests {
         // The production geometry backend must win if both flags are present;
         // the state type resolves that precedence before handlers run.
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::ArcBounds);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1798,7 +1843,7 @@ mod tests {
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
-            WindowLayoutAction::Fullscreen,
+            test_shortcut("<Alt>s"),
         ));
         let opcodes: Vec<u16> = ctx
             .client_to_host_queue
@@ -1854,7 +1899,10 @@ mod tests {
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::ArcBounds);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1873,15 +1921,15 @@ mod tests {
             },
         );
 
-        for (action, expected_x) in [
-            (WindowLayoutAction::Left, 0),
-            (WindowLayoutAction::Right, 1920),
+        for (shortcut, expected_x) in [
+            (test_shortcut("<Alt>a"), 0),
+            (test_shortcut("<Alt>d"), 1920),
         ] {
             ctx.client_to_host_queue.clear();
             assert!(KeyboardHandler::apply_window_layout(
                 &mut ctx,
                 HostId(host_keyboard),
-                action,
+                shortcut,
             ));
             let opcodes: Vec<u16> = ctx
                 .client_to_host_queue
@@ -1893,15 +1941,15 @@ mod tests {
                 .collect();
             assert!(
                 opcodes.contains(&REQ_SET_WINDOW_BOUNDS),
-                "{action:?} must use set_window_bounds"
+                "{shortcut:?} must use set_window_bounds"
             );
             assert!(
                 !opcodes.contains(&crate::protocols::aura_shell::zaura_surface::REQ_SET_SNAP_LEFT),
-                "{action:?} must not use set_snap_left"
+                "{shortcut:?} must not use set_snap_left"
             );
             assert!(
                 !opcodes.contains(&crate::protocols::aura_shell::zaura_surface::REQ_SET_SNAP_RIGHT),
-                "{action:?} must not use set_snap_right"
+                "{shortcut:?} must not use set_snap_right"
             );
             let bounds = ctx
                 .client_to_host_queue
@@ -1940,7 +1988,10 @@ mod tests {
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::SelfParent);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Guest,
+                crate::state::WindowGeometryMethod::SelfParent,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1968,7 +2019,7 @@ mod tests {
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
-            WindowLayoutAction::TopLeft,
+            test_shortcut("<Alt>q"),
         ));
         let parent_request = ctx
             .client_to_host_queue
@@ -2029,7 +2080,10 @@ mod tests {
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::SelfParent);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Guest,
+                crate::state::WindowGeometryMethod::SelfParent,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
@@ -2055,7 +2109,7 @@ mod tests {
             KeyboardHandler::apply_window_layout(
                 &mut ctx,
                 HostId(host_keyboard),
-                WindowLayoutAction::TopLeft,
+                test_shortcut("<Alt>q"),
             ),
             "an early accelerator must be consumed rather than forwarded"
         );
@@ -2079,7 +2133,10 @@ mod tests {
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::SelfParent);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Guest,
+                crate::state::WindowGeometryMethod::SelfParent,
+            ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
@@ -2107,12 +2164,12 @@ mod tests {
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
-            WindowLayoutAction::TopLeft,
+            test_shortcut("<Alt>q"),
         ));
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
-            WindowLayoutAction::BottomRight,
+            test_shortcut("<Alt>c"),
         ));
 
         let parent_requests: Vec<_> = ctx

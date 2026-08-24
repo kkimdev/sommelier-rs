@@ -1430,7 +1430,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         let xdg_surface_id = ctx.last_sender_id;
         if let Some(&wl_surface_id) = ctx.xdg_surface_to_wl_surface.get(&xdg_surface_id) {
             ctx.xdg_toplevel_to_wl_surface.insert(id, wl_surface_id);
-            if ctx.window_placement.uses_arc_bounds() {
+            if ctx.window_placement.uses_arc_policy() {
                 // Allocate the identity at role creation so both the XDG app
                 // ID and a later GTK D-Bus metadata update can reuse it.
                 let _ = ctx
@@ -1440,7 +1440,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
             // The generated dispatcher installs the guest→host mapping after
             // this callback, so the proxy retries Aura-child creation after
             // dispatch for the normal path.
-            if ctx.window_placement.uses_arc_bounds() {
+            if ctx.window_placement.handles_shortcuts() {
                 let _ = ensure_zaura_toplevel(ctx, id);
             }
         }
@@ -1493,7 +1493,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             .xdg_toplevel_to_wl_surface
             .get(&xdg_toplevel_id)
             .copied();
-        let formatted_app_id = if ctx.window_placement.uses_arc_bounds() {
+        let formatted_app_id = if ctx.window_placement.uses_arc_policy() {
             let Some(wl_surface_guest_id) = wl_surface_guest_id else {
                 log::warn!(
                     "Cannot allocate ARC session ID for xdg_toplevel {} without its wl_surface",
@@ -2165,7 +2165,10 @@ mod tests {
     fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         ctx.window_placement
-            .set_mode_for_test(crate::state::WindowPlacementMode::ArcBounds);
+            .set_mode_for_test(crate::state::WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Arc,
+                crate::state::WindowGeometryMethod::Bounds,
+            ));
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;

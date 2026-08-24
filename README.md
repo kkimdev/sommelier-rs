@@ -210,39 +210,50 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the ARC application namespace required for compositor-owned window bounds placement. |
-| `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT` | Experimental, position-only probe: send `zaura_surface.set_parent` with the same surface as parent; it does not resize and does not send `set_window_bounds`. |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
+| `--experimental-window-placement` | Required opt-in gate for every compositor-owned placement option. |
+| `--window-host-policy guest\|arc` | Hidden startup-only application-ID policy for placement experiments. |
+| `--window-geometry-method none\|bounds\|self-parent` | Hidden startup-only geometry operation. With only the experimental gate, native Guest/self-parent is selected; `none` explicitly disables placement. |
+| `--window-shortcuts-config PATH` | Explicit TOML binding file. No file is read unless this option and the experimental gate are supplied. |
 
-When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set, Sommelier handles
-`Alt+Q/W/E/A/S/D/Z/X/C` for a focused XDG toplevel and places it in the
-corresponding top-left, top, top-right, left, full-screen, right, bottom-left,
-bottom, or bottom-right work-area region. Each guest surface receives a stable
-`org.chromium.arc.session.<unique_id>` application ID for the lifetime of that
-surface so the XDG and GTK metadata paths stay consistent without sharing a
-fabricated ARC task ID. The variable is intentionally opt-in because it changes
-the ChromeOS window-policy namespace and enables ARC-specific host behavior;
-key/action configuration will be separated from this policy switch in a
-follow-up.
+Window placement is disabled by default. To enable ordinary work-area
+placement, pass the experimental gate and provide a config file:
 
-For isolated Aura experiments, set `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT=1`.
-This flag is independent of the ARC policy flag. It handles the same nine
-shortcuts, but sends `zaura_surface.set_parent(surface, x, y)` and a stream
-barrier instead of `zaura_toplevel.set_window_bounds`; it is strictly
-position-only because `set_parent` has no width/height arguments. The request
-coordinates are converted from the target screen position using the latest
-`zaura_toplevel.configure`/`origin_change` origin, and an early shortcut is
-consumed until that origin is known. Chromium's Exo implementation explicitly
-rejects the self-parent cycle; any movement is an implementation side effect,
-not a supported placement API, and it may destabilize a custom host build.
-The flag is therefore experimental/non-production. If both this flag and
-`SOMMELIER_WINDOW_BOUNDS_AS_ARC` are set, the ARC-session geometry backend wins.
-Use a uniquely named display socket and never enable this probe on the shared
-system Sommelier instance.
+```bash
+./target/release/sommelier \
+  --virtio-wl /dev/wl0 \
+  --experimental-window-placement \
+  --window-host-policy arc \
+  --window-geometry-method bounds \
+  --window-shortcuts-config "$HOME/.config/sommelier/window-shortcuts.toml" \
+  wayland-2
+```
+
+The inline TOML schema, nine-grid example, validation rules, and `SIGHUP`
+reload procedure are documented in
+[`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
+Reloading a malformed file keeps the last known-good generation. A binding
+that overlaps a parsed `SOMMELIER_ACCELERATORS` entry is a hard startup/reload
+error because the host and Sommelier cannot safely own the same chord.
+`SOMMELIER_ACCELERATORS` is parsed once during startup; a malformed value is a
+startup error (exit status 2), never an empty-list fallback. Changing that
+environment variable requires restarting the proxy; `SIGHUP` only reloads the
+explicit shortcut file.
+
+Passing a placement axis or config path without the experimental gate is a
+startup error. The gate alone selects native Guest identity plus the
+self-parent experiment, but no shortcut is active until a config path is
+provided.
+
+The older `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
+`SOMMELIER_WINDOW_BOUNDS_SELF_PARENT` environment switches are retained only
+for legacy in-process compatibility paths; the production CLI no longer reads
+them. Use the explicit options above, and never enable the experimental
+`self-parent` method on the shared system Sommelier instance.
 
 ## Design notes
 
@@ -254,6 +265,7 @@ system Sommelier instance.
   teardown invariants after every mutation.
 - [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md) documents ARC task IDs, restore-session IDs, and the allocator used by this experiment.
 - [`sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md`](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md) documents ChromeOS accelerator acknowledgement and shortcut inhibition.
+- [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md) documents the inline shortcut schema and runtime reload contract.
 
 ## CI and release workflow
 
