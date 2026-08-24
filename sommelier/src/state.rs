@@ -48,14 +48,16 @@ pub(crate) use self::render::{
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ShortcutReloadResult;
+pub(crate) use self::window_placement::{
+    PlacementBarrierCleanup, PlacementTarget, WindowArcIdLifetime, WindowGeometryMethod,
+    WindowHostPolicy, WindowPlacementGeometry, WindowPlacementMode, WindowPlacementPlan,
+    WindowPlacementPlanError, WindowPlacementRuntime, WindowPlacementRuntimeHandle,
+    WindowPlacementState,
+};
 #[cfg(test)]
 pub(crate) use self::window_placement::{
-    OutputState, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START,
-};
-pub(crate) use self::window_placement::{
-    WindowArcIdLifetime, WindowGeometryMethod, WindowHostPolicy, WindowPlacementGeometry,
-    WindowPlacementMode, WindowPlacementPlanError, WindowPlacementRuntime,
-    WindowPlacementRuntimeHandle, WindowPlacementState,
+    TransientArcIdentity, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END,
+    ARC_TASK_ID_POOL_START,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -428,7 +430,7 @@ impl ShadowTable {
     /// Clear a guest destructor marker after the guest-side mapping has been
     /// removed while a host-only reservation remains for a delayed event.
     ///
-    /// This is narrower than [`remove_id`]: orphaned asynchronous
+    /// This is narrower than [`Self::remove_id`]: orphaned asynchronous
     /// linux-dmabuf params can acknowledge their guest `delete_id` before
     /// emitting `created`/`failed`, so their host interface metadata must stay
     /// registered until that final event is consumed.
@@ -603,7 +605,7 @@ impl ShadowTable {
     ///
     /// Requests carrying this guest ID will fail the interface validation,
     /// while events from the still-live host object can continue to resolve
-    /// back to the retired guest ID until [`remove_id`] is called. Preserve the
+    /// back to the retired guest ID until [`Self::remove_id`] is called. Preserve the
     /// interface metadata on the host side as well: proxy dispatch needs an
     /// interface name before it can invoke the event handler, and the guest
     /// metadata is intentionally removed so a destroyed object cannot accept
@@ -1163,7 +1165,20 @@ impl Context {
                 None
             }
         };
+        Self::new_with_placement_runtime_and_allocator(
+            gpu_accel,
+            xdg_decoration,
+            placement_runtime,
+            allocator,
+        )
+    }
 
+    fn new_with_placement_runtime_and_allocator(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        placement_runtime: WindowPlacementRuntimeHandle,
+        allocator: Option<Allocator>,
+    ) -> Self {
         let window_placement = WindowPlacementState::with_runtime(placement_runtime);
 
         Self {
@@ -1267,7 +1282,10 @@ impl Context {
             Arc::new(accelerators),
             None,
         );
-        Self::new_with_placement_runtime(gpu_accel, xdg_decoration, runtime)
+        // Unit tests do not exercise GBM allocation. Avoid probing every DRM
+        // render node for each fixture: exhaustive state-model tests create
+        // thousands of contexts, and hardware probing would dominate runtime.
+        Self::new_with_placement_runtime_and_allocator(gpu_accel, xdg_decoration, runtime, None)
     }
 }
 
@@ -1314,32 +1332,6 @@ mod tests {
 
         assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
         assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
-    }
-
-    #[test]
-    fn output_work_area_converts_scale_and_insets() {
-        let output = OutputState {
-            mode_width: 3840,
-            mode_height: 2160,
-            scale: 2,
-            insets_top: 24,
-            insets_left: 8,
-            insets_bottom: 48,
-            insets_right: 16,
-        };
-        assert_eq!(output.work_area(), Some((8, 24, 1896, 1008)));
-    }
-
-    #[test]
-    fn output_work_area_rejects_invalid_dimensions() {
-        let output = OutputState {
-            mode_width: 100,
-            mode_height: 100,
-            scale: 2,
-            insets_top: 60,
-            ..Default::default()
-        };
-        assert_eq!(output.work_area(), None);
     }
 
     #[test]

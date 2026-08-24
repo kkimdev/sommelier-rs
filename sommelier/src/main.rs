@@ -102,7 +102,9 @@ struct Args {
     /// `set-parent` keeps the custom self-parent position probe but uses the
     /// persistent ARC task identity needed for the accompanying bounds
     /// request, `transient-arc`
-    /// installs an ARC task identity around each bounds request, and
+    /// installs an ARC task identity around each bounds request, removes the
+    /// nullable parent after the host barrier, and restores the native
+    /// identity, and
     /// `persistent` keeps the ARC task identity for the window lifetime. Do
     /// not combine this option with the lower-level placement axis options
     /// below.
@@ -235,6 +237,27 @@ fn resolve_placement_mode(
     )
 }
 
+fn validate_shortcut_startup(
+    public_backend_selected: bool,
+    config_path_supplied: bool,
+    shortcut_config: &ShortcutConfig,
+    placement_mode: WindowPlacementMode,
+) -> Result<(), String> {
+    if public_backend_selected && !config_path_supplied {
+        return Err(
+            "--window-placement-backend requires --window-shortcuts-config; \
+             placement is otherwise disabled"
+                .to_string(),
+        );
+    }
+    if !shortcut_config.is_empty() && !placement_mode.handles_shortcuts() {
+        return Err("window shortcut config contains bindings, but \
+             --window-geometry-method=none disables window placement"
+            .to_string());
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
@@ -304,11 +327,13 @@ async fn main() {
         },
         None => ShortcutConfig::disabled(),
     };
-    if !shortcut_config.is_empty() && !placement_mode.handles_shortcuts() {
-        log::error!(
-            "window shortcut config contains bindings, but \
-             --window-geometry-method=none disables window placement"
-        );
+    if let Err(error) = validate_shortcut_startup(
+        args.window_placement_backend.is_some(),
+        shortcut_config_path.is_some(),
+        &shortcut_config,
+        placement_mode,
+    ) {
+        log::error!("{error}");
         std::process::exit(2);
     }
     let shortcut_config_handle = ShortcutConfigHandle::new(shortcut_config);
@@ -402,5 +427,28 @@ mod tests {
 
         assert!(error.contains("--window-placement-backend"));
         assert!(error.contains("--window-host-policy"));
+    }
+
+    #[test]
+    fn public_backend_requires_an_explicit_shortcut_file() {
+        let error = validate_shortcut_startup(
+            true,
+            false,
+            &ShortcutConfig::disabled(),
+            PlacementBackendArg::SetParent.mode(),
+        )
+        .expect_err("public backend without a config path must stay disabled");
+        assert!(error.contains("--window-shortcuts-config"));
+    }
+
+    #[test]
+    fn hidden_backend_axes_can_remain_disabled_without_a_config_file() {
+        validate_shortcut_startup(
+            false,
+            false,
+            &ShortcutConfig::disabled(),
+            WindowPlacementMode::disabled(),
+        )
+        .expect("the default disabled mode needs no config file");
     }
 }

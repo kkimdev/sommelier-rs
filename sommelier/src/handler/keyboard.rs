@@ -26,15 +26,12 @@ limitations under the License.
 //!
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
-use crate::protocols::aura_shell::zaura_surface::REQ_UNSET_SNAP;
-use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
 use crate::protocols::wayland::wl_keyboard;
-use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
 use crate::window_shortcuts::{ShortcutConfig, WindowShortcut};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::Action;
 use xkbcommon::xkb;
 
 /// `wl_keyboard.key` state values (Wayland spec §wl_keyboard.key).
@@ -337,18 +334,6 @@ impl KeyboardHandler {
         shortcut
     }
 
-    fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
-        let message = MessageBuilder::new().build_message(host_xdg_toplevel_id, opcode);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-    }
-
-    fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surface_id: u32) {
-        Self::queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_FULLSCREEN);
-        Self::queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_MAXIMIZED);
-        let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-    }
-
     fn apply_window_layout(
         ctx: &mut Context,
         host_keyboard_id: HostId,
@@ -364,223 +349,12 @@ impl KeyboardHandler {
             );
             return false;
         };
-        let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
-            log::debug!(
-                "window shortcut {:?} ignored: guest xdg_toplevel {} has no host mapping",
-                shortcut,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some(zaura_toplevel_id) =
-            crate::handler::compositor::ensure_zaura_toplevel(ctx, guest_xdg_toplevel_id)
-        else {
-            log::debug!(
-                "window shortcut {:?} ignored: no zaura_toplevel for xdg_toplevel {}",
-                shortcut,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some(zaura_surface_id) =
-            crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
-        else {
-            log::debug!(
-                "window shortcut {:?} ignored: no zaura_surface for wl_surface {}",
-                shortcut,
-                guest_wl_surface_id
-            );
-            return false;
-        };
-        let zaura_surface_version = ctx
-            .shadow_table
-            .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.window_placement.aura_shell_version());
-        let plan = match ctx.window_placement.prepare_placement(
-            shortcut.rect,
-            zaura_toplevel_id,
-            guest_wl_surface_id,
-            zaura_surface_version,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                if matches!(
-                    error,
-                    crate::state::WindowPlacementPlanError::UnsupportedSurfaceVersion
-                ) {
-                    log::warn!(
-                        "window layout {:?}: self-parent probe requires zaura_surface v2, got v{}",
-                        shortcut,
-                        zaura_surface_version
-                    );
-                } else {
-                    log::debug!(
-                        "window layout {:?} ignored for xdg_toplevel {}: {:?}",
-                        shortcut,
-                        guest_xdg_toplevel_id,
-                        error
-                    );
-                }
-                return error.consumes_shortcut();
-            }
-        };
-
-        if let Some(identity) = &plan.transient_arc_identity {
-            if !crate::handler::compositor::queue_zaura_application_id(
-                ctx,
-                zaura_surface_id,
-                &identity.arc_application_id,
-            ) {
-                log::warn!(
-                    "window layout {:?}: unable to install transient ARC ID on \
-                     zaura_surface {}",
-                    shortcut,
-                    zaura_surface_id
-                );
-                return false;
-            }
-            log::debug!(
-                "window layout {:?}: transient ARC ID {} installed before bounds; \
-                 native ID {} will be restored after the host sync",
-                shortcut,
-                identity.arc_application_id,
-                identity.native_application_id,
-            );
-        }
-
-        Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
-        let mut builder = MessageBuilder::new();
-        let (request_x, request_y, width, height) = match plan.geometry {
-            crate::state::WindowPlacementGeometry::Bounds => {
-                (plan.bounds.0, plan.bounds.1, plan.bounds.2, plan.bounds.3)
-            }
-            crate::state::WindowPlacementGeometry::SelfParent { current_origin, .. } => (
-                current_origin.0,
-                current_origin.1,
-                plan.bounds.2,
-                plan.bounds.3,
-            ),
-        };
-        builder.write_i32(request_x);
-        builder.write_i32(request_y);
-        builder.write_i32(width);
-        builder.write_i32(height);
-        builder.write_u32(plan.output_host_id);
-        let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-
-        let self_parent_surface_id = if let crate::state::WindowPlacementGeometry::SelfParent {
-            relative_position: (relative_x, relative_y),
-            ..
-        } = plan.geometry
-        {
-            if !crate::handler::compositor::queue_zaura_surface_parent(
-                ctx,
-                zaura_surface_id,
-                Some(zaura_surface_id),
-                relative_x,
-                relative_y,
-            ) {
-                log::warn!(
-                    "window layout {:?}: unable to queue self-parent request for \
-                         zaura_surface {}",
-                    shortcut,
-                    zaura_surface_id
-                );
-                return false;
-            }
-            Some(zaura_surface_id)
-        } else {
-            None
-        };
-
-        if !crate::handler::compositor::queue_window_placement_barrier(
+        crate::handler::placement::apply_window_shortcut(
             ctx,
-            zaura_toplevel_id,
-            self_parent_surface_id,
-        ) {
-            log::warn!(
-                "window layout {:?}: failed to queue host sync barrier for zaura_toplevel {}",
-                shortcut,
-                zaura_toplevel_id
-            );
-        }
-        if let Some(identity) = &plan.transient_arc_identity {
-            if !crate::handler::compositor::queue_zaura_application_id(
-                ctx,
-                zaura_surface_id,
-                &identity.native_application_id,
-            ) {
-                log::warn!(
-                    "window layout {:?}: unable to restore native application ID {} \
-                     on zaura_surface {} after bounds",
-                    shortcut,
-                    identity.native_application_id,
-                    zaura_surface_id
-                );
-            } else {
-                log::debug!(
-                    "window layout {:?}: queued native application ID {} after \
-                     placement barrier",
-                    shortcut,
-                    identity.native_application_id
-                );
-            }
-        }
-        if !ctx
-            .window_placement
-            .commit_placement_plan(zaura_toplevel_id, &plan)
-        {
-            log::warn!(
-                "window layout {:?}: placement target was released before \
-                 the state transition could be committed",
-                shortcut
-            );
-        }
-        if let crate::state::WindowPlacementGeometry::SelfParent {
-            current_origin: (origin_x, origin_y),
-            relative_position: (relative_x, relative_y),
-        } = plan.geometry
-        {
-            log::warn!(
-                "window layout {:?}: experimental self-parent probe sent for zaura_surface={} \
-                 target_screen_position=({}, {}) origin=({}, {}) \
-                 relative_position=({}, {})",
-                shortcut,
-                zaura_surface_id,
-                plan.bounds.0,
-                plan.bounds.1,
-                origin_x,
-                origin_y,
-                relative_x,
-                relative_y
-            );
-            log::info!(
-                "window layout {:?}: self-parent resize-then-move sent \
-                 current_origin=({}, {}) target_screen_bounds=({}, {}, {}, {}) output={}",
-                shortcut,
-                origin_x,
-                origin_y,
-                plan.bounds.0,
-                plan.bounds.1,
-                plan.bounds.2,
-                plan.bounds.3,
-                plan.output_host_id
-            );
-        } else {
-            log::info!(
-                "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
-                shortcut,
-                guest_xdg_toplevel_id,
-                zaura_toplevel_id,
-                plan.bounds.0,
-                plan.bounds.1,
-                plan.bounds.2,
-                plan.bounds.3,
-                plan.output_host_id
-            );
-        }
-        true
+            guest_xdg_toplevel_id,
+            guest_wl_surface_id,
+            shortcut,
+        )
     }
 
     fn reset_host_keyboard_modifiers(&mut self, host_keyboard_id: HostId) {
@@ -1456,11 +1230,15 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT;
+    use crate::handler::callback::CallbackHandler;
+    use crate::protocols::aura_shell::zaura_surface::{REQ_SET_PARENT, REQ_UNSET_SNAP};
+    use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
+    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+    use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
     use crate::wire::WireMessage;
     use std::os::unix::io::AsRawFd;
 
@@ -1712,6 +1490,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1849,6 +1629,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1936,6 +1718,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -1970,7 +1754,6 @@ mod tests {
                 REQ_UNSET_SNAP,
                 REQ_SET_WINDOW_BOUNDS,
                 crate::protocols::wayland::wl_display::REQ_SYNC,
-                crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID,
             ]
         );
         let app_id_messages = ctx
@@ -1981,17 +1764,83 @@ mod tests {
                     == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID
             })
             .collect::<Vec<_>>();
-        assert_eq!(app_id_messages.len(), 2);
+        let callback_id = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| {
+                message_sender(message) == 1
+                    && message_opcode(message) == crate::protocols::wayland::wl_display::REQ_SYNC
+            })
+            .map(message_first_u32)
+            .expect("placement sync callback");
         let first_payload = &app_id_messages[0].0[8..];
         let first_len = u32::from_ne_bytes(first_payload[0..4].try_into().unwrap()) as usize;
         let first_id =
             std::str::from_utf8(&first_payload[4..4 + first_len - 1]).expect("valid ARC ID");
         assert!(first_id.starts_with("org.chromium.arc."));
-        let final_payload = &app_id_messages[1].0[8..];
+        assert_eq!(
+            app_id_messages.len(),
+            1,
+            "native identity must wait for sync.done"
+        );
+
+        ctx.last_sender_id = callback_id;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        let final_payload = &ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| {
+                message_opcode(message)
+                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID
+            })
+            .nth(1)
+            .expect("native identity restore after sync.done")
+            .0[8..];
         let final_len = u32::from_ne_bytes(final_payload[0..4].try_into().unwrap()) as usize;
         let final_id =
             std::str::from_utf8(&final_payload[4..4 + final_len - 1]).expect("valid native ID");
         assert_eq!(final_id, native_id);
+        let parent_requests = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| {
+                message_opcode(message)
+                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parent_requests.len(),
+            1,
+            "transient ARC cleanup must emit one nullable-parent request"
+        );
+        assert_eq!(
+            message_first_u32(parent_requests[0]),
+            0,
+            "transient ARC cleanup must use a null parent"
+        );
+        let parent_position = ctx
+            .client_to_host_queue
+            .iter()
+            .position(|message| {
+                message_opcode(message)
+                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_PARENT
+            })
+            .expect("null-parent request");
+        let restore_position = ctx
+            .client_to_host_queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message_opcode(message)
+                    == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID
+            })
+            .nth(1)
+            .map(|(position, _)| position)
+            .expect("native identity restore");
+        assert!(
+            parent_position < restore_position,
+            "null-parent cleanup must be queued before native identity restore"
+        );
     }
 
     #[test]
@@ -2013,6 +1862,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2101,6 +1952,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2111,7 +1964,7 @@ mod tests {
             .update_output_mode(output, true, 3840, 2160);
         ctx.window_placement.update_output_scale(output, 1);
         let zaura_toplevel_id =
-            crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
+            crate::handler::placement::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");
         assert!(ctx
             .window_placement
@@ -2203,6 +2056,58 @@ mod tests {
             Some((0, 0)),
             "the requested origin remains pending until host confirmation"
         );
+        let callback_id = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|(message, _)| {
+                u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 1
+                    && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+                        == crate::protocols::wayland::wl_display::REQ_SYNC
+            })
+            .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
+            .expect("self-parent placement barrier callback");
+        assert!(
+            ctx.window_placement.has_any_barriers(),
+            "placement barrier should remain pending after shortcut"
+        );
+        let active_callback_id = ctx
+            .window_placement
+            .active_barrier_for_toplevel(zaura_toplevel_id)
+            .expect("active placement barrier");
+        assert_eq!(callback_id, active_callback_id);
+        assert_eq!(
+            ctx.window_placement.barrier_for_callback(callback_id),
+            Some(zaura_toplevel_id)
+        );
+        ctx.last_sender_id = callback_id;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+
+        let parent_requests: Vec<_> = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|(message, _)| {
+                (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+                    == REQ_SET_PARENT
+            })
+            .collect();
+        assert_eq!(
+            parent_requests.len(),
+            2,
+            "barrier completion must append the explicit unparent request"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(parent_requests[1].0[8..12].try_into().unwrap()),
+            0,
+            "cleanup must use a null parent"
+        );
+        assert_eq!(
+            i32::from_ne_bytes(parent_requests[1].0[12..16].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            i32::from_ne_bytes(parent_requests[1].0[16..20].try_into().unwrap()),
+            0
+        );
     }
 
     #[test]
@@ -2223,6 +2128,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2233,7 +2140,7 @@ mod tests {
             .update_output_mode(output, true, 3840, 2160);
         ctx.window_placement.update_output_scale(output, 1);
         let _zaura_toplevel_id =
-            crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
+            crate::handler::placement::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");
 
         assert!(
@@ -2271,6 +2178,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.shadow_table
+            .track_interface(xdg_toplevel, "xdg_toplevel".to_string());
         assert!(ctx
             .window_placement
             .remember_xdg_toplevel(xdg_toplevel, surface));
@@ -2281,7 +2190,7 @@ mod tests {
             .update_output_mode(output, true, 3840, 2160);
         ctx.window_placement.update_output_scale(output, 1);
         let zaura_toplevel_id =
-            crate::handler::compositor::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
+            crate::handler::placement::ensure_zaura_toplevel(&mut ctx, xdg_toplevel)
                 .expect("host zaura toplevel mapping");
         assert!(ctx
             .window_placement

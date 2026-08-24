@@ -579,7 +579,7 @@ impl Client {
                     let guest_xdg_toplevel_id =
                         u32::from_ne_bytes(packet[8..12].try_into().unwrap());
                     if self.ctx.window_placement.handles_shortcuts() {
-                        let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                        let _ = crate::handler::placement::ensure_zaura_toplevel(
                             &mut self.ctx,
                             guest_xdg_toplevel_id,
                         );
@@ -3330,12 +3330,20 @@ rect = [0.0, 0.0, 0.5, 0.5]
     fn early_output_cleanup_preserves_incoming_fd_ownership() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let incoming_target =
+            fs::read_link(format!("/proc/self/fd/{}", pipe_fds[1])).expect("incoming fd target");
         let mut output = vec![pipe_fds[1]];
         close_pending_output_fds(&mut output, &[pipe_fds[1]]);
 
         // The incoming connection still owns this descriptor; the cleanup
         // helper must not close it before the connection drains/drops.
-        assert_ne!(unsafe { libc::fcntl(pipe_fds[1], libc::F_GETFD) }, -1);
+        let current = fs::read_link(format!("/proc/self/fd/{}", pipe_fds[1]));
+        assert!(
+            current
+                .as_ref()
+                .is_ok_and(|current| current == &incoming_target),
+            "protected incoming descriptors must remain owned by the connection"
+        );
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -3344,9 +3352,10 @@ rect = [0.0, 0.0, 0.5, 0.5]
         let mut second_pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
         let fd = second_pipe[1];
+        let target = fs::read_link(format!("/proc/self/fd/{fd}")).expect("output fd target");
         let mut output = vec![fd];
         close_pending_output_fds(&mut output, &[]);
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_fd_released(fd, &target);
         unsafe {
             libc::close(second_pipe[0]);
         }
