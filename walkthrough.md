@@ -1249,11 +1249,13 @@ so late focus/animation coordinates cannot rebase the next relative request.
 The regression fixtures cover both fallback promotion and repeated-shortcut
 deduplication.
 
-The final serialized workspace verification passed:
+The final serialized Sommelier verification passed:
 
-- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 694
-  passed, 0 failed, 1 ignored (live VirtWL); sample GUI 12 passed; Wayland codegen 6
-  passed; GUI smoke remained ignored because it requires a live compositor.
+- `cargo test -p sommelier --bin sommelier -- --test-threads=1`: Sommelier 716
+  passed, 0 failed, 1 ignored (live VirtWL). This includes direct coverage for
+  live transient-ARC restore completion followed by role teardown.
+- The workspace check and strict all-target Clippy pass; sample GUI and Wayland
+  codegen remain covered by the earlier serialized workspace run.
 - `cargo fmt --check`, `cargo check --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`, and
   `git diff --check` passed.
