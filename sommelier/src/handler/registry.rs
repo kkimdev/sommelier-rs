@@ -29,7 +29,7 @@ use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal};
+use crate::state::{Context, HostGlobal, HostId, PendingDmabufGlobal};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -323,9 +323,18 @@ fn queue_gtk_shell_capability_barrier(ctx: &mut Context, gtk_shell_id: u32) -> b
     builder.write_u32(callback_id);
     match builder.try_build_message(1, wl_display::REQ_SYNC) {
         Ok(message) => {
+            if !ctx
+                .window_placement
+                .register_gtk_shell_capability_callback(callback_id, gtk_shell_id)
+            {
+                log::error!(
+                    "Refusing duplicate GTK shell capability callback {}",
+                    callback_id
+                );
+                ctx.shadow_table.remove_host_interface(callback_id);
+                return false;
+            }
             ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.gtk_shell_capability_callbacks
-                .insert(callback_id, gtk_shell_id);
             true
         }
         Err(error) => {
@@ -346,7 +355,7 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx.host_text_input_manager_v1_global_name == Some(name)
         || ctx.host_text_input_extension_v1_global_name == Some(name)
         || ctx.host_keyboard_extension_global_name == Some(name)
-        || ctx.host_zaura_shell_global_name == Some(name)
+        || ctx.window_placement.aura_shell_global_name() == Some(name)
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -412,11 +421,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // is released. Keep both maps and the child dispatch registrations so
         // queued peek_key events remain routable after the manager disappears.
     }
-    if ctx.host_zaura_shell_global_name == Some(name) {
-        let shell_version = ctx.host_zaura_shell_version;
-        let shell_id = ctx.host_zaura_shell_id.take();
-        ctx.host_zaura_shell_global_name = None;
-        ctx.host_zaura_shell_version = 0;
+    if let Some((shell_id, shell_version)) = ctx.window_placement.take_aura_shell_for_global(name) {
         // `global_remove` invalidates only the advertised global name. Already
         // created `zaura_surface` children have their own protocol lifetime
         // and remain usable until their owning wl_surface is destroyed. Keep
@@ -428,14 +433,12 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // Release only the internally bound manager, matching ChromiumOS'
         // registry remover. New children cannot be created until a replacement
         // shell global is advertised and rebound.
-        if let Some(host_id) = shell_id {
-            if shell_version >= 38 {
-                let message = MessageBuilder::new().build_message(host_id, ZAURA_SHELL_RELEASE);
-                ctx.client_to_host_queue.push((message, Vec::new()));
-                ctx.shadow_table.mark_pending_destroy_host(host_id);
-            } else {
-                ctx.shadow_table.retire_host_interface(host_id);
-            }
+        if shell_version >= 38 {
+            let message = MessageBuilder::new().build_message(shell_id, ZAURA_SHELL_RELEASE);
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.shadow_table.mark_pending_destroy_host(shell_id);
+        } else {
+            ctx.shadow_table.retire_host_interface(shell_id);
         }
     }
     ctx.hidden_host_globals.remove(&name);
@@ -865,7 +868,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             return Action::Drop;
         } else if interface == "zaura_shell" {
-            if ctx.host_zaura_shell_id.is_some() {
+            if ctx.window_placement.aura_shell_id().is_some() {
                 // The host compositor sends the same global list to every
                 // wl_registry object. Sommelier has one internal aura shell
                 // binding per connection, so a later registry must not bind
@@ -888,9 +891,16 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // registry name so its global_remove lifecycle remains paired.
             let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, 38);
-            ctx.host_zaura_shell_id = Some(host_id);
-            ctx.host_zaura_shell_global_name = Some(name);
-            ctx.host_zaura_shell_version = bound_version;
+            if !ctx
+                .window_placement
+                .set_aura_shell_binding(host_id, name, bound_version)
+            {
+                log::error!(
+                    "Refusing to replace the live Aura shell binding for global {}",
+                    name
+                );
+                return Action::Drop;
+            }
             ctx.shadow_table.track_host_interface_with_version(
                 host_id,
                 "zaura_shell".to_string(),
@@ -907,7 +917,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            let bound = queue_internal_bind(
                 ctx,
                 registry_host_id,
                 name,
@@ -915,6 +925,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
+            if !bound {
+                // Do not leave a manager generation that can suppress every
+                // future re-advertisement after its host bind failed.
+                let _ = ctx.window_placement.take_aura_shell_for_global(name);
+                ctx.shadow_table.remove_host_interface(host_id);
+                ctx.host_globals.remove(&name);
+                ctx.fatal_protocol_error = true;
+                return Action::Drop;
+            }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
             return Action::Drop;
@@ -1144,8 +1163,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 interface.clone(),
                 *version,
             );
-            ctx.gtk_shells
-                .insert(*guest_new_id, GtkShellState::default());
+            if !ctx.window_placement.remember_gtk_shell(*guest_new_id) {
+                log::warn!("Refusing duplicate GTK shell object {}", guest_new_id);
+                return Action::Drop;
+            }
             if !queue_gtk_shell_capability_barrier(ctx, *guest_new_id) {
                 ctx.fatal_protocol_error = true;
             }
@@ -1157,9 +1178,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
-        if interface == "wl_output" {
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
+        if interface == "wl_output" && !ctx.window_placement.remember_output(host_new_id) {
+            log::error!(
+                "Refusing duplicate placement output binding for host ID {}",
+                host_new_id
+            );
+            ctx.shadow_table.remove_id(*guest_new_id);
+            return Action::Drop;
         }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
@@ -1181,6 +1206,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
             // Do not leave a guest→host mapping behind when the registry
             // itself has already been destroyed or was never mapped.
+            if interface == "wl_output" {
+                let _ = ctx.window_placement.take_output(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
@@ -1197,6 +1225,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
+            if interface == "wl_output" {
+                // The placement record was created before the bind request so
+                // host mode/scale events can be accepted immediately. If the
+                // request cannot be encoded, roll that record back together
+                // with the guest/host mapping.
+                let _ = ctx.window_placement.take_output(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
@@ -1412,12 +1447,11 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.shadow_table.is_local_only_guest_object(50));
-        assert!(ctx.gtk_shells.contains_key(&50));
+        assert!(ctx.window_placement.has_gtk_shell(50));
         assert!(ctx.host_to_client_queue.is_empty());
         let callback_id = ctx
-            .gtk_shell_capability_callbacks
-            .iter()
-            .find_map(|(&callback_id, &shell_id)| (shell_id == 50).then_some(callback_id))
+            .window_placement
+            .gtk_shell_capability_callback_for_test(50)
             .expect("GTK capability callback");
         ctx.last_sender_id = callback_id;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
@@ -1507,6 +1541,30 @@ mod tests {
             "invalid wl_registry.bind must report a fatal wl_display.error"
         );
         assert!(ctx.fatal_protocol_error);
+    }
+
+    #[test]
+    fn output_bind_without_registry_mapping_rolls_back_placement_state() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.host_globals.insert(
+            7,
+            HostGlobal {
+                interface: "wl_output".to_string(),
+                version: 3,
+            },
+        );
+        ctx.last_sender_id = 10;
+
+        let mut handler = RegistryHandler;
+        let bind = ("wl_output".to_string(), 3, 20);
+        assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
+        assert_eq!(
+            ctx.window_placement.primary_output(),
+            None,
+            "a failed registry bind must not leave output geometry alive"
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert_eq!(ctx.shadow_table.get_interface(20), None);
     }
 
     #[test]
@@ -2068,7 +2126,10 @@ mod tests {
         let shell = "zaura_shell".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &shell, 37), Action::Drop);
-        let shell_id = ctx.host_zaura_shell_id.expect("legacy aura shell");
+        let shell_id = ctx
+            .window_placement
+            .aura_shell_id()
+            .expect("legacy aura shell");
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
@@ -2108,14 +2169,17 @@ mod tests {
         let shell = "zaura_shell".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &shell, 38), Action::Drop);
-        let shell_id = ctx.host_zaura_shell_id.expect("aura shell binding");
+        let shell_id = ctx
+            .window_placement
+            .aura_shell_id()
+            .expect("aura shell binding");
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
         assert!(ctx.window_placement.remember_aura_surface(50, surface_id));
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(ctx.host_zaura_shell_id, None);
+        assert_eq!(ctx.window_placement.aura_shell_id(), None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(
             ctx.window_placement.aura_surface_for_wl_surface(50),

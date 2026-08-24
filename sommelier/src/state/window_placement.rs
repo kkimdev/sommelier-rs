@@ -22,10 +22,13 @@ limitations under the License.
 //! keeps backend selection, origin prediction, barrier retirement, and ARC
 //! application-ID lifetime consistent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use log::warn;
+
+use crate::window_shortcuts::{NormalizedRect, ShortcutConfig, ShortcutConfigHandle};
 
 /// Application-ID policy used for compositor-owned window operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,6 +124,11 @@ impl WindowPlacementMode {
     }
 
     /// Return whether the ARC application namespace is selected.
+    ///
+    /// This policy is intentionally independent from geometry selection:
+    /// `arc + none` still rewrites application IDs but does not consume
+    /// shortcuts. Use `guest + none` for a completely inactive placement
+    /// feature.
     pub(crate) const fn uses_arc_policy(self) -> bool {
         matches!(self.host_policy, WindowHostPolicy::Arc)
     }
@@ -136,13 +144,58 @@ impl WindowPlacementMode {
     }
 }
 
+/// Host output geometry used by compositor-owned window layout requests.
+///
+/// `wl_output.mode` reports pixel dimensions while Aura window bounds use
+/// logical screen coordinates. `scale` converts the former into the latter;
+/// output insets remove shelf/non-work-area margins when they are known.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OutputState {
+    pub(crate) mode_width: i32,
+    pub(crate) mode_height: i32,
+    pub(crate) scale: i32,
+    pub(crate) insets_top: i32,
+    pub(crate) insets_left: i32,
+    pub(crate) insets_bottom: i32,
+    pub(crate) insets_right: i32,
+}
+
+impl OutputState {
+    pub(crate) fn work_area(self) -> Option<(i32, i32, i32, i32)> {
+        let scale = self.scale.max(1);
+        let width = self.mode_width.checked_div(scale)?;
+        let height = self.mode_height.checked_div(scale)?;
+        let x = self.insets_left;
+        let y = self.insets_top;
+        let width = width
+            .checked_sub(self.insets_left)?
+            .checked_sub(self.insets_right)?;
+        let height = height
+            .checked_sub(self.insets_top)?
+            .checked_sub(self.insets_bottom)?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((x, y, width, height))
+    }
+}
+
 /// Application-ID namespace used by the ARC bounds backend.
 pub(crate) const ARC_SESSION_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.session";
+const DEFAULT_VM_IDENTIFIER: &str = "termina";
 
 // ARC parses the numeric suffix with a signed 32-bit `%d`. Keep generated
 // values positive and well below INT32_MAX while partitioning the range by
 // process ID and a process-wide serial. The serial is intentionally global so
 // multiple Context instances in one process cannot reuse an ID concurrently.
+//
+// This allocator is the one deliberate process-wide exception to
+// `WindowPlacementState`'s lifecycle ownership: it only reserves a fresh
+// numeric identity. The live identity-to-surface mapping remains in each
+// connection's state and is retired by `take_aura_surface_for_wl_surface`.
+// Keeping allocation process-wide avoids collisions between simultaneous
+// client contexts; moving it into each state would restart the serial for
+// every connection and make active ARC application IDs collide.
 const ARC_SESSION_ID_BASE: u32 = 1_000_000_000;
 const ARC_SESSION_ID_PID_MASK: u32 = (1 << 14) - 1;
 const ARC_SESSION_ID_SERIAL_MASK: u32 = (1 << 14) - 1;
@@ -156,12 +209,210 @@ fn next_arc_session_id() -> u32 {
     ARC_SESSION_ID_BASE + 1 + pid_component * ARC_SESSION_ID_SERIAL_SLOT_COUNT + serial
 }
 
+/// Resolve the VM namespace used in ChromeOS guest application IDs.
+///
+/// An exported-but-empty environment variable is equivalent to an unset one,
+/// matching ChromiumOS Sommelier's fallback to the standard Crostini VM name.
+fn resolve_vm_identifier(value: Option<String>) -> String {
+    value
+        .filter(|identifier| !identifier.is_empty())
+        .unwrap_or_else(|| DEFAULT_VM_IDENTIFIER.to_string())
+}
+
 #[derive(Debug, Default)]
 struct ToplevelPlacementState {
     /// Last authoritative or predicted screen-space origin.
     origin: Option<(i32, i32)>,
     /// Newest self-parent target waiting for a matching host notification.
     pending_origin: Option<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuraShellBinding {
+    host_id: u32,
+    global_name: u32,
+    version: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputRecord {
+    host_id: u32,
+    state: OutputState,
+}
+
+#[derive(Debug, Default)]
+struct GtkShellState {
+    /// Activation token supplied by GTK for windows created through this
+    /// shell binding. ChromeOS validates the token before granting focus.
+    startup_id: Option<String>,
+    /// Synthetic gtk_surface1 objects created from this shell binding.
+    surfaces: HashSet<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GtkSurfaceState {
+    shell_id: u32,
+    wl_surface_id: u32,
+}
+
+/// One-to-one association with both lookup directions owned together.
+///
+/// Placement lifecycle code frequently needs to resolve either side of a
+/// guest/host relationship. Keeping the two maps behind this type prevents a
+/// caller from updating one direction without the reverse direction and makes
+/// conflict handling identical for every association kind.
+#[derive(Debug, Default)]
+struct BidirectionalLinks {
+    forward: HashMap<u32, u32>,
+    reverse: HashMap<u32, u32>,
+}
+
+impl BidirectionalLinks {
+    /// Insert an association if both IDs are unused or already paired.
+    #[must_use = "a conflicting association must not replace live state"]
+    fn insert(&mut self, forward_id: u32, reverse_id: u32) -> bool {
+        match (
+            self.forward.get(&forward_id).copied(),
+            self.reverse.get(&reverse_id).copied(),
+        ) {
+            (None, None) => {
+                self.forward.insert(forward_id, reverse_id);
+                self.reverse.insert(reverse_id, forward_id);
+                true
+            }
+            (Some(existing_reverse), Some(existing_forward))
+                if existing_reverse == reverse_id && existing_forward == forward_id =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Resolve the reverse-side ID for one forward-side ID.
+    fn get_forward(&self, forward_id: u32) -> Option<u32> {
+        self.forward.get(&forward_id).copied()
+    }
+
+    /// Resolve the forward-side ID for one reverse-side ID.
+    fn get_reverse(&self, reverse_id: u32) -> Option<u32> {
+        self.reverse.get(&reverse_id).copied()
+    }
+
+    /// Remove an association by its forward-side ID.
+    fn remove_forward(&mut self, forward_id: u32) -> Option<u32> {
+        let reverse_id = self.forward.remove(&forward_id)?;
+        self.reverse.remove(&reverse_id);
+        Some(reverse_id)
+    }
+
+    /// Remove an association by its reverse-side ID.
+    fn remove_reverse(&mut self, reverse_id: u32) -> Option<u32> {
+        let forward_id = self.reverse.remove(&reverse_id)?;
+        self.forward.remove(&forward_id);
+        Some(forward_id)
+    }
+
+    /// Return whether both lookup directions contain exactly the same pairs.
+    fn is_consistent(&self) -> bool {
+        self.forward.len() == self.reverse.len()
+            && self
+                .forward
+                .iter()
+                .all(|(forward_id, reverse_id)| self.reverse.get(reverse_id) == Some(forward_id))
+            && self
+                .reverse
+                .iter()
+                .all(|(reverse_id, forward_id)| self.forward.get(forward_id) == Some(reverse_id))
+    }
+}
+
+/// Ordered host-sync callbacks retained for placement requests.
+///
+/// A toplevel may have several callbacks in flight when the user presses
+/// shortcuts quickly. `by_callback` retains every callback until its terminal
+/// host event, while `active_by_toplevel` identifies the newest callback for
+/// each toplevel. The callback establishes host-stream ordering; it does not
+/// suppress `xdg_toplevel.configure` events. Keeping these maps behind one
+/// owner prevents stale callback completion from clearing newer placement
+/// bookkeeping.
+#[derive(Debug, Default)]
+struct PlacementBarrierRegistry {
+    by_callback: HashMap<u32, u32>,
+    active_by_toplevel: HashMap<u32, u32>,
+}
+
+impl PlacementBarrierRegistry {
+    /// Return whether a callback ID is already retained by this registry.
+    fn contains_callback(&self, callback_id: u32) -> bool {
+        self.by_callback.contains_key(&callback_id)
+    }
+
+    /// Retain a callback and make it the latest sync for its toplevel.
+    ///
+    /// An existing active callback is intentionally superseded but remains in
+    /// `by_callback` until its host-side terminal event arrives.
+    fn register(&mut self, callback_id: u32, toplevel_id: u32) -> bool {
+        if self.contains_callback(callback_id) {
+            return false;
+        }
+        self.by_callback.insert(callback_id, toplevel_id);
+        self.active_by_toplevel.insert(toplevel_id, callback_id);
+        true
+    }
+
+    /// Complete one callback and return the toplevel it guarded.
+    ///
+    /// Only the callback that is still active for that toplevel may clear the
+    /// active entry; an older superseded callback remains callback-owned until
+    /// its own completion without disturbing the newer barrier.
+    fn complete(&mut self, callback_id: u32) -> Option<u32> {
+        let toplevel_id = self.by_callback.remove(&callback_id)?;
+        if self.active_by_toplevel.get(&toplevel_id) == Some(&callback_id) {
+            self.active_by_toplevel.remove(&toplevel_id);
+        }
+        Some(toplevel_id)
+    }
+
+    /// Clear the latest pending sync for a released toplevel.
+    ///
+    /// Retained callbacks are deliberately left untouched because the host
+    /// may still emit their terminal events and their numeric IDs remain
+    /// reserved until then.
+    fn release_toplevel(&mut self, toplevel_id: u32) {
+        self.active_by_toplevel.remove(&toplevel_id);
+    }
+
+    /// Return whether a toplevel currently has a pending sync callback.
+    fn has_pending(&self, toplevel_id: u32) -> bool {
+        self.active_by_toplevel.contains_key(&toplevel_id)
+    }
+
+    /// Return whether no callback ownership remains.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.by_callback.is_empty() && self.active_by_toplevel.is_empty()
+    }
+
+    /// Check the forward/reverse barrier invariants.
+    fn is_consistent(&self, is_live_toplevel: impl Fn(u32) -> bool) -> bool {
+        self.active_by_toplevel
+            .iter()
+            .all(|(toplevel_id, callback_id)| {
+                self.by_callback.get(callback_id) == Some(toplevel_id)
+                    && is_live_toplevel(*toplevel_id)
+            })
+    }
+
+    #[cfg(test)]
+    fn callback_for(&self, callback_id: u32) -> Option<u32> {
+        self.by_callback.get(&callback_id).copied()
+    }
+
+    #[cfg(test)]
+    fn active_callback_for(&self, toplevel_id: u32) -> Option<u32> {
+        self.active_by_toplevel.get(&toplevel_id).copied()
+    }
 }
 
 /// All mutable state owned by the window-placement feature.
@@ -173,14 +424,20 @@ struct ToplevelPlacementState {
 #[derive(Debug)]
 pub(crate) struct WindowPlacementState {
     mode: WindowPlacementMode,
+    shortcut_config: ShortcutConfigHandle,
+    vm_identifier: String,
+    aura_shell: Option<AuraShellBinding>,
     arc_session_application_ids: HashMap<u32, String>,
-    aura_surface_by_wl_surface: HashMap<u32, u32>,
-    wl_surface_by_aura_surface: HashMap<u32, u32>,
-    aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
-    xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
+    aura_surface_links: BidirectionalLinks,
+    aura_toplevel_links: BidirectionalLinks,
+    xdg_surface_links: BidirectionalLinks,
+    xdg_toplevel_links: BidirectionalLinks,
     toplevels: HashMap<u32, ToplevelPlacementState>,
-    barrier_to_toplevel: HashMap<u32, u32>,
-    active_barrier_by_toplevel: HashMap<u32, u32>,
+    barriers: PlacementBarrierRegistry,
+    outputs: Vec<OutputRecord>,
+    gtk_shells: HashMap<u32, GtkShellState>,
+    gtk_surfaces: HashMap<u32, GtkSurfaceState>,
+    gtk_shell_capability_callbacks: HashMap<u32, u32>,
 }
 
 impl WindowPlacementState {
@@ -192,58 +449,69 @@ impl WindowPlacementState {
     /// builds instead of silently corrupting a later destructor path.
     #[inline]
     fn debug_assert_consistent(&self) {
-        debug_assert!(self.aura_surface_by_wl_surface.iter().all(
-            |(wl_surface_host_id, zaura_surface_host_id)| {
-                self.wl_surface_by_aura_surface.get(zaura_surface_host_id)
-                    == Some(wl_surface_host_id)
-            }
-        ));
-        debug_assert!(self.wl_surface_by_aura_surface.iter().all(
-            |(zaura_surface_host_id, wl_surface_host_id)| {
-                self.aura_surface_by_wl_surface.get(wl_surface_host_id)
-                    == Some(zaura_surface_host_id)
-            }
-        ));
-        debug_assert!(self.aura_toplevel_by_xdg_toplevel.iter().all(
-            |(xdg_toplevel_guest_id, zaura_toplevel_host_id)| {
-                self.xdg_toplevel_by_aura_toplevel
-                    .get(zaura_toplevel_host_id)
-                    == Some(xdg_toplevel_guest_id)
-            }
-        ));
-        debug_assert!(self.xdg_toplevel_by_aura_toplevel.iter().all(
-            |(zaura_toplevel_host_id, xdg_toplevel_guest_id)| {
-                self.aura_toplevel_by_xdg_toplevel
-                    .get(xdg_toplevel_guest_id)
-                    == Some(zaura_toplevel_host_id)
-            }
-        ));
-        debug_assert!(self.toplevels.keys().all(|zaura_toplevel_host_id| {
-            self.xdg_toplevel_by_aura_toplevel
-                .contains_key(zaura_toplevel_host_id)
+        debug_assert!(self.aura_surface_links.is_consistent());
+        debug_assert!(self.aura_toplevel_links.is_consistent());
+        debug_assert!(self.xdg_surface_links.is_consistent());
+        debug_assert!(self.xdg_toplevel_links.is_consistent());
+        debug_assert!(self.outputs.iter().enumerate().all(|(index, output)| {
+            self.outputs[..index]
+                .iter()
+                .all(|previous| previous.host_id != output.host_id)
         }));
-        debug_assert!(self.active_barrier_by_toplevel.iter().all(
-            |(zaura_toplevel_host_id, callback_host_id)| {
-                self.barrier_to_toplevel.get(callback_host_id) == Some(zaura_toplevel_host_id)
-                    && self
-                        .xdg_toplevel_by_aura_toplevel
-                        .contains_key(zaura_toplevel_host_id)
-            }
-        ));
+        debug_assert!(self.gtk_shells.iter().all(|(shell_id, shell)| {
+            shell.surfaces.iter().all(|surface_id| {
+                self.gtk_surfaces
+                    .get(surface_id)
+                    .is_some_and(|surface| surface.shell_id == *shell_id)
+            })
+        }));
+        debug_assert!(self.gtk_surfaces.iter().all(|(surface_id, surface)| {
+            self.gtk_shells
+                .get(&surface.shell_id)
+                .is_some_and(|shell| shell.surfaces.contains(surface_id))
+        }));
+        debug_assert!(self.toplevels.keys().all(|zaura_toplevel_host_id| {
+            self.aura_toplevel_links
+                .get_reverse(*zaura_toplevel_host_id)
+                .is_some()
+        }));
+        debug_assert!(self.barriers.is_consistent(|zaura_toplevel_host_id| {
+            self.aura_toplevel_links
+                .get_reverse(zaura_toplevel_host_id)
+                .is_some()
+        }));
     }
 
     /// Create empty placement state for one connection.
     pub(crate) fn new(mode: WindowPlacementMode) -> Self {
+        Self::with_shortcut_config(mode, ShortcutConfigHandle::disabled())
+    }
+
+    /// Create placement state with the process-wide immutable binding handle.
+    ///
+    /// The handle is shared by every client connection, while all geometry,
+    /// object associations, and lifecycle state remain connection-local.
+    pub(crate) fn with_shortcut_config(
+        mode: WindowPlacementMode,
+        shortcut_config: ShortcutConfigHandle,
+    ) -> Self {
+        let vm_identifier = resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
         Self {
             mode,
+            shortcut_config,
+            vm_identifier,
+            aura_shell: None,
             arc_session_application_ids: HashMap::new(),
-            aura_surface_by_wl_surface: HashMap::new(),
-            wl_surface_by_aura_surface: HashMap::new(),
-            aura_toplevel_by_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_by_aura_toplevel: HashMap::new(),
+            aura_surface_links: BidirectionalLinks::default(),
+            aura_toplevel_links: BidirectionalLinks::default(),
+            xdg_surface_links: BidirectionalLinks::default(),
+            xdg_toplevel_links: BidirectionalLinks::default(),
             toplevels: HashMap::new(),
-            barrier_to_toplevel: HashMap::new(),
-            active_barrier_by_toplevel: HashMap::new(),
+            barriers: PlacementBarrierRegistry::default(),
+            outputs: Vec::new(),
+            gtk_shells: HashMap::new(),
+            gtk_surfaces: HashMap::new(),
+            gtk_shell_capability_callbacks: HashMap::new(),
         }
     }
 
@@ -267,11 +535,448 @@ impl WindowPlacementState {
         self.mode.uses_self_parent()
     }
 
+    /// Return the internally bound Aura shell manager, if one is live.
+    pub(crate) const fn aura_shell_id(&self) -> Option<u32> {
+        match self.aura_shell {
+            Some(binding) => Some(binding.host_id),
+            None => None,
+        }
+    }
+
+    /// Return the negotiated version of the internally bound Aura shell.
+    pub(crate) const fn aura_shell_version(&self) -> u32 {
+        match self.aura_shell {
+            Some(binding) => binding.version,
+            None => 0,
+        }
+    }
+
+    /// Return the host registry global that produced the Aura shell binding.
+    pub(crate) const fn aura_shell_global_name(&self) -> Option<u32> {
+        match self.aura_shell {
+            Some(binding) => Some(binding.global_name),
+            None => None,
+        }
+    }
+
+    /// Publish one complete Aura shell binding generation.
+    ///
+    /// Keeping ID, source global, and version in one record prevents a global
+    /// replacement from accidentally retaining the old version or routing
+    /// requests through an object whose manager has already been released.
+    ///
+    /// A live generation cannot be replaced in place. The caller must retire
+    /// the old generation first so its host object and child lifetimes remain
+    /// reachable until their protocol teardown completes.
+    #[must_use = "a live Aura shell generation must not be overwritten"]
+    pub(crate) fn set_aura_shell_binding(
+        &mut self,
+        host_id: u32,
+        global_name: u32,
+        version: u32,
+    ) -> bool {
+        if self.aura_shell.is_some() {
+            return false;
+        }
+        self.aura_shell = Some(AuraShellBinding {
+            host_id,
+            global_name,
+            version,
+        });
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Retire the Aura shell only when the named global owns the live binding.
+    pub(crate) fn take_aura_shell_for_global(&mut self, global_name: u32) -> Option<(u32, u32)> {
+        if self.aura_shell?.global_name != global_name {
+            return None;
+        }
+        let binding = self.aura_shell.take()?;
+        self.debug_assert_consistent();
+        Some((binding.host_id, binding.version))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_aura_shell_for_test(&mut self) {
+        self.aura_shell = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_aura_shell_binding_for_test(&mut self, host_id: u32, version: u32) {
+        self.aura_shell = Some(AuraShellBinding {
+            host_id,
+            global_name: 0,
+            version,
+        });
+        self.debug_assert_consistent();
+    }
+
+    /// Take one immutable binding generation for a key event.
+    pub(crate) fn shortcut_config_snapshot(&self) -> Arc<ShortcutConfig> {
+        self.shortcut_config.snapshot()
+    }
+
+    /// Format a native Wayland application ID in ChromeOS' Guest OS namespace.
+    pub(crate) fn native_wayland_app_id(&self, app_id: &str) -> String {
+        format!(
+            "org.chromium.guest_os.{}.wayland.{}",
+            self.vm_identifier, app_id
+        )
+    }
+
+    /// Replace the shared binding handle. Production reloads replace the
+    /// handle's immutable generation; this setter exists for deterministic
+    /// in-process fixtures that construct a complete state directly.
+    #[cfg(test)]
+    pub(crate) fn set_shortcut_config(&mut self, shortcut_config: ShortcutConfigHandle) {
+        self.shortcut_config = shortcut_config;
+    }
+
+    /// Register one synthetic GTK shell binding.
+    #[must_use = "duplicate GTK shell IDs must not replace live protocol state"]
+    pub(crate) fn remember_gtk_shell(&mut self, shell_id: u32) -> bool {
+        if self.gtk_shells.contains_key(&shell_id) {
+            return false;
+        }
+        self.gtk_shells.insert(shell_id, GtkShellState::default());
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Return the startup ID and child-surface IDs owned by a GTK shell.
+    pub(crate) fn gtk_shell_startup_and_surfaces(
+        &self,
+        shell_id: u32,
+    ) -> Option<(Option<String>, Vec<u32>)> {
+        let shell = self.gtk_shells.get(&shell_id)?;
+        let mut surfaces = shell.surfaces.iter().copied().collect::<Vec<_>>();
+        surfaces.sort_unstable();
+        Some((shell.startup_id.clone(), surfaces))
+    }
+
+    /// Update a shell's startup ID and return its current child surfaces.
+    pub(crate) fn update_gtk_shell_startup_id(
+        &mut self,
+        shell_id: u32,
+        startup_id: Option<String>,
+    ) -> Option<Vec<u32>> {
+        let shell = self.gtk_shells.get_mut(&shell_id)?;
+        shell.startup_id = startup_id;
+        let mut surfaces = shell.surfaces.iter().copied().collect::<Vec<_>>();
+        surfaces.sort_unstable();
+        self.debug_assert_consistent();
+        Some(surfaces)
+    }
+
+    /// Return the wl_surface backing one synthetic GTK surface.
+    pub(crate) fn wl_surface_for_gtk_surface(&self, gtk_surface_id: u32) -> Option<u32> {
+        self.gtk_surfaces
+            .get(&gtk_surface_id)
+            .map(|surface| surface.wl_surface_id)
+    }
+
+    /// Register a GTK surface and link it to its owning shell.
+    #[must_use = "the GTK surface association may conflict with a live object"]
+    pub(crate) fn remember_gtk_surface(
+        &mut self,
+        gtk_surface_id: u32,
+        shell_id: u32,
+        wl_surface_id: u32,
+    ) -> bool {
+        if !self.gtk_shells.contains_key(&shell_id)
+            || self
+                .gtk_surfaces
+                .get(&gtk_surface_id)
+                .is_some_and(|existing| {
+                    *existing
+                        != (GtkSurfaceState {
+                            shell_id,
+                            wl_surface_id,
+                        })
+                })
+        {
+            return false;
+        }
+        self.gtk_surfaces.insert(
+            gtk_surface_id,
+            GtkSurfaceState {
+                shell_id,
+                wl_surface_id,
+            },
+        );
+        self.gtk_shells
+            .get_mut(&shell_id)
+            .expect("GTK shell was checked above")
+            .surfaces
+            .insert(gtk_surface_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Remove one GTK surface and its reverse shell membership.
+    fn take_gtk_surface(&mut self, gtk_surface_id: u32) -> Option<GtkSurfaceState> {
+        let surface = self.gtk_surfaces.remove(&gtk_surface_id)?;
+        if let Some(shell) = self.gtk_shells.get_mut(&surface.shell_id) {
+            shell.surfaces.remove(&gtk_surface_id);
+        }
+        self.debug_assert_consistent();
+        Some(surface)
+    }
+
+    /// Remove every synthetic GTK surface backed by one wl_surface.
+    pub(crate) fn take_gtk_surfaces_for_wl_surface(&mut self, wl_surface_id: u32) -> Vec<u32> {
+        let mut surface_ids = self
+            .gtk_surfaces
+            .iter()
+            .filter_map(|(&gtk_surface_id, surface)| {
+                (surface.wl_surface_id == wl_surface_id).then_some(gtk_surface_id)
+            })
+            .collect::<Vec<_>>();
+        surface_ids.sort_unstable();
+        for gtk_surface_id in &surface_ids {
+            self.take_gtk_surface(*gtk_surface_id);
+        }
+        self.debug_assert_consistent();
+        surface_ids
+    }
+
+    /// Return whether a synthetic GTK shell is still registered.
+    pub(crate) fn has_gtk_shell(&self, shell_id: u32) -> bool {
+        self.gtk_shells.contains_key(&shell_id)
+    }
+
+    /// Register a host capability barrier for one GTK shell.
+    #[must_use = "a callback ID may only be registered once"]
+    pub(crate) fn register_gtk_shell_capability_callback(
+        &mut self,
+        callback_host_id: u32,
+        shell_id: u32,
+    ) -> bool {
+        if self
+            .gtk_shell_capability_callbacks
+            .contains_key(&callback_host_id)
+            || !self.gtk_shells.contains_key(&shell_id)
+        {
+            return false;
+        }
+        self.gtk_shell_capability_callbacks
+            .insert(callback_host_id, shell_id);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Retire and resolve a completed GTK shell capability barrier.
+    pub(crate) fn take_gtk_shell_capability_callback(
+        &mut self,
+        callback_host_id: u32,
+    ) -> Option<u32> {
+        let shell_id = self
+            .gtk_shell_capability_callbacks
+            .remove(&callback_host_id)?;
+        self.debug_assert_consistent();
+        Some(shell_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gtk_shell_capability_callback_for_test(&self, shell_id: u32) -> Option<u32> {
+        self.gtk_shell_capability_callbacks.iter().find_map(
+            |(&callback_host_id, &registered_shell_id)| {
+                (registered_shell_id == shell_id).then_some(callback_host_id)
+            },
+        )
+    }
+
+    /// Register a host output once and create its geometry record.
+    #[must_use = "a duplicate output must not be forwarded"]
+    pub(crate) fn remember_output(&mut self, host_output_id: u32) -> bool {
+        if self
+            .outputs
+            .iter()
+            .any(|output| output.host_id == host_output_id)
+        {
+            return false;
+        }
+        self.outputs.push(OutputRecord {
+            host_id: host_output_id,
+            state: OutputState::default(),
+        });
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Retire one host output after the guest releases its wl_output object.
+    ///
+    /// Host output events can still be queued between the guest release
+    /// request and the host's `wl_display.delete_id`. Removing the record at
+    /// the request boundary, and making later updates ignore unknown IDs,
+    /// prevents a stale event from resurrecting a released output as the
+    /// primary placement target.
+    #[must_use = "the caller must account for an untracked output release"]
+    pub(crate) fn take_output(&mut self, host_output_id: u32) -> bool {
+        let Some(index) = self
+            .outputs
+            .iter()
+            .position(|output| output.host_id == host_output_id)
+        else {
+            return false;
+        };
+        self.outputs.remove(index);
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Return a mutable output record only while its host object is live.
+    fn output_state_mut(&mut self, host_output_id: u32) -> Option<&mut OutputState> {
+        self.outputs
+            .iter_mut()
+            .find(|output| output.host_id == host_output_id)
+            .map(|output| &mut output.state)
+    }
+
+    /// Update the current mode for one output.
+    ///
+    /// Non-current mode events are ignored after the first mode is known, as
+    /// required by Wayland's output mode advertisement semantics.
+    pub(crate) fn update_output_mode(
+        &mut self,
+        host_output_id: u32,
+        current: bool,
+        width: i32,
+        height: i32,
+    ) {
+        let Some(output) = self.output_state_mut(host_output_id) else {
+            return;
+        };
+        if current || output.mode_width == 0 || output.mode_height == 0 {
+            output.mode_width = width;
+            output.mode_height = height;
+        }
+        self.debug_assert_consistent();
+    }
+
+    /// Update the scale advertised by one output.
+    pub(crate) fn update_output_scale(&mut self, host_output_id: u32, scale: i32) {
+        let Some(output) = self.output_state_mut(host_output_id) else {
+            return;
+        };
+        output.scale = scale;
+        self.debug_assert_consistent();
+    }
+
+    /// Return the first usable output in stable host-advertisement order.
+    pub(crate) fn primary_output(&self) -> Option<(u32, OutputState)> {
+        self.outputs.iter().find_map(|output| {
+            output
+                .state
+                .work_area()
+                .map(|_| (output.host_id, output.state))
+        })
+    }
+
+    /// Convert a normalized shortcut rectangle using the first usable output.
+    ///
+    /// Output selection and work-area conversion belong to placement state so
+    /// handlers cannot accidentally apply a rectangle against a stale or
+    /// differently scaled output record.
+    pub(crate) fn bounds_for_rect(
+        &self,
+        rect: NormalizedRect,
+    ) -> Option<(u32, (i32, i32, i32, i32))> {
+        let (host_id, output) = self.primary_output()?;
+        let bounds = rect.to_bounds(output.work_area()?)?;
+        Some((host_id, bounds))
+    }
+
+    /// Record the xdg_surface → wl_surface role association.
+    #[must_use = "the XDG surface association may conflict with a live role"]
+    pub(crate) fn remember_xdg_surface(
+        &mut self,
+        xdg_surface_guest_id: u32,
+        wl_surface_guest_id: u32,
+    ) -> bool {
+        if !self
+            .xdg_surface_links
+            .insert(xdg_surface_guest_id, wl_surface_guest_id)
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Resolve an xdg_surface to its backing wl_surface.
+    pub(crate) fn wl_surface_for_xdg_surface(&self, xdg_surface_guest_id: u32) -> Option<u32> {
+        self.xdg_surface_links.get_forward(xdg_surface_guest_id)
+    }
+
+    /// Remove an xdg_surface association.
+    pub(crate) fn take_xdg_surface(&mut self, xdg_surface_guest_id: u32) -> Option<u32> {
+        let wl_surface_guest_id = self
+            .xdg_surface_links
+            .remove_forward(xdg_surface_guest_id)?;
+        self.debug_assert_consistent();
+        Some(wl_surface_guest_id)
+    }
+
+    /// Record the xdg_toplevel → wl_surface role association.
+    #[must_use = "the XDG toplevel association may conflict with a live role"]
+    pub(crate) fn remember_xdg_toplevel(
+        &mut self,
+        xdg_toplevel_guest_id: u32,
+        wl_surface_guest_id: u32,
+    ) -> bool {
+        if !self
+            .xdg_toplevel_links
+            .insert(xdg_toplevel_guest_id, wl_surface_guest_id)
+        {
+            return false;
+        }
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Resolve an xdg_toplevel to its backing wl_surface.
+    pub(crate) fn wl_surface_for_xdg_toplevel(&self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+        self.xdg_toplevel_links.get_forward(xdg_toplevel_guest_id)
+    }
+
+    /// Find the XDG toplevel currently associated with a wl_surface.
+    pub(crate) fn xdg_toplevel_for_wl_surface(&self, wl_surface_guest_id: u32) -> Option<u32> {
+        self.xdg_toplevel_links.get_reverse(wl_surface_guest_id)
+    }
+
+    /// Remove one xdg_toplevel role association.
+    pub(crate) fn take_xdg_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
+        let wl_surface_guest_id = self
+            .xdg_toplevel_links
+            .remove_forward(xdg_toplevel_guest_id)?;
+        self.debug_assert_consistent();
+        Some(wl_surface_guest_id)
+    }
+
+    /// Remove all XDG role links for one wl_surface and return its toplevels.
+    ///
+    /// The caller releases each returned Aura child after this state
+    /// transition, so a malformed destroy ordering cannot leave stale links
+    /// that route a later app-id request to an unrelated surface.
+    pub(crate) fn take_xdg_links_for_wl_surface(&mut self, wl_surface_guest_id: u32) -> Vec<u32> {
+        self.xdg_surface_links.remove_reverse(wl_surface_guest_id);
+        let toplevels = self
+            .xdg_toplevel_links
+            .remove_reverse(wl_surface_guest_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.debug_assert_consistent();
+        toplevels
+    }
+
     /// Return the stable ARC application ID for one guest wl_surface.
     ///
-    /// The mapping lasts until [`Self::remove_surface`] is called, so XDG and
-    /// GTK metadata paths cannot disagree while the surface is alive. The
-    /// result is `None` when the ARC host policy is not selected.
+    /// The mapping lasts until [`Self::take_aura_surface_for_wl_surface`] is
+    /// called. XDG and GTK metadata paths therefore cannot disagree while the
+    /// surface is alive. The result is `None` when the ARC host policy is not
+    /// selected.
     pub(crate) fn arc_session_application_id(
         &mut self,
         wl_surface_guest_id: u32,
@@ -292,34 +997,28 @@ impl WindowPlacementState {
         )
     }
 
-    /// Remove all placement metadata owned by a destroyed guest surface.
+    /// Remove the ARC identity and Aura-surface link for a destroyed surface.
     ///
     /// The guest ID owns the ARC application ID while the host ID owns the
     /// Aura-surface association. Requiring both IDs keeps their lifetimes
     /// coupled at the only teardown boundary that has authoritative ownership
     /// of both objects.
     #[must_use = "the returned Aura surface ID identifies host teardown work"]
-    pub(crate) fn remove_surface(
+    pub(crate) fn take_aura_surface_for_wl_surface(
         &mut self,
         wl_surface_guest_id: u32,
         wl_surface_host_id: u32,
     ) -> Option<u32> {
         self.arc_session_application_ids
             .remove(&wl_surface_guest_id);
-        let zaura_surface_host_id = self.aura_surface_by_wl_surface.remove(&wl_surface_host_id);
-        if let Some(zaura_surface_host_id) = zaura_surface_host_id {
-            self.wl_surface_by_aura_surface
-                .remove(&zaura_surface_host_id);
-        }
+        let zaura_surface_host_id = self.aura_surface_links.remove_forward(wl_surface_host_id);
         self.debug_assert_consistent();
         zaura_surface_host_id
     }
 
     /// Return the Aura surface associated with a host wl_surface.
     pub(crate) fn aura_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
-        self.aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .copied()
+        self.aura_surface_links.get_forward(wl_surface_host_id)
     }
 
     /// Record the one-to-one Aura surface association for a host wl_surface.
@@ -333,30 +1032,19 @@ impl WindowPlacementState {
         wl_surface_host_id: u32,
         zaura_surface_host_id: u32,
     ) -> bool {
-        if self
-            .aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .is_some_and(|existing| *existing != zaura_surface_host_id)
-            || self
-                .wl_surface_by_aura_surface
-                .get(&zaura_surface_host_id)
-                .is_some_and(|existing| *existing != wl_surface_host_id)
+        if !self
+            .aura_surface_links
+            .insert(wl_surface_host_id, zaura_surface_host_id)
         {
             return false;
         }
-        self.aura_surface_by_wl_surface
-            .insert(wl_surface_host_id, zaura_surface_host_id);
-        self.wl_surface_by_aura_surface
-            .insert(zaura_surface_host_id, wl_surface_host_id);
         self.debug_assert_consistent();
         true
     }
 
     /// Return the Aura toplevel associated with a guest xdg_toplevel.
     pub(crate) fn aura_toplevel_for_xdg_toplevel(&self, xdg_toplevel_guest_id: u32) -> Option<u32> {
-        self.aura_toplevel_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .copied()
+        self.aura_toplevel_links.get_forward(xdg_toplevel_guest_id)
     }
 
     /// Record a one-to-one xdg_toplevel ↔ Aura toplevel association.
@@ -370,23 +1058,12 @@ impl WindowPlacementState {
         xdg_toplevel_guest_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> bool {
-        let existing_host = self
-            .aura_toplevel_by_xdg_toplevel
-            .get(&xdg_toplevel_guest_id)
-            .copied();
-        let existing_guest = self
-            .xdg_toplevel_by_aura_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied();
-        if existing_host.is_some_and(|existing| existing != zaura_toplevel_host_id)
-            || existing_guest.is_some_and(|existing| existing != xdg_toplevel_guest_id)
+        if !self
+            .aura_toplevel_links
+            .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id)
         {
             return false;
         }
-        self.aura_toplevel_by_xdg_toplevel
-            .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id);
-        self.xdg_toplevel_by_aura_toplevel
-            .insert(zaura_toplevel_host_id, xdg_toplevel_guest_id);
         self.debug_assert_consistent();
         true
     }
@@ -399,10 +1076,8 @@ impl WindowPlacementState {
     #[must_use = "the returned Aura toplevel ID identifies host teardown work"]
     pub(crate) fn take_aura_toplevel(&mut self, xdg_toplevel_guest_id: u32) -> Option<u32> {
         let zaura_toplevel_host_id = self
-            .aura_toplevel_by_xdg_toplevel
-            .remove(&xdg_toplevel_guest_id)?;
-        self.xdg_toplevel_by_aura_toplevel
-            .remove(&zaura_toplevel_host_id);
+            .aura_toplevel_links
+            .remove_forward(xdg_toplevel_guest_id)?;
         self.release_toplevel(zaura_toplevel_host_id);
         self.debug_assert_consistent();
         Some(zaura_toplevel_host_id)
@@ -413,9 +1088,7 @@ impl WindowPlacementState {
         &self,
         zaura_toplevel_host_id: u32,
     ) -> Option<u32> {
-        self.xdg_toplevel_by_aura_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied()
+        self.aura_toplevel_links.get_reverse(zaura_toplevel_host_id)
     }
 
     /// Return the latest screen-space origin for an Aura toplevel.
@@ -445,9 +1118,10 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         origin: (i32, i32),
     ) -> bool {
-        if !self
-            .xdg_toplevel_by_aura_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
@@ -470,9 +1144,10 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         target_origin: (i32, i32),
     ) -> bool {
-        if !self
-            .xdg_toplevel_by_aura_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
@@ -490,11 +1165,10 @@ impl WindowPlacementState {
     /// reserved until its terminal `delete_id`.
     fn release_toplevel(&mut self, zaura_toplevel_host_id: u32) {
         self.toplevels.remove(&zaura_toplevel_host_id);
-        self.active_barrier_by_toplevel
-            .remove(&zaura_toplevel_host_id);
+        self.barriers.release_toplevel(zaura_toplevel_host_id);
     }
 
-    /// Register a newly queued host sync callback as the active barrier.
+    /// Register a newly queued host sync callback as the latest pending sync.
     ///
     /// A callback ID must be globally unique for the connection. Returning
     /// `false` instead of overwriting an existing entry keeps an older
@@ -505,17 +1179,19 @@ impl WindowPlacementState {
         callback_host_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> bool {
-        if self.barrier_to_toplevel.contains_key(&callback_host_id)
-            || !self
-                .xdg_toplevel_by_aura_toplevel
-                .contains_key(&zaura_toplevel_host_id)
+        if self
+            .aura_toplevel_links
+            .get_reverse(zaura_toplevel_host_id)
+            .is_none()
         {
             return false;
         }
-        self.barrier_to_toplevel
-            .insert(callback_host_id, zaura_toplevel_host_id);
-        self.active_barrier_by_toplevel
-            .insert(zaura_toplevel_host_id, callback_host_id);
+        if !self
+            .barriers
+            .register(callback_host_id, zaura_toplevel_host_id)
+        {
+            return false;
+        }
         self.debug_assert_consistent();
         true
     }
@@ -523,36 +1199,32 @@ impl WindowPlacementState {
     /// Retire a completed barrier and clear it only if it is still newest.
     #[must_use = "the returned Aura toplevel identifies which placement completed"]
     pub(crate) fn complete_barrier(&mut self, callback_host_id: u32) -> Option<u32> {
-        let zaura_toplevel_host_id = self.barrier_to_toplevel.remove(&callback_host_id)?;
-        if self.active_barrier_by_toplevel.get(&zaura_toplevel_host_id) == Some(&callback_host_id) {
-            self.active_barrier_by_toplevel
-                .remove(&zaura_toplevel_host_id);
-        }
+        let zaura_toplevel_host_id = self.barriers.complete(callback_host_id)?;
         self.debug_assert_consistent();
         Some(zaura_toplevel_host_id)
     }
 
-    /// Return whether a placement barrier currently gates this toplevel.
-    pub(crate) fn has_active_barrier(&self, zaura_toplevel_host_id: u32) -> bool {
-        self.active_barrier_by_toplevel
-            .contains_key(&zaura_toplevel_host_id)
+    /// Return whether a placement sync callback is pending for this toplevel.
+    ///
+    /// The callback only establishes host-stream ordering. Configure events
+    /// continue to be forwarded; origin prediction handles stale positions.
+    pub(crate) fn has_pending_barrier(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.barriers.has_pending(zaura_toplevel_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn barrier_for_callback(&self, callback_host_id: u32) -> Option<u32> {
-        self.barrier_to_toplevel.get(&callback_host_id).copied()
+        self.barriers.callback_for(callback_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn active_barrier_for_toplevel(&self, zaura_toplevel_host_id: u32) -> Option<u32> {
-        self.active_barrier_by_toplevel
-            .get(&zaura_toplevel_host_id)
-            .copied()
+        self.barriers.active_callback_for(zaura_toplevel_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn has_any_barriers(&self) -> bool {
-        !self.barrier_to_toplevel.is_empty() || !self.active_barrier_by_toplevel.is_empty()
+        !self.barriers.is_empty()
     }
 
     #[cfg(test)]
@@ -572,6 +1244,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bidirectional_links_are_atomic_and_reject_conflicts() {
+        let mut links = BidirectionalLinks::default();
+        assert!(links.insert(1, 10));
+        assert!(links.is_consistent());
+        assert_eq!(links.get_forward(1), Some(10));
+        assert_eq!(links.get_reverse(10), Some(1));
+
+        assert!(links.insert(1, 10));
+        assert!(!links.insert(1, 11));
+        assert!(!links.insert(2, 10));
+        assert!(links.is_consistent());
+
+        assert_eq!(links.remove_reverse(10), Some(1));
+        assert!(links.is_consistent());
+        assert_eq!(links.remove_forward(1), None);
+
+        links.forward.insert(3, 30);
+        assert!(!links.is_consistent());
+        assert!(!links.insert(3, 30));
+        assert!(!links.is_consistent());
+    }
+
+    #[test]
+    fn placement_barriers_retain_superseded_callbacks_until_completion() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        assert!(barriers.register(40, 77));
+        assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
+        assert_eq!(barriers.active_callback_for(77), Some(40));
+
+        assert!(barriers.register(41, 77));
+        assert!(barriers.is_consistent(|toplevel_id| toplevel_id == 77));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.callback_for(40), Some(77));
+        assert_eq!(barriers.callback_for(41), Some(77));
+
+        assert!(!barriers.register(41, 88));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.complete(40), Some(77));
+        assert_eq!(barriers.active_callback_for(77), Some(41));
+        assert_eq!(barriers.complete(41), Some(77));
+        assert!(barriers.is_empty());
+
+        let mut released = PlacementBarrierRegistry::default();
+        assert!(released.register(50, 99));
+        assert!(!released.is_consistent(|_| false));
+        released.release_toplevel(99);
+        assert!(released.is_consistent(|_| false));
+        assert_eq!(released.complete(50), Some(99));
+        assert!(released.is_empty());
+    }
+
+    #[test]
     fn backend_flags_are_mutually_exclusive_with_arc_precedence() {
         assert_eq!(
             WindowPlacementMode::from_flags(false, false),
@@ -588,6 +1312,24 @@ mod tests {
         assert_eq!(
             WindowPlacementMode::from_flags(true, true),
             WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
+        );
+    }
+
+    #[test]
+    fn vm_identifier_defaults_and_native_ids_are_owned_by_placement_state() {
+        assert_eq!(resolve_vm_identifier(None), "termina");
+        assert_eq!(resolve_vm_identifier(Some(String::new())), "termina");
+        assert_eq!(
+            resolve_vm_identifier(Some("penguin".to_string())),
+            "penguin"
+        );
+
+        let state = WindowPlacementState::default();
+        let expected_vm_identifier =
+            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok());
+        assert_eq!(
+            state.native_wayland_app_id("com.example.Terminal"),
+            format!("org.chromium.guest_os.{expected_vm_identifier}.wayland.com.example.Terminal")
         );
     }
 
@@ -633,7 +1375,7 @@ mod tests {
             .expect("ARC session prefix");
         assert!(suffix.parse::<u32>().expect("numeric ARC session ID") > ARC_SESSION_ID_BASE);
 
-        assert_eq!(state.remove_surface(10, 20), None);
+        assert_eq!(state.take_aura_surface_for_wl_surface(10, 20), None);
         assert_ne!(state.arc_session_application_id(10), Some(first));
     }
 
@@ -647,7 +1389,7 @@ mod tests {
         assert!(state.remember_aura_surface(51, 61));
         assert!(!state.remember_aura_surface(51, 60));
         assert!(!state.remember_aura_surface(52, 61));
-        assert_eq!(state.remove_surface(10, 50), Some(60));
+        assert_eq!(state.take_aura_surface_for_wl_surface(10, 50), Some(60));
         assert_eq!(state.aura_surface_for_wl_surface(50), None);
         assert!(state.remember_aura_surface(52, 60));
 
@@ -676,7 +1418,7 @@ mod tests {
         assert_eq!(state.take_aura_toplevel(11), Some(71));
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(71), None);
         assert_eq!(state.origin(71), None);
-        assert!(!state.has_active_barrier(71));
+        assert!(!state.has_pending_barrier(71));
         assert_eq!(state.barrier_for_callback(80), Some(71));
     }
 
@@ -702,7 +1444,7 @@ mod tests {
         assert_eq!(state.take_aura_toplevel(10), Some(77));
 
         assert_eq!(state.origin(77), None);
-        assert!(!state.has_active_barrier(77));
+        assert!(!state.has_pending_barrier(77));
         assert_eq!(state.barrier_for_callback(40), Some(77));
         assert_eq!(state.complete_barrier(40), Some(77));
     }
@@ -743,5 +1485,149 @@ mod tests {
         assert_eq!(state.origin(77), None);
         assert_eq!(state.pending_origin(77), None);
         assert_eq!(state.barrier_for_callback(40), None);
+    }
+
+    #[test]
+    fn xdg_role_associations_are_one_to_one_and_teardown_is_bidirectional() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(!state.remember_xdg_surface(11, 20));
+        assert!(!state.remember_xdg_surface(10, 21));
+        assert_eq!(state.wl_surface_for_xdg_surface(10), Some(20));
+
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert!(!state.remember_xdg_toplevel(31, 20));
+        assert!(!state.remember_xdg_toplevel(30, 21));
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), Some(30));
+
+        assert_eq!(state.take_xdg_toplevel(30), Some(20));
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
+        assert_eq!(state.take_xdg_surface(10), Some(20));
+        assert_eq!(state.wl_surface_for_xdg_surface(10), None);
+    }
+
+    #[test]
+    fn surface_link_teardown_removes_all_role_directions() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_xdg_surface(10, 20));
+        assert!(state.remember_xdg_toplevel(30, 20));
+        assert_eq!(state.take_xdg_links_for_wl_surface(20), vec![30]);
+        assert_eq!(state.wl_surface_for_xdg_surface(10), None);
+        assert_eq!(state.wl_surface_for_xdg_toplevel(30), None);
+        assert_eq!(state.xdg_toplevel_for_wl_surface(20), None);
+        assert_eq!(state.take_xdg_links_for_wl_surface(20), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn output_registry_is_idempotent_and_ignores_non_current_modes() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_output(50));
+        assert!(!state.remember_output(50));
+        state.update_output_mode(50, true, 3840, 2160);
+        state.update_output_mode(50, false, 1920, 1080);
+        state.update_output_scale(50, 2);
+        assert_eq!(
+            state.primary_output(),
+            Some((
+                50,
+                OutputState {
+                    mode_width: 3840,
+                    mode_height: 2160,
+                    scale: 2,
+                    ..Default::default()
+                }
+            ))
+        );
+        assert_eq!(
+            state.bounds_for_rect(NormalizedRect::new(0.0, 0.0, 0.5, 0.5)),
+            Some((50, (0, 0, 960, 540)))
+        );
+    }
+
+    #[test]
+    fn released_outputs_cannot_be_resurrected_by_delayed_events() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_output(50));
+        state.update_output_mode(50, true, 3840, 2160);
+        state.update_output_scale(50, 1);
+        assert!(state.take_output(50));
+        assert_eq!(state.primary_output(), None);
+
+        // A host mode/scale event can be queued before delete_id reaches the
+        // proxy. It must not recreate placement state for the retired object.
+        state.update_output_mode(50, true, 1920, 1080);
+        state.update_output_scale(50, 2);
+        assert_eq!(state.primary_output(), None);
+        assert!(!state.take_output(50));
+    }
+
+    #[test]
+    fn aura_shell_binding_teardown_is_owned_by_global_generation() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.set_aura_shell_binding(24, 7, 38));
+        assert!(!state.set_aura_shell_binding(25, 8, 38));
+
+        assert_eq!(state.aura_shell_id(), Some(24));
+        assert_eq!(state.aura_shell_global_name(), Some(7));
+        assert_eq!(state.aura_shell_version(), 38);
+        assert_eq!(
+            state.take_aura_shell_for_global(8),
+            None,
+            "a stale generation must not release the current shell"
+        );
+        assert_eq!(state.aura_shell_id(), Some(24));
+        assert_eq!(state.aura_shell_global_name(), Some(7));
+        assert_eq!(state.aura_shell_version(), 38);
+
+        assert_eq!(state.take_aura_shell_for_global(7), Some((24, 38)));
+        assert_eq!(state.aura_shell_id(), None);
+        assert_eq!(state.aura_shell_global_name(), None);
+        assert_eq!(state.aura_shell_version(), 0);
+
+        assert!(state.set_aura_shell_binding(25, 8, 37));
+        assert_eq!(state.aura_shell_id(), Some(25));
+        assert_eq!(state.aura_shell_global_name(), Some(8));
+        assert_eq!(state.aura_shell_version(), 37);
+    }
+
+    #[test]
+    fn gtk_shell_and_surface_state_has_one_authoritative_bidirectional_link() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.remember_gtk_shell(10));
+        assert!(!state.remember_gtk_shell(10));
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((None, Vec::new()))
+        );
+        assert!(!state.remember_gtk_surface(11, 99, 20));
+        assert!(state.remember_gtk_surface(11, 10, 20));
+        assert!(!state.remember_gtk_surface(11, 10, 21));
+        assert!(state.remember_gtk_surface(12, 10, 20));
+        assert_eq!(state.wl_surface_for_gtk_surface(11), Some(20));
+
+        assert_eq!(
+            state.update_gtk_shell_startup_id(10, Some("startup".to_string())),
+            Some(vec![11, 12])
+        );
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((Some("startup".to_string()), vec![11, 12]))
+        );
+
+        assert!(state.register_gtk_shell_capability_callback(40, 10));
+        assert!(!state.register_gtk_shell_capability_callback(40, 10));
+        assert_eq!(state.gtk_shell_capability_callback_for_test(10), Some(40));
+        assert_eq!(state.take_gtk_shell_capability_callback(40), Some(10));
+        assert_eq!(state.gtk_shell_capability_callback_for_test(10), None);
+
+        assert_eq!(state.take_gtk_surfaces_for_wl_surface(20), vec![11, 12]);
+        assert_eq!(state.wl_surface_for_gtk_surface(11), None);
+        assert_eq!(state.wl_surface_for_gtk_surface(12), None);
+        assert_eq!(
+            state.gtk_shell_startup_and_surfaces(10),
+            Some((Some("startup".to_string()), Vec::new()))
+        );
     }
 }

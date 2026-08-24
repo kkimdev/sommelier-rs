@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::compositor::{
-    ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
-};
+use crate::handler::compositor::{ensure_host_zaura_surface, wayland_string_fits_message};
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
-use crate::state::{Context, GtkSurfaceState};
+use crate::state::Context;
 use crate::wire::{Action, MessageBuilder};
 
 pub struct GtkShellHandler;
@@ -29,7 +27,7 @@ fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option
     let version = ctx
         .shadow_table
         .host_object_version(zaura_surface_id)
-        .unwrap_or(ctx.host_zaura_shell_version);
+        .unwrap_or(ctx.window_placement.aura_shell_version());
     if version < 4 {
         return;
     }
@@ -54,10 +52,9 @@ impl GtkShell1Handler for GtkShellHandler {
         wl_surface_id: u32,
     ) -> Action {
         let shell_id = ctx.last_sender_id;
-        let Some(startup_id) = ctx
-            .gtk_shells
-            .get(&shell_id)
-            .map(|shell| shell.startup_id.clone())
+        let Some((startup_id, _)) = ctx
+            .window_placement
+            .gtk_shell_startup_and_surfaces(shell_id)
         else {
             log::warn!(
                 "Ignoring get_gtk_surface from unknown gtk_shell1 {}",
@@ -66,22 +63,22 @@ impl GtkShell1Handler for GtkShellHandler {
             return Action::Drop;
         };
 
+        if !ctx
+            .window_placement
+            .remember_gtk_surface(gtk_surface_id, shell_id, wl_surface_id)
+        {
+            log::warn!(
+                "Refusing duplicate or orphaned gtk_surface1 {}",
+                gtk_surface_id
+            );
+            return Action::Drop;
+        }
         let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
             1,
         );
-        ctx.gtk_surfaces.insert(
-            gtk_surface_id,
-            GtkSurfaceState {
-                shell_id,
-                wl_surface_id,
-            },
-        );
-        if let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) {
-            shell.surfaces.insert(gtk_surface_id);
-        }
         if let Some(zaura_surface_id) = host_zaura_surface_id {
             queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
         }
@@ -90,22 +87,21 @@ impl GtkShell1Handler for GtkShellHandler {
 
     fn on_set_startup_id(&mut self, ctx: &mut Context, startup_id: &Option<String>) -> Action {
         let shell_id = ctx.last_sender_id;
-        let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) else {
+        let Some(gtk_surface_ids) = ctx
+            .window_placement
+            .update_gtk_shell_startup_id(shell_id, startup_id.clone())
+        else {
             log::warn!(
                 "Ignoring set_startup_id from unknown gtk_shell1 {}",
                 shell_id
             );
             return Action::Drop;
         };
-        shell.startup_id.clone_from(startup_id);
-        let startup_id = shell.startup_id.clone();
-        let gtk_surface_ids = shell.surfaces.iter().copied().collect::<Vec<_>>();
         let mut aura_surface_ids = std::collections::HashSet::new();
         for gtk_surface_id in gtk_surface_ids {
             let Some(wl_surface_id) = ctx
-                .gtk_surfaces
-                .get(&gtk_surface_id)
-                .map(|surface| surface.wl_surface_id)
+                .window_placement
+                .wl_surface_for_gtk_surface(gtk_surface_id)
             else {
                 continue;
             };
@@ -138,9 +134,8 @@ impl GtkSurface1Handler for GtkShellHandler {
             return Action::Drop;
         };
         let Some(wl_surface_guest_id) = ctx
-            .gtk_surfaces
-            .get(&ctx.last_sender_id)
-            .map(|surface| surface.wl_surface_id)
+            .window_placement
+            .wl_surface_for_gtk_surface(ctx.last_sender_id)
         else {
             return Action::Drop;
         };
@@ -150,7 +145,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         let version = ctx
             .shadow_table
             .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.host_zaura_shell_version);
+            .unwrap_or(ctx.window_placement.aura_shell_version());
         if version < 5 {
             return Action::Drop;
         }
@@ -175,7 +170,7 @@ impl GtkSurface1Handler for GtkShellHandler {
             };
             application_id
         } else {
-            native_wayland_app_id(&ctx.vm_identifier, application_id)
+            ctx.window_placement.native_wayland_app_id(application_id)
         };
         if !wayland_string_fits_message(&application_id) {
             log::warn!(
@@ -214,7 +209,6 @@ impl GtkSurface1Handler for GtkShellHandler {
 mod tests {
     use super::*;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
-    use crate::state::GtkShellState;
     use crate::wire::WireMessage;
 
     const GTK_SHELL: u32 = 10;
@@ -227,15 +221,15 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table
             .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
-        ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
+        assert!(ctx.window_placement.remember_gtk_shell(GTK_SHELL));
         ctx.shadow_table.map_id(WL_SURFACE_GUEST, WL_SURFACE_HOST);
         ctx.shadow_table.track_interface_with_version(
             WL_SURFACE_GUEST,
             "wl_surface".to_string(),
             4,
         );
-        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
-        ctx.host_zaura_shell_version = 38;
+        ctx.window_placement
+            .set_aura_shell_binding_for_test(ZAURA_SHELL_HOST, 38);
         ctx.shadow_table.track_host_interface_with_version(
             ZAURA_SHELL_HOST,
             "zaura_shell".to_string(),
@@ -280,8 +274,8 @@ mod tests {
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
         assert!(ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE));
         assert_eq!(
-            ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id,
-            WL_SURFACE_GUEST
+            ctx.window_placement.wl_surface_for_gtk_surface(GTK_SURFACE),
+            Some(WL_SURFACE_GUEST)
         );
     }
 
@@ -338,11 +332,9 @@ mod tests {
         assert_eq!(
             nullable_string(message).as_deref(),
             Some(
-                format!(
-                    "org.chromium.guest_os.{}.wayland.com.example.Terminal",
-                    ctx.vm_identifier
-                )
-                .as_str()
+                ctx.window_placement
+                    .native_wayland_app_id("com.example.Terminal")
+                    .as_str()
             )
         );
     }
@@ -395,13 +387,28 @@ mod tests {
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
-        assert!(ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
+        assert_eq!(
+            ctx.window_placement
+                .gtk_shell_startup_and_surfaces(GTK_SHELL)
+                .expect("GTK shell")
+                .1,
+            vec![GTK_SURFACE]
+        );
 
         ctx.last_sender_id = WL_SURFACE_GUEST;
         let mut compositor = crate::handler::compositor::CompositorHandler;
         assert_eq!(compositor.on_destroy(&mut ctx), Action::Drop);
-        assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
-        assert!(!ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
+        assert_eq!(
+            ctx.window_placement.wl_surface_for_gtk_surface(GTK_SURFACE),
+            None
+        );
+        assert_eq!(
+            ctx.window_placement
+                .gtk_shell_startup_and_surfaces(GTK_SHELL)
+                .expect("GTK shell")
+                .1,
+            Vec::<u32>::new()
+        );
         assert!(
             ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE),
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
