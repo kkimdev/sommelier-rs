@@ -461,6 +461,27 @@ mod tests {
     }
 
     #[test]
+    fn live_restore_claim_is_not_replayed_after_role_teardown() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        let cleanup = Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+            zaura_surface_id: 55,
+            wl_surface_guest_id: 10,
+        });
+        assert!(barriers.register(40, 77, cleanup.clone()));
+        assert!(barriers.register(41, 77, cleanup));
+
+        assert!(
+            barriers.complete(41, true).unwrap().cleanup.is_some(),
+            "the newest live callback must own native identity restoration"
+        );
+        barriers.release_toplevel(77);
+        assert!(
+            barriers.complete(40, false).unwrap().cleanup.is_none(),
+            "role teardown must not replay a restore already emitted by the newest callback"
+        );
+    }
+
+    #[test]
     fn released_role_allows_only_one_transient_restore_callback() {
         let mut barriers = PlacementBarrierRegistry::default();
         let cleanup = Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
