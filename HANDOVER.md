@@ -119,7 +119,7 @@
 
 ## Latest verification
 
-The current source passes 715 Sommelier unit tests with one ignored live-VirtWL
+The current source passes 716 Sommelier unit tests with one ignored live-VirtWL
 test. Workspace `cargo check --all-targets`, strict all-target Clippy,
 `cargo fmt --check`, and `git diff --check` all pass. Runtime testing must
 compare the release binary mtime with the isolated proxy start time before
