@@ -604,8 +604,10 @@ The window-placement path now keeps the ARC application ID when a GTK client sen
 `gtk_surface1.set_dbus_properties`. That request can arrive after
 `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
 Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
-returned to its old `800x600` geometry. A unique ARC session ID is shared by the
-GTK and XDG paths for each wl_surface, and both paths have regression coverage.
+returned to its old `800x600` geometry. A compatibility ARC task-form ID is
+shared by the GTK and Aura paths, while the host XDG role remains in the normal
+guest namespace. The previously attempted per-surface ARC session ID was
+removed after it restarted the host compositor even with geometry disabled.
 At that point the workaround was still selected by
 `SOMMELIER_WINDOW_BOUNDS_AS_ARC`; the current implementation uses explicit CLI
 policy and geometry options instead.
@@ -757,19 +759,42 @@ Wayland keeps that object valid until the client releases it, so placement state
 follows the bound-object lifetime rather than the advertisement lifetime.
 Failed output binds roll back both the guest/host mapping and the placement
 record before reporting the protocol failure.
-The process-wide ARC serial allocator is documented as an allocation-only
-exception: live ARC identity mappings remain connection-owned and are retired
-with their surface.
+The process-wide ARC task allocator now reserves one high numeric block with a
+shared `flock` file under `$XDG_RUNTIME_DIR/sommelier/arc-task-blocks`. Every
+surface consumes the next ID in that block, while independent Sommelier
+instances contend on the same block files. The lock file remains after exit;
+the kernel releases the lock when the owning descriptor closes, avoiding an
+unlink/recreate inode race.
+The allocator additionally holds a parent-side generation guard in the stable
+`$XDG_RUNTIME_DIR` parent and compares only the block directory's device/inode
+identity. A timestamp is not part of the marker: normal lock-file creation
+changes directory ctime and would make a second valid allocator fail
+spuriously. Replacement block or `sommelier/` directories are rejected while
+an older guard is held, and unsafe paths or lock-file types fail closed.
 
 Regression coverage includes atomic conflict rejection and both-direction
 teardown; the VM namespace test derives its expected value from the active
 environment so it remains deterministic in configured CI shells.
 
+The task-ID research is preserved in
+`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`: real ARC task IDs come from
+Android's per-user `PER_USER_RANGE` allocator, while the current
+`2,000,000,000..2,147,483,646` range is only a best-effort fabricated-task
+pool coordinated between local Sommelier instances. The exact
+`org.chromium.arc.2147483647` value remains documented as the PR #2/custom-host
+compatibility sentinel and is excluded from the allocator. The per-surface
+`.session.*` allocator and its PID/serial formula are also retained there as a
+rejected experiment, including the `/dev/wl0` host-compositor restart observed
+with `arc + none`.
+
 Final verification from this worktree:
 
-- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 577
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 599
   passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
   smoke test is ignored because it requires a live compositor.
+- The allocator-focused suite passes 21 tests, including concurrent block
+  contention, directory replacement, malformed guard, symlink/FIFO, and
+  exhaustion cases.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier

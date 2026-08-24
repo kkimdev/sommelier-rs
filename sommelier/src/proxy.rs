@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::arc_task_ids::ArcTaskIdAllocator;
 use crate::connection::WaylandConnection;
 use crate::protocols;
 use crate::state::{Context, ShadowTable, WindowPlacementMode};
@@ -180,6 +181,7 @@ pub(crate) struct ProxyRuntimeConfig {
     pub(crate) shortcut_config: ShortcutConfigHandle,
     pub(crate) shortcut_config_path: Option<PathBuf>,
     pub(crate) host_accelerators: Arc<Vec<crate::accelerator::Accelerator>>,
+    pub(crate) arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
 }
 
 impl ProxyRuntimeConfig {
@@ -256,6 +258,7 @@ impl Client {
                 runtime.placement_mode,
                 runtime.shortcut_config.clone(),
                 runtime.host_accelerators.as_ref().clone(),
+                runtime.arc_task_allocator.clone(),
             ),
             handler: SommelierHandler::new(),
         }
@@ -881,6 +884,7 @@ rect = [0.0, 0.0, 0.5, 0.5]
             shortcut_config: handle.clone(),
             shortcut_config_path: Some(path.clone()),
             host_accelerators: Arc::new(Vec::new()),
+            arc_task_allocator: None,
         };
         runtime.reload_shortcuts();
         let loaded = handle.snapshot();
@@ -920,6 +924,7 @@ rect = [0.0, 0.0, 0.5, 0.5]
             shortcut_config: handle.clone(),
             shortcut_config_path: Some(path.clone()),
             host_accelerators: Arc::new(Vec::new()),
+            arc_task_allocator: None,
         };
         runtime.reload_shortcuts();
         assert!(

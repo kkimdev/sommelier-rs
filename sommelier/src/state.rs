@@ -28,6 +28,7 @@ use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
+use crate::arc_task_ids::ArcTaskIdAllocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 #[cfg(test)]
 use crate::window_shortcuts::ShortcutConfig;
@@ -46,7 +47,9 @@ pub(crate) use self::render::{
     SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
-pub(crate) use self::window_placement::{OutputState, ARC_SESSION_APPLICATION_ID_PREFIX};
+pub(crate) use self::window_placement::{
+    OutputState, ARC_TASK_APPLICATION_ID_PREFIX, ARC_TASK_ID_POOL_END, ARC_TASK_ID_POOL_START,
+};
 pub(crate) use self::window_placement::{
     WindowGeometryMethod, WindowHostPolicy, WindowPlacementMode, WindowPlacementState,
 };
@@ -1143,6 +1146,7 @@ impl Context {
             WindowPlacementMode::from_environment(),
             ShortcutConfigHandle::disabled(),
             crate::accelerator::from_environment(),
+            None,
         )
     }
 
@@ -1152,6 +1156,7 @@ impl Context {
         placement_mode: WindowPlacementMode,
         shortcut_config: ShortcutConfigHandle,
         accelerators: Vec<crate::accelerator::Accelerator>,
+        arc_task_allocator: Option<Arc<ArcTaskIdAllocator>>,
     ) -> Self {
         // Initialize allocator
         let allocator = match Allocator::new() {
@@ -1162,8 +1167,11 @@ impl Context {
             }
         };
 
-        let window_placement =
-            WindowPlacementState::with_shortcut_config(placement_mode, shortcut_config);
+        let window_placement = WindowPlacementState::with_shortcut_config(
+            placement_mode,
+            shortcut_config,
+            arc_task_allocator,
+        );
 
         Self {
             shadow_table: ShadowTable::new(),
