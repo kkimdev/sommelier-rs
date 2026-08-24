@@ -71,6 +71,10 @@ mod protocols {
     ));
     include!(concat!(env!("OUT_DIR"), "/gtk_shell_protocol.rs"));
     include!(concat!(env!("OUT_DIR"), "/aura_shell_protocol.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/remote_shell_unstable_v2_protocol.rs"
+    ));
 }
 
 #[derive(Parser, Debug)]
@@ -99,14 +103,14 @@ struct Args {
     /// Select one complete window-placement backend.
     ///
     /// This is the convenient switch for runtime experiments:
-    /// `set-parent` keeps the custom self-parent position probe but uses the
-    /// persistent ARC task identity needed for the accompanying bounds
-    /// request, `transient-arc`
-    /// installs an ARC task identity around each bounds request, removes the
-    /// nullable parent after the host barrier, and restores the native
-    /// identity, and
-    /// `persistent` keeps the ARC task identity for the window lifetime. Do
-    /// not combine this option with the lower-level placement axis options
+    /// `set-parent` keeps the custom self-parent position probe with the
+    /// native Guest OS identity, `transient-arc`
+    /// installs an ARC task identity around each direct-bounds request and
+    /// restores the native identity after the host barrier, and
+    /// `persistent` keeps the ARC task identity for the window lifetime.
+    /// `remote-shell-v2` uses the host's zcr_remote_shell_v2 role and is
+    /// intentionally experimental. Do not combine this option with the
+    /// lower-level placement axis options
     /// below.
     #[arg(long, value_enum)]
     window_placement_backend: Option<PlacementBackendArg>,
@@ -146,16 +150,19 @@ enum GeometryMethodArg {
     None,
     Bounds,
     SelfParent,
+    RemoteShell,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PlacementBackendArg {
-    /// Persistent ARC task identity plus the experimental set_parent-and-bounds path.
+    /// Native Guest OS identity plus the experimental self-parent path.
     SetParent,
     /// ARC task identity only while a direct Aura bounds request is queued.
     TransientArc,
     /// ARC task identity retained for the full window lifetime.
     Persistent,
+    /// Host-managed zcr_remote_shell_v2 role (experimental).
+    RemoteShellV2,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -169,21 +176,19 @@ impl PlacementBackendArg {
     fn mode(self) -> WindowPlacementMode {
         match self {
             Self::SetParent => {
-                // set_parent only supplies a position. The companion
-                // set_window_bounds request is still subject to ChromeOS's
-                // CanSetBounds policy, which accepts the ARC task-form Aura
-                // identity proven by PR #2. Keep the ID persistent here:
-                // transiently changing it around a shortcut causes an
-                // enter/leave cycle that resets IME focus on the custom host.
-                WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::SelfParent)
+                // Keep the native Guest OS application ID so shelf/taskbar
+                // matching remains intact. The self-parent operation is an
+                // experimental position probe and is deliberately separate
+                // from the ARC-ID bounds experiments below: ARC task IDs can
+                // authorize bounds on some hosts but may lose the guest
+                // application's shelf icon.
+                WindowPlacementMode::new(WindowHostPolicy::Guest, WindowGeometryMethod::SelfParent)
             }
-            Self::TransientArc => {
-                WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
-                    .with_arc_id_lifetime(WindowArcIdLifetime::Transient)
-            }
+            Self::TransientArc => WindowPlacementMode::arc_bounds(WindowArcIdLifetime::Transient),
             Self::Persistent => {
                 WindowPlacementMode::new(WindowHostPolicy::Arc, WindowGeometryMethod::Bounds)
             }
+            Self::RemoteShellV2 => WindowPlacementMode::remote_shell(),
         }
     }
 }
@@ -207,6 +212,15 @@ fn resolve_placement_mode(
         return Ok(backend.mode());
     }
 
+    // Use the native Guest OS identity plus self-parent as the default
+    // capability policy. This path preserves ChromeOS shelf/icon matching
+    // and IME processing; the transient ARC bounds path remains available
+    // only as an explicit experiment because ChromeOS' ARC resolver leaves
+    // kSkipImeProcessing sticky after the application ID is restored.
+    if host_policy.is_none() && geometry_method.is_none() && arc_id_lifetime.is_none() {
+        return Ok(PlacementBackendArg::SetParent.mode());
+    }
+
     let host_policy = match host_policy.unwrap_or(HostPolicyArg::Guest) {
         HostPolicyArg::Guest => WindowHostPolicy::Guest,
         HostPolicyArg::Arc => WindowHostPolicy::Arc,
@@ -215,6 +229,7 @@ fn resolve_placement_mode(
         GeometryMethodArg::None => WindowGeometryMethod::None,
         GeometryMethodArg::Bounds => WindowGeometryMethod::Bounds,
         GeometryMethodArg::SelfParent => WindowGeometryMethod::SelfParent,
+        GeometryMethodArg::RemoteShell => WindowGeometryMethod::RemoteShell,
     };
     let arc_id_lifetime = match arc_id_lifetime.unwrap_or(ArcIdLifetimeArg::Persistent) {
         ArcIdLifetimeArg::Persistent => WindowArcIdLifetime::Persistent,
@@ -222,19 +237,23 @@ fn resolve_placement_mode(
         ArcIdLifetimeArg::PersistentNativeShell => WindowArcIdLifetime::PersistentNativeShell,
     };
 
-    if !matches!(host_policy, WindowHostPolicy::Arc)
-        && !matches!(arc_id_lifetime, WindowArcIdLifetime::Persistent)
-    {
-        return Err(format!(
-            "--window-arc-id-lifetime={arc_id_lifetime:?} requires \
-             --window-host-policy=arc",
-        ));
-    }
+    WindowPlacementMode::from_axes(host_policy, geometry_method, arc_id_lifetime)
+        .map_err(str::to_string)
+}
 
-    Ok(
-        WindowPlacementMode::new(host_policy, geometry_method)
-            .with_arc_id_lifetime(arc_id_lifetime),
-    )
+/// Resolve a CLI-supplied shortcut path without panicking when the process
+/// current directory is unavailable.
+///
+/// Relative paths are interpreted against the startup working directory,
+/// matching normal CLI behavior. Filesystem failure stays on the ordinary
+/// startup-error path instead of aborting through `expect`.
+fn resolve_shortcut_config_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("unable to resolve relative window shortcut config path: {error}"))
 }
 
 fn validate_shortcut_startup(
@@ -286,16 +305,16 @@ async fn main() {
     }
     if placement_mode.uses_self_parent() {
         log::warn!(
-            "--window-geometry-method=self-parent is experimental; it sends \
-             bounds at the current origin followed by set_parent and may be \
-             unstable on custom ChromeOS hosts"
+            "--window-geometry-method=self-parent is experimental; it uses the \
+             native XDG configure/commit handshake for size and a non-null \
+             set_parent(self) probe for position, and may be unstable on custom \
+             ChromeOS hosts"
         );
         if !placement_mode.uses_arc_policy() {
             log::warn!(
-                "self-parent with Guest OS identity is position-only on this host: \
-                 set_window_bounds may be rejected; use \
-                 --window-placement-backend=set-parent or \
-                 --window-host-policy=arc for resize"
+                "self-parent keeps the native Guest OS identity; resize is \
+                 applied through XDG configure/commit rather than direct Aura \
+                 bounds, so the host must honor the normal XDG resize handshake"
             );
         }
     }
@@ -307,16 +326,26 @@ async fn main() {
         );
     }
 
-    let host_accelerators = Arc::new(crate::accelerator::from_environment());
-    let shortcut_config_path = args.window_shortcuts_config.map(|path| {
-        if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .expect("current working directory is required for a relative config path")
-                .join(path)
+    let host_accelerators = match crate::accelerator::try_from_environment() {
+        Ok(accelerators) => Arc::new(accelerators),
+        Err(error) => {
+            log::error!(
+                "Invalid SOMMELIER_ACCELERATORS; refusing to start: {}",
+                error
+            );
+            std::process::exit(2);
         }
-    });
+    };
+    let shortcut_config_path = match args.window_shortcuts_config {
+        Some(path) => match resolve_shortcut_config_path(path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                log::error!("{error}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let shortcut_config = match shortcut_config_path.as_deref() {
         Some(path) => match ShortcutConfig::load_from_path(path, host_accelerators.as_ref()) {
             Ok(config) => config,
@@ -386,23 +415,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_placement_is_disabled() {
+    fn default_placement_uses_native_set_parent() {
         assert_eq!(
             resolve_placement_mode(None, None, None, None).expect("default mode should resolve"),
-            WindowPlacementMode::disabled()
+            PlacementBackendArg::SetParent.mode()
         );
     }
 
     #[test]
-    fn set_parent_backend_keeps_arc_authorization_for_bounds() {
+    fn absolute_shortcut_config_path_is_preserved() {
+        let path = PathBuf::from("/tmp/window-shortcuts.toml");
+        assert_eq!(
+            resolve_shortcut_config_path(path.clone()).expect("absolute path should resolve"),
+            path
+        );
+    }
+
+    #[test]
+    fn relative_shortcut_config_path_uses_startup_working_directory() {
+        let relative = PathBuf::from("window-shortcuts.toml");
+        let expected = std::env::current_dir()
+            .expect("test working directory should be available")
+            .join(&relative);
+        assert_eq!(
+            resolve_shortcut_config_path(relative).expect("relative path should resolve"),
+            expected
+        );
+    }
+
+    #[test]
+    fn set_parent_backend_keeps_native_guest_identity() {
         let mode = PlacementBackendArg::SetParent.mode();
 
-        assert_eq!(mode.host_policy, WindowHostPolicy::Arc);
-        assert_eq!(mode.geometry_method, WindowGeometryMethod::SelfParent);
-        assert_eq!(mode.arc_id_lifetime, WindowArcIdLifetime::Persistent);
-        assert!(mode.uses_arc_policy());
+        assert_eq!(mode.host_policy(), WindowHostPolicy::Guest);
+        assert_eq!(mode.arc_id_lifetime(), WindowArcIdLifetime::Persistent);
+        assert!(!mode.uses_arc_policy());
         assert!(mode.uses_self_parent());
         assert!(mode.handles_shortcuts());
+    }
+
+    #[test]
+    fn remote_shell_backend_is_explicit_and_non_arc() {
+        let mode = PlacementBackendArg::RemoteShellV2.mode();
+        assert!(mode.handles_shortcuts());
+        assert!(mode.uses_remote_shell());
+        assert!(!mode.uses_arc_policy());
+        assert!(!mode.uses_bounds());
     }
 
     #[test]

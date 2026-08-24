@@ -57,6 +57,10 @@ fn main() {
         ),
         ("gtk_shell", "../third_party/protocols/gtk-shell.xml"),
         ("aura_shell", "../third_party/protocols/aura-shell.xml"),
+        (
+            "remote_shell_unstable_v2",
+            "../third_party/protocols/remote-shell-unstable-v2.xml",
+        ),
     ];
 
     for (name, path_str) in &protocols {

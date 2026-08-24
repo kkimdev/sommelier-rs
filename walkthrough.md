@@ -3,6 +3,11 @@
 This review compares the Rust proxy with ChromiumOS Sommelier behavior and
 keeps every confirmed fix behind a regression test.
 
+Entries below are chronological research notes. Sections labeled
+`Historical` describe superseded wire sequences and are retained to explain
+why the current implementation changed; the latest dated section and the
+configuration document define the current contract.
+
 ## Damage and SHM
 
 - Surface damage is expanded and clamped to ChromiumOS' `INT_MIN / 10` through
@@ -598,16 +603,17 @@ path, root hygiene/prohibited-file/absolute-path findings, and pre-existing
 shebang or executable-bit findings. None points to the Sommelier or Nix
 changes.
 
-## 2026-08-21 — GTK ARC metadata and direct left/right placement
+## 2026-08-21 — Historical GTK ARC metadata and direct left/right placement
 
-The window-placement path now keeps the ARC application ID when a GTK client sends
-`gtk_surface1.set_dbus_properties`. That request can arrive after
-`xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
-Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
-returned to its old `800x600` geometry. A compatibility ARC task-form ID is
-shared by the GTK and Aura paths, while the host XDG role remains in the normal
-guest namespace. The previously attempted per-surface ARC session ID was
-removed after it restarted the host compositor even with geometry disabled.
+At this earlier point, the window-placement path kept the ARC application ID
+when a GTK client sent `gtk_surface1.set_dbus_properties`. That request can
+arrive after `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata
+with the normal Crostini namespace, so ChromeOS rejected arbitrary Aura bounds
+and the window returned to its old `800x600` geometry. A compatibility ARC
+task-form ID was shared by the GTK and Aura paths, while the host XDG role
+remained in the normal guest namespace. The previously attempted per-surface
+ARC session ID was removed after it restarted the host compositor even with
+geometry disabled.
 At that point the workaround was still selected by
 `SOMMELIER_WINDOW_BOUNDS_AS_ARC`; the current implementation uses explicit CLI
 policy and geometry options instead.
@@ -627,7 +633,7 @@ It must only be used with a uniquely named test display and never on the shared
 system Sommelier instance.
 
 All mutable placement state now lives in
-`sommelier/src/state/window_placement.rs`: one backend mode is resolved at
+`sommelier/src/state/window_placement/mod.rs`: one backend mode is resolved at
 startup, Aura surface/toplevel associations are one-to-one, one per-toplevel
 record owns the authoritative/predicted origin, and one barrier registry owns
 callback supersession and retirement. Compositor, keyboard, GTK, registry, and
@@ -680,12 +686,13 @@ policy and geometry axes are independent:
 --window-shortcuts-config PATH
 ```
 
-The default is `guest + none`, with no config file read and no shortcut
+The default is `guest + self-parent`, with no config file read and no shortcut
 interception. A CLI-selected file is validated before accepting clients.
 Sending `SIGHUP` reloads that same path atomically into all current and future
 client contexts; malformed or conflicting reloads retain the last-known-good
 generation. `SOMMELIER_ACCELERATORS` conflicts are hard errors. The
-self-parent method remains experimental and position-only.
+self-parent method remained experimental and position-only in that
+implementation snapshot.
 
 Verification for this implementation:
 
@@ -716,12 +723,169 @@ Verification from the review worktree:
   smoke test is also ignored because it requires a live compositor.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `RUSTDOCFLAGS='-D warnings' cargo doc -p sommelier --no-deps` passed with no
+  broken intra-documentation links.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
 
-## 2026-08-21 — preserve the native XDG identity in ARC bounds mode
+## 2026-08-22 — Test-fixture allocator probe removal
 
-The ARC bounds workaround now changes only the Aura application identity.
+The exhaustive render-buffer state tests were unexpectedly dominated by their
+fixture setup rather than by the state machine. `Context::new_for_test()` was
+calling the production constructor, which probes every DRM render node and
+constructs a GBM allocator for every generated trace. The two exhaustive
+tests create 15,625 and 46,656 contexts respectively, so this repeated
+hardware probing made the suite appear hung and produced a test-runner timeout
+event.
+
+The production constructor still performs the normal allocator probe. The
+test-only constructor now injects `None` for the allocator through a shared
+constructor helper; these unit tests exercise ID mapping and render-buffer
+lifecycle, not GBM allocation. No transition count or assertion was removed.
+The previously slow `host_buffer_use_matches_all_short_transition_sequences`
+test now completes in about 2.3 seconds, and the full workspace suite completes
+with 613 Sommelier tests passed, one ignored, 12 sample-GUI tests passed, and
+six Wayland-codegen tests passed.
+
+## 2026-08-22 — Final placement validation and timing
+
+The wire adapter now revalidates the prepared plan's XDG/Aura associations and
+the three host object interfaces immediately before queueing. A stale
+`zaura_surface` that is already pending destruction is rejected without
+publishing a wire request or registering a placement barrier. Keyboard fixtures
+now register the same XDG interface metadata as production dispatch, so the
+regression tests exercise the real lifecycle invariant instead of bypassing it.
+
+The final serialized workspace run passed 615 Sommelier tests, one ignored, 12
+sample-GUI tests, and six Wayland-codegen tests. The Sommelier test body took
+about 7.8 seconds; the longest exhaustive state-model test took about 2.3
+seconds. `cargo check --workspace --all-targets`, strict Clippy, formatting,
+`git diff --check`, and the release build also passed. For local iteration, the
+same matrix is stable with `--test-threads=4` and completes in about 3.2
+seconds of test execution.
+
+## 2026-08-22 — placement runtime and request-plan ownership cleanup
+
+The placement refactor now has one process-wide
+`WindowPlacementRuntime` owned by
+`sommelier/src/state/window_placement/runtime.rs`. It contains the selected backend,
+the reloadable shortcut-generation handle, host accelerator policy, VM
+namespace, and process-shared ARC task allocator. Each connection receives an
+`Arc` reference to that runtime; its `WindowPlacementState` owns only
+connection-local links, origins, outputs, GTK associations, and barriers.
+`Context` and `ProxyRuntime` no longer carry parallel copies of placement
+configuration.
+
+Keyboard handling now asks the state owner for a validated
+`WindowPlacementPlan`. The plan selects direct bounds versus the
+bounds-first/self-parent sequence, calculates relative coordinates, and
+allocates transient ARC identity when applicable. The keyboard handler
+serializes that plan, queues the barrier, and then asks the state owner to
+commit the origin prediction; it cannot independently choose a geometry
+backend or mutate placement maps.
+
+The public CLI is intentionally small: the native `set-parent` backend is the
+default mode, but placement shortcuts remain disabled until
+`--window-shortcuts-config PATH` is supplied. The older
+`--window-host-policy`, `--window-geometry-method`, and
+`--window-arc-id-lifetime` switches remain hidden compatibility options for
+development experiments. SIGHUP reload is implemented by the placement
+runtime and returns a typed result while preserving the last valid generation
+on errors.
+
+## 2026-08-22 — Historical self-parent resize follow-up
+
+The earlier self-parent experiment intentionally sent only
+`zaura_surface.set_parent`, so it moved the window while preserving its old
+size. The first resize follow-up kept that custom position probe but completed
+each shortcut with the same screen-coordinate
+`zaura_toplevel.set_window_bounds` request used by the direct backend:
+
+```text
+unset fullscreen/maximized/snap
+set_parent(relative_x, relative_y)
+set_window_bounds(screen_x, screen_y, width, height, output)
+sync
+```
+
+The bounds request is necessary because `set_parent` has no size arguments.
+That ordering was later found insufficient on the custom host: the position
+side effect worked, but the post-parent bounds request was rejected.
+
+## 2026-08-22 — Historical self-parent resize authorization correction
+
+This section records an intermediate experiment and is not the current
+backend contract.
+
+The first implementation of the sequence above still selected the Guest OS
+application policy for the `set-parent` backend. On the custom host that
+allowed the self-parent side effect to move the window, but ChromeOS rejected
+the accompanying `set_window_bounds` size change; `zaura_toplevel.configure`
+continued to report the original `800x600` bounds. This was a policy failure,
+not a wire-encoding failure.
+
+The named `set-parent` backend now selects the native Guest OS identity
+together with the self-parent probe. The host XDG role remains the normal
+`org.chromium.guest_os.<vm>.wayland.<app>` identity. This preserves
+shelf/taskbar matching; persistent ARC task metadata authorized the size
+request but produced generic or missing shelf icons in manual testing. The
+transient ARC variant also caused an IME focus reset after the first shortcut,
+while `.session.*` metadata had already been observed to destabilize the host
+compositor. The Guest + self-parent path was therefore treated as a
+position-only experiment at this point, with resize authorization left as an
+explicit host-specific limitation to verify. It was later superseded by the
+native XDG resize handshake described below; the current `set-parent` backend
+does not rely on this intermediate direct-Aura conclusion.
+
+## 2026-08-22 — Self-parent bounds-first resize fix (superseded)
+
+The first production attempt cleared compositor-owned state, resized the
+top-level window at its last authoritative screen origin with a direct Aura
+bounds request, and only then used the self-parent probe for the target
+position:
+
+```text
+unset fullscreen/maximized/snap
+set_window_bounds(current_x, current_y, width, height, output)
+set_parent(relative_x, relative_y)
+sync
+set_parent(NULL, 0, 0)   # queued after sync.done
+```
+
+The regression test captured the wire order and requested dimensions. On the
+custom host this direct Aura resize remained policy-sensitive, so the current
+implementation supersedes that size phase with the native XDG configure/commit
+handshake described below. The historical wire sequence is retained here
+because it explains why the companion direct-bounds request was removed.
+
+## 2026-08-23 — Native XDG resize before self-parent position
+
+The current `set-parent` backend keeps the Guest OS identity and applies size
+through the host's ordinary XDG surface state:
+
+```text
+synthetic guest xdg_toplevel.configure(width, height)
+host xdg_surface.set_window_geometry(0, 0, width, height)
+guest ack_configure + wl_surface.commit
+host zaura_toplevel.configure(width, height)
+set_parent(self, target - authoritative_origin)
+sync.done -> retain self-parent; queue an ordered IME-refresh barrier
+```
+
+This avoids `ChromeSecurityDelegate::CanSetBounds()` for the size phase while
+retaining the native shelf identity. The nullable `set_parent(NULL, 0, 0)`
+request is intentionally not sent: on the tested custom host it starts a new
+focus/activation animation and can invalidate IME state. The state machine
+suppresses stale configures and intermediate origins while a generation is
+active. If the host omits the final target `origin_change`, the ordered cleanup
+barrier treats the requested target as the best available baseline and keeps
+any deferred shortcut retryable. After completion, a short-lived origin guard
+ignores late focus/animation frames until the next explicit placement starts;
+this prevents the earlier `z -> a -> a` lower-right drift.
+
+## 2026-08-21 — Historical preserve the native XDG identity in ARC bounds mode
+
+The earlier ARC bounds workaround changed only the Aura application identity.
 `xdg_toplevel.set_app_id` continues to use the normal guest namespace, while
 `zaura_surface.set_application_id` and GTK Aura metadata use the per-surface
 `org.chromium.arc.session.<id>` identity. This matches the established
@@ -735,6 +899,57 @@ failed against the previous rewrite and passes after the split.
   assertions and 9 unrelated baseline failures (nested Biome configuration,
   missing Typst assets, missing Astro/Slidev tooling or paths, and existing
   hygiene/permission findings).
+
+## 2026-08-22 — Historical transient ARC identity experiment
+
+This experiment kept the native Guest OS application ID on the
+Aura surface during normal operation, including XDG and GTK metadata updates.
+The allocated numeric `org.chromium.arc.<task_id>` value is retained only as a
+placement capability. For each bounds shortcut, Sommelier queues one ordered
+host sequence:
+
+```text
+set_application_id(ARC task ID)
+set_window_bounds(...)
+wl_display.sync(...)
+sync.done -> set_application_id(native Guest OS ID)
+```
+
+The native identity is deliberately queued only from the `sync.done` callback,
+so the restore cannot race the bounds request or be mistaken for part of the
+pre-barrier wire sequence. This preserves the earlier task-ID allocator and
+the `/dev/wl0` observations while avoiding a persistent ARC shelf/icon
+identity. Unit coverage asserts the exact sequence and verifies that the
+native ID is restored after every placement.
+
+It is retained as a comparison path, but is not the named `set-parent`
+backend: changing the Aura identity around a shortcut caused an IME focus
+reset on the custom host. The current `set-parent` backend keeps the native
+Guest OS identity, uses the ordinary XDG configure/commit handshake for size,
+and uses `set_parent` only for its position probe.
+
+## 2026-08-22 — Historical transient ARC nullable-parent follow-up
+
+The transient comparison path now tests a complete post-barrier cleanup:
+
+```text
+set_application_id(ARC task ID)
+set_window_bounds(...)
+wl_display.sync
+sync.done -> set_parent(NULL, 0, 0)
+sync.done -> set_application_id(native Guest OS ID)
+```
+
+This explicitly releases any parent relationship before returning to the
+native Guest OS identity. The restore uses the latest native ID recorded for
+the surface at barrier completion, rather than a stale placement-time copy.
+The order is covered by unit tests, and the path requires `zaura_surface`
+version 5 or newer: v2 provides nullable `set_parent`, while v5 is also
+needed for the temporary `set_application_id` update. It remains experimental
+because
+the custom host may move the window again or reset IME focus when the nullable
+parent and application identity are changed. Runtime verification must use an
+isolated `/dev/wl0` proxy; the primary Sommelier instance is not a test target.
 
 ## 2026-08-21 — bidirectional placement-link ownership
 
@@ -765,12 +980,6 @@ surface consumes the next ID in that block, while independent Sommelier
 instances contend on the same block files. The lock file remains after exit;
 the kernel releases the lock when the owning descriptor closes, avoiding an
 unlink/recreate inode race.
-The allocator additionally holds a parent-side generation guard in the stable
-`$XDG_RUNTIME_DIR` parent and compares only the block directory's device/inode
-identity. A timestamp is not part of the marker: normal lock-file creation
-changes directory ctime and would make a second valid allocator fail
-spuriously. Replacement block or `sommelier/` directories are rejected while
-an older guard is held, and unsafe paths or lock-file types fail closed.
 
 Regression coverage includes atomic conflict rejection and both-direction
 teardown; the VM namespace test derives its expected value from the active
@@ -787,15 +996,272 @@ compatibility sentinel and is excluded from the allocator. The per-surface
 rejected experiment, including the `/dev/wl0` host-compositor restart observed
 with `arc + none`.
 
-Final verification from this worktree:
+Final verification before the identity-map consolidation:
 
-- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 599
+- `cargo test --workspace --all-targets -- --test-threads=1`: Sommelier 618
   passed, 1 ignored; sample GUI 12 passed; Wayland codegen 6 passed; the GUI
   smoke test is ignored because it requires a live compositor.
-- The allocator-focused suite passes 21 tests, including concurrent block
-  contention, directory replacement, malformed guard, symlink/FIFO, and
-  exhaustion cases.
+- The parallel workspace run (`--test-threads=4`) also passed with 618 tests
+  successful and one ignored.
 - `cargo check --workspace --all-targets` and
   `cargo clippy --workspace --all-targets -- -D warnings` passed.
 - `cargo fmt --all -- --check`, `cargo build --release -p sommelier
   -p sommelier-test-gui`, and `git diff --check` passed.
+- Placement plans now have an explicit lifecycle-pairing invariant check;
+  malformed target/cleanup/identity combinations are rejected before any
+  host wire message or barrier state is created.
+
+## 2026-08-22 — identity ownership consolidation and timing recheck
+
+The placement state now stores native and ARC application IDs for each guest
+surface in one `SurfaceApplicationState` record instead of two independent
+maps. The record is removed together with the Aura-surface association during
+surface teardown, keeping the two identity lifetimes atomic. The duplicate
+output-geometry tests were moved into `plan.rs`, which owns the pure
+`OutputState` value and its invariants.
+
+After that change the workspace matrix passed 617 Sommelier tests with one
+ignored test, 12 sample-GUI tests, and six Wayland-codegen tests. The serialized
+test bodies took 7.76 seconds (the same cached matrix took 2.67–2.71 seconds
+with `--test-threads=4`; a cold compile adds roughly ten seconds). Two
+descriptor-lifetime tests were hardened to compare `/proc/self/fd` targets,
+eliminating false failures caused by numeric FD reuse in parallel tests.
+`cargo check`,
+strict Clippy, rustdoc with warnings denied, the release build, formatting, and
+`git diff --check` all passed. No `/dev/wl0` runtime test was run in this pass.
+
+## 2026-08-22 — Historical type-safe placement policy
+
+The runtime configuration now represents placement as one closed policy value:
+
+```text
+Disabled
+IdentityOnly
+Bounds { host_policy, arc_id_lifetime }
+SelfParent { host_policy }
+```
+
+Startup still accepts the hidden axis flags for compatibility, but
+`WindowPlacementMode::from_axes` validates them once and collapses them into
+that policy. This prevents combinations such as Guest + transient ARC,
+self-parent + transient identity, or identity-only + transient cleanup from
+reaching connection-local placement state. The public named backends construct
+the same policy directly. This was a historical snapshot: at that point the
+transient post-barrier `set_parent(NULL)` cleanup was still present. It was
+later superseded by the persistent self-parent and native XDG resize sequence
+documented in the later sections.
+
+Verification for this pass:
+
+- `cargo test -p sommelier --all-targets -- --test-threads=1`: 619 passed,
+  0 failed, 1 ignored.
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps`,
+  `cargo build --release -p sommelier -p sommelier-test-gui`, and
+  `git diff --check`: all passed.
+- The enclosing monorepo `bun run verify` still reports 1,853 passing
+  assertions and 9 unrelated baseline failures (nested Biome configuration,
+  missing Typst/Astro assets or tooling, and existing hygiene/shebang findings).
+- No `/dev/wl0` process was restarted for this structural-only pass.
+
+## 2026-08-22 — opaque placement plans and test timing recheck
+
+`WindowPlacementPlan` and `TransientArcIdentity` now expose no mutable fields
+outside the placement-state module. Production plans can only be constructed by
+`WindowPlacementState::prepare_placement`; the wire adapter receives read-only
+accessors and cannot pair a target, temporary ARC identity, and barrier cleanup
+from different surface generations. Test-only constructors keep malformed-plan
+coverage without widening the production construction boundary.
+
+The final cached verification matrix passed 619 Sommelier tests, one ignored,
+12 sample-GUI tests, and six Wayland-codegen tests. The required serialized
+run took 11.08 seconds of test body time (11.91 seconds including the harness).
+The same matrix passed with four test threads in 2.85 seconds of test body time
+(3.15 seconds including the harness); the README now documents that as the
+faster local iteration command while CI/release remains serialized for
+conservative descriptor ownership. Formatting, workspace check, strict Clippy,
+rustdoc with warnings denied, release build, and whitespace validation remain
+passing. No primary `/dev/wl0` process was restarted.
+
+## 2026-08-22 — atomic XDG/Aura role teardown
+
+XDG role destruction now has one state-owned transition for both the guest
+`xdg_toplevel` association and its host `zaura_toplevel` child. The new
+`XdgToplevelRelease` record is returned after the state owner has removed the
+role link, Aura reverse link, origin/pending-origin state, and active placement
+barrier. Surface- and `xdg_surface`-level cleanup use the same bulk transition,
+so malformed destroy ordering cannot leave an Aura child or placement record
+attached to a reused guest surface ID.
+
+The wire adapter accepts only that returned release record and serializes the
+optional host `zaura_toplevel.release`; it no longer mutates placement state.
+Older callbacks remain callback-owned until their host `delete_id`, but their
+cleanup is no longer active after role teardown. This keeps the state owner as
+the single source of truth while preserving host object reservation semantics.
+
+Focused state/compositor tests and the full Sommelier suite pass. The current
+four-thread full run completes in about 3.0 seconds with 620 tests passing and
+one ignored GUI smoke test. No `/dev/wl0` process was restarted for this
+structural change.
+
+## 2026-08-22 — lifecycle cardinality and parent-link audit
+
+The surface teardown API now returns one optional `XdgToplevelRelease`, matching
+Wayland's one-role-per-surface rule instead of allocating a collection that
+could suggest multiple live roles. Aura-surface teardown removes native and ARC
+application identity only after the expected host-side surface association is
+found; a stale host ID therefore cannot erase a newer surface generation's
+identity. A regression test covers the mismatched-ID path.
+
+Role registration now enforces the protocol hierarchy in the placement state:
+`xdg_toplevel` requires an existing `xdg_surface → wl_surface` link, and
+`zaura_toplevel` requires the corresponding guest XDG role. Handler fixtures
+were updated to register those parent links explicitly, so tests exercise the
+same lifecycle ordering as production. The generated-dispatch post-hook for
+`get_toplevel` remains a narrowly documented retry because the guest→host ID
+mapping is installed after the handler; it now skips the retry if dispatch
+returned a protocol error.
+
+The four-thread workspace matrix passes 622 Sommelier tests with one ignored
+live-VirtWL test, 12 sample-GUI tests, and six Wayland-codegen tests; the GUI
+smoke test remains ignored because it needs a live compositor. This pass is
+structural only and did not restart or exercise the primary `/dev/wl0`
+compositor.
+
+## 2026-08-22 — orphaned application-identity teardown
+
+ARC task identity allocation can happen when an XDG role is created, before
+any XDG/GTK metadata request creates the corresponding host `zaura_surface`.
+Previously, destroying that surface without an Aura link left the native/ARC
+record in the connection-local map until connection teardown. The
+`wl_surface.destroy` handler now uses a separate state-owned orphan cleanup
+operation when the expected Aura link is absent. The existing mismatched-host
+ID guard remains unchanged, so a stale teardown cannot erase a newer
+generation's identity. State and compositor regression tests cover both paths.
+
+## 2026-08-22 — final serialized workspace verification
+
+The final required serialized command,
+`cargo test --workspace --all-targets -- --test-threads=1`, passed:
+
+- Sommelier: 624 passed, 0 failed, 1 ignored (the live VirtWL test).
+- `sommelier_test_gui`: 12 passed.
+- `wayland_codegen`: 6 passed.
+- The GUI smoke integration test remained ignored because it needs a live
+  compositor.
+
+The Sommelier test binary completed in 8.57 seconds after compilation. The
+faster four-thread command remains available for local iteration; the
+serialized command is retained for CI/release validation because it is the
+conservative descriptor-ownership configuration. No `/dev/wl0` process was
+restarted or exercised during this verification.
+
+The enclosing monorepo `bun run verify` was also rerun: 1,853 assertions
+passed and the same nine unrelated baseline checks failed. Those failures are
+the nested Biome configuration, missing Typst diagrams/fonts, unavailable
+Astro/Slidev tools or paths, and pre-existing root hygiene/shebang findings;
+none reference the Sommelier worktree.
+
+## 2026-08-22 — Historical shadow-owned surface teardown and fast test iteration
+
+Surface identity teardown now resolves the host `wl_surface` from the
+authoritative `ShadowTable` inside `WindowPlacementState`. The compositor
+handler still uses its mapping to serialize `wl_surface.destroy`, but it no
+longer supplies an independently assembled guest/host pair to placement state.
+The mismatched-generation regression now exercises a stale shadow mapping and
+confirms that the live Aura association and native/ARC identities remain
+untouched.
+
+The placement barrier cleanup path was explicitly ordered after
+`wl_display.sync`: transient ARC placement queued nullable
+`zaura_surface.set_parent(0, 0, 0)` first, then restored the latest native
+application ID. This sequence is retained as historical evidence; the current
+transient path does not unparent, and the current self-parent path retains its
+relationship. Callback tests from this snapshot verify the old null-parent
+ordering, superseded-barrier behavior, and released-surface guards.
+
+After this change, the cached Sommelier package suite passes 625 tests with one
+ignored live-VirtWL test. The serialized run takes about eight seconds; the
+same suite with four test threads takes about 2.6 seconds. The faster command
+is suitable for local iteration, while the serialized command remains the
+conservative descriptor-ownership check. No `/dev/wl0` process was restarted.
+
+## 2026-08-23 — remote-shell-v2 opt-in backend probe
+
+The implementation now includes an explicit
+`--window-placement-backend=remote-shell-v2` backend. It vendors the official
+`remote-shell-unstable-v2.xml` request/event ordering, binds
+`zcr_remote_shell_v2` only on the host side, and maps each guest XDG role to a
+host `zcr_remote_surface_v2` role. Placement uses the protocol's
+`set_bounds_in_output` request followed by `wl_surface.commit`; no ARC task
+identity, Aura `set_window_bounds`, or self-parent relationship is involved.
+Remote bounds/close events are converted into the guest XDG configure/close
+stream, and app ID/title metadata is forwarded to the remote surface.
+
+The backend is intentionally opt-in and still requires the explicit shortcut
+config path. On the live custom `/dev/wl0` host, the remote-shell global was
+not advertised. A Ghostty client therefore reached normal registry/keyboard
+initialization but was rejected at its first XDG surface with:
+
+```text
+remote-shell: ... host did not provide a bound zcr_remote_shell_v2
+```
+
+The isolated proxy exited without restarting the primary Sommelier process.
+This runtime result confirms the capability gate and safe failure path; it
+does not yet validate remote-shell geometry, shelf icon, IME, or teardown.
+A custom host/security delegate that advertises the global is required for that
+next end-to-end test.
+
+## 2026-08-24 — persistent self-parent cleanup
+
+The first PR8 runtime path sent `zaura_surface.set_parent(NULL)` after every
+self-parent placement. On the custom `/dev/wl0` host, Exo/Ash treated that as a
+new activation transition: it emitted a long origin animation toward the
+bottom-right and could leave focus/IME state unusable. The persistent experiment
+in `/tmp/pr8-persist-runtime.log` remained stable across repeated shortcuts and
+focus changes.
+
+The production self-parent path now retains the self-parent relationship for
+the proxy lifetime. Its `wl_display.sync` callback still orders the follow-up
+host-IME refresh and transaction settlement, but never emits the nullable
+unparent request. The older nullable-unparent implementation and its observed
+runtime failure remain documented above as historical context.
+
+Follow-up manual testing exposed a second limitation that must remain visible
+in this record: a placement can appear correct initially, then a later host
+focus transition can animate the window toward the lower-right and leave
+subsequent shortcuts unhandled. This is not a normal Wayland lifecycle event;
+it is another observable consequence of using a self-parent cycle as a
+positioning probe. The placement reducer now ignores those late animation
+coordinates instead of rebasing the next relative delta, and the cleanup
+barrier uses the requested target as a liveness baseline when Aura omits
+`origin_change`. This keeps repeated shortcuts retryable without claiming that
+the host emitted geometry. Treat the backend as host-specific and experimental
+until a supported bounds or remote-shell capability is available.
+
+## 2026-08-24 — generation fallback verification
+
+The omitted-`origin_change` liveness fallback now settles the requested target
+after the ordered cleanup barrier. It preserves and promotes a deferred latest
+shortcut instead of dropping it, and arms a short-lived guard after completion
+so late focus/animation coordinates cannot rebase the next relative request.
+The regression fixtures cover both fallback promotion and repeated-shortcut
+deduplication.
+
+The final serialized Sommelier verification passed:
+
+- `cargo test -p sommelier --bin sommelier -- --test-threads=1`: Sommelier 716
+  passed, 0 failed, 1 ignored (live VirtWL). This includes direct coverage for
+  live transient-ARC restore completion followed by role teardown.
+- The workspace check and strict all-target Clippy pass; sample GUI and Wayland
+  codegen remain covered by the earlier serialized workspace run.
+- `cargo fmt --check`, `cargo check --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `git diff --check` passed.
+
+The enclosing monorepo `bun run verify` still has unrelated baseline failures:
+1,853 assertions passed and 10 failed due to the nested Biome configuration,
+missing Typst assets/fonts, unavailable Astro/Slidev tools or paths, and
+pre-existing root hygiene/shebang findings (including the user's untracked
+`rust_out`). No `/dev/wl0` process was restarted for this structural pass.

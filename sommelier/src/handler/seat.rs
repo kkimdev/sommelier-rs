@@ -144,6 +144,7 @@ mod tests {
                 pending_deletes: Vec::new(),
                 pending_cursor_position: None,
                 host_activation: crate::state::HostActivationState::Active,
+                placement_ime: crate::state::PlacementImeState::None,
             },
         );
 

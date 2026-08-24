@@ -1,6 +1,6 @@
 # Window shortcut configuration and runtime reload
 
-Status: implemented in the stacked window-placement shortcut configuration PR
+Status: implemented in the `window-placement-shortcuts-rewrite` worktree
 
 This document defines how compositor-owned keyboard shortcuts are configured.
 It deliberately separates shortcut bindings from the window-placement backend:
@@ -18,27 +18,32 @@ whether Sommelier can carry out that action on the host.
   requests, and raw ARC IDs are not configuration values.
 - Backend selection is startup-only. Reloading shortcuts must not change the
   ARC/guest policy or the geometry method of already-connected clients.
+- The supported public startup surface has one backend switch and one explicit
+  config-path switch. Lower-level policy/geometry/lifetime axes are hidden
+  compatibility options reserved for development experiments.
 
 ## Startup interface
 
-The policy and geometry axes are independent:
+The supported interface is:
 
 ```text
---experimental-window-placement
---window-host-policy=guest|arc
---window-geometry-method=none|bounds|self-parent
---window-shortcuts-config PATH       # optional
+--window-placement-backend=set-parent|transient-arc|persistent|remote-shell-v2
+--window-shortcuts-config PATH       # required when a backend is selected
 ```
 
-Window placement is disabled unless `--experimental-window-placement` is
-present. Passing a placement axis or config path without the gate is a startup
-error. With the gate and no hidden axis overrides, the default is equivalent
-to:
+The default backend is the native Guest OS identity plus the experimental
+self-parent geometry path. The shortcut feature itself remains inactive until
+an explicit config file is supplied:
 
 ```text
---window-host-policy=guest
---window-geometry-method=self-parent
+native Guest OS identity + XDG resize/self-parent placement
+no shortcut file read
 ```
+
+`--window-host-policy`, `--window-geometry-method`, and
+`--window-arc-id-lifetime` still exist as hidden compatibility switches for
+focused host experiments. They are not required for normal use and should not
+be combined with `--window-placement-backend`.
 
 When `--window-shortcuts-config` is omitted, Sommelier does not open, stat, or
 watch a shortcut config file. The process still starts normally, but no
@@ -48,10 +53,38 @@ When the option is present, Sommelier reads and validates the file before it
 starts accepting guest clients. A malformed explicit startup config is a
 startup error; it must not silently disable only some bindings.
 
-`self-parent` remains experimental. It can move a window on hosts that support
-the custom probe, but `zaura_surface.set_parent` has no width or height
-arguments and therefore cannot implement a resize. Explicitly selecting
-`--window-geometry-method=none` disables placement after the gate is enabled.
+`self-parent` remains experimental and is the geometry path of the public
+`set-parent` backend. It keeps the native Guest OS application identity so
+ChromeOS can continue matching the guest window to its shelf/taskbar metadata.
+It first performs a normal XDG resize handshake: Sommelier queues
+`xdg_surface.set_window_geometry(0, 0, width, height)` on the host and a
+synthetic guest `xdg_toplevel.configure`/`xdg_surface.configure`. The guest's
+acknowledgement and commit apply the new size at the current origin. Only after
+the matching host Aura configure does Sommelier issue the custom
+`zaura_surface.set_parent(self, relative_x, relative_y)` position probe. The
+split is required because `set_parent` has no width or height arguments, while
+the native Guest OS policy may reject direct Aura bounds. The native Guest
+identity is deliberate: the ARC task-form ID can authorize bounds on some
+hosts but may prevent the guest `.desktop` entry from producing the expected
+shelf/taskbar icon. If the host rejects the XDG resize handshake, the backend
+remains position-only; it never falls back to a direct ARC/Aura bounds request.
+Internally, the public `set-parent` backend is equivalent to:
+
+```text
+--window-host-policy=guest --window-geometry-method=self-parent
+```
+
+The self-parent request itself is emitted only for a shortcut. Its sync barrier
+orders the host-IME refresh and transaction settlement, but Sommelier
+deliberately does not send the protocol's nullable-parent form
+(`set_parent(NULL, 0, 0)`). On the custom host, that request starts a new
+focus/activation animation and can move the window toward an unsolicited
+bottom-right origin. Keeping the relationship installed is stable across
+repeated shortcuts; the association is released with the host Aura object.
+A superseded or released toplevel does not receive stale cleanup from an older
+barrier. Identical rectangles are consumed without another wire request while
+the resize, self-parent, or delayed host-origin phase is still converging; this
+prevents the small `z -> a -> a` drift seen in the earlier implementation.
 
 The comparison backend `--window-placement-backend=transient-arc` uses a
 different cleanup sequence:
@@ -60,25 +93,64 @@ different cleanup sequence:
 set_application_id(ARC task ID)
 set_window_bounds(...)
 wl_display.sync
-sync.done -> set_parent(NULL, 0, 0)
 sync.done -> set_application_id(native Guest OS ID)
+identity sync.done -> refresh host text-input generation
 ```
 
-The nullable-parent request is deliberately sent before restoring the native
-identity. Sommelier resolves the latest native ID from the surface state when
+The bounds path does not emit a speculative `set_parent(NULL)`: the window was
+never parented, and doing so creates another host focus/IME transition.
+Sommelier resolves the latest native ID from the surface state when
 the barrier completes, so an app-ID update that arrives while the bounds
 request is in flight is not overwritten by an old snapshot. This is an
-experimental host-compatibility probe: ChromeOS may
-recompute the window's placement or reset IME focus when either the parent or
-the Aura application ID changes. The backend therefore requires
-`zaura_surface` version 5 or newer: v2 provides nullable `set_parent`, while
-v5 provides `set_application_id`, which is also needed to install the
-temporary ARC identity. It must be tested independently on `/dev/wl0`; it is
-not the default `set-parent` backend.
+experimental host-compatibility probe: ChromeOS may recompute the window's
+placement or reset IME focus when the Aura application ID changes. The
+backend therefore requires `zaura_surface` version 5 or newer for
+`set_application_id`. The self-parent backend separately requires version 2
+for the non-null `set_parent(self, ...)` request. It is not currently considered IME-safe on the custom
+host: ChromeOS' ARC property resolver adds `kSkipImeProcessing` and restore
+properties but does not remove them when the native Guest OS ID is restored.
+The runtime diagnostic path logs this sequence with a `placement#N` correlation
+ID. Keep this backend available for comparison, but do not treat the native-ID
+restore as proof that host ARC state was cleared.
+
+Transient placement also arms a per-`wl_keyboard` focus guard for the two
+identity transitions above. Custom Exo builds can deliver each corresponding
+`wl_keyboard.leave` several seconds late; forwarding that stale leave would
+tear down the guest text-input generation even though focus never moved to
+another guest surface. A same-surface `enter` completes one guarded cycle,
+while an enter for a different surface releases the guard and projects the
+normal guest leave/enter transition. This protects Korean IME focus from the
+known delayed-event ordering, but it does not remove ChromeOS'
+sticky `kSkipImeProcessing` ARC property; hosts with that resolver behavior
+still require the native Guest identity path or a host-side fix for full IME
+semantics.
 
 If the guest surface is destroyed before `sync.done`, the cleanup path drops
 both post-barrier requests instead of sending them to the released Aura object;
 the host ID remains reserved for its normal `delete_id` lifecycle.
+
+The opt-in `--window-placement-backend=remote-shell-v2` backend uses the
+official ChromeOS `zcr_remote_shell_v2` protocol instead of Aura bounds or ARC
+application IDs:
+
+```text
+host zcr_remote_shell_v2.get_remote_surface(wl_surface, container=default)
+guest XDG role -> local configure facade
+window.place -> zcr_remote_surface_v2.set_bounds_in_output(...)
+             -> wl_surface.commit
+host bounds event -> synthetic guest XDG configure
+```
+
+The remote-shell global is deliberately kept host-only; it is never advertised
+to guest applications. XDG `set_app_id` and `set_title` are translated to the
+remote surface, and host close/bounds events are translated back to the guest
+XDG role. This path does not use `zaura_toplevel.set_window_bounds`, ARC task
+IDs, or the self-parent probe. The host must advertise the global and permit the
+connection through its remote-shell security policy. If the global is absent,
+the opt-in backend logs the missing capability and rejects the affected client;
+it does not silently switch to the transient-ARC or self-parent path. This
+backend remains experimental until a custom host with the global enabled has
+been tested for resize, shelf icon, IME, and teardown behavior.
 
 ## Config file format
 
@@ -141,10 +213,14 @@ versions, malformed accelerator strings, non-finite numbers, and rectangles
 outside the work area. The whole file is rejected rather than partially
 applied.
 
-For `bounds`, all four rectangle components are applied. For the
-experimental `self-parent` method, only the calculated x/y position can be
-sent; width and height are ignored and a warning is emitted. This does not
-change the config format, so the same file can be tested with either backend.
+For direct `bounds`, all four rectangle components are sent in the Aura
+`set_window_bounds` request. The experimental `self-parent` method uses the
+native Guest OS resize handshake instead: Sommelier sends host
+`xdg_surface.set_window_geometry` plus a synthetic guest configure, waits for
+the matching guest commit and host size acknowledgement, and only then sends
+`set_parent(self, relative_x, relative_y)` for the target position. This
+keeps the native Guest OS identity and does not require an ARC policy. The
+normalized config format is shared by both methods.
 
 ## Runtime reload
 
@@ -187,10 +263,6 @@ captured.
 `SOMMELIER_ACCELERATORS` remains separate. It describes which accelerators the
 host should handle; it is not the action/geometry configuration and is not
 changed by shortcut reload.
-The environment list is parsed once at startup. If it is malformed, Sommelier
-exits with status 2 rather than silently treating the list as empty. Changing
-the host accelerator environment therefore requires a proxy restart; `SIGHUP`
-only reparses the explicit shortcut file.
 
 A shortcut binding must not overlap a parsed `SOMMELIER_ACCELERATORS` entry.
 The two settings have deliberately different owners: the shortcut config
@@ -202,8 +274,7 @@ The conflict behavior is therefore:
 
 | Situation | Result |
 | --- | --- |
-| Malformed `SOMMELIER_ACCELERATORS` at startup | Startup fails with exit status 2 |
-| Startup config overlaps a host accelerator | Startup fails and identifies the conflicting binding |
+| Startup config overlaps a host accelerator | Startup fails and names every conflicting chord |
 | Reloaded config overlaps a host accelerator | Reload fails; last-known-good bindings remain active |
 | No overlap | Both policies operate independently |
 
@@ -246,7 +317,8 @@ for the initial `SIGHUP` implementation.
 
 - [x] Use `--window-shortcuts-config` as the explicit config path.
 - [x] Use normalized work-area geometry instead of pixel coordinates.
-- [x] Keep `self-parent` position-only and experimental.
+- [x] Keep `self-parent` experimental while pairing its position probe with
+  the native XDG configure/commit resize handshake.
 - [x] Preserve the last known-good bindings after an invalid reload.
 - [x] Reject overlap with `SOMMELIER_ACCELERATORS`.
 - [x] Defer a control socket until runtime path selection is required.

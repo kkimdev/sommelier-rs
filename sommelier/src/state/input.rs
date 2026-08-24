@@ -31,6 +31,22 @@ pub enum HostActivationState {
     Draining { callback: HostId },
 }
 
+/// Guest-side IME generation state while a transient placement metadata
+/// transition is in flight.
+///
+/// This belongs to the text-input object rather than to a connection-wide
+/// collection. A focus boundary can invalidate one object's placement refresh
+/// without affecting another text-input object on the same seat.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlacementImeState {
+    /// No placement refresh is waiting for a synthetic guest enter.
+    #[default]
+    None,
+    /// The host identity transition is complete only when the guest receives
+    /// an enter for this still-focused surface.
+    AwaitingGuestEnter { surface: u32 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
@@ -72,6 +88,8 @@ pub struct TextInputState {
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
     pub(crate) host_activation: HostActivationState,
+    /// Authoritative lifecycle marker for transient placement IME recovery.
+    pub(crate) placement_ime: PlacementImeState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,6 +174,7 @@ impl TextInputState {
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
             host_activation: HostActivationState::Inactive,
+            placement_ime: PlacementImeState::None,
         }
     }
 
@@ -181,6 +200,24 @@ impl TextInputState {
     /// Begin draining the active generation behind `callback`.
     pub fn begin_host_draining(&mut self, callback: HostId) -> bool {
         if self.host_activation != HostActivationState::Active {
+            return false;
+        }
+        self.host_activation = HostActivationState::Draining { callback };
+        true
+    }
+
+    /// Start a host-generation refresh when the local marker is already
+    /// inactive.
+    ///
+    /// A compositor-owned Aura identity change can invalidate Exo's
+    /// text-input generation even after the guest has committed `disable`.
+    /// In that case there is no active generation for
+    /// [`Self::begin_host_draining`] to consume, but the next `enable` still
+    /// needs a reset/deactivate/sync barrier before activation.  Reusing the
+    /// same draining state keeps callback ownership and stale-event filtering
+    /// identical to the active-generation path.
+    pub(crate) fn begin_host_refresh(&mut self, callback: HostId) -> bool {
+        if self.host_activation != HostActivationState::Inactive {
             return false;
         }
         self.host_activation = HostActivationState::Draining { callback };
@@ -225,28 +262,60 @@ impl TextInputState {
     /// generation with the correct transaction ordering.
     pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
         let previous_surface = self.active_surface;
-        self.pending_enabled = false;
-        self.committed_enabled = false;
-        self.enabled_dirty = false;
-        self.pending_surrounding_text = None;
-        self.committed_surrounding_text = None;
-        self.surrounding_text_dirty = false;
-        self.content_hint = 0;
-        self.content_purpose = 0;
-        self.committed_content_type = None;
-        self.content_type_dirty = false;
-        self.cursor_rect = None;
-        self.cursor_rect_dirty = false;
-        self.text_change_cause = 0;
-        self.clear_host_composition();
+        // A real guest focus boundary supersedes any in-flight placement
+        // refresh. The subsequent enter/commit transaction owns the new IME
+        // generation and must not be mistaken for the placement enter.
+        self.cancel_placement_ime();
+        self.reset_editor_projection();
         self.active_surface = active_surface;
         previous_surface
+    }
+
+    /// Begin a transient placement refresh without fabricating a guest focus
+    /// change.
+    ///
+    /// The focused surface remains selected so Winit keeps its `ime_allowed`
+    /// state. The committed editor projection is retained for the host-side
+    /// replay that follows the identity barrier. When the editor is currently
+    /// disabled, the marker is retained until the next guest enable/commit,
+    /// which performs a fresh host-generation reset before activation.
+    pub(crate) fn begin_placement_ime(&mut self, surface: u32) -> bool {
+        if self.active_surface != Some(surface) || self.placement_ime != PlacementImeState::None {
+            return false;
+        }
+        self.clear_host_composition();
+        self.placement_ime = PlacementImeState::AwaitingGuestEnter { surface };
+        true
+    }
+
+    /// Return whether this object is waiting for placement recovery on a
+    /// particular focused surface.
+    pub(crate) fn placement_ime_pending_for(&self, surface: u32) -> bool {
+        self.placement_ime == PlacementImeState::AwaitingGuestEnter { surface }
+    }
+
+    /// Complete a placement refresh after its synthetic enter was queued.
+    pub(crate) fn complete_placement_ime(&mut self, surface: u32) -> bool {
+        if !self.placement_ime_pending_for(surface) {
+            return false;
+        }
+        self.placement_ime = PlacementImeState::None;
+        true
+    }
+
+    /// Cancel a placement refresh because a real focus/lifecycle transition
+    /// has taken ownership of the next guest enter.
+    pub(crate) fn cancel_placement_ime(&mut self) -> bool {
+        let pending = self.placement_ime != PlacementImeState::None;
+        self.placement_ime = PlacementImeState::None;
+        pending
     }
 
     /// Move the object to its final disabled target before host reconciliation.
     pub fn begin_destroy(&mut self) {
         self.committed_enabled = false;
         self.active_surface = None;
+        self.cancel_placement_ime();
     }
 
     /// Start a new text-input-v3 enable or disable transaction.
@@ -478,6 +547,23 @@ impl TextInputState {
         self.pending_preedit_selection = None;
         self.pending_deletes.clear();
         self.pending_cursor_position = None;
+    }
+
+    fn reset_editor_projection(&mut self) {
+        self.pending_enabled = false;
+        self.committed_enabled = false;
+        self.enabled_dirty = false;
+        self.pending_surrounding_text = None;
+        self.committed_surrounding_text = None;
+        self.surrounding_text_dirty = false;
+        self.content_hint = 0;
+        self.content_purpose = 0;
+        self.committed_content_type = None;
+        self.content_type_dirty = false;
+        self.cursor_rect = None;
+        self.cursor_rect_dirty = false;
+        self.text_change_cause = 0;
+        self.clear_host_composition();
     }
 }
 
@@ -1547,6 +1633,25 @@ impl KeyboardFocusRegistry {
             .is_some_and(|focus| focus.guest_surface == guest_surface)
     }
 
+    /// Return every live host keyboard resource that currently owns a guest
+    /// surface.
+    ///
+    /// ChromeOS can expose more than one `wl_keyboard` resource for the same
+    /// seat/window. Placement metadata changes can therefore produce one
+    /// delayed leave per resource; callers that guard a focus generation must
+    /// arm all of them, not only the resource that delivered the shortcut.
+    pub fn host_keyboards_for_surface(&self, guest_surface: u32) -> Vec<HostId> {
+        let mut keyboards = self
+            .keyboards
+            .iter()
+            .filter_map(|(&keyboard, focus)| {
+                (focus.guest_surface == guest_surface).then_some(keyboard)
+            })
+            .collect::<Vec<_>>();
+        keyboards.sort_unstable_by_key(|keyboard| keyboard.0);
+        keyboards
+    }
+
     #[cfg(test)]
     pub fn set_for_test(
         &mut self,
@@ -1725,31 +1830,109 @@ impl KeyboardFocusRegistry {
 /// [`HostActivationState::Draining`], before the object may be activated again.
 #[derive(Default)]
 pub struct TextInputActivationBarrierRegistry {
-    by_callback: HashMap<HostId, (u32, u32)>,
+    by_callback: HashMap<HostId, (u32, u32, bool)>,
 }
 
 impl TextInputActivationBarrierRegistry {
+    /// Install one host-generation barrier.
+    ///
+    /// `replay_editor_state` records whether the caller invalidated the host
+    /// generation without a guest text-input commit. In that case the latest
+    /// committed editor state must be queued before reactivation when the
+    /// barrier completes.
     pub(crate) fn install(
         &mut self,
         callback: HostId,
         guest_text_input: u32,
         host_v1_id: u32,
+        replay_editor_state: bool,
     ) -> bool {
         if self.by_callback.contains_key(&callback) {
             return false;
         }
-        self.by_callback
-            .insert(callback, (guest_text_input, host_v1_id));
+        self.by_callback.insert(
+            callback,
+            (guest_text_input, host_v1_id, replay_editor_state),
+        );
         true
     }
 
-    pub(crate) fn complete(&mut self, callback: HostId) -> Option<(u32, u32)> {
+    /// Retire a barrier and return its owner plus replay requirement.
+    pub(crate) fn complete(&mut self, callback: HostId) -> Option<(u32, u32, bool)> {
         self.by_callback.remove(&callback)
+    }
+
+    /// Return whether a live draining generation is waiting to replay editor
+    /// state after host text-input `enter`.
+    pub(crate) fn expects_replay(&self, guest_text_input: u32, host_v1_id: u32) -> bool {
+        self.by_callback.values().any(|(guest, host, replay)| {
+            *guest == guest_text_input && *host == host_v1_id && *replay
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, callback: HostId) -> bool {
         self.by_callback.contains_key(&callback)
+    }
+}
+
+/// Pending editor replays waiting for the host text-input-v1 `enter` event.
+///
+/// A display sync only orders requests on the host stream.  Custom Exo builds
+/// can acknowledge `activate` before installing the corresponding input
+/// method client, so the host `enter` event is the readiness boundary for
+/// replaying surrounding text and content metadata.
+#[derive(Default)]
+pub struct TextInputReplayBarrierRegistry {
+    /// Placement refreshes arm a replay before sending host activate.  The
+    /// host's text-input `enter` event is the stronger readiness signal: it
+    /// means Exo has installed the new input-method generation.  Keep the
+    /// pending replay keyed by the reused host object instead of guessing
+    /// readiness from a display.sync callback.
+    pending_host_enter: HashMap<(u32, u32), ()>,
+    /// A conforming host normally emits `enter` after the activation request,
+    /// but a custom host may deliver the event before the preceding sync
+    /// callback is observed by the proxy.  Remember only enters that belong
+    /// to a currently draining replay generation.
+    early_host_enters: HashMap<(u32, u32), ()>,
+}
+
+impl TextInputReplayBarrierRegistry {
+    /// Arm an editor replay that must wait for host text-input `enter`.
+    ///
+    /// Returns whether an early matching `enter` was already observed while
+    /// the activation barrier was draining.
+    pub(crate) fn arm_for_host_enter(&mut self, guest_text_input: u32, host_v1_id: u32) -> bool {
+        let key = (guest_text_input, host_v1_id);
+        let entered_early = self.early_host_enters.remove(&key).is_some();
+        self.pending_host_enter.insert(key, ());
+        entered_early
+    }
+
+    /// Mark a host `enter` for a pending replay and consume the replay token.
+    pub(crate) fn complete_on_host_enter(
+        &mut self,
+        guest_text_input: u32,
+        host_v1_id: u32,
+    ) -> bool {
+        self.pending_host_enter
+            .remove(&(guest_text_input, host_v1_id))
+            .is_some()
+    }
+
+    /// Record an `enter` that arrived before activation-barrier completion.
+    pub(crate) fn record_early_host_enter(&mut self, guest_text_input: u32, host_v1_id: u32) {
+        let key = (guest_text_input, host_v1_id);
+        if !self.pending_host_enter.contains_key(&key) {
+            self.early_host_enters.insert(key, ());
+        }
+    }
+
+    /// Cancel replay tokens when a text-input object loses its focus or dies.
+    pub(crate) fn cancel_host_enter_replay(&mut self, guest_text_input: u32, host_v1_id: u32) {
+        let key = (guest_text_input, host_v1_id);
+        self.pending_host_enter.remove(&key);
+        self.early_host_enters.remove(&key);
     }
 }
 
@@ -1955,6 +2138,60 @@ mod tests {
         expected.guest_commit_serial = 17;
         assert!(expected.activate_host());
         assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn placement_ime_refresh_is_owned_by_text_input_and_cancelled_by_focus() {
+        let surface = 13;
+        let mut state = TextInputState::new(10, Some(11), 12, Some(surface));
+        state.pending_enabled = true;
+        state.committed_enabled = true;
+        state.committed_surrounding_text = Some(("editor".to_string(), 6, 6));
+        state.current_preedit = "조합".to_string();
+        assert!(state.activate_host());
+
+        assert!(state.begin_placement_ime(surface));
+        assert!(state.placement_ime_pending_for(surface));
+        assert_eq!(state.active_surface, Some(surface));
+        assert!(state.committed_enabled);
+        assert_eq!(
+            state.committed_surrounding_text,
+            Some(("editor".to_string(), 6, 6))
+        );
+        assert!(state.current_preedit.is_empty());
+        assert!(!state.begin_placement_ime(surface));
+
+        // A real keyboard focus leave owns the next guest generation. The
+        // placement marker must not survive with an unrelated surface state.
+        assert_eq!(state.apply_focus(None), Some(surface));
+        assert!(!state.placement_ime_pending_for(surface));
+        assert_eq!(state.placement_ime, PlacementImeState::None);
+    }
+
+    #[test]
+    fn placement_ime_completion_is_idempotent_and_surface_scoped() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        state.committed_enabled = true;
+        assert!(state.begin_placement_ime(13));
+        assert!(!state.complete_placement_ime(14));
+        assert!(state.placement_ime_pending_for(13));
+        assert!(state.complete_placement_ime(13));
+        assert!(!state.complete_placement_ime(13));
+    }
+
+    #[test]
+    fn inactive_host_can_enter_a_placement_refresh_barrier() {
+        let mut state = TextInputState::new(10, None, 12, Some(13));
+        let callback = HostId(77);
+
+        assert!(state.begin_host_refresh(callback));
+        assert_eq!(
+            state.host_activation(),
+            HostActivationState::Draining { callback }
+        );
+        assert!(!state.begin_host_refresh(HostId(78)));
+        assert!(state.complete_host_draining(callback));
+        assert_eq!(state.host_activation(), HostActivationState::Inactive);
     }
 
     #[test]
