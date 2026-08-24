@@ -105,9 +105,8 @@ struct Args {
     /// This is the convenient switch for runtime experiments:
     /// `set-parent` keeps the custom self-parent position probe with the
     /// native Guest OS identity, `transient-arc`
-    /// installs an ARC task identity around each bounds request, removes the
-    /// nullable parent after the host barrier, and restores the native
-    /// identity, and
+    /// installs an ARC task identity around each direct-bounds request and
+    /// restores the native identity after the host barrier, and
     /// `persistent` keeps the ARC task identity for the window lifetime.
     /// `remote-shell-v2` uses the host's zcr_remote_shell_v2 role and is
     /// intentionally experimental. Do not combine this option with the
@@ -242,6 +241,21 @@ fn resolve_placement_mode(
         .map_err(str::to_string)
 }
 
+/// Resolve a CLI-supplied shortcut path without panicking when the process
+/// current directory is unavailable.
+///
+/// Relative paths are interpreted against the startup working directory,
+/// matching normal CLI behavior. Filesystem failure stays on the ordinary
+/// startup-error path instead of aborting through `expect`.
+fn resolve_shortcut_config_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("unable to resolve relative window shortcut config path: {error}"))
+}
+
 fn validate_shortcut_startup(
     public_backend_selected: bool,
     config_path_supplied: bool,
@@ -292,8 +306,8 @@ async fn main() {
     if placement_mode.uses_self_parent() {
         log::warn!(
             "--window-geometry-method=self-parent is experimental; it uses the \
-             native XDG configure/commit handshake for size and a nullable \
-             set_parent probe for position, and may be unstable on custom \
+             native XDG configure/commit handshake for size and a non-null \
+             set_parent(self) probe for position, and may be unstable on custom \
              ChromeOS hosts"
         );
         if !placement_mode.uses_arc_policy() {
@@ -312,16 +326,26 @@ async fn main() {
         );
     }
 
-    let host_accelerators = Arc::new(crate::accelerator::from_environment());
-    let shortcut_config_path = args.window_shortcuts_config.map(|path| {
-        if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .expect("current working directory is required for a relative config path")
-                .join(path)
+    let host_accelerators = match crate::accelerator::try_from_environment() {
+        Ok(accelerators) => Arc::new(accelerators),
+        Err(error) => {
+            log::error!(
+                "Invalid SOMMELIER_ACCELERATORS; refusing to start: {}",
+                error
+            );
+            std::process::exit(2);
         }
-    });
+    };
+    let shortcut_config_path = match args.window_shortcuts_config {
+        Some(path) => match resolve_shortcut_config_path(path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                log::error!("{error}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let shortcut_config = match shortcut_config_path.as_deref() {
         Some(path) => match ShortcutConfig::load_from_path(path, host_accelerators.as_ref()) {
             Ok(config) => config,
@@ -395,6 +419,27 @@ mod tests {
         assert_eq!(
             resolve_placement_mode(None, None, None, None).expect("default mode should resolve"),
             PlacementBackendArg::SetParent.mode()
+        );
+    }
+
+    #[test]
+    fn absolute_shortcut_config_path_is_preserved() {
+        let path = PathBuf::from("/tmp/window-shortcuts.toml");
+        assert_eq!(
+            resolve_shortcut_config_path(path.clone()).expect("absolute path should resolve"),
+            path
+        );
+    }
+
+    #[test]
+    fn relative_shortcut_config_path_uses_startup_working_directory() {
+        let relative = PathBuf::from("window-shortcuts.toml");
+        let expected = std::env::current_dir()
+            .expect("test working directory should be available")
+            .join(&relative);
+        assert_eq!(
+            resolve_shortcut_config_path(relative).expect("relative path should resolve"),
+            expected
         );
     }
 

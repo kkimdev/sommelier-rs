@@ -23,7 +23,7 @@ limitations under the License.
 
 use crate::handler::placement::queue_synthetic_xdg_resize;
 use crate::protocols::remote_shell_unstable_v2::{
-    zcr_remote_shell_v2::REQ_GET_REMOTE_SURFACE,
+    zcr_remote_shell_v2::{REQ_DESTROY as REQ_SHELL_DESTROY, REQ_GET_REMOTE_SURFACE},
     zcr_remote_surface_v2::{REQ_DESTROY, REQ_SET_APP_ID, REQ_SET_TITLE},
 };
 use crate::state::Context;
@@ -64,10 +64,11 @@ pub(crate) fn queue_get_remote_surface(ctx: &mut Context, guest_wl_surface_id: u
         "zcr_remote_surface_v2".to_string(),
         version,
     );
-    if !ctx
-        .window_placement
-        .remember_remote_surface(host_wl_surface_id, remote_surface_id)
-    {
+    if !ctx.window_placement.remember_remote_surface_for_manager(
+        host_wl_surface_id,
+        remote_surface_id,
+        remote_shell_id,
+    ) {
         log::warn!(
             "remote-shell: refusing duplicate role for host wl_surface {}",
             host_wl_surface_id
@@ -99,6 +100,16 @@ pub(crate) fn queue_get_remote_surface(ctx: &mut Context, guest_wl_surface_id: u
 }
 
 pub(crate) fn queue_remote_app_id(ctx: &mut Context, remote_surface_id: u32, app_id: &str) -> bool {
+    if !ctx
+        .shadow_table
+        .host_object_matches(remote_surface_id, "zcr_remote_surface_v2")
+    {
+        log::debug!(
+            "remote-shell: skipping app-id for stale remote surface {}",
+            remote_surface_id
+        );
+        return false;
+    }
     let mut builder = MessageBuilder::new();
     builder.write_string(app_id);
     let Ok(message) = builder.try_build_message(remote_surface_id, REQ_SET_APP_ID) else {
@@ -109,6 +120,16 @@ pub(crate) fn queue_remote_app_id(ctx: &mut Context, remote_surface_id: u32, app
 }
 
 pub(crate) fn queue_remote_title(ctx: &mut Context, remote_surface_id: u32, title: &str) -> bool {
+    if !ctx
+        .shadow_table
+        .host_object_matches(remote_surface_id, "zcr_remote_surface_v2")
+    {
+        log::debug!(
+            "remote-shell: skipping title for stale remote surface {}",
+            remote_surface_id
+        );
+        return false;
+    }
     let mut builder = MessageBuilder::new();
     builder.write_string(title);
     let Ok(message) = builder.try_build_message(remote_surface_id, REQ_SET_TITLE) else {
@@ -125,10 +146,41 @@ pub(crate) fn queue_remote_destroy(ctx: &mut Context, remote_surface_id: u32) ->
     {
         return false;
     }
+    // Retire the object before queueing its destructor.  Cleanup can be
+    // reached through both the wl_surface and xdg_surface paths; only the
+    // first path that successfully claims the object may emit a destroy
+    // request.  Otherwise a second path can enqueue a duplicate destructor
+    // while the object is already pending host deletion.
+    if !ctx
+        .shadow_table
+        .mark_pending_destroy_host(remote_surface_id)
+    {
+        return false;
+    }
     let message = MessageBuilder::new().build_message(remote_surface_id, REQ_DESTROY);
     ctx.client_to_host_queue.push((message, Vec::new()));
-    ctx.shadow_table
-        .mark_pending_destroy_host(remote_surface_id)
+    true
+}
+
+/// Queue destruction of one host-only remote-shell manager generation.
+///
+/// The manager may have outlived its registry global after `global_remove`.
+/// Its host shadow metadata is intentionally retained until this final
+/// destructor is queued, so the request remains type-checked and the ID stays
+/// reserved until the host acknowledges `wl_display.delete_id`.
+pub(crate) fn queue_remote_shell_destroy(ctx: &mut Context, manager_id: u32) -> bool {
+    if !ctx
+        .shadow_table
+        .host_object_matches(manager_id, "zcr_remote_shell_v2")
+    {
+        return false;
+    }
+    if !ctx.shadow_table.mark_pending_destroy_host(manager_id) {
+        return false;
+    }
+    let message = MessageBuilder::new().build_message(manager_id, REQ_SHELL_DESTROY);
+    ctx.client_to_host_queue.push((message, Vec::new()));
+    true
 }
 
 pub struct RemoteShellHandler;
@@ -288,6 +340,53 @@ mod tests {
         assert!(queue_remote_title(&mut ctx, 40, "Terminal"));
         assert_eq!(opcode(&ctx.client_to_host_queue[0]), 1);
         assert_eq!(opcode(&ctx.client_to_host_queue[1]), 2);
+    }
+
+    #[test]
+    fn remote_destroy_is_claimed_before_queueing_and_is_idempotent() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            40,
+            "zcr_remote_surface_v2".to_string(),
+            6,
+        );
+        ctx.shadow_table.track_host_interface_with_version(
+            41,
+            "zcr_remote_shell_v2".to_string(),
+            6,
+        );
+
+        assert!(queue_remote_destroy(&mut ctx, 40));
+        assert!(!queue_remote_destroy(&mut ctx, 40));
+        assert!(queue_remote_shell_destroy(&mut ctx, 41));
+        assert!(!queue_remote_shell_destroy(&mut ctx, 41));
+
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(ctx.client_to_host_queue[0].0[0..4], 40u32.to_ne_bytes());
+        assert_eq!(opcode(&ctx.client_to_host_queue[0]), REQ_DESTROY);
+        assert_eq!(ctx.client_to_host_queue[1].0[0..4], 41u32.to_ne_bytes());
+        assert_eq!(opcode(&ctx.client_to_host_queue[1]), REQ_SHELL_DESTROY);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(40));
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(41));
+    }
+
+    #[test]
+    fn remote_metadata_is_not_sent_after_destroy_is_claimed() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.track_host_interface_with_version(
+            40,
+            "zcr_remote_surface_v2".to_string(),
+            6,
+        );
+
+        assert!(queue_remote_destroy(&mut ctx, 40));
+        assert!(!queue_remote_app_id(&mut ctx, 40, "org.example.Stale"));
+        assert!(!queue_remote_title(&mut ctx, 40, "stale"));
+        assert_eq!(
+            ctx.client_to_host_queue.len(),
+            1,
+            "metadata must not be queued after the destructor claims the role"
+        );
     }
 
     #[test]

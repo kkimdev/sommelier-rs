@@ -16,9 +16,9 @@ limitations under the License.
 
 use crate::handler::display::queue_protocol_error;
 use crate::handler::placement::{
-    advance_deferred_self_parent_after_resize, advance_self_parent_after_origin,
-    ensure_host_zaura_surface, ensure_zaura_toplevel, queue_pending_self_parent_move,
-    queue_policy_application_id, queue_zaura_toplevel_release, wayland_string_fits_message,
+    advance_self_parent_after_origin, ensure_host_zaura_surface, ensure_zaura_toplevel,
+    queue_pending_self_parent_move, queue_policy_application_id, queue_zaura_toplevel_release,
+    wayland_string_fits_message,
 };
 use crate::handler::remote_shell;
 use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
@@ -747,11 +747,14 @@ impl WlSurfaceHandler for CompositorHandler {
             return Action::Drop;
         };
         if ctx.window_placement.uses_remote_shell() {
-            if let Some(remote_surface_id) = ctx
+            if let Some((remote_surface_id, retired_manager)) = ctx
                 .window_placement
-                .take_remote_surface_for_wl_surface(wl_surface_host_id)
+                .take_remote_surface_for_wl_surface_with_cleanup(wl_surface_host_id)
             {
                 let _ = remote_shell::queue_remote_destroy(ctx, remote_surface_id);
+                if let Some((manager_id, _manager_version)) = retired_manager {
+                    let _ = remote_shell::queue_remote_shell_destroy(ctx, manager_id);
+                }
             }
         }
         // Keep the references owned by this surface before removing its
@@ -1150,10 +1153,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     .window_placement
                     .aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)
                 {
-                    if let Some(origin) = ctx.window_placement.origin(zaura_toplevel_id) {
-                        let _ =
-                            queue_pending_self_parent_move(ctx, zaura_toplevel_id, origin, None);
-                    }
+                    let _ = queue_pending_self_parent_move(ctx, zaura_toplevel_id, None);
                 }
             }
         }
@@ -1316,6 +1316,12 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
                     "remote-shell backend could not create a remote surface for wl_surface {}",
                     surface
                 );
+                // The facade was allocated before the host-only role request
+                // could be encoded. Roll it back so a fatal connection
+                // teardown cannot leave a stale xdg_surface association or
+                // synthetic ID reservation behind in the connection state.
+                let _ = ctx.window_placement.take_xdg_surface(id);
+                ctx.shadow_table.remove_id(id);
                 ctx.fatal_protocol_error = true;
             }
             return Action::Drop;
@@ -1333,20 +1339,34 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
             // hierarchy intact even for the protocol-violation ordering where
             // a client destroys xdg_surface before xdg_toplevel: retire the
             // orphaned remote role before acknowledging the parent facade.
+            //
+            // The remote surface is owned by the wl_surface/xdg_surface
+            // lifetime, not by one xdg_toplevel role. A client may destroy a
+            // toplevel and create a replacement role on the same surface, so
+            // do not destroy the host remote surface from the toplevel
+            // destructor. Retire it exactly once when this parent facade (or
+            // the wl_surface fallback path) is destroyed.
             if let Some(wl_surface_id) = ctx.window_placement.take_xdg_surface(xdg_surface_id) {
                 if let Some(xdg_toplevel_id) = ctx
                     .window_placement
                     .xdg_toplevel_for_wl_surface(wl_surface_id)
                 {
-                    if let Some(remote_surface_id) =
-                        ctx.window_placement.take_remote_toplevel(xdg_toplevel_id)
-                    {
-                        let _ = remote_shell::queue_remote_destroy(ctx, remote_surface_id);
-                    }
+                    let _ = ctx.window_placement.take_remote_toplevel(xdg_toplevel_id);
                     let _ = ctx
                         .window_placement
                         .take_xdg_toplevel_for_destroy(xdg_toplevel_id);
                     crate::handler::display::queue_mapped_local_delete_id(ctx, xdg_toplevel_id);
+                }
+                if let Some(host_wl_surface_id) = ctx.shadow_table.get_host_id(wl_surface_id) {
+                    if let Some((remote_surface_id, retired_manager)) = ctx
+                        .window_placement
+                        .take_remote_surface_for_wl_surface_with_cleanup(host_wl_surface_id)
+                    {
+                        let _ = remote_shell::queue_remote_destroy(ctx, remote_surface_id);
+                        if let Some((manager_id, _manager_version)) = retired_manager {
+                            let _ = remote_shell::queue_remote_shell_destroy(ctx, manager_id);
+                        }
+                    }
                 }
             }
             crate::handler::display::queue_mapped_local_delete_id(ctx, xdg_surface_id);
@@ -1463,6 +1483,21 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
             // The host never saw this configure, so forwarding its
             // acknowledgement would make the host xdg_surface reject the
             // serial. The guest commit that follows is still forwarded.
+            return Action::Drop;
+        }
+        if ctx.window_placement.uses_remote_shell() {
+            // Remote-shell XDG objects are local facades: the host never
+            // created an xdg_surface and therefore cannot validate an
+            // acknowledgement for an unknown/stale serial. Forwarding this
+            // request would address a synthetic host object and can tear down
+            // the connection with an unknown-object protocol error. Report
+            // the xdg-shell invalid_serial error locally instead.
+            queue_protocol_error(
+                ctx,
+                xdg_surface_id,
+                4,
+                "remote-shell xdg_surface ack_configure has an unknown serial",
+            );
             return Action::Drop;
         }
         Action::Forward
@@ -1592,11 +1627,10 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let xdg_toplevel_id = ctx.last_sender_id;
         if ctx.window_placement.uses_remote_shell() {
-            if let Some(remote_surface_id) =
-                ctx.window_placement.take_remote_toplevel(xdg_toplevel_id)
-            {
-                let _ = remote_shell::queue_remote_destroy(ctx, remote_surface_id);
-            }
+            // The remote surface is tied to the backing wl_surface, so it
+            // remains reusable if the client creates another xdg_toplevel
+            // role on this surface after destroying the current role.
+            let _ = ctx.window_placement.take_remote_toplevel(xdg_toplevel_id);
             let _ = ctx
                 .window_placement
                 .take_xdg_toplevel_for_destroy(xdg_toplevel_id);
@@ -1853,7 +1887,19 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
         // can publish a deferred shortcut from a focus transition and move the
         // window without a new key press.
         let resize_was_pending = ctx.window_placement.pending_resize_size(host_id).is_some();
-        let origin_was_known = ctx.window_placement.origin(host_id).is_some();
+        // A cleanup liveness fallback can retain the last coordinate for
+        // diagnostics while explicitly marking it unconfirmed. Treat that
+        // state as unknown here: the next idle Aura configure is the first
+        // authoritative coordinate available for another relative placement.
+        let retained_origin = ctx.window_placement.origin(host_id);
+        let origin_was_known = ctx.window_placement.confirmed_origin(host_id).is_some();
+        if retained_origin.is_some() && !origin_was_known {
+            log::debug!(
+                "retained Aura origin is unconfirmed; accepting the next idle \
+                 configure as a fresh baseline host={}",
+                host_id
+            );
+        }
         let cleanup_was_pending = ctx.window_placement.self_parent_cleanup_pending(host_id);
         let has_real_size = width > 0 && height > 0;
         if !ctx
@@ -1887,12 +1933,12 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
         // arrive through `origin_change`; the placement resize phase is the
         // only configure path allowed to validate an existing baseline.
         let origin_accepted = if has_real_size && cleanup_was_pending {
-            // After NULL-parent cleanup the host may report the final
-            // position in a normal Aura configure instead of origin_change.
-            // This is still an authoritative placement event while cleanup
-            // is active; intermediate coordinates are rejected by the state
-            // owner and cannot rebase the next shortcut.
-            ctx.window_placement.record_origin(host_id, (_x, _y))
+            // A cleanup configure is authoritative only when it carries the
+            // active self-parent target. Focus/activation configures can arrive
+            // in the same phase with an unrelated animation coordinate; never
+            // let those events rebase the next relative placement.
+            ctx.window_placement.pending_origin(host_id) == Some((_x, _y))
+                && ctx.window_placement.record_origin(host_id, (_x, _y))
         } else if has_real_size && !origin_was_known {
             ctx.window_placement.record_origin(host_id, (_x, _y))
         } else {
@@ -1908,35 +1954,13 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
             );
         }
 
-        // A newer shortcut may have superseded this resize while the host
-        // was converging. Consume that target at this boundary instead of
-        // publishing another operation in response to every intermediate
-        // configure.
-        if resize_was_pending {
-            if let Some(guest_wl_surface_id) = ctx
-                .window_placement
-                .wl_surface_for_xdg_toplevel(guest_xdg_toplevel_id)
-            {
-                if advance_deferred_self_parent_after_resize(
-                    ctx,
-                    guest_xdg_toplevel_id,
-                    guest_wl_surface_id,
-                    host_id,
-                    (width, height),
-                    (_x, _y),
-                ) {
-                    return Action::Drop;
-                }
-            }
-        }
-
         // A native Guest OS window cannot use Aura's direct bounds request.
         // Once the host has acknowledged the synthetic XDG size, perform the
         // position phase from the authoritative origin that just arrived.
         // This deliberately happens in a later host event instead of in the
         // resize batch, avoiding the resize/self-parent race that made an
         // identical `z → a → a` sequence drift by a few pixels.
-        if resize_was_pending && queue_pending_self_parent_move(ctx, host_id, (_x, _y), None) {
+        if resize_was_pending && queue_pending_self_parent_move(ctx, host_id, None) {
             log::debug!(
                 "queued deferred self-parent move host={} origin=({}, {})",
                 host_id,
@@ -1944,7 +1968,7 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
                 _y
             );
         }
-        if advance_self_parent_after_origin(ctx, host_id, (_x, _y)) {
+        if advance_self_parent_after_origin(ctx, host_id) {
             log::debug!(
                 "completed or advanced self-parent placement after configure origin \
                  host={} origin=({}, {})",
@@ -1990,7 +2014,7 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
                 y
             );
         }
-        if advance_self_parent_after_origin(ctx, host_id, (x, y)) {
+        if advance_self_parent_after_origin(ctx, host_id) {
             log::debug!(
                 "completed or advanced self-parent placement after origin_change \
                  host={} origin=({}, {})",
@@ -2033,6 +2057,7 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+    use crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
     use crate::state::{
@@ -2109,6 +2134,61 @@ mod tests {
                 serial,
             ),
             Action::Forward
+        );
+    }
+
+    #[test]
+    fn remote_shell_unknown_xdg_configure_ack_is_rejected_locally() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::remote_shell());
+        ctx.last_sender_id = 500;
+
+        assert_eq!(
+            crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler::on_ack_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                0xdead_beef,
+            ),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(protocol_error_code(&ctx), 4);
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "a synthetic remote-shell xdg_surface must never receive a host ack"
+        );
+    }
+
+    #[test]
+    fn remote_shell_xdg_facade_rolls_back_when_role_creation_fails() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::remote_shell());
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_surface".to_string(), 6);
+        ctx.shadow_table
+            .track_host_interface_with_version(20, "wl_surface".to_string(), 6);
+        // Deliberately omit the host zcr_remote_shell_v2 binding so role
+        // creation fails after the synthetic XDG facade has been allocated.
+        ctx.last_sender_id = 30;
+
+        assert_eq!(
+            crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler::on_get_xdg_surface(
+                &mut CompositorHandler,
+                &mut ctx,
+                40,
+                10,
+            ),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.shadow_table.get_host_id(40), None);
+        assert_eq!(ctx.window_placement.wl_surface_for_xdg_surface(40), None);
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "a failed remote-shell role must not leave a host request queued"
         );
     }
 
@@ -2537,6 +2617,11 @@ mod tests {
         ctx.last_sender_id = xdg_toplevel_id;
 
         let zaura_surface_host = 99u32;
+        ctx.shadow_table.track_host_interface_with_version(
+            zaura_surface_host,
+            "zaura_surface".to_string(),
+            38,
+        );
         assert!(ctx
             .window_placement
             .remember_aura_surface(wl_surface_host, zaura_surface_host));
@@ -4297,7 +4382,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_shell_toplevel_destroy_acknowledges_synthetic_xdg_role() {
+    fn remote_shell_toplevel_destroy_keeps_surface_role_reusable() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement
             .set_mode_for_test(crate::state::WindowPlacementMode::remote_shell());
@@ -4374,6 +4459,51 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_interface(xdg_toplevel_guest), None);
         assert_eq!(ctx.shadow_table.get_host_id(xdg_toplevel_guest), None);
+        assert_eq!(
+            ctx.window_placement
+                .remote_surface_for_wl_surface(wl_surface_host),
+            Some(remote_surface_host),
+            "destroying one XDG role must not retire the wl_surface-owned remote role"
+        );
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "the remote surface must remain live until xdg_surface/wl_surface teardown"
+        );
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
+            xdg_toplevel_guest
+        );
+
+        // A client may create a replacement xdg_toplevel role on the same
+        // xdg_surface/wl_surface after destroying the old role. It must reuse
+        // the live remote surface instead of sending requests to a child whose
+        // destroy was already queued.
+        let replacement_toplevel_guest = 600;
+        assert!(ctx
+            .window_placement
+            .remember_xdg_toplevel(replacement_toplevel_guest, wl_surface_guest));
+        assert!(ctx
+            .window_placement
+            .remember_remote_toplevel(replacement_toplevel_guest, remote_surface_host));
+        assert_eq!(
+            ctx.window_placement
+                .remote_surface_for_xdg_toplevel(replacement_toplevel_guest),
+            Some(remote_surface_host)
+        );
+
+        // Destroying the parent xdg_surface finally retires the shared remote
+        // role exactly once.
+        ctx.last_sender_id = xdg_surface_guest;
+        assert_eq!(
+            XdgSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.window_placement
+                .remote_surface_for_wl_surface(wl_surface_host),
+            None
+        );
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(
             msg_sender(&ctx.client_to_host_queue[0].0),
@@ -4382,11 +4512,6 @@ mod tests {
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[0].0),
             crate::protocols::remote_shell_unstable_v2::zcr_remote_surface_v2::REQ_DESTROY
-        );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
-            xdg_toplevel_guest
         );
     }
 
@@ -4559,6 +4684,49 @@ mod tests {
     }
 
     #[test]
+    fn idle_configure_recovers_an_unconfirmed_origin_baseline() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        assert!(ctx
+            .window_placement
+            .remember_aura_toplevel(xdg_toplevel_id, 77));
+        ctx.shadow_table
+            .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
+
+        // Model the cleanup liveness fallback used when the host omits the
+        // target `origin_change`: the retained coordinate is diagnostic only
+        // and must not block a later relative placement forever.
+        assert!(ctx.window_placement.record_origin(77, (10, 20)));
+        assert!(ctx.window_placement.predict_origin(77, (0, 0)));
+        ctx.window_placement.finish_self_parent_move(77);
+        assert!(ctx
+            .window_placement
+            .complete_self_parent_cleanup_barrier(77));
+        assert!(ctx
+            .window_placement
+            .settle_self_parent_cleanup_without_origin(77));
+        assert_eq!(ctx.window_placement.confirmed_origin(77), None);
+
+        ctx.last_sender_id = 77;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                229,
+                334,
+                1920,
+                1080,
+                &[],
+            ),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.window_placement.confirmed_origin(77),
+            Some((229, 334)),
+            "an idle configure must restore the baseline after fallback"
+        );
+    }
+
+    #[test]
     fn stale_self_parent_origin_does_not_rebase_following_shortcut() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         assert!(ctx
@@ -4568,9 +4736,9 @@ mod tests {
             .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
         assert!(ctx.window_placement.record_origin(77, (100, 200)));
         assert!(ctx.window_placement.predict_origin(77, (0, 0)));
-        // `predict_origin` models the parent request itself.  The real
-        // wire path enters the cleanup phase only after the matching sync
-        // callback has queued `set_parent(NULL)`, so put the fixture at the
+        // `predict_origin` models the parent request itself. The real wire
+        // path enters the cleanup phase only after the matching sync callback
+        // has queued the ordered follow-up barrier, so put the fixture at the
         // same lifecycle boundary before delivering host animation events.
         ctx.window_placement.finish_self_parent_move(77);
         assert!(ctx

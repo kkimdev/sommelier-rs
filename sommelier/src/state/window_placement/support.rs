@@ -49,6 +49,15 @@ pub(super) struct OutputRecord {
 pub(super) struct ToplevelPlacementState {
     /// Last authoritative screen-space origin observed from Aura.
     pub(super) origin: Option<(i32, i32)>,
+    /// Whether `origin` is still confirmed by an idle Aura event.
+    ///
+    /// A completed self-parent transaction may have no matching
+    /// `origin_change` on some Exo/Ash versions. In that case we retire the
+    /// transaction at the ordered cleanup barrier but retain the last known
+    /// coordinate only as a diagnostic value; it must not be used as the
+    /// baseline for another relative placement until Aura reports a fresh
+    /// origin.
+    pub(super) origin_confirmed: bool,
     /// Reducer-owned placement transaction. All phase, generation, deferred
     /// target, and cleanup state lives here; handlers can only feed events
     /// through the methods exposed by `WindowPlacementState`.
@@ -156,10 +165,6 @@ impl BidirectionalLinks {
                 .iter()
                 .all(|(reverse_id, forward_id)| self.forward.get(forward_id) == Some(reverse_id))
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.forward.is_empty()
-    }
 }
 
 /// Ordered host-sync callbacks retained for placement requests.
@@ -167,6 +172,11 @@ impl BidirectionalLinks {
 pub(super) struct PlacementBarrierRegistry {
     by_callback: HashMap<u32, PlacementBarrierRecord>,
     active_by_toplevel: HashMap<u32, u32>,
+    /// Surface IDs whose transient native-identity restore has already been
+    /// handed to the wire adapter. A role can outlive several callbacks, so
+    /// this one-shot claim prevents stale callbacks after teardown from
+    /// emitting the same restore again.
+    released_restore_claims: HashSet<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +189,10 @@ struct PlacementBarrierRecord {
     /// The ID is deliberately metadata only: it never participates in
     /// lifecycle decisions or host protocol serialization.
     trace_id: Option<u64>,
+    /// Whether this callback displaced a previously emitted transient-ARC
+    /// restore claim. If the transaction is cancelled before publication,
+    /// the previous claim must be put back.
+    displaced_restore_claim: bool,
 }
 
 /// Result of completing one placement barrier.
@@ -238,6 +252,12 @@ impl PlacementBarrierRegistry {
         if self.contains_callback(callback_id) {
             return false;
         }
+        let displaced_restore_claim = match cleanup.as_ref() {
+            Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+                zaura_surface_id, ..
+            }) => self.released_restore_claims.remove(zaura_surface_id),
+            _ => false,
+        };
         self.by_callback.insert(
             callback_id,
             PlacementBarrierRecord {
@@ -245,6 +265,7 @@ impl PlacementBarrierRegistry {
                 cleanup,
                 generation,
                 trace_id,
+                displaced_restore_claim,
             },
         );
         self.active_by_toplevel.insert(toplevel_id, callback_id);
@@ -252,18 +273,73 @@ impl PlacementBarrierRegistry {
     }
 
     /// Complete one callback and return cleanup only when it is still active.
-    pub(super) fn complete(&mut self, callback_id: u32) -> Option<PlacementBarrierCompletion> {
+    ///
+    /// A callback can outlive its XDG role. In that teardown case a transient
+    /// ARC identity still needs to be restored because it belongs to the
+    /// backing `wl_surface`. The caller supplies authoritative role
+    /// liveness so an older callback that completes after a newer direct
+    /// bounds operation cannot be mistaken for a released role.
+    pub(super) fn complete(
+        &mut self,
+        callback_id: u32,
+        role_is_live: bool,
+    ) -> Option<PlacementBarrierCompletion> {
         let record = self.by_callback.remove(&callback_id)?;
         let is_active = self.active_by_toplevel.get(&record.toplevel_id) == Some(&callback_id);
         if is_active {
             self.active_by_toplevel.remove(&record.toplevel_id);
         }
+        // A transient ARC identity is owned by the wl_surface rather than
+        // the xdg_toplevel role. If that role was released before the sync
+        // callback arrived, retain only one restore claim so multiple stale
+        // callbacks cannot re-emit the same native identity. The claim is
+        // also recorded for the live active callback: a later role teardown
+        // must not replay cleanup that was already handed to the wire
+        // adapter.
+        let cleanup = match record.cleanup {
+            Some(
+                cleanup @ PlacementBarrierCleanup::RestoreNativeApplicationId {
+                    zaura_surface_id,
+                    ..
+                },
+            ) if is_active || !role_is_live => self
+                .released_restore_claims
+                .insert(zaura_surface_id)
+                .then_some(cleanup),
+            Some(cleanup) if is_active => Some(cleanup),
+            _ => None,
+        };
         Some(PlacementBarrierCompletion {
             toplevel_id: record.toplevel_id,
-            cleanup: is_active.then_some(record.cleanup).flatten(),
+            cleanup,
             trace_id: record.trace_id,
             generation: record.generation,
         })
+    }
+
+    /// Cancel a barrier that was registered during a wire transaction that
+    /// was never published.
+    ///
+    /// This is distinct from `complete`: no host callback can arrive for an
+    /// unpublished `wl_display.sync`, so retaining the record would leak
+    /// cleanup ownership and make a later callback ID appear live forever.
+    pub(super) fn cancel(&mut self, callback_id: u32) -> bool {
+        let Some(record) = self.by_callback.remove(&callback_id) else {
+            return false;
+        };
+        if record.displaced_restore_claim {
+            if let Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+                zaura_surface_id,
+                ..
+            }) = record.cleanup.as_ref()
+            {
+                self.released_restore_claims.insert(*zaura_surface_id);
+            }
+        }
+        if self.active_by_toplevel.get(&record.toplevel_id) == Some(&callback_id) {
+            self.active_by_toplevel.remove(&record.toplevel_id);
+        }
+        true
     }
 
     pub(super) fn release_toplevel(&mut self, toplevel_id: u32) {
@@ -290,7 +366,6 @@ impl PlacementBarrierRegistry {
             })
     }
 
-    #[cfg(test)]
     pub(super) fn callback_for(&self, callback_id: u32) -> Option<u32> {
         self.by_callback
             .get(&callback_id)
@@ -334,9 +409,9 @@ mod tests {
         assert_eq!(barriers.callback_for(40), Some(77));
         assert_eq!(barriers.callback_for(41), Some(77));
         assert!(!barriers.register(41, 88, None));
-        assert_eq!(barriers.complete(40).unwrap().toplevel_id, 77);
+        assert_eq!(barriers.complete(40, true).unwrap().toplevel_id, 77);
         assert_eq!(barriers.active_callback_for(77), Some(41));
-        assert_eq!(barriers.complete(41).unwrap().toplevel_id, 77);
+        assert_eq!(barriers.complete(41, true).unwrap().toplevel_id, 77);
         assert!(barriers.is_empty());
 
         let mut released = PlacementBarrierRegistry::default();
@@ -344,24 +419,84 @@ mod tests {
         assert!(!released.is_consistent(|_| false));
         released.release_toplevel(99);
         assert!(released.is_consistent(|_| false));
-        assert_eq!(released.complete(50).unwrap().toplevel_id, 99);
+        assert_eq!(released.complete(50, false).unwrap().toplevel_id, 99);
         assert!(released.is_empty());
     }
 
     #[test]
     fn only_active_barrier_returns_cleanup() {
         let mut barriers = PlacementBarrierRegistry::default();
-        let cleanup = Some(PlacementBarrierCleanup::Unparent {
+        let cleanup = Some(PlacementBarrierCleanup::RetainSelfParent {
             zaura_surface_id: 55,
         });
         assert!(barriers.register(40, 77, cleanup.clone()));
         assert!(barriers.register(41, 77, cleanup));
-        assert_eq!(barriers.complete(40).unwrap().cleanup, None);
+        assert_eq!(barriers.complete(40, true).unwrap().cleanup, None);
         assert_eq!(
-            barriers.complete(41).unwrap().cleanup,
-            Some(PlacementBarrierCleanup::Unparent {
+            barriers.complete(41, true).unwrap().cleanup,
+            Some(PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: 55
             })
+        );
+    }
+
+    #[test]
+    fn stale_restore_cleanup_is_not_replayed_after_live_role_finishes() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        let cleanup = Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+            zaura_surface_id: 55,
+            wl_surface_guest_id: 10,
+        });
+        assert!(barriers.register(40, 77, cleanup.clone()));
+        assert!(barriers.register(41, 77, cleanup));
+
+        // The newer generation completes first. The old callback is still
+        // host-owned, but the role is alive; it must not be interpreted as a
+        // released role and restore an identity after the newer generation.
+        assert!(barriers.complete(41, true).unwrap().cleanup.is_some());
+        assert!(
+            barriers.complete(40, true).unwrap().cleanup.is_none(),
+            "a stale callback on a live role must not replay transient cleanup"
+        );
+    }
+
+    #[test]
+    fn released_role_allows_only_one_transient_restore_callback() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        let cleanup = Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+            zaura_surface_id: 55,
+            wl_surface_guest_id: 10,
+        });
+        assert!(barriers.register(40, 77, cleanup.clone()));
+        assert!(barriers.register(41, 77, cleanup));
+        barriers.release_toplevel(77);
+
+        assert!(
+            barriers.complete(40, false).unwrap().cleanup.is_some(),
+            "the first stale callback owns the released surface restore"
+        );
+        assert!(
+            barriers.complete(41, false).unwrap().cleanup.is_none(),
+            "a second stale callback must not replay native identity restore"
+        );
+    }
+
+    #[test]
+    fn cancelled_transient_registration_restores_displaced_claim() {
+        let mut barriers = PlacementBarrierRegistry::default();
+        let cleanup = Some(PlacementBarrierCleanup::RestoreNativeApplicationId {
+            zaura_surface_id: 55,
+            wl_surface_guest_id: 10,
+        });
+        assert!(barriers.register(40, 77, cleanup.clone()));
+        assert!(barriers.register(41, 77, cleanup.clone()));
+        assert!(barriers.complete(41, true).unwrap().cleanup.is_some());
+        assert!(barriers.register(42, 77, cleanup));
+        assert!(barriers.cancel(42));
+        barriers.release_toplevel(77);
+        assert!(
+            barriers.complete(40, false).unwrap().cleanup.is_none(),
+            "cancelling the replacement must preserve the prior one-shot claim"
         );
     }
 }

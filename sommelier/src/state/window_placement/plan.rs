@@ -162,8 +162,9 @@ impl PlacementTarget {
 /// encodes the selected operation after the matching barrier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlacementBarrierCleanup {
-    /// Release the temporary self-parent relationship.
-    Unparent { zaura_surface_id: u32 },
+    /// Retain the self-parent relationship while the ordered cleanup barrier
+    /// refreshes host activation/IME state.
+    RetainSelfParent { zaura_surface_id: u32 },
     /// Restore the native Guest OS ID after a transient ARC bounds request.
     ///
     /// The bounds backend does not install a parent relationship, so its
@@ -302,7 +303,7 @@ impl WindowPlacementPlan {
                     relative_position,
                 },
                 None,
-                Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+                Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
             ) => {
                 *zaura_surface_id == self.target.zaura_surface_host_id
                     && current_origin.0.checked_add(relative_position.0) == Some(self.bounds.0)
@@ -451,7 +452,7 @@ mod tests {
             current_origin: (50, 100),
             relative_position: (50, 100),
         };
-        self_parent.barrier_cleanup = Some(PlacementBarrierCleanup::Unparent {
+        self_parent.barrier_cleanup = Some(PlacementBarrierCleanup::RetainSelfParent {
             zaura_surface_id: 6,
         });
         assert!(self_parent.is_well_formed());
@@ -491,7 +492,7 @@ mod tests {
             (100, 200, 800, 600),
             WindowPlacementGeometry::Bounds,
             None,
-            Some(PlacementBarrierCleanup::Unparent {
+            Some(PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: 99,
             }),
         );
@@ -522,7 +523,7 @@ mod tests {
                 relative_position: (1, 200),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent {
+            Some(PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: 6,
             }),
         );

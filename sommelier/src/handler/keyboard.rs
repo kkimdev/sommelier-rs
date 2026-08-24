@@ -2174,6 +2174,16 @@ mod tests {
                 ctx.window_placement.note_guest_surface_commit(surface),
                 "guest ack and commit must open the resize phase"
             );
+            if let Some(zaura_toplevel_id) = ctx
+                .window_placement
+                .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
+            {
+                let _ = crate::handler::placement::queue_pending_self_parent_move(
+                    ctx,
+                    zaura_toplevel_id,
+                    None,
+                );
+            }
         };
         acknowledge_synthetic_resize(&mut ctx);
         let zaura_surface_id = ctx
@@ -2271,7 +2281,7 @@ mod tests {
 
         // A newer shortcut can arrive after the first parent move but before
         // its barrier completes. The newer resize must survive the older
-        // callback's unparent cleanup and reach its own position phase.
+        // callback's ordered cleanup and reach its own position phase.
         assert!(KeyboardHandler::apply_window_layout(
             &mut ctx,
             HostId(host_keyboard),
@@ -2293,6 +2303,20 @@ mod tests {
             "the newer rectangle must remain queued behind cleanup"
         );
 
+        // The first self-parent move is not settled by its sync callback.
+        // Feed the authoritative target origin before the follow-up IME
+        // barrier can promote the deferred rectangle.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut crate::handler::compositor::CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+            ),
+            Action::Drop
+        );
+
         let parent_requests: Vec<_> = ctx
             .client_to_host_queue
             .iter()
@@ -2303,26 +2327,13 @@ mod tests {
             .collect();
         assert_eq!(
             parent_requests.len(),
-            2,
-            "barrier completion must append the explicit unparent request"
-        );
-        assert_eq!(
-            u32::from_ne_bytes(parent_requests[1].0[8..12].try_into().unwrap()),
-            0,
-            "cleanup must use a null parent"
-        );
-        assert_eq!(
-            i32::from_ne_bytes(parent_requests[1].0[12..16].try_into().unwrap()),
-            0
-        );
-        assert_eq!(
-            i32::from_ne_bytes(parent_requests[1].0[16..20].try_into().unwrap()),
-            0
+            1,
+            "barrier completion must retain the existing self-parent request"
         );
 
-        // The first callback queues a second sync after NULL-parent and IME
-        // refresh. Complete that barrier before accepting the final host
-        // origin; an origin event alone must not advance the deferred resize.
+        // The first callback queues a second sync for the IME refresh.
+        // Complete that barrier before accepting the final host origin; an
+        // origin event alone must not advance the deferred resize.
         let followup_callback = ctx
             .client_to_host_queue
             .iter()
@@ -2360,21 +2371,21 @@ mod tests {
             .collect();
         assert_eq!(
             parent_requests.len(),
-            2,
+            1,
             "the newer size must start a second resize phase before its \
-             self-parent move"
+             self-parent move; cleanup must not add a nullable parent request"
         );
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
-            None,
-            "a changed deferred rectangle must also wait for the \
-             previous self-parent origin to settle"
+            Some((1920, 2160)),
+            "the changed deferred rectangle may start after the cleanup \
+             barrier settles the previous parent generation"
         );
         assert_eq!(
             ctx.window_placement
                 .deferred_self_parent_target(zaura_toplevel_id),
-            Some((1920, 0, 1920, 2160)),
-            "the changed target remains deferred until final origin"
+            None,
+            "the changed target must be promoted exactly once after cleanup"
         );
 
         ctx.last_sender_id = zaura_toplevel_id;
@@ -2390,7 +2401,7 @@ mod tests {
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
             Some((1920, 2160)),
-            "the changed target starts only after final origin confirmation"
+            "a late origin must not cancel the promoted resize"
         );
 
         acknowledge_synthetic_resize(&mut ctx);
@@ -2419,19 +2430,19 @@ mod tests {
             .collect();
         assert_eq!(
             parent_requests.len(),
-            3,
+            2,
             "the acknowledged deferred size must queue one self-parent move"
         );
         assert_eq!(
-            u32::from_ne_bytes(parent_requests[2].0[8..12].try_into().unwrap()),
+            u32::from_ne_bytes(parent_requests[1].0[8..12].try_into().unwrap()),
             zaura_surface_id
         );
         assert_eq!(
-            i32::from_ne_bytes(parent_requests[2].0[12..16].try_into().unwrap()),
+            i32::from_ne_bytes(parent_requests[1].0[12..16].try_into().unwrap()),
             1920
         );
         assert_eq!(
-            i32::from_ne_bytes(parent_requests[2].0[16..20].try_into().unwrap()),
+            i32::from_ne_bytes(parent_requests[1].0[16..20].try_into().unwrap()),
             0
         );
     }

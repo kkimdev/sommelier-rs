@@ -24,7 +24,8 @@ use crate::protocols::wayland::{wl_display, wl_keyboard};
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId, SeatFocusChange,
+    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
+    SeatFocusChange, TextInputState,
 };
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
@@ -1540,6 +1541,9 @@ pub(crate) struct PlacementImePreflight {
     pub(crate) host_messages: Vec<(Vec<u8>, Vec<RawFd>)>,
     pub(crate) guest_text_inputs: Vec<u32>,
     pub(crate) guest_surface_id: u32,
+    /// Byte-for-byte snapshots used if a later placement publication step
+    /// fails after this preflight has been committed locally.
+    previous_states: Vec<(u32, TextInputState)>,
 }
 
 pub(crate) fn prepare_placement_ime_deactivation(
@@ -1577,6 +1581,7 @@ pub(crate) fn prepare_placement_ime_deactivation(
             host_messages: Vec::new(),
             guest_text_inputs: Vec::new(),
             guest_surface_id,
+            previous_states: Vec::new(),
         });
     }
 
@@ -1651,6 +1656,19 @@ pub(crate) fn prepare_placement_ime_deactivation(
             return None;
         }
     }
+    let previous_states = guest_text_inputs
+        .iter()
+        .filter_map(|&guest_id| {
+            ctx.text_inputs
+                .get(&guest_id)
+                .cloned()
+                .map(|state| (guest_id, state))
+        })
+        .collect::<Vec<_>>();
+    if previous_states.len() != guest_text_inputs.len() {
+        log::warn!("Text-input state disappeared while snapshotting transient placement preflight");
+        return None;
+    }
 
     log::debug!(
         "[ime] draining {} committed text-input generation(s) before transient ARC placement on surface {}",
@@ -1661,6 +1679,7 @@ pub(crate) fn prepare_placement_ime_deactivation(
         host_messages,
         guest_text_inputs,
         guest_surface_id,
+        previous_states,
     })
 }
 
@@ -1672,7 +1691,7 @@ pub(crate) fn prepare_placement_ime_deactivation(
 /// after Aura identity restoration without fabricating a guest focus event.
 pub(crate) fn commit_placement_ime_preflight(
     ctx: &mut Context,
-    preflight: PlacementImePreflight,
+    preflight: &PlacementImePreflight,
 ) -> bool {
     for &guest_id in &preflight.guest_text_inputs {
         let Some(state) = ctx.text_inputs.get(&guest_id) else {
@@ -1693,7 +1712,7 @@ pub(crate) fn commit_placement_ime_preflight(
         }
     }
 
-    for guest_id in preflight.guest_text_inputs {
+    for &guest_id in &preflight.guest_text_inputs {
         let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
             return false;
         };
@@ -1705,6 +1724,7 @@ pub(crate) fn commit_placement_ime_preflight(
                 "Text input {} could not begin transient placement refresh",
                 guest_id
             );
+            rollback_placement_ime_preflight(ctx, preflight);
             return false;
         }
         log::info!(
@@ -1715,10 +1735,41 @@ pub(crate) fn commit_placement_ime_preflight(
             preflight.guest_surface_id
         );
         let _ = state.deactivate_host_without_barrier();
-        ctx.text_input_replay_barriers
-            .cancel_host_enter_replay(guest_id, state.host_v1_id);
     }
     true
+}
+
+/// Restore the text-input state captured before a placement preflight.
+///
+/// Placement publication is synchronous, but the state owner still treats the
+/// preflight as a transaction: a failed placement plan must not strand a
+/// focused editor in the temporary inactive generation.
+pub(crate) fn rollback_placement_ime_preflight(
+    ctx: &mut Context,
+    preflight: &PlacementImePreflight,
+) {
+    for (guest_id, snapshot) in &preflight.previous_states {
+        if let Some(state) = ctx.text_inputs.get_mut(guest_id) {
+            *state = snapshot.clone();
+        }
+    }
+}
+
+/// Finalize a successfully published placement preflight.
+///
+/// Replay tokens are cancelled only after every fallible placement/state
+/// operation has succeeded. Keeping them intact during the transaction makes
+/// rollback byte-for-byte complete.
+pub(crate) fn finalize_placement_ime_preflight(
+    ctx: &mut Context,
+    preflight: &PlacementImePreflight,
+) {
+    for &guest_id in &preflight.guest_text_inputs {
+        if let Some(state) = ctx.text_inputs.get(&guest_id) {
+            ctx.text_input_replay_barriers
+                .cancel_host_enter_replay(guest_id, state.host_v1_id);
+        }
+    }
 }
 
 /// Finish the local half of a transient placement marker.
@@ -4112,6 +4163,42 @@ mod tests {
     }
 
     #[test]
+    fn placement_preflight_partial_commit_restores_every_text_input_snapshot() {
+        let (mut ctx, host_v1_id, first_guest_id) = setup_v1_ctx();
+        let focused_surface = ctx.text_inputs[&first_guest_id]
+            .active_surface
+            .expect("fixture must start focused");
+        let second_guest_id = first_guest_id + 1;
+        let second_host_v1_id = host_v1_id + 1;
+        let mut second = ctx.text_inputs[&first_guest_id].clone();
+        second.host_v1_id = second_host_v1_id;
+        ctx.text_inputs.insert(second_guest_id, second);
+
+        let first_before = ctx.text_inputs[&first_guest_id].clone();
+        let second_before = ctx.text_inputs[&second_guest_id].clone();
+        let preflight = PlacementImePreflight {
+            host_messages: Vec::new(),
+            // The duplicate final entry is a crafted mid-transaction fault:
+            // the first two objects begin successfully, then the repeated
+            // second object fails because its placement marker is already
+            // active. The rollback must restore both earlier objects.
+            guest_text_inputs: vec![first_guest_id, second_guest_id, second_guest_id],
+            guest_surface_id: focused_surface,
+            previous_states: vec![
+                (first_guest_id, first_before.clone()),
+                (second_guest_id, second_before.clone()),
+            ],
+        };
+
+        assert!(
+            !commit_placement_ime_preflight(&mut ctx, &preflight),
+            "a later text-input failure must abort the entire preflight"
+        );
+        assert_eq!(ctx.text_inputs[&first_guest_id], first_before);
+        assert_eq!(ctx.text_inputs[&second_guest_id], second_before);
+    }
+
+    #[test]
     fn placement_refresh_recovers_when_guest_was_disabled() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let focused_surface = ctx.text_inputs[&guest_id]
@@ -4135,7 +4222,7 @@ mod tests {
             .expect("focused text input should be tracked during placement");
         assert_eq!(preflight.guest_text_inputs, vec![guest_id]);
         assert!(preflight.host_messages.is_empty());
-        assert!(commit_placement_ime_preflight(&mut ctx, preflight));
+        assert!(commit_placement_ime_preflight(&mut ctx, &preflight));
         assert!(ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface));
         assert!(!refresh_host_activation_for_surface(
             &mut ctx,
@@ -4209,7 +4296,7 @@ mod tests {
 
         let preflight = prepare_placement_ime_deactivation(&mut ctx, focused_surface)
             .expect("focused text input should be eligible for placement refresh");
-        assert!(commit_placement_ime_preflight(&mut ctx, preflight));
+        assert!(commit_placement_ime_preflight(&mut ctx, &preflight));
         assert!(
             ctx.text_inputs[&guest_id].placement_ime_pending_for(focused_surface),
             "placement must own one pending recovery generation"

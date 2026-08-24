@@ -24,7 +24,6 @@ use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCAL
 use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
-use crate::protocols::remote_shell_unstable_v2::zcr_remote_shell_v2::REQ_DESTROY as REMOTE_SHELL_DESTROY;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
@@ -447,24 +446,21 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     if let Some((shell_id, _shell_version)) =
         ctx.window_placement.take_remote_shell_for_global(name)
     {
-        if ctx.window_placement.has_remote_surfaces() {
+        if ctx.window_placement.remote_shell_has_children(shell_id) {
             // The remote-shell protocol explicitly forbids destroying its
             // manager while child remote surfaces are alive. A registry
             // global removal invalidates only the advertisement; keep the
-            // manager host ID reserved but retire dispatch metadata, and let
-            // each child finish its own destructor before the connection
-            // closes. A replacement global may bind a new manager ID.
+            // manager host ID and dispatch metadata, and let each child finish
+            // its own destructor before releasing the manager. A replacement
+            // global may bind a new manager ID.
             log::warn!(
                 "Keeping remote-shell manager {} alive after global {} removal \
                  because remote surfaces remain",
                 shell_id,
                 name
             );
-            ctx.shadow_table.retire_host_interface(shell_id);
         } else {
-            let message = MessageBuilder::new().build_message(shell_id, REMOTE_SHELL_DESTROY);
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.shadow_table.mark_pending_destroy_host(shell_id);
+            let _ = crate::handler::remote_shell::queue_remote_shell_destroy(ctx, shell_id);
         }
     }
     ctx.hidden_host_globals.remove(&name);
@@ -1380,6 +1376,7 @@ mod tests {
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
     use crate::protocols::gtk::gtk_shell1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+    use crate::protocols::remote_shell_unstable_v2::zcr_remote_shell_v2;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_fixes::WlFixesHandler;
@@ -1458,21 +1455,26 @@ mod tests {
             .window_placement
             .remote_shell_id()
             .expect("remote-shell manager should be bound");
-        let remote_surface_id = ctx.shadow_table.allocate_host_id();
+        let expected_remote_surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table.track_host_interface_with_version(
-            remote_surface_id,
+            expected_remote_surface_id,
             "zcr_remote_surface_v2".to_string(),
             6,
         );
         assert!(ctx
             .window_placement
-            .remember_remote_surface(200, remote_surface_id));
+            .remember_remote_surface(200, expected_remote_surface_id));
 
         ctx.last_sender_id = 100;
         assert_eq!(handler.on_global_remove(&mut ctx, 7), Action::Drop);
         assert!(ctx.window_placement.remote_shell_id().is_none());
         assert!(!ctx.shadow_table.is_pending_destroy_host_only(manager_id));
         assert!(!ctx.shadow_table.is_host_id_available(manager_id));
+        assert!(
+            ctx.shadow_table
+                .host_object_matches(manager_id, "zcr_remote_shell_v2"),
+            "the retired manager must remain addressable until its child is gone"
+        );
         assert!(
             ctx.client_to_host_queue
                 .iter()
@@ -1482,6 +1484,125 @@ mod tests {
                 ),
             "destroying the manager while a child role is live is a protocol error"
         );
+
+        let (remote_surface_id, retired_manager) = ctx
+            .window_placement
+            .take_remote_surface_for_wl_surface_with_cleanup(200)
+            .expect("live remote surface should be removed");
+        assert_eq!(remote_surface_id, expected_remote_surface_id);
+        assert_eq!(retired_manager, Some((manager_id, 6)));
+        assert!(!ctx.window_placement.remote_shell_has_children(manager_id));
+        assert!(crate::handler::remote_shell::queue_remote_destroy(
+            &mut ctx,
+            remote_surface_id
+        ));
+        assert!(crate::handler::remote_shell::queue_remote_shell_destroy(
+            &mut ctx, manager_id
+        ));
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(manager_id));
+        assert_eq!(
+            u32::from_ne_bytes(
+                ctx.client_to_host_queue[ctx.client_to_host_queue.len() - 2].0[0..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            remote_surface_id
+        );
+        assert_eq!(
+            u32::from_ne_bytes(
+                ctx.client_to_host_queue[ctx.client_to_host_queue.len() - 1].0[0..4]
+                    .try_into()
+                    .unwrap()
+            ),
+            manager_id
+        );
+        assert_eq!(
+            u16::from_ne_bytes(
+                ctx.client_to_host_queue[ctx.client_to_host_queue.len() - 1].0[4..6]
+                    .try_into()
+                    .unwrap()
+            ),
+            zcr_remote_shell_v2::REQ_DESTROY
+        );
+    }
+
+    #[test]
+    fn remote_shell_replacement_destruction_isolated_by_manager_generation() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement
+            .set_mode_for_test(crate::state::WindowPlacementMode::remote_shell());
+        ctx.shadow_table.map_id(10, 100);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+        ctx.last_sender_id = 100;
+
+        let mut handler = RegistryHandler;
+        assert_eq!(
+            handler.on_global(&mut ctx, 7, &"zcr_remote_shell_v2".to_string(), 6,),
+            Action::Drop
+        );
+        let manager_a = ctx
+            .window_placement
+            .remote_shell_id()
+            .expect("first manager should be bound");
+        let child_a = ctx.shadow_table.allocate_host_id();
+        ctx.shadow_table.track_host_interface_with_version(
+            child_a,
+            "zcr_remote_surface_v2".to_string(),
+            6,
+        );
+        assert!(ctx
+            .window_placement
+            .remember_remote_surface_for_manager(200, child_a, manager_a));
+
+        assert_eq!(handler.on_global_remove(&mut ctx, 7), Action::Drop);
+        assert!(ctx
+            .shadow_table
+            .host_object_matches(manager_a, "zcr_remote_shell_v2"));
+
+        // The same numeric global name is re-advertised as a new manager
+        // generation while the first generation's child remains live.
+        assert_eq!(
+            handler.on_global(&mut ctx, 7, &"zcr_remote_shell_v2".to_string(), 6,),
+            Action::Drop
+        );
+        let manager_b = ctx
+            .window_placement
+            .remote_shell_id()
+            .expect("replacement manager should be bound");
+        assert_ne!(manager_a, manager_b);
+        assert_eq!(
+            handler.on_global_remove(&mut ctx, 7),
+            Action::Drop,
+            "replacement removal should be consumed internally"
+        );
+        assert!(
+            ctx.shadow_table.is_pending_destroy_host_only(manager_b),
+            "manager B has no children and must be destroyed immediately"
+        );
+        assert!(
+            !ctx.shadow_table.is_pending_destroy_host_only(manager_a),
+            "manager A must not be destroyed by manager B removal"
+        );
+        assert!(
+            ctx.shadow_table
+                .host_object_matches(manager_a, "zcr_remote_shell_v2"),
+            "manager A metadata remains live for its child"
+        );
+
+        let (child_id, retired_manager) = ctx
+            .window_placement
+            .take_remote_surface_for_wl_surface_with_cleanup(200)
+            .expect("manager A child should remain live");
+        assert_eq!(child_id, child_a);
+        assert_eq!(retired_manager, Some((manager_a, 6)));
+        assert!(crate::handler::remote_shell::queue_remote_destroy(
+            &mut ctx, child_id
+        ));
+        assert!(crate::handler::remote_shell::queue_remote_shell_destroy(
+            &mut ctx, manager_a
+        ));
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(manager_a));
     }
 
     #[test]

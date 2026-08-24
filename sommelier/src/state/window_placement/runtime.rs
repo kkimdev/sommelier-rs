@@ -45,8 +45,9 @@ pub(crate) enum WindowArcIdLifetime {
     /// Keep the ARC task-form ID on the Aura surface for the window lifetime.
     #[default]
     Persistent,
-    /// Install ARC around one placement, then unparent and restore the native
-    /// Guest OS identity after the host barrier.
+    /// Install ARC around one direct-bounds placement, then restore the native
+    /// Guest OS identity after the host barrier. This path does not install a
+    /// parent relationship.
     Transient,
     /// Restore the native shell ID after installation while retaining ARC
     /// policy properties for later bounds requests.
@@ -177,6 +178,11 @@ impl WindowPlacementMode {
             && !matches!(arc_id_lifetime, WindowArcIdLifetime::Persistent)
         {
             return Err("a non-persistent ARC lifetime requires a geometry method");
+        }
+        if matches!(geometry_method, WindowGeometryMethod::RemoteShell)
+            && !matches!(host_policy, WindowHostPolicy::Guest)
+        {
+            return Err("remote-shell geometry does not support ARC host policy");
         }
 
         Ok(match geometry_method {
@@ -501,6 +507,12 @@ mod tests {
             WindowHostPolicy::Arc,
             WindowGeometryMethod::None,
             WindowArcIdLifetime::PersistentNativeShell,
+        )
+        .is_err());
+        assert!(WindowPlacementMode::from_axes(
+            WindowHostPolicy::Arc,
+            WindowGeometryMethod::RemoteShell,
+            WindowArcIdLifetime::Persistent,
         )
         .is_err());
     }

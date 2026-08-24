@@ -40,9 +40,12 @@ therefore does not create a genuine ARC task.
 
 ## IDs in the current rewrite
 
-When `--window-host-policy=arc` is selected, Sommelier reserves one numeric
-block before it accepts clients. The block is claimed by an exclusive
-filesystem lock under:
+When the public `--window-placement-backend` selects an ARC-backed mode
+(`transient-arc` or `persistent`), Sommelier reserves one numeric block before
+it accepts clients. The native `set-parent` backend does not allocate or
+install an ARC identity. The lower-level
+`--window-host-policy=arc` spelling is retained only as a hidden development
+switch. The block is claimed by an exclusive filesystem lock under:
 
 ```text
 $XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<start>-<end>.lock
@@ -52,28 +55,13 @@ The block files are deliberately retained after process exit. The kernel
 releases the `flock` automatically when the owning process closes its
 descriptor; deleting a locked pathname could let another process create a
 different inode and accidentally hold the same numeric range concurrently.
-The allocator also keeps a parent-side
-`$XDG_RUNTIME_DIR/.arc-task-blocks.guard` descriptor. Its
-generation marker stores only the stable device/inode pair for
-`arc-task-blocks`; timestamps are deliberately excluded because creating a
-normal lock file changes directory ctime. If the block directory is removed
-and recreated while another allocator is alive, the guard in the stable XDG
-runtime parent rejects the new generation instead of silently creating a
-second lock namespace. This also covers replacement of the whole
-`sommelier/` directory. Once all allocators release the guard, a later
-process may adopt the replacement directory. The guard directory and guard
-pathname are part of the trusted same-user runtime namespace: advisory
-`flock` cannot prevent a same-UID process from unlinking the guard inode itself
-and creating a replacement inode. Such deliberate cleanup can split the lock
-namespace and is outside the protection this user-space allocator can provide;
-production cleanup must leave the XDG runtime parent and its guard file in place
-while a proxy may be running.
-
-The runtime, `sommelier`, and `arc-task-blocks` directories must be absolute,
-owner-only directories. Existing lock files must be regular files owned by
-the effective user with mode `0600`; symlinks, FIFOs, unsafe permissions, and
-malformed generation markers fail closed rather than being followed or
-silently repaired.
+The allocator keeps a shared guard in the trusted XDG runtime parent and
+records the device/inode identity of the lock directory. A replacement of the
+`sommelier/` or `arc-task-blocks/` directory while another allocator is alive
+is rejected, and runtime/lock directories plus lock files are validated for
+owner, mode, regular-file type, and symlink safety. Advisory `flock` still
+cannot defend against a deliberate same-UID unlink/recreate of the guard inode
+itself; the runtime namespace must remain intact while a proxy is running.
 
 The current private best-effort pool is:
 
@@ -87,25 +75,54 @@ Every guest surface receives the next numeric suffix from the process block:
 org.chromium.arc.<allocated_task_id>
 ```
 
-The same ID is reused by the corresponding XDG/Aura and GTK metadata paths
-for that surface. Separate Sommelier processes contend on the same block
-files, so they cannot select the same block while both are alive. `INT_MAX` is
-excluded because `org.chromium.arc.2147483647` was the exact PR #2/custom-host
-compatibility sentinel; it is retained only as historical evidence, not as a
-general allocation endpoint.
+The ID is retained in placement state and is installed on the Aura surface as
+the steady-state compatibility identity. The host XDG role remains the native
+Guest OS ID. The ordered metadata stream is:
+
+```text
+zaura_surface.set_application_id(org.chromium.arc.<allocated_task_id>)
+```
+
+Placement then sends only:
+
+```text
+zaura_toplevel.set_window_bounds(...)
+wl_display.sync(...)
+```
+
+Separate Sommelier processes contend on the same block files, so they cannot
+select the same block while both are alive. `INT_MAX` is excluded because
+`org.chromium.arc.2147483647` was the exact PR #2/custom-host compatibility
+sentinel; it is retained only as historical evidence, not as a general
+allocation endpoint. A generated task ID is unique within the live Sommelier
+block, but it is still not a genuine Android task identity.
 
 The host XDG role keeps Sommelier's normal
 `org.chromium.guest_os.<vm>.wayland.<app>` identity. This split prevents
-ordinary XDG shelf, restore, and role bookkeeping from being misclassified as
-ARC. The allocator is still only a convention: ChromeOS does not provide a
-query through this Wayland path, so Sommelier cannot prove that a fabricated
+ordinary XDG role/restore bookkeeping from being classified as ARC. Aura shelf
+or icon classification may still be generic because the compatibility task ID
+is visible there; this is the current trade-off for stable placement and IME
+behavior. The allocator is still only a convention: ChromeOS does not provide
+a query through this Wayland path, so Sommelier cannot prove that a fabricated
 number is absent from Android's own task table.
 
-The feature remains opt-in because changing the namespace enables ARC-specific
-host behavior beyond bounds placement. A process that loses its host windows
-without a corresponding compositor teardown could make a newly reused block
-overlap stale metadata; the block scheme therefore assumes normal Wayland
-connection teardown.
+The named `--window-placement-backend=set-parent` mode deliberately keeps the
+native Guest OS identity and uses the experimental `zaura_surface.set_parent`
+probe only for position. Size is negotiated through the normal XDG
+`configure`/`ack_configure`/`commit` path, with a host-side
+`xdg_surface.set_window_geometry` request. After the host has acknowledged the
+size and the self-parent position phase, the self-parent relationship remains
+installed for the life of the Aura surface. Sending
+`set_parent(NULL, 0, 0)` was rejected after runtime testing because it starts
+another host focus/activation transition. No ARC task/session identity is
+allocated or installed in this mode, so the normal shelf icon and IME
+classification remain intact.
+
+The feature remains opt-in because the task-form namespace enables
+ARC-specific host behavior beyond bounds placement. A process that loses its
+host windows without a corresponding compositor teardown could make a newly
+reused block overlap stale metadata; the block scheme therefore assumes normal
+Wayland connection teardown.
 
 ## The real ARC task-ID allocator
 
@@ -151,6 +168,38 @@ without a host capability: it reserves a positive private pool, never reuses
 an ID within a live process block, and coordinates all local Sommelier
 instances through `flock`. A real host capability remains preferable because
 only ARC/Android can establish global task ownership.
+
+## ChromiumOS property-lifetime finding (2026-08-22)
+
+The transient sequence is not a reversible policy transaction on the current
+ChromiumOS Exo implementation. `ShellSurfaceBase::SetApplicationId()` invokes
+`WMHelper::PopulateAppProperties()` on the existing Aura window. The ARC
+resolver adds `kAppTypeKey=ARC_APP`, restore/ghost properties, and
+`aura::client::kSkipImeProcessing=true` when it sees
+`org.chromium.arc.<task_id>`. The resolver has no inverse operation that
+removes those properties when a later native Guest OS ID is supplied; it only
+adds properties for recognized namespaces.
+
+Therefore:
+
+```text
+Guest ID -> ARC task ID -> Guest ID
+```
+
+restores the application-ID string but can leave the Aura window classified as
+ARC and keep the IME-skip property set. `components/exo/keyboard.cc` checks
+that property before running the normal `ConsumedByIme()` path, which matches
+the observed “English works, Korean composition stops after one placement”
+failure. Deactivate/activate replay inside Sommelier cannot clear a host Aura
+property that the Wayland protocol does not expose.
+
+This is why the transient backend must remain an experiment until a host-side
+property-clearing API is available. The persistent task-form backend avoids the
+mid-life identity transition (and has been the IME-stable comparison), but its
+fabricated task identity can degrade shelf/icon matching. The native Guest
+`set-parent` backend preserves IME and icon identity but cannot be assumed to
+resize: `ChromeSecurityDelegate::CanSetBounds()` returns `IGNORE` for a
+non-ARC window.
 
 ## Rejected experiment: fabricated ARC session IDs
 
@@ -218,6 +267,9 @@ Chromium ARC parsing and host classification:
 
 - [`chromeos/ash/experiences/arc/arc_util.cc`](https://chromium.googlesource.com/chromium/src/+/main/chromeos/ash/experiences/arc/arc_util.cc)
 - [`chrome/browser/ui/ash/shelf/app_service/exo_app_type_resolver.cc`](https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ui/ash/shelf/app_service/exo_app_type_resolver.cc)
+- [`components/exo/shell_surface_base.cc`](https://chromium.googlesource.com/chromium/src/+/main/components/exo/shell_surface_base.cc)
+- [`components/exo/keyboard.cc`](https://chromium.googlesource.com/chromium/src/+/main/components/exo/keyboard.cc)
+- [`chrome/browser/ash/exo/chrome_security_delegate.cc`](https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ash/exo/chrome_security_delegate.cc)
 
 ARC restore/session handling:
 
