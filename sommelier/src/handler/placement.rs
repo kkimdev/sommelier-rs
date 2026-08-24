@@ -244,10 +244,12 @@ pub(crate) fn queue_zaura_output_release(ctx: &mut Context, zaura_output_host_id
     }
 }
 
-/// Queue a nullable `zaura_surface.set_parent` request.
+/// Encode a `zaura_surface.set_parent` request.
 ///
-/// `parent_id = None` is the protocol's explicit unparent operation. Both the
-/// shortcut path and the asynchronous barrier path use this serializer.
+/// `parent_id = None` is the protocol's explicit unparent operation. Runtime
+/// self-parent placement currently uses only the self-parent form; cleanup
+/// retains that relationship because the nullable form starts a new host
+/// focus/activation transition on the tested compositor.
 fn build_zaura_surface_parent(
     ctx: &mut Context,
     zaura_surface_id: u32,
@@ -297,9 +299,7 @@ fn build_zaura_surface_parent(
 }
 
 /// Queue a nullable `zaura_surface.set_parent` request.
-///
-/// `parent_id = None` is the protocol's explicit unparent operation. Both the
-/// shortcut path and the asynchronous barrier path use this serializer.
+#[cfg(test)]
 pub(crate) fn queue_zaura_surface_parent(
     ctx: &mut Context,
     zaura_surface_id: u32,
@@ -359,18 +359,22 @@ pub(crate) fn queue_barrier_cleanup_with_trace(
         );
     }
     match cleanup {
-        PlacementBarrierCleanup::Unparent { zaura_surface_id } => {
+        PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id } => {
             if let Some(trace_id) = trace_id {
                 log::info!(
-                    "[placement#{}] queue phase=unparent surface={} (NULL parent)",
+                    "[placement#{}] queue phase=self-parent-retain surface={} \
+                     (no NULL-parent request)",
                     trace_id,
                     zaura_surface_id
                 );
             }
-            let unparented = queue_zaura_surface_parent(ctx, *zaura_surface_id, None, 0, 0);
-            if !unparented {
-                return false;
-            }
+            // Keep the self-parent relationship installed for this proxy
+            // instance.  On the tested Exo/Ash host, `set_parent(NULL)` is
+            // interpreted as a fresh activation transition: it can animate
+            // the window to an unsolicited origin and invalidate the host IME
+            // generation.  The ordered follow-up barrier still retires the
+            // placement transaction and refreshes IME state, so no nullable
+            // parent request is needed here.
             ctx.window_placement
                 .finish_self_parent_move(zaura_toplevel_id);
             // The self-parent probe can invalidate Exo's host IME generation
@@ -432,6 +436,17 @@ pub(crate) fn queue_barrier_cleanup_with_trace(
             if !restored {
                 return false;
             }
+            // The xdg role can be destroyed while its wl_surface remains
+            // alive. In that teardown case the surface identity still needs
+            // restoration, but there is no live placement transaction to own
+            // an IME-refresh barrier.
+            if ctx
+                .window_placement
+                .xdg_toplevel_for_aura_toplevel(zaura_toplevel_id)
+                .is_none()
+            {
+                return true;
+            }
             // Do not deactivate text input in this same host batch. First
             // prove that the native identity request crossed the host stream;
             // the follow-up cleanup then starts the normal text-input
@@ -478,40 +493,33 @@ pub(crate) fn queue_barrier_cleanup_with_trace(
                 .window_placement
                 .self_parent_cleanup_pending(zaura_toplevel_id)
             {
-                // A few host versions omit the final origin_change after
-                // nullable-unparent.  The cleanup barrier is placement-owned
-                // and therefore the safe fallback boundary; ordinary focus
-                // configures must never settle this state or publish a
-                // deferred shortcut.
-                if ctx
+                // The sync callback is an ordering boundary and carries no
+                // geometry. Some Exo/Ash generations omit the matching
+                // target `origin_change`, however. In that case the request
+                // target is the only safe baseline: settle it before running
+                // the normal completion/deferred-promotion path. Retiring
+                // the transaction without this fallback drops the deferred
+                // shortcut and leaves the next request OriginUnknown.
+                if !ctx
                     .window_placement
-                    .settle_self_parent_after_cleanup(zaura_toplevel_id)
+                    .self_parent_origin_settled(zaura_toplevel_id)
+                    && ctx
+                        .window_placement
+                        .settle_self_parent_after_cleanup(zaura_toplevel_id)
                 {
-                    log::debug!(
-                        "using requested self-parent origin as cleanup-barrier \
-                         fallback for host={}",
+                    log::warn!(
+                        "self-parent cleanup omitted target origin; using requested target \
+                         as fallback baseline for host={}",
                         zaura_toplevel_id
                     );
                 }
                 if ctx
                     .window_placement
                     .self_parent_origin_settled(zaura_toplevel_id)
+                    && !advance_self_parent_after_origin(ctx, zaura_toplevel_id)
                 {
-                    if !advance_self_parent_after_origin(
-                        ctx,
-                        zaura_toplevel_id,
-                        ctx.window_placement
-                            .origin(zaura_toplevel_id)
-                            .unwrap_or((0, 0)),
-                    ) {
-                        log::warn!(
-                            "Unable to advance self-parent target after cleanup for host={}",
-                            zaura_toplevel_id
-                        );
-                    }
-                } else {
-                    log::debug!(
-                        "waiting for final self-parent origin before advancing host={}",
+                    log::warn!(
+                        "Unable to advance self-parent target after cleanup for host={}",
                         zaura_toplevel_id
                     );
                 }
@@ -529,7 +537,7 @@ fn queue_placement_cleanup_barrier(
     cleanup: PlacementBarrierCleanup,
     trace_id: Option<u64>,
 ) -> bool {
-    let Some(message) = build_and_register_placement_barrier_with_trace(
+    let Some((_callback_host_id, message)) = build_and_register_placement_barrier_with_trace(
         ctx,
         zaura_toplevel_id,
         Some(cleanup),
@@ -717,6 +725,38 @@ struct SelfParentResizeWire {
     host_geometry: Vec<u8>,
 }
 
+/// Wire batch for one self-parent request and its cleanup barrier.
+///
+/// The barrier is registered while the batch is staged, but neither request is
+/// appended to the transport queue until the matching reducer transition has
+/// succeeded. This keeps state and host-stream publication atomic from the
+/// proxy's point of view.
+struct StagedSelfParentMove {
+    parent_message: Vec<u8>,
+    callback_host_id: u32,
+    barrier_message: Vec<u8>,
+}
+
+impl StagedSelfParentMove {
+    fn publish(self, ctx: &mut Context) {
+        ctx.client_to_host_queue
+            .push((self.parent_message, Vec::new()));
+        ctx.client_to_host_queue
+            .push((self.barrier_message, Vec::new()));
+    }
+
+    fn rollback(self, ctx: &mut Context) {
+        if !ctx.window_placement.cancel_barrier(self.callback_host_id) {
+            log::debug!(
+                "self-parent rollback callback {} was already retired",
+                self.callback_host_id
+            );
+        }
+        ctx.shadow_table
+            .remove_host_interface(self.callback_host_id);
+    }
+}
+
 /// Build the two wire halves of one native self-parent resize phase.
 ///
 /// The guest configure and the host XDG geometry are intentionally built
@@ -772,70 +812,91 @@ fn queue_self_parent_resize_phase(wire: SelfParentResizeWire, ctx: &mut Context)
 pub(crate) fn queue_pending_self_parent_move(
     ctx: &mut Context,
     zaura_toplevel_host_id: u32,
-    fallback_origin: (i32, i32),
     trace_id: Option<u64>,
 ) -> bool {
-    let Some((zaura_surface_id, current_origin, relative)) = ctx
+    let Some((zaura_surface_id, _current_origin, relative)) = ctx
         .window_placement
-        .pending_self_parent_move(zaura_toplevel_host_id, fallback_origin)
+        .pending_self_parent_move(zaura_toplevel_host_id)
     else {
         return false;
     };
-    let queued = queue_self_parent_move_wire(
+    let Some(parent_message) =
+        build_self_parent_move_message(ctx, zaura_surface_id, relative, trace_id)
+    else {
+        return false;
+    };
+    let Some(staged_move) = stage_self_parent_move(
         ctx,
         zaura_toplevel_host_id,
         zaura_surface_id,
-        current_origin,
-        relative,
+        parent_message,
         trace_id,
-    );
-    if queued
-        && !ctx
-            .window_placement
-            .mark_self_parent_move_queued(zaura_toplevel_host_id)
+    ) else {
+        return false;
+    };
+    if !ctx
+        .window_placement
+        .mark_self_parent_move_queued(zaura_toplevel_host_id)
     {
         log::warn!(
             "self-parent move was queued after its state was released for host={}",
             zaura_toplevel_host_id
         );
+        // The barrier was registered before the reducer transition so a
+        // callback cannot observe an untracked host request. If the live-role
+        // check fails at this final boundary, also abort the resize phase;
+        // otherwise every subsequent shortcut would remain stuck waiting for
+        // a move that was never published.
+        ctx.window_placement
+            .abort_self_parent_resize(zaura_toplevel_host_id);
+        staged_move.rollback(ctx);
         return false;
     }
-    queued
+    staged_move.publish(ctx);
+    true
 }
 
-/// Serialize one self-parent request and its cleanup barrier. The caller
-/// performs the matching state transition only after this function succeeds.
-fn queue_self_parent_move_wire(
+/// Encode a self-parent request without mutating placement state or queues.
+fn build_self_parent_move_message(
     ctx: &mut Context,
-    zaura_toplevel_host_id: u32,
     zaura_surface_id: u32,
-    current_origin: (i32, i32),
     relative: (i32, i32),
     trace_id: Option<u64>,
-) -> bool {
+) -> Option<Vec<u8>> {
     if let Some(trace_id) = trace_id {
         log::info!(
             "[placement#{}] queue phase=self-parent-move surface={} \
-             current_origin=({}, {}) relative=({}, {})",
+             relative=({}, {})",
             trace_id,
             zaura_surface_id,
-            current_origin.0,
-            current_origin.1,
             relative.0,
             relative.1
         );
     }
-    let Some(parent_message) = build_zaura_surface_parent(
+    let parent_message = build_zaura_surface_parent(
         ctx,
         zaura_surface_id,
         Some(zaura_surface_id),
         relative.0,
         relative.1,
-    ) else {
-        return false;
-    };
-    let cleanup = PlacementBarrierCleanup::Unparent { zaura_surface_id };
-    let Some(barrier_message) = build_and_register_placement_barrier_with_trace(
+    )?;
+    Some(parent_message)
+}
+
+/// Register the cleanup barrier for an already encoded self-parent request.
+///
+/// Registration is deliberately separate from message encoding so a deferred
+/// target can be promoted first. The callback then captures the new
+/// generation instead of the superseded transaction.
+fn stage_self_parent_move(
+    ctx: &mut Context,
+    zaura_toplevel_host_id: u32,
+    zaura_surface_id: u32,
+    parent_message: Vec<u8>,
+    trace_id: Option<u64>,
+) -> Option<StagedSelfParentMove> {
+    let cleanup = PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id };
+    let Some((callback_host_id, barrier_message)) = build_and_register_placement_barrier_with_trace(
         ctx,
         zaura_toplevel_host_id,
         Some(cleanup),
@@ -846,134 +907,22 @@ fn queue_self_parent_move_wire(
              for host={}",
             zaura_toplevel_host_id
         );
-        return false;
+        return None;
     };
-    ctx.client_to_host_queue.push((parent_message, Vec::new()));
-    ctx.client_to_host_queue.push((barrier_message, Vec::new()));
-    true
+    Some(StagedSelfParentMove {
+        parent_message,
+        callback_host_id,
+        barrier_message,
+    })
 }
 
-/// Advance a deferred target after the host acknowledged the active resize.
-///
-/// If the new rectangle has the same size, only a parent move is needed. For
-/// a different size, publish one new XDG resize phase and wait for its
-/// matching Aura configure. In both cases the state promotion occurs only
-/// after the corresponding wire sequence has been queued.
-pub(crate) fn advance_deferred_self_parent_after_resize(
-    ctx: &mut Context,
-    guest_xdg_toplevel_id: u32,
-    guest_wl_surface_id: u32,
-    zaura_toplevel_host_id: u32,
-    reported_size: (i32, i32),
-    fallback_origin: (i32, i32),
-) -> bool {
-    let Some(target) = ctx
-        .window_placement
-        .deferred_self_parent_target(zaura_toplevel_host_id)
-    else {
-        return false;
-    };
-    let trace_id = next_placement_trace_id();
-    // `reported_size` is the host's client rectangle and may be smaller than
-    // the logical placement target because Ash subtracts decorations.  The
-    // active state retains the logical size that was requested for the
-    // previous transaction; compare against that value so a same-size
-    // deferred move does not start an identical XDG resize phase merely
-    // because the host reported (for example) 2112 instead of 2160.
-    let active_size = ctx
-        .window_placement
-        .active_self_parent_size(zaura_toplevel_host_id);
-    if active_size == Some((target.2, target.3)) {
-        log::debug!(
-            "[placement#{}] reusing acknowledged logical size {}x{} for \
-             deferred target; host reported client size {}x{}",
-            trace_id,
-            target.2,
-            target.3,
-            reported_size.0,
-            reported_size.1
-        );
-        let Some((zaura_surface_id, current_origin, relative, _)) = ctx
-            .window_placement
-            .deferred_self_parent_move(zaura_toplevel_host_id, fallback_origin)
-        else {
-            return false;
-        };
-        if !queue_self_parent_move_wire(
-            ctx,
-            zaura_toplevel_host_id,
-            zaura_surface_id,
-            current_origin,
-            relative,
-            Some(trace_id),
-        ) {
-            return false;
-        }
-        if !ctx
-            .window_placement
-            .promote_deferred_self_parent_target(zaura_toplevel_host_id, target)
-            || !ctx
-                .window_placement
-                .mark_self_parent_move_queued(zaura_toplevel_host_id)
-        {
-            log::warn!(
-                "[placement#{}] failed to commit same-size deferred self-parent target \
-                 for host={}",
-                trace_id,
-                zaura_toplevel_host_id
-            );
-            return false;
-        }
-        return true;
-    }
-
-    let Some(resize_wire) = build_self_parent_resize_phase(
-        ctx,
-        guest_xdg_toplevel_id,
-        guest_wl_surface_id,
-        target.2,
-        target.3,
-        trace_id,
-    ) else {
-        return false;
-    };
-    let configure_token = resize_wire.configure_token;
-    if !ctx
-        .window_placement
-        .promote_deferred_self_parent_resize(zaura_toplevel_host_id, target)
-    {
-        log::warn!(
-            "[placement#{}] failed to commit deferred self-parent resize for host={}",
-            trace_id,
-            zaura_toplevel_host_id
-        );
-        return false;
-    }
-    if !ctx.window_placement.gate_resize_on_guest_commit(
-        zaura_toplevel_host_id,
-        configure_token.0,
-        configure_token.1,
-    ) {
-        log::warn!(
-            "[placement#{}] failed to bind synthetic configure token to deferred \
-             self-parent resize host={}",
-            trace_id,
-            zaura_toplevel_host_id
-        );
-        return false;
-    }
-    queue_self_parent_resize_phase(resize_wire, ctx);
-    true
-}
-
-/// Start a deferred target after the previous nullable-unparent and IME
-/// refresh barriers have completed.
+/// Start a deferred target after the previous self-parent and IME refresh
+/// barriers have completed.
 pub(crate) fn advance_deferred_self_parent_after_cleanup(
     ctx: &mut Context,
     guest_xdg_toplevel_id: u32,
     guest_wl_surface_id: u32,
     zaura_toplevel_host_id: u32,
-    fallback_origin: (i32, i32),
 ) -> bool {
     if !ctx
         .window_placement
@@ -997,31 +946,46 @@ pub(crate) fn advance_deferred_self_parent_after_cleanup(
         .window_placement
         .active_self_parent_size(zaura_toplevel_host_id);
     if old_size == Some((target.2, target.3)) {
-        let Some((zaura_surface_id, current_origin, relative, _)) = ctx
+        let Some((zaura_surface_id, _current_origin, relative, _)) = ctx
             .window_placement
-            .deferred_self_parent_move(zaura_toplevel_host_id, fallback_origin)
+            .deferred_self_parent_move(zaura_toplevel_host_id)
         else {
             return false;
         };
-        if !queue_self_parent_move_wire(
+        let Some(parent_message) =
+            build_self_parent_move_message(ctx, zaura_surface_id, relative, Some(trace_id))
+        else {
+            return false;
+        };
+        let Some(rollback) = ctx
+            .window_placement
+            .promote_deferred_self_parent_target_with_rollback(zaura_toplevel_host_id, target)
+        else {
+            return false;
+        };
+        let Some(staged_move) = stage_self_parent_move(
             ctx,
             zaura_toplevel_host_id,
             zaura_surface_id,
-            current_origin,
-            relative,
+            parent_message,
             Some(trace_id),
-        ) {
+        ) else {
+            let _ = ctx
+                .window_placement
+                .rollback_deferred_self_parent_promotion(zaura_toplevel_host_id, rollback);
             return false;
-        }
+        };
         if !ctx
             .window_placement
-            .promote_deferred_self_parent_target(zaura_toplevel_host_id, target)
-            || !ctx
-                .window_placement
-                .mark_self_parent_move_queued(zaura_toplevel_host_id)
+            .mark_self_parent_move_queued(zaura_toplevel_host_id)
         {
+            let _ = ctx
+                .window_placement
+                .rollback_deferred_self_parent_promotion(zaura_toplevel_host_id, rollback);
+            staged_move.rollback(ctx);
             return false;
         }
+        staged_move.publish(ctx);
         return true;
     }
 
@@ -1036,17 +1000,24 @@ pub(crate) fn advance_deferred_self_parent_after_cleanup(
         return false;
     };
     let configure_token = resize_wire.configure_token;
-    if !ctx
+    let Some(rollback) = ctx
         .window_placement
-        .promote_deferred_self_parent_resize(zaura_toplevel_host_id, target)
-    {
+        .promote_deferred_self_parent_resize_with_rollback(zaura_toplevel_host_id, target)
+    else {
+        ctx.window_placement
+            .cancel_synthetic_xdg_configure_serial(configure_token.0, configure_token.1);
         return false;
-    }
+    };
     if !ctx.window_placement.gate_resize_on_guest_commit(
         zaura_toplevel_host_id,
         configure_token.0,
         configure_token.1,
     ) {
+        ctx.window_placement
+            .cancel_synthetic_xdg_configure_serial(configure_token.0, configure_token.1);
+        let _ = ctx
+            .window_placement
+            .rollback_deferred_self_parent_promotion(zaura_toplevel_host_id, rollback);
         return false;
     }
     queue_self_parent_resize_phase(resize_wire, ctx);
@@ -1055,14 +1026,13 @@ pub(crate) fn advance_deferred_self_parent_after_cleanup(
 
 /// Finish or advance a self-parent transaction after a final origin event.
 ///
-/// The host sync callback only orders the nullable-unparent request; it does
-/// not mean that Ash has finished animating the widget. This helper is called
-/// from both `origin_change` and `configure`, so either host event can release
-/// the queued latest target without duplicating the transition logic.
+/// The host sync callback only orders the persistent self-parent transition;
+/// it does not mean that Ash has finished animating the widget. This helper is
+/// called from both `origin_change` and `configure`, so either host event can
+/// release the queued latest target without duplicating the transition logic.
 pub(crate) fn advance_self_parent_after_origin(
     ctx: &mut Context,
     zaura_toplevel_host_id: u32,
-    fallback_origin: (i32, i32),
 ) -> bool {
     if !ctx
         .window_placement
@@ -1070,6 +1040,17 @@ pub(crate) fn advance_self_parent_after_origin(
         || !ctx
             .window_placement
             .self_parent_origin_settled(zaura_toplevel_host_id)
+    {
+        return false;
+    }
+    // `origin_change` and the ordered cleanup callback can race. The origin
+    // is useful evidence even when it arrives first, but promotion must wait
+    // for the callback's host-stream barrier. Returning here (instead of
+    // treating the unavailable move as an encoding failure) preserves the
+    // deferred target for the callback path.
+    if ctx
+        .window_placement
+        .self_parent_cleanup_barrier_pending(zaura_toplevel_host_id)
     {
         return false;
     }
@@ -1109,13 +1090,29 @@ pub(crate) fn advance_self_parent_after_origin(
             .abort_self_parent_cleanup(zaura_toplevel_host_id);
         return false;
     };
-    advance_deferred_self_parent_after_cleanup(
+    let advanced = advance_deferred_self_parent_after_cleanup(
         ctx,
         guest_xdg_toplevel_id,
         guest_surface_id,
         zaura_toplevel_host_id,
-        fallback_origin,
-    )
+    );
+    if !advanced {
+        // The cleanup barrier has already crossed the host stream. If the
+        // deferred phase cannot be encoded or registered, no later callback
+        // is guaranteed to retry it. Leave the reducer idle and retryable
+        // rather than retaining a CleanupPending target forever.
+        if ctx
+            .window_placement
+            .abort_self_parent_cleanup(zaura_toplevel_host_id)
+        {
+            log::warn!(
+                "Aborted deferred self-parent target after cleanup advancement \
+                 failed for host={}",
+                zaura_toplevel_host_id
+            );
+        }
+    }
+    advanced
 }
 
 /// Queue one complete placement operation and its ordered host barrier.
@@ -1258,27 +1255,6 @@ pub(crate) fn queue_window_placement(ctx: &mut Context, plan: &WindowPlacementPl
         return true;
     }
 
-    let synthetic_resize_wire = if matches!(geometry, WindowPlacementGeometry::SelfParent { .. }) {
-        let Some(wire) = build_self_parent_resize_phase(
-            ctx,
-            target.guest_xdg_toplevel_id(),
-            target.wl_surface_guest_id(),
-            bounds.2,
-            bounds.3,
-            trace_id,
-        ) else {
-            log::warn!(
-                "[placement#{}] refusing native self-parent placement without \
-                 a synthetic XDG resize handshake",
-                trace_id
-            );
-            return false;
-        };
-        Some(wire)
-    } else {
-        None
-    };
-
     if plan.transient_arc_identity().is_some() {
         let Some(preflight) = crate::handler::text_input::prepare_placement_ime_deactivation(
             ctx,
@@ -1357,16 +1333,81 @@ pub(crate) fn queue_window_placement(ctx: &mut Context, plan: &WindowPlacementPl
         ));
     }
 
-    // Self-parent cleanup is registered only after the matching host size
-    // configure arrives. Registering it in this first batch would allow
-    // `wl_display.sync.done` to unparent before Exo has applied the resize.
-    if matches!(geometry, WindowPlacementGeometry::Bounds) {
-        let Some(barrier_message) = build_and_register_placement_barrier_with_trace(
+    // Build the self-parent resize only after every other fallible message
+    // encoder has succeeded. The helper owns the synthetic serial reservation
+    // and cancels it if either configure message cannot be encoded.
+    let synthetic_resize_wire = if matches!(geometry, WindowPlacementGeometry::SelfParent { .. }) {
+        let Some(wire) = build_self_parent_resize_phase(
             ctx,
-            target.zaura_toplevel_host_id(),
-            plan.barrier_cleanup().cloned(),
-            Some(trace_id),
+            target.guest_xdg_toplevel_id(),
+            target.wl_surface_guest_id(),
+            bounds.2,
+            bounds.3,
+            trace_id,
         ) else {
+            log::warn!(
+                "[placement#{}] refusing native self-parent placement without \
+                 a synthetic XDG resize handshake",
+                trace_id
+            );
+            return false;
+        };
+        Some(wire)
+    } else {
+        None
+    };
+
+    let configure_token = synthetic_resize_wire
+        .as_ref()
+        .map(|wire| wire.configure_token);
+    if let Some(preflight) = ime_preflight.as_ref() {
+        if !crate::handler::text_input::commit_placement_ime_preflight(ctx, preflight) {
+            if let Some((xdg_surface_id, serial)) = configure_token {
+                ctx.window_placement
+                    .cancel_synthetic_xdg_configure_serial(xdg_surface_id, serial);
+            }
+            log::warn!("Transient placement IME preflight could not be committed");
+            return false;
+        }
+    }
+
+    let committed = ctx
+        .window_placement
+        .commit_placement_plan_with_configure(plan, configure_token);
+    if !committed {
+        if let Some(preflight) = ime_preflight.as_ref() {
+            crate::handler::text_input::rollback_placement_ime_preflight(ctx, preflight);
+        }
+        if let Some((xdg_surface_id, serial)) = configure_token {
+            ctx.window_placement
+                .cancel_synthetic_xdg_configure_serial(xdg_surface_id, serial);
+        }
+        log::warn!(
+            "Placement target for zaura_toplevel {} was released before \
+             its state transition could be committed",
+            target.zaura_toplevel_host_id()
+        );
+        return false;
+    }
+
+    // Self-parent cleanup is registered only after the matching host size
+    // configure arrives. Registering it in this first batch would allow the
+    // follow-up IME barrier to run before Exo has applied the resize.
+    // Direct-bounds barriers are registered only after all fallible local
+    // state transitions, so a registration failure can still roll back the
+    // IME preflight without leaving a callback record behind.
+    if matches!(geometry, WindowPlacementGeometry::Bounds) {
+        let Some((_callback_host_id, barrier_message)) =
+            build_and_register_placement_barrier_with_trace(
+                ctx,
+                target.zaura_toplevel_host_id(),
+                plan.barrier_cleanup().cloned(),
+                Some(trace_id),
+            )
+        else {
+            if let Some(preflight) = ime_preflight.as_ref() {
+                crate::handler::text_input::rollback_placement_ime_preflight(ctx, preflight);
+            }
             return false;
         };
         message_phases.push("placement-sync");
@@ -1383,24 +1424,6 @@ pub(crate) fn queue_window_placement(ctx: &mut Context, plan: &WindowPlacementPl
         messages.len(),
         plan.barrier_cleanup()
     );
-    let configure_token = synthetic_resize_wire
-        .as_ref()
-        .map(|wire| wire.configure_token);
-    let committed = ctx
-        .window_placement
-        .commit_placement_plan_with_configure(plan, configure_token);
-    if !committed {
-        if let Some((xdg_surface_id, serial)) = configure_token {
-            ctx.window_placement
-                .cancel_synthetic_xdg_configure_serial(xdg_surface_id, serial);
-        }
-        log::warn!(
-            "Placement target for zaura_toplevel {} was released before \
-             its state transition could be committed",
-            target.zaura_toplevel_host_id()
-        );
-        return false;
-    }
     // Keep host XDG geometry ahead of the unset-state requests, matching the
     // original wire sequence. The reducer is already armed, so a guest
     // configure cannot race an untracked state transition.
@@ -1415,11 +1438,8 @@ pub(crate) fn queue_window_placement(ctx: &mut Context, plan: &WindowPlacementPl
         ctx.host_to_client_queue
             .push((wire.guest_surface_configure, Vec::new()));
     }
-    if let Some(preflight) = ime_preflight {
-        if !crate::handler::text_input::commit_placement_ime_preflight(ctx, preflight) {
-            log::warn!("Transient placement IME state changed before its wire batch was committed");
-            return false;
-        }
+    if let Some(preflight) = ime_preflight.as_ref() {
+        crate::handler::text_input::finalize_placement_ime_preflight(ctx, preflight);
     }
     log::info!("[placement#{}] queued successfully", trace_id);
     true
@@ -1498,9 +1518,9 @@ pub(crate) fn apply_window_shortcut(
                     2
                 };
                 let required_capability = if ctx.window_placement.uses_transient_arc_id() {
-                    "set_application_id plus nullable set_parent"
+                    "set_application_id"
                 } else {
-                    "nullable set_parent"
+                    "set_parent(self)"
                 };
                 log::warn!(
                     "window layout {:?}: placement requires zaura_surface v{} \
@@ -1594,6 +1614,7 @@ fn build_and_register_placement_barrier(
     cleanup: Option<PlacementBarrierCleanup>,
 ) -> Option<Vec<u8>> {
     build_and_register_placement_barrier_with_trace(ctx, zaura_toplevel_id, cleanup, None)
+        .map(|(_callback_host_id, message)| message)
 }
 
 /// Build/register a host sync barrier and carry an optional placement trace.
@@ -1602,7 +1623,7 @@ fn build_and_register_placement_barrier_with_trace(
     zaura_toplevel_id: u32,
     cleanup: Option<PlacementBarrierCleanup>,
     trace_id: Option<u64>,
-) -> Option<Vec<u8>> {
+) -> Option<(u32, Vec<u8>)> {
     let callback_host_id = ctx.shadow_table.allocate_host_id();
     let mut barrier_builder = MessageBuilder::new();
     barrier_builder.write_u32(callback_host_id);
@@ -1640,7 +1661,7 @@ fn build_and_register_placement_barrier_with_trace(
             cleanup
         );
     }
-    Some(barrier_message)
+    Some((callback_host_id, barrier_message))
 }
 
 /// Queue a nullable Aura application ID update for a live host surface.
@@ -1649,6 +1670,16 @@ fn build_zaura_application_id(
     zaura_surface_id: u32,
     application_id: &str,
 ) -> Option<Vec<u8>> {
+    if !ctx
+        .shadow_table
+        .host_object_matches(zaura_surface_id, "zaura_surface")
+    {
+        log::debug!(
+            "Skipping application ID update for released zaura_surface {}",
+            zaura_surface_id
+        );
+        return None;
+    }
     let version = ctx
         .shadow_table
         .host_object_version(zaura_surface_id)
@@ -1880,7 +1911,7 @@ mod tests {
     use crate::state::{
         Context, HostActivationState, PlacementBarrierCleanup, PlacementTarget, TextInputState,
         TransientArcIdentity, WindowPlacementGeometry, WindowPlacementMode, WindowPlacementPlan,
-        XdgToplevelRelease,
+        WindowPlacementPlanError, XdgToplevelRelease,
     };
     use crate::wire::Action;
 
@@ -2087,7 +2118,7 @@ mod tests {
             (100, 200, 800, 600),
             WindowPlacementGeometry::Bounds,
             None,
-            Some(PlacementBarrierCleanup::Unparent {
+            Some(PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: zaura_surface_id + 1,
             }),
         );
@@ -2143,7 +2174,7 @@ mod tests {
                 relative_position: (400, 500),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
 
         assert!(queue_window_placement(&mut ctx, &plan,));
@@ -2232,7 +2263,7 @@ mod tests {
                 relative_position: (400, 500),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
         let second = WindowPlacementPlan::for_test(
             placement_target(host_xdg_toplevel_id, zaura_toplevel_id, zaura_surface_id, 2),
@@ -2243,7 +2274,7 @@ mod tests {
                 relative_position: (-100, -200),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
         let latest = WindowPlacementPlan::for_test(
             placement_target(host_xdg_toplevel_id, zaura_toplevel_id, zaura_surface_id, 2),
@@ -2254,7 +2285,7 @@ mod tests {
                 relative_position: (1820, -200),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
 
         assert!(queue_window_placement(&mut ctx, &first));
@@ -2309,11 +2340,14 @@ mod tests {
         assert_eq!(
             ctx.window_placement
                 .deferred_self_parent_target(zaura_toplevel_id),
-            None
+            Some((1920, 0, 1920, 2160)),
+            "a deferred shortcut must wait for the first parent origin and cleanup barrier"
         );
 
-        // Ash may animate the latest self-parent move. Intermediate origins
-        // must not cause another parent request or rebase the relative delta.
+        // The host must acknowledge the first move's target origin before
+        // cleanup can promote the deferred shortcut. This is deliberately an
+        // explicit origin event; the preceding sync callback is only an
+        // ordering boundary.
         ctx.last_sender_id = zaura_toplevel_id;
         assert_eq!(
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
@@ -2331,6 +2365,98 @@ mod tests {
                 .count(),
             1,
             "intermediate origin events must not duplicate the parent move"
+        );
+
+        // The same-size deferred move must register its cleanup barrier after
+        // promotion, so the callback belongs to the new generation and can
+        // run the ordered IME refresh without changing the persistent
+        // self-parent relationship.
+        let move_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("same-size deferred move barrier callback");
+        let parent_count_before_cleanup = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|message| opcode(message) == REQ_SET_PARENT)
+            .count();
+        ctx.last_sender_id = move_callback;
+        assert_eq!(
+            CallbackHandler.on_done(&mut ctx, 3),
+            Action::Drop,
+            "same-size move barrier must be consumed internally"
+        );
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .filter(|message| opcode(message) == REQ_SET_PARENT)
+                .count()
+                == parent_count_before_cleanup,
+            "barrier completion must not queue a nullable-unparent request"
+        );
+        let cleanup_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("same-size cleanup barrier callback");
+        assert_ne!(cleanup_callback, move_callback);
+        ctx.last_sender_id = cleanup_callback;
+        assert_eq!(
+            CallbackHandler.on_done(&mut ctx, 4),
+            Action::Drop,
+            "same-size cleanup barrier must retire the promoted generation"
+        );
+        assert_eq!(
+            ctx.window_placement
+                .active_self_parent_size(zaura_toplevel_id),
+            Some((1920, 2160)),
+            "the latest deferred target must become the active move after cleanup"
+        );
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .filter(|message| opcode(message) == REQ_SET_PARENT)
+                .count(),
+            2,
+            "only the first move and the latest deferred move may be published"
+        );
+
+        // The promoted move has its own authoritative origin and two ordered
+        // barriers. Complete that generation before asserting idle; the
+        // previous cleanup callback cannot retire a newly published move.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut CompositorHandler,
+                &mut ctx,
+                1920,
+                0,
+            ),
+            Action::Drop
+        );
+        let latest_move_callback = ctx
+            .window_placement
+            .active_barrier_for_toplevel(zaura_toplevel_id)
+            .expect("latest deferred move barrier callback");
+        assert_ne!(latest_move_callback, cleanup_callback);
+        ctx.last_sender_id = latest_move_callback;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 5), Action::Drop);
+        let latest_cleanup_callback = ctx
+            .window_placement
+            .active_barrier_for_toplevel(zaura_toplevel_id)
+            .expect("latest deferred cleanup barrier callback");
+        assert_ne!(latest_cleanup_callback, latest_move_callback);
+        ctx.last_sender_id = latest_cleanup_callback;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 6), Action::Drop);
+        assert!(
+            !ctx.window_placement
+                .self_parent_transaction_active(zaura_toplevel_id),
+            "completed same-size deferred placement must return to idle"
         );
     }
 
@@ -2365,7 +2491,7 @@ mod tests {
                 relative_position: (400, 500),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
         let latest = WindowPlacementPlan::for_test(
             placement_target(host_xdg_toplevel_id, zaura_toplevel_id, zaura_surface_id, 2),
@@ -2376,7 +2502,7 @@ mod tests {
                 relative_position: (1820, -200),
             },
             None,
-            Some(PlacementBarrierCleanup::Unparent { zaura_surface_id }),
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
         );
 
         assert!(queue_window_placement(&mut ctx, &first));
@@ -2411,9 +2537,23 @@ mod tests {
             Action::Drop
         );
 
-        // The first callback has queued NULL-parent plus the follow-up
-        // activation barrier. The latest shortcut is retained, not appended
-        // to the host stream while that cleanup is in flight.
+        // A real Aura origin acknowledgement is required before the
+        // follow-up IME barrier may promote a deferred target. `sync.done`
+        // alone does not carry screen-space geometry.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut CompositorHandler,
+                &mut ctx,
+                500,
+                700,
+            ),
+            Action::Drop
+        );
+
+        // The first callback has queued the follow-up activation barrier. The
+        // latest shortcut is retained, not appended to the host stream while
+        // that cleanup is in flight.
         let queue_len_before_deferred = ctx.client_to_host_queue.len();
         assert!(queue_window_placement(&mut ctx, &latest));
         assert_eq!(
@@ -2445,19 +2585,19 @@ mod tests {
         );
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
-            None,
-            "a deferred target must not be promoted from a fabricated cleanup origin"
+            Some((1920, 2160)),
+            "the cleanup barrier is sufficient to promote a deferred target \
+             when the host omits origin_change"
         );
         assert_eq!(
             ctx.window_placement
                 .deferred_self_parent_target(zaura_toplevel_id),
-            Some((1920, 0, 1920, 2160)),
-            "the latest target waits for the host's final origin event"
+            None,
+            "the promoted target must not remain deferred after cleanup"
         );
 
-        // The NULL-parent barrier does not itself provide an absolute
-        // position.  Once the host reports the final origin, the deferred
-        // target may be promoted and its resize phase can start.
+        // A late intermediate coordinate from the old parent generation must
+        // not rebase the newly promoted resize phase.
         ctx.last_sender_id = zaura_toplevel_id;
         assert_eq!(
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
@@ -2471,7 +2611,7 @@ mod tests {
         assert_eq!(
             ctx.window_placement.pending_resize_size(zaura_toplevel_id),
             Some((1920, 2160)),
-            "the final host origin should release the deferred resize"
+            "a late origin must not cancel the promoted resize"
         );
         assert_eq!(
             ctx.window_placement
@@ -2514,6 +2654,119 @@ mod tests {
                 .count(),
             parent_count_before_origin,
             "an intermediate origin must not duplicate the parent request"
+        );
+    }
+
+    #[test]
+    fn late_origin_after_completion_does_not_rebase_the_same_shortcut() {
+        let host_xdg_toplevel_id = 20;
+        let zaura_toplevel_id = 30;
+        let zaura_surface_id = 40;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement
+            .set_mode_for_test(WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Guest,
+                crate::state::WindowGeometryMethod::SelfParent,
+            ));
+        track_placement_objects(
+            &mut ctx,
+            host_xdg_toplevel_id,
+            zaura_toplevel_id,
+            zaura_surface_id,
+            2,
+        );
+        ctx.shadow_table.map_id(9, 13);
+        ctx.shadow_table
+            .track_interface_with_version(9, "xdg_surface".to_string(), 6);
+        ctx.shadow_table
+            .track_host_interface_with_version(13, "xdg_surface".to_string(), 6);
+        assert!(ctx.window_placement.remember_output(50));
+        ctx.window_placement
+            .update_output_mode(50, true, 1920, 1080);
+        ctx.window_placement.update_output_scale(50, 1);
+        assert!(ctx
+            .window_placement
+            .record_origin(zaura_toplevel_id, (100, 200)));
+
+        let rect = crate::window_shortcuts::NormalizedRect::new(0.0, 0.0, 0.5, 1.0);
+        let first = ctx
+            .window_placement
+            .prepare_placement(&ctx.shadow_table, 10, 11, rect)
+            .expect("first self-parent shortcut should produce a plan");
+        assert!(queue_window_placement(&mut ctx, &first));
+        acknowledge_synthetic_resize(&mut ctx);
+
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                100,
+                200,
+                960,
+                1080,
+                &[],
+            ),
+            Action::Drop
+        );
+        let first_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("first self-parent barrier callback");
+        ctx.last_sender_id = first_callback;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 1), Action::Drop);
+        // The placement barrier only orders host processing. The first
+        // generation is complete once Aura reports the requested screen
+        // origin.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+            ),
+            Action::Drop
+        );
+        let cleanup_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("self-parent cleanup barrier callback");
+        assert_ne!(cleanup_callback, first_callback);
+        ctx.last_sender_id = cleanup_callback;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 2), Action::Drop);
+        assert!(
+            !ctx.window_placement
+                .self_parent_transaction_active(zaura_toplevel_id),
+            "the first placement must be fully idle before testing an external move"
+        );
+
+        // A focus/activation transition can emit a late animation origin
+        // after self-parent cleanup. Do not rebase the next relative request
+        // on that intermediate coordinate: it would make repeated shortcuts
+        // drift toward the lower-right corner.
+        ctx.last_sender_id = zaura_toplevel_id;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
+                &mut CompositorHandler,
+                &mut ctx,
+                500,
+                700,
+            ),
+            Action::Drop
+        );
+        assert_eq!(ctx.window_placement.origin(zaura_toplevel_id), Some((0, 0)));
+        assert_eq!(
+            ctx.window_placement
+                .prepare_placement(&ctx.shadow_table, 10, 11, rect)
+                .expect_err("late origin must not turn a duplicate into a new move"),
+            WindowPlacementPlanError::AlreadyAtTarget
         );
     }
 
@@ -2735,7 +2988,7 @@ mod tests {
             "an already inactive host generation needs no duplicate deactivate"
         );
         assert!(crate::handler::text_input::commit_placement_ime_preflight(
-            &mut ctx, preflight
+            &mut ctx, &preflight
         ));
         assert!(
             ctx.host_to_client_queue.is_empty(),
@@ -3002,7 +3255,7 @@ mod tests {
     }
 
     #[test]
-    fn self_parent_cleanup_refreshes_focused_ime_after_unparent() {
+    fn self_parent_cleanup_refreshes_focused_ime_without_unparent() {
         let surface_id = 55;
         let guest_surface_id = 91;
         let guest_text_input_id = 20;
@@ -3045,7 +3298,7 @@ mod tests {
         assert!(queue_barrier_cleanup(
             &mut ctx,
             30,
-            &PlacementBarrierCleanup::Unparent {
+            &PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: surface_id,
             }
         ));
@@ -3054,11 +3307,242 @@ mod tests {
                 .iter()
                 .map(opcode)
                 .collect::<Vec<_>>(),
-            vec![REQ_SET_PARENT, REQ_SYNC]
+            vec![REQ_SYNC],
+            "self-parent cleanup keeps only the ordered IME barrier on the host stream"
         );
         assert!(ctx.text_inputs[&guest_text_input_id]
             .draining_callback()
             .is_none());
+
+        let placement_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("persistent self-parent follow-up barrier callback");
+        ctx.last_sender_id = placement_callback;
+        assert_eq!(
+            CallbackHandler.on_done(&mut ctx, 0),
+            Action::Drop,
+            "the follow-up barrier must be consumed before IME refresh"
+        );
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .map(opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                REQ_SYNC,
+                crate::protocols::text_input_unstable_v1::zwp_text_input_v1::REQ_RESET,
+                1,
+                REQ_SYNC,
+            ],
+            "self-parent cleanup must refresh IME after its own sync without \
+             sending set_parent(NULL)"
+        );
+        let ime_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("IME refresh barrier callback");
+        assert_ne!(ime_callback, placement_callback);
+        assert!(ctx.text_inputs[&guest_text_input_id]
+            .draining_callback()
+            .is_some());
+
+        ctx.last_sender_id = ime_callback;
+        assert_eq!(
+            CallbackHandler.on_done(&mut ctx, 0),
+            Action::Drop,
+            "the host IME barrier must settle its generation"
+        );
+        assert!(ctx.text_inputs[&guest_text_input_id]
+            .draining_callback()
+            .is_none());
+        assert_eq!(
+            ctx.text_inputs[&guest_text_input_id].host_activation(),
+            HostActivationState::Active
+        );
+        assert!(
+            ctx.client_to_host_queue.iter().any(|message| {
+                opcode(message)
+                    == crate::protocols::text_input_unstable_v1::zwp_text_input_v1::REQ_ACTIVATE
+            }),
+            "IME refresh must reactivate the host text input after sync.done"
+        );
+    }
+
+    #[test]
+    fn self_parent_cleanup_does_not_require_nullable_unparent() {
+        let zaura_toplevel_id = 30;
+        let zaura_surface_id = 55;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        track_placement_objects(&mut ctx, 20, zaura_toplevel_id, zaura_surface_id, 1);
+        assert!(ctx
+            .window_placement
+            .record_origin(zaura_toplevel_id, (100, 200)));
+        assert!(ctx.window_placement.arm_self_parent_target(
+            zaura_toplevel_id,
+            zaura_surface_id,
+            (0, 0, 800, 600),
+        ));
+        assert!(ctx.window_placement.accept_pending_resize_at_origin(
+            zaura_toplevel_id,
+            (800, 600),
+            (100, 200),
+        ));
+        assert!(ctx
+            .window_placement
+            .mark_self_parent_move_queued(zaura_toplevel_id));
+        assert!(ctx
+            .window_placement
+            .self_parent_transaction_active(zaura_toplevel_id));
+
+        assert!(queue_barrier_cleanup(
+            &mut ctx,
+            zaura_toplevel_id,
+            &PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id },
+        ));
+        assert!(
+            ctx.client_to_host_queue.iter().map(opcode).eq([REQ_SYNC]),
+            "persistent self-parent cleanup queues only the follow-up barrier"
+        );
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| opcode(message) != REQ_SET_PARENT),
+            "cleanup must never emit set_parent(NULL), even for v1 surfaces"
+        );
+
+        // The cleanup barrier does not prove that the host applied the
+        // requested position. Supply the authoritative origin event before
+        // completing the barrier.
+        assert!(ctx
+            .window_placement
+            .record_origin(zaura_toplevel_id, (0, 0)));
+
+        let cleanup_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("persistent cleanup barrier callback");
+        ctx.last_sender_id = cleanup_callback;
+        assert_eq!(
+            WlCallbackHandler::on_done(&mut CallbackHandler, &mut ctx, 1),
+            Action::Drop
+        );
+        assert!(
+            !ctx.window_placement
+                .self_parent_transaction_active(zaura_toplevel_id),
+            "the ordered barrier must still settle the transaction"
+        );
+    }
+
+    #[test]
+    fn omitted_origin_cleanup_retires_and_drops_deferred_shortcut() {
+        let host_xdg_toplevel_id = 20;
+        let zaura_toplevel_id = 30;
+        let zaura_surface_id = 40;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement
+            .set_mode_for_test(WindowPlacementMode::new(
+                crate::state::WindowHostPolicy::Guest,
+                crate::state::WindowGeometryMethod::SelfParent,
+            ));
+        track_placement_objects(
+            &mut ctx,
+            host_xdg_toplevel_id,
+            zaura_toplevel_id,
+            zaura_surface_id,
+            2,
+        );
+        assert!(ctx.window_placement.remember_output(50));
+        ctx.window_placement
+            .update_output_mode(50, true, 1920, 1080);
+        ctx.window_placement.update_output_scale(50, 1);
+        assert!(ctx
+            .window_placement
+            .record_origin(zaura_toplevel_id, (100, 200)));
+        assert!(ctx.window_placement.arm_self_parent_target(
+            zaura_toplevel_id,
+            zaura_surface_id,
+            (0, 0, 800, 600),
+        ));
+        assert!(ctx.window_placement.accept_pending_resize_at_origin(
+            zaura_toplevel_id,
+            (800, 600),
+            (100, 200),
+        ));
+        assert!(ctx
+            .window_placement
+            .mark_self_parent_move_queued(zaura_toplevel_id));
+
+        // This models the first self-parent barrier after the host has
+        // acknowledged the resize. No target origin event is delivered before
+        // the ordered IME follow-up callback.
+        assert!(queue_barrier_cleanup(
+            &mut ctx,
+            zaura_toplevel_id,
+            &PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id },
+        ));
+        let deferred = WindowPlacementPlan::for_test(
+            placement_target(host_xdg_toplevel_id, zaura_toplevel_id, zaura_surface_id, 2),
+            7,
+            (1920, 0, 800, 600),
+            WindowPlacementGeometry::SelfParent {
+                current_origin: (100, 200),
+                relative_position: (1820, -200),
+            },
+            None,
+            Some(PlacementBarrierCleanup::RetainSelfParent { zaura_surface_id }),
+        );
+        assert!(
+            ctx.window_placement.commit_placement_plan(&deferred),
+            "a newer shortcut should be retained while cleanup is pending"
+        );
+        assert_eq!(
+            ctx.window_placement
+                .deferred_self_parent_target(zaura_toplevel_id),
+            Some((1920, 0, 800, 600))
+        );
+
+        let cleanup_callback = ctx
+            .client_to_host_queue
+            .iter()
+            .rev()
+            .find(|message| opcode(message) == REQ_SYNC)
+            .map(|message| u32::from_ne_bytes(message.0[8..12].try_into().unwrap()))
+            .expect("ordered self-parent cleanup callback");
+        ctx.last_sender_id = cleanup_callback;
+        assert_eq!(
+            WlCallbackHandler::on_done(&mut CallbackHandler, &mut ctx, 1),
+            Action::Drop
+        );
+        assert!(
+            ctx.window_placement
+                .self_parent_transaction_active(zaura_toplevel_id),
+            "cleanup omission must promote the deferred target instead of \
+             stranding or dropping it"
+        );
+        assert_eq!(
+            ctx.window_placement
+                .deferred_self_parent_target(zaura_toplevel_id),
+            None,
+            "the deferred target should be consumed by the promoted generation"
+        );
+        assert_eq!(
+            ctx.window_placement.origin(zaura_toplevel_id),
+            Some((0, 0)),
+            "the fallback baseline must be the requested first target"
+        );
+        assert_eq!(
+            ctx.window_placement.confirmed_origin(zaura_toplevel_id),
+            Some((0, 0)),
+            "the requested target is authoritative after the ordered barrier"
+        );
     }
 
     #[test]
@@ -3092,6 +3576,7 @@ mod tests {
     fn transient_cleanup_drops_released_surface_without_stale_wire() {
         let surface_id = 55;
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_aura_shell_binding_for_test(300, 5);
         ctx.shadow_table.track_host_interface_with_version(
             surface_id,
             "zaura_surface".to_string(),

@@ -42,7 +42,9 @@ use self::support::{
     AuraShellBinding, BidirectionalLinks, GtkShellState, GtkSurfaceState, OutputRecord,
     PlacementBarrierRegistry, RemoteShellBinding, SurfaceApplicationState, ToplevelPlacementState,
 };
-use self::transaction::{ConfigureToken, HostResizeResult, OriginResult, SelfParentPhase};
+use self::transaction::{
+    ConfigureToken, DeferredPromotionRollback, HostResizeResult, OriginResult, SelfParentPhase,
+};
 
 pub(crate) use self::plan::{
     OutputState, PlacementBarrierCleanup, PlacementTarget, TransientArcIdentity,
@@ -88,6 +90,14 @@ pub(crate) struct WindowPlacementState {
     runtime: WindowPlacementRuntimeHandle,
     aura_shell: Option<AuraShellBinding>,
     remote_shell: Option<RemoteShellBinding>,
+    /// Remote-shell manager generations whose advertised global disappeared
+    /// while one or more child remote surfaces remained alive.
+    ///
+    /// The host manager is a real protocol object with a lifetime independent
+    /// of its registry advertisement. Keep its binding metadata until the
+    /// final child is destroyed so the manager can then be addressed by its
+    /// wire destructor.
+    retired_remote_shells: HashMap<u32, RemoteShellBinding>,
     /// Native and compatibility application IDs for each guest surface.
     ///
     /// The XDG role always retains the native identity even when the Aura
@@ -104,6 +114,10 @@ pub(crate) struct WindowPlacementState {
     aura_output_links: BidirectionalLinks,
     remote_surface_links: BidirectionalLinks,
     remote_toplevel_links: BidirectionalLinks,
+    /// Manager generation that owns each host remote-surface child.
+    remote_surface_owners: HashMap<u32, u32>,
+    /// Number of live remote-surface children for each manager generation.
+    remote_shell_child_counts: HashMap<u32, usize>,
     xdg_surface_links: BidirectionalLinks,
     xdg_toplevel_links: BidirectionalLinks,
     /// Synthetic `xdg_surface.configure` serials sent to a guest client.
@@ -135,6 +149,25 @@ impl WindowPlacementState {
         debug_assert!(self.aura_output_links.is_consistent());
         debug_assert!(self.remote_surface_links.is_consistent());
         debug_assert!(self.remote_toplevel_links.is_consistent());
+        debug_assert!(self
+            .remote_surface_owners
+            .iter()
+            .all(|(remote_surface_id, _manager_id)| self
+                .remote_surface_links
+                .get_reverse(*remote_surface_id)
+                .is_some()));
+        debug_assert!(self
+            .remote_shell_child_counts
+            .values()
+            .all(|count| *count > 0));
+        debug_assert!(self
+            .retired_remote_shells
+            .keys()
+            .all(|manager_id| self.remote_shell_has_children(*manager_id)));
+        debug_assert_eq!(
+            self.remote_surface_owners.len(),
+            self.remote_shell_child_counts.values().sum::<usize>()
+        );
         debug_assert!(self.xdg_surface_links.is_consistent());
         debug_assert!(self.xdg_toplevel_links.is_consistent());
         debug_assert!(self.outputs.iter().enumerate().all(|(index, output)| {
@@ -187,12 +220,15 @@ impl WindowPlacementState {
             runtime,
             aura_shell: None,
             remote_shell: None,
+            retired_remote_shells: HashMap::new(),
             application_ids: HashMap::new(),
             aura_surface_links: BidirectionalLinks::default(),
             aura_toplevel_links: BidirectionalLinks::default(),
             aura_output_links: BidirectionalLinks::default(),
             remote_surface_links: BidirectionalLinks::default(),
             remote_toplevel_links: BidirectionalLinks::default(),
+            remote_surface_owners: HashMap::new(),
+            remote_shell_child_counts: HashMap::new(),
             xdg_surface_links: BidirectionalLinks::default(),
             xdg_toplevel_links: BidirectionalLinks::default(),
             synthetic_xdg_configure_serials: HashMap::new(),
@@ -315,6 +351,12 @@ impl WindowPlacementState {
             return None;
         }
         let binding = self.remote_shell.take()?;
+        if self.remote_shell_has_children(binding.host_id) {
+            // `global_remove` invalidates only the advertisement. Keep the
+            // manager generation addressable until every child role created
+            // through it has completed its own destructor lifecycle.
+            self.retired_remote_shells.insert(binding.host_id, binding);
+        }
         self.debug_assert_consistent();
         Some((binding.host_id, binding.version))
     }
@@ -936,10 +978,9 @@ impl WindowPlacementState {
                 None,
             ));
         }
-        // Transient placement needs both nullable set_parent (v2) for
-        // cleanup and set_application_id (v5) for the temporary ARC task
-        // identity. Reject the whole plan before allocating/queueing anything
-        // when the latter capability is unavailable.
+        // Transient placement needs set_application_id (v5) for the temporary
+        // ARC task identity. Reject the whole plan before allocating/queueing
+        // anything when that capability is unavailable.
         if self.uses_transient_arc_id() && target.zaura_surface_version() < 5 {
             return Err(WindowPlacementPlanError::UnsupportedSurfaceVersion);
         }
@@ -948,7 +989,8 @@ impl WindowPlacementState {
             if target.zaura_surface_version() < 2 {
                 return Err(WindowPlacementPlanError::UnsupportedSurfaceVersion);
             }
-            let Some(current_origin) = self.origin(target.zaura_toplevel_host_id()) else {
+            let Some(current_origin) = self.confirmed_origin(target.zaura_toplevel_host_id())
+            else {
                 return Err(WindowPlacementPlanError::OriginUnknown);
             };
             let Some(relative_x) = bounds.0.checked_sub(current_origin.0) else {
@@ -988,7 +1030,7 @@ impl WindowPlacementState {
         };
 
         let barrier_cleanup = if self.uses_self_parent() {
-            Some(PlacementBarrierCleanup::Unparent {
+            Some(PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: target.zaura_surface_host_id(),
             })
         } else {
@@ -1458,18 +1500,55 @@ impl WindowPlacementState {
 
     /// Record the host wl_surface → host remote_surface role created by the
     /// opt-in remote-shell backend.
+    ///
+    /// Test-only compatibility helper for fixtures that do not model a
+    /// manager generation explicitly. Production creation uses
+    /// [`Self::remember_remote_surface_for_manager`].
+    #[cfg(test)]
     #[must_use = "the remote surface association may conflict with a live role"]
     pub(crate) fn remember_remote_surface(
         &mut self,
         wl_surface_host_id: u32,
         remote_surface_host_id: u32,
     ) -> bool {
+        let manager_host_id = self.remote_shell_id().unwrap_or(0);
+        self.remember_remote_surface_for_manager(
+            wl_surface_host_id,
+            remote_surface_host_id,
+            manager_host_id,
+        )
+    }
+
+    /// Record a remote-surface role and the manager generation that owns it.
+    ///
+    /// The manager ID is captured at creation time instead of looked up during
+    /// teardown. A replacement `zcr_remote_shell_v2` may therefore coexist
+    /// with children from an older generation without sharing lifecycle
+    /// accounting.
+    #[must_use = "the remote surface association may conflict with a live role"]
+    pub(crate) fn remember_remote_surface_for_manager(
+        &mut self,
+        wl_surface_host_id: u32,
+        remote_surface_host_id: u32,
+        manager_host_id: u32,
+    ) -> bool {
+        if let Some(existing_manager) = self.remote_surface_owners.get(&remote_surface_host_id) {
+            return *existing_manager == manager_host_id
+                && self.remote_surface_links.get_forward(wl_surface_host_id)
+                    == Some(remote_surface_host_id);
+        }
         if !self
             .remote_surface_links
             .insert(wl_surface_host_id, remote_surface_host_id)
         {
             return false;
         }
+        self.remote_surface_owners
+            .insert(remote_surface_host_id, manager_host_id);
+        *self
+            .remote_shell_child_counts
+            .entry(manager_host_id)
+            .or_default() += 1;
         self.debug_assert_consistent();
         true
     }
@@ -1478,26 +1557,102 @@ impl WindowPlacementState {
         self.remote_surface_links.get_forward(wl_surface_host_id)
     }
 
-    /// Return whether any remote-surface role still owns the manager.
+    /// Return whether one manager generation still owns remote-surface roles.
     ///
-    /// `zcr_remote_shell_v2.destroy` is illegal while one of its child
-    /// `zcr_remote_surface_v2` roles is alive. Global removal therefore needs
-    /// this lifecycle check before retiring the hidden manager binding.
-    pub(crate) fn has_remote_surfaces(&self) -> bool {
-        !self.remote_surface_links.is_empty()
+    /// This intentionally counts only children created by `manager_host_id`.
+    /// Older retired generations must not prevent a replacement manager from
+    /// being destroyed after its own global is removed.
+    pub(crate) fn remote_shell_has_children(&self, manager_host_id: u32) -> bool {
+        self.remote_shell_child_counts
+            .get(&manager_host_id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// Rebuild remote-shell child counts from the surviving child-owner map.
+    ///
+    /// The owner map is normally updated atomically with the bidirectional
+    /// surface link.  A stale host event or a future teardown path must not
+    /// turn a bookkeeping discrepancy into a compositor panic, though.  In
+    /// that situation the surviving links are the least destructive source
+    /// of truth; retired managers with no discoverable children are dropped
+    /// from the local retirement map and remain reserved by the shadow table
+    /// until connection teardown.
+    fn repair_remote_shell_accounting(&mut self) {
+        let mut counts = HashMap::new();
+        for manager_host_id in self.remote_surface_owners.values().copied() {
+            *counts.entry(manager_host_id).or_insert(0usize) += 1;
+        }
+        let live_manager_ids: HashSet<u32> = counts.keys().copied().collect();
+        self.remote_shell_child_counts = counts;
+        self.retired_remote_shells
+            .retain(|manager_host_id, _| live_manager_ids.contains(manager_host_id));
     }
 
     pub(crate) fn take_remote_surface_for_wl_surface(
         &mut self,
         wl_surface_host_id: u32,
     ) -> Option<u32> {
+        self.take_remote_surface_for_wl_surface_with_cleanup(wl_surface_host_id)
+            .map(|(remote_surface_host_id, _manager)| remote_surface_host_id)
+    }
+
+    /// Remove a remote-surface role and, if it was the final child of a
+    /// retired manager generation, return that manager for destruction.
+    ///
+    /// The child is removed from ownership accounting before the optional
+    /// manager binding is returned, so callers can queue the child destructor
+    /// first and then the manager destructor in protocol order.
+    pub(crate) fn take_remote_surface_for_wl_surface_with_cleanup(
+        &mut self,
+        wl_surface_host_id: u32,
+    ) -> Option<(u32, Option<(u32, u32)>)> {
         let remote_surface_host_id = self
             .remote_surface_links
             .remove_forward(wl_surface_host_id)?;
         self.remote_toplevel_links
             .remove_reverse(remote_surface_host_id);
+        let Some(manager_host_id) = self.remote_surface_owners.remove(&remote_surface_host_id)
+        else {
+            log::warn!(
+                "remote surface {} has no manager owner; retiring the child \
+                 without attempting manager destruction",
+                remote_surface_host_id
+            );
+            self.repair_remote_shell_accounting();
+            self.debug_assert_consistent();
+            return Some((remote_surface_host_id, None));
+        };
+        let last_child = {
+            let child_count = self
+                .remote_shell_child_counts
+                .entry(manager_host_id)
+                .or_insert_with(|| {
+                    log::warn!(
+                        "remote-shell manager {} lost its child count; \
+                         reconstructing accounting before child teardown",
+                        manager_host_id
+                    );
+                    self.remote_surface_owners
+                        .values()
+                        .filter(|owner| **owner == manager_host_id)
+                        .count()
+                        .saturating_add(1)
+                });
+            *child_count -= 1;
+            *child_count == 0
+        };
+        if last_child {
+            self.remote_shell_child_counts.remove(&manager_host_id);
+        }
+        let retired_manager = if last_child {
+            self.retired_remote_shells
+                .remove(&manager_host_id)
+                .map(|binding| (binding.host_id, binding.version))
+        } else {
+            None
+        };
         self.debug_assert_consistent();
-        Some(remote_surface_host_id)
+        Some((remote_surface_host_id, retired_manager))
     }
 
     #[must_use = "the remote toplevel association may conflict with a live role"]
@@ -1661,6 +1816,19 @@ impl WindowPlacementState {
             .and_then(|state| state.origin)
     }
 
+    /// Return the origin only while Aura has confirmed it as authoritative.
+    ///
+    /// `origin()` remains available for diagnostics after a liveness fallback
+    /// retires a cleanup phase without a matching host event. Placement
+    /// planning uses this stricter accessor so a retained but unconfirmed
+    /// coordinate cannot become the baseline for a new relative request.
+    pub(crate) fn confirmed_origin(&self, zaura_toplevel_host_id: u32) -> Option<(i32, i32)> {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .filter(|state| state.origin_confirmed)
+            .and_then(|state| state.origin)
+    }
+
     /// Return the client size still waiting for host geometry application.
     ///
     /// A pending size is scoped to one live Aura toplevel.  It is cleared only
@@ -1698,16 +1866,21 @@ impl WindowPlacementState {
             return true;
         }
         // `last_completed_target` is recorded only after the operation has
-        // reached its settled origin. The requested rectangle is therefore
-        // the correct deduplication key even when a decorated host reports a
-        // client size slightly smaller than the work-area target.
-        state.transaction.last_completed_target() == Some(target)
+        // reached its settled origin. Keep using it as a deduplication key
+        // only while the host still reports that target origin. Once an idle
+        // origin event reports a focus animation or an external move, the
+        // completed rectangle is stale and the same shortcut must be allowed
+        // to re-establish it.
+        matches!(state.transaction.phase(), SelfParentPhase::Idle)
+            && state.origin_confirmed
+            && state.transaction.last_completed_target() == Some(target)
+            && state.origin == Some((target.0, target.1))
     }
 
     /// Return whether one self-parent transaction still owns this toplevel.
     ///
-    /// The active target remains retained through the nullable-unparent and
-    /// host-IME follow-up barriers. This makes a shortcut received during
+    /// The active target remains retained through the persistent self-parent
+    /// and host-IME follow-up barriers. This makes a shortcut received during
     /// cleanup a deferred update rather than a second wire transaction.
     pub(crate) fn self_parent_transaction_active(&self, zaura_toplevel_host_id: u32) -> bool {
         self.toplevels
@@ -1747,15 +1920,16 @@ impl WindowPlacementState {
     pub(crate) fn deferred_self_parent_move(
         &self,
         zaura_toplevel_host_id: u32,
-        _fallback_origin: (i32, i32),
     ) -> Option<DeferredSelfParentMove> {
         let state = self.toplevels.get(&zaura_toplevel_host_id)?;
         let target = state.transaction.deferred_target()?;
-        // A caller-provided event coordinate is not a source of truth.  It
-        // may be an intermediate focus/animation origin, so never use it to
-        // synthesize an absolute placement delta when the last authoritative
-        // Aura observation is unavailable.
-        let current_origin = state.origin?;
+        // Use only the origin retained from an authoritative Aura event; a
+        // deferred target must never be rebased from an intermediate focus or
+        // animation coordinate.
+        // A liveness fallback may retain the last coordinate for diagnostics
+        // while explicitly marking it unconfirmed. Never use that stale
+        // coordinate to rebase a deferred relative move.
+        let current_origin = state.origin.filter(|_| state.origin_confirmed)?;
         let relative = (
             target.0.checked_sub(current_origin.0)?,
             target.1.checked_sub(current_origin.1)?,
@@ -1798,27 +1972,25 @@ impl WindowPlacementState {
             .and_then(|state| state.transaction.active_surface())
     }
 
-    /// Promote a deferred target whose size is already acknowledged by the
-    /// host. The caller can immediately ask for
-    /// [`Self::pending_self_parent_move`].
-    pub(crate) fn promote_deferred_self_parent_target(
+    /// Promote a deferred target and retain an exact rollback token for the
+    /// wire adapter.
+    pub(crate) fn promote_deferred_self_parent_target_with_rollback(
         &mut self,
         zaura_toplevel_host_id: u32,
         target: (i32, i32, i32, i32),
-    ) -> bool {
-        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
-            return false;
-        };
-        if !state.transaction.promote_deferred(target, None) {
-            return false;
-        }
+    ) -> Option<DeferredPromotionRollback> {
+        let state = self.toplevels.get_mut(&zaura_toplevel_host_id)?;
+        let rollback = state
+            .transaction
+            .promote_deferred_with_rollback(target, None)?;
         self.debug_assert_consistent();
-        true
+        Some(rollback)
     }
 
     /// Promote a deferred target whose size still needs a host XDG
     /// configure. The caller publishes that configure/geometry pair before
     /// invoking this method.
+    #[cfg(test)]
     pub(crate) fn promote_deferred_self_parent_resize(
         &mut self,
         zaura_toplevel_host_id: u32,
@@ -1837,6 +2009,37 @@ impl WindowPlacementState {
         true
     }
 
+    /// Promote a deferred resize target and retain an exact rollback token for
+    /// failures while its configure/barrier wire is being staged.
+    pub(crate) fn promote_deferred_self_parent_resize_with_rollback(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        target: (i32, i32, i32, i32),
+    ) -> Option<DeferredPromotionRollback> {
+        let state = self.toplevels.get_mut(&zaura_toplevel_host_id)?;
+        let rollback = state
+            .transaction
+            .promote_deferred_with_rollback(target, Some((target.2, target.3)))?;
+        self.debug_assert_consistent();
+        Some(rollback)
+    }
+
+    /// Roll back a deferred promotion if no later reducer event superseded it.
+    pub(crate) fn rollback_deferred_self_parent_promotion(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+        rollback: DeferredPromotionRollback,
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let rolled_back = state.transaction.rollback_deferred_promotion(rollback);
+        if rolled_back {
+            self.debug_assert_consistent();
+        }
+        rolled_back
+    }
+
     /// Finish a self-parent transaction that has no deferred target after the
     /// follow-up barrier.
     pub(crate) fn complete_self_parent_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
@@ -1848,6 +2051,52 @@ impl WindowPlacementState {
             self.debug_assert_consistent();
         }
         completed
+    }
+
+    /// Settle cleanup when the ordered host barrier completed but Aura omitted
+    /// the target `origin_change`.
+    ///
+    /// A sync callback has no geometry payload, but it is ordered after the
+    /// self-parent request. In that narrow case the requested target is the
+    /// only safe baseline available to the proxy. Keep the transaction alive
+    /// long enough for [`crate::handler::placement::advance_self_parent_after_origin`]
+    /// to promote a deferred shortcut (or complete the current one), and mark
+    /// the target as confirmed so the next relative delta can be calculated.
+    pub(crate) fn settle_self_parent_after_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        if !state.transaction.settle_origin_after_cleanup_barrier() {
+            return false;
+        }
+        let Some(target) = state.transaction.active_target() else {
+            return false;
+        };
+        state.origin = Some((target.0, target.1));
+        state.origin_confirmed = true;
+        self.debug_assert_consistent();
+        true
+    }
+
+    /// Test/compatibility helper that retires cleanup without claiming a
+    /// target origin. Runtime callbacks use
+    /// [`Self::settle_self_parent_after_cleanup`] because dropping a deferred
+    /// target here deadlocks subsequent shortcuts when Aura omits
+    /// `origin_change`.
+    #[cfg(test)]
+    pub(crate) fn settle_self_parent_cleanup_without_origin(
+        &mut self,
+        zaura_toplevel_host_id: u32,
+    ) -> bool {
+        let Some(state) = self.toplevels.get_mut(&zaura_toplevel_host_id) else {
+            return false;
+        };
+        let settled = state.transaction.settle_cleanup_without_origin();
+        if settled {
+            state.origin_confirmed = false;
+            self.debug_assert_consistent();
+        }
+        settled
     }
 
     /// Abort a cleanup transition after a follow-up wire operation could not
@@ -1923,7 +2172,9 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         reported_size: (i32, i32),
     ) -> bool {
-        let origin = self.origin(zaura_toplevel_host_id).unwrap_or((0, 0));
+        let Some(origin) = self.origin(zaura_toplevel_host_id) else {
+            return false;
+        };
         self.accept_pending_resize_at_origin(zaura_toplevel_host_id, reported_size, origin)
             && self.pending_resize_size(zaura_toplevel_host_id).is_none()
     }
@@ -1948,27 +2199,75 @@ impl WindowPlacementState {
             return true;
         };
         let phase_before_configure = state.transaction.phase();
-        state.observed_size = Some(reported_size);
+        // A retained coordinate from the no-origin cleanup fallback is only
+        // diagnostic. It must not reject the first real configure that carries
+        // the fresh host origin used to recover the relative-placement
+        // baseline.
+        let known_origin = state.origin.filter(|_| state.origin_confirmed);
+        let waiting_for_resize = matches!(
+            phase_before_configure,
+            SelfParentPhase::ResizePending {
+                expected_size: Some(_),
+                ..
+            }
+        );
+        // A synthetic XDG geometry resize must preserve the current
+        // screen-space origin.  Aura also emits focus/activation configures
+        // while a resize is pending; those can have a plausible size but a
+        // widget/animation origin.  Treating one as the resize ACK rebases
+        // the subsequent self-parent delta and causes the window to drift.
+        // When no authoritative origin exists yet, the first real configure
+        // is still allowed to establish it.
+        if waiting_for_resize
+            && known_origin.is_some_and(|expected_origin| expected_origin != origin)
+        {
+            return false;
+        }
         let result = state.transaction.note_host_resize(
             reported_size,
             origin,
             MAX_HOST_CLIENT_SIZE_ADJUSTMENT,
         );
+        if let HostResizeResult::Accepted {
+            origin: accepted_origin,
+        } = result
+        {
+            // When the first valid configure arrives before any
+            // `origin_change`, this configure is the only authoritative
+            // screen-space coordinate available for the move phase. Record it
+            // together with the accepted resize transition; leaving it for
+            // the caller's later `record_origin` pass races the reducer phase
+            // change and causes that pass to reject the otherwise valid first
+            // origin.
+            if !state.origin_confirmed {
+                state.origin = Some(accepted_origin);
+                state.origin_confirmed = true;
+            }
+        }
+        if !matches!(result, HostResizeResult::Ignored) {
+            state.observed_size = Some(reported_size);
+        }
         self.debug_assert_consistent();
         if !matches!(result, HostResizeResult::Ignored) {
             return true;
         }
 
         // An Aura configure is also the host's normal state/resize signal.
-        // Only reject it when a native self-parent transaction is actively
-        // waiting for its requested size.  Once that transaction has moved
-        // past the resize gate, or when no placement is active, the configure
-        // must continue through the normal XDG translation path.
+        // Reject an unrelated configure while a native self-parent
+        // transaction is still waiting for its requested size.  Treating an
+        // ignored configure as accepted here lets a focus/activation event
+        // open a deferred placement and move the window without a shortcut.
+        // Once the resize gate has been accepted, or when no placement is
+        // active, the configure continues through the normal XDG path.
         matches!(
             phase_before_configure,
             SelfParentPhase::Idle
                 | SelfParentPhase::MovePending { .. }
                 | SelfParentPhase::CleanupPending { .. }
+                | SelfParentPhase::ResizePending {
+                    expected_size: None,
+                    ..
+                }
         )
     }
 
@@ -1978,7 +2277,6 @@ impl WindowPlacementState {
     pub(crate) fn pending_self_parent_move(
         &self,
         zaura_toplevel_host_id: u32,
-        _fallback_origin: (i32, i32),
     ) -> Option<PendingSelfParentMove> {
         let state = self.toplevels.get(&zaura_toplevel_host_id)?;
         let SelfParentPhase::ResizePending {
@@ -1990,10 +2288,9 @@ impl WindowPlacementState {
         else {
             return None;
         };
-        // Do not fall back to the origin carried by the current configure:
-        // that coordinate can describe an activation animation rather than
-        // the window's settled screen position.
-        let current_origin = state.origin?;
+        // The retained origin is the only safe baseline; an activation or
+        // animation coordinate must never be substituted here.
+        let current_origin = state.origin.filter(|_| state.origin_confirmed)?;
         let relative = (
             target.0.checked_sub(current_origin.0)?,
             target.1.checked_sub(current_origin.1)?,
@@ -2011,19 +2308,19 @@ impl WindowPlacementState {
         let SelfParentPhase::ResizePending { target, .. } = state.transaction.phase() else {
             return false;
         };
-        if !state
-            .transaction
-            .mark_move_queued(state.origin.unwrap_or((0, 0)), target)
-        {
+        let Some(origin) = state.origin else {
+            return false;
+        };
+        if !state.transaction.mark_move_queued(origin, target) {
             return false;
         }
         self.debug_assert_consistent();
         true
     }
 
-    /// Retire the active self-parent target after its nullable unparent
-    /// cleanup has been queued. This is the deduplication boundary for the
-    /// next identical shortcut.
+    /// Retire the active self-parent target after its ordered cleanup barrier
+    /// has been queued. This is the deduplication boundary for the next
+    /// identical shortcut; the parent relationship itself remains installed.
     ///
     /// A newer shortcut may have entered the resize phase while the older
     /// target's host barrier was in flight. In that case the state no longer
@@ -2046,7 +2343,7 @@ impl WindowPlacementState {
             .is_some_and(|state| state.transaction.origin_settled())
     }
 
-    /// Return whether nullable-unparent cleanup has completed its first
+    /// Return whether ordered self-parent cleanup has completed its first
     /// barrier while the placement state is still active.
     pub(crate) fn self_parent_cleanup_pending(&self, zaura_toplevel_host_id: u32) -> bool {
         self.toplevels
@@ -2059,7 +2356,25 @@ impl WindowPlacementState {
             })
     }
 
-    /// Mark the follow-up NULL-parent/IME barrier as host-complete.
+    /// Return whether the ordered follow-up cleanup barrier is still in
+    /// flight. An origin event may arrive before `sync.done`; it can mark the
+    /// target as acknowledged, but must not promote a deferred shortcut until
+    /// the barrier has crossed the host stream.
+    pub(crate) fn self_parent_cleanup_barrier_pending(&self, zaura_toplevel_host_id: u32) -> bool {
+        self.toplevels
+            .get(&zaura_toplevel_host_id)
+            .is_some_and(|state| {
+                matches!(
+                    state.transaction.phase(),
+                    SelfParentPhase::CleanupPending {
+                        cleanup_barrier_pending: true,
+                        ..
+                    }
+                )
+            })
+    }
+
+    /// Mark the follow-up self-parent/IME barrier as host-complete.
     ///
     /// An origin event can race this callback. Keeping the bit in the phase
     /// prevents `complete_self_parent_cleanup` from retiring the transaction
@@ -2078,25 +2393,6 @@ impl WindowPlacementState {
         true
     }
 
-    /// Report whether cleanup is complete without fabricating a host origin.
-    ///
-    /// The nullable-unparent and IME sync callbacks establish ordering on the
-    /// host stream, but they do not carry the widget's final screen position.
-    /// Promoting `pending_origin` here used to make the next shortcut compute
-    /// its relative delta from a prediction.  A delayed `configure` or focus
-    /// event could then overwrite that prediction and move the window again.
-    ///
-    /// Keep this method as an explicit no-op compatibility boundary for the
-    /// callback adapter: only a matching host `origin_change` (or the origin
-    /// in a matching resize acknowledgement) may settle a self-parent
-    /// transaction.
-    #[must_use = "cleanup completion never authorizes a fabricated origin"]
-    pub(crate) fn settle_self_parent_after_cleanup(&mut self, zaura_toplevel_host_id: u32) -> bool {
-        let _ = zaura_toplevel_host_id;
-        false
-    }
-
-    #[cfg(test)]
     pub(crate) fn pending_origin(&self, zaura_toplevel_host_id: u32) -> Option<(i32, i32)> {
         self.toplevels
             .get(&zaura_toplevel_host_id)
@@ -2112,9 +2408,10 @@ impl WindowPlacementState {
     ///
     /// Returns `false` for an intermediate origin that conflicts with a
     /// pending self-parent target or for an Aura toplevel that is no longer
-    /// associated with a live guest xdg_toplevel. The caller can log either
-    /// event, but cannot accidentally recreate state after teardown or
-    /// overwrite the origin used by the next shortcut.
+    /// associated with a live guest xdg_toplevel. After a completed
+    /// self-parent generation, the reducer may temporarily reject late
+    /// focus/animation origins until the next explicit placement starts; this
+    /// prevents an intermediate frame from rebasing the next relative delta.
     #[must_use = "the origin was rejected or is still pending"]
     pub(crate) fn record_origin(
         &mut self,
@@ -2155,6 +2452,7 @@ impl WindowPlacementState {
         };
         if accepted {
             state.origin = Some(origin);
+            state.origin_confirmed = true;
         }
         self.debug_assert_consistent();
         accepted
@@ -2177,6 +2475,7 @@ impl WindowPlacementState {
         }
         let state = self.toplevels.entry(zaura_toplevel_host_id).or_default();
         state.origin = Some(target_origin);
+        state.origin_confirmed = true;
         state
             .transaction
             .assume_move_pending((target_origin.0, target_origin.1, 0, 0), 0);
@@ -2246,19 +2545,42 @@ impl WindowPlacementState {
         true
     }
 
+    /// Cancel a barrier that was staged but never published to the host.
+    pub(crate) fn cancel_barrier(&mut self, callback_host_id: u32) -> bool {
+        let cancelled = self.barriers.cancel(callback_host_id);
+        if cancelled {
+            self.debug_assert_consistent();
+        }
+        cancelled
+    }
+
     /// Retire a completed barrier and return cleanup only if it is still newest.
     #[must_use = "the returned completion identifies which placement finished"]
     pub(crate) fn complete_barrier(
         &mut self,
         callback_host_id: u32,
     ) -> Option<PlacementBarrierCompletion> {
-        let mut completion = self.barriers.complete(callback_host_id)?;
+        let role_is_live = self
+            .barriers
+            .callback_for(callback_host_id)
+            .is_some_and(|toplevel_id| self.aura_toplevel_links.get_reverse(toplevel_id).is_some());
+        let mut completion = self.barriers.complete(callback_host_id, role_is_live)?;
         if let Some(generation) = completion.generation {
             let current_generation = self
                 .toplevels
                 .get(&completion.toplevel_id)
                 .and_then(|state| state.transaction.active_generation());
             if current_generation != Some(generation) {
+                // A transient ARC identity belongs to the wl_surface, not
+                // the xdg_toplevel role.  The role may be destroyed while
+                // its surface (and Aura child) remains alive; in that case
+                // the callback must still restore the native identity.
+                let role_was_released = !role_is_live;
+                let restore_surface_identity = role_was_released
+                    && matches!(
+                        completion.cleanup.as_ref(),
+                        Some(PlacementBarrierCleanup::RestoreNativeApplicationId { .. })
+                    );
                 log::debug!(
                     "discarding stale placement cleanup callback={} toplevel={} \
                      generation={} current={:?}",
@@ -2267,7 +2589,9 @@ impl WindowPlacementState {
                     generation,
                     current_generation
                 );
-                completion.cleanup = None;
+                if !restore_surface_identity {
+                    completion.cleanup = None;
+                }
             }
         }
         self.debug_assert_consistent();
@@ -2551,7 +2875,7 @@ mod tests {
         );
         assert_eq!(
             probe.barrier_cleanup(),
-            Some(&PlacementBarrierCleanup::Unparent {
+            Some(&PlacementBarrierCleanup::RetainSelfParent {
                 zaura_surface_id: 80
             })
         );
@@ -2570,7 +2894,7 @@ mod tests {
         assert!(!self_parent.accept_pending_resize(70, (800, 600)));
         assert!(self_parent.accept_pending_resize(70, (1920, 1080)));
         assert_eq!(
-            self_parent.pending_self_parent_move(70, (100, 200)),
+            self_parent.pending_self_parent_move(70),
             Some((80, (100, 200), (-100, -200)))
         );
         assert!(self_parent.mark_self_parent_move_queued(70));
@@ -2583,10 +2907,6 @@ mod tests {
             )
             .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
         self_parent.finish_self_parent_move(70);
-        assert!(
-            !self_parent.settle_self_parent_after_cleanup(70),
-            "cleanup ordering must not fabricate a host origin"
-        );
         assert_eq!(
             self_parent.origin(70),
             Some((100, 200)),
@@ -2598,7 +2918,7 @@ mod tests {
             "cleanup cannot complete before the target origin is acknowledged"
         );
         // The host may deliver the final origin notification after the
-        // nullable-unparent cleanup. A duplicate shortcut in that interval
+        // ordered self-parent cleanup. A duplicate shortcut in that interval
         // must remain deferred rather than enqueueing another probe.
         assert!(self_parent
             .prepare_placement(
@@ -2619,6 +2939,38 @@ mod tests {
                 NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
             )
             .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget));
+    }
+
+    #[test]
+    fn first_accepted_resize_configure_establishes_origin_baseline() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(2);
+        let _shadow = register_target(&mut state, target);
+
+        assert!(state.arm_self_parent_target(
+            target.zaura_toplevel_host_id(),
+            target.zaura_surface_host_id(),
+            (0, 0, 1920, 1080),
+        ));
+        assert_eq!(state.origin(target.zaura_toplevel_host_id()), None);
+        assert!(state.accept_pending_resize_at_origin(
+            target.zaura_toplevel_host_id(),
+            (1920, 1080),
+            (320, 180),
+        ));
+        assert_eq!(
+            state.origin(target.zaura_toplevel_host_id()),
+            Some((320, 180)),
+            "the first accepted host configure must provide the relative-move baseline"
+        );
+        assert_eq!(
+            state.pending_self_parent_move(target.zaura_toplevel_host_id()),
+            Some((target.zaura_surface_host_id(), (320, 180), (-320, -180))),
+            "a valid first configure must open the self-parent move phase"
+        );
     }
 
     #[test]
@@ -2670,7 +3022,7 @@ mod tests {
             Some(original_origin)
         );
         assert_eq!(
-            state.pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin),
+            state.pending_self_parent_move(target.zaura_toplevel_host_id()),
             None,
             "the resize must be acknowledged before the parent phase"
         );
@@ -2680,7 +3032,7 @@ mod tests {
             "a resize-time animation coordinate must not rebase the settled origin"
         );
         assert_eq!(
-            state.pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin),
+            state.pending_self_parent_move(target.zaura_toplevel_host_id()),
             Some((
                 target.zaura_surface_host_id(),
                 original_origin,
@@ -2713,14 +3065,68 @@ mod tests {
         // parent delta.
         assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2160),));
         assert_eq!(
-            state.pending_self_parent_move(target.zaura_toplevel_host_id(), (0, 0)),
+            state.pending_self_parent_move(target.zaura_toplevel_host_id()),
             Some((target.zaura_surface_host_id(), (0, 0), (1920, 0),)),
             "the parent delta must use the last settled host origin"
         );
     }
 
     #[test]
-    fn late_origin_after_cleanup_does_not_rebase_idle_self_parent() {
+    fn stale_focus_configure_cannot_open_deferred_self_parent_target() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(17);
+        let shadow_table = register_target(&mut state, target);
+        let host_id = target.zaura_toplevel_host_id();
+        let original_origin = (100, 200);
+        assert!(state.record_origin(host_id, original_origin));
+
+        let first = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("first self-parent target should be valid");
+        assert!(state.commit_placement_plan(&first));
+
+        // A second shortcut is retained while the first synthetic resize is
+        // in flight. It must not be published merely because focus/activation
+        // emits an unrelated Aura configure.
+        let second = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 0.5),
+            )
+            .expect("a different shortcut should be deferred");
+        assert!(state.commit_placement_plan(&second));
+        assert!(state.deferred_self_parent_target(host_id).is_some());
+
+        let pending_size = state
+            .pending_resize_size(host_id)
+            .expect("first synthetic resize should still be pending");
+        assert!(
+            !state.accept_pending_resize_at_origin(host_id, pending_size, (1920, 1080)),
+            "a same-size focus configure with a different origin must not count \
+             as the requested resize ACK"
+        );
+        assert!(
+            state.pending_resize_size(host_id).is_some(),
+            "the first synthetic resize must remain pending"
+        );
+        assert!(
+            state.deferred_self_parent_target(host_id).is_some(),
+            "the deferred shortcut must wait for a real size ACK"
+        );
+    }
+
+    #[test]
+    fn late_origin_after_cleanup_does_not_rebase_idle_baseline() {
         let mut state = state_with_output(WindowPlacementMode::new(
             WindowHostPolicy::Guest,
             WindowGeometryMethod::SelfParent,
@@ -2740,40 +3146,253 @@ mod tests {
         assert!(state.commit_placement_plan(&plan));
         assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 1080),));
         assert!(state
-            .pending_self_parent_move(target.zaura_toplevel_host_id(), original_origin)
+            .pending_self_parent_move(target.zaura_toplevel_host_id())
             .is_some());
         assert!(state.mark_self_parent_move_queued(target.zaura_toplevel_host_id()));
         state.finish_self_parent_move(target.zaura_toplevel_host_id());
         assert!(
-            !state.settle_self_parent_after_cleanup(target.zaura_toplevel_host_id()),
-            "cleanup must not promote a predicted origin"
-        );
-        assert!(
-            !state.complete_self_parent_cleanup(target.zaura_toplevel_host_id()),
-            "cleanup must wait for host origin acknowledgement"
+            state.complete_self_parent_cleanup_barrier(target.zaura_toplevel_host_id()),
+            "the follow-up barrier must be acknowledged before cleanup can settle"
         );
         assert_eq!(
             state.origin(target.zaura_toplevel_host_id()),
-            Some(original_origin)
+            Some(original_origin),
+            "the pre-move origin remains authoritative until the host reports the target"
         );
 
-        // A delayed animation/focus event from the old parent generation must
-        // not become the baseline for the next shortcut.
-        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
-        assert_eq!(
-            state.origin(target.zaura_toplevel_host_id()),
-            Some(original_origin)
-        );
-        // Once the host confirms the final origin, cleanup can retire the
-        // transaction and normal external origin updates are accepted again.
+        // Once cleanup completes, late focus/animation origins are ignored
+        // until a new placement generation explicitly clears the guard.
+        // Rebasing on an intermediate coordinate is what caused repeated
+        // shortcuts to drift toward the lower-right corner.
         assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
-        assert!(state.complete_self_parent_cleanup_barrier(target.zaura_toplevel_host_id()));
         assert!(state.complete_self_parent_cleanup(target.zaura_toplevel_host_id()));
-        assert!(state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert_eq!(state.origin(target.zaura_toplevel_host_id()), Some((0, 0)));
+        assert!(
+            state
+                .prepare_placement(
+                    &shadow_table,
+                    target.guest_xdg_toplevel_id(),
+                    target.wl_surface_guest_id(),
+                    NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+                )
+                .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget),
+            "a late focus origin must not turn a duplicate shortcut into a new delta"
+        );
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (0, 0)));
+        assert_eq!(state.origin(target.zaura_toplevel_host_id()), Some((0, 0)));
+        assert!(
+            state
+                .prepare_placement(
+                    &shadow_table,
+                    target.guest_xdg_toplevel_id(),
+                    target.wl_surface_guest_id(),
+                    NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+                )
+                .is_err_and(|error| error == WindowPlacementPlanError::AlreadyAtTarget),
+            "a duplicate shortcut must remain a no-op after cleanup"
+        );
+
+        // Starting a different generation still works after those ordinary
+        // host position updates.
+        let next = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
+            .expect("a different shortcut should supersede the completed target");
+        assert!(state.commit_placement_plan(&next));
+        assert!(!state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
+        assert!(state.abort_self_parent_resize(target.zaura_toplevel_host_id()));
         assert!(state.record_origin(target.zaura_toplevel_host_id(), (500, 700)));
         assert_eq!(
             state.origin(target.zaura_toplevel_host_id()),
             Some((500, 700))
+        );
+    }
+
+    #[test]
+    fn completed_target_is_not_deduplicated_while_newer_transaction_is_active() {
+        let completed_target = (0, 0, 1920, 1080);
+        let newer_target = (1920, 0, 1920, 1080);
+        let mut transaction = super::transaction::PlacementTransaction::default();
+        transaction.assume_move_pending(completed_target, 44);
+        assert_eq!(
+            transaction.note_origin((completed_target.0, completed_target.1)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            }
+        );
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert!(transaction.complete());
+        assert_eq!(transaction.last_completed_target(), Some(completed_target));
+
+        // A different target is now in its resize phase. Pressing the old
+        // completed shortcut must become the deferred latest target, not be
+        // suppressed merely because the physical origin still happens to be
+        // the old target.
+        transaction.begin_resize(newer_target, 44, (1920, 1080));
+        let mut state = WindowPlacementState::default();
+        state.toplevels.insert(
+            77,
+            ToplevelPlacementState {
+                origin: Some((completed_target.0, completed_target.1)),
+                origin_confirmed: true,
+                transaction,
+                observed_size: None,
+            },
+        );
+        assert!(
+            !state.is_self_parent_target_current(77, completed_target),
+            "last-completed deduplication is valid only while the reducer is idle"
+        );
+    }
+
+    #[test]
+    fn late_origin_after_real_cleanup_ack_does_not_rebase_next_resize() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(18);
+        let shadow_table = register_target(&mut state, target);
+        let host_id = target.zaura_toplevel_host_id();
+        assert!(state.record_origin(host_id, (100, 200)));
+
+        let plan = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("self-parent target should be valid");
+        assert!(state.commit_placement_plan(&plan));
+        assert!(state.accept_pending_resize(host_id, (1920, 1080)));
+        assert!(state.mark_self_parent_move_queued(host_id));
+        state.finish_self_parent_move(host_id);
+
+        // This models the normal host path where the requested origin arrives
+        // before the ordered self-parent cleanup barrier.
+        assert!(state.record_origin(host_id, (0, 0)));
+        assert!(state.complete_self_parent_cleanup_barrier(host_id));
+        assert!(state.complete_self_parent_cleanup(host_id));
+
+        // Once cleanup completes, late focus/animation origins are ignored
+        // until a new generation explicitly clears the guard.
+        assert!(!state.record_origin(host_id, (2500, 1500)));
+        assert_eq!(state.origin(host_id), Some((0, 0)));
+
+        let next = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.5, 0.0, 0.5, 1.0),
+            )
+            .expect("the next shortcut should remain usable");
+        assert!(state.commit_placement_plan(&next));
+        assert_eq!(state.pending_origin(host_id), Some((1920, 0)));
+    }
+
+    #[test]
+    fn omitted_origin_cleanup_marks_baseline_unconfirmed_and_allows_retry() {
+        let mut state = state_with_output(WindowPlacementMode::new(
+            WindowHostPolicy::Guest,
+            WindowGeometryMethod::SelfParent,
+        ));
+        let target = placement_target(19);
+        let shadow_table = register_target(&mut state, target);
+        let host_id = target.zaura_toplevel_host_id();
+        let original_origin = (100, 200);
+        assert!(state.record_origin(host_id, original_origin));
+
+        let first = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                NormalizedRect::new(0.0, 0.0, 0.5, 0.5),
+            )
+            .expect("first self-parent target should be valid");
+        assert!(state.commit_placement_plan(&first));
+        assert!(state.accept_pending_resize(host_id, (1920, 1080)));
+        assert!(state.pending_self_parent_move(host_id).is_some());
+        assert!(state.mark_self_parent_move_queued(host_id));
+        state.finish_self_parent_move(host_id);
+
+        // The host has acknowledged the resize and the ordered cleanup
+        // barrier, but omitted the target origin event. The fallback must not
+        // fabricate `(0, 0)` or retain a deferred shortcut that has no safe
+        // relative baseline.
+        assert!(state.complete_self_parent_cleanup_barrier(host_id));
+        let second_rect = NormalizedRect::new(0.5, 0.0, 0.5, 0.5);
+        let second = state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                second_rect,
+            )
+            .expect("a later shortcut should be retained while cleanup is active");
+        assert!(state.commit_placement_plan(&second));
+        assert!(state.deferred_self_parent_target(host_id).is_some());
+
+        assert!(state.settle_self_parent_cleanup_without_origin(host_id));
+        assert!(!state.self_parent_transaction_active(host_id));
+        assert_eq!(state.origin(host_id), Some(original_origin));
+        assert_eq!(
+            state.confirmed_origin(host_id),
+            None,
+            "the retained coordinate is diagnostic only until Aura reports a fresh origin"
+        );
+        assert_eq!(
+            state.deferred_self_parent_target(host_id),
+            None,
+            "the deferred target must be discarded instead of becoming a phantom phase"
+        );
+
+        // Before a fresh origin, the next press is consumed as OriginUnknown,
+        // not suppressed as AlreadyAtTarget. Once Aura reports its actual
+        // position, the same requested rectangle can be planned and queued.
+        assert_eq!(
+            state
+                .prepare_placement(
+                    &shadow_table,
+                    target.guest_xdg_toplevel_id(),
+                    target.wl_surface_guest_id(),
+                    second_rect,
+                )
+                .expect_err("an unconfirmed baseline must block relative placement"),
+            WindowPlacementPlanError::OriginUnknown
+        );
+        assert!(state.record_origin(host_id, (0, 0)));
+        assert!(state
+            .prepare_placement(
+                &shadow_table,
+                target.guest_xdg_toplevel_id(),
+                target.wl_surface_guest_id(),
+                second_rect,
+            )
+            .is_ok());
+
+        // A later resize phase may already be armed by the protocol adapter
+        // when the first fresh Aura configure arrives. The retained
+        // diagnostic origin must not reject that configure merely because it
+        // differs from the unconfirmed coordinate.
+        assert!(state.arm_self_parent_target(
+            host_id,
+            target.zaura_surface_host_id(),
+            (0, 0, 1920, 1080),
+        ));
+        assert!(state.accept_pending_resize_at_origin(host_id, (1920, 1080), (0, 0),));
+        assert_eq!(
+            state.confirmed_origin(host_id),
+            Some((0, 0)),
+            "the first post-fallback configure must restore an authoritative baseline"
         );
     }
 
@@ -2798,13 +3417,13 @@ mod tests {
         assert!(state.commit_placement_plan(&first));
         assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 1080),));
         assert!(state
-            .pending_self_parent_move(target.zaura_toplevel_host_id(), (100, 200))
+            .pending_self_parent_move(target.zaura_toplevel_host_id())
             .is_some());
         assert!(state.mark_self_parent_move_queued(target.zaura_toplevel_host_id()));
 
-        // The second shortcut supersedes the first while its unparent barrier
-        // is still in flight. It is retained as a deferred target; no second
-        // resize transaction is published until the cleanup barrier.
+        // The second shortcut supersedes the first while its ordered cleanup
+        // barrier is still in flight. It is retained as a deferred target; no
+        // second resize transaction is published until that barrier.
         let second = state
             .prepare_placement(
                 &shadow_table,
@@ -2860,7 +3479,7 @@ mod tests {
         );
         assert!(state.accept_pending_resize(target.zaura_toplevel_host_id(), (1920, 2112),));
         assert!(state
-            .pending_self_parent_move(target.zaura_toplevel_host_id(), (100, 200))
+            .pending_self_parent_move(target.zaura_toplevel_host_id())
             .is_some());
     }
 
@@ -2928,25 +3547,6 @@ mod tests {
             .expect("plan preparation should not mutate the role");
         assert_eq!(released.take_aura_toplevel(10), Some(70));
         assert!(!released.commit_placement_plan(&plan));
-    }
-
-    #[test]
-    fn transient_arc_requires_nullable_parent_capability() {
-        let mut transient = state_with_output(WindowPlacementMode::arc_bounds(
-            WindowArcIdLifetime::Transient,
-        ));
-        let target = placement_target(1);
-        let shadow_table = register_target(&mut transient, target);
-        transient.remember_native_application_id(20, "org.chromium.guest_os.native".to_string());
-        let error = transient
-            .prepare_placement(
-                &shadow_table,
-                10,
-                20,
-                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
-            )
-            .expect_err("transient cleanup must be rejected without set_parent");
-        assert_eq!(error, WindowPlacementPlanError::UnsupportedSurfaceVersion);
     }
 
     #[test]
@@ -3284,6 +3884,7 @@ mod tests {
         ));
         let target = placement_target(5);
         let _shadow = register_target(&mut state, target);
+        assert!(state.record_origin(target.zaura_toplevel_host_id(), (100, 200)));
         assert!(state.arm_self_parent_target(
             target.zaura_toplevel_host_id(),
             target.zaura_surface_host_id(),
@@ -3459,6 +4060,49 @@ mod tests {
         assert_eq!(state.aura_shell_id(), Some(25));
         assert_eq!(state.aura_shell_global_name(), Some(8));
         assert_eq!(state.aura_shell_version(), 37);
+    }
+
+    #[test]
+    fn remote_shell_children_are_owned_by_their_manager_generation() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.set_remote_shell_binding(24, 7, 6));
+        assert!(state.remember_remote_surface_for_manager(100, 200, 24));
+        assert!(
+            state.remember_remote_surface_for_manager(100, 200, 24),
+            "registering an already paired role must be idempotent"
+        );
+        assert!(
+            !state.remember_remote_surface_for_manager(101, 200, 25),
+            "a child cannot be rebound to a different manager generation"
+        );
+        assert!(state.remote_shell_has_children(24));
+        assert_eq!(state.take_remote_shell_for_global(7), Some((24, 6)));
+        assert!(state.remote_shell_has_children(24));
+
+        let (remote_surface_id, manager) = state
+            .take_remote_surface_for_wl_surface_with_cleanup(100)
+            .expect("the manager child should be removable");
+        assert_eq!(remote_surface_id, 200);
+        assert_eq!(manager, Some((24, 6)));
+        assert!(!state.remote_shell_has_children(24));
+    }
+
+    #[test]
+    fn orphaned_remote_surface_metadata_is_retired_without_panicking() {
+        let mut state = WindowPlacementState::default();
+        assert!(state.set_remote_shell_binding(24, 7, 6));
+        assert!(state.remember_remote_surface_for_manager(100, 200, 24));
+
+        // Model a stale teardown path that removed the ownership record before
+        // the surface link. The host child is still safe to destroy, but there
+        // is no trustworthy manager generation to release.
+        assert_eq!(state.remote_surface_owners.remove(&200), Some(24));
+        let result = state
+            .take_remote_surface_for_wl_surface_with_cleanup(100)
+            .expect("the orphaned child link should still be retired");
+        assert_eq!(result, (200, None));
+        assert_eq!(state.remote_surface_for_wl_surface(100), None);
+        assert!(!state.remote_shell_has_children(24));
     }
 
     #[test]

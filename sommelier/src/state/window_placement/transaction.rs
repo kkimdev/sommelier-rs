@@ -71,7 +71,7 @@ pub(super) enum SelfParentPhase {
         surface_id: u32,
         origin_acknowledged: bool,
     },
-    /// NULL-parent cleanup and the final origin acknowledgement are pending.
+    /// Ordered cleanup and the final origin acknowledgement are pending.
     CleanupPending {
         generation: u64,
         target: PlacementRect,
@@ -111,13 +111,36 @@ pub(super) enum ResizeGateResult {
 }
 
 /// State and reducer for one live Aura toplevel.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(super) struct PlacementTransaction {
     phase: SelfParentPhase,
     deferred_target: Option<PlacementRect>,
     last_completed_target: Option<PlacementRect>,
+    /// Ignore late host origin frames from the completed self-parent
+    /// generation until a new placement explicitly starts.
+    ///
+    /// Exo/Ash may continue sending focus/animation coordinates after the
+    /// ordered cleanup barrier. Treating those frames as a new baseline makes
+    /// the next relative delta drift (often toward the lower-right corner).
+    /// A new `begin_resize` clears this guard before accepting fresh geometry.
     completed_origin_guard: Option<PlacementPoint>,
     next_generation: u64,
+}
+
+/// Opaque rollback record for a deferred-target promotion.
+///
+/// A placement adapter may need to publish a host barrier after promoting a
+/// deferred target. If message registration fails, the reducer must return to
+/// the exact phase that was active before promotion; otherwise a later
+/// shortcut observes a phantom resize generation with no corresponding wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeferredPromotionRollback {
+    previous_phase: SelfParentPhase,
+    previous_deferred_target: Option<PlacementRect>,
+    previous_last_completed_target: Option<PlacementRect>,
+    previous_completed_origin_guard: Option<PlacementPoint>,
+    previous_next_generation: u64,
+    promoted_generation: u64,
 }
 
 impl PlacementTransaction {
@@ -307,13 +330,26 @@ impl PlacementTransaction {
             expected_size,
             configure_surface_id,
             configure_serial,
-            client_ack_seen: true,
+            client_ack_seen,
             host_resize_ack,
             ..
         } = self.phase
         else {
             return ResizeGateResult::Waiting;
         };
+        // A host XDG/Aura configure can race the proxy-generated configure
+        // sent to the guest. In that ordering a client may commit the host
+        // configure first, then acknowledge the proxy configure when it is
+        // delivered. The host resize acknowledgement is authoritative for
+        // the requested size, so retain that commit instead of dropping it
+        // merely because the synthetic serial has not arrived yet.
+        //
+        // When neither side has acknowledged the requested size, preserve the
+        // defensive rule that an early commit may belong to an older
+        // configure generation.
+        if !client_ack_seen && host_resize_ack.is_none() {
+            return ResizeGateResult::Waiting;
+        }
         self.phase = SelfParentPhase::ResizePending {
             generation,
             target,
@@ -321,7 +357,7 @@ impl PlacementTransaction {
             expected_size,
             configure_surface_id,
             configure_serial,
-            client_ack_seen: true,
+            client_ack_seen,
             client_commit_seen: true,
             host_resize_ack,
         };
@@ -388,7 +424,7 @@ impl PlacementTransaction {
     /// present. This is also called after a late guest ack/commit.
     fn try_open_resize(&mut self) -> ResizeGateResult {
         let SelfParentPhase::ResizePending {
-            client_ack_seen: true,
+            expected_size: Some(_),
             client_commit_seen: true,
             host_resize_ack: Some(host_resize_ack),
             ..
@@ -540,14 +576,17 @@ impl PlacementTransaction {
     }
 
     /// Feed a host origin event into the transaction.
+    ///
+    /// During an active self-parent transaction, only the requested target
+    /// origin can settle the move; focus/animation coordinates are ignored.
+    /// After cleanup, Exo can continue emitting animation/focus coordinates
+    /// from the old parent generation. Keep those frames out of the baseline
+    /// until the next placement explicitly starts a new generation.
     pub(super) fn note_origin(&mut self, origin: PlacementPoint) -> OriginResult {
         match self.phase {
             SelfParentPhase::Idle => {
-                if let Some(guarded_origin) = self.completed_origin_guard {
-                    if guarded_origin != origin {
-                        return OriginResult::Ignored;
-                    }
-                    self.completed_origin_guard = None;
+                if self.completed_origin_guard.is_some() {
+                    return OriginResult::Ignored;
                 }
                 OriginResult::Accepted {
                     transaction_complete: false,
@@ -642,24 +681,90 @@ impl PlacementTransaction {
         true
     }
 
-    /// Abort cleanup without pretending that an origin was observed.
-    pub(super) fn abort_cleanup(&mut self) -> bool {
-        let SelfParentPhase::CleanupPending { target, .. } = self.phase else {
+    /// Settle a cleanup phase when the host omitted the target origin event.
+    ///
+    /// The follow-up barrier is ordered after the self-parent request. When
+    /// Aura omits the corresponding `origin_change`, the requested target is
+    /// the only useful baseline available to this proxy. Mark it settled and
+    /// retain any deferred shortcut so the normal promotion path can continue.
+    /// Completion arms `completed_origin_guard`, preventing late focus frames
+    /// from rebasing the next relative request.
+    pub(super) fn settle_origin_after_cleanup_barrier(&mut self) -> bool {
+        let SelfParentPhase::CleanupPending {
+            generation,
+            target,
+            surface_id,
+            origin_acknowledged: false,
+            cleanup_barrier_pending: false,
+        } = self.phase
+        else {
             return false;
         };
-        self.last_completed_target = Some(target);
-        self.completed_origin_guard = Some((target.0, target.1));
+        self.phase = SelfParentPhase::CleanupPending {
+            generation,
+            target,
+            surface_id,
+            origin_acknowledged: true,
+            cleanup_barrier_pending: false,
+        };
+        true
+    }
+
+    /// Retire a cleanup phase without asserting a target origin.
+    ///
+    /// This is reserved for a true cleanup failure where the host did not
+    /// acknowledge the ordered follow-up barrier. A successful sync barrier
+    /// should use [`Self::settle_origin_after_cleanup_barrier`] instead.
+    #[cfg(test)]
+    pub(super) fn settle_cleanup_without_origin(&mut self) -> bool {
+        let SelfParentPhase::CleanupPending {
+            cleanup_barrier_pending: false,
+            ..
+        } = self.phase
+        else {
+            return false;
+        };
+        self.deferred_target = None;
+        self.phase = SelfParentPhase::Idle;
+        true
+    }
+
+    /// Abort cleanup without pretending that an origin was observed.
+    pub(super) fn abort_cleanup(&mut self) -> bool {
+        if !matches!(self.phase, SelfParentPhase::CleanupPending { .. }) {
+            return false;
+        }
+        // Cleanup failure is not a successful placement.  In particular, do
+        // not publish the target as `last_completed_target`: callers must be
+        // able to retry the same rectangle after a queue/teardown failure.
+        // Likewise, no post-completion origin guard is justified because the
+        // host may never have applied the move.
         self.deferred_target = None;
         self.phase = SelfParentPhase::Idle;
         true
     }
 
     /// Promote a deferred target after cleanup has fully converged.
+    #[cfg(test)]
     pub(super) fn promote_deferred(
         &mut self,
         target: PlacementRect,
         expected_size: Option<(i32, i32)>,
     ) -> bool {
+        self.promote_deferred_with_rollback(target, expected_size)
+            .is_some()
+    }
+
+    /// Promote a deferred target and return an exact rollback record.
+    ///
+    /// The returned token is valid until the next reducer event for this
+    /// transaction. Callers use it when a subsequent wire/barrier operation
+    /// fails after promotion but before the new phase is published.
+    pub(super) fn promote_deferred_with_rollback(
+        &mut self,
+        target: PlacementRect,
+        expected_size: Option<(i32, i32)>,
+    ) -> Option<DeferredPromotionRollback> {
         let surface_id = match self.phase {
             SelfParentPhase::ResizePending {
                 surface_id,
@@ -672,13 +777,22 @@ impl PlacementTransaction {
                 cleanup_barrier_pending: false,
                 ..
             } => surface_id,
-            _ => return false,
+            _ => return None,
         };
         if self.deferred_target != Some(target) {
-            return false;
+            return None;
         }
+        let promoted_generation = self.next_generation.wrapping_add(1).max(1);
+        let rollback = DeferredPromotionRollback {
+            previous_phase: self.phase,
+            previous_deferred_target: self.deferred_target,
+            previous_last_completed_target: self.last_completed_target,
+            previous_completed_origin_guard: self.completed_origin_guard,
+            previous_next_generation: self.next_generation,
+            promoted_generation,
+        };
         self.deferred_target = None;
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.next_generation = promoted_generation;
         let generation = self.next_generation;
         self.phase = SelfParentPhase::ResizePending {
             generation,
@@ -694,6 +808,22 @@ impl PlacementTransaction {
             client_commit_seen: true,
             host_resize_ack: None,
         };
+        Some(rollback)
+    }
+
+    /// Restore the exact transaction state captured before promotion.
+    pub(super) fn rollback_deferred_promotion(
+        &mut self,
+        rollback: DeferredPromotionRollback,
+    ) -> bool {
+        if self.active_generation() != Some(rollback.promoted_generation) {
+            return false;
+        }
+        self.phase = rollback.previous_phase;
+        self.deferred_target = rollback.previous_deferred_target;
+        self.last_completed_target = rollback.previous_last_completed_target;
+        self.completed_origin_guard = rollback.previous_completed_origin_guard;
+        self.next_generation = rollback.previous_next_generation;
         true
     }
 }
@@ -720,6 +850,7 @@ fn is_acceptable_size(
 mod tests {
     use super::{
         ConfigureToken, HostResizeResult, OriginResult, PlacementTransaction, ResizeGateResult,
+        SelfParentPhase,
     };
 
     const TARGET: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
@@ -745,6 +876,31 @@ mod tests {
             ResizeGateResult::Ready { origin: (100, 200) }
         );
         assert!(!transaction.origin_settled());
+    }
+
+    #[test]
+    fn host_resize_allows_commit_before_late_synthetic_ack() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.bind_configure(ConfigureToken {
+            xdg_surface_id: 11,
+            serial: 77,
+        }));
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Buffered
+        );
+        assert_eq!(
+            transaction.note_client_commit(),
+            ResizeGateResult::Ready { origin: (100, 200) },
+            "a commit after the host's matching resize configure is valid even \
+             when the proxy configure acknowledgement is delivered later"
+        );
+        assert_eq!(
+            transaction.note_client_ack(11, 77),
+            ResizeGateResult::Waiting,
+            "the late synthetic acknowledgement must not reopen a completed gate"
+        );
     }
 
     #[test]
@@ -831,5 +987,144 @@ mod tests {
             }
         );
         assert!(transaction.complete());
+    }
+
+    #[test]
+    fn completed_cleanup_ignores_late_origin_updates_until_next_generation() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert_eq!(
+            transaction.note_origin((0, 0)),
+            OriginResult::Accepted {
+                transaction_complete: true
+            }
+        );
+        assert!(transaction.complete());
+
+        // Exo can continue an animation/focus origin stream after the
+        // placement cleanup callback. Those coordinates are not a new
+        // placement baseline: accepting them would rebase the next relative
+        // request on an intermediate frame and visibly drift the window.
+        assert_eq!(transaction.note_origin((785, 541)), OriginResult::Ignored);
+        assert_eq!(transaction.note_origin((800, 550)), OriginResult::Ignored);
+        // Starting a fresh generation explicitly clears the guard. A
+        // subsequent idle origin after an aborted request can then establish
+        // a new authoritative baseline.
+        transaction.begin_resize((1920, 0, 1920, 1080), 44, (1920, 1080));
+        assert!(transaction.abort_resize());
+        assert_eq!(
+            transaction.note_origin((800, 550)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            }
+        );
+    }
+
+    #[test]
+    fn omitted_origin_fallback_retires_cleanup_and_drops_deferred_target() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+
+        let deferred = (1920, 0, 1920, 1080);
+        assert!(transaction.defer_target(deferred));
+        assert_eq!(transaction.deferred_target(), Some(deferred));
+        assert!(transaction.complete_cleanup_barrier());
+
+        // The host has ordered the resize and cleanup but omitted the target
+        // origin. Retire the generation without claiming that the target was
+        // observed; a later idle origin can re-establish the baseline.
+        assert!(transaction.settle_cleanup_without_origin());
+        assert_eq!(transaction.phase(), SelfParentPhase::Idle);
+        assert_eq!(transaction.deferred_target(), None);
+        assert_eq!(
+            transaction.last_completed_target(),
+            None,
+            "an unconfirmed target must not become an AlreadyAtTarget guard"
+        );
+        assert_eq!(
+            transaction.note_origin((0, 0)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            }
+        );
+        assert_eq!(
+            transaction.begin_resize(deferred, 44, (1920, 1080)),
+            2,
+            "the next shortcut must be able to retry after the fallback"
+        );
+    }
+
+    #[test]
+    fn active_resize_rejects_untrusted_origins_until_it_is_aborted() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.begin_resize(TARGET, 44, (1920, 1080));
+        assert!(transaction.assume_client_ready());
+        assert_eq!(
+            transaction.note_host_resize((1920, 1080), (100, 200), 256),
+            HostResizeResult::Accepted { origin: (100, 200) }
+        );
+        assert!(transaction.mark_move_queued((100, 200), TARGET));
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.complete_cleanup_barrier());
+        assert_eq!(
+            transaction.note_origin((0, 0)),
+            OriginResult::Accepted {
+                transaction_complete: true
+            }
+        );
+        assert!(transaction.complete());
+
+        let next_target = (1920, 0, 1920, 1080);
+        transaction.begin_resize(next_target, 44, (1920, 1080));
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Ignored,
+            "active resize phases still reject untrusted animation origins"
+        );
+        assert!(transaction.abort_resize());
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            },
+            "idle origin tracking resumes after the failed generation is aborted"
+        );
+    }
+
+    #[test]
+    fn aborted_cleanup_does_not_mark_target_as_completed_or_block_retry() {
+        let mut transaction = PlacementTransaction::default();
+        transaction.assume_move_pending(TARGET, 44);
+        assert!(transaction.begin_cleanup());
+        assert!(transaction.abort_cleanup());
+        assert_eq!(transaction.phase(), SelfParentPhase::Idle);
+        assert_eq!(
+            transaction.last_completed_target(),
+            None,
+            "a failed cleanup is not a completed placement"
+        );
+        assert_eq!(
+            transaction.note_origin((785, 541)),
+            OriginResult::Accepted {
+                transaction_complete: false
+            },
+            "failed cleanup must not leave a permanent origin guard"
+        );
+        assert_eq!(transaction.begin_resize(TARGET, 44, (1920, 1080)), 2);
     }
 }
