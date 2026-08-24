@@ -22,7 +22,7 @@ limitations under the License.
 //! validation.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -237,10 +237,27 @@ impl ShortcutConfig {
         path: &Path,
         host_accelerators: &[Accelerator],
     ) -> Result<Arc<Self>, ShortcutConfigError> {
-        let bytes = fs::read(path).map_err(|source| ShortcutConfigError::Io {
+        let file = fs::File::open(path).map_err(|source| ShortcutConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+        // Bound the read itself rather than loading an untrusted path with
+        // `fs::read` and checking its size afterwards. The extra byte lets us
+        // distinguish an exactly-at-limit file from one that exceeds it.
+        let mut bytes = Vec::with_capacity(
+            MAX_CONFIG_BYTES.min(
+                file.metadata()
+                    .map(|metadata| metadata.len() as usize)
+                    .unwrap_or_default()
+                    .saturating_add(1),
+            ),
+        );
+        file.take((MAX_CONFIG_BYTES as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| ShortcutConfigError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
         if bytes.len() > MAX_CONFIG_BYTES {
             return Err(ShortcutConfigError::FileTooLarge {
                 actual: bytes.len(),
@@ -323,15 +340,28 @@ impl ShortcutConfigHandle {
 
     /// Clone the currently published immutable configuration.
     pub(crate) fn snapshot(&self) -> Arc<ShortcutConfig> {
-        self.current
-            .read()
-            .expect("shortcut config lock poisoned")
-            .clone()
+        match self.current.read() {
+            Ok(config) => config.clone(),
+            Err(poisoned) => {
+                // The protected value is an immutable Arc and remains valid
+                // even if a future maintenance change panics while holding
+                // the lock. Recover the last complete generation instead of
+                // taking down the compositor on the next key event.
+                log::error!("shortcut config lock poisoned; recovering last generation");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// Replace the published generation after validation has succeeded.
     pub(crate) fn replace(&self, config: Arc<ShortcutConfig>) {
-        *self.current.write().expect("shortcut config lock poisoned") = config;
+        match self.current.write() {
+            Ok(mut current) => *current = config,
+            Err(poisoned) => {
+                log::error!("shortcut config lock poisoned; replacing recovered generation");
+                *poisoned.into_inner() = config;
+            }
+        }
     }
 }
 
@@ -500,6 +530,27 @@ rect = [0.8, 0.0, 0.5, 0.5]
     }
 
     #[test]
+    fn rejects_a_file_that_exceeds_the_bounded_read_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "sommelier-window-shortcuts-too-large-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let bytes = vec![b' '; MAX_CONFIG_BYTES + 1];
+        fs::write(&path, bytes).expect("write oversized shortcut config");
+        let error = ShortcutConfig::load_from_path(&path, &[])
+            .expect_err("oversized shortcut config must be rejected");
+        let _ = fs::remove_file(&path);
+        match error {
+            ShortcutConfigError::FileTooLarge { actual, maximum } => {
+                assert_eq!(actual, MAX_CONFIG_BYTES + 1);
+                assert_eq!(maximum, MAX_CONFIG_BYTES);
+            }
+            other => panic!("expected bounded file-size error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn converts_normalized_rect_to_work_area_bounds() {
         assert_eq!(
             NormalizedRect::new(0.5, 0.5, 0.5, 0.5).to_bounds((10, 20, 101, 99)),
@@ -531,6 +582,23 @@ rect = [0.8, 0.0, 0.5, 0.5]
     fn handle_replaces_snapshot_atomically() {
         let handle = ShortcutConfigHandle::disabled();
         assert!(handle.snapshot().is_empty());
+        handle.replace(ShortcutConfig::test_nine_grid());
+        assert_eq!(handle.snapshot().bindings.len(), 9);
+    }
+
+    #[test]
+    fn handle_recovers_after_a_writer_panics() {
+        let handle = ShortcutConfigHandle::disabled();
+        let poisoned_handle = handle.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned_handle
+                .current
+                .write()
+                .expect("test lock should initially be healthy");
+            panic!("intentional shortcut config lock poison");
+        })
+        .join();
+
         handle.replace(ShortcutConfig::test_nine_grid());
         assert_eq!(handle.snapshot().bindings.len(), 9);
     }

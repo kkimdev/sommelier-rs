@@ -147,14 +147,19 @@ pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> 
 
 /// Parse a `SOMMELIER_ACCELERATORS`-style string into a list of accelerators.
 pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
+    // An explicitly empty environment value means “reserve no host
+    // accelerators”.  Once a comma is present, however, every list element
+    // must name a keysym.  Silently dropping `a,,b` or `a,` would turn a
+    // malformed host policy into a different policy and could make a
+    // Sommelier-owned shortcut appear to work intermittently.
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let mut result = Vec::new();
     for token in s.split(',') {
         let token = token.trim();
-        // Intentionally skip empty tokens so that trailing/double commas
-        // (e.g. "Super_L,") in user-provided configs are silently tolerated
-        // rather than rejected with a parse error.
         if token.is_empty() {
-            continue;
+            return Err(ParseError::InvalidKeysym("Empty keysym".to_string()));
         }
         result.push(parse_accelerator(token)?);
     }
@@ -231,6 +236,17 @@ mod tests {
     #[test]
     fn parse_empty_string() {
         assert!(parse_accelerators("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_empty_list_elements() {
+        for value in ["<Alt>a,", ",<Alt>a", "<Alt>a,,<Alt>b"] {
+            assert_eq!(
+                parse_accelerators(value),
+                Err(ParseError::InvalidKeysym("Empty keysym".to_string())),
+                "malformed accelerator list should be rejected: {value:?}"
+            );
+        }
     }
 
     #[test]

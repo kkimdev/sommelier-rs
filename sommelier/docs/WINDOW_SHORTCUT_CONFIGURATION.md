@@ -1,6 +1,6 @@
 # Window shortcut configuration and runtime reload
 
-Status: implemented in the `window-placement-shortcuts-rewrite` worktree
+Status: implemented in the stacked window-placement shortcut configuration PR
 
 This document defines how compositor-owned keyboard shortcuts are configured.
 It deliberately separates shortcut bindings from the window-placement backend:
@@ -176,7 +176,7 @@ The conflict behavior is therefore:
 | Situation | Result |
 | --- | --- |
 | Malformed `SOMMELIER_ACCELERATORS` at startup | Startup fails with exit status 2 |
-| Startup config overlaps a host accelerator | Startup fails and names every conflicting chord |
+| Startup config overlaps a host accelerator | Startup fails and identifies the conflicting binding |
 | Reloaded config overlaps a host accelerator | Reload fails; last-known-good bindings remain active |
 | No overlap | Both policies operate independently |
 

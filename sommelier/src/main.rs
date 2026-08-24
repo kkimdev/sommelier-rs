@@ -173,6 +173,21 @@ fn resolve_placement_mode(
     ))
 }
 
+/// Resolve a CLI-supplied shortcut path without panicking when the process
+/// current directory is unavailable.
+///
+/// Absolute paths are returned unchanged. Relative paths are interpreted
+/// against the startup working directory, matching normal CLI behavior while
+/// keeping filesystem failures on the ordinary startup-error path.
+fn resolve_shortcut_config_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("unable to resolve relative window shortcut config path: {error}"))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let env = env_logger::Env::default().default_filter_or("info");
@@ -229,15 +244,16 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let shortcut_config_path = args.window_shortcuts_config.map(|path| {
-        if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .expect("current working directory is required for a relative config path")
-                .join(path)
-        }
-    });
+    let shortcut_config_path = match args.window_shortcuts_config {
+        Some(path) => match resolve_shortcut_config_path(path) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                log::error!("{error}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let shortcut_config = match shortcut_config_path.as_deref() {
         Some(path) => match ShortcutConfig::load_from_path(path, host_accelerators.as_ref()) {
             Ok(config) => config,
@@ -311,6 +327,13 @@ mod tests {
     }
 
     #[test]
+    fn config_path_alone_requires_the_experimental_gate() {
+        let error = resolve_placement_mode(false, true, None, None)
+            .expect_err("a config path must not opt into placement implicitly");
+        assert!(error.contains("--experimental-window-placement"));
+    }
+
+    #[test]
     fn gated_default_uses_native_guest_self_parent() {
         let mode =
             resolve_placement_mode(true, false, None, None).expect("gated default should resolve");
@@ -331,6 +354,27 @@ mod tests {
             )
             .expect("explicit disabled policy should resolve"),
             WindowPlacementMode::disabled()
+        );
+    }
+
+    #[test]
+    fn absolute_shortcut_config_path_is_preserved() {
+        let path = PathBuf::from("/tmp/window-shortcuts.toml");
+        assert_eq!(
+            resolve_shortcut_config_path(path.clone()).expect("absolute path should resolve"),
+            path
+        );
+    }
+
+    #[test]
+    fn relative_shortcut_config_path_uses_startup_working_directory() {
+        let relative = PathBuf::from("window-shortcuts.toml");
+        let expected = std::env::current_dir()
+            .expect("test working directory should be available")
+            .join(&relative);
+        assert_eq!(
+            resolve_shortcut_config_path(relative).expect("relative path should resolve"),
+            expected
         );
     }
 }
