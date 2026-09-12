@@ -707,6 +707,80 @@ pub struct GtkSurfaceState {
     pub host_zaura_surface_id: Option<u32>,
 }
 
+/// Host output geometry used for compositor-owned window layout requests.
+///
+/// `wl_output.mode` reports pixel dimensions while Aura window bounds use
+/// logical screen coordinates. `scale` converts the former into the latter;
+/// output insets remove shelf/non-work-area margins when they are known.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputState {
+    /// Logical screen-space origin from `wl_output.geometry`.
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub mode_width: i32,
+    pub mode_height: i32,
+    pub scale: i32,
+    /// Effective logical output transform. This starts with the
+    /// `wl_output.geometry` transform and is replaced by Aura's
+    /// `logical_transform` event when available.
+    pub transform: i32,
+    pub insets_top: i32,
+    pub insets_left: i32,
+    pub insets_bottom: i32,
+    pub insets_right: i32,
+}
+
+impl OutputState {
+    pub fn work_area(self) -> Option<(i32, i32, i32, i32)> {
+        if !(0..=7).contains(&self.transform) {
+            return None;
+        }
+        let scale = self.scale.max(1);
+        let (mode_width, mode_height) = if matches!(self.transform, 1 | 3 | 5 | 7) {
+            (self.mode_height, self.mode_width)
+        } else {
+            (self.mode_width, self.mode_height)
+        };
+        let width = mode_width.checked_div(scale)?;
+        let height = mode_height.checked_div(scale)?;
+        let x = self.origin_x.checked_add(self.insets_left)?;
+        let y = self.origin_y.checked_add(self.insets_top)?;
+        let width = width
+            .checked_sub(self.insets_left)?
+            .checked_sub(self.insets_right)?;
+        let height = height
+            .checked_sub(self.insets_top)?
+            .checked_sub(self.insets_bottom)?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        Some((x, y, width, height))
+    }
+}
+
+/// Latest host configure retained while a window-bounds sync barrier is
+/// active.  The barrier establishes ordering; flushing only this newest event
+/// avoids forwarding stale intermediate configures while still delivering the
+/// final state once the host has processed the placement request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWindowBoundsConfigure {
+    pub guest_xdg_toplevel_id: u32,
+    pub width: i32,
+    pub height: i32,
+    pub states: Vec<u8>,
+}
+
+/// The serial-bearing `xdg_surface.configure` paired with a retained
+/// toplevel configure while a window-bounds sync barrier is active.
+///
+/// Wayland requires the toplevel event to precede this event.  Keep the pair
+/// separate because either event may arrive first from the host stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingWindowBoundsSurfaceConfigure {
+    pub guest_xdg_surface_id: u32,
+    pub serial: u32,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -804,6 +878,9 @@ pub struct Context {
     pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
     /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
     pub accelerators: Vec<crate::accelerator::Accelerator>,
+    /// Explicitly configured compositor-owned placement shortcuts. An empty
+    /// list means the feature consumes no keyboard chords.
+    pub window_placement_shortcuts: Vec<crate::accelerator::WindowPlacementShortcut>,
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
@@ -880,6 +957,42 @@ pub struct Context {
     pub host_zaura_shell_version: u32,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
+    /// Experimental host-policy workaround: identify the host surface as an
+    /// ARC window so Exo permits `zaura_toplevel.set_window_bounds`.
+    pub window_bounds_as_arc: bool,
+    /// Per-surface ARC policy identities used by the opt-in bounds path.
+    pub arc_application_ids: HashMap<u32, String>,
+    /// Process-shared allocator backing the fabricated ARC policy identities.
+    /// `None` means the allocator could not reserve a collision-free block;
+    /// callers then fail closed and do not enable the bounds path.
+    pub(crate) arc_id_allocator: Option<Arc<crate::arc_task_ids::ArcIdAllocator>>,
+    /// Guest surfaces whose ARC policy identity has already been sent to the
+    /// paired host Aura surface. Keeping this separate from the allocated
+    /// identity avoids repeating the metadata request on every placement.
+    pub arc_application_ids_applied: HashSet<u32>,
+    /// Host wl_output IDs advertised to the guest.
+    pub output_host_ids: Vec<u32>,
+    /// Output mode/scale/insets keyed by host wl_output ID.
+    pub output_states: HashMap<u32, OutputState>,
+    /// Double-buffered output metadata collected until `wl_output.done`.
+    /// Version-1 outputs, which have no done event, update `output_states`
+    /// directly in the compositor handler.
+    pub pending_output_states: HashMap<u32, OutputState>,
+    /// Host output object → (global name, advertisement generation) from
+    /// which the object was bound.  The generation prevents a delayed
+    /// global_remove for an old advertisement from retiring a replacement.
+    pub output_host_global_bindings: HashMap<u32, (u32, u64)>,
+    /// Output objects whose host global disappeared.  Their Wayland object
+    /// lifetime remains valid until release, but they are no longer eligible
+    /// for compositor-owned placement.
+    pub inactive_output_host_ids: HashSet<u32>,
+    /// Host wl_surface ID → host wl_output IDs currently entered by that
+    /// surface. A surface may be visible on more than one output at once;
+    /// selection remains deterministic by following output advertisement
+    /// order.
+    pub surface_output_ids: HashMap<u32, HashSet<u32>>,
+    /// Host-only Aura output objects keyed by their host wl_output object ID.
+    pub zaura_output_to_wl_output: HashMap<u32, u32>,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
     pub wl_surface_to_zaura_surface: HashMap<u32, u32>,
     /// Synthetic GTK shell bindings and their activation token state.
@@ -888,8 +1001,26 @@ pub struct Context {
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
     /// Tracks xdg_surface → wl_surface associations (guest IDs).
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
+    /// Tracks xdg_surface → xdg_toplevel associations (guest IDs).
+    pub xdg_surface_to_xdg_toplevel: HashMap<u32, u32>,
     /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
     pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
+    /// Maps guest xdg_toplevel IDs → host zaura_toplevel IDs.
+    pub xdg_toplevel_to_zaura_toplevel: HashMap<u32, u32>,
+    /// Host callback IDs queued after `zaura_toplevel.set_window_bounds`,
+    /// keyed by callback ID → Aura toplevel ID. A callback.done is the
+    /// compositor-side barrier proving that all preceding bounds requests and
+    /// configure events have been processed.
+    pub window_bounds_barriers: HashMap<u32, u32>,
+    /// The newest bounds barrier for each Aura toplevel. Older callbacks stay
+    /// in `window_bounds_barriers` until their terminal `done`/`delete_id`
+    /// sequence arrives, but no longer gate configure handling.
+    pub active_window_bounds_barriers: HashMap<u32, u32>,
+    /// Latest configure retained while the active placement barrier is live.
+    pub pending_window_bounds_configures: HashMap<u32, PendingWindowBoundsConfigure>,
+    /// Latest serial-bearing surface configure retained while the active
+    /// placement barrier is live.
+    pub pending_window_bounds_surface_configures: HashMap<u32, PendingWindowBoundsSurfaceConfigure>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1171,22 +1302,109 @@ impl Context {
             }
         };
 
-        let accelerators_env = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
-        let accelerators = match crate::accelerator::parse_accelerators(&accelerators_env) {
-            Ok(list) => list,
-            Err(e) => {
-                // A malformed accelerator config should not crash the proxy — that
-                // would break every app in the container. Degrade to no filtering
-                // (all keys forwarded to guest) and log a clear error.
+        let (accelerators, accelerators_valid) = match utf8_env("SOMMELIER_ACCELERATORS") {
+            Ok(Some(accelerators_env)) => {
+                match crate::accelerator::parse_accelerators(&accelerators_env) {
+                    Ok(list) => (list, true),
+                    Err(e) => {
+                        // A malformed accelerator config should not crash the proxy —
+                        // that would break every app in the container. Degrade to no
+                        // filtering (all keys forwarded to the guest), but retain the
+                        // invalid state so placement shortcuts cannot accidentally
+                        // bypass a conflict check against an empty list.
+                        warn!(
+                            "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
+                         Accelerator filtering disabled.",
+                            accelerators_env, e
+                        );
+                        (Vec::new(), false)
+                    }
+                }
+            }
+            Ok(None) => (Vec::new(), true),
+            Err(()) => {
+                // Environment values are bytes on Unix. Treat a non-UTF-8
+                // value as malformed rather than as an unset variable: the
+                // placement conflict gate must fail closed even when the
+                // accelerator list cannot be rendered in a warning.
                 warn!(
-                    "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
-                     Accelerator filtering disabled.",
-                    accelerators_env, e
+                    "Invalid SOMMELIER_ACCELERATORS (value is not UTF-8). \
+                 Accelerator filtering disabled."
                 );
-                Vec::new()
+                (Vec::new(), false)
             }
         };
-
+        let requested_window_bounds_as_arc = env_flag_is_true(
+            std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
+                .ok()
+                .as_deref(),
+        );
+        // ARC application IDs are the capability that makes the direct Aura
+        // bounds policy safe to attempt.  If the process cannot reserve a
+        // collision-free identity block, keep the entire workaround off
+        // rather than creating Aura objects that can never be authorized.
+        let arc_id_allocator = if requested_window_bounds_as_arc {
+            crate::arc_task_ids::process_allocator()
+        } else {
+            None
+        };
+        let window_bounds_as_arc = requested_window_bounds_as_arc && arc_id_allocator.is_some();
+        if requested_window_bounds_as_arc && !window_bounds_as_arc {
+            warn!(
+                "SOMMELIER_WINDOW_BOUNDS_AS_ARC is disabled because no collision-free ARC identity block could be reserved"
+            );
+        }
+        let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
+            Ok(Some(value)) => value,
+            Ok(None) => String::new(),
+            Err(()) => {
+                warn!(
+                    "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS (value is not UTF-8). \
+                 Window placement shortcuts disabled."
+                );
+                String::new()
+            }
+        };
+        let window_placement_shortcuts = if !window_bounds_as_arc {
+            if !window_placement_env.trim().is_empty() {
+                warn!(
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC is set"
+                );
+            }
+            Vec::new()
+        } else if !accelerators_valid {
+            if !window_placement_env.trim().is_empty() {
+                warn!(
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is disabled because \
+                     SOMMELIER_ACCELERATORS is invalid"
+                );
+            }
+            Vec::new()
+        } else {
+            match crate::accelerator::parse_window_placement_shortcuts(&window_placement_env) {
+                Ok(bindings) => {
+                    if let Some(conflict) = bindings
+                        .iter()
+                        .find(|binding| accelerators.contains(&binding.accelerator))
+                    {
+                        warn!(
+                            "Window placement shortcut {:?} conflicts with SOMMELIER_ACCELERATORS; placement shortcuts disabled",
+                            conflict
+                        );
+                        Vec::new()
+                    } else {
+                        bindings
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS '{}': {}. Window placement shortcuts disabled.",
+                        window_placement_env, error
+                    );
+                    Vec::new()
+                }
+            }
+        };
         Self {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
@@ -1229,6 +1447,7 @@ impl Context {
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
+            window_placement_shortcuts,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1256,11 +1475,28 @@ impl Context {
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            window_bounds_as_arc,
+            arc_application_ids: HashMap::new(),
+            arc_id_allocator,
+            arc_application_ids_applied: HashSet::new(),
+            output_host_ids: Vec::new(),
+            output_states: HashMap::new(),
+            pending_output_states: HashMap::new(),
+            output_host_global_bindings: HashMap::new(),
+            inactive_output_host_ids: HashSet::new(),
+            surface_output_ids: HashMap::new(),
+            zaura_output_to_wl_output: HashMap::new(),
             wl_surface_to_zaura_surface: HashMap::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
+            xdg_surface_to_xdg_toplevel: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
+            xdg_toplevel_to_zaura_toplevel: HashMap::new(),
+            window_bounds_barriers: HashMap::new(),
+            active_window_bounds_barriers: HashMap::new(),
+            pending_window_bounds_configures: HashMap::new(),
+            pending_window_bounds_surface_configures: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1299,7 +1535,149 @@ impl Context {
     ) -> Self {
         let mut ctx = Self::new(gpu_accel, xdg_decoration);
         ctx.accelerators = accelerators;
+        ctx.window_placement_shortcuts.clear();
+        // Keep unit tests deterministic even when the developer's shell uses
+        // the runtime-only ARC bounds workaround for an isolated proxy.
+        ctx.window_bounds_as_arc = false;
+        ctx.arc_id_allocator = Some(crate::arc_task_ids::ArcIdAllocator::for_test(
+            crate::arc_task_ids::ARC_ID_POOL_START,
+            crate::arc_task_ids::ARC_ID_POOL_START + 1_000_000 - 1,
+        ));
         ctx
+    }
+
+    /// Return the first output with a usable mode.
+    pub fn primary_output(&self) -> Option<(u32, OutputState)> {
+        self.output_host_ids
+            .iter()
+            .find_map(|&host_id| self.usable_output(host_id))
+    }
+
+    /// Return the output to use for placement of a focused surface.
+    ///
+    /// `wl_surface.enter`/`leave` maintain a set because a surface can span
+    /// outputs. Iterating `output_host_ids` makes the choice deterministic
+    /// even when several entered outputs are simultaneously usable. If the
+    /// association is empty or stale, fall back to the first usable output so
+    /// a surface created before its first enter event remains placeable.
+    pub fn output_for_surface(&self, host_surface_id: u32) -> Option<(u32, OutputState)> {
+        let associated = self.surface_output_ids.get(&host_surface_id);
+        associated
+            .and_then(|associated| {
+                self.output_host_ids.iter().find_map(|&host_id| {
+                    associated
+                        .contains(&host_id)
+                        .then(|| self.usable_output(host_id))
+                        .flatten()
+                })
+            })
+            .or_else(|| self.primary_output())
+    }
+
+    fn usable_output(&self, host_id: u32) -> Option<(u32, OutputState)> {
+        if self.shadow_table.is_pending_destroy_host(host_id)
+            || self.inactive_output_host_ids.contains(&host_id)
+        {
+            return None;
+        }
+        let state = *self.output_states.get(&host_id)?;
+        state.work_area().map(|_| (host_id, state))
+    }
+
+    /// Mutably access the current output snapshot while collecting a new
+    /// `wl_output` event group. The returned state is committed on `done` for
+    /// version-2+ outputs; v1 callers may copy it directly to `output_states`.
+    pub fn pending_output_state(&mut self, host_output_id: u32) -> &mut OutputState {
+        let initial = self
+            .output_states
+            .get(&host_output_id)
+            .copied()
+            .unwrap_or_default();
+        self.pending_output_states
+            .entry(host_output_id)
+            .or_insert(initial)
+    }
+
+    /// Publish one complete output metadata snapshot after `wl_output.done`.
+    pub fn commit_output_state(&mut self, host_output_id: u32) {
+        if let Some(state) = self.pending_output_states.remove(&host_output_id) {
+            self.output_states.insert(host_output_id, state);
+        }
+    }
+
+    /// Whether this output advertises the atomic metadata barrier introduced
+    /// by wl_output version 2. Unknown test-only registrations are treated as
+    /// versioned outputs and therefore require an explicit done event.
+    pub fn output_uses_done(&self, host_output_id: u32) -> bool {
+        self.shadow_table
+            .host_object_version(host_output_id)
+            .is_none_or(|version| version >= 2 || version == u32::MAX)
+    }
+
+    /// Record that a surface entered a host output. Unknown or inactive
+    /// outputs are intentionally ignored; their events may be in flight after
+    /// a global removal and must not steer a new placement operation.
+    pub fn surface_entered_output(&mut self, host_surface_id: u32, host_output_id: u32) {
+        if !self.output_host_ids.contains(&host_output_id)
+            || self.inactive_output_host_ids.contains(&host_output_id)
+            || self.shadow_table.is_pending_destroy_host(host_output_id)
+        {
+            return;
+        }
+        self.surface_output_ids
+            .entry(host_surface_id)
+            .or_default()
+            .insert(host_output_id);
+    }
+
+    /// Remove one output association from a surface, deleting the empty set.
+    pub fn surface_left_output(&mut self, host_surface_id: u32, host_output_id: u32) {
+        let Some(outputs) = self.surface_output_ids.get_mut(&host_surface_id) else {
+            return;
+        };
+        outputs.remove(&host_output_id);
+        if outputs.is_empty() {
+            self.surface_output_ids.remove(&host_surface_id);
+        }
+    }
+
+    fn remove_output_from_surface_associations(&mut self, host_output_id: u32) {
+        self.surface_output_ids.retain(|_, outputs| {
+            outputs.remove(&host_output_id);
+            !outputs.is_empty()
+        });
+    }
+
+    /// Retire placement metadata as soon as the guest releases a wl_output.
+    /// The shadow mapping itself remains reserved until the host's
+    /// `wl_display.delete_id`, but a released output must never be selected
+    /// for a later placement operation.
+    pub fn remove_output_state(&mut self, host_output_id: u32) {
+        self.output_host_ids
+            .retain(|candidate| *candidate != host_output_id);
+        self.output_states.remove(&host_output_id);
+        self.pending_output_states.remove(&host_output_id);
+        self.output_host_global_bindings.remove(&host_output_id);
+        self.inactive_output_host_ids.insert(host_output_id);
+        self.remove_output_from_surface_associations(host_output_id);
+    }
+
+    /// Mark every bound output from one removed host-global generation
+    /// inactive without destroying its still-valid Wayland object.
+    pub fn deactivate_output_bindings(&mut self, global_name: u32, generation: u64) {
+        let retired = self
+            .output_host_global_bindings
+            .iter()
+            .filter_map(|(&host_output_id, &(bound_name, bound_generation))| {
+                (bound_name == global_name && bound_generation == generation)
+                    .then_some(host_output_id)
+            })
+            .collect::<Vec<_>>();
+        for host_output_id in retired {
+            self.inactive_output_host_ids.insert(host_output_id);
+            self.pending_output_states.remove(&host_output_id);
+            self.remove_output_from_surface_associations(host_output_id);
+        }
     }
 }
 
@@ -1312,6 +1690,35 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
     value
         .filter(|identifier| !identifier.is_empty())
         .unwrap_or_else(|| "termina".to_string())
+}
+
+/// Read an environment value only when it is valid UTF-8.
+///
+/// Unix environment variables are arbitrary byte strings. Configuration
+/// parsers in this module operate on `&str`, so a non-UTF-8 value must be
+/// reported distinctly from an unset variable instead of silently becoming an
+/// empty (and potentially valid-looking) configuration.
+fn utf8_env(name: &str) -> Result<Option<String>, ()> {
+    decode_utf8_env(std::env::var_os(name))
+}
+
+fn decode_utf8_env(value: Option<std::ffi::OsString>) -> Result<Option<String>, ()> {
+    match value {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| ()),
+    }
+}
+
+/// Interpret an environment flag without treating mere presence as enabled.
+/// This keeps `VAR=0`, `VAR=false`, and an exported empty value disabled while
+/// accepting the conventional explicit true spellings.
+fn env_flag_is_true(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl Default for Context {
@@ -1357,6 +1764,91 @@ mod tests {
 
         assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
         assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn output_work_area_converts_scale_and_insets() {
+        let output = OutputState {
+            origin_x: 1920,
+            origin_y: 16,
+            mode_width: 3840,
+            mode_height: 2160,
+            scale: 2,
+            insets_top: 24,
+            insets_left: 8,
+            insets_bottom: 48,
+            insets_right: 16,
+            ..Default::default()
+        };
+        assert_eq!(output.work_area(), Some((1928, 40, 1896, 1008)));
+    }
+
+    #[test]
+    fn output_work_area_rejects_invalid_dimensions() {
+        let output = OutputState {
+            mode_width: 100,
+            mode_height: 100,
+            scale: 2,
+            insets_top: 60,
+            ..Default::default()
+        };
+        assert_eq!(output.work_area(), None);
+    }
+
+    #[test]
+    fn output_work_area_swaps_rotated_dimensions() {
+        let output = OutputState {
+            mode_width: 1920,
+            mode_height: 1080,
+            scale: 1,
+            transform: 1,
+            ..Default::default()
+        };
+        assert_eq!(output.work_area(), Some((0, 0, 1080, 1920)));
+    }
+
+    #[test]
+    fn surface_output_selection_prefers_entered_output_and_falls_back() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.output_host_ids = vec![20, 30];
+        for output in ctx.output_host_ids.clone() {
+            ctx.output_states.insert(
+                output,
+                OutputState {
+                    mode_width: 1920,
+                    mode_height: 1080,
+                    scale: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        ctx.surface_entered_output(100, 30);
+        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(30));
+
+        ctx.inactive_output_host_ids.insert(30);
+        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
+        ctx.surface_left_output(100, 30);
+        assert!(!ctx.surface_output_ids.contains_key(&100));
+    }
+
+    #[test]
+    fn explicit_environment_true_values_are_required() {
+        assert!(env_flag_is_true(Some("true")));
+        assert!(env_flag_is_true(Some(" YES ")));
+        assert!(!env_flag_is_true(None));
+        assert!(!env_flag_is_true(Some("")));
+        assert!(!env_flag_is_true(Some("false")));
+        assert!(!env_flag_is_true(Some("1please")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_values_are_not_treated_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![0xff, b'a']);
+        assert_eq!(decode_utf8_env(Some(value)), Err(()));
+        assert_eq!(decode_utf8_env(None), Ok(None));
     }
 
     #[test]
@@ -2105,13 +2597,15 @@ mod tests {
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
-        let buffer = 20;
-        let host_buffer = 40;
+        let host_buffer = HostId(40);
 
         for mut encoded in 0..sequence_count {
-            let mut ctx = Context::new_for_test(false, false, Vec::new());
-            ctx.shadow_table.map_id(buffer, host_buffer);
-            assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
+            // Exercise the lifecycle reducer directly. Constructing a full
+            // Context for every one of the 15,625 short sequences also
+            // initializes the GBM allocator, turning this bounded unit test
+            // into a multi-minute smoke test on systems without /dev/dri.
+            let mut registry = RenderBufferRegistry::default();
+            assert!(registry.register_native(host_buffer, (1, 1), Vec::new()));
             let mut model = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
@@ -2122,14 +2616,14 @@ mod tests {
                         if !matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
                             model = awaiting_release(false);
                         }
-                        assert!(ctx.mark_buffer_submitted(buffer));
+                        assert!(registry.submit(host_buffer));
                     }
                     Operation::Release => {
                         let expected = matches!(&model, RenderBufferUse::AwaitingRelease { .. });
                         if expected {
                             model = RenderBufferUse::Released;
                         }
-                        assert_eq!(ctx.mark_buffer_released(buffer), expected);
+                        assert_eq!(registry.release(host_buffer), expected);
                     }
                     Operation::Detach => {
                         let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
@@ -2137,7 +2631,7 @@ mod tests {
                             model = awaiting_release(true);
                         }
                         assert_eq!(
-                            ctx.finalize_surface_attachment(Some(buffer), None),
+                            registry.finalize_attachment(Some(host_buffer), None),
                             expected
                         );
                     }
@@ -2146,15 +2640,14 @@ mod tests {
                         if model == awaiting_release(false) {
                             model = RenderBufferUse::NeverSubmitted;
                         }
-                        assert_eq!(ctx.finish_surface_destroy_use(buffer, false), expected);
+                        assert_eq!(registry.end_last_surface_use(host_buffer, false), expected);
                     }
                     Operation::OtherSurfaceRemains => {
-                        assert!(ctx.finish_surface_destroy_use(buffer, true));
+                        assert!(registry.end_last_surface_use(host_buffer, true));
                     }
                 }
-                assert_eq!(ctx.host_buffer_use(buffer), Some(model.clone()));
                 assert_eq!(
-                    ctx.render_buffers.lifecycle(HostId(host_buffer)),
+                    registry.lifecycle(host_buffer),
                     Some(RenderBufferLifecycle::GuestAlive(model.clone()))
                 );
             }

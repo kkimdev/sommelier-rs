@@ -907,7 +907,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            let bound = queue_internal_bind(
                 ctx,
                 registry_host_id,
                 name,
@@ -915,6 +915,35 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
+            if bound && ctx.window_bounds_as_arc {
+                // A guest may bind an output before the host registry has
+                // delivered zaura_shell. Retry every already-live output now
+                // that the shell object and its version are available; the
+                // output bind path cannot do this retroactively on its own.
+                for output_host_id in ctx.output_host_ids.clone() {
+                    if !ctx.inactive_output_host_ids.contains(&output_host_id)
+                        && !ctx.shadow_table.is_pending_destroy_host(output_host_id)
+                    {
+                        let _ =
+                            crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
+                    }
+                }
+                // Apply the same retry to XDG roles created before the shell
+                // global arrived. Their guest-side associations are recorded
+                // after a successful get_toplevel dispatch, so a late shell
+                // can safely attach the missing Aura child here as well.
+                for xdg_toplevel_guest_id in ctx
+                    .xdg_toplevel_to_wl_surface
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+                {
+                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                        ctx,
+                        xdg_toplevel_guest_id,
+                    );
+                }
+            }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
             return Action::Drop;
@@ -1017,6 +1046,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 && Some(pending.generation) == removed_generation)
         });
         if let Some(generation) = removed_generation {
+            // A bound wl_output remains a valid Wayland object after its
+            // global advertisement disappears, but it must stop feeding
+            // compositor-owned placement.  Match the exact advertisement
+            // generation so a delayed remove cannot retire a replacement.
+            ctx.deactivate_output_bindings(name, generation);
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
         }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
@@ -1157,6 +1191,24 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
+        if interface == "wl_output" {
+            ctx.output_host_ids.push(host_new_id);
+            ctx.output_states.entry(host_new_id).or_default();
+            let registry_host_id = ctx
+                .shadow_table
+                .get_host_id(ctx.last_sender_id)
+                .unwrap_or(ctx.last_sender_id);
+            let generation = ctx
+                .registry_global_generations
+                .get(&registry_host_id)
+                .and_then(|generations| generations.get(&name))
+                .copied()
+                .or_else(|| ctx.global_generations.get(&name).copied())
+                .unwrap_or_default();
+            ctx.output_host_global_bindings
+                .insert(host_new_id, (name, generation));
+            ctx.inactive_output_host_ids.remove(&host_new_id);
+        }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
         // guest metadata at v4 so feedback requests are accepted locally,
@@ -1193,9 +1245,18 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
+            if interface == "wl_output" {
+                ctx.remove_output_state(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
+        }
+        if interface == "wl_output" && ctx.window_bounds_as_arc {
+            // The Aura output extension carries the logical work-area insets
+            // that wl_output itself does not expose. It is host-only; the
+            // guest continues to receive the ordinary wl_output events.
+            let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
         }
         if interface == "zwp_linux_dmabuf_v1" {
             let generation = ctx
@@ -1683,6 +1744,84 @@ mod tests {
                 interface: first,
                 version: 5,
             })
+        );
+    }
+
+    #[test]
+    fn global_remove_deactivates_bound_output_without_destroying_object() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+        let generation = ctx.global_generations[&10];
+        let bind = (output.clone(), 3, 20);
+        assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
+        let output_host = ctx
+            .output_host_global_bindings
+            .keys()
+            .copied()
+            .next()
+            .expect("bound output host object");
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(output_host));
+
+        ctx.last_sender_id = 1;
+        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
+        assert_eq!(
+            ctx.output_host_global_bindings[&output_host],
+            (10, generation)
+        );
+        assert!(ctx.output_states.contains_key(&output_host));
+        assert!(ctx.inactive_output_host_ids.contains(&output_host));
+        assert!(ctx.primary_output().is_none());
+    }
+
+    #[test]
+    fn late_zaura_shell_binding_attaches_existing_outputs() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+        assert_eq!(
+            handler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20)),
+            Action::Drop
+        );
+        let output_host = *ctx
+            .output_host_global_bindings
+            .keys()
+            .next()
+            .expect("bound output");
+        assert!(
+            ctx.zaura_output_to_wl_output.is_empty(),
+            "Aura output must wait for the shell binding"
+        );
+
+        let shell = "zaura_shell".to_string();
+        assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
+        assert!(
+            ctx.zaura_output_to_wl_output
+                .values()
+                .any(|&output_id| output_id == output_host),
+            "late shell binding must attach every already-bound output"
         );
     }
 

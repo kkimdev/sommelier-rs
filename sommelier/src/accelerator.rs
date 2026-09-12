@@ -68,6 +68,31 @@ pub struct Accelerator {
     pub symbol: u32,
 }
 
+/// Actions that may be bound to compositor-owned window placement shortcuts.
+///
+/// The binding is deliberately parsed from configuration rather than inferred
+/// from a fixed set of keysyms in the keyboard event path.  This keeps keyboard
+/// ownership policy at the process boundary and lets deployments choose a
+/// layout without changing the proxy binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowLayoutAction {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Fullscreen,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowPlacementShortcut {
+    pub(crate) accelerator: Accelerator,
+    pub(crate) action: WindowLayoutAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     InvalidModifier(String),
@@ -143,6 +168,70 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
         result.push(parse_accelerator(token)?);
     }
     Ok(result)
+}
+
+/// Parse compositor-owned window placement bindings.
+///
+/// The format is a comma-separated list of `CHORD=ACTION` pairs, for example:
+///
+/// ```text
+/// <Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen
+/// ```
+///
+/// Empty entries are ignored for consistency with `SOMMELIER_ACCELERATORS`.
+/// Duplicate chords are rejected so a deployment cannot depend on ordering.
+pub(crate) fn parse_window_placement_shortcuts(
+    value: &str,
+) -> Result<Vec<WindowPlacementShortcut>, String> {
+    let mut bindings = Vec::new();
+    for (index, raw_binding) in value.split(',').enumerate() {
+        let raw_binding = raw_binding.trim();
+        if raw_binding.is_empty() {
+            continue;
+        }
+        let (chord, action) = raw_binding.split_once('=').ok_or_else(|| {
+            format!(
+                "binding {} must use CHORD=ACTION syntax, got {:?}",
+                index, raw_binding
+            )
+        })?;
+        let accelerator = parse_accelerator(chord.trim())
+            .map_err(|error| format!("binding {} has invalid chord: {}", index, error))?;
+        let action_name = action.trim().to_ascii_lowercase();
+        let action = match action_name.as_str() {
+            "top-left" => WindowLayoutAction::TopLeft,
+            "top" => WindowLayoutAction::Top,
+            "top-right" => WindowLayoutAction::TopRight,
+            "left" => WindowLayoutAction::Left,
+            "fullscreen" => WindowLayoutAction::Fullscreen,
+            "right" => WindowLayoutAction::Right,
+            "bottom-left" => WindowLayoutAction::BottomLeft,
+            "bottom" => WindowLayoutAction::Bottom,
+            "bottom-right" => WindowLayoutAction::BottomRight,
+            _ => {
+                return Err(format!(
+                    "binding {} has unsupported action {:?}",
+                    index,
+                    action.trim()
+                ));
+            }
+        };
+        if bindings
+            .iter()
+            .any(|binding: &WindowPlacementShortcut| binding.accelerator == accelerator)
+        {
+            return Err(format!(
+                "binding {} duplicates accelerator {:?}",
+                index,
+                chord.trim()
+            ));
+        }
+        bindings.push(WindowPlacementShortcut {
+            accelerator,
+            action,
+        });
+    }
+    Ok(bindings)
 }
 
 #[cfg(test)]
@@ -240,5 +329,30 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].modifiers, SUPER_MASK);
         assert_eq!(list[0].symbol, xkb::keysyms::KEY_space);
+    }
+
+    #[test]
+    fn parse_window_placement_shortcuts_accepts_bindings() {
+        let bindings =
+            parse_window_placement_shortcuts("<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen")
+                .unwrap();
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].accelerator.modifiers, ALT_MASK);
+        assert_eq!(bindings[0].accelerator.symbol, xkb::keysyms::KEY_q);
+        assert_eq!(bindings[0].action, WindowLayoutAction::TopLeft);
+        assert_eq!(bindings[2].action, WindowLayoutAction::Fullscreen);
+    }
+
+    #[test]
+    fn parse_window_placement_shortcuts_rejects_duplicates_and_bad_actions() {
+        assert!(parse_window_placement_shortcuts("<Alt>q=top,<Alt>q=left")
+            .unwrap_err()
+            .contains("duplicates"));
+        assert!(parse_window_placement_shortcuts("<Alt>q=tile")
+            .unwrap_err()
+            .contains("unsupported action"));
+        assert!(parse_window_placement_shortcuts("<Alt>q")
+            .unwrap_err()
+            .contains("CHORD=ACTION"));
     }
 }

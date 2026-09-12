@@ -597,3 +597,56 @@ the same 10 unrelated baseline failures: nested Biome roots, a missing Slidev
 path, root hygiene/prohibited-file/absolute-path findings, and pre-existing
 shebang or executable-bit findings. None points to the Sommelier or Nix
 changes.
+
+## 2026-08-21 — GTK ARC metadata and direct left/right placement
+
+The window-placement path now keeps one per-surface ARC policy identity when a GTK
+client sends `gtk_surface1.set_dbus_properties`. That request can arrive after
+`xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
+Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
+returned to its old `800x600` geometry. The GTK and XDG paths share the generated
+identity, while the host XDG role keeps its native guest namespace. The workaround
+and its compositor-owned shortcuts are disabled unless the ARC policy is enabled;
+the explicit shortcut configuration remains empty by default, so no chord is
+consumed until a deployment opts into one.
+
+Alt+A and Alt+D now use the same direct
+`unset fullscreen/maximized/snap → zaura_toplevel.set_window_bounds → sync`
+sequence as the other seven layouts. They no longer invoke ChromeOS snap
+animations. A regression test asserts that neither snap opcode is queued.
+
+Verification:
+
+- `cargo fmt --all -- --check`, `cargo check -p sommelier`, and
+  `cargo clippy -p sommelier --all-targets -- -D warnings` pass.
+- `cargo test -p sommelier -- --test-threads=1`: 540 passed, 1 ignored.
+- `cargo build --release -p sommelier` produced the tested binary at
+  `target/release/sommelier`.
+- The isolated release proxy was restarted on
+  `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records distinct
+  per-surface ARC task-form policy identities for GTK and Ghostty while their
+  host XDG roles retain the native guest namespace.
+- A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
+  as flaky; each passed alone and in the serialized full suite.
+
+## 2026-09-12 — PR #9 review hardening
+
+The review pass now allocates ARC task-form identities from a process-shared,
+file-locked block. The allocator validates private runtime directories, keeps a
+stable generation guard across lock-directory replacement, and opens range locks
+relative to the validated directory descriptor. If the allocator cannot reserve
+an unambiguous block, the ARC bounds policy fails closed. The `.session.*`
+restore namespace is never fabricated.
+
+Late `zaura_shell` binding now repairs already-bound outputs and XDG toplevels,
+and XDG role metadata is recorded only after a valid `get_toplevel` dispatch.
+`wl_output.release`, negative Aura insets, and delayed output/surface events are
+also covered by lifecycle regressions.
+
+Verification from the final review snapshot:
+
+- Nix source derivation: release build and `cargo test -p sommelier --all-targets`
+  passed 572 tests, with 1 live-device test ignored.
+- Nix development shell: workspace check and strict Clippy passed; formatting
+  and `git diff --check` are clean.
+- Host-level Aura/Wayland compositor validation remains intentionally unrun.

@@ -210,16 +210,39 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window bounds placement (`1`, `true`, `yes`, or `on`). |
+| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional comma-separated `CHORD=ACTION` bindings, enabled only with the ARC policy gate. |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
 
+When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
+`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier handles the
+configured chords for a focused XDG toplevel and places it in the selected
+work-area region. The focused surface's active output association is preferred
+on multi-monitor setups, with a deterministic usable-output fallback. For example:
+
+```text
+SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
+SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
+```
+
+No placement shortcut is active by default. The policy gate remains opt-in
+because it changes the ChromeOS window-policy namespace; malformed bindings or
+bindings that conflict with `SOMMELIER_ACCELERATORS` disable shortcut
+consumption at startup. The ARC policy may still be enabled without bindings
+for deployments that need the metadata path but no compositor-owned chords. When
+the policy is enabled, Sommelier reserves a process-shared ARC task-identity
+block under `$XDG_RUNTIME_DIR/sommelier`; if that reservation cannot be made,
+the policy is disabled rather than using a potentially colliding identity.
+
 ## CI and release workflow
 
-The `virtwl` branch CI builds x86_64 and aarch64, runs tests on x86_64, and
-checks formatting and Clippy. Successful pushes also upload debug binaries to
+The `virtwl` branch CI builds x86_64 and aarch64, runs executable tests on
+x86_64, compiles all test targets for aarch64, and checks formatting and
+Clippy. Successful pushes also upload debug binaries to
 the Actions run and create non-release tags such as
 `virtwl-ci-<run-id>-<attempt>-<sha>`. Those artifacts expire after seven days;
 the cleanup job keeps the ten newest CI build runs by default. Set the
