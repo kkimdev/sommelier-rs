@@ -758,6 +758,17 @@ pub struct PendingWindowBoundsConfigure {
     pub states: Vec<u8>,
 }
 
+/// The serial-bearing `xdg_surface.configure` paired with a retained
+/// toplevel configure while a window-bounds sync barrier is active.
+///
+/// Wayland requires the toplevel event to precede this event.  Keep the pair
+/// separate because either event may arrive first from the host stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingWindowBoundsSurfaceConfigure {
+    pub guest_xdg_surface_id: u32,
+    pub serial: u32,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -943,6 +954,14 @@ pub struct Context {
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
     pub output_states: HashMap<u32, OutputState>,
+    /// Host output object → (global name, advertisement generation) from
+    /// which the object was bound.  The generation prevents a delayed
+    /// global_remove for an old advertisement from retiring a replacement.
+    pub output_host_global_bindings: HashMap<u32, (u32, u64)>,
+    /// Output objects whose host global disappeared.  Their Wayland object
+    /// lifetime remains valid until release, but they are no longer eligible
+    /// for compositor-owned placement.
+    pub inactive_output_host_ids: HashSet<u32>,
     /// Host-only Aura output objects keyed by their host wl_output object ID.
     pub zaura_output_to_wl_output: HashMap<u32, u32>,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
@@ -953,6 +972,8 @@ pub struct Context {
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
     /// Tracks xdg_surface → wl_surface associations (guest IDs).
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
+    /// Tracks xdg_surface → xdg_toplevel associations (guest IDs).
+    pub xdg_surface_to_xdg_toplevel: HashMap<u32, u32>,
     /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
     pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
     /// Maps guest xdg_toplevel IDs → host zaura_toplevel IDs.
@@ -968,6 +989,9 @@ pub struct Context {
     pub active_window_bounds_barriers: HashMap<u32, u32>,
     /// Latest configure retained while the active placement barrier is live.
     pub pending_window_bounds_configures: HashMap<u32, PendingWindowBoundsConfigure>,
+    /// Latest serial-bearing surface configure retained while the active
+    /// placement barrier is live.
+    pub pending_window_bounds_surface_configures: HashMap<u32, PendingWindowBoundsSurfaceConfigure>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1374,16 +1398,20 @@ impl Context {
             arc_application_ids: HashMap::new(),
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
+            output_host_global_bindings: HashMap::new(),
+            inactive_output_host_ids: HashSet::new(),
             zaura_output_to_wl_output: HashMap::new(),
             wl_surface_to_zaura_surface: HashMap::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
+            xdg_surface_to_xdg_toplevel: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),
             xdg_toplevel_to_zaura_toplevel: HashMap::new(),
             window_bounds_barriers: HashMap::new(),
             active_window_bounds_barriers: HashMap::new(),
             pending_window_bounds_configures: HashMap::new(),
+            pending_window_bounds_surface_configures: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1432,7 +1460,9 @@ impl Context {
     /// Return the first output with a usable mode.
     pub fn primary_output(&self) -> Option<(u32, OutputState)> {
         self.output_host_ids.iter().find_map(|&host_id| {
-            if self.shadow_table.is_pending_destroy_host(host_id) {
+            if self.shadow_table.is_pending_destroy_host(host_id)
+                || self.inactive_output_host_ids.contains(&host_id)
+            {
                 return None;
             }
             let state = *self.output_states.get(&host_id)?;
@@ -1448,6 +1478,19 @@ impl Context {
         self.output_host_ids
             .retain(|candidate| *candidate != host_output_id);
         self.output_states.remove(&host_output_id);
+        self.output_host_global_bindings.remove(&host_output_id);
+        self.inactive_output_host_ids.insert(host_output_id);
+    }
+
+    /// Mark every bound output from one removed host-global generation
+    /// inactive without destroying its still-valid Wayland object.
+    pub fn deactivate_output_bindings(&mut self, global_name: u32, generation: u64) {
+        for (&host_output_id, &(bound_name, bound_generation)) in &self.output_host_global_bindings
+        {
+            if bound_name == global_name && bound_generation == generation {
+                self.inactive_output_host_ids.insert(host_output_id);
+            }
+        }
     }
 }
 
