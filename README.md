@@ -210,7 +210,7 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window bounds placement. |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window bounds placement (`1`, `true`, `yes`, or `on`). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional comma-separated `CHORD=ACTION` bindings, enabled only with the ARC policy gate. |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
@@ -221,7 +221,8 @@ test uses `/dev/wl0`.
 When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
 `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier handles the
 configured chords for a focused XDG toplevel and places it in the selected
-work-area region. For example:
+work-area region. The focused surface's active output association is preferred
+on multi-monitor setups, with a deterministic usable-output fallback. For example:
 
 ```text
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
@@ -235,8 +236,9 @@ startup.
 
 ## CI and release workflow
 
-The `virtwl` branch CI builds x86_64 and aarch64, runs tests on x86_64, and
-checks formatting and Clippy. Successful pushes also upload debug binaries to
+The `virtwl` branch CI builds x86_64 and aarch64, runs executable tests on
+x86_64, compiles all test targets for aarch64, and checks formatting and
+Clippy. Successful pushes also upload debug binaries to
 the Actions run and create non-release tags such as
 `virtwl-ci-<run-id>-<attempt>-<sha>`. Those artifacts expire after seven days;
 the cleanup job keeps the ten newest CI build runs by default. Set the
