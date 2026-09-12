@@ -714,6 +714,9 @@ pub struct GtkSurfaceState {
 /// output insets remove shelf/non-work-area margins when they are known.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutputState {
+    /// Logical screen-space origin from `wl_output.geometry`.
+    pub origin_x: i32,
+    pub origin_y: i32,
     pub mode_width: i32,
     pub mode_height: i32,
     pub scale: i32,
@@ -728,8 +731,8 @@ impl OutputState {
         let scale = self.scale.max(1);
         let width = self.mode_width.checked_div(scale)?;
         let height = self.mode_height.checked_div(scale)?;
-        let x = self.insets_left;
-        let y = self.insets_top;
+        let x = self.origin_x.checked_add(self.insets_left)?;
+        let y = self.origin_y.checked_add(self.insets_top)?;
         let width = width
             .checked_sub(self.insets_left)?
             .checked_sub(self.insets_right)?;
@@ -741,6 +744,18 @@ impl OutputState {
         }
         Some((x, y, width, height))
     }
+}
+
+/// Latest host configure retained while a window-bounds sync barrier is
+/// active.  The barrier establishes ordering; flushing only this newest event
+/// avoids forwarding stale intermediate configures while still delivering the
+/// final state once the host has processed the placement request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWindowBoundsConfigure {
+    pub guest_xdg_toplevel_id: u32,
+    pub width: i32,
+    pub height: i32,
+    pub states: Vec<u8>,
 }
 
 pub struct Context {
@@ -840,6 +855,9 @@ pub struct Context {
     pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
     /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
     pub accelerators: Vec<crate::accelerator::Accelerator>,
+    /// Explicitly configured compositor-owned placement shortcuts. An empty
+    /// list means the feature consumes no keyboard chords.
+    pub window_placement_shortcuts: Vec<crate::accelerator::WindowPlacementShortcut>,
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
@@ -919,10 +937,14 @@ pub struct Context {
     /// Experimental host-policy workaround: identify the host surface as an
     /// ARC window so Exo permits `zaura_toplevel.set_window_bounds`.
     pub window_bounds_as_arc: bool,
+    /// Per-surface ARC policy identities used by the opt-in bounds path.
+    pub arc_application_ids: HashMap<u32, String>,
     /// Host wl_output IDs advertised to the guest.
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
     pub output_states: HashMap<u32, OutputState>,
+    /// Host-only Aura output objects keyed by their host wl_output object ID.
+    pub zaura_output_to_wl_output: HashMap<u32, u32>,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
     pub wl_surface_to_zaura_surface: HashMap<u32, u32>,
     /// Synthetic GTK shell bindings and their activation token state.
@@ -944,6 +966,8 @@ pub struct Context {
     /// in `window_bounds_barriers` until their terminal `done`/`delete_id`
     /// sequence arrives, but no longer gate configure handling.
     pub active_window_bounds_barriers: HashMap<u32, u32>,
+    /// Latest configure retained while the active placement barrier is live.
+    pub pending_window_bounds_configures: HashMap<u32, PendingWindowBoundsConfigure>,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1240,6 +1264,41 @@ impl Context {
                 Vec::new()
             }
         };
+        let window_bounds_as_arc = std::env::var_os("SOMMELIER_WINDOW_BOUNDS_AS_ARC").is_some();
+        let window_placement_env =
+            std::env::var("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS").unwrap_or_default();
+        let window_placement_shortcuts = if !window_bounds_as_arc {
+            if !window_placement_env.trim().is_empty() {
+                warn!(
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC is set"
+                );
+            }
+            Vec::new()
+        } else {
+            match crate::accelerator::parse_window_placement_shortcuts(&window_placement_env) {
+                Ok(bindings) => {
+                    if let Some(conflict) = bindings
+                        .iter()
+                        .find(|binding| accelerators.contains(&binding.accelerator))
+                    {
+                        warn!(
+                            "Window placement shortcut {:?} conflicts with SOMMELIER_ACCELERATORS; placement shortcuts disabled",
+                            conflict
+                        );
+                        Vec::new()
+                    } else {
+                        bindings
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS '{}': {}. Window placement shortcuts disabled.",
+                        window_placement_env, error
+                    );
+                    Vec::new()
+                }
+            }
+        };
 
         Self {
             shadow_table: ShadowTable::new(),
@@ -1283,6 +1342,7 @@ impl Context {
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
+            window_placement_shortcuts,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1310,9 +1370,11 @@ impl Context {
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
-            window_bounds_as_arc: std::env::var_os("SOMMELIER_WINDOW_BOUNDS_AS_ARC").is_some(),
+            window_bounds_as_arc,
+            arc_application_ids: HashMap::new(),
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
+            zaura_output_to_wl_output: HashMap::new(),
             wl_surface_to_zaura_surface: HashMap::new(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
@@ -1321,6 +1383,7 @@ impl Context {
             xdg_toplevel_to_zaura_toplevel: HashMap::new(),
             window_bounds_barriers: HashMap::new(),
             active_window_bounds_barriers: HashMap::new(),
+            pending_window_bounds_configures: HashMap::new(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }
@@ -1359,6 +1422,7 @@ impl Context {
     ) -> Self {
         let mut ctx = Self::new(gpu_accel, xdg_decoration);
         ctx.accelerators = accelerators;
+        ctx.window_placement_shortcuts.clear();
         // Keep unit tests deterministic even when the developer's shell uses
         // the runtime-only ARC bounds workaround for an isolated proxy.
         ctx.window_bounds_as_arc = false;
@@ -1368,9 +1432,22 @@ impl Context {
     /// Return the first output with a usable mode.
     pub fn primary_output(&self) -> Option<(u32, OutputState)> {
         self.output_host_ids.iter().find_map(|&host_id| {
+            if self.shadow_table.is_pending_destroy_host(host_id) {
+                return None;
+            }
             let state = *self.output_states.get(&host_id)?;
             state.work_area().map(|_| (host_id, state))
         })
+    }
+
+    /// Retire placement metadata as soon as the guest releases a wl_output.
+    /// The shadow mapping itself remains reserved until the host's
+    /// `wl_display.delete_id`, but a released output must never be selected
+    /// for a later placement operation.
+    pub fn remove_output_state(&mut self, host_output_id: u32) {
+        self.output_host_ids
+            .retain(|candidate| *candidate != host_output_id);
+        self.output_states.remove(&host_output_id);
     }
 }
 
@@ -1433,6 +1510,8 @@ mod tests {
     #[test]
     fn output_work_area_converts_scale_and_insets() {
         let output = OutputState {
+            origin_x: 1920,
+            origin_y: 16,
             mode_width: 3840,
             mode_height: 2160,
             scale: 2,
@@ -1441,7 +1520,7 @@ mod tests {
             insets_bottom: 48,
             insets_right: 16,
         };
-        assert_eq!(output.work_area(), Some((8, 24, 1896, 1008)));
+        assert_eq!(output.work_area(), Some((1928, 40, 1896, 1008)));
     }
 
     #[test]
@@ -2202,13 +2281,15 @@ mod tests {
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
-        let buffer = 20;
-        let host_buffer = 40;
+        let host_buffer = HostId(40);
 
         for mut encoded in 0..sequence_count {
-            let mut ctx = Context::new_for_test(false, false, Vec::new());
-            ctx.shadow_table.map_id(buffer, host_buffer);
-            assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
+            // Exercise the lifecycle reducer directly. Constructing a full
+            // Context for every one of the 15,625 short sequences also
+            // initializes the GBM allocator, turning this bounded unit test
+            // into a multi-minute smoke test on systems without /dev/dri.
+            let mut registry = RenderBufferRegistry::default();
+            assert!(registry.register_native(host_buffer, (1, 1), Vec::new()));
             let mut model = RenderBufferUse::NeverSubmitted;
 
             for _ in 0..sequence_len {
@@ -2219,14 +2300,14 @@ mod tests {
                         if !matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
                             model = awaiting_release(false);
                         }
-                        assert!(ctx.mark_buffer_submitted(buffer));
+                        assert!(registry.submit(host_buffer));
                     }
                     Operation::Release => {
                         let expected = matches!(&model, RenderBufferUse::AwaitingRelease { .. });
                         if expected {
                             model = RenderBufferUse::Released;
                         }
-                        assert_eq!(ctx.mark_buffer_released(buffer), expected);
+                        assert_eq!(registry.release(host_buffer), expected);
                     }
                     Operation::Detach => {
                         let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
@@ -2234,7 +2315,7 @@ mod tests {
                             model = awaiting_release(true);
                         }
                         assert_eq!(
-                            ctx.finalize_surface_attachment(Some(buffer), None),
+                            registry.finalize_attachment(Some(host_buffer), None),
                             expected
                         );
                     }
@@ -2243,15 +2324,14 @@ mod tests {
                         if model == awaiting_release(false) {
                             model = RenderBufferUse::NeverSubmitted;
                         }
-                        assert_eq!(ctx.finish_surface_destroy_use(buffer, false), expected);
+                        assert_eq!(registry.end_last_surface_use(host_buffer, false), expected);
                     }
                     Operation::OtherSurfaceRemains => {
-                        assert!(ctx.finish_surface_destroy_use(buffer, true));
+                        assert!(registry.end_last_surface_use(host_buffer, true));
                     }
                 }
-                assert_eq!(ctx.host_buffer_use(buffer), Some(model.clone()));
                 assert_eq!(
-                    ctx.render_buffers.lifecycle(HostId(host_buffer)),
+                    registry.lifecycle(host_buffer),
                     Some(RenderBufferLifecycle::GuestAlive(model.clone()))
                 );
             }

@@ -1197,9 +1197,18 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
+            if interface == "wl_output" {
+                ctx.remove_output_state(host_new_id);
+            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
+        }
+        if interface == "wl_output" && ctx.window_bounds_as_arc {
+            // The Aura output extension carries the logical work-area insets
+            // that wl_output itself does not expose. It is host-only; the
+            // guest continues to receive the ordinary wl_output events.
+            let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
         }
         if interface == "zwp_linux_dmabuf_v1" {
             let generation = ctx

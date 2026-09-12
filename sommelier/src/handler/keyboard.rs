@@ -26,6 +26,7 @@ limitations under the License.
 //!
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
+use crate::accelerator::WindowLayoutAction;
 use crate::protocols::aura_shell::zaura_surface::REQ_UNSET_SNAP;
 use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
 use crate::protocols::wayland::wl_keyboard;
@@ -66,19 +67,6 @@ const WL_KEYMAP_FORMAT_XKB_V1: u32 = 1;
 const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
 const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
 const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowLayoutAction {
-    TopLeft,
-    Top,
-    TopRight,
-    Left,
-    Fullscreen,
-    Right,
-    BottomLeft,
-    Bottom,
-    BottomRight,
-}
 
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
@@ -327,6 +315,7 @@ impl KeyboardHandler {
 
     fn window_layout_action(
         &self,
+        ctx: &Context,
         host_keyboard_id: HostId,
         key: u32,
     ) -> Option<WindowLayoutAction> {
@@ -344,18 +333,15 @@ impl KeyboardHandler {
         if modifiers != crate::accelerator::ALT_MASK {
             return None;
         }
-        let action = match crate::accelerator::keysym_to_lower(sym.raw()) {
-            xkb::keysyms::KEY_q => Some(WindowLayoutAction::TopLeft),
-            xkb::keysyms::KEY_w => Some(WindowLayoutAction::Top),
-            xkb::keysyms::KEY_e => Some(WindowLayoutAction::TopRight),
-            xkb::keysyms::KEY_a => Some(WindowLayoutAction::Left),
-            xkb::keysyms::KEY_s => Some(WindowLayoutAction::Fullscreen),
-            xkb::keysyms::KEY_d => Some(WindowLayoutAction::Right),
-            xkb::keysyms::KEY_z => Some(WindowLayoutAction::BottomLeft),
-            xkb::keysyms::KEY_x => Some(WindowLayoutAction::Bottom),
-            xkb::keysyms::KEY_c => Some(WindowLayoutAction::BottomRight),
-            _ => None,
+        let accelerator = crate::accelerator::Accelerator {
+            modifiers,
+            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
         };
+        let action = ctx
+            .window_placement_shortcuts
+            .iter()
+            .find(|binding| binding.accelerator == accelerator)
+            .map(|binding| binding.action);
         log::trace!("window layout candidate resolved to {:?}", action);
         action
     }
@@ -370,6 +356,19 @@ impl KeyboardHandler {
         Self::queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_MAXIMIZED);
         let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
         ctx.client_to_host_queue.push((message, Vec::new()));
+    }
+
+    /// Roll back every request belonging to one placement batch.
+    ///
+    /// Setup requests for the focused role may precede the batch and must
+    /// remain queued; the placement-owned state reset and bounds request must
+    /// either be sent together with their barrier or be removed together.
+    fn rollback_window_layout_batch(ctx: &mut Context, queue_start: usize) {
+        debug_assert!(
+            queue_start <= ctx.client_to_host_queue.len(),
+            "placement queue rollback boundary must remain valid"
+        );
+        ctx.client_to_host_queue.truncate(queue_start);
     }
 
     fn bounds_for_action(
@@ -468,6 +467,11 @@ impl KeyboardHandler {
             return false;
         };
 
+        // Keep every request emitted by this shortcut in one rollback
+        // boundary.  `ensure_zaura_toplevel`/`ensure_host_zaura_surface`
+        // may already have staged setup requests above us, so the offset
+        // must be captured immediately before the placement-owned batch.
+        let placement_queue_start = ctx.client_to_host_queue.len();
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
         let mut builder = MessageBuilder::new();
         builder.write_i32(x);
@@ -483,6 +487,12 @@ impl KeyboardHandler {
                 action,
                 zaura_toplevel_id
             );
+            // Do not publish a partial placement batch without its ordering
+            // barrier.  Removing only the final bounds request would leave
+            // the state-reset requests in the host stream and make the next
+            // shortcut observe a half-applied operation.
+            Self::rollback_window_layout_batch(ctx, placement_queue_start);
+            return false;
         }
         log::info!(
             "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
@@ -1000,7 +1010,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
         }
 
-        let layout_action = self.window_layout_action(host_keyboard_id, key);
+        let layout_action = self.window_layout_action(ctx, host_keyboard_id, key);
         let compositor_shortcut = match state {
             WL_KEY_PRESSED => layout_action
                 .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
@@ -1534,6 +1544,10 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts = crate::accelerator::parse_window_placement_shortcuts(
+            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,<Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
+        )
+        .unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         handler
             .modifiers
@@ -1552,7 +1566,10 @@ mod tests {
         ];
         for (sym, action) in expected {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
-            assert_eq!(handler.window_layout_action(HostId(5), key), Some(action));
+            assert_eq!(
+                handler.window_layout_action(&ctx, HostId(5), key),
+                Some(action)
+            );
         }
     }
 
@@ -1561,16 +1578,18 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
         handler.modifiers.insert(HostId(5), 0);
-        assert_eq!(handler.window_layout_action(HostId(5), key), None);
+        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
         handler.modifiers.insert(
             HostId(5),
             crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
         );
-        assert_eq!(handler.window_layout_action(HostId(5), key), None);
+        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
     }
 
     #[test]
@@ -1726,6 +1745,24 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
         assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 3840);
         assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
+    }
+
+    #[test]
+    fn placement_batch_rollback_removes_all_partial_state_requests() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.client_to_host_queue.push((vec![0xaa], Vec::new()));
+        let queue_start = ctx.client_to_host_queue.len();
+
+        KeyboardHandler::clear_window_state(&mut ctx, 23, 24);
+        ctx.client_to_host_queue.push((vec![0xbb], Vec::new()));
+        assert_eq!(ctx.client_to_host_queue.len(), queue_start + 4);
+
+        KeyboardHandler::rollback_window_layout_batch(&mut ctx, queue_start);
+        assert_eq!(
+            ctx.client_to_host_queue,
+            vec![(vec![0xaa], Vec::new())],
+            "failed placement must not leave state-reset or bounds requests queued"
+        );
     }
 
     #[test]

@@ -64,13 +64,12 @@ impl WlCallbackHandler for CallbackHandler {
             }
             return Action::Drop;
         }
-        if let Some(zaura_toplevel_id) = ctx.window_bounds_barriers.remove(&host_id) {
+        if ctx.window_bounds_barriers.contains_key(&host_id) {
             // A sync callback is host-only and terminal at `done`. Keep its
             // numeric ID reserved until the host's subsequent delete_id, but
             // stop treating duplicate/stale events as live callbacks.
-            if ctx.active_window_bounds_barriers.get(&zaura_toplevel_id) == Some(&host_id) {
-                ctx.active_window_bounds_barriers.remove(&zaura_toplevel_id);
-            }
+            crate::handler::compositor::complete_window_bounds_barrier(ctx, host_id);
+            ctx.window_bounds_barriers.remove(&host_id);
             if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
                 log::warn!(
                     "window-bounds barrier callback {} was not tracked as host-only",
