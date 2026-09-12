@@ -330,9 +330,6 @@ impl KeyboardHandler {
             sym.raw(),
             modifiers
         );
-        if modifiers != crate::accelerator::ALT_MASK {
-            return None;
-        }
         let accelerator = crate::accelerator::Accelerator {
             modifiers,
             symbol: crate::accelerator::keysym_to_lower(sym.raw()),
@@ -381,22 +378,32 @@ impl KeyboardHandler {
         match action {
             WindowLayoutAction::TopLeft => Some((x, y, half_width, half_height)),
             WindowLayoutAction::Top => Some((x, y, width, half_height)),
-            WindowLayoutAction::TopRight => {
-                Some((x + half_width, y, width - half_width, half_height))
+            WindowLayoutAction::TopRight => Some((
+                x.checked_add(half_width)?,
+                y,
+                width - half_width,
+                half_height,
+            )),
+            WindowLayoutAction::BottomLeft => Some((
+                x,
+                y.checked_add(half_height)?,
+                half_width,
+                height - half_height,
+            )),
+            WindowLayoutAction::Bottom => {
+                Some((x, y.checked_add(half_height)?, width, height - half_height))
             }
-            WindowLayoutAction::BottomLeft => {
-                Some((x, y + half_height, half_width, height - half_height))
-            }
-            WindowLayoutAction::Bottom => Some((x, y + half_height, width, height - half_height)),
             WindowLayoutAction::BottomRight => Some((
-                x + half_width,
-                y + half_height,
+                x.checked_add(half_width)?,
+                y.checked_add(half_height)?,
                 width - half_width,
                 height - half_height,
             )),
             WindowLayoutAction::Left => Some((x, y, half_width, height)),
             WindowLayoutAction::Fullscreen => Some((x, y, width, height)),
-            WindowLayoutAction::Right => Some((x + half_width, y, width - half_width, height)),
+            WindowLayoutAction::Right => {
+                Some((x.checked_add(half_width)?, y, width - half_width, height))
+            }
         }
     }
 
@@ -1593,6 +1600,25 @@ mod tests {
     }
 
     #[test]
+    fn window_layout_honors_non_alt_configured_modifier() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+
+        handler
+            .modifiers
+            .insert(HostId(5), crate::accelerator::CONTROL_MASK);
+        assert_eq!(
+            handler.window_layout_action(&ctx, HostId(5), key),
+            Some(WindowLayoutAction::TopLeft)
+        );
+    }
+
+    #[test]
     fn window_layout_is_disabled_without_arc_bounds_policy() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         assert!(!KeyboardHandler::apply_window_layout(
@@ -1645,6 +1671,30 @@ mod tests {
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
             Some((1920, 0, 1920, 2160))
+        );
+    }
+
+    #[test]
+    fn grid_bounds_reject_coordinate_overflow() {
+        let output = crate::state::OutputState {
+            origin_x: i32::MAX,
+            mode_width: 4,
+            mode_height: 4,
+            scale: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopRight, output),
+            None
+        );
+        assert_eq!(
+            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomRight, output),
+            None
+        );
+        assert_eq!(
+            KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
+            None
         );
     }
 
