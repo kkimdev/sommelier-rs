@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::handler::compositor::{
-    ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
-    ARC_APPLICATION_ID,
+    ensure_arc_application_id, ensure_host_zaura_surface, native_wayland_app_id,
+    wayland_string_fits_message,
 };
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
@@ -68,6 +68,9 @@ impl GtkShell1Handler for GtkShellHandler {
         };
 
         let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
+        if ctx.window_bounds_as_arc {
+            let _ = ensure_arc_application_id(ctx, wl_surface_id);
+        }
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
@@ -134,10 +137,14 @@ impl GtkSurface1Handler for GtkShellHandler {
         let Some(application_id) = application_id.as_deref() else {
             return Action::Drop;
         };
-        let Some(zaura_surface_id) = ctx
+        let Some((zaura_surface_id, wl_surface_id)) = ctx
             .gtk_surfaces
             .get(&ctx.last_sender_id)
-            .and_then(|surface| surface.host_zaura_surface_id)
+            .and_then(|surface| {
+                surface
+                    .host_zaura_surface_id
+                    .map(|id| (id, surface.wl_surface_id))
+            })
         else {
             return Action::Drop;
         };
@@ -157,7 +164,14 @@ impl GtkSurface1Handler for GtkShellHandler {
         // D-Bus properties after that xdg request, so do not overwrite the
         // ARC ID with the normal Crostini namespace.
         let application_id = if ctx.window_bounds_as_arc {
-            ARC_APPLICATION_ID.to_string()
+            let Some(application_id) = ensure_arc_application_id(ctx, wl_surface_id) else {
+                log::warn!(
+                    "Unable to allocate ARC policy identity for GTK wl_surface {}",
+                    wl_surface_id
+                );
+                return Action::Drop;
+            };
+            application_id
         } else {
             native_wayland_app_id(&ctx.vm_identifier, application_id)
         };
@@ -356,9 +370,13 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
         assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
+        let application_id = nullable_string(message).expect("ARC application identity");
+        assert!(application_id.starts_with(crate::handler::compositor::ARC_APPLICATION_ID_PREFIX));
         assert_eq!(
-            nullable_string(message).as_deref(),
-            Some(ARC_APPLICATION_ID)
+            Some(application_id.as_str()),
+            ctx.arc_application_ids
+                .get(&WL_SURFACE_GUEST)
+                .map(String::as_str)
         );
     }
 

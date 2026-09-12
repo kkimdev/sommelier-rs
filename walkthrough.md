@@ -600,14 +600,14 @@ changes.
 
 ## 2026-08-21 — GTK ARC metadata and direct left/right placement
 
-The window-placement path now keeps the ARC application ID when a GTK client sends
-`gtk_surface1.set_dbus_properties`. That request can arrive after
+The window-placement path now keeps one per-surface ARC policy identity when a GTK
+client sends `gtk_surface1.set_dbus_properties`. That request can arrive after
 `xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
 Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
-returned to its old `800x600` geometry. The ARC ID is shared by the GTK and XDG
-paths through one constant and both paths have regression coverage. The workaround
-and its compositor-owned shortcuts are disabled unless
-`SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set.
+returned to its old `800x600` geometry. The GTK and XDG paths share the generated
+identity, while the host XDG role keeps its native guest namespace. The workaround
+and its compositor-owned shortcuts are disabled unless the ARC policy and explicit
+shortcut configuration are both set.
 
 Alt+A and Alt+D now use the same direct
 `unset fullscreen/maximized/snap → zaura_toplevel.set_window_bounds → sync`
@@ -622,7 +622,8 @@ Verification:
 - `cargo build --release -p sommelier` produced the tested binary at
   `target/release/sommelier`.
 - The isolated release proxy was restarted on
-  `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records both
-  GTK and Ghostty application IDs as `org.chromium.arc.2147483647`.
+  `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records distinct
+  per-surface ARC session identities for GTK and Ghostty while their host XDG
+  roles retain the native guest namespace.
 - A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
   as flaky; each passed alone and in the serialized full suite.

@@ -340,6 +340,13 @@ impl Client {
                     ctx,
                 );
             }
+            if interface == "zaura_output" {
+                return protocols::aura_shell::zaura_output::dispatch_event(
+                    msg,
+                    &mut handler.compositor,
+                    ctx,
+                );
+            }
 
             // Other Aura objects are bound internally and have no guest event
             // path. Consume their payload so an event from one of these
