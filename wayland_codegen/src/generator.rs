@@ -127,6 +127,141 @@ pub fn generate(protocol: &Protocol) -> String {
     expanded.to_string()
 }
 
+/// Generate the cross-protocol routing table used by the proxy.
+///
+/// Individual protocol modules own message decoding and handler dispatch, but
+/// the proxy should not need to repeat the interface-to-protocol mapping for
+/// every message direction. The build script passes the complete protocol
+/// list here so that the classifier and both dispatch entry points are derived
+/// from the same source as the protocol modules themselves.
+pub fn generate_routing(protocols: &[Protocol]) -> String {
+    let mut family_variants = Vec::new();
+    let mut handler_traits = Vec::new();
+    let mut classify_arms = Vec::new();
+    let mut dispatch_request_arms = Vec::new();
+    let mut dispatch_event_arms = Vec::new();
+    let mut special_request_arms = Vec::new();
+    let mut special_event_arms = Vec::new();
+    let mut consume_event_arms = Vec::new();
+
+    for protocol in protocols {
+        let protocol_name = format_ident!("{}", protocol.name);
+        let family_name = format_ident!("{}", snake_to_camel(&protocol.name));
+
+        family_variants.push(quote! { #family_name });
+        // Aura objects are internal to Sommelier. Their event payload is
+        // consumed by the proxy's explicit special case, and no aggregate
+        // handler implementation exists for the generated Aura interfaces.
+        // Keep the family in the classifier while leaving it out of the
+        // generic handler bounds and dispatch arms.
+        if protocol.name != "aura_shell" {
+            handler_traits.push(quote! { #protocol_name::ProtocolHandler });
+            dispatch_request_arms.push(quote! {
+                ProtocolFamily::#family_name => #protocol_name::dispatch_request(interface, msg, handler, ctx),
+            });
+            dispatch_event_arms.push(quote! {
+                ProtocolFamily::#family_name => #protocol_name::dispatch_event(interface, msg, handler, ctx),
+            });
+        } else {
+            special_request_arms.push(quote! {
+                ProtocolFamily::#family_name => Ok(None),
+            });
+            special_event_arms.push(quote! {
+                ProtocolFamily::#family_name => Ok(None),
+            });
+        }
+        consume_event_arms.push(quote! {
+            ProtocolFamily::#family_name => #protocol_name::consume_event(interface, msg),
+        });
+
+        let interface_names: Vec<String> = protocol
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let ProtocolItem::Interface(interface) = item {
+                    Some(interface.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !interface_names.is_empty() {
+            classify_arms.push(quote! {
+                #(#interface_names)|* => Some(ProtocolFamily::#family_name),
+            });
+        }
+    }
+
+    let expanded = quote! {
+        use std::os::unix::io::RawFd;
+
+        use crate::state::Context;
+        use crate::wire::{ProtocolError, WireMessage};
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ProtocolFamily {
+            #(#family_variants),*
+        }
+
+        pub trait AllProtocolHandlers:
+            #(#handler_traits +)*
+        {}
+
+        impl<T: ?Sized> AllProtocolHandlers for T
+        where
+            T: #(#handler_traits +)*
+        {}
+
+        pub fn classify_interface(interface: &str) -> Option<ProtocolFamily> {
+            match interface {
+                #(#classify_arms)*
+                _ => None,
+            }
+        }
+
+        #[allow(clippy::type_complexity)]
+        pub fn dispatch_request<H: AllProtocolHandlers + ?Sized>(
+            family: ProtocolFamily,
+            interface: &str,
+            msg: &mut WireMessage,
+            handler: &mut H,
+            ctx: &mut Context,
+        ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            match family {
+                #(#dispatch_request_arms)*
+                #(#special_request_arms)*
+            }
+        }
+
+        #[allow(clippy::type_complexity)]
+        pub fn dispatch_event<H: AllProtocolHandlers + ?Sized>(
+            family: ProtocolFamily,
+            interface: &str,
+            msg: &mut WireMessage,
+            handler: &mut H,
+            ctx: &mut Context,
+        ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            match family {
+                #(#dispatch_event_arms)*
+                #(#special_event_arms)*
+            }
+        }
+
+        pub fn consume_event(
+            family: ProtocolFamily,
+            interface: &str,
+            msg: &mut WireMessage,
+        ) -> Result<(), ProtocolError> {
+            match family {
+                #(#consume_event_arms)*
+            }
+        }
+    };
+
+    expanded.to_string()
+}
+
 fn map_type(arg: &Arg) -> TokenStream {
     match arg.typ.as_str() {
         "int" => quote! { i32 },

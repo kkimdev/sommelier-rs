@@ -17,7 +17,7 @@ limitations under the License.
 use std::env;
 use std::fs;
 use std::path::Path;
-use wayland_codegen::generator::generate;
+use wayland_codegen::generator::{generate, generate_routing};
 use wayland_codegen::parse;
 
 fn main() {
@@ -59,6 +59,8 @@ fn main() {
         ("aura_shell", "../third_party/protocols/aura-shell.xml"),
     ];
 
+    let mut parsed_protocols = Vec::with_capacity(protocols.len());
+
     for (name, path_str) in &protocols {
         let dest_path = Path::new(&out_dir).join(format!("{}_protocol.rs", name));
         let protocol_path = Path::new(path_str);
@@ -71,5 +73,10 @@ fn main() {
 
         fs::write(&dest_path, code)
             .unwrap_or_else(|_| panic!("Failed to write {}", dest_path.display()));
+        parsed_protocols.push(protocol);
     }
+
+    let routing_path = Path::new(&out_dir).join("protocol_routing.rs");
+    fs::write(&routing_path, generate_routing(&parsed_protocols))
+        .unwrap_or_else(|_| panic!("Failed to write {}", routing_path.display()));
 }
