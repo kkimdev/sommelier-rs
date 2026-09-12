@@ -437,7 +437,12 @@ impl KeyboardHandler {
             );
             return false;
         };
-        let Some((output_host_id, output)) = ctx.primary_output() else {
+        let Some((output_host_id, output)) = ctx
+            .shadow_table
+            .get_host_id(guest_wl_surface_id)
+            .and_then(|host_surface_id| ctx.output_for_surface(host_surface_id))
+            .or_else(|| ctx.primary_output())
+        else {
             log::debug!(
                 "window layout {:?} ignored: no usable output for xdg_toplevel {}",
                 action,
@@ -1812,6 +1817,84 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
         assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 3840);
         assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
+    }
+
+    #[test]
+    fn placement_uses_the_focused_surfaces_entered_output() {
+        let keyboard = 10u32;
+        let host_keyboard = 5u32;
+        let seat = 11u32;
+        let surface = 12u32;
+        let host_surface = 22u32;
+        let xdg_toplevel = 13u32;
+        let host_xdg_toplevel = 23u32;
+        let primary_output = 25u32;
+        let secondary_output = 26u32;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
+        ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
+        ctx.host_zaura_shell_id = Some(24);
+        ctx.host_zaura_shell_version = 38;
+        ctx.output_host_ids = vec![primary_output, secondary_output];
+        ctx.output_states.insert(
+            primary_output,
+            crate::state::OutputState {
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                ..Default::default()
+            },
+        );
+        ctx.output_states.insert(
+            secondary_output,
+            crate::state::OutputState {
+                origin_x: 1920,
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                ..Default::default()
+            },
+        );
+        ctx.surface_entered_output(host_surface, secondary_output);
+
+        assert!(KeyboardHandler::apply_window_layout(
+            &mut ctx,
+            HostId(host_keyboard),
+            WindowLayoutAction::Fullscreen,
+        ));
+        let aura_toplevel = *ctx
+            .xdg_toplevel_to_zaura_toplevel
+            .get(&xdg_toplevel)
+            .expect("Aura toplevel mapping");
+        let bounds = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| {
+                message_sender(message) == aura_toplevel
+                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+            })
+            .expect("window bounds request");
+        assert_eq!(
+            i32::from_ne_bytes(bounds.0[8..12].try_into().unwrap()),
+            1920
+        );
+        assert_eq!(i32::from_ne_bytes(bounds.0[12..16].try_into().unwrap()), 0);
+        assert_eq!(
+            i32::from_ne_bytes(bounds.0[16..20].try_into().unwrap()),
+            1920
+        );
+        assert_eq!(
+            i32::from_ne_bytes(bounds.0[20..24].try_into().unwrap()),
+            1080
+        );
+        assert_eq!(
+            u32::from_ne_bytes(bounds.0[24..28].try_into().unwrap()),
+            secondary_output
+        );
     }
 
     #[test]

@@ -720,6 +720,10 @@ pub struct OutputState {
     pub mode_width: i32,
     pub mode_height: i32,
     pub scale: i32,
+    /// Effective logical output transform. This starts with the
+    /// `wl_output.geometry` transform and is replaced by Aura's
+    /// `logical_transform` event when available.
+    pub transform: i32,
     pub insets_top: i32,
     pub insets_left: i32,
     pub insets_bottom: i32,
@@ -728,9 +732,17 @@ pub struct OutputState {
 
 impl OutputState {
     pub fn work_area(self) -> Option<(i32, i32, i32, i32)> {
+        if !(0..=7).contains(&self.transform) {
+            return None;
+        }
         let scale = self.scale.max(1);
-        let width = self.mode_width.checked_div(scale)?;
-        let height = self.mode_height.checked_div(scale)?;
+        let (mode_width, mode_height) = if matches!(self.transform, 1 | 3 | 5 | 7) {
+            (self.mode_height, self.mode_width)
+        } else {
+            (self.mode_width, self.mode_height)
+        };
+        let width = mode_width.checked_div(scale)?;
+        let height = mode_height.checked_div(scale)?;
         let x = self.origin_x.checked_add(self.insets_left)?;
         let y = self.origin_y.checked_add(self.insets_top)?;
         let width = width
@@ -958,6 +970,10 @@ pub struct Context {
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
     pub output_states: HashMap<u32, OutputState>,
+    /// Double-buffered output metadata collected until `wl_output.done`.
+    /// Version-1 outputs, which have no done event, update `output_states`
+    /// directly in the compositor handler.
+    pub pending_output_states: HashMap<u32, OutputState>,
     /// Host output object → (global name, advertisement generation) from
     /// which the object was bound.  The generation prevents a delayed
     /// global_remove for an old advertisement from retiring a replacement.
@@ -966,6 +982,11 @@ pub struct Context {
     /// lifetime remains valid until release, but they are no longer eligible
     /// for compositor-owned placement.
     pub inactive_output_host_ids: HashSet<u32>,
+    /// Host wl_surface ID → host wl_output IDs currently entered by that
+    /// surface. A surface may be visible on more than one output at once;
+    /// selection remains deterministic by following output advertisement
+    /// order.
+    pub surface_output_ids: HashMap<u32, HashSet<u32>>,
     /// Host-only Aura output objects keyed by their host wl_output object ID.
     pub zaura_output_to_wl_output: HashMap<u32, u32>,
     /// Maps host wl_surface ID → host zaura_surface ID for app ID passthrough.
@@ -1278,27 +1299,42 @@ impl Context {
         };
 
         let accelerators_env = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
-        let accelerators = match crate::accelerator::parse_accelerators(&accelerators_env) {
-            Ok(list) => list,
-            Err(e) => {
-                // A malformed accelerator config should not crash the proxy — that
-                // would break every app in the container. Degrade to no filtering
-                // (all keys forwarded to guest) and log a clear error.
-                warn!(
-                    "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
+        let (accelerators, accelerators_valid) =
+            match crate::accelerator::parse_accelerators(&accelerators_env) {
+                Ok(list) => (list, true),
+                Err(e) => {
+                    // A malformed accelerator config should not crash the proxy —
+                    // that would break every app in the container. Degrade to no
+                    // filtering (all keys forwarded to the guest), but retain the
+                    // invalid state so placement shortcuts cannot accidentally
+                    // bypass a conflict check against an empty list.
+                    warn!(
+                        "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
                      Accelerator filtering disabled.",
-                    accelerators_env, e
-                );
-                Vec::new()
-            }
-        };
-        let window_bounds_as_arc = std::env::var_os("SOMMELIER_WINDOW_BOUNDS_AS_ARC").is_some();
+                        accelerators_env, e
+                    );
+                    (Vec::new(), false)
+                }
+            };
+        let window_bounds_as_arc = env_flag_is_true(
+            std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
+                .ok()
+                .as_deref(),
+        );
         let window_placement_env =
             std::env::var("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS").unwrap_or_default();
         let window_placement_shortcuts = if !window_bounds_as_arc {
             if !window_placement_env.trim().is_empty() {
                 warn!(
                     "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC is set"
+                );
+            }
+            Vec::new()
+        } else if !accelerators_valid {
+            if !window_placement_env.trim().is_empty() {
+                warn!(
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is disabled because \
+                     SOMMELIER_ACCELERATORS is invalid"
                 );
             }
             Vec::new()
@@ -1403,8 +1439,10 @@ impl Context {
             arc_application_ids_applied: HashSet::new(),
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
+            pending_output_states: HashMap::new(),
             output_host_global_bindings: HashMap::new(),
             inactive_output_host_ids: HashSet::new(),
+            surface_output_ids: HashMap::new(),
             zaura_output_to_wl_output: HashMap::new(),
             wl_surface_to_zaura_surface: HashMap::new(),
             gtk_shells: HashMap::new(),
@@ -1464,15 +1502,104 @@ impl Context {
 
     /// Return the first output with a usable mode.
     pub fn primary_output(&self) -> Option<(u32, OutputState)> {
-        self.output_host_ids.iter().find_map(|&host_id| {
-            if self.shadow_table.is_pending_destroy_host(host_id)
-                || self.inactive_output_host_ids.contains(&host_id)
-            {
-                return None;
-            }
-            let state = *self.output_states.get(&host_id)?;
-            state.work_area().map(|_| (host_id, state))
-        })
+        self.output_host_ids
+            .iter()
+            .find_map(|&host_id| self.usable_output(host_id))
+    }
+
+    /// Return the output to use for placement of a focused surface.
+    ///
+    /// `wl_surface.enter`/`leave` maintain a set because a surface can span
+    /// outputs. Iterating `output_host_ids` makes the choice deterministic
+    /// even when several entered outputs are simultaneously usable. If the
+    /// association is empty or stale, fall back to the first usable output so
+    /// a surface created before its first enter event remains placeable.
+    pub fn output_for_surface(&self, host_surface_id: u32) -> Option<(u32, OutputState)> {
+        let associated = self.surface_output_ids.get(&host_surface_id);
+        associated
+            .and_then(|associated| {
+                self.output_host_ids.iter().find_map(|&host_id| {
+                    associated
+                        .contains(&host_id)
+                        .then(|| self.usable_output(host_id))
+                        .flatten()
+                })
+            })
+            .or_else(|| self.primary_output())
+    }
+
+    fn usable_output(&self, host_id: u32) -> Option<(u32, OutputState)> {
+        if self.shadow_table.is_pending_destroy_host(host_id)
+            || self.inactive_output_host_ids.contains(&host_id)
+        {
+            return None;
+        }
+        let state = *self.output_states.get(&host_id)?;
+        state.work_area().map(|_| (host_id, state))
+    }
+
+    /// Mutably access the current output snapshot while collecting a new
+    /// `wl_output` event group. The returned state is committed on `done` for
+    /// version-2+ outputs; v1 callers may copy it directly to `output_states`.
+    pub fn pending_output_state(&mut self, host_output_id: u32) -> &mut OutputState {
+        let initial = self
+            .output_states
+            .get(&host_output_id)
+            .copied()
+            .unwrap_or_default();
+        self.pending_output_states
+            .entry(host_output_id)
+            .or_insert(initial)
+    }
+
+    /// Publish one complete output metadata snapshot after `wl_output.done`.
+    pub fn commit_output_state(&mut self, host_output_id: u32) {
+        if let Some(state) = self.pending_output_states.remove(&host_output_id) {
+            self.output_states.insert(host_output_id, state);
+        }
+    }
+
+    /// Whether this output advertises the atomic metadata barrier introduced
+    /// by wl_output version 2. Unknown test-only registrations are treated as
+    /// versioned outputs and therefore require an explicit done event.
+    pub fn output_uses_done(&self, host_output_id: u32) -> bool {
+        self.shadow_table
+            .host_object_version(host_output_id)
+            .is_none_or(|version| version >= 2 || version == u32::MAX)
+    }
+
+    /// Record that a surface entered a host output. Unknown or inactive
+    /// outputs are intentionally ignored; their events may be in flight after
+    /// a global removal and must not steer a new placement operation.
+    pub fn surface_entered_output(&mut self, host_surface_id: u32, host_output_id: u32) {
+        if !self.output_host_ids.contains(&host_output_id)
+            || self.inactive_output_host_ids.contains(&host_output_id)
+            || self.shadow_table.is_pending_destroy_host(host_output_id)
+        {
+            return;
+        }
+        self.surface_output_ids
+            .entry(host_surface_id)
+            .or_default()
+            .insert(host_output_id);
+    }
+
+    /// Remove one output association from a surface, deleting the empty set.
+    pub fn surface_left_output(&mut self, host_surface_id: u32, host_output_id: u32) {
+        let Some(outputs) = self.surface_output_ids.get_mut(&host_surface_id) else {
+            return;
+        };
+        outputs.remove(&host_output_id);
+        if outputs.is_empty() {
+            self.surface_output_ids.remove(&host_surface_id);
+        }
+    }
+
+    fn remove_output_from_surface_associations(&mut self, host_output_id: u32) {
+        self.surface_output_ids.retain(|_, outputs| {
+            outputs.remove(&host_output_id);
+            !outputs.is_empty()
+        });
     }
 
     /// Retire placement metadata as soon as the guest releases a wl_output.
@@ -1483,18 +1610,27 @@ impl Context {
         self.output_host_ids
             .retain(|candidate| *candidate != host_output_id);
         self.output_states.remove(&host_output_id);
+        self.pending_output_states.remove(&host_output_id);
         self.output_host_global_bindings.remove(&host_output_id);
         self.inactive_output_host_ids.insert(host_output_id);
+        self.remove_output_from_surface_associations(host_output_id);
     }
 
     /// Mark every bound output from one removed host-global generation
     /// inactive without destroying its still-valid Wayland object.
     pub fn deactivate_output_bindings(&mut self, global_name: u32, generation: u64) {
-        for (&host_output_id, &(bound_name, bound_generation)) in &self.output_host_global_bindings
-        {
-            if bound_name == global_name && bound_generation == generation {
-                self.inactive_output_host_ids.insert(host_output_id);
-            }
+        let retired = self
+            .output_host_global_bindings
+            .iter()
+            .filter_map(|(&host_output_id, &(bound_name, bound_generation))| {
+                (bound_name == global_name && bound_generation == generation)
+                    .then_some(host_output_id)
+            })
+            .collect::<Vec<_>>();
+        for host_output_id in retired {
+            self.inactive_output_host_ids.insert(host_output_id);
+            self.pending_output_states.remove(&host_output_id);
+            self.remove_output_from_surface_associations(host_output_id);
         }
     }
 }
@@ -1508,6 +1644,18 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
     value
         .filter(|identifier| !identifier.is_empty())
         .unwrap_or_else(|| "termina".to_string())
+}
+
+/// Interpret an environment flag without treating mere presence as enabled.
+/// This keeps `VAR=0`, `VAR=false`, and an exported empty value disabled while
+/// accepting the conventional explicit true spellings.
+fn env_flag_is_true(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 impl Default for Context {
@@ -1567,6 +1715,7 @@ mod tests {
             insets_left: 8,
             insets_bottom: 48,
             insets_right: 16,
+            ..Default::default()
         };
         assert_eq!(output.work_area(), Some((1928, 40, 1896, 1008)));
     }
@@ -1581,6 +1730,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(output.work_area(), None);
+    }
+
+    #[test]
+    fn output_work_area_swaps_rotated_dimensions() {
+        let output = OutputState {
+            mode_width: 1920,
+            mode_height: 1080,
+            scale: 1,
+            transform: 1,
+            ..Default::default()
+        };
+        assert_eq!(output.work_area(), Some((0, 0, 1080, 1920)));
+    }
+
+    #[test]
+    fn surface_output_selection_prefers_entered_output_and_falls_back() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.output_host_ids = vec![20, 30];
+        for output in ctx.output_host_ids.clone() {
+            ctx.output_states.insert(
+                output,
+                OutputState {
+                    mode_width: 1920,
+                    mode_height: 1080,
+                    scale: 1,
+                    ..Default::default()
+                },
+            );
+        }
+        ctx.surface_entered_output(100, 30);
+        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(30));
+
+        ctx.inactive_output_host_ids.insert(30);
+        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
+        ctx.surface_left_output(100, 30);
+        assert!(!ctx.surface_output_ids.contains_key(&100));
+    }
+
+    #[test]
+    fn explicit_environment_true_values_are_required() {
+        assert!(env_flag_is_true(Some("true")));
+        assert!(env_flag_is_true(Some(" YES ")));
+        assert!(!env_flag_is_true(None));
+        assert!(!env_flag_is_true(Some("")));
+        assert!(!env_flag_is_true(Some("false")));
+        assert!(!env_flag_is_true(Some("1please")));
     }
 
     #[test]
