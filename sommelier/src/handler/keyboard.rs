@@ -473,12 +473,28 @@ impl KeyboardHandler {
             );
             return false;
         };
+        // Setup requests may already be staged above us, but the ARC policy
+        // identity belongs to this placement batch and must roll back with
+        // the state-reset and bounds requests if the barrier cannot be queued.
+        let placement_queue_start = ctx.client_to_host_queue.len();
+        if !crate::handler::compositor::ensure_arc_application_id_on_surface(
+            ctx,
+            guest_wl_surface_id,
+            zaura_surface_id,
+        ) {
+            log::debug!(
+                "window layout {:?} ignored: unable to apply ARC policy identity to wl_surface {}",
+                action,
+                guest_wl_surface_id
+            );
+            Self::rollback_window_layout_batch(ctx, placement_queue_start);
+            return false;
+        }
 
         // Keep every request emitted by this shortcut in one rollback
         // boundary.  `ensure_zaura_toplevel`/`ensure_host_zaura_surface`
         // may already have staged setup requests above us, so the offset
         // must be captured immediately before the placement-owned batch.
-        let placement_queue_start = ctx.client_to_host_queue.len();
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
         let mut builder = MessageBuilder::new();
         builder.write_i32(x);
@@ -1769,6 +1785,7 @@ mod tests {
                 crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
                 crate::protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES,
                 crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE,
+                crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID,
                 REQ_UNSET_FULLSCREEN,
                 REQ_UNSET_MAXIMIZED,
                 REQ_UNSET_SNAP,

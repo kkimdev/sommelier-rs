@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::handler::compositor::{
-    ensure_arc_application_id, ensure_host_zaura_surface, native_wayland_app_id,
-    wayland_string_fits_message,
+    ensure_arc_application_id, ensure_arc_application_id_on_surface, ensure_host_zaura_surface,
+    native_wayland_app_id, wayland_string_fits_message,
 };
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
@@ -158,39 +158,36 @@ impl GtkSurface1Handler for GtkShellHandler {
 
         // `zaura_surface.set_application_id` is also the metadata Exo uses
         // when deciding whether a window is allowed to receive arbitrary
-        // `zaura_toplevel.set_window_bounds` requests.  The compositor-owned
-        // layout path opts the surface into ARC policy (the same ID is sent
-        // from xdg_toplevel.set_app_id); GTK applications can send their
-        // D-Bus properties after that xdg request, so do not overwrite the
-        // ARC ID with the normal Crostini namespace.
-        let application_id = if ctx.window_bounds_as_arc {
-            let Some(application_id) = ensure_arc_application_id(ctx, wl_surface_id) else {
+        // `zaura_toplevel.set_window_bounds` requests. The compositor-owned
+        // layout path opts the surface into ARC policy and the shared helper
+        // ensures GTK cannot overwrite it with the normal Crostini namespace.
+        if ctx.window_bounds_as_arc {
+            if !ensure_arc_application_id_on_surface(ctx, wl_surface_id, zaura_surface_id) {
                 log::warn!(
-                    "Unable to allocate ARC policy identity for GTK wl_surface {}",
+                    "Unable to apply ARC policy identity for GTK wl_surface {}",
                     wl_surface_id
                 );
                 return Action::Drop;
-            };
-            application_id
+            }
         } else {
-            native_wayland_app_id(&ctx.vm_identifier, application_id)
-        };
-        if !wayland_string_fits_message(&application_id) {
-            log::warn!(
-                "Dropping oversized GTK application ID for gtk_surface1 {}",
-                ctx.last_sender_id
-            );
-            return Action::Drop;
-        }
-        let mut builder = MessageBuilder::new();
-        builder.write_nullable_string(Some(&application_id));
-        match builder.try_build_message(zaura_surface_id, REQ_SET_APPLICATION_ID) {
-            Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
-            Err(error) => log::warn!(
-                "Unable to encode GTK application ID for gtk_surface1 {}: {}",
-                ctx.last_sender_id,
-                error
-            ),
+            let application_id = native_wayland_app_id(&ctx.vm_identifier, application_id);
+            if !wayland_string_fits_message(&application_id) {
+                log::warn!(
+                    "Dropping oversized GTK application ID for gtk_surface1 {}",
+                    ctx.last_sender_id
+                );
+                return Action::Drop;
+            }
+            let mut builder = MessageBuilder::new();
+            builder.write_nullable_string(Some(&application_id));
+            match builder.try_build_message(zaura_surface_id, REQ_SET_APPLICATION_ID) {
+                Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
+                Err(error) => log::warn!(
+                    "Unable to encode GTK application ID for gtk_surface1 {}: {}",
+                    ctx.last_sender_id,
+                    error
+                ),
+            }
         }
         Action::Drop
     }
