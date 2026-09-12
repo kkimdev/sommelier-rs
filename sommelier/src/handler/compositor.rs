@@ -161,7 +161,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         _subpixel: i32,
         _make: &String,
         _model: &String,
-        _transform: i32,
+        transform: i32,
     ) -> Action {
         if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
             return Action::Drop;
@@ -169,9 +169,22 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
             return Action::Forward;
         }
-        let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
+        let host_output_id = ctx.last_sender_id;
+        let output = ctx.pending_output_state(host_output_id);
         output.origin_x = x;
         output.origin_y = y;
+        if (0..=7).contains(&transform) {
+            output.transform = transform;
+        } else {
+            log::warn!(
+                "Ignoring invalid wl_output.transform={} for host output {}",
+                transform,
+                host_output_id
+            );
+        }
+        if !ctx.output_uses_done(host_output_id) {
+            ctx.commit_output_state(host_output_id);
+        }
         Action::Forward
     }
 
@@ -189,10 +202,24 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
             return Action::Forward;
         }
-        if flags & 1 != 0 || !ctx.output_states.contains_key(&ctx.last_sender_id) {
-            let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
+        let host_output_id = ctx.last_sender_id;
+        let output = ctx.pending_output_state(host_output_id);
+        if flags & 1 != 0 || output.mode_width <= 0 || output.mode_height <= 0 {
             output.mode_width = width;
             output.mode_height = height;
+        }
+        if !ctx.output_uses_done(host_output_id) {
+            ctx.commit_output_state(host_output_id);
+        }
+        Action::Forward
+    }
+
+    fn on_done(&mut self, ctx: &mut Context) -> Action {
+        let host_output_id = ctx.last_sender_id;
+        if !ctx.shadow_table.is_pending_destroy_host(host_output_id)
+            && !ctx.inactive_output_host_ids.contains(&host_output_id)
+        {
+            ctx.commit_output_state(host_output_id);
         }
         Action::Forward
     }
@@ -204,7 +231,8 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
             return Action::Forward;
         }
-        let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
+        let host_output_id = ctx.last_sender_id;
+        let output = ctx.pending_output_state(host_output_id);
         if factor > 0 {
             output.scale = factor;
         } else {
@@ -213,6 +241,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
                 factor,
                 ctx.last_sender_id
             );
+        }
+        if !ctx.output_uses_done(host_output_id) {
+            ctx.commit_output_state(host_output_id);
         }
         Action::Forward
     }
@@ -265,11 +296,14 @@ impl ZauraOutputHandler for CompositorHandler {
         {
             return Action::Drop;
         }
-        let output = ctx.output_states.entry(wl_output_id).or_default();
+        let output = ctx.pending_output_state(wl_output_id);
         output.insets_top = top.max(0);
         output.insets_left = left.max(0);
         output.insets_bottom = bottom.max(0);
         output.insets_right = right.max(0);
+        if !ctx.output_uses_done(wl_output_id) {
+            ctx.commit_output_state(wl_output_id);
+        }
         Action::Drop
     }
 
@@ -281,6 +315,31 @@ impl ZauraOutputHandler for CompositorHandler {
             log::warn!("Ignoring invalid zaura_output.scale=0");
         }
         let _ = ctx.last_sender_id;
+        Action::Drop
+    }
+
+    fn on_logical_transform(&mut self, ctx: &mut Context, transform: i32) -> Action {
+        let zaura_output_id = ctx.last_sender_id;
+        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&zaura_output_id) else {
+            return Action::Drop;
+        };
+        if ctx.inactive_output_host_ids.contains(&wl_output_id)
+            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
+        {
+            return Action::Drop;
+        }
+        if !(0..=7).contains(&transform) {
+            log::warn!(
+                "Ignoring invalid zaura_output.logical_transform={} for host output {}",
+                transform,
+                wl_output_id
+            );
+            return Action::Drop;
+        }
+        ctx.pending_output_state(wl_output_id).transform = transform;
+        if !ctx.output_uses_done(wl_output_id) {
+            ctx.commit_output_state(wl_output_id);
+        }
         Action::Drop
     }
 }
@@ -1134,6 +1193,7 @@ impl WlSurfaceHandler for CompositorHandler {
         }
         ctx.arc_application_ids.remove(&wl_surface_guest_id);
         ctx.arc_application_ids_applied.remove(&wl_surface_guest_id);
+        ctx.surface_output_ids.remove(&wl_surface_host_id);
         let gtk_surface_ids = ctx
             .gtk_surfaces
             .iter()
@@ -1203,6 +1263,24 @@ impl WlSurfaceHandler for CompositorHandler {
         // guest can safely reuse the ID only after that acknowledgement.
         ctx.shadow_table.mark_pending_destroy(wl_surface_guest_id);
         Action::Drop
+    }
+
+    fn on_enter(&mut self, ctx: &mut Context, output: u32) -> Action {
+        let host_surface_id = ctx.last_sender_id;
+        if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
+            || ctx.inactive_output_host_ids.contains(&output)
+            || ctx.shadow_table.is_pending_destroy_host(output)
+        {
+            return Action::Forward;
+        }
+        ctx.surface_entered_output(host_surface_id, output);
+        Action::Forward
+    }
+
+    fn on_leave(&mut self, ctx: &mut Context, output: u32) -> Action {
+        let host_surface_id = ctx.last_sender_id;
+        ctx.surface_left_output(host_surface_id, output);
+        Action::Forward
     }
 
     fn on_attach(&mut self, ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
@@ -2153,6 +2231,12 @@ mod tests {
         WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
         ctx.last_sender_id = aura_output_host;
         assert_eq!(handler.on_insets(&mut ctx, 24, 8, 48, 16), Action::Drop);
+        assert_eq!(ctx.output_states[&output_host].mode_width, 0);
+        ctx.last_sender_id = output_host;
+        assert_eq!(
+            WlOutputHandler::on_done(&mut handler, &mut ctx),
+            Action::Forward
+        );
 
         assert_eq!(
             ctx.output_states[&output_host].work_area(),
@@ -2188,6 +2272,68 @@ mod tests {
             ctx.output_states[&output_host].insets_top, 1,
             "late insets must not repopulate retired placement metadata"
         );
+    }
+
+    #[test]
+    fn logical_transform_updates_rotated_output_work_area() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.output_host_ids.push(output_host);
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 2,
+                insets_top: 24,
+                insets_left: 8,
+                insets_bottom: 48,
+                insets_right: 16,
+                ..Default::default()
+            },
+        );
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        ctx.last_sender_id = aura_output_host;
+
+        assert_eq!(
+            ZauraOutputHandler::on_logical_transform(&mut CompositorHandler, &mut ctx, 1),
+            Action::Drop
+        );
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut CompositorHandler, &mut ctx);
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((8, 24, 1056, 1848))
+        );
+    }
+
+    #[test]
+    fn surface_enter_leave_tracks_multiple_outputs() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut handler = CompositorHandler;
+        ctx.output_host_ids = vec![20, 30];
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, 20),
+            Action::Forward
+        );
+        assert_eq!(
+            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, 30),
+            Action::Forward
+        );
+        assert_eq!(
+            ctx.surface_output_ids[&100],
+            [20, 30]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
+        assert_eq!(
+            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, 20),
+            Action::Forward
+        );
+        assert_eq!(ctx.surface_output_ids[&100], [30].into_iter().collect());
     }
 
     #[test]
