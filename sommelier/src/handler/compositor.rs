@@ -260,6 +260,11 @@ impl ZauraOutputHandler for CompositorHandler {
         let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&zaura_output_id) else {
             return Action::Drop;
         };
+        if ctx.inactive_output_host_ids.contains(&wl_output_id)
+            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
+        {
+            return Action::Drop;
+        }
         let output = ctx.output_states.entry(wl_output_id).or_default();
         output.insets_top = top.max(0);
         output.insets_left = left.max(0);
@@ -374,6 +379,53 @@ pub(crate) fn ensure_arc_application_id(
             .or_insert_with(|| format!("{}{}", ARC_APPLICATION_ID_PREFIX, next_arc_session_id()))
             .clone(),
     )
+}
+
+/// Queue the ARC policy identity for a host Aura surface exactly once.
+///
+/// An XDG client is allowed to omit `xdg_toplevel.set_app_id`. Placement still
+/// needs the ARC policy identity in that case, so the placement path applies
+/// it immediately before the first bounds request. The separate applied set
+/// keeps repeated shortcuts from emitting duplicate metadata requests.
+pub(crate) fn ensure_arc_application_id_on_surface(
+    ctx: &mut Context,
+    wl_surface_guest_id: u32,
+    zaura_surface_host_id: u32,
+) -> bool {
+    if !ctx.window_bounds_as_arc
+        || ctx
+            .arc_application_ids_applied
+            .contains(&wl_surface_guest_id)
+    {
+        return true;
+    }
+    let Some(application_id) = ensure_arc_application_id(ctx, wl_surface_guest_id) else {
+        return false;
+    };
+    let version = ctx
+        .shadow_table
+        .host_object_version(zaura_surface_host_id)
+        .unwrap_or(ctx.host_zaura_shell_version);
+    if version < 5 || !wayland_string_fits_message(&application_id) {
+        log::warn!(
+            "Unable to apply ARC application identity to zaura_surface {}",
+            zaura_surface_host_id
+        );
+        return false;
+    }
+    let mut builder = crate::wire::MessageBuilder::new();
+    builder.write_string(&application_id);
+    let Ok(message) = builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
+    else {
+        log::warn!(
+            "Unable to encode ARC application identity for zaura_surface {}",
+            zaura_surface_host_id
+        );
+        return false;
+    };
+    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.arc_application_ids_applied.insert(wl_surface_guest_id);
+    true
 }
 
 pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
@@ -1081,6 +1133,7 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
         ctx.arc_application_ids.remove(&wl_surface_guest_id);
+        ctx.arc_application_ids_applied.remove(&wl_surface_guest_id);
         let gtk_surface_ids = ctx
             .gtk_surfaces
             .iter()
@@ -1734,43 +1787,35 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 if zaura_surface_version < 5 {
                     return Action::Drop;
                 }
-                let aura_app_id = if ctx.window_bounds_as_arc {
-                    let Some(application_id) = ensure_arc_application_id(ctx, wl_surface_guest_id)
-                    else {
+                if ctx.window_bounds_as_arc {
+                    if !ensure_arc_application_id_on_surface(
+                        ctx,
+                        wl_surface_guest_id,
+                        zaura_surface_host_id,
+                    ) {
                         log::warn!(
-                            "Unable to allocate ARC policy identity for wl_surface {}",
+                            "Unable to apply ARC policy identity for wl_surface {}",
                             wl_surface_guest_id
                         );
                         return Action::Drop;
-                    };
-                    application_id
+                    }
                 } else {
-                    native_app_id.clone()
-                };
-                if !wayland_string_fits_message(&aura_app_id) {
-                    log::warn!(
-                        "Dropping oversized Aura application ID for xdg_toplevel {}",
-                        xdg_toplevel_id
-                    );
-                    return Action::Drop;
+                    let mut builder = crate::wire::MessageBuilder::new();
+                    builder.write_string(&native_app_id);
+                    let Ok(msg) =
+                        builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
+                    else {
+                        log::warn!(
+                            "Dropping oversized aura application ID for xdg_toplevel {}",
+                            xdg_toplevel_id
+                        );
+                        return Action::Drop;
+                    };
+                    ctx.client_to_host_queue.push((msg, Vec::new()));
                 }
-                let mut builder = crate::wire::MessageBuilder::new();
-                builder.write_string(&aura_app_id);
-
-                let Ok(msg) =
-                    builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
-                else {
-                    log::warn!(
-                        "Dropping oversized aura application ID for xdg_toplevel {}",
-                        xdg_toplevel_id
-                    );
-                    return Action::Drop;
-                };
-                ctx.client_to_host_queue.push((msg, Vec::new()));
                 log::debug!(
-                    "Set application ID to {} (formatted: {}) on zaura_surface (host_id={})",
+                    "Set application ID to {} on zaura_surface (host_id={})",
                     app_id,
-                    aura_app_id,
                     zaura_surface_host_id
                 );
             }
@@ -2035,6 +2080,45 @@ mod tests {
     }
 
     #[test]
+    fn arc_policy_identity_is_applied_before_placement_without_app_id() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.window_bounds_as_arc = true;
+        let zaura_surface_host = ensure_host_zaura_surface(&mut ctx, 100).expect("Aura surface");
+        assert!(ensure_arc_application_id_on_surface(
+            &mut ctx,
+            100,
+            zaura_surface_host,
+        ));
+        assert!(ctx.arc_application_ids_applied.contains(&100));
+        let set_application_id_count = ctx
+            .client_to_host_queue
+            .iter()
+            .filter(|(message, _)| {
+                msg_sender(message) == zaura_surface_host
+                    && msg_opcode(message) == REQ_SET_APPLICATION_ID
+            })
+            .count();
+        assert_eq!(set_application_id_count, 1);
+
+        assert!(ensure_arc_application_id_on_surface(
+            &mut ctx,
+            100,
+            zaura_surface_host,
+        ));
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .filter(|(message, _)| {
+                    msg_sender(message) == zaura_surface_host
+                        && msg_opcode(message) == REQ_SET_APPLICATION_ID
+                })
+                .count(),
+            1,
+            "repeated placement must not duplicate ARC metadata"
+        );
+    }
+
+    #[test]
     fn output_geometry_and_aura_insets_define_logical_work_area() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_host = 20;
@@ -2073,6 +2157,36 @@ mod tests {
         assert_eq!(
             ctx.output_states[&output_host].work_area(),
             Some((1928, 40, 1896, 1008))
+        );
+    }
+
+    #[test]
+    fn inactive_output_ignores_late_aura_insets() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                insets_top: 1,
+                insets_left: 2,
+                insets_bottom: 3,
+                insets_right: 4,
+                ..Default::default()
+            },
+        );
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        ctx.inactive_output_host_ids.insert(output_host);
+        ctx.last_sender_id = aura_output_host;
+
+        assert_eq!(
+            ZauraOutputHandler::on_insets(&mut CompositorHandler, &mut ctx, 10, 20, 30, 40),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.output_states[&output_host].insets_top, 1,
+            "late insets must not repopulate retired placement metadata"
         );
     }
 

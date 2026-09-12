@@ -950,6 +950,10 @@ pub struct Context {
     pub window_bounds_as_arc: bool,
     /// Per-surface ARC policy identities used by the opt-in bounds path.
     pub arc_application_ids: HashMap<u32, String>,
+    /// Guest surfaces whose ARC policy identity has already been sent to the
+    /// paired host Aura surface. Keeping this separate from the allocated
+    /// identity avoids repeating the metadata request on every placement.
+    pub arc_application_ids_applied: HashSet<u32>,
     /// Host wl_output IDs advertised to the guest.
     pub output_host_ids: Vec<u32>,
     /// Output mode/scale/insets keyed by host wl_output ID.
@@ -1396,6 +1400,7 @@ impl Context {
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             window_bounds_as_arc,
             arc_application_ids: HashMap::new(),
+            arc_application_ids_applied: HashSet::new(),
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
             output_host_global_bindings: HashMap::new(),
