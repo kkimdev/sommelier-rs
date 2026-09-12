@@ -166,6 +166,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
             return Action::Drop;
         }
+        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
+            return Action::Forward;
+        }
         let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
         output.origin_x = x;
         output.origin_y = y;
@@ -183,6 +186,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
             return Action::Drop;
         }
+        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
+            return Action::Forward;
+        }
         if flags & 1 != 0 || !ctx.output_states.contains_key(&ctx.last_sender_id) {
             let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
             output.mode_width = width;
@@ -194,6 +200,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
     fn on_scale(&mut self, ctx: &mut Context, factor: i32) -> Action {
         if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
             return Action::Drop;
+        }
+        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
+            return Action::Forward;
         }
         let output = ctx.output_states.entry(ctx.last_sender_id).or_default();
         if factor > 0 {
@@ -528,6 +537,8 @@ pub(crate) fn release_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u
     ctx.active_window_bounds_barriers
         .remove(&zaura_toplevel_host_id);
     ctx.pending_window_bounds_configures
+        .remove(&zaura_toplevel_host_id);
+    ctx.pending_window_bounds_surface_configures
         .remove(&zaura_toplevel_host_id);
     let version = ctx
         .shadow_table
@@ -1120,6 +1131,16 @@ impl WlSurfaceHandler for CompositorHandler {
         for toplevel_id in orphaned_toplevels {
             release_zaura_toplevel(ctx, toplevel_id);
         }
+        let orphaned_xdg_surfaces = ctx
+            .xdg_surface_to_wl_surface
+            .iter()
+            .filter_map(|(&xdg_surface_id, &surface_id)| {
+                (surface_id == wl_surface_guest_id).then_some(xdg_surface_id)
+            })
+            .collect::<Vec<_>>();
+        for xdg_surface_id in orphaned_xdg_surfaces {
+            ctx.xdg_surface_to_xdg_toplevel.remove(&xdg_surface_id);
+        }
         ctx.xdg_surface_to_wl_surface
             .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
         ctx.xdg_toplevel_to_wl_surface
@@ -1559,6 +1580,7 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
 impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let xdg_surface_id = ctx.last_sender_id;
+        ctx.xdg_surface_to_xdg_toplevel.remove(&xdg_surface_id);
         if let Some(wl_surface_id) = ctx.xdg_surface_to_wl_surface.remove(&xdg_surface_id) {
             // A malformed client can destroy xdg_surface before its
             // xdg_toplevel. Do not leave a stale toplevel→surface association
@@ -1580,9 +1602,42 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         Action::Forward
     }
 
+    fn on_configure(&mut self, ctx: &mut Context, serial: u32) -> Action {
+        let host_xdg_surface_id = ctx.last_sender_id;
+        let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
+            return Action::Drop;
+        };
+        let Some(&guest_xdg_toplevel_id) =
+            ctx.xdg_surface_to_xdg_toplevel.get(&guest_xdg_surface_id)
+        else {
+            return Action::Forward;
+        };
+        let Some(&zaura_toplevel_host_id) = ctx
+            .xdg_toplevel_to_zaura_toplevel
+            .get(&guest_xdg_toplevel_id)
+        else {
+            return Action::Forward;
+        };
+        if ctx
+            .active_window_bounds_barriers
+            .contains_key(&zaura_toplevel_host_id)
+        {
+            ctx.pending_window_bounds_surface_configures.insert(
+                zaura_toplevel_host_id,
+                crate::state::PendingWindowBoundsSurfaceConfigure {
+                    guest_xdg_surface_id,
+                    serial,
+                },
+            );
+            return Action::Drop;
+        }
+        Action::Forward
+    }
+
     fn on_get_toplevel(&mut self, ctx: &mut Context, id: u32) -> Action {
         let xdg_surface_id = ctx.last_sender_id;
         if let Some(&wl_surface_id) = ctx.xdg_surface_to_wl_surface.get(&xdg_surface_id) {
+            ctx.xdg_surface_to_xdg_toplevel.insert(xdg_surface_id, id);
             ctx.xdg_toplevel_to_wl_surface.insert(id, wl_surface_id);
             // The generated dispatcher installs the guest→host mapping after
             // this callback, so the proxy retries Aura-child creation after
@@ -1622,6 +1677,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // guest ID until the host acknowledges the destructor.
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
         ctx.xdg_toplevel_to_wl_surface.remove(&xdg_toplevel_id);
+        ctx.xdg_surface_to_xdg_toplevel
+            .retain(|_, toplevel_id| *toplevel_id != xdg_toplevel_id);
         release_zaura_toplevel(ctx, xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
         Action::Drop
@@ -1779,6 +1836,17 @@ fn queue_guest_xdg_configure(
     true
 }
 
+fn queue_guest_xdg_surface_configure(ctx: &mut Context, guest_xdg_surface_id: u32, serial: u32) {
+    let mut builder = crate::wire::MessageBuilder::new();
+    builder.write_u32(serial);
+    if let Ok(message) = builder.try_build_message(
+        guest_xdg_surface_id,
+        crate::protocols::xdg_shell::xdg_surface::EVT_CONFIGURE,
+    ) {
+        ctx.host_to_client_queue.push((message, Vec::new()));
+    }
+}
+
 /// Complete one active bounds barrier and flush the newest configure retained
 /// for it. Older callbacks are intentionally ignored: a newer barrier owns
 /// the pending configure and will flush it when its own `done` arrives.
@@ -1806,6 +1874,12 @@ pub(crate) fn complete_window_bounds_barrier(ctx: &mut Context, callback_host_id
             configure.height,
             &configure.states,
         );
+    }
+    if let Some(configure) = ctx
+        .pending_window_bounds_surface_configures
+        .remove(&zaura_toplevel_host_id)
+    {
+        queue_guest_xdg_surface_configure(ctx, configure.guest_xdg_surface_id, configure.serial);
     }
 }
 
@@ -1892,6 +1966,7 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+    use crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
     use crate::state::{
@@ -1929,6 +2004,8 @@ mod tests {
 
         ctx.shadow_table.map_id(wl_surface_guest, wl_surface_host);
         ctx.shadow_table
+            .map_id(xdg_surface_id, xdg_surface_id + 100);
+        ctx.shadow_table
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
         ctx.host_zaura_shell_id = Some(zaura_shell_host);
         ctx.host_zaura_shell_version = 38;
@@ -1936,6 +2013,8 @@ mod tests {
             .insert(xdg_surface_id, wl_surface_guest);
         ctx.xdg_toplevel_to_wl_surface
             .insert(xdg_toplevel_id, wl_surface_guest);
+        ctx.xdg_surface_to_xdg_toplevel
+            .insert(xdg_surface_id, xdg_toplevel_id);
 
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
     }
@@ -2083,6 +2162,61 @@ mod tests {
         assert_eq!(
             msg_opcode(&ctx.host_to_client_queue[0].0),
             crate::protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE
+        );
+    }
+
+    #[test]
+    fn bounds_barrier_flushes_toplevel_before_surface_configure() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let aura_toplevel_host = 700;
+        let callback_host = 701;
+        let xdg_surface_host = 600;
+        ctx.xdg_toplevel_to_zaura_toplevel
+            .insert(xdg_toplevel_id, aura_toplevel_host);
+        ctx.shadow_table.track_host_interface_with_version(
+            aura_toplevel_host,
+            "zaura_toplevel".into(),
+            38,
+        );
+        ctx.shadow_table
+            .track_host_interface_with_version(callback_host, "wl_callback".into(), 1);
+        ctx.active_window_bounds_barriers
+            .insert(aura_toplevel_host, callback_host);
+        ctx.window_bounds_barriers
+            .insert(callback_host, aura_toplevel_host);
+        ctx.last_sender_id = xdg_surface_host;
+        assert_eq!(
+            XdgSurfaceHandler::on_configure(&mut CompositorHandler, &mut ctx, 77),
+            Action::Drop
+        );
+        ctx.last_sender_id = aura_toplevel_host;
+        assert_eq!(
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+                800,
+                600,
+                &[],
+            ),
+            Action::Drop
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        complete_window_bounds_barrier(&mut ctx, callback_host);
+        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert_eq!(
+            msg_opcode(&ctx.host_to_client_queue[0].0),
+            crate::protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE
+        );
+        assert_eq!(
+            msg_opcode(&ctx.host_to_client_queue[1].0),
+            crate::protocols::xdg_shell::xdg_surface::EVT_CONFIGURE
+        );
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[1].0[8..12].try_into().unwrap()),
+            77
         );
     }
 

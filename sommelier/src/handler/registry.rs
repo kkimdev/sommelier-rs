@@ -1017,6 +1017,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 && Some(pending.generation) == removed_generation)
         });
         if let Some(generation) = removed_generation {
+            // A bound wl_output remains a valid Wayland object after its
+            // global advertisement disappears, but it must stop feeding
+            // compositor-owned placement.  Match the exact advertisement
+            // generation so a delayed remove cannot retire a replacement.
+            ctx.deactivate_output_bindings(name, generation);
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
         }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
@@ -1160,6 +1165,20 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         if interface == "wl_output" {
             ctx.output_host_ids.push(host_new_id);
             ctx.output_states.entry(host_new_id).or_default();
+            let registry_host_id = ctx
+                .shadow_table
+                .get_host_id(ctx.last_sender_id)
+                .unwrap_or(ctx.last_sender_id);
+            let generation = ctx
+                .registry_global_generations
+                .get(&registry_host_id)
+                .and_then(|generations| generations.get(&name))
+                .copied()
+                .or_else(|| ctx.global_generations.get(&name).copied())
+                .unwrap_or_default();
+            ctx.output_host_global_bindings
+                .insert(host_new_id, (name, generation));
+            ctx.inactive_output_host_ids.remove(&host_new_id);
         }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
@@ -1697,6 +1716,48 @@ mod tests {
                 version: 5,
             })
         );
+    }
+
+    #[test]
+    fn global_remove_deactivates_bound_output_without_destroying_object() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+        let generation = ctx.global_generations[&10];
+        let bind = (output.clone(), 3, 20);
+        assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
+        let output_host = ctx
+            .output_host_global_bindings
+            .keys()
+            .copied()
+            .next()
+            .expect("bound output host object");
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(output_host));
+
+        ctx.last_sender_id = 1;
+        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
+        assert_eq!(
+            ctx.output_host_global_bindings[&output_host],
+            (10, generation)
+        );
+        assert!(ctx.output_states.contains_key(&output_host));
+        assert!(ctx.inactive_output_host_ids.contains(&output_host));
+        assert!(ctx.primary_output().is_none());
     }
 
     #[test]
