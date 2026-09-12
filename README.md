@@ -231,8 +231,12 @@ SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscre
 
 No placement shortcut is active by default. The policy gate remains opt-in
 because it changes the ChromeOS window-policy namespace; malformed bindings or
-bindings that conflict with `SOMMELIER_ACCELERATORS` disable placement at
-startup.
+bindings that conflict with `SOMMELIER_ACCELERATORS` disable shortcut
+consumption at startup. The ARC policy may still be enabled without bindings
+for deployments that need the metadata path but no compositor-owned chords. When
+the policy is enabled, Sommelier reserves a process-shared ARC task-identity
+block under `$XDG_RUNTIME_DIR/sommelier`; if that reservation cannot be made,
+the policy is disabled rather than using a potentially colliding identity.
 
 ## CI and release workflow
 

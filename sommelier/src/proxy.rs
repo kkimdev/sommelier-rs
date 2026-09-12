@@ -489,16 +489,6 @@ impl Client {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
                 };
-                if is_xdg_surface_get_toplevel && packet.len() >= 12 {
-                    let guest_xdg_toplevel_id =
-                        u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                    if self.ctx.window_bounds_as_arc {
-                        let _ = crate::handler::compositor::ensure_zaura_toplevel(
-                            &mut self.ctx,
-                            guest_xdg_toplevel_id,
-                        );
-                    }
-                }
                 consumed_fds = msg.fd_offset;
                 if !msg.is_payload_consumed() {
                     log::error!(
@@ -509,6 +499,51 @@ impl Client {
                     );
                     Err(ProtocolError::TrailingData)
                 } else {
+                    // The compositor handler may reject a malformed or
+                    // dropped request after decoding it. Only create the
+                    // internal Aura child after payload validation and when
+                    // the guest request produced a real host message;
+                    // otherwise a failed get_toplevel would leave an
+                    // orphaned host-only object and placement metadata
+                    // behind.
+                    if is_xdg_surface_get_toplevel
+                        && res.as_ref().is_ok_and(Option::is_some)
+                        && packet.len() >= 12
+                    {
+                        let guest_xdg_toplevel_id =
+                            u32::from_ne_bytes(packet[8..12].try_into().unwrap());
+                        if let Some(wl_surface_guest_id) =
+                            crate::handler::compositor::record_xdg_toplevel(
+                                &mut self.ctx,
+                                sender_id,
+                                guest_xdg_toplevel_id,
+                            )
+                        {
+                            if self.ctx.window_bounds_as_arc {
+                                // Allocate the ARC policy identity only after
+                                // the generated dispatcher has accepted and
+                                // mapped the new role. Exhaustion fails closed:
+                                // do not create an Aura child that placement
+                                // could never authorize.
+                                if crate::handler::compositor::ensure_arc_application_id(
+                                    &mut self.ctx,
+                                    wl_surface_guest_id,
+                                )
+                                .is_some()
+                                {
+                                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                                        &mut self.ctx,
+                                        guest_xdg_toplevel_id,
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "Unable to allocate ARC policy identity for wl_surface {}",
+                                        wl_surface_guest_id
+                                    );
+                                }
+                            }
+                        }
+                    }
                     res
                 }
             } else {
@@ -1200,6 +1235,50 @@ mod tests {
             "unknown client sender IDs must terminate the connection"
         );
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn failed_get_toplevel_does_not_create_internal_aura_object() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (client_socket, host_socket) =
+            UnixStream::pair().expect("test socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            false,
+            false,
+        );
+        client.ctx.window_bounds_as_arc = true;
+        client.ctx.arc_id_allocator = Some(crate::arc_task_ids::ArcIdAllocator::for_test(
+            crate::arc_task_ids::ARC_ID_POOL_START,
+            crate::arc_task_ids::ARC_ID_POOL_START + 16,
+        ));
+        client.ctx.host_zaura_shell_id = Some(40);
+        client.ctx.host_zaura_shell_version = 38;
+        client.ctx.shadow_table.map_id(10, 20);
+        client
+            .ctx
+            .shadow_table
+            .track_interface_with_version(10, "xdg_surface".to_string(), 6);
+        client.ctx.shadow_table.set_host_version(20, 6);
+        client.ctx.shadow_table.mark_pending_destroy(10);
+
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(30);
+        let request =
+            builder.build_message(10, protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL);
+        client.client_conn.read_buf.extend_from_slice(&request);
+
+        assert!(
+            !client.handle_msgs(Direction::ClientToHost).await,
+            "a request from a pending xdg_surface must terminate the session"
+        );
+        assert!(
+            client.ctx.xdg_toplevel_to_zaura_toplevel.is_empty(),
+            "failed get_toplevel requests must not leave an internal Aura child"
+        );
     }
 
     #[tokio::test]

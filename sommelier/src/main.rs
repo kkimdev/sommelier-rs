@@ -20,6 +20,7 @@ use clap::Parser;
 
 mod accelerator;
 mod allocator;
+mod arc_task_ids;
 mod connection;
 mod handler;
 mod proxy;

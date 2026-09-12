@@ -962,6 +962,10 @@ pub struct Context {
     pub window_bounds_as_arc: bool,
     /// Per-surface ARC policy identities used by the opt-in bounds path.
     pub arc_application_ids: HashMap<u32, String>,
+    /// Process-shared allocator backing the fabricated ARC policy identities.
+    /// `None` means the allocator could not reserve a collision-free block;
+    /// callers then fail closed and do not enable the bounds path.
+    pub(crate) arc_id_allocator: Option<Arc<crate::arc_task_ids::ArcIdAllocator>>,
     /// Guest surfaces whose ARC policy identity has already been sent to the
     /// paired host Aura surface. Keeping this separate from the allocated
     /// identity avoids repeating the metadata request on every placement.
@@ -1298,31 +1302,69 @@ impl Context {
             }
         };
 
-        let accelerators_env = std::env::var("SOMMELIER_ACCELERATORS").unwrap_or_default();
-        let (accelerators, accelerators_valid) =
-            match crate::accelerator::parse_accelerators(&accelerators_env) {
-                Ok(list) => (list, true),
-                Err(e) => {
-                    // A malformed accelerator config should not crash the proxy —
-                    // that would break every app in the container. Degrade to no
-                    // filtering (all keys forwarded to the guest), but retain the
-                    // invalid state so placement shortcuts cannot accidentally
-                    // bypass a conflict check against an empty list.
-                    warn!(
-                        "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
-                     Accelerator filtering disabled.",
-                        accelerators_env, e
-                    );
-                    (Vec::new(), false)
+        let (accelerators, accelerators_valid) = match utf8_env("SOMMELIER_ACCELERATORS") {
+            Ok(Some(accelerators_env)) => {
+                match crate::accelerator::parse_accelerators(&accelerators_env) {
+                    Ok(list) => (list, true),
+                    Err(e) => {
+                        // A malformed accelerator config should not crash the proxy —
+                        // that would break every app in the container. Degrade to no
+                        // filtering (all keys forwarded to the guest), but retain the
+                        // invalid state so placement shortcuts cannot accidentally
+                        // bypass a conflict check against an empty list.
+                        warn!(
+                            "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
+                         Accelerator filtering disabled.",
+                            accelerators_env, e
+                        );
+                        (Vec::new(), false)
+                    }
                 }
-            };
-        let window_bounds_as_arc = env_flag_is_true(
+            }
+            Ok(None) => (Vec::new(), true),
+            Err(()) => {
+                // Environment values are bytes on Unix. Treat a non-UTF-8
+                // value as malformed rather than as an unset variable: the
+                // placement conflict gate must fail closed even when the
+                // accelerator list cannot be rendered in a warning.
+                warn!(
+                    "Invalid SOMMELIER_ACCELERATORS (value is not UTF-8). \
+                 Accelerator filtering disabled."
+                );
+                (Vec::new(), false)
+            }
+        };
+        let requested_window_bounds_as_arc = env_flag_is_true(
             std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
                 .ok()
                 .as_deref(),
         );
-        let window_placement_env =
-            std::env::var("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS").unwrap_or_default();
+        // ARC application IDs are the capability that makes the direct Aura
+        // bounds policy safe to attempt.  If the process cannot reserve a
+        // collision-free identity block, keep the entire workaround off
+        // rather than creating Aura objects that can never be authorized.
+        let arc_id_allocator = if requested_window_bounds_as_arc {
+            crate::arc_task_ids::process_allocator()
+        } else {
+            None
+        };
+        let window_bounds_as_arc = requested_window_bounds_as_arc && arc_id_allocator.is_some();
+        if requested_window_bounds_as_arc && !window_bounds_as_arc {
+            warn!(
+                "SOMMELIER_WINDOW_BOUNDS_AS_ARC is disabled because no collision-free ARC identity block could be reserved"
+            );
+        }
+        let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
+            Ok(Some(value)) => value,
+            Ok(None) => String::new(),
+            Err(()) => {
+                warn!(
+                    "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS (value is not UTF-8). \
+                 Window placement shortcuts disabled."
+                );
+                String::new()
+            }
+        };
         let window_placement_shortcuts = if !window_bounds_as_arc {
             if !window_placement_env.trim().is_empty() {
                 warn!(
@@ -1363,7 +1405,6 @@ impl Context {
                 }
             }
         };
-
         Self {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
@@ -1436,6 +1477,7 @@ impl Context {
             vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
             window_bounds_as_arc,
             arc_application_ids: HashMap::new(),
+            arc_id_allocator,
             arc_application_ids_applied: HashSet::new(),
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
@@ -1497,6 +1539,10 @@ impl Context {
         // Keep unit tests deterministic even when the developer's shell uses
         // the runtime-only ARC bounds workaround for an isolated proxy.
         ctx.window_bounds_as_arc = false;
+        ctx.arc_id_allocator = Some(crate::arc_task_ids::ArcIdAllocator::for_test(
+            crate::arc_task_ids::ARC_ID_POOL_START,
+            crate::arc_task_ids::ARC_ID_POOL_START + 1_000_000 - 1,
+        ));
         ctx
     }
 
@@ -1646,6 +1692,23 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
         .unwrap_or_else(|| "termina".to_string())
 }
 
+/// Read an environment value only when it is valid UTF-8.
+///
+/// Unix environment variables are arbitrary byte strings. Configuration
+/// parsers in this module operate on `&str`, so a non-UTF-8 value must be
+/// reported distinctly from an unset variable instead of silently becoming an
+/// empty (and potentially valid-looking) configuration.
+fn utf8_env(name: &str) -> Result<Option<String>, ()> {
+    decode_utf8_env(std::env::var_os(name))
+}
+
+fn decode_utf8_env(value: Option<std::ffi::OsString>) -> Result<Option<String>, ()> {
+    match value {
+        None => Ok(None),
+        Some(value) => value.into_string().map(Some).map_err(|_| ()),
+    }
+}
+
 /// Interpret an environment flag without treating mere presence as enabled.
 /// This keeps `VAR=0`, `VAR=false`, and an exported empty value disabled while
 /// accepting the conventional explicit true spellings.
@@ -1776,6 +1839,16 @@ mod tests {
         assert!(!env_flag_is_true(Some("")));
         assert!(!env_flag_is_true(Some("false")));
         assert!(!env_flag_is_true(Some("1please")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_values_are_not_treated_as_unset() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(vec![0xff, b'a']);
+        assert_eq!(decode_utf8_env(Some(value)), Err(()));
+        assert_eq!(decode_utf8_env(None), Ok(None));
     }
 
     #[test]

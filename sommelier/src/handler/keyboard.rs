@@ -375,6 +375,30 @@ impl KeyboardHandler {
         let (x, y, width, height) = output.work_area()?;
         let half_width = width / 2;
         let half_height = height / 2;
+        if matches!(
+            action,
+            WindowLayoutAction::TopLeft
+                | WindowLayoutAction::TopRight
+                | WindowLayoutAction::BottomLeft
+                | WindowLayoutAction::BottomRight
+                | WindowLayoutAction::Left
+                | WindowLayoutAction::Right
+        ) && half_width <= 0
+        {
+            return None;
+        }
+        if matches!(
+            action,
+            WindowLayoutAction::TopLeft
+                | WindowLayoutAction::Top
+                | WindowLayoutAction::TopRight
+                | WindowLayoutAction::BottomLeft
+                | WindowLayoutAction::Bottom
+                | WindowLayoutAction::BottomRight
+        ) && half_height <= 0
+        {
+            return None;
+        }
         match action {
             WindowLayoutAction::TopLeft => Some((x, y, half_width, half_height)),
             WindowLayoutAction::Top => Some((x, y, width, half_height)),
@@ -482,6 +506,9 @@ impl KeyboardHandler {
         // identity belongs to this placement batch and must roll back with
         // the state-reset and bounds requests if the barrier cannot be queued.
         let placement_queue_start = ctx.client_to_host_queue.len();
+        let arc_identity_was_applied = ctx
+            .arc_application_ids_applied
+            .contains(&guest_wl_surface_id);
         if !crate::handler::compositor::ensure_arc_application_id_on_surface(
             ctx,
             guest_wl_surface_id,
@@ -520,6 +547,13 @@ impl KeyboardHandler {
             // the state-reset requests in the host stream and make the next
             // shortcut observe a half-applied operation.
             Self::rollback_window_layout_batch(ctx, placement_queue_start);
+            if !arc_identity_was_applied {
+                // `ensure_arc_application_id_on_surface` marks the identity
+                // as applied when it queues the metadata request. If the
+                // placement batch is rolled back before reaching the host,
+                // allow the next attempt to queue that request again.
+                ctx.arc_application_ids_applied.remove(&guest_wl_surface_id);
+            }
             return false;
         }
         log::info!(
@@ -1716,6 +1750,22 @@ mod tests {
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
             None
+        );
+
+        let tiny_output = crate::state::OutputState {
+            mode_width: 1,
+            mode_height: 1,
+            scale: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopLeft, tiny_output),
+            None,
+            "split layouts must never emit zero-sized bounds"
+        );
+        assert_eq!(
+            KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, tiny_output),
+            Some((0, 0, 1, 1))
         );
     }
 

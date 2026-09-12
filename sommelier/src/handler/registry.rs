@@ -907,7 +907,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            let bound = queue_internal_bind(
                 ctx,
                 registry_host_id,
                 name,
@@ -915,6 +915,35 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
+            if bound && ctx.window_bounds_as_arc {
+                // A guest may bind an output before the host registry has
+                // delivered zaura_shell. Retry every already-live output now
+                // that the shell object and its version are available; the
+                // output bind path cannot do this retroactively on its own.
+                for output_host_id in ctx.output_host_ids.clone() {
+                    if !ctx.inactive_output_host_ids.contains(&output_host_id)
+                        && !ctx.shadow_table.is_pending_destroy_host(output_host_id)
+                    {
+                        let _ =
+                            crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
+                    }
+                }
+                // Apply the same retry to XDG roles created before the shell
+                // global arrived. Their guest-side associations are recorded
+                // after a successful get_toplevel dispatch, so a late shell
+                // can safely attach the missing Aura child here as well.
+                for xdg_toplevel_guest_id in ctx
+                    .xdg_toplevel_to_wl_surface
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+                {
+                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                        ctx,
+                        xdg_toplevel_guest_id,
+                    );
+                }
+            }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
             return Action::Drop;
@@ -1758,6 +1787,42 @@ mod tests {
         assert!(ctx.output_states.contains_key(&output_host));
         assert!(ctx.inactive_output_host_ids.contains(&output_host));
         assert!(ctx.primary_output().is_none());
+    }
+
+    #[test]
+    fn late_zaura_shell_binding_attaches_existing_outputs() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+        assert_eq!(
+            handler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20)),
+            Action::Drop
+        );
+        let output_host = *ctx
+            .output_host_global_bindings
+            .keys()
+            .next()
+            .expect("bound output");
+        assert!(
+            ctx.zaura_output_to_wl_output.is_empty(),
+            "Aura output must wait for the shell binding"
+        );
+
+        let shell = "zaura_shell".to_string();
+        assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
+        assert!(
+            ctx.zaura_output_to_wl_output
+                .values()
+                .any(|&output_id| output_id == output_host),
+            "late shell binding must attach every already-bound output"
+        );
     }
 
     #[test]
