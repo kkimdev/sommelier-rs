@@ -1460,27 +1460,69 @@ mod tests {
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
     use crate::wire::{Action, WireMessage};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
 
     fn message_opcode(message: &[u8]) -> u16 {
         u16::from_ne_bytes(message[4..6].try_into().unwrap())
     }
 
     fn pending_native_create(guest_params_id: u32, dimensions: (i32, i32)) -> PendingNativeCreate {
+        // A descriptor number from `/dev/null` can be reused by another
+        // parallel test after the owning generation is dropped. A per-test
+        // pipe read end gives the ownership assertions a descriptor that no
+        // unrelated test can accidentally keep open.
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+            0,
+            "create test synchronization pipe"
+        );
+        assert_eq!(unsafe { libc::close(pipe_fds[1]) }, 0);
         PendingNativeCreate {
             guest_params_id,
             dimensions,
-            sync_fds: vec![std::fs::File::open("/dev/null")
-                .expect("open test synchronization descriptor")
-                .into()],
+            // Safety: the read end was returned by `pipe` and is transferred
+            // into `File`, which owns it until the pending generation drops.
+            sync_fds: vec![unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) }.into()],
         }
     }
 
-    fn fd_is_open(fd: i32) -> bool {
-        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TestFdIdentity {
+        device: libc::dev_t,
+        inode: libc::ino_t,
     }
 
-    fn orphan_old_params_and_reuse_guest_id() -> (Context, LinuxDmabufHandler, i32) {
+    fn fd_identity(fd: i32) -> TestFdIdentity {
+        let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(
+            unsafe { libc::fstat(fd, &mut metadata) },
+            0,
+            "stat test synchronization descriptor"
+        );
+        TestFdIdentity {
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        }
+    }
+
+    fn any_fd_has_identity(identity: TestFdIdentity) -> bool {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read process descriptor directory")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter_map(|fd| {
+                let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+                (unsafe { libc::fstat(fd, &mut metadata) } == 0).then_some(TestFdIdentity {
+                    device: metadata.st_dev,
+                    inode: metadata.st_ino,
+                })
+            })
+            .any(|current| current == identity)
+    }
+
+    fn orphan_old_params_and_reuse_guest_id() -> (Context, LinuxDmabufHandler, i32, TestFdIdentity)
+    {
         let guest_params_id = 7;
         let old_host_params_id = 8;
         let replacement_host_params_id = 9;
@@ -1495,6 +1537,7 @@ mod tests {
 
         let old_pending = pending_native_create(guest_params_id, (16, 8));
         let old_sync_fd = old_pending.sync_fds[0].as_raw_fd();
+        let old_sync_identity = fd_identity(old_sync_fd);
         ctx.pending_native_creates
             .insert(HostId(old_host_params_id), old_pending);
 
@@ -1505,7 +1548,7 @@ mod tests {
             Action::Forward
         );
         assert!(
-            !fd_is_open(old_sync_fd),
+            !any_fd_has_identity(old_sync_identity),
             "destroying old params must close that generation's synchronization descriptor"
         );
         ctx.shadow_table.mark_pending_destroy(guest_params_id);
@@ -1529,10 +1572,11 @@ mod tests {
             .set_host_version(replacement_host_params_id, 4);
         let replacement = pending_native_create(guest_params_id, (32, 16));
         let replacement_sync_fd = replacement.sync_fds[0].as_raw_fd();
+        let replacement_sync_identity = fd_identity(replacement_sync_fd);
         ctx.pending_native_creates
             .insert(HostId(replacement_host_params_id), replacement);
 
-        (ctx, handler, replacement_sync_fd)
+        (ctx, handler, replacement_sync_fd, replacement_sync_identity)
     }
 
     #[test]
@@ -2555,7 +2599,8 @@ mod tests {
         let old_host_params_id = 8;
         let replacement_host_params_id = 9;
         let old_host_buffer_id: u32 = 42;
-        let (mut ctx, mut handler, replacement_sync_fd) = orphan_old_params_and_reuse_guest_id();
+        let (mut ctx, mut handler, replacement_sync_fd, replacement_sync_identity) =
+            orphan_old_params_and_reuse_guest_id();
 
         ctx.last_sender_id = old_host_params_id;
         let payload = old_host_buffer_id.to_ne_bytes();
@@ -2578,7 +2623,7 @@ mod tests {
         assert_eq!(replacement.dimensions, (32, 16));
         assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
         assert!(
-            fd_is_open(replacement_sync_fd),
+            any_fd_has_identity(replacement_sync_identity),
             "late old created must not close the replacement synchronization descriptor"
         );
         assert!(ctx
@@ -2587,7 +2632,7 @@ mod tests {
 
         drop(ctx);
         assert!(
-            !fd_is_open(replacement_sync_fd),
+            !any_fd_has_identity(replacement_sync_identity),
             "dropping the owning replacement generation must close its descriptor"
         );
     }
@@ -2596,7 +2641,8 @@ mod tests {
     fn late_orphan_failed_cannot_consume_reused_guest_generation() {
         let old_host_params_id = 8;
         let replacement_host_params_id = 9;
-        let (mut ctx, mut handler, replacement_sync_fd) = orphan_old_params_and_reuse_guest_id();
+        let (mut ctx, mut handler, replacement_sync_fd, replacement_sync_identity) =
+            orphan_old_params_and_reuse_guest_id();
 
         ctx.last_sender_id = old_host_params_id;
         let mut message = WireMessage::new(
@@ -2618,13 +2664,13 @@ mod tests {
         assert_eq!(replacement.dimensions, (32, 16));
         assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
         assert!(
-            fd_is_open(replacement_sync_fd),
+            any_fd_has_identity(replacement_sync_identity),
             "late old failed must not close the replacement synchronization descriptor"
         );
 
         drop(ctx);
         assert!(
-            !fd_is_open(replacement_sync_fd),
+            !any_fd_has_identity(replacement_sync_identity),
             "dropping the owning replacement generation must close its descriptor"
         );
     }
@@ -2848,9 +2894,11 @@ mod tests {
             },
             rewritten.len() as isize
         );
-        let words: Vec<u32> = rewritten
-            .chunks_exact(4)
-            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+        let (chunks, remainder) = rewritten.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let words: Vec<u32> = chunks
+            .iter()
+            .map(|chunk| u32::from_ne_bytes(*chunk))
             .collect();
         assert_eq!(words, entries);
         assert_eq!(ctx.feedback_index_maps[&10].get(&0), Some(&0));
