@@ -3,8 +3,9 @@ name: Virtwl CI
 on:
   push:
     branches: ["virtwl"]
+  # Stacked PRs use their immediate parent branch as the base. Run the same
+  # validation for those branches instead of leaving the child PR unchecked.
   pull_request:
-    branches: ["virtwl"]
 
 permissions:
   contents: read
