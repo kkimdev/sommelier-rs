@@ -61,6 +61,7 @@ mod protocols {
     ));
     include!(concat!(env!("OUT_DIR"), "/gtk_shell_protocol.rs"));
     include!(concat!(env!("OUT_DIR"), "/aura_shell_protocol.rs"));
+    include!(concat!(env!("OUT_DIR"), "/protocol_routing.rs"));
 }
 
 #[derive(Parser, Debug)]

@@ -173,4 +173,22 @@ mod tests {
             "typed object arguments must accept synthetic local-only objects for local handlers"
         );
     }
+
+    #[test]
+    fn test_generate_routing() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocols = ["wayland.xml", "xdg-shell.xml"]
+            .iter()
+            .map(|file| parse(manifest_dir.join("../third_party/protocols").join(file)))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to parse routing protocol fixtures");
+
+        let code = generator::generate_routing(&protocols);
+        assert!(code.contains("enum ProtocolFamily"));
+        assert!(code.contains("Wayland"));
+        assert!(code.contains("XdgShell"));
+        assert!(code.contains("wl_surface"));
+        assert!(code.contains("fn classify_interface"));
+        assert!(code.contains("fn consume_event"));
+    }
 }

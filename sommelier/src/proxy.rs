@@ -310,38 +310,16 @@ impl Client {
         interface: &str,
         msg: &mut WireMessage,
     ) -> DispatchResult {
-        if protocols::wayland::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::wayland::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::xdg_shell::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_shell::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::linux_dmabuf_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::linux_dmabuf_v1::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::viewporter::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::viewporter::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::text_input_unstable_v3::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v3::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::text_input_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v1::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::text_input_extension_unstable_v1::ALLOWED_INTERFACES
-            .contains(&interface)
-        {
-            protocols::text_input_extension_unstable_v1::dispatch_request(
-                interface, msg, handler, ctx,
-            )
-        } else if protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_decoration_unstable_v1::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::fractional_scale_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::fractional_scale_v1::dispatch_request(interface, msg, handler, ctx)
-        } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
-        {
-            protocols::keyboard_extension_unstable_v1::dispatch_request(
-                interface, msg, handler, ctx,
-            )
-        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::gtk::dispatch_request(interface, msg, handler, ctx)
-        } else {
-            Ok(None)
+        let Some(family) = protocols::classify_interface(interface) else {
+            return Ok(None);
+        };
+
+        // Aura objects are bound internally and have no guest request path.
+        if family == protocols::ProtocolFamily::AuraShell {
+            return Ok(None);
         }
+
+        protocols::dispatch_request(family, interface, msg, handler, ctx)
     }
 
     fn dispatch_event(
@@ -350,34 +328,11 @@ impl Client {
         interface: &str,
         msg: &mut WireMessage,
     ) -> DispatchResult {
-        if protocols::wayland::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::wayland::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::xdg_shell::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_shell::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::linux_dmabuf_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::linux_dmabuf_v1::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::viewporter::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::viewporter::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::text_input_unstable_v3::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v3::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::text_input_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v1::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::text_input_extension_unstable_v1::ALLOWED_INTERFACES
-            .contains(&interface)
-        {
-            protocols::text_input_extension_unstable_v1::dispatch_event(
-                interface, msg, handler, ctx,
-            )
-        } else if protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_decoration_unstable_v1::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::fractional_scale_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::fractional_scale_v1::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
-        {
-            protocols::keyboard_extension_unstable_v1::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::gtk::dispatch_event(interface, msg, handler, ctx)
-        } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
+        let Some(family) = protocols::classify_interface(interface) else {
+            return Ok(None);
+        };
+
+        if family == protocols::ProtocolFamily::AuraShell {
             // Silently drop events for internally-bound aura_shell objects.
             // We only use these interfaces to send requests (set_application_id
             // via zaura_surface), never to receive events. Consume the
@@ -386,49 +341,24 @@ impl Client {
             // tear down the client connection even though it is intentionally
             // hidden from the guest.
             msg.offset = msg.payload.len();
-            Ok(None)
-        } else {
-            Ok(None)
+            return Ok(None);
         }
+
+        protocols::dispatch_event(family, interface, msg, handler, ctx)
     }
 
     fn consume_event(interface: &str, msg: &mut WireMessage) -> Result<(), ProtocolError> {
-        if protocols::wayland::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::wayland::consume_event(interface, msg)
-        } else if protocols::xdg_shell::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_shell::consume_event(interface, msg)
-        } else if protocols::linux_dmabuf_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::linux_dmabuf_v1::consume_event(interface, msg)
-        } else if protocols::viewporter::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::viewporter::consume_event(interface, msg)
-        } else if protocols::text_input_unstable_v3::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v3::consume_event(interface, msg)
-        } else if protocols::text_input_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::text_input_unstable_v1::consume_event(interface, msg)
-        } else if protocols::text_input_extension_unstable_v1::ALLOWED_INTERFACES
-            .contains(&interface)
-        {
-            protocols::text_input_extension_unstable_v1::consume_event(interface, msg)
-        } else if protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::xdg_decoration_unstable_v1::consume_event(interface, msg)
-        } else if protocols::fractional_scale_v1::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::fractional_scale_v1::consume_event(interface, msg)
-        } else if protocols::keyboard_extension_unstable_v1::ALLOWED_INTERFACES.contains(&interface)
-        {
-            protocols::keyboard_extension_unstable_v1::consume_event(interface, msg)
-        } else if protocols::gtk::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::gtk::consume_event(interface, msg)
-        } else if protocols::aura_shell::ALLOWED_INTERFACES.contains(&interface) {
-            protocols::aura_shell::consume_event(interface, msg)
-        } else {
+        let Some(family) = protocols::classify_interface(interface) else {
             log::error!(
                 "Cannot consume event for unsupported interface {} (id={}, opcode={})",
                 interface,
                 msg.sender_id,
                 msg.opcode
             );
-            Err(ProtocolError::InvalidObjectId(msg.sender_id))
-        }
+            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
+        };
+
+        protocols::consume_event(family, interface, msg)
     }
 
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
@@ -764,6 +694,27 @@ mod tests {
     use crate::wire::MessageBuilder;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn generated_classifier_routes_each_protocol_family() {
+        assert_eq!(
+            protocols::classify_interface("wl_surface"),
+            Some(protocols::ProtocolFamily::Wayland)
+        );
+        assert_eq!(
+            protocols::classify_interface("xdg_toplevel"),
+            Some(protocols::ProtocolFamily::XdgShell)
+        );
+        assert_eq!(
+            protocols::classify_interface("gtk_shell1"),
+            Some(protocols::ProtocolFamily::Gtk)
+        );
+        assert_eq!(
+            protocols::classify_interface("zaura_toplevel"),
+            Some(protocols::ProtocolFamily::AuraShell)
+        );
+        assert_eq!(protocols::classify_interface("unknown_interface"), None);
+    }
 
     #[tokio::test]
     async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
