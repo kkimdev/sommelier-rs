@@ -369,6 +369,12 @@ mod tests {
         assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
         let application_id = nullable_string(message).expect("ARC application identity");
         assert!(application_id.starts_with(crate::handler::compositor::ARC_APPLICATION_ID_PREFIX));
+        assert!(!application_id.starts_with("org.chromium.arc.session."));
+        assert!(application_id
+            .strip_prefix(crate::handler::compositor::ARC_APPLICATION_ID_PREFIX)
+            .unwrap()
+            .parse::<u32>()
+            .is_ok());
         assert_eq!(
             Some(application_id.as_str()),
             ctx.arc_application_ids

@@ -26,6 +26,7 @@ use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
 use crate::protocols::aura_shell::zaura_toplevel::REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_display::REQ_SYNC;
+use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
@@ -41,7 +42,6 @@ use crate::state::{
 use crate::wire::Action;
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub struct CompositorHandler;
@@ -249,7 +249,20 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
     }
 
     fn on_release(&mut self, ctx: &mut Context) -> Action {
-        let host_output_id = ctx.last_sender_id;
+        // This is a client→host request, so `last_sender_id` is the guest
+        // wl_output ID. Translate it before touching host-side output state or
+        // queueing the destructor. Keeping the direction explicit avoids
+        // retiring an unrelated host object when the two namespaces differ.
+        let guest_output_id = ctx.last_sender_id;
+        let Some(host_output_id) = ctx.shadow_table.get_host_id(guest_output_id) else {
+            queue_protocol_error(
+                ctx,
+                guest_output_id,
+                0,
+                "wl_output.release has no host object mapping",
+            );
+            return Action::Drop;
+        };
         ctx.remove_output_state(host_output_id);
         if let Some(zaura_output_host_id) = ctx
             .zaura_output_to_wl_output
@@ -271,10 +284,15 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
                 ctx.shadow_table.retire_host_interface(zaura_output_host_id);
             }
         }
-        if let Some(guest_output_id) = ctx.shadow_table.get_guest_id(host_output_id) {
-            ctx.shadow_table.mark_pending_destroy(guest_output_id);
-        }
-        Action::Forward
+        // `zaura_output` is an internal child of the wl_output and must be
+        // released first. Returning Forward here would put the original
+        // wl_output.release ahead of the queued Aura release in proxy.rs.
+        // Queue the translated wl_output destructor explicitly instead.
+        ctx.shadow_table.mark_pending_destroy(guest_output_id);
+        let release_message =
+            crate::wire::MessageBuilder::new().build_message(host_output_id, REQ_RELEASE_WL_OUTPUT);
+        ctx.client_to_host_queue.push((release_message, Vec::new()));
+        Action::Drop
     }
 }
 
@@ -296,11 +314,25 @@ impl ZauraOutputHandler for CompositorHandler {
         {
             return Action::Drop;
         }
+        if top < 0 || left < 0 || bottom < 0 || right < 0 {
+            // Negative work-area insets are malformed. Clamping them to zero
+            // would silently expand the usable area beyond the compositor's
+            // advertised output and could place windows outside the work area.
+            log::warn!(
+                "Ignoring invalid negative zaura_output.insets for host output {}: ({}, {}, {}, {})",
+                wl_output_id,
+                top,
+                left,
+                bottom,
+                right
+            );
+            return Action::Drop;
+        }
         let output = ctx.pending_output_state(wl_output_id);
-        output.insets_top = top.max(0);
-        output.insets_left = left.max(0);
-        output.insets_bottom = bottom.max(0);
-        output.insets_right = right.max(0);
+        output.insets_top = top;
+        output.insets_left = left;
+        output.insets_bottom = bottom;
+        output.insets_right = right;
         if !ctx.output_uses_done(wl_output_id) {
             ctx.commit_output_state(wl_output_id);
         }
@@ -400,27 +432,12 @@ fn map_surface_damage(rect: DamageRect) -> DamageRect {
 }
 
 /// Namespace used by the opt-in bounds-policy workaround. ChromeOS's Exo
-/// security delegate recognizes the ARC session spelling and allows Aura
+/// security delegate recognizes the ARC task-form identity and allows Aura
 /// bounds requests for it. The suffix is generated per surface; sharing one
-/// fabricated ID across every window would merge their task/restore identity.
-pub(crate) const ARC_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.session.";
-
-// Keep generated values positive and below INT32_MAX while separating IDs
-// across simultaneous Context instances. The process-wide serial avoids an
-// immediate collision when two proxy connections create a surface with the
-// same local Wayland object ID.
-const ARC_SESSION_ID_BASE: u32 = 1_000_000_000;
-const ARC_SESSION_ID_PID_MASK: u32 = (1 << 14) - 1;
-const ARC_SESSION_ID_SERIAL_MASK: u32 = (1 << 14) - 1;
-const ARC_SESSION_ID_SERIAL_SLOT_COUNT: u32 = ARC_SESSION_ID_SERIAL_MASK + 1;
-static NEXT_ARC_SESSION_ID_SERIAL: AtomicU32 = AtomicU32::new(0);
-
-fn next_arc_session_id() -> u32 {
-    let pid_component = std::process::id() & ARC_SESSION_ID_PID_MASK;
-    let serial =
-        NEXT_ARC_SESSION_ID_SERIAL.fetch_add(1, Ordering::Relaxed) & ARC_SESSION_ID_SERIAL_MASK;
-    ARC_SESSION_ID_BASE + 1 + pid_component * ARC_SESSION_ID_SERIAL_SLOT_COUNT + serial
-}
+/// fabricated ID across every window would merge their task identity. The
+/// `.session.*` namespace is reserved for restore/ghost sessions and must not
+/// be fabricated by the proxy.
+pub(crate) const ARC_APPLICATION_ID_PREFIX: &str = "org.chromium.arc.";
 
 /// Return the stable policy identity for one guest surface, allocating it on
 /// first use. The identity is intentionally scoped to the surface rather than
@@ -432,12 +449,15 @@ pub(crate) fn ensure_arc_application_id(
     if !ctx.window_bounds_as_arc {
         return None;
     }
-    Some(
-        ctx.arc_application_ids
-            .entry(wl_surface_guest_id)
-            .or_insert_with(|| format!("{}{}", ARC_APPLICATION_ID_PREFIX, next_arc_session_id()))
-            .clone(),
-    )
+    let allocator = ctx.arc_id_allocator.as_ref()?;
+    if let Some(application_id) = ctx.arc_application_ids.get(&wl_surface_guest_id) {
+        return Some(application_id.clone());
+    }
+    let id = allocator.allocate().ok()?;
+    let application_id = format!("{}{}", ARC_APPLICATION_ID_PREFIX, id);
+    ctx.arc_application_ids
+        .insert(wl_surface_guest_id, application_id.clone());
+    Some(application_id)
 }
 
 /// Queue the ARC policy identity for a host Aura surface exactly once.
@@ -632,6 +652,26 @@ pub(crate) fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u3
     ctx.xdg_toplevel_to_zaura_toplevel
         .insert(xdg_toplevel_guest_id, zaura_toplevel_host_id);
     Some(zaura_toplevel_host_id)
+}
+
+/// Commit the guest-side XDG role association after the generated dispatcher
+/// has accepted and mapped `get_toplevel`. Keeping this after dispatch avoids
+/// stale application/surface state when validation rejects the request.
+pub(crate) fn record_xdg_toplevel(
+    ctx: &mut Context,
+    xdg_surface_guest_id: u32,
+    xdg_toplevel_guest_id: u32,
+) -> Option<u32> {
+    let wl_surface_guest_id = ctx
+        .xdg_surface_to_wl_surface
+        .get(&xdg_surface_guest_id)
+        .copied()?;
+    ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
+    ctx.xdg_surface_to_xdg_toplevel
+        .insert(xdg_surface_guest_id, xdg_toplevel_guest_id);
+    ctx.xdg_toplevel_to_wl_surface
+        .insert(xdg_toplevel_guest_id, wl_surface_guest_id);
+    Some(wl_surface_guest_id)
 }
 
 pub(crate) fn release_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
@@ -1268,9 +1308,18 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_enter(&mut self, ctx: &mut Context, output: u32) -> Action {
         let host_surface_id = ctx.last_sender_id;
         if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
-            || ctx.inactive_output_host_ids.contains(&output)
             || ctx.shadow_table.is_pending_destroy_host(output)
         {
+            // The guest has already destroyed one of the objects named by
+            // this event.  Forwarding a late enter would make the client
+            // observe an event for a dead wl_surface/wl_output and can turn a
+            // normal destroy race into a protocol error.
+            return Action::Drop;
+        }
+        if ctx.inactive_output_host_ids.contains(&output) {
+            // A removed global may still have a live bound wl_output object;
+            // its lifecycle events remain valid for the guest, but the
+            // association must not steer compositor-owned placement.
             return Action::Forward;
         }
         ctx.surface_entered_output(host_surface_id, output);
@@ -1280,6 +1329,14 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_leave(&mut self, ctx: &mut Context, output: u32) -> Action {
         let host_surface_id = ctx.last_sender_id;
         ctx.surface_left_output(host_surface_id, output);
+        if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
+            || ctx.shadow_table.is_pending_destroy_host(output)
+        {
+            // See on_enter: consume the state transition locally, but do not
+            // expose a late event to a guest object that has already been
+            // destroyed (or released its output).
+            return Action::Drop;
+        }
         Action::Forward
     }
 
@@ -1765,19 +1822,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         Action::Forward
     }
 
-    fn on_get_toplevel(&mut self, ctx: &mut Context, id: u32) -> Action {
-        let xdg_surface_id = ctx.last_sender_id;
-        if let Some(&wl_surface_id) = ctx.xdg_surface_to_wl_surface.get(&xdg_surface_id) {
-            ctx.xdg_surface_to_xdg_toplevel.insert(xdg_surface_id, id);
-            ctx.xdg_toplevel_to_wl_surface.insert(id, wl_surface_id);
-            // The generated dispatcher installs the guest→host mapping after
-            // this callback, so the proxy retries Aura-child creation after
-            // dispatch for the normal path.
-            if ctx.window_bounds_as_arc {
-                let _ = ensure_arc_application_id(ctx, wl_surface_id);
-                let _ = ensure_zaura_toplevel(ctx, id);
-            }
-        }
+    fn on_get_toplevel(&mut self, _ctx: &mut Context, _id: u32) -> Action {
         Action::Forward
     }
 }
@@ -2155,6 +2200,26 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(ARC_APPLICATION_ID_PREFIX));
         assert!(second.starts_with(ARC_APPLICATION_ID_PREFIX));
+        for identity in [&first, &second] {
+            assert!(!identity.starts_with("org.chromium.arc.session."));
+            let id = identity
+                .strip_prefix(ARC_APPLICATION_ID_PREFIX)
+                .expect("task-form ARC prefix")
+                .parse::<u32>()
+                .expect("numeric ARC task ID");
+            assert!((crate::arc_task_ids::ARC_ID_POOL_START
+                ..=crate::arc_task_ids::ARC_ID_POOL_END)
+                .contains(&id));
+        }
+    }
+
+    #[test]
+    fn arc_policy_identity_fails_closed_without_allocator() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        ctx.arc_id_allocator = None;
+        assert!(ensure_arc_application_id(&mut ctx, 10).is_none());
+        assert!(ctx.arc_application_ids.is_empty());
     }
 
     #[test]
@@ -2242,6 +2307,41 @@ mod tests {
             ctx.output_states[&output_host].work_area(),
             Some((1928, 40, 1896, 1008))
         );
+    }
+
+    #[test]
+    fn negative_aura_insets_are_rejected_without_mutating_output_state() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                insets_top: 1,
+                insets_left: 2,
+                insets_bottom: 3,
+                insets_right: 4,
+                ..Default::default()
+            },
+        );
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        ctx.shadow_table.track_host_interface_with_version(
+            aura_output_host,
+            "zaura_output".into(),
+            38,
+        );
+        ctx.last_sender_id = aura_output_host;
+
+        assert_eq!(
+            ZauraOutputHandler::on_insets(&mut CompositorHandler, &mut ctx, -1, 2, 3, 4),
+            Action::Drop
+        );
+        assert_eq!(ctx.output_states[&output_host].insets_top, 1);
+        assert_eq!(ctx.output_states[&output_host].insets_left, 2);
+        assert_eq!(ctx.output_states[&output_host].insets_bottom, 3);
+        assert_eq!(ctx.output_states[&output_host].insets_right, 4);
+        assert!(ctx.pending_output_states.is_empty());
     }
 
     #[test]
@@ -2337,6 +2437,44 @@ mod tests {
     }
 
     #[test]
+    fn surface_output_events_drop_after_surface_or_output_release() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut handler = CompositorHandler;
+        let surface_guest = 100;
+        let surface_host = 200;
+        let output_guest = 10;
+        let output_host = 20;
+        ctx.shadow_table.map_id(surface_guest, surface_host);
+        ctx.shadow_table.map_id(output_guest, output_host);
+        ctx.output_host_ids.push(output_host);
+
+        ctx.last_sender_id = surface_host;
+        ctx.shadow_table.mark_pending_destroy(surface_guest);
+        assert_eq!(
+            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, output_host),
+            Action::Drop
+        );
+        assert_eq!(
+            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, output_host),
+            Action::Drop
+        );
+
+        // A released output remains mapped until the host's delete_id, so a
+        // late surface event must still be consumed without being forwarded
+        // as an event naming a dead guest wl_output.
+        ctx.shadow_table.clear_pending_destroy_guest(surface_guest);
+        ctx.shadow_table.mark_pending_destroy(output_guest);
+        assert_eq!(
+            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, output_host),
+            Action::Drop
+        );
+        assert_eq!(
+            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, output_host),
+            Action::Drop
+        );
+    }
+
+    #[test]
     fn releasing_output_removes_it_from_placement_selection() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_guest = 10;
@@ -2363,10 +2501,23 @@ mod tests {
         ctx.zaura_output_to_wl_output
             .insert(aura_output_host, output_host);
         let mut handler = CompositorHandler;
-        ctx.last_sender_id = output_host;
+        // wl_output.release is a client request, so the sender is the guest
+        // object ID even though the queued destructor targets the host ID.
+        ctx.last_sender_id = output_guest;
         assert_eq!(
             WlOutputHandler::on_release(&mut handler, &mut ctx),
-            Action::Forward
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue[0].0), aura_output_host);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue[0].0),
+            REQ_RELEASE_AURA_OUTPUT
+        );
+        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), output_host);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue[1].0),
+            REQ_RELEASE_WL_OUTPUT
         );
         assert!(ctx.primary_output().is_none());
         assert!(!ctx.output_states.contains_key(&output_host));
@@ -2377,6 +2528,20 @@ mod tests {
         assert!(ctx
             .shadow_table
             .is_pending_destroy_host_only(aura_output_host));
+    }
+
+    #[test]
+    fn releasing_unmapped_output_reports_a_protocol_error() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 10;
+
+        assert_eq!(
+            WlOutputHandler::on_release(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(protocol_error_code(&ctx), 0);
     }
 
     #[test]
@@ -2947,6 +3112,12 @@ mod tests {
         let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
         let aura_app_id = std::str::from_utf8(&payload[4..4 + str_len - 1]).unwrap();
         assert!(aura_app_id.starts_with(ARC_APPLICATION_ID_PREFIX));
+        assert!(!aura_app_id.starts_with("org.chromium.arc.session."));
+        assert!(aura_app_id
+            .strip_prefix(ARC_APPLICATION_ID_PREFIX)
+            .unwrap()
+            .parse::<u32>()
+            .is_ok());
         assert_eq!(
             Some(aura_app_id),
             ctx.arc_application_ids.get(&100).map(String::as_str)

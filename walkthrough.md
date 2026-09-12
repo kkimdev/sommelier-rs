@@ -606,8 +606,9 @@ client sends `gtk_surface1.set_dbus_properties`. That request can arrive after
 Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
 returned to its old `800x600` geometry. The GTK and XDG paths share the generated
 identity, while the host XDG role keeps its native guest namespace. The workaround
-and its compositor-owned shortcuts are disabled unless the ARC policy and explicit
-shortcut configuration are both set.
+and its compositor-owned shortcuts are disabled unless the ARC policy is enabled;
+the explicit shortcut configuration remains empty by default, so no chord is
+consumed until a deployment opts into one.
 
 Alt+A and Alt+D now use the same direct
 `unset fullscreen/maximized/snap → zaura_toplevel.set_window_bounds → sync`
@@ -623,7 +624,29 @@ Verification:
   `target/release/sommelier`.
 - The isolated release proxy was restarted on
   `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records distinct
-  per-surface ARC session identities for GTK and Ghostty while their host XDG
-  roles retain the native guest namespace.
+  per-surface ARC task-form policy identities for GTK and Ghostty while their
+  host XDG roles retain the native guest namespace.
 - A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
   as flaky; each passed alone and in the serialized full suite.
+
+## 2026-09-12 — PR #9 review hardening
+
+The review pass now allocates ARC task-form identities from a process-shared,
+file-locked block. The allocator validates private runtime directories, keeps a
+stable generation guard across lock-directory replacement, and opens range locks
+relative to the validated directory descriptor. If the allocator cannot reserve
+an unambiguous block, the ARC bounds policy fails closed. The `.session.*`
+restore namespace is never fabricated.
+
+Late `zaura_shell` binding now repairs already-bound outputs and XDG toplevels,
+and XDG role metadata is recorded only after a valid `get_toplevel` dispatch.
+`wl_output.release`, negative Aura insets, and delayed output/surface events are
+also covered by lifecycle regressions.
+
+Verification from the final review snapshot:
+
+- Nix source derivation: release build and `cargo test -p sommelier --all-targets`
+  passed 572 tests, with 1 live-device test ignored.
+- Nix development shell: workspace check and strict Clippy passed; formatting
+  and `git diff --check` are clean.
+- Host-level Aura/Wayland compositor validation remains intentionally unrun.
