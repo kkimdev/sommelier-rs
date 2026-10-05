@@ -3420,6 +3420,36 @@ mod tests {
     }
 
     #[test]
+    fn created_surface_keeps_separate_guest_and_host_versions() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_compositor".to_string(), 4);
+        ctx.shadow_table.set_host_version(20, 3);
+        let mut handler = SommelierHandler::new();
+        let payload = 30u32.to_ne_bytes();
+        let mut msg = WireMessage::new(
+            10,
+            protocols::wayland::wl_compositor::REQ_CREATE_SURFACE,
+            &payload,
+            &[],
+        );
+        let (forwarded, fds) =
+            protocols::wayland::dispatch_request("wl_compositor", &mut msg, &mut handler, &mut ctx)
+                .expect("create_surface dispatch")
+                .expect("create_surface forwarded");
+        assert!(fds.is_empty());
+        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 20);
+        let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
+        assert_eq!(
+            u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
+            host_surface
+        );
+        assert_eq!(ctx.shadow_table.guest_object_version(30), Some(4));
+        assert_eq!(ctx.shadow_table.host_object_version(host_surface), Some(3));
+    }
+
+    #[test]
     fn request_since_guard_rejects_a_newer_opcode_for_an_old_guest_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table.map_id(10, 20);

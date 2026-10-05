@@ -44,6 +44,8 @@ const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 3;
 const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
 const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const WL_COMPOSITOR_VERSION: u32 = 4;
+// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
+const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
 
@@ -57,10 +59,13 @@ const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
 /// those ceilings so clients do not start using requests/events that this
 /// proxy merely forwards without the required coordinate/focus handling.
 fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
+    if interface == "wl_compositor" && host_version >= WL_COMPOSITOR_HOST_VERSION {
+        return WL_COMPOSITOR_VERSION;
+    }
     let cap = match interface {
         // ChromiumOS implements wl_surface.damage_buffer in terms of the
-        // legacy damage request and therefore exposes compositor v4 when the
-        // host supports it. It does not expose v5/v6 surface semantics.
+        // legacy damage request. Hosts below v3 retain their original version;
+        // the proxy does not expose v5/v6 surface semantics.
         "wl_compositor" => WL_COMPOSITOR_VERSION,
         "wl_output" => 3,
         "wl_seat" => 5,
@@ -1164,6 +1169,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // request an unsupported host version.
         let host_version = if interface == "zwp_linux_dmabuf_v1" {
             (*version).min(LINUX_DMABUF_CAPABILITY_VERSION)
+        } else if interface == "wl_compositor" {
+            // Every guest v4 request missing from host v3 is handled locally.
+            (*version).min(WL_COMPOSITOR_HOST_VERSION)
         } else {
             *version
         };
@@ -1180,11 +1188,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
-        let bind_version = if interface == "zwp_linux_dmabuf_v1" {
-            host_version
-        } else {
-            *version
-        };
+        let bind_version = host_version;
         if !queue_internal_bind(
             ctx,
             registry_host_id,
@@ -2388,6 +2392,58 @@ mod tests {
         let bind = (seat, 4, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
+    }
+
+    #[test]
+    fn compositor_guest_version_and_host_bind_are_negotiated_separately() {
+        for (host_version, guest_version) in [(1, 1), (2, 2), (3, 4), (4, 4), (6, 4)] {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            ctx.last_sender_id = 1;
+            ctx.shadow_table.map_id(1, 1);
+            ctx.shadow_table
+                .track_interface(1, "wl_registry".to_string());
+            let mut handler = RegistryHandler;
+            let compositor = "wl_compositor".to_string();
+            let action = handler.on_global(&mut ctx, 7, &compositor, host_version);
+            if guest_version == host_version {
+                assert_eq!(action, Action::Forward);
+            } else {
+                assert_eq!(action, Action::Drop);
+                let (global, _) = ctx.host_to_client_queue.pop().expect("guest global");
+                let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..], &[]);
+                assert_eq!(wire.read_u32().unwrap(), 7);
+                assert_eq!(wire.read_string().unwrap(), compositor);
+                assert_eq!(wire.read_u32().unwrap(), guest_version);
+            }
+
+            let bind = (compositor.clone(), guest_version, 20);
+            assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
+            assert!(!ctx.fatal_protocol_error);
+            let host_id = ctx
+                .shadow_table
+                .get_host_id(20)
+                .expect("paired host object");
+            assert_eq!(
+                ctx.shadow_table.guest_object_version(20),
+                Some(guest_version)
+            );
+            assert_eq!(
+                ctx.shadow_table.host_object_version(host_id),
+                Some(guest_version.min(3))
+            );
+            let (bind, _) = ctx.client_to_host_queue.pop().expect("host bind");
+            let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..], &[]);
+            assert_eq!(wire.read_u32().unwrap(), 7);
+            assert_eq!(wire.read_string().unwrap(), compositor);
+            assert_eq!(wire.read_u32().unwrap(), guest_version.min(3));
+            assert_eq!(wire.read_u32().unwrap(), host_id);
+
+            let invalid_bind = (compositor, guest_version + 1, 21);
+            assert_eq!(handler.on_bind(&mut ctx, 7, &invalid_bind), Action::Drop);
+            assert!(ctx.fatal_protocol_error);
+            assert_eq!(ctx.shadow_table.get_host_id(21), None);
+            assert!(ctx.client_to_host_queue.is_empty());
+        }
     }
 
     #[test]
