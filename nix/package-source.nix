@@ -9,7 +9,7 @@
 
 rustPlatform.buildRustPackage {
   pname = "sommelier-rs";
-  version = "0.2.5";
+  version = "0.2.6";
 
   inherit src;
 

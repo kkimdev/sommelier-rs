@@ -457,6 +457,11 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                             .shadow_table
                                             .guest_object_version(msg.sender_id)
                                             .unwrap_or(u32::MAX);
+                                        let host_object_version = ctx
+                                            .shadow_table
+                                            .get_host_id(msg.sender_id)
+                                            .and_then(|parent| ctx.shadow_table.host_object_version(parent))
+                                            .unwrap_or(object_version);
                                         let host_id = ctx.shadow_table.allocate_host_id();
                                         ctx.shadow_table.map_id(#name, host_id);
                                         ctx.shadow_table.track_interface_with_version(
@@ -464,7 +469,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                             #interface_name.to_string(),
                                             object_version,
                                         );
-                                        ctx.shadow_table.set_host_version(host_id, object_version);
+                                        ctx.shadow_table.set_host_version(host_id, host_object_version);
                                         builder.write_u32(host_id);
                                     });
                                 } else {
