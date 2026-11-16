@@ -66,6 +66,11 @@ const _: () = assert!(
     crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID_SINCE
         <= ZAURA_SHELL_MIN_VERSION
 );
+/// The newest `zaura_shell` this proxy binds: the interface version of the
+/// vendored `third_party/protocols/aura-shell.xml`. The generated code knows
+/// no request or event added after it, so binding a newer host shell would
+/// let Exo send Aura events whose unknown opcodes end the client's session.
+const ZAURA_SHELL_MAX_VERSION: u32 = 38;
 
 /// Version ceilings used by ChromiumOS Sommelier's client-facing globals.
 ///
@@ -926,7 +931,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // at the guest boundary with gtk_shell1, using the same numeric
             // registry name so its global_remove lifecycle remains paired.
             let host_id = ctx.shadow_table.allocate_host_id();
-            let bound_version = std::cmp::min(version, 38);
+            let bound_version = std::cmp::min(version, ZAURA_SHELL_MAX_VERSION);
             ctx.host_zaura_shell_id = Some(host_id);
             ctx.host_zaura_shell_global_name = Some(name);
             ctx.host_zaura_shell_version = bound_version;
