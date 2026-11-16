@@ -352,6 +352,10 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx.host_text_input_extension_v1_global_name == Some(name)
         || ctx.host_keyboard_extension_global_name == Some(name)
         || ctx.host_zaura_shell_global_name == Some(name)
+        || ctx
+            .window_placement
+            .remote_shell()
+            .is_some_and(|remote_shell| remote_shell.manager_global_matches(name))
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -442,6 +446,12 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
                 ctx.shadow_table.retire_host_interface(host_id);
             }
         }
+    }
+    if let Some(remote_shell) = ctx.window_placement.remote_shell_mut() {
+        // Like zaura_shell, removal invalidates only the advertisement.
+        // Remote surfaces created from this manager keep their own lifetime,
+        // so the manager object stays bound until the connection closes.
+        remote_shell.retire_manager_global(name);
     }
     ctx.hidden_host_globals.remove(&name);
 }
@@ -920,11 +930,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
-            if bound && ctx.window_placement.uses_arc_bounds() {
+            if bound && ctx.window_placement.backend().is_some() {
                 // A guest may bind an output before the host registry has
                 // delivered zaura_shell. Retry every already-live output now
                 // that the shell object and its version are available; the
                 // output bind path cannot do this retroactively on its own.
+                // Every placement backend needs the Aura work area.
                 for output_host_id in ctx.output_host_ids.clone() {
                     if !ctx.inactive_output_host_ids.contains(&output_host_id)
                         && !ctx.shadow_table.is_pending_destroy_host(output_host_id)
@@ -933,6 +944,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                             crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
                     }
                 }
+            }
+            if bound && ctx.window_placement.uses_arc_bounds() {
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived. Their guest-side associations are recorded
                 // after a successful get_toplevel dispatch, so a late shell
@@ -951,6 +964,60 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
+            return Action::Drop;
+        } else if interface == "zcr_remote_shell_v2" && ctx.window_placement.uses_remote_shell() {
+            // Experimental placement backend: bind the remote shell host-side
+            // only. Without this opt-in the global falls through to the
+            // allow-list below and is dropped as before.
+            ctx.hidden_host_globals.insert(name, interface.clone());
+            record_registry_global_visibility(ctx, name, false);
+            let Some(bound_version) = crate::handler::remote_shell::bind_version(version) else {
+                log::warn!(
+                    "Ignoring zcr_remote_shell_v2 v{}; the placement backend requires v{}",
+                    version,
+                    crate::handler::remote_shell::MIN_VERSION
+                );
+                return Action::Drop;
+            };
+            if ctx
+                .window_placement
+                .remote_shell()
+                .is_some_and(|remote_shell| remote_shell.has_live_manager_global())
+            {
+                return Action::Drop;
+            }
+            let host_id = ctx.shadow_table.allocate_host_id();
+            ctx.shadow_table.track_host_interface_with_version(
+                host_id,
+                interface.clone(),
+                bound_version,
+            );
+            let registry_host_id = ctx.last_sender_id;
+            if !queue_internal_bind(
+                ctx,
+                registry_host_id,
+                name,
+                interface,
+                bound_version,
+                host_id,
+            ) {
+                ctx.shadow_table.remove_host_interface(host_id);
+                return Action::Drop;
+            }
+            if let Some(remote_shell) = ctx.window_placement.remote_shell_mut() {
+                remote_shell.bind_manager(
+                    name,
+                    crate::state::RemoteShellManager {
+                        host_id,
+                        version: bound_version,
+                    },
+                );
+            }
+            log::info!(
+                "Bound zcr_remote_shell_v2 v{} internally (host_id={})",
+                bound_version,
+                host_id
+            );
             return Action::Drop;
         } else if interface == "wl_shm" {
             if ctx.host_shm_id.is_some() {
@@ -1256,7 +1323,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         }
-        if interface == "wl_output" && ctx.window_placement.uses_arc_bounds() {
+        if interface == "wl_output" && ctx.window_placement.backend().is_some() {
             // The Aura output extension carries the logical work-area insets
             // that wl_output itself does not expose. It is host-only; the
             // guest continues to receive the ordinary wl_output events.
@@ -2138,6 +2205,106 @@ mod tests {
             Some(&"zcr_extended_keyboard_v1".to_string()),
             "child dispatch metadata must survive global removal"
         );
+    }
+
+    fn remote_shell_registry_ctx(enabled: bool) -> Context {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        if enabled {
+            ctx.window_placement.enable_remote_shell_for_test();
+        }
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        ctx
+    }
+
+    #[test]
+    fn remote_shell_global_is_dropped_unless_the_backend_is_selected() {
+        let mut ctx = remote_shell_registry_ctx(false);
+        let remote_shell = "zcr_remote_shell_v2".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 10, &remote_shell, 6),
+            Action::Drop
+        );
+        assert!(ctx.client_to_host_queue.is_empty(), "nothing is bound");
+        assert!(!ctx.host_globals.contains_key(&10));
+        assert!(!ctx.hidden_host_globals.contains_key(&10));
+    }
+
+    #[test]
+    fn remote_shell_global_is_bound_host_side_once_and_hidden() {
+        let mut ctx = remote_shell_registry_ctx(true);
+        let remote_shell = "zcr_remote_shell_v2".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 10, &remote_shell, 9),
+            Action::Drop
+        );
+        let manager = ctx
+            .window_placement
+            .remote_shell()
+            .and_then(|state| state.manager())
+            .expect("bound manager");
+        assert_eq!(manager.version, 6, "bind is capped at the vendored version");
+        assert!(ctx
+            .shadow_table
+            .host_object_matches(manager.host_id, "zcr_remote_shell_v2"));
+        assert_eq!(ctx.client_to_host_queue.len(), 1, "one internal bind");
+        assert!(ctx.hidden_host_globals.contains_key(&10));
+        assert!(
+            !ctx.host_globals.contains_key(&10),
+            "never advertised to guests"
+        );
+
+        // A second registry sees the same advertisement but must not bind
+        // a second manager.
+        ctx.last_sender_id = 2;
+        ctx.shadow_table.map_id(2, 2);
+        ctx.shadow_table
+            .track_interface(2, "wl_registry".to_string());
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 10, &remote_shell, 9),
+            Action::Drop
+        );
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+    }
+
+    #[test]
+    fn remote_shell_global_below_minimum_version_stays_unbound() {
+        let mut ctx = remote_shell_registry_ctx(true);
+        let remote_shell = "zcr_remote_shell_v2".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 10, &remote_shell, 3),
+            Action::Drop
+        );
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            ctx.window_placement
+                .remote_shell()
+                .and_then(|state| state.manager()),
+            None,
+            "an unusable global fails closed to the normal XDG path"
+        );
+    }
+
+    #[test]
+    fn remote_shell_global_remove_keeps_manager_for_existing_surfaces() {
+        let mut ctx = remote_shell_registry_ctx(true);
+        let remote_shell = "zcr_remote_shell_v2".to_string();
+        RegistryHandler.on_global(&mut ctx, 10, &remote_shell, 6);
+        let manager = ctx
+            .window_placement
+            .remote_shell()
+            .and_then(|state| state.manager())
+            .expect("bound manager");
+        assert_eq!(RegistryHandler.on_global_remove(&mut ctx, 10), Action::Drop);
+        let state = ctx.window_placement.remote_shell().unwrap();
+        assert!(!state.has_live_manager_global());
+        assert_eq!(state.manager(), Some(manager));
+        assert!(ctx
+            .shadow_table
+            .host_object_matches(manager.host_id, "zcr_remote_shell_v2"));
+        assert_eq!(ctx.client_to_host_queue.len(), 1, "no destructor is sent");
     }
 
     #[test]

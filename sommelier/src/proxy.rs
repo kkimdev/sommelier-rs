@@ -312,6 +312,13 @@ impl Client {
         interface: &str,
         msg: &mut WireMessage,
     ) -> DispatchResult {
+        // XDG objects that the experimental remote-shell backend implements
+        // locally never reach the host. No-op unless that backend is active.
+        if let Some(result) =
+            crate::handler::remote_shell::dispatch_facade_request(ctx, interface, msg)
+        {
+            return result;
+        }
         let Some(family) = protocols::classify_interface(interface) else {
             return Ok(None);
         };

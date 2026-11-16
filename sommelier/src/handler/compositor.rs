@@ -1239,6 +1239,10 @@ impl WlSurfaceHandler for CompositorHandler {
                 }
             }
         }
+        // A remote-surface role, like zaura_surface, must be destroyed
+        // before its wl_surface. No-op unless the remote-shell backend is
+        // selected.
+        crate::handler::remote_shell::release_surface_roles(ctx, wl_surface_guest_id);
         // The generated dispatcher cannot express the ordering required by
         // the aura-shell integration: zaura_surface.release must precede the
         // paired wl_surface destructor.
@@ -1751,6 +1755,11 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
 
 impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHandler {
     fn on_get_xdg_surface(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
+        // The experimental remote-shell backend answers this surface's XDG
+        // objects locally; it is a no-op unless that backend is selected.
+        if crate::handler::remote_shell::claim_xdg_surface(ctx, id, surface) {
+            return Action::Drop;
+        }
         ctx.xdg_surface_to_wl_surface.insert(id, surface);
         Action::Forward
     }
@@ -2000,7 +2009,7 @@ fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
         .collect()
 }
 
-fn queue_guest_xdg_configure(
+pub(crate) fn queue_guest_xdg_configure(
     ctx: &mut Context,
     guest_xdg_toplevel_id: u32,
     width: i32,
@@ -2028,7 +2037,11 @@ fn queue_guest_xdg_configure(
     true
 }
 
-fn queue_guest_xdg_surface_configure(ctx: &mut Context, guest_xdg_surface_id: u32, serial: u32) {
+pub(crate) fn queue_guest_xdg_surface_configure(
+    ctx: &mut Context,
+    guest_xdg_surface_id: u32,
+    serial: u32,
+) {
     let mut builder = crate::wire::MessageBuilder::new();
     builder.write_u32(serial);
     if let Ok(message) = builder.try_build_message(

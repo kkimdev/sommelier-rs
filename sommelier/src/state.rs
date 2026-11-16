@@ -45,7 +45,8 @@ pub(crate) use self::render::{
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
-    PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, WindowPlacementState,
+    PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, RemoteShellFacade,
+    RemoteShellManager, WindowPlacementBackend, WindowPlacementState, REMOTE_SHELL_V2_ENV,
 };
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -151,6 +152,11 @@ pub struct ShadowTable {
     /// Guest objects whose destructor request has reached the host but whose
     /// host-side `wl_display.delete_id` has not arrived yet.
     pending_destroy_guest_ids: HashSet<u32>,
+    /// Guest objects implemented entirely by the proxy whose interface is
+    /// not local-only in general (the remote-shell backend's XDG facades).
+    /// They have no host mapping, so forwarded requests that reference them
+    /// are dropped instead of carrying an ID the host never created.
+    local_only_guest_ids: HashSet<u32>,
     next_host_id: u32,
     /// Wayland reserves the upper 8-bit ID range for IDs allocated by the
     /// server and sent to the client in an event. Host and guest object
@@ -177,6 +183,7 @@ impl ShadowTable {
             retired_host_ids: HashSet::new(),
             pending_destroy_host_ids: HashSet::new(),
             pending_destroy_guest_ids: HashSet::new(),
+            local_only_guest_ids: HashSet::new(),
             // Start at 2 to mimic standard Wayland client behavior.
             // ID 1 is reserved for wl_display.
             next_host_id: 2,
@@ -289,17 +296,35 @@ impl ShadowTable {
     /// let those requests reach the handler while rejecting every other
     /// unmapped sender before it can mutate state.
     pub fn is_local_only_guest_object(&self, guest_id: u32) -> bool {
-        matches!(
-            self.interfaces.get(&guest_id).map(String::as_str),
-            Some(
-                "wl_shm"
-                    | "wl_shm_pool"
-                    | "zwp_text_input_manager_v3"
-                    | "zwp_linux_dmabuf_feedback_v1"
-                    | "gtk_shell1"
-                    | "gtk_surface1"
+        self.local_only_guest_ids.contains(&guest_id)
+            || matches!(
+                self.interfaces.get(&guest_id).map(String::as_str),
+                Some(
+                    "wl_shm"
+                        | "wl_shm_pool"
+                        | "zwp_text_input_manager_v3"
+                        | "zwp_linux_dmabuf_feedback_v1"
+                        | "gtk_shell1"
+                        | "gtk_surface1"
+                )
             )
-        )
+    }
+
+    /// Register a proxy-implemented guest object whose interface is
+    /// normally host-backed. It must have no host mapping; the registration
+    /// ends with [`Self::remove_id`].
+    pub fn track_local_only_guest_object(
+        &mut self,
+        guest_id: u32,
+        interface: String,
+        version: u32,
+    ) {
+        debug_assert!(
+            !self.guest_to_host.contains_key(&guest_id),
+            "a local-only guest object has no host mapping"
+        );
+        self.track_interface_with_version(guest_id, interface, version);
+        self.local_only_guest_ids.insert(guest_id);
     }
 
     /// Check the interface of a host object carried by an event. Host-created
@@ -537,6 +562,7 @@ impl ShadowTable {
 
     pub fn remove_id(&mut self, guest_id: u32) {
         self.pending_destroy_guest_ids.remove(&guest_id);
+        self.local_only_guest_ids.remove(&guest_id);
         if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
             self.host_to_guest.remove(&host_id);
             self.host_interfaces.remove(&host_id);
@@ -1296,6 +1322,16 @@ impl Context {
                 }
             };
         let window_placement = WindowPlacementState::from_environment();
+        // xdg-decoration references xdg_toplevel objects, which are
+        // proxy-local facades under the remote-shell backend. Hide it so the
+        // guest falls back to client-side decorations instead of sending a
+        // facade ID to the host.
+        let xdg_decoration = if xdg_decoration && window_placement.uses_remote_shell() {
+            warn!("xdg-decoration is disabled by {}", REMOTE_SHELL_V2_ENV);
+            false
+        } else {
+            xdg_decoration
+        };
         let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
             Ok(Some(value)) => value,
             Ok(None) => String::new(),
@@ -1307,10 +1343,11 @@ impl Context {
                 String::new()
             }
         };
-        let window_placement_shortcuts = if !window_placement.uses_arc_bounds() {
+        let window_placement_shortcuts = if window_placement.backend().is_none() {
             if !window_placement_env.trim().is_empty() {
                 warn!(
-                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC is set"
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC or {} is set",
+                    REMOTE_SHELL_V2_ENV
                 );
             }
             Vec::new()
@@ -2123,6 +2160,25 @@ mod tests {
         table.track_host_interface(30, "wl_shm".to_string());
         assert!(table.is_event_sender_known(30));
         assert!(!table.is_event_sender_known(31));
+    }
+
+    #[test]
+    fn individually_tracked_local_only_objects_end_with_remove_id() {
+        let mut table = ShadowTable::new();
+        table.track_interface_with_version(20, "xdg_surface".to_string(), 3);
+        assert!(
+            !table.is_local_only_guest_object(20),
+            "xdg_surface is host-backed"
+        );
+        table.remove_id(20);
+
+        table.track_local_only_guest_object(20, "xdg_surface".to_string(), 3);
+        assert!(table.is_local_only_guest_object(20));
+        assert_eq!(table.get_host_id(20), None);
+        assert!(!table.is_guest_id_available(20));
+        table.remove_id(20);
+        assert!(!table.is_local_only_guest_object(20));
+        assert!(table.is_guest_id_available(20));
     }
 
     #[test]

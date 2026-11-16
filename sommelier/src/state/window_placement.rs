@@ -16,12 +16,18 @@ limitations under the License.
 
 //! State and lifecycle invariants for compositor-owned window placement.
 //!
-//! [`WindowPlacementState`] is the single owner of the opt-in ARC bounds
-//! policy: whether it is enabled, the per-surface ARC policy identities, the
-//! host Aura surface/toplevel associations, the host-stream sync barriers that
-//! order `zaura_toplevel.set_window_bounds`, and the configures held behind
-//! those barriers. The maps are private so handlers cannot update one side of
-//! an association, or retire a toplevel, without the matching cleanup.
+//! [`WindowPlacementState`] is the single owner of compositor-owned placement
+//! state. It selects at most one opt-in backend ([`WindowPlacementBackend`]):
+//!
+//! - ARC bounds: the per-surface ARC policy identities, the host Aura
+//!   surface/toplevel associations, the host-stream sync barriers that order
+//!   `zaura_toplevel.set_window_bounds`, and the configures held behind those
+//!   barriers.
+//! - Remote shell v2 (experimental): [`RemoteShellState`], owned by the
+//!   `remote_shell` submodule.
+//!
+//! The maps are private so handlers cannot update one side of an
+//! association, or retire a toplevel, without the matching cleanup.
 //!
 //! Wire encoding stays in the protocol handlers; this type only answers
 //! ownership questions and returns the IDs whose host teardown the caller must
@@ -33,6 +39,24 @@ use std::sync::Arc;
 use log::warn;
 
 use crate::arc_task_ids::ArcIdAllocator;
+
+mod remote_shell;
+
+pub(crate) use self::remote_shell::{RemoteShellFacade, RemoteShellManager, RemoteShellState};
+
+/// Environment flag that selects the experimental remote-shell-v2 backend.
+pub(crate) const REMOTE_SHELL_V2_ENV: &str = "SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2";
+
+/// The placement backend selected for a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowPlacementBackend {
+    /// `SOMMELIER_WINDOW_BOUNDS_AS_ARC`: `zaura_toplevel.set_window_bounds`
+    /// with an ARC policy identity.
+    ArcBounds,
+    /// `SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2`: host
+    /// `zcr_remote_surface_v2` roles placed with `set_bounds_in_output`.
+    RemoteShellV2,
+}
 
 /// Namespace used by the opt-in bounds-policy workaround. ChromeOS's Exo
 /// security delegate recognizes the ARC task-form identity and allows Aura
@@ -113,6 +137,9 @@ pub(crate) struct WindowPlacementState {
     /// Latest serial-bearing surface configure held while the active barrier
     /// is live.
     held_surface_configures: HashMap<u32, PendingWindowBoundsSurfaceConfigure>,
+    /// Experimental remote-shell-v2 backend. `Some` exactly when that backend
+    /// is selected; it is mutually exclusive with `arc_bounds`.
+    remote_shell: Option<RemoteShellState>,
 }
 
 impl WindowPlacementState {
@@ -137,6 +164,11 @@ impl WindowPlacementState {
     /// objects that can never be authorized.
     pub(crate) fn from_environment() -> Self {
         let requested = Self::arc_bounds_requested();
+        let remote_shell_requested =
+            super::env_flag_is_true(std::env::var(REMOTE_SHELL_V2_ENV).ok().as_deref());
+        if remote_shell_requested {
+            return Self::with_remote_shell_request(requested);
+        }
         let arc_id_allocator = if requested {
             crate::arc_task_ids::process_allocator()
         } else {
@@ -151,6 +183,28 @@ impl WindowPlacementState {
         Self {
             arc_bounds,
             arc_id_allocator,
+            ..Self::default()
+        }
+    }
+
+    /// Resolve an explicit remote-shell-v2 request.
+    ///
+    /// The two backends assign different shell roles, so a request for both
+    /// is ambiguous and disables placement instead of guessing.
+    fn with_remote_shell_request(arc_requested: bool) -> Self {
+        if arc_requested {
+            warn!(
+                "{} and SOMMELIER_WINDOW_BOUNDS_AS_ARC are mutually exclusive; window placement is disabled",
+                REMOTE_SHELL_V2_ENV
+            );
+            return Self::default();
+        }
+        warn!(
+            "{} enables the experimental remote-shell-v2 placement backend",
+            REMOTE_SHELL_V2_ENV
+        );
+        Self {
+            remote_shell: Some(RemoteShellState::default()),
             ..Self::default()
         }
     }
@@ -174,6 +228,13 @@ impl WindowPlacementState {
         self.arc_bounds = enabled;
     }
 
+    /// Select the remote-shell-v2 backend in a unit test.
+    #[cfg(test)]
+    pub(crate) fn enable_remote_shell_for_test(&mut self) {
+        self.arc_bounds = false;
+        self.remote_shell = Some(RemoteShellState::default());
+    }
+
     #[cfg(test)]
     pub(crate) fn set_arc_id_allocator_for_test(&mut self, allocator: Option<Arc<ArcIdAllocator>>) {
         self.arc_id_allocator = allocator;
@@ -182,6 +243,38 @@ impl WindowPlacementState {
     /// Return whether the opt-in ARC bounds placement policy is active.
     pub(crate) const fn uses_arc_bounds(&self) -> bool {
         self.arc_bounds
+    }
+
+    /// Return the selected placement backend, or `None` when placement is
+    /// disabled (the default).
+    pub(crate) fn backend(&self) -> Option<WindowPlacementBackend> {
+        debug_assert!(
+            !(self.arc_bounds && self.remote_shell.is_some()),
+            "placement backends are mutually exclusive"
+        );
+        if self.arc_bounds {
+            Some(WindowPlacementBackend::ArcBounds)
+        } else if self.remote_shell.is_some() {
+            Some(WindowPlacementBackend::RemoteShellV2)
+        } else {
+            None
+        }
+    }
+
+    /// Return whether the experimental remote-shell-v2 backend is active.
+    pub(crate) fn uses_remote_shell(&self) -> bool {
+        self.remote_shell.is_some()
+    }
+
+    /// Remote-shell backend state; `None` unless that backend is selected.
+    pub(crate) fn remote_shell(&self) -> Option<&RemoteShellState> {
+        self.remote_shell.as_ref()
+    }
+
+    /// Mutable remote-shell backend state; `None` unless that backend is
+    /// selected.
+    pub(crate) fn remote_shell_mut(&mut self) -> Option<&mut RemoteShellState> {
+        self.remote_shell.as_mut()
     }
 
     /// Verify the ownership graph after every mutation in debug/test builds,
@@ -511,6 +604,43 @@ mod tests {
             guest_xdg_surface_id: 5,
             serial,
         }
+    }
+
+    #[test]
+    fn default_state_selects_no_backend() {
+        let state = WindowPlacementState::for_test();
+        assert_eq!(state.backend(), None);
+        assert!(!state.uses_remote_shell());
+        assert!(state.remote_shell().is_none());
+    }
+
+    #[test]
+    fn remote_shell_request_selects_only_the_remote_shell_backend() {
+        let mut state = WindowPlacementState::with_remote_shell_request(false);
+        assert_eq!(state.backend(), Some(WindowPlacementBackend::RemoteShellV2));
+        assert!(!state.uses_arc_bounds());
+        assert!(state.remote_shell_mut().is_some());
+        assert_eq!(
+            state.arc_application_id(10),
+            None,
+            "the remote-shell backend never fabricates ARC identities"
+        );
+    }
+
+    #[test]
+    fn requesting_both_backends_disables_placement() {
+        let state = WindowPlacementState::with_remote_shell_request(true);
+        assert_eq!(state.backend(), None);
+        assert!(!state.uses_arc_bounds());
+        assert!(!state.uses_remote_shell());
+    }
+
+    #[test]
+    fn arc_bounds_selects_the_arc_backend() {
+        let mut state = WindowPlacementState::for_test();
+        state.set_arc_bounds_for_test(true);
+        assert_eq!(state.backend(), Some(WindowPlacementBackend::ArcBounds));
+        assert!(state.remote_shell().is_none());
     }
 
     #[test]

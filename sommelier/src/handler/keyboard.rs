@@ -33,6 +33,7 @@ use crate::protocols::wayland::wl_keyboard;
 use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
+    WindowPlacementBackend,
 };
 use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
@@ -396,13 +397,13 @@ impl KeyboardHandler {
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
     ) -> bool {
-        if !ctx.window_placement.uses_arc_bounds() {
+        let Some(backend) = ctx.window_placement.backend() else {
             log::trace!(
-                "window layout {:?} ignored: ARC bounds policy is disabled",
+                "window layout {:?} ignored: no placement backend is enabled",
                 action
             );
             return false;
-        }
+        };
         let Some((guest_xdg_toplevel_id, guest_wl_surface_id)) =
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
         else {
@@ -434,14 +435,25 @@ impl KeyboardHandler {
             );
             return false;
         };
-        Self::apply_arc_window_bounds(
-            ctx,
-            action,
-            guest_xdg_toplevel_id,
-            guest_wl_surface_id,
-            output_host_id,
-            bounds,
-        )
+        match backend {
+            WindowPlacementBackend::ArcBounds => Self::apply_arc_window_bounds(
+                ctx,
+                action,
+                guest_xdg_toplevel_id,
+                guest_wl_surface_id,
+                output_host_id,
+                bounds,
+            ),
+            WindowPlacementBackend::RemoteShellV2 => {
+                crate::handler::remote_shell::queue_window_bounds(
+                    ctx,
+                    guest_xdg_toplevel_id,
+                    output_host_id,
+                    output,
+                    bounds,
+                )
+            }
+        }
     }
 
     /// ARC bounds backend: reset the window state and queue
@@ -1671,6 +1683,115 @@ mod tests {
             handler.window_layout_action(&ctx, HostId(5), key),
             Some(WindowLayoutAction::TopLeft)
         );
+    }
+
+    #[test]
+    fn remote_shell_backend_places_with_bounds_in_output() {
+        let keyboard = 10u32;
+        let host_keyboard = 5u32;
+        let seat = 11u32;
+        let surface = 12u32;
+        let xdg_surface = 14u32;
+        let xdg_toplevel = 13u32;
+        let remote_surface = 27u32;
+        let output = 25u32;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.enable_remote_shell_for_test();
+        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
+        ctx.shadow_table.map_id(surface, 22);
+        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
+        ctx.shadow_table.track_host_interface_with_version(
+            remote_surface,
+            "zcr_remote_surface_v2".to_string(),
+            6,
+        );
+        let remote_shell = ctx.window_placement.remote_shell_mut().unwrap();
+        remote_shell.remember_facade(
+            xdg_surface,
+            crate::state::RemoteShellFacade::Surface {
+                wl_surface_guest_id: surface,
+                constructed: true,
+            },
+        );
+        remote_shell.remember_facade(
+            xdg_toplevel,
+            crate::state::RemoteShellFacade::Toplevel {
+                xdg_surface_guest_id: xdg_surface,
+            },
+        );
+        remote_shell.remember_remote_surface(xdg_toplevel, remote_surface);
+        ctx.output_host_ids.push(output);
+        ctx.output_states.insert(
+            output,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
+                insets_bottom: 48,
+                ..Default::default()
+            },
+        );
+
+        assert!(KeyboardHandler::apply_window_layout(
+            &mut ctx,
+            HostId(host_keyboard),
+            WindowLayoutAction::Right,
+        ));
+        // No Aura objects, ARC identity, state reset, or sync barrier: the
+        // whole batch is one set_bounds_in_output plus the guest configure.
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let request = &ctx.client_to_host_queue[0];
+        assert_eq!(message_sender(request), remote_surface);
+        assert_eq!(
+            message_opcode(request),
+            crate::protocols::remote_shell_unstable_v2::zcr_remote_surface_v2::REQ_SET_BOUNDS_IN_OUTPUT
+        );
+        let args: Vec<i32> = request.0[8..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_ne_bytes(*chunk))
+            .collect();
+        assert_eq!(args, vec![output as i32, 1920, 0, 1920, 2112]);
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert!(!ctx.window_placement.has_arc_application_ids());
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            2,
+            "toplevel + surface configure"
+        );
+    }
+
+    #[test]
+    fn remote_shell_backend_leaves_key_with_client_without_remote_surface() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.enable_remote_shell_for_test();
+        map_keyboard(&mut ctx, 10, 5, 50, 11);
+        ctx.shadow_table.map_id(12, 22);
+        ctx.xdg_toplevel_to_wl_surface.insert(13, 12);
+        focus_keyboard(&mut ctx, 5, 11, 12);
+        ctx.output_host_ids.push(25);
+        ctx.output_states.insert(
+            25,
+            crate::state::OutputState {
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
+                ..Default::default()
+            },
+        );
+        assert!(!KeyboardHandler::apply_window_layout(
+            &mut ctx,
+            HostId(5),
+            WindowLayoutAction::Left,
+        ));
+        assert!(ctx.client_to_host_queue.is_empty());
     }
 
     #[test]
