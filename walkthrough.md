@@ -1307,17 +1307,21 @@ are doc comments, the `--help` text, and one new test.
 - The allocator facts were already consolidated by PR B; the README and
   the module comment only link to them.
 
-Left for the placement-module PR (D), whose files this PR does not touch:
-the `Context` field docs in `state.rs` restate the "single owner" summaries
-of `WindowPlacementState` and `OutputRegistry`, and the `zaura_shell` field
-doc repeats the registry's literal 38. If D moves `PlacementSkip`, the
-doc's pointer to `sommelier/src/handler/keyboard.rs` moves with it.
+After rebasing onto PR D: the doc points at `PlacementSkip::log_level` in
+`sommelier/src/handler/window_placement.rs` and names each skip by its
+level, since D removed two variants. The `state.rs` row of the code map
+says that `Context` holds the connection's `WindowPlacementState` and
+`OutputRegistry`. The `Context` field docs for those two no longer restate
+their "single owner" summaries; they link to the types. The `zaura_shell`
+version field doc no longer repeats the registry's literal 38. The
+registry's upper bound is still an unnamed literal in the `zaura_shell`
+bind; naming it is code, not docs, and is left for a follow-up.
 
-Validation (monorepo dev shell, locked, serial): Sommelier 676 passed /
-1 ignored (675 before, plus the doc-table test), sample GUI 12, codegen 7,
-`gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets,
-`cargo fmt --check`, and `git diff --check` pass. Every relative Markdown
-link and anchor in the README, the handover, the walkthrough and
-`sommelier/docs/` resolves. The doc-table test was checked to fail for a
-changed value, a dropped row, and a duplicated row. Not host-validated: no
-Sommelier process was started.
+Validation (monorepo dev shell, locked, serial), rebased on PR D:
+Sommelier 678 passed / 1 ignored (677 on D, plus the doc-table test),
+sample GUI 12, codegen 8, `gui_smoke` 0 run / 1 ignored. Strict Clippy on
+all targets, `cargo fmt --check`, and `git diff --check` pass, and this PR
+adds no `cargo doc` warning. Every relative Markdown link and anchor in the
+README, the handover, the walkthrough and `sommelier/docs/` resolves. The
+doc-table test was checked to fail for a changed value, a dropped row, and
+a duplicated row. Not host-validated: no Sommelier process was started.
