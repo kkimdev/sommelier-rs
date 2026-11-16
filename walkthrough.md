@@ -877,3 +877,21 @@ Validation (monorepo dev shell, locked, serial): Sommelier 640 passed /
 1 ignored; strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. Not host-validated: no Sommelier process was started
 or signalled.
+
+### Host acceptance (2026-11-16)
+
+The release build ran as an isolated proxy on `wayland-9` with
+`SOMMELIER_WINDOW_BOUNDS_AS_ARC=1` and `--window-shortcuts-config`, serving
+`gtk3-widget-factory` on the 3840x2160 output (work area 3840x2112). The
+primary Sommelier service on `wayland-2` was not touched.
+
+- `SIGHUP` with an invalid edit (`x + width > 1`) logged the error and kept
+  the last known-good bindings; a valid edit then reloaded 5 bindings. The
+  proxy stayed up through both signals.
+- Configured thirds placed the window at `(0, 0, 1280, 2112)`,
+  `(1280, 0, 1280, 2112)` and `(2560, 0, 1280, 2112)`: shared edges, no gaps.
+  The reloaded centre rect `[0.25, 0.25, 0.5, 0.5]` placed it at
+  `(960, 528, 1920, 1056)`, and the named `top-left` action was unchanged at
+  `(0, 0, 1920, 1056)`. The user confirmed each placement visually.
+- No placement was skipped. Logs are kept in the untracked local evidence
+  directory `_local/evidence/pr18-hostval-2026-11-16/` in the primary checkout.
