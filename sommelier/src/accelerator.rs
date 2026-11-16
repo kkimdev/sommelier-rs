@@ -199,6 +199,33 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
     Ok(result)
 }
 
+/// Read and parse `SOMMELIER_ACCELERATORS` from the process environment.
+///
+/// # Returns
+///
+/// The host accelerator list; an unset variable means an empty list.
+///
+/// # Errors
+///
+/// Returns a diagnostic when the value is not UTF-8 or does not parse. Callers
+/// decide whether that degrades filtering or fails closed.
+pub(crate) fn host_accelerators_from_environment() -> Result<Vec<Accelerator>, String> {
+    host_accelerators_from_value(std::env::var("SOMMELIER_ACCELERATORS"))
+}
+
+fn host_accelerators_from_value(
+    value: Result<String, std::env::VarError>,
+) -> Result<Vec<Accelerator>, String> {
+    match value {
+        Ok(value) => parse_accelerators(&value)
+            .map_err(|error| format!("Invalid SOMMELIER_ACCELERATORS '{}': {}", value, error)),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("Invalid SOMMELIER_ACCELERATORS (value is not UTF-8)".to_string())
+        }
+    }
+}
+
 /// Parse compositor-owned window placement bindings.
 ///
 /// The format is a comma-separated list of `CHORD=ACTION` pairs, for example:
@@ -346,6 +373,27 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].modifiers, SUPER_MASK);
         assert_eq!(list[0].symbol, xkb::keysyms::KEY_space);
+    }
+
+    #[test]
+    fn host_accelerator_environment_value_is_unset_valid_or_invalid() {
+        use std::env::VarError;
+        assert_eq!(
+            host_accelerators_from_value(Err(VarError::NotPresent)),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            host_accelerators_from_value(Ok("<Alt>a".to_string())),
+            Ok(vec![parse_accelerator("<Alt>a").unwrap()])
+        );
+        assert!(host_accelerators_from_value(Ok("<Hyper>a".to_string()))
+            .unwrap_err()
+            .starts_with("Invalid SOMMELIER_ACCELERATORS '<Hyper>a'"));
+        assert!(
+            host_accelerators_from_value(Err(VarError::NotUnicode(std::ffi::OsString::from("x"))))
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
     }
 
     #[test]

@@ -1277,38 +1277,20 @@ impl Context {
             }
         };
 
-        let (accelerators, accelerators_valid) = match utf8_env("SOMMELIER_ACCELERATORS") {
-            Ok(Some(accelerators_env)) => {
-                match crate::accelerator::parse_accelerators(&accelerators_env) {
-                    Ok(list) => (list, true),
-                    Err(e) => {
-                        // A malformed accelerator config should not crash the proxy —
-                        // that would break every app in the container. Degrade to no
-                        // filtering (all keys forwarded to the guest), but retain the
-                        // invalid state so placement shortcuts cannot accidentally
-                        // bypass a conflict check against an empty list.
-                        warn!(
-                            "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
-                         Accelerator filtering disabled.",
-                            accelerators_env, e
-                        );
-                        (Vec::new(), false)
-                    }
+        let (accelerators, accelerators_valid) =
+            match crate::accelerator::host_accelerators_from_environment() {
+                Ok(list) => (list, true),
+                Err(error) => {
+                    // A malformed accelerator config should not crash the proxy —
+                    // that would break every app in the container. Degrade to no
+                    // filtering (all keys forwarded to the guest), but retain the
+                    // invalid state so placement shortcuts cannot accidentally
+                    // bypass a conflict check against an empty list. A non-UTF-8
+                    // value is malformed rather than unset for the same reason.
+                    warn!("{}. Accelerator filtering disabled.", error);
+                    (Vec::new(), false)
                 }
-            }
-            Ok(None) => (Vec::new(), true),
-            Err(()) => {
-                // Environment values are bytes on Unix. Treat a non-UTF-8
-                // value as malformed rather than as an unset variable: the
-                // placement conflict gate must fail closed even when the
-                // accelerator list cannot be rendered in a warning.
-                warn!(
-                    "Invalid SOMMELIER_ACCELERATORS (value is not UTF-8). \
-                 Accelerator filtering disabled."
-                );
-                (Vec::new(), false)
-            }
-        };
+            };
         let window_placement = WindowPlacementState::from_environment();
         let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
             Ok(Some(value)) => value,

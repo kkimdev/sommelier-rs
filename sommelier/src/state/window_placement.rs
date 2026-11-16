@@ -116,6 +116,18 @@ pub(crate) struct WindowPlacementState {
 }
 
 impl WindowPlacementState {
+    /// Return whether `SOMMELIER_WINDOW_BOUNDS_AS_ARC` requests the ARC
+    /// bounds policy. The request is process-wide; whether a connection can
+    /// actually use it also depends on the identity allocator
+    /// ([`Self::from_environment`]).
+    pub(crate) fn arc_bounds_requested() -> bool {
+        super::env_flag_is_true(
+            std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
+                .ok()
+                .as_deref(),
+        )
+    }
+
     /// Resolve the ARC bounds policy from the process environment.
     ///
     /// `SOMMELIER_WINDOW_BOUNDS_AS_ARC` requests the policy. ARC application
@@ -124,11 +136,7 @@ impl WindowPlacementState {
     /// block the entire workaround stays off rather than creating Aura
     /// objects that can never be authorized.
     pub(crate) fn from_environment() -> Self {
-        let requested = super::env_flag_is_true(
-            std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
-                .ok()
-                .as_deref(),
-        );
+        let requested = Self::arc_bounds_requested();
         let arc_id_allocator = if requested {
             crate::arc_task_ids::process_allocator()
         } else {
