@@ -1890,9 +1890,17 @@ mod tests {
             RegistryHandler.on_global(&mut ctx, 11, &shell, 38),
             Action::Drop
         );
-        ctx.window_placement
+        let attached = ctx
+            .window_placement
             .aura_toplevel_for_xdg_toplevel(13)
-            .is_some()
+            .is_some();
+        if attached {
+            assert!(
+                ctx.window_placement.arc_application_id(12).is_some(),
+                "an attached toplevel's surface carries an ARC identity"
+            );
+        }
+        attached
     }
 
     #[test]

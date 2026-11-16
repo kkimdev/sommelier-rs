@@ -105,6 +105,25 @@ enum PlacementSkip {
     BarrierUnavailable,
 }
 
+impl PlacementSkip {
+    /// Log level for a skip. A rect the output cannot represent, or an Aura
+    /// toplevel that cannot be attached (old or missing zaura_shell, or ARC
+    /// identities exhausted), persists until the configuration or the proxy
+    /// changes, so it is logged at info. Other skips depend on transient
+    /// focus or output state and stay at debug.
+    fn log_level(self) -> log::Level {
+        match self {
+            Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
+            Self::NoFocusedToplevel
+            | Self::UnmappedToplevel
+            | Self::NoUsableOutput
+            | Self::NoAuraSurface
+            | Self::ArcIdentityUnavailable
+            | Self::BarrierUnavailable => log::Level::Debug,
+        }
+    }
+}
+
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
@@ -333,6 +352,9 @@ impl KeyboardHandler {
     /// policy is active. Configuration validation rejects a chord that is
     /// both a host accelerator and a binding; if one slipped through, the
     /// host keeps its accelerator.
+    ///
+    /// Side effect: while the policy is active, this first adopts a reloaded
+    /// shortcut generation, if one is pending.
     fn classify_key(&self, ctx: &mut Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
         let Some(chord) = self.current_chord(host_keyboard_id, key) else {
             return KeyClass::Guest;
@@ -428,8 +450,10 @@ impl KeyboardHandler {
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
     ) -> Result<(), PlacementSkip> {
-        // `classify_key` yields placement actions only while the ARC bounds
-        // policy is active, so this path never runs without it.
+        debug_assert!(
+            ctx.window_placement.uses_arc_bounds(),
+            "classify_key yields placement actions only while the ARC bounds policy is active"
+        );
         let (guest_xdg_toplevel_id, guest_wl_surface_id) =
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
                 .ok_or(PlacementSkip::NoFocusedToplevel)?;
@@ -1033,7 +1057,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     // repeat follow the CompositorShortcut owner claimed
                     // below.
                     if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
-                        log::debug!(
+                        log::log!(
+                            reason.log_level(),
                             "window layout {:?} skipped for keyboard {}: {:?}",
                             action,
                             host_keyboard_id.0,
@@ -2224,6 +2249,11 @@ mod tests {
             KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
             Err(PlacementSkip::NoFocusedToplevel)
         );
+        assert_eq!(
+            PlacementSkip::NoFocusedToplevel.log_level(),
+            log::Level::Debug,
+            "a transient skip stays at debug"
+        );
         assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
     }
 
@@ -2238,6 +2268,11 @@ mod tests {
         assert_eq!(
             KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), sliver),
             Err(PlacementSkip::RectNotRepresentable)
+        );
+        assert_eq!(
+            PlacementSkip::RectNotRepresentable.log_level(),
+            log::Level::Info,
+            "a persistent misconfiguration is visible at info"
         );
         assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
@@ -3421,8 +3456,8 @@ mod tests {
 
     #[test]
     fn no_chord_without_xkb_state() {
-        let handler = KeyboardHandler::new(); // no keymap loaded
-                                              // Must degrade gracefully, not panic.
+        // No keymap is loaded; the lookup must degrade gracefully, not panic.
+        let handler = KeyboardHandler::new();
         assert_eq!(
             handler.current_chord(HostId(0), 30),
             None,
