@@ -136,10 +136,11 @@ bounds = (X + left, Y + top, right - left, bottom - top)
   so their bounds are exactly what the dedicated half-split code produced
   before (a unit test compares both across small, odd, and extreme sizes).
   For an odd width the left half gets the smaller share.
-- The placement is skipped (logged at debug level, key not consumed) when the
-  work area is unavailable, when an edge strictly inside `(0, 1)` rounds onto
-  the work-area border (the output is too small to represent the rectangle),
-  when a rounded extent is empty, or when `X + left` / `Y + top` overflows.
+- The placement is skipped (logged at debug level; the chord is still
+  consumed) when the work area is unavailable, when an edge strictly inside
+  `(0, 1)` rounds onto the work-area border (the output is too small to
+  represent the rectangle), when a rounded extent is empty, or when
+  `X + left` / `Y + top` overflows.
 
 The owner of this rule is `NormalizedRect::to_work_area_bounds` in
 `sommelier/src/window_layout.rs`.
