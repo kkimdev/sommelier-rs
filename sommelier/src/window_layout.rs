@@ -28,8 +28,11 @@ limitations under the License.
 //! * [`Rect`] - an integer rectangle in logical screen coordinates: the work
 //!   area a placement maps into and the window bounds it produces.
 //!
-//! The module depends on nothing else in the crate; the configuration
-//! parsers and the keyboard handler depend on it.
+//! The module depends on nothing else in the crate. The configuration
+//! parser (`placement_config`) builds actions; `Context` and the keyboard
+//! handler pass them on; the output registry (`state::outputs`) returns
+//! work areas as [`Rect`]; and the placement handler
+//! (`handler::window_placement`) maps one into the other.
 //!
 //! # Rules
 //!
