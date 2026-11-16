@@ -267,14 +267,10 @@ No placement shortcut is active by default. The policy gate remains opt-in
 because it changes the ChromeOS window-policy namespace; malformed bindings or
 bindings that conflict with `SOMMELIER_ACCELERATORS` disable shortcut
 consumption at startup. The ARC policy may still be enabled without bindings
-for deployments that need the metadata path but no compositor-owned chords. When
-the policy is enabled, Sommelier reserves a process-shared ARC task-identity
-block under `$XDG_RUNTIME_DIR/sommelier`; if that reservation cannot be made,
-the policy is disabled rather than using a potentially colliding identity.
-Exclusivity holds only among proxies sharing one `$XDG_RUNTIME_DIR`; proxies in
-other containers or VMs pick a random block and offset, which makes overlap
-unlikely but not impossible. A block is never refilled, so after its identities
-are exhausted new surfaces skip the ARC policy until the proxy restarts.
+for deployments that need the metadata path but no compositor-owned chords. The
+policy needs a process-wide block of fabricated ARC task IDs and is disabled if
+none can be reserved; see
+[Sommelier's task-ID allocator](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator).
 
 `WindowPlacementState` in `sommelier/src/state/window_placement.rs` is the
 single owner of this policy's per-connection state: the per-surface ARC

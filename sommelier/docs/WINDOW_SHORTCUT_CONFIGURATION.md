@@ -28,8 +28,9 @@ Notes:
 - The gate is read only at startup. A reload never turns the ARC policy on or
   off, and never re-reads any environment variable.
 - If the gate is requested but the proxy cannot reserve an ARC identity
-  block, that connection's ARC policy is disabled and it consumes no chords;
-  the file still loads and reloads normally.
+  block, the ARC policy is disabled for the whole process and no connection
+  consumes chords; the file still loads and reloads normally. See
+  [Sommelier's task-ID allocator](ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator).
 - `SOMMELIER_ACCELERATORS` is parsed at startup and every binding is checked
   against it. If that variable is malformed, the conflict check cannot run,
   so the file option is a startup error. (Without the file option, a malformed

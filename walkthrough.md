@@ -895,3 +895,52 @@ primary Sommelier service on `wayland-2` was not touched.
   `(0, 0, 1920, 1056)`. The user confirmed each placement visually.
 - No placement was skipped. Logs are kept in the untracked local evidence
   directory `_local/evidence/pr18-hostval-2026-11-16/` in the primary checkout.
+
+## 2026-11-16 — Simplified ARC task-ID allocator
+
+Cleanup PR B for review findings A3, C8, H5 (allocator part), H6, S8 and the
+allocator parts of D1/D2.
+
+What changed in `sommelier/src/arc_task_ids.rs` (826 → 414 lines; about
+548 → 245 lines of non-test code):
+
+- Removed the directory-generation guard file, the dev/ino rechecks, the
+  non-atomic `LOCK_EX` → `LOCK_SH` conversions and the per-file uid/mode
+  checks. All of them defended against writers inside the lock directory, and
+  the one check kept, that `$XDG_RUNTIME_DIR` is owned by the user with no
+  group/other access, already limits those writers to the user's own
+  processes.
+- Reservation walks the blocks from a random start, opens each lock file
+  `O_CREAT | O_NOFOLLOW | O_NONBLOCK` (`0600`) and takes a non-blocking
+  exclusive `flock`. Any per-block error skips the block, so a stray lock file
+  no longer disables ARC placement; `O_NONBLOCK` keeps a stray FIFO from
+  blocking the open forever. A held block is logged at debug, any other
+  per-block error at warn. Lock file names are unchanged, so older and newer builds
+  still exclude each other.
+- Random seeds come from `getrandom(2)` instead of opening `/dev/urandom`.
+- `ArcIdAllocator` is now a pure range, offset and issued-ID counter (behind a `Mutex`; `AtomicU32::fetch_update` is deprecated in Rust 1.100). The lock
+  descriptor sits beside it in a never-dropped static, so the `Option<File>`
+  test fields, the no-op `Drop` and the test-only guard-directory parameter
+  are gone, and reservation tests run in a temporary runtime directory.
+- A failed reservation is logged once and still cached for the process: its
+  causes do not clear at runtime, and retrying would let connections disagree.
+  The per-connection warning in `WindowPlacementState` is gone, and block
+  exhaustion is logged once instead of being dropped by `ok()?`.
+- `WindowPlacementState::for_test` sizes its block with `ARC_ID_BLOCK_SIZE`.
+- The "placement shortcuts ignored" warning now names both causes: the gate
+  is unset, or no ARC task-ID block was reserved.
+
+Docs: the "Sommelier's task-ID allocator" section of
+`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md` now owns every allocator fact;
+the README, the shortcut configuration doc and the module comment link to it.
+The duplicated pool paragraph is gone, and the doc now says reservation
+happens on first use and that a failure disables the policy for the whole
+process. It also states the caveat that deleting or replacing the lock
+directory, or a held lock file, while a proxy runs lets a later proxy reuse
+that block undetected.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 640 passed /
+1 ignored (644 before: 14 old allocator tests replaced by 10), sample GUI 12,
+codegen 7, `gui_smoke` 0 run / 1 ignored; strict Clippy on all targets,
+`cargo fmt --check` and `git diff --check` pass. Not host-validated: no
+Sommelier process was started.
