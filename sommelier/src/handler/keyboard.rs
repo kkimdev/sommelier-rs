@@ -436,7 +436,7 @@ impl KeyboardHandler {
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
     ) -> bool {
-        if !ctx.window_bounds_as_arc {
+        if !ctx.window_placement.uses_arc_bounds() {
             log::trace!(
                 "window layout {:?} ignored: ARC bounds policy is disabled",
                 action
@@ -507,8 +507,8 @@ impl KeyboardHandler {
         // the state-reset and bounds requests if the barrier cannot be queued.
         let placement_queue_start = ctx.client_to_host_queue.len();
         let arc_identity_was_applied = ctx
-            .arc_application_ids_applied
-            .contains(&guest_wl_surface_id);
+            .window_placement
+            .arc_application_id_applied(guest_wl_surface_id);
         if !crate::handler::compositor::ensure_arc_application_id_on_surface(
             ctx,
             guest_wl_surface_id,
@@ -552,7 +552,8 @@ impl KeyboardHandler {
                 // as applied when it queues the metadata request. If the
                 // placement batch is rolled back before reaching the host,
                 // allow the next attempt to queue that request again.
-                ctx.arc_application_ids_applied.remove(&guest_wl_surface_id);
+                ctx.window_placement
+                    .unmark_arc_application_id_applied(guest_wl_surface_id);
             }
             return false;
         }
@@ -1821,7 +1822,7 @@ mod tests {
         let host_xdg_toplevel = 23u32;
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1875,9 +1876,9 @@ mod tests {
             .find(|(message, _)| {
                 let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
                 u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                    == *ctx
-                        .xdg_toplevel_to_zaura_toplevel
-                        .get(&xdg_toplevel)
+                    == ctx
+                        .window_placement
+                        .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
                         .unwrap()
                     && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
             })
@@ -1902,7 +1903,7 @@ mod tests {
         let primary_output = 25u32;
         let secondary_output = 26u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1941,9 +1942,9 @@ mod tests {
             HostId(host_keyboard),
             WindowLayoutAction::Fullscreen,
         ));
-        let aura_toplevel = *ctx
-            .xdg_toplevel_to_zaura_toplevel
-            .get(&xdg_toplevel)
+        let aura_toplevel = ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
             .expect("Aura toplevel mapping");
         let bounds = ctx
             .client_to_host_queue
@@ -1982,7 +1983,7 @@ mod tests {
         let xdg_toplevel = 13;
         let output = 25;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
@@ -2029,9 +2030,9 @@ mod tests {
             Action::Forward
         );
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
-        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
-        assert!(ctx.wl_surface_to_zaura_surface.is_empty());
-        assert!(ctx.window_bounds_barriers.is_empty());
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(ctx.window_placement.aura_surface_count(), 0);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert!(
             ctx.client_to_host_queue
                 .iter()
@@ -2048,7 +2049,7 @@ mod tests {
         let xdg_toplevel = 13;
         let output = 25;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
         map_keyboard(&mut ctx, 10, host_keyboard, 50, 11);
@@ -2082,7 +2083,7 @@ mod tests {
 
     /// Number of `set_window_bounds` requests queued for xdg_toplevel 13.
     fn queued_window_bounds(ctx: &Context) -> usize {
-        let Some(&aura_toplevel) = ctx.xdg_toplevel_to_zaura_toplevel.get(&13) else {
+        let Some(aura_toplevel) = ctx.window_placement.aura_toplevel_for_xdg_toplevel(13) else {
             return 0;
         };
         ctx.client_to_host_queue
@@ -2119,8 +2120,8 @@ mod tests {
             Action::Forward,
             "the release must close the guest press delivered by text-input"
         );
-        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
-        assert!(ctx.window_bounds_barriers.is_empty());
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert_eq!(
             queued_window_bounds(&ctx),
             0,
@@ -2152,8 +2153,8 @@ mod tests {
             Action::Drop,
             "the recovered pair is already balanced"
         );
-        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
-        assert!(ctx.window_bounds_barriers.is_empty());
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
@@ -2167,7 +2168,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(queued_window_bounds(&ctx), 1);
-        let barriers = ctx.window_bounds_barriers.len();
+        let barriers = ctx.window_placement.barrier_count();
 
         assert_eq!(
             handler.on_key(&mut ctx, 2, 130, key, WL_KEY_PRESSED),
@@ -2179,7 +2180,7 @@ mod tests {
             1,
             "a duplicate press must not place the window again"
         );
-        assert_eq!(ctx.window_bounds_barriers.len(), barriers);
+        assert_eq!(ctx.window_placement.barrier_count(), barriers);
         assert_eq!(
             ctx.guest_key_owner(keyboard, key),
             Some(GuestKeyOwner::CompositorShortcut)
@@ -2263,7 +2264,7 @@ mod tests {
         let host_xdg_toplevel = 23u32;
         let output = 25u32;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -2320,9 +2321,9 @@ mod tests {
                 .find(|(message, _)| {
                     let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
                     u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                        == *ctx
-                            .xdg_toplevel_to_zaura_toplevel
-                            .get(&xdg_toplevel)
+                        == ctx
+                            .window_placement
+                            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
                             .unwrap()
                         && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
                 })

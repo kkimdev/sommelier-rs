@@ -920,7 +920,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
                 host_id,
             );
-            if bound && ctx.window_bounds_as_arc {
+            if bound && ctx.window_placement.uses_arc_bounds() {
                 // A guest may bind an output before the host registry has
                 // delivered zaura_shell. Retry every already-live output now
                 // that the shell object and its version are available; the
@@ -1256,7 +1256,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         }
-        if interface == "wl_output" && ctx.window_bounds_as_arc {
+        if interface == "wl_output" && ctx.window_placement.uses_arc_bounds() {
             // The Aura output extension carries the logical work-area insets
             // that wl_output itself does not expose. It is host-only; the
             // guest continues to receive the ordinary wl_output events.
@@ -1798,7 +1798,7 @@ mod tests {
     #[test]
     fn late_zaura_shell_binding_attaches_existing_outputs() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_bounds_as_arc = true;
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
@@ -2213,14 +2213,14 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
+        ctx.window_placement.remember_aura_surface(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_ne!(ctx.shadow_table.allocate_host_id(), shell_id);
         assert_ne!(ctx.shadow_table.allocate_host_id(), surface_id);
         assert_eq!(
-            ctx.wl_surface_to_zaura_surface.get(&50),
-            Some(&surface_id),
+            ctx.window_placement.aura_surface_for_wl_surface(50),
+            Some(surface_id),
             "legacy aura children also survive global removal"
         );
         assert_eq!(
@@ -2253,14 +2253,14 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.wl_surface_to_zaura_surface.insert(50, surface_id);
+        ctx.window_placement.remember_aura_surface(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_eq!(ctx.host_zaura_shell_id, None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(
-            ctx.wl_surface_to_zaura_surface.get(&50),
-            Some(&surface_id),
+            ctx.window_placement.aura_surface_for_wl_surface(50),
+            Some(surface_id),
             "global removal must not destroy an existing aura child"
         );
         assert_eq!(
