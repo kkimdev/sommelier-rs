@@ -1658,8 +1658,10 @@ mod tests {
             .map_id(xdg_surface_id, xdg_surface_id + 100);
         ctx.shadow_table
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
-        ctx.host_zaura_shell_id = Some(zaura_shell_host);
-        ctx.host_zaura_shell_version = 38;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: zaura_shell_host,
+            version: 38,
+        });
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
@@ -2664,7 +2666,7 @@ mod tests {
     #[test]
     fn set_app_id_noop_when_no_zaura_shell() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.host_zaura_shell_id = None;
+        ctx.host_zaura_shell = None;
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;
@@ -5166,7 +5168,10 @@ mod tests {
     #[test]
     fn old_aura_surface_stays_reserved_without_release_request() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        ctx.host_zaura_shell_version = 37;
+        ctx.host_zaura_shell
+            .as_mut()
+            .expect("bound zaura_shell")
+            .version = 37;
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;

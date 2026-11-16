@@ -239,8 +239,10 @@ mod tests {
             "wl_surface".to_string(),
             4,
         );
-        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
-        ctx.host_zaura_shell_version = 38;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: ZAURA_SHELL_HOST,
+            version: 38,
+        });
         ctx.shadow_table.track_host_interface_with_version(
             ZAURA_SHELL_HOST,
             "zaura_shell".to_string(),
@@ -359,13 +361,16 @@ mod tests {
     #[test]
     fn gtk_metadata_reaches_a_shell_bound_after_the_surface() {
         let mut ctx = setup_ctx();
-        ctx.host_zaura_shell_id = None;
+        ctx.host_zaura_shell = None;
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
         assert!(ctx.client_to_host_queue.is_empty());
 
-        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: ZAURA_SHELL_HOST,
+            version: 38,
+        });
         ctx.last_sender_id = GTK_SURFACE;
         handler.on_set_dbus_properties(
             &mut ctx,

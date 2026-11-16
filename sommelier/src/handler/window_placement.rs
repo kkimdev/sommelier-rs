@@ -309,7 +309,10 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
     }
 
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
-    if ctx.host_zaura_shell_version < PLACEMENT_TOPLEVEL_SINCE {
+    if ctx
+        .host_zaura_shell
+        .is_none_or(|shell| shell.version < PLACEMENT_TOPLEVEL_SINCE)
+    {
         return None;
     }
     let zaura_toplevel_host_id =
@@ -784,8 +787,10 @@ mod tests {
             .map_id(xdg_surface_id, xdg_surface_id + 100);
         ctx.shadow_table
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
-        ctx.host_zaura_shell_id = Some(zaura_shell_host);
-        ctx.host_zaura_shell_version = 38;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: zaura_shell_host,
+            version: 38,
+        });
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
@@ -895,8 +900,10 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, 12);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: 24,
+            version: 38,
+        });
         ctx.outputs.bind_for_test(
             25,
             crate::state::OutputState {
@@ -1029,8 +1036,10 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: 24,
+            version: 38,
+        });
         ctx.outputs.bind_for_test(
             primary_output,
             crate::state::OutputState {
@@ -1327,7 +1336,10 @@ mod tests {
         ] {
             let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
                 setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
-            ctx.host_zaura_shell_version = shell_version;
+            ctx.host_zaura_shell
+                .as_mut()
+                .expect("bound zaura_shell")
+                .version = shell_version;
             attach_toplevel(&mut ctx, xdg_toplevel_id, 100);
             assert_eq!(
                 ctx.window_placement
@@ -1350,7 +1362,10 @@ mod tests {
     #[test]
     fn aura_toplevel_without_release_is_retired_silently() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.host_zaura_shell_version = REQ_RELEASE_AURA_TOPLEVEL_SINCE - 1;
+        ctx.host_zaura_shell
+            .as_mut()
+            .expect("bound zaura_shell")
+            .version = REQ_RELEASE_AURA_TOPLEVEL_SINCE - 1;
         let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
 

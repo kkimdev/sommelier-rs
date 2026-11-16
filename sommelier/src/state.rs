@@ -739,6 +739,16 @@ pub(crate) enum PostDispatch {
     XdgToplevelCreated { xdg_surface: u32, xdg_toplevel: u32 },
 }
 
+/// The proxy's internal host `zaura_shell` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostAuraShell {
+    pub(crate) id: u32,
+    /// The bound version, clamped by the `zaura_shell` bind in
+    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Every
+    /// Aura child created from this binding takes it.
+    pub(crate) version: u32,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -905,12 +915,9 @@ pub struct Context {
     pub dmabuf_guest_generations: HashMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
-    /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
-    pub host_zaura_shell_id: Option<u32>,
-    /// Bound version of zaura_shell, clamped by the `zaura_shell` bind in
-    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Used to
-    /// guard opcodes that require specific protocol versions.
-    pub host_zaura_shell_version: u32,
+    /// The internal host zaura_shell binding (not exposed to the guest), if
+    /// one is bound.
+    pub(crate) host_zaura_shell: Option<HostAuraShell>,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
     /// This connection's ARC bounds policy state (see
@@ -1311,8 +1318,7 @@ impl Context {
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
             xdg_decoration,
-            host_zaura_shell_id: None,
-            host_zaura_shell_version: 0,
+            host_zaura_shell: None,
             vm_identifier,
             window_placement,
             outputs: OutputRegistry::default(),

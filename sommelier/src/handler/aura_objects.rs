@@ -65,22 +65,18 @@ impl AuraChild {
     };
 }
 
-/// Return the negotiated version of a host Aura child object.
-///
-/// Aura children take the version of the `zaura_shell` that created them,
-/// and [`create`] records it. Every caller passes a live child, so a missing
-/// version is a bookkeeping bug and fails the debug assertion. Release
-/// builds fall back to the current shell version, the version the child
-/// would have been created with: at worst that sends or skips one
-/// version-gated request, which is better than crashing every client of
-/// the proxy.
+/// The version [`create`] recorded for a live Aura child: its shell's.
+/// A missing one is a bookkeeping bug; release builds then guess the
+/// current shell's version (0 without one) rather than crash the proxy.
 pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
     let version = ctx.shadow_table.host_object_version(aura_object_host_id);
     debug_assert!(
         version.is_some(),
         "Aura child {aura_object_host_id} has no recorded version"
     );
-    version.unwrap_or(ctx.host_zaura_shell_version)
+    version
+        .or(ctx.host_zaura_shell.map(|shell| shell.version))
+        .unwrap_or_default()
 }
 
 /// Create a host Aura child that extends `parent_host_id`.
@@ -97,17 +93,17 @@ pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u3
 ///
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
-    let shell_host_id = ctx.host_zaura_shell_id?;
+    let shell = ctx.host_zaura_shell?;
     let child_host_id = ctx.shadow_table.allocate_host_id();
     ctx.shadow_table.track_host_interface_with_version(
         child_host_id,
         child.interface.to_string(),
-        ctx.host_zaura_shell_version,
+        shell.version,
     );
     let mut builder = MessageBuilder::new();
     builder.write_u32(child_host_id);
     builder.write_u32(parent_host_id);
-    let message = builder.build_message(shell_host_id, child.get_opcode);
+    let message = builder.build_message(shell.id, child.get_opcode);
     ctx.client_to_host_queue.push((message, Vec::new()));
     Some(child_host_id)
 }
@@ -192,8 +188,10 @@ mod tests {
 
     fn ctx_with_shell(version: u32) -> Context {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_zaura_shell_id = Some(SHELL_HOST);
-        ctx.host_zaura_shell_version = version;
+        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
+            id: SHELL_HOST,
+            version,
+        });
         ctx
     }
 
