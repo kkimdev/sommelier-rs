@@ -16,42 +16,31 @@ limitations under the License.
 
 //! Work-area geometry for compositor-owned window placement.
 //!
-//! [`NormalizedRect`] is the single description of *where* a placement
-//! shortcut puts a window: `[x, y, width, height]` as fractions of the
-//! output work area. The nine named [`WindowLayoutAction`] presets are
-//! expressed as such rectangles ([`WindowLayoutAction::rect`]), and every
-//! placement — named or configured — goes through
-//! [`NormalizedRect::to_work_area_bounds`], so there is exactly one rounding
-//! rule.
+//! This module owns *where* a placement shortcut puts a window:
 //!
-//! # Rounding
+//! * [`WindowLayoutAction`] - the placement vocabulary: nine named presets
+//!   plus an arbitrary configured rectangle, and the one parser for the
+//!   preset names ([`WindowLayoutAction::from_name`]).
+//! * [`NormalizedRect`] - `[x, y, width, height]` as fractions of the output
+//!   work area. Every action resolves to one ([`WindowLayoutAction::rect`]),
+//!   and every placement goes through [`NormalizedRect::to_work_area_bounds`],
+//!   so there is exactly one rounding rule.
 //!
-//! A rectangle is stored as its four edge fractions. On validation, an edge
-//! within [`EDGE_TOLERANCE`] of `0` or `1` snaps to exactly `0` or `1`, which
-//! absorbs decimal-to-binary error such as `0.7 + 0.3` or `2 * (1 / 3)`.
+//! The module depends on nothing else in the crate; the configuration
+//! parsers and the keyboard handler depend on it.
 //!
-//! For a work area `(X, Y, W, H)` each edge fraction `f` maps to the pixel
-//! offset `floor(f * W + PIXEL_BIAS)` (or `H`), computed in `f64` and clamped
-//! to `[0, W]`. The window is `(X + left, Y + top, right - left, bottom -
-//! top)`. Flooring shared edge fractions keeps adjacent rectangles sharing one
-//! boundary, and for the half splits used by the presets it reproduces integer
-//! division (`W / 2`) exactly. The `PIXEL_BIAS` of one millionth of a pixel
-//! only absorbs representation error, so `1 / 3` written as
-//! `0.3333333333333333` still lands on the intended pixel.
+//! # Rules
 //!
-//! A placement is refused (`None`) instead of emitting degenerate bounds when
-//! the work area is too small to represent the rectangle: an edge strictly
-//! inside the unit interval that lands on the work-area border, or an empty
-//! extent after rounding.
+//! The rules this module implements are specified once, in
+//! `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`: the edge band in
+//! "Validation", the precision a rect needs in "Precision", and the pixel
+//! mapping in "From rectangle to window bounds". The constants and the unit
+//! tests below are the code side of that contract.
 
 use thiserror::Error;
 
-use crate::accelerator::WindowLayoutAction;
-
-/// Edge-fraction tolerance for floating-point representation error.
-///
-/// `x + width` may exceed `1.0` by at most this much, and an edge this close
-/// to `0` or `1` snaps onto the work-area border.
+/// Distance within which an edge fraction is a work-area border (the edge
+/// band; see the module rules).
 const EDGE_TOLERANCE: f64 = 1e-9;
 
 /// Sub-pixel bias added before flooring an edge to a pixel offset.
@@ -60,6 +49,26 @@ const EDGE_TOLERANCE: f64 = 1e-9;
 /// so the bias corrects representation error without moving any edge that
 /// was meant to fall between pixels.
 const PIXEL_BIAS: f64 = 1e-6;
+
+/// Actions that may be bound to compositor-owned window placement shortcuts.
+///
+/// Every action resolves to a normalized work-area rectangle through
+/// [`WindowLayoutAction::rect`], so named presets and configured rectangles
+/// share one rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum WindowLayoutAction {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Fullscreen,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+    /// An arbitrary validated rectangle from the shortcut configuration file.
+    Rect(NormalizedRect),
+}
 
 /// Reasons a rectangle is not a valid normalized work-area rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -118,14 +127,15 @@ impl NormalizedRect {
         if !(width > 0.0 && width <= 1.0 && height > 0.0 && height <= 1.0) {
             return Err(RectError::SizeOutOfRange);
         }
-        if x + width > 1.0 + EDGE_TOLERANCE || y + height > 1.0 + EDGE_TOLERANCE {
+        let (right, bottom) = (snap_edge(x + width), snap_edge(y + height));
+        if right > 1.0 || bottom > 1.0 {
             return Err(RectError::ExceedsWorkArea);
         }
         Ok(Self {
             left: snap_edge(x),
             top: snap_edge(y),
-            right: snap_edge(x + width),
-            bottom: snap_edge(y + height),
+            right,
+            bottom,
         })
     }
 
@@ -138,8 +148,8 @@ impl NormalizedRect {
     ///
     /// # Returns
     ///
-    /// `(x, y, width, height)` screen bounds using the module-level rounding
-    /// rule, or `None` when the work area is empty, too small to represent the
+    /// `(x, y, width, height)` screen bounds using the rounding rule (see the
+    /// module rules), or `None` when the work area is empty, too small to represent the
     /// rectangle without collapsing an interior edge, or the absolute
     /// coordinates overflow `i32`.
     pub(crate) fn to_work_area_bounds(
@@ -170,10 +180,13 @@ impl NormalizedRect {
 }
 
 /// Snap an edge fraction within [`EDGE_TOLERANCE`] of a border onto it.
+///
+/// A fraction further than the tolerance outside `[0, 1]` is returned
+/// unchanged, so the caller's range check rejects it.
 fn snap_edge(fraction: f64) -> f64 {
     if fraction < EDGE_TOLERANCE {
         0.0
-    } else if fraction > 1.0 - EDGE_TOLERANCE {
+    } else if fraction > 1.0 - EDGE_TOLERANCE && fraction <= 1.0 + EDGE_TOLERANCE {
         1.0
     } else {
         fraction
@@ -193,7 +206,7 @@ fn span(start: f64, end: f64, extent: i32) -> Option<(i32, i32)> {
     (end > start).then_some((start, end))
 }
 
-/// Round an edge fraction to a pixel offset; see the module rounding rule.
+/// Round an edge fraction to a pixel offset (see the module rules).
 fn edge(fraction: f64, extent: i32) -> Option<i32> {
     debug_assert!(fraction.is_finite() && (0.0..=1.0).contains(&fraction));
     // `fraction * extent` is at most `i32::MAX` plus the bias, so the cast
@@ -209,11 +222,43 @@ fn edge(fraction: f64, extent: i32) -> Option<i32> {
 }
 
 impl WindowLayoutAction {
+    /// Resolve a named preset, case-insensitively.
+    ///
+    /// This is the one parser for preset names; both configuration sources
+    /// use it.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
+    ///   `right`, `bottom-left`, `bottom`, or `bottom-right`, optionally
+    ///   surrounded by whitespace.
+    ///
+    /// # Returns
+    ///
+    /// The matching preset, or `None` for any other spelling.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "top-left" => Some(Self::TopLeft),
+            "top" => Some(Self::Top),
+            "top-right" => Some(Self::TopRight),
+            "left" => Some(Self::Left),
+            "fullscreen" => Some(Self::Fullscreen),
+            "right" => Some(Self::Right),
+            "bottom-left" => Some(Self::BottomLeft),
+            "bottom" => Some(Self::Bottom),
+            "bottom-right" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
+
     /// Return the normalized work-area rectangle for this action.
     ///
     /// The named presets split the work area into halves; a configured
     /// [`WindowLayoutAction::Rect`] returns its own rectangle.
     pub(crate) fn rect(self) -> NormalizedRect {
+        // The presets are exact binary fractions inside the unit square, so
+        // validation could not change them; a test proves that this
+        // infallible shortcut equals `NormalizedRect::new` of each preset.
         const fn preset(x: f64, y: f64, width: f64, height: f64) -> NormalizedRect {
             NormalizedRect {
                 left: x,
@@ -468,15 +513,110 @@ mod tests {
         );
     }
 
+    /// The preset table, written independently of `WindowLayoutAction::rect`.
+    const PRESET_COMPONENTS: [(WindowLayoutAction, [f64; 4]); 9] = [
+        (WindowLayoutAction::TopLeft, [0.0, 0.0, 0.5, 0.5]),
+        (WindowLayoutAction::Top, [0.0, 0.0, 1.0, 0.5]),
+        (WindowLayoutAction::TopRight, [0.5, 0.0, 0.5, 0.5]),
+        (WindowLayoutAction::Left, [0.0, 0.0, 0.5, 1.0]),
+        (WindowLayoutAction::Fullscreen, [0.0, 0.0, 1.0, 1.0]),
+        (WindowLayoutAction::Right, [0.5, 0.0, 0.5, 1.0]),
+        (WindowLayoutAction::BottomLeft, [0.0, 0.5, 0.5, 0.5]),
+        (WindowLayoutAction::Bottom, [0.0, 0.5, 1.0, 0.5]),
+        (WindowLayoutAction::BottomRight, [0.5, 0.5, 0.5, 0.5]),
+    ];
+
+    /// The `const fn` preset shortcut must never drift from validation.
     #[test]
-    fn preset_rects_pass_validation() {
-        for action in PRESETS {
-            let [x, y, width, height] = action.rect().components();
+    fn presets_equal_the_validated_rect_of_the_same_values() {
+        assert_eq!(PRESET_COMPONENTS.map(|(action, _)| action), PRESETS);
+        for (action, [x, y, width, height]) in PRESET_COMPONENTS {
             assert_eq!(
                 NormalizedRect::new(x, y, width, height),
                 Ok(action.rect()),
                 "{action:?}"
             );
         }
+    }
+
+    #[test]
+    fn preset_names_parse_case_insensitively_and_reject_others() {
+        let names = [
+            "top-left",
+            "top",
+            "top-right",
+            "left",
+            "fullscreen",
+            "right",
+            "bottom-left",
+            "bottom",
+            "bottom-right",
+        ];
+        for (name, action) in names.into_iter().zip(PRESETS) {
+            assert_eq!(WindowLayoutAction::from_name(name), Some(action));
+        }
+        assert_eq!(
+            WindowLayoutAction::from_name(" Top-Left "),
+            Some(WindowLayoutAction::TopLeft)
+        );
+        for other in ["", "tile", "top_left", "window.place"] {
+            assert_eq!(WindowLayoutAction::from_name(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn edge_tolerance_is_one_symmetric_border_band() {
+        // Inside the band on either side of 1: the edge is the border.
+        for overshoot in [-0.5e-9, 0.0, 0.5e-9, 0.9e-9] {
+            let rect = NormalizedRect::new(0.5, 0.0, 0.5 + overshoot, 1.0).unwrap();
+            assert_eq!(rect.components()[2], 0.5, "overshoot {overshoot}");
+        }
+        // Past the band above 1: out of range.
+        assert_eq!(
+            NormalizedRect::new(0.5, 0.0, 0.5 + 2e-9, 1.0),
+            Err(RectError::ExceedsWorkArea)
+        );
+        // Past the band below 1: an ordinary interior edge.
+        let rect = NormalizedRect::new(0.5, 0.0, 0.5 - 2e-9, 1.0).unwrap();
+        assert!(rect.components()[2] < 0.5);
+    }
+
+    /// Round-trip `value` through a decimal with 16 significant digits.
+    fn sixteen_digits(value: f64) -> f64 {
+        format!("{value:.15e}").parse().unwrap()
+    }
+
+    /// The precision contract in the configuration doc: 16 significant digits land
+    /// every edge on the pixel its exact fraction names.
+    #[test]
+    fn sixteen_significant_digits_land_on_the_intended_pixel() {
+        let extents = (1..=600).chain([1366, 1920, 2560, 3840, 7680, 65_536, 1_000_000]);
+        for extent in extents {
+            let step = usize::try_from(extent / 600).unwrap().max(1);
+            for left in (0..extent).step_by(step) {
+                // A pseudo-random right edge strictly after `left`.
+                let spread = i64::from(extent - left);
+                let right = left + 1 + i32::try_from(i64::from(left) * 7919 % spread).unwrap();
+                let right = right.min(extent);
+                let x = sixteen_digits(f64::from(left) / f64::from(extent));
+                let width = sixteen_digits(f64::from(right - left) / f64::from(extent));
+                let rect = NormalizedRect::new(x, 0.0, width, 1.0).unwrap();
+                assert_eq!(
+                    rect.to_work_area_bounds((0, 0, extent, 1)),
+                    Some((left, 0, right - left, 1)),
+                    "edges {left}..{right} of {extent} written as x={x:e} width={width:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_decimal_rounded_down_can_land_one_pixel_short() {
+        // The counterexample quoted in the configuration doc.
+        let third = NormalizedRect::new(0.3333333, 0.0, 0.6666667, 1.0).unwrap();
+        assert_eq!(
+            third.to_work_area_bounds((0, 0, 1920, 1)),
+            Some((639, 0, 1281, 1))
+        );
     }
 }

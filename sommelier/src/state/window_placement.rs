@@ -16,12 +16,15 @@ limitations under the License.
 
 //! State and lifecycle invariants for compositor-owned window placement.
 //!
-//! [`WindowPlacementState`] is the single owner of the opt-in ARC bounds
-//! policy: whether it is enabled, the per-surface ARC policy identities, the
-//! host Aura surface/toplevel associations, the host-stream sync barriers that
-//! order `zaura_toplevel.set_window_bounds`, and the configures held behind
-//! those barriers. The maps are private so handlers cannot update one side of
-//! an association, or retire a toplevel, without the matching cleanup.
+//! [`WindowPlacementState`] is the single owner of one connection's state
+//! for the opt-in ARC bounds policy: the per-surface ARC policy identities,
+//! the host Aura surface/toplevel associations, the host-stream sync barriers
+//! that order `zaura_toplevel.set_window_bounds`, and the configures held
+//! behind those barriers. Whether the policy is active is decided once per
+//! process by `crate::placement_config::PlacementConfig`, which hands this
+//! state the process's ARC task-ID block. The maps are private so handlers
+//! cannot update one side of an association, or retire a toplevel, without
+//! the matching cleanup.
 //!
 //! Wire encoding stays in the protocol handlers; this type only answers
 //! ownership questions and returns the IDs whose host teardown the caller must
@@ -74,14 +77,12 @@ pub(crate) struct HeldWindowBoundsConfigures {
 
 /// All mutable state owned by the window-placement feature for one client
 /// connection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WindowPlacementState {
-    /// Experimental host-policy workaround: identify the host surface as an
-    /// ARC window so Exo permits `zaura_toplevel.set_window_bounds`.
-    arc_bounds: bool,
-    /// Process-shared allocator backing the fabricated ARC policy identities.
-    /// `None` means the process could not reserve a collision-free block;
-    /// identity allocation then fails closed.
+    /// The process's ARC task-ID block, from `PlacementConfig`. `Some` is
+    /// the experimental host-policy workaround being active: the host
+    /// surface is identified as an ARC window so Exo permits
+    /// `zaura_toplevel.set_window_bounds`.
     arc_id_allocator: Option<&'static ArcIdAllocator>,
     /// Guest wl_surface ID → ARC policy identity, stable for the surface's
     /// lifetime.
@@ -113,69 +114,31 @@ pub(crate) struct WindowPlacementState {
 }
 
 impl WindowPlacementState {
-    /// Return whether `SOMMELIER_WINDOW_BOUNDS_AS_ARC` requests the ARC
-    /// bounds policy. The request is process-wide; whether a connection can
-    /// actually use it also depends on the identity allocator
-    /// ([`Self::from_environment`]).
-    pub(crate) fn arc_bounds_requested() -> bool {
-        super::env_flag_is_true(
-            std::env::var("SOMMELIER_WINDOW_BOUNDS_AS_ARC")
-                .ok()
-                .as_deref(),
-        )
-    }
-
-    /// Resolve the ARC bounds policy from the process environment.
+    /// Create one connection's placement state.
     ///
-    /// `SOMMELIER_WINDOW_BOUNDS_AS_ARC` requests the policy. ARC application
-    /// IDs are the capability that makes the direct Aura bounds policy safe
-    /// to attempt, so if the process cannot reserve a collision-free identity
-    /// block the entire workaround stays off rather than creating Aura
-    /// objects that can never be authorized. The allocator logs that failure
-    /// once for the process.
-    pub(crate) fn from_environment() -> Self {
-        let arc_id_allocator = if Self::arc_bounds_requested() {
-            crate::arc_task_ids::process_allocator()
-        } else {
-            None
-        };
+    /// # Arguments
+    ///
+    /// * `arc_id_allocator` - `PlacementConfig::arc_id_allocator`: the
+    ///   process's ARC task-ID block while the ARC bounds policy is active,
+    ///   `None` while it is off.
+    pub(crate) fn new(arc_id_allocator: Option<&'static ArcIdAllocator>) -> Self {
         Self {
-            arc_bounds: arc_id_allocator.is_some(),
             arc_id_allocator,
-            ..Self::default()
+            arc_application_ids: HashMap::new(),
+            arc_application_ids_applied: HashSet::new(),
+            aura_surface_by_wl_surface: HashMap::new(),
+            aura_toplevel_by_xdg_toplevel: HashMap::new(),
+            xdg_toplevel_by_aura_toplevel: HashMap::new(),
+            barrier_toplevels: HashMap::new(),
+            active_barriers: HashMap::new(),
+            held_configures: HashMap::new(),
+            held_surface_configures: HashMap::new(),
         }
-    }
-
-    /// Deterministic unit-test state: the policy is disabled regardless of
-    /// the developer's environment, but a private allocator is installed so a
-    /// test can enable the policy with [`Self::set_arc_bounds_for_test`].
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            arc_id_allocator: Some(ArcIdAllocator::for_test(
-                crate::arc_task_ids::ARC_ID_POOL_START,
-                crate::arc_task_ids::ARC_ID_POOL_START + crate::arc_task_ids::ARC_ID_BLOCK_SIZE - 1,
-            )),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_arc_bounds_for_test(&mut self, enabled: bool) {
-        self.arc_bounds = enabled;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_arc_id_allocator_for_test(
-        &mut self,
-        allocator: Option<&'static ArcIdAllocator>,
-    ) {
-        self.arc_id_allocator = allocator;
     }
 
     /// Return whether the opt-in ARC bounds placement policy is active.
     pub(crate) const fn uses_arc_bounds(&self) -> bool {
-        self.arc_bounds
+        self.arc_id_allocator.is_some()
     }
 
     /// Verify the ownership graph after every mutation in debug/test builds,
@@ -221,14 +184,10 @@ impl WindowPlacementState {
     ///
     /// # Returns
     ///
-    /// `None` when the ARC bounds policy is disabled, no allocator is
-    /// available, or the allocator's block is exhausted (which the allocator
-    /// logs once).
+    /// `None` when the ARC bounds policy is off or the process's block is
+    /// exhausted (which the allocator logs once).
     pub(crate) fn arc_application_id(&mut self, wl_surface_guest_id: u32) -> Option<String> {
-        if !self.arc_bounds {
-            return None;
-        }
-        let allocator = self.arc_id_allocator.as_ref()?;
+        let allocator = self.arc_id_allocator?;
         if let Some(application_id) = self.arc_application_ids.get(&wl_surface_guest_id) {
             return Some(application_id.clone());
         }
@@ -508,27 +467,35 @@ mod tests {
         }
     }
 
+    /// State for a connection with the ARC bounds policy active.
+    fn active() -> WindowPlacementState {
+        WindowPlacementState::new(Some(ArcIdAllocator::block_for_test()))
+    }
+
+    /// State for a connection with the ARC bounds policy off.
+    fn inactive() -> WindowPlacementState {
+        WindowPlacementState::new(None)
+    }
+
     #[test]
     fn disabled_policy_cannot_allocate_arc_identities() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         assert!(!state.uses_arc_bounds());
         assert_eq!(state.arc_application_id(10), None);
         assert!(!state.has_arc_application_ids());
     }
 
     #[test]
-    fn missing_allocator_fails_closed() {
-        let mut state = WindowPlacementState::for_test();
-        state.set_arc_bounds_for_test(true);
-        state.set_arc_id_allocator_for_test(None);
+    fn exhausted_allocator_fails_closed() {
+        let mut state = WindowPlacementState::new(Some(ArcIdAllocator::exhausted_for_test()));
+        assert!(state.uses_arc_bounds());
         assert_eq!(state.arc_application_id(10), None);
         assert!(!state.has_arc_application_ids());
     }
 
     #[test]
     fn surface_release_retires_identity_applied_flag_and_aura_surface() {
-        let mut state = WindowPlacementState::for_test();
-        state.set_arc_bounds_for_test(true);
+        let mut state = active();
         let first = state.arc_application_id(10).expect("ARC identity");
         assert_eq!(state.arc_application_id(10), Some(first.clone()));
         state.mark_arc_application_id_applied(10);
@@ -548,8 +515,7 @@ mod tests {
 
     #[test]
     fn applied_flag_can_be_rolled_back_without_losing_identity() {
-        let mut state = WindowPlacementState::for_test();
-        state.set_arc_bounds_for_test(true);
+        let mut state = active();
         let identity = state.arc_application_id(10).expect("ARC identity");
         state.mark_arc_application_id_applied(10);
         assert!(state.arc_application_id_applied(10));
@@ -560,7 +526,7 @@ mod tests {
 
     #[test]
     fn toplevel_association_resolves_both_directions_until_taken() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         state.remember_aura_toplevel(10, 70);
         assert_eq!(state.aura_toplevel_for_xdg_toplevel(10), Some(70));
         assert_eq!(state.xdg_toplevel_for_aura_toplevel(70), Some(10));
@@ -573,7 +539,7 @@ mod tests {
 
     #[test]
     fn taking_toplevel_clears_gate_and_held_configures_but_keeps_callback_owned() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         state.remember_aura_toplevel(10, 77);
         state.register_barrier(40, 77);
         assert!(state.hold_configure(77, configure(10)));
@@ -593,7 +559,7 @@ mod tests {
 
     #[test]
     fn configures_are_held_only_behind_an_active_barrier() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         state.remember_aura_toplevel(10, 77);
         assert!(!state.hold_configure(77, configure(10)));
         assert!(!state.hold_surface_configure(77, surface_configure(1)));
@@ -619,7 +585,7 @@ mod tests {
 
     #[test]
     fn stale_barrier_completion_keeps_newer_barrier_and_held_configures() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         state.remember_aura_toplevel(10, 77);
         state.register_barrier(40, 77);
         state.register_barrier(41, 77);
@@ -639,7 +605,7 @@ mod tests {
 
     #[test]
     fn unknown_callback_is_not_a_placement_barrier() {
-        let mut state = WindowPlacementState::for_test();
+        let mut state = inactive();
         assert_eq!(state.complete_barrier(40), None);
         state.remember_aura_toplevel(10, 77);
         state.register_barrier(40, 77);

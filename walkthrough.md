@@ -1001,3 +1001,89 @@ ARC allocator: Sommelier 650 passed / 1 ignored (640 on that base),
 sample GUI 12, codegen 7, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. These fixes have not been validated on a host: no
 Sommelier process was started.
+
+## 2026-11-16 — Placement configuration has one owner
+
+Cleanup PR C for review findings S1, S7, A2, A5, A6, A7, H7 and the
+configuration and test-seam part of H5. The contract itself lives in
+`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`; this section records what
+changed and why.
+
+**Before.** The environment bindings were parsed in `Context::new` on every
+connection, warn-only, with their own duplicate and conflict checks. The file
+was parsed once in `main`, fail-closed, with a second copy of those checks.
+`SOMMELIER_ACCELERATORS` and `SOMMELIER_WINDOW_BOUNDS_AS_ARC` were read in
+four places. Each `Context` copied the bindings into a `Vec` and had to call
+`refresh_*` before matching a key. `accelerator.rs` and `window_layout.rs`
+imported each other, and so did `window_shortcuts.rs` and `state.rs`.
+
+**After.**
+
+- `placement_config.rs` (was `window_shortcuts.rs`) owns `PlacementConfig`.
+  `main` resolves it once from the gate, the ARC block,
+  `SOMMELIER_ACCELERATORS` and exactly one binding source, then shares it
+  with every `Context` as an `Arc`. Nothing else reads these variables.
+  Bindings live inside the active ARC policy, so "policy off" and "chord
+  consumed" cannot coexist. The environment source is a policy without a
+  reload path.
+- Both sources produce raw bindings for one validator: size, chord syntax,
+  duplicates after parsing, host-accelerator conflicts, actions and rects.
+  `configured_text` is the only "blank means unset" rule.
+- `Context` asks the shared config through `placement_action_for` and
+  `is_host_accelerator`. A reload swaps the generation's `Arc`, and the
+  next lookup sees it, so `classify_key` takes `&Context`.
+- `WindowPlacementState::new` takes the ARC block from the config, and
+  "policy active" means a block is present. The environment constructor,
+  the gate helper and the `set_*_for_test` seams are gone.
+  `Context::new_for_test` / `with_placement_for_test` read no environment
+  and reserve no real block; tests build configs through the production
+  resolver.
+- Module graph: `accelerator` (chords only) and `window_layout` (actions and
+  geometry) depend on nothing. `placement_config` depends on both and on
+  `arc_task_ids`. `state` depends on `placement_config`. `keyboard`, `proxy`
+  and `main` sit on top. There are no cycles.
+- A7: `main` installs the `SIGHUP` handler before the file is first read.
+- A5: `GuestKeyOwner::admits_compositor_shortcut` is the only statement of
+  the shortcut arbitration contract. The key reducer's `arbitrate` routes
+  every event to the channel that owns its generation, and rejects a
+  shortcut event the contract does not admit instead of acking it. Routing
+  has one owner: `on_key` sends `CompositorShortcutPress` only for the press
+  that claims an unowned key and runs placement, and it sends repeats,
+  releases and duplicate presses as physical events.
+- A6: both model-based key tests now produce the `CompositorShortcut`
+  owner. The extended trace test found that calling the reducer API directly
+  with a physical press of a shortcut-owned key tripped an assertion.
+  `on_key` never sent that combination, so this was not a production bug;
+  `arbitrate` now defines it.
+- H7: the precision a rect needs is documented and tested (16 significant
+  digits land on the intended pixel up to 1,000,000 pixels; `0.3333333`
+  can land one pixel short). A test pins every preset to
+  `NormalizedRect::new` of an independent table. `EDGE_TOLERANCE` now has a
+  single role, a border band, with unchanged results.
+
+**Behavior changes.**
+
+- A placement configuration problem never stops the proxy (lead decision,
+  which replaces an earlier exit-2 draft of this PR). Both sources follow one
+  policy: both sources given, an invalid or non-UTF-8 environment list, an
+  unusable file path or file, or an invalid `SOMMELIER_ACCELERATORS` while a
+  source is requested each log one error per process, and the proxy runs
+  with placement shortcuts disabled. Before, a bad environment list logged a
+  warning on every connection, while a bad file or both sources stopped
+  startup with exit status 2. A file that was unusable at startup is
+  activated by a later valid `SIGHUP` reload. A `SIGHUP` handler that cannot
+  be installed is logged instead of exiting.
+- Shortcuts requested while the gate is off, or while no ARC block can be
+  reserved, log one warning per process, and neither source is read.
+- The ARC block is reserved at startup instead of on the first connection.
+- With `--window-shortcuts-config`, `SIGHUP` is caught even when the file
+  ends up unused; it is then logged and ignored.
+
+Deliberately not done: `Context::new` still reads `SOMMELIER_VM_IDENTIFIER`
+(the test constructors do not), and the GBM allocator it creates reads
+`SOMMELIER_DRM_DEVICE`. Neither is placement configuration.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 664 passed /
+1 ignored (650 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
+1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. Not host-validated: no Sommelier process was started.

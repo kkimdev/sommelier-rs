@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::connection::WaylandConnection;
+use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::state::{Context, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
@@ -185,11 +186,12 @@ impl Client {
         host_conn: WaylandConnection,
         gpu_accel: bool,
         xdg_decoration: bool,
+        placement: Arc<PlacementConfig>,
     ) -> Self {
         Self {
             client_conn,
             host_conn,
-            ctx: Context::new(gpu_accel, xdg_decoration),
+            ctx: Context::new(gpu_accel, xdg_decoration, placement),
             handler: SommelierHandler::new(),
         }
     }
@@ -779,6 +781,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         let render_request = MessageBuilder::new().build_message(7, 0);
@@ -816,6 +819,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         // Use an untracked host event so dispatch has no protocol state to
@@ -872,6 +876,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         for (guest_id, host_id) in [
@@ -1050,6 +1055,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1104,6 +1110,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1162,6 +1169,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1210,6 +1218,7 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         // A client request with an unknown sender is malformed Wayland
@@ -1239,15 +1248,8 @@ mod tests {
             WaylandConnection::new(host_socket.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::arc_bounds_for_test("")),
         );
-        client.ctx.window_placement.set_arc_bounds_for_test(true);
-        client
-            .ctx
-            .window_placement
-            .set_arc_id_allocator_for_test(Some(crate::arc_task_ids::ArcIdAllocator::for_test(
-                crate::arc_task_ids::ARC_ID_POOL_START,
-                crate::arc_task_ids::ARC_ID_POOL_START + 16,
-            )));
         client.ctx.host_zaura_shell_id = Some(40);
         client.ctx.host_zaura_shell_version = 38;
         client.ctx.shadow_table.map_id(10, 20);
@@ -1289,6 +1291,7 @@ mod tests {
             WaylandConnection::new(host_proxy.into_raw_fd()),
             false,
             false,
+            Arc::new(PlacementConfig::for_test(Vec::new())),
         );
 
         // Register one advertised global under the host-side registry ID so
@@ -3784,25 +3787,9 @@ pub async fn run(
     gpu_accel: bool,
     xdg_decoration: bool,
     virtio_wayland: Option<String>,
-    window_shortcuts: Option<crate::window_shortcuts::ShortcutConfigSource>,
+    placement: Arc<PlacementConfig>,
+    mut reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
-    // SIGHUP reloads the shortcut configuration file. The handler is
-    // installed only when a file is in use, so otherwise SIGHUP keeps its
-    // default disposition (terminate). Tokio delivers the signal through its
-    // own self-pipe, and the reload runs on this event loop between accepts.
-    let mut reload_signal = window_shortcuts.as_ref().map(|_| {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-            Ok(signal) => signal,
-            Err(e) => {
-                log::error!(
-                    "Failed to install the SIGHUP shortcut reload handler: {}",
-                    e
-                );
-                std::process::exit(1);
-            }
-        }
-    });
-
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
             .read(true)
@@ -3837,10 +3824,10 @@ pub async fn run(
         .run_until(async move {
             loop {
                 let accepted = tokio::select! {
+                    // The reload runs on this event loop between accepts, so
+                    // it never races a key event.
                     Some(()) = next_reload_signal(&mut reload_signal) => {
-                        if let Some(source) = &window_shortcuts {
-                            source.reload_and_log();
-                        }
+                        placement.reload_and_log();
                         continue;
                     }
                     accepted = listener.accept() => accepted,
@@ -3910,15 +3897,15 @@ pub async fn run(
                         };
 
                         if let Some(host_conn) = host_conn {
-                            let mut client =
-                                Client::new(client_conn, host_conn, gpu_accel, xdg_decoration);
+                            let mut client = Client::new(
+                                client_conn,
+                                host_conn,
+                                gpu_accel,
+                                xdg_decoration,
+                                Arc::clone(&placement),
+                            );
                             if let Some(channel) = virtwayland_channel_ref {
                                 client.ctx.virtwayland_channel = Some(channel);
-                            }
-                            if let Some(source) = &window_shortcuts {
-                                client
-                                    .ctx
-                                    .follow_window_placement_shortcuts(source.subscribe());
                             }
 
                             tokio::task::spawn_local(async move {

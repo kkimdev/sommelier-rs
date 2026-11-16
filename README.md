@@ -210,55 +210,34 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window bounds placement (`1`, `true`, `yes`, or `on`). |
-| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional comma-separated `CHORD=ACTION` bindings, enabled only with the ARC policy gate. |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window placement (`1`, `true`, `yes`, or `on`). See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
+| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
-| `--window-shortcuts-config PATH` | Optional versioned TOML file of placement bindings (named actions or work-area rects), read only with the ARC policy gate; mutually exclusive with `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`; `SIGHUP` reloads it. |
+| `--window-shortcuts-config PATH` | Optional TOML file of placement bindings (named actions or work-area rects), reloaded on `SIGHUP`. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
-When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
-`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier consumes the
-configured chords and places the focused XDG toplevel in the selected
+With the ARC policy gate and placement bindings configured, Sommelier
+consumes the bound chords and places the focused XDG toplevel in the selected
 work-area region of the output that surface has entered. Only a surface with
 no current output association uses the first usable output; a window is never
 moved to another monitor. A matched chord never reaches the guest, even when
 the placement is skipped (for example, with no focused toplevel or before the
-output's metadata is complete); the reason is logged at debug level. A chord
-that the host IME consumes is neither placed nor delivered. For example:
+output's metadata is complete); the reason is logged. A chord that the host
+IME consumes is neither placed nor delivered. For example:
 
 ```text
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
 SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
 ```
 
-The same bindings, plus arbitrary rectangles given as `[x, y, width, height]`
-fractions of the work area, can instead live in a TOML file:
-
-```toml
-# ~/.config/sommelier/shortcuts.toml
-version = 1
-
-[[bindings]]
-chord = "<Alt>q"
-action = "top-left"
-
-[[bindings]]
-chord = "<Alt>w"
-rect = [0.25, 0.0, 0.5, 1.0] # centered half-width column
-```
-
-```text
-SOMMELIER_WINDOW_BOUNDS_AS_ARC=1 sommelier-rs --window-shortcuts-config ~/.config/sommelier/shortcuts.toml ...
-kill -HUP <pid>   # reload; an invalid file keeps the previous bindings
-```
-
-An invalid file, or setting both the file and
-`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, stops startup with exit status 2.
 [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
-describes the schema, validation, rounding rule, and reload semantics.
+owns the configuration contract: both binding sources and the TOML schema,
+which source wins, the failure policy (a configuration problem is logged and
+disables placement shortcuts; it never stops the proxy), reloading, and the
+precision rectangles need.
 
 Work areas use Aura's current output scale and device scale factor, then apply
 the logical rotation and insets. Placement waits for both scale factors to be
@@ -268,14 +247,12 @@ these factors in thousandths, so unusual scale settings may still differ
 slightly from the host's exact logical dimensions.
 
 No placement shortcut is active by default. The policy gate remains opt-in
-because it changes the ChromeOS window-policy namespace; malformed bindings or
-bindings that conflict with `SOMMELIER_ACCELERATORS` disable shortcut
-consumption at startup. The ARC policy may still be enabled without bindings
-for deployments that need the metadata path but no compositor-owned chords. The
-policy needs a process-wide block of fabricated ARC task IDs and is disabled if
-none can be reserved; see
-[Sommelier's task-ID allocator](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator).
+because it changes the ChromeOS window-policy namespace. The ARC policy may
+still be enabled without bindings for deployments that need the metadata path
+but no compositor-owned chords.
 
+`PlacementConfig` in `sommelier/src/placement_config.rs` owns the
+process-wide configuration, and every connection shares it.
 `WindowPlacementState` in `sommelier/src/state/window_placement.rs` is the
 single owner of this policy's per-connection state: the per-surface ARC
 identities, the host Aura surface/toplevel associations, the host-sync bounds

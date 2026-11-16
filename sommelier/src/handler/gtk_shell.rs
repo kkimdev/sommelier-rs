@@ -216,7 +216,14 @@ mod tests {
     const ZAURA_SHELL_HOST: u32 = 200;
 
     fn setup_ctx() -> Context {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        setup_ctx_with(crate::placement_config::PlacementConfig::for_test(
+            Vec::new(),
+        ))
+    }
+
+    /// [`setup_ctx`] with an explicit placement configuration.
+    fn setup_ctx_with(placement: crate::placement_config::PlacementConfig) -> Context {
+        let mut ctx = Context::with_placement_for_test(placement);
         ctx.shadow_table
             .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
         ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
@@ -341,8 +348,8 @@ mod tests {
 
     #[test]
     fn gtk_surface_creation_does_not_allocate_an_arc_identity() {
-        let mut ctx = setup_ctx();
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx =
+            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         ctx.last_sender_id = GTK_SHELL;
         GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
         assert!(
@@ -353,8 +360,8 @@ mod tests {
 
     #[test]
     fn dbus_application_id_preserves_arc_policy_for_window_bounds() {
-        let mut ctx = setup_ctx();
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx =
+            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
         handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);

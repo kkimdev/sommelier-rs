@@ -105,6 +105,23 @@ impl ArcIdAllocator {
     pub(crate) fn for_test(first_id: u32, last_id: u32) -> &'static Self {
         Box::leak(Box::new(Self::new(first_id, last_id, 0)))
     }
+
+    /// A full-size test block, like the one a process reserves.
+    #[cfg(test)]
+    pub(crate) fn block_for_test() -> &'static Self {
+        Self::for_test(
+            ARC_ID_POOL_START,
+            ARC_ID_POOL_START + (ARC_ID_BLOCK_SIZE - 1),
+        )
+    }
+
+    /// A test allocator with no ID left, as after exhaustion.
+    #[cfg(test)]
+    pub(crate) fn exhausted_for_test() -> &'static Self {
+        let allocator = Self::for_test(ARC_ID_POOL_START, ARC_ID_POOL_START);
+        assert!(allocator.allocate().is_some());
+        allocator
+    }
 }
 
 /// Return the inclusive ID range of block `index`.
@@ -129,11 +146,11 @@ static PROCESS_BLOCK: OnceLock<Option<ReservedBlock>> = OnceLock::new();
 
 /// Return this process's allocator, reserving its block on the first call.
 ///
-/// A failed reservation is logged once and cached for the process. Its causes
-/// (no private runtime directory, no lock directory, no randomness, every
-/// block taken) do not clear while the process runs, and retrying per
-/// connection would repeat the warning and let connections disagree about
-/// whether ARC placement is on.
+/// `PlacementConfig::from_environment` calls this once, at startup, when
+/// `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set. A failed reservation is logged
+/// once and cached for the process: its causes (no private runtime
+/// directory, no lock directory, no randomness, every block taken) do not
+/// clear while the process runs.
 pub(crate) fn process_allocator() -> Option<&'static ArcIdAllocator> {
     PROCESS_BLOCK
         .get_or_init(|| match reserve_process_block() {

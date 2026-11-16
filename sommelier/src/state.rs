@@ -29,7 +29,7 @@ use self::render::RenderBufferRegistry;
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
-use log::{debug, warn};
+use log::warn;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -47,6 +47,7 @@ pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
     PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, WindowPlacementState,
 };
+use crate::placement_config::PlacementConfig;
 
 /// A Wayland object ID allocated by the **guest** (client) side.
 ///
@@ -878,15 +879,10 @@ pub struct Context {
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
     /// synthesizes a wl_keyboard event.
     pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
-    /// Parsed SOMMELIER_ACCELERATORS: keys the host should handle.
-    pub accelerators: Vec<crate::accelerator::Accelerator>,
-    /// Explicitly configured compositor-owned placement shortcuts. An empty
-    /// list means the feature consumes no keyboard chords.
-    pub window_placement_shortcuts: Vec<crate::accelerator::WindowPlacementShortcut>,
-    /// Shared `--window-shortcuts-config` bindings followed by this
-    /// connection. A reloaded generation replaces
-    /// `window_placement_shortcuts` before the next key press is matched.
-    window_placement_shortcut_updates: Option<crate::window_shortcuts::ShortcutSubscription>,
+    /// The process-wide placement configuration: host accelerators, the
+    /// ARC bounds policy, and the placement bindings. Shared, never copied:
+    /// a reloaded binding generation is visible to the next lookup.
+    placement: Arc<PlacementConfig>,
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
@@ -963,9 +959,9 @@ pub struct Context {
     pub host_zaura_shell_version: u32,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
-    /// Single owner of the opt-in ARC bounds policy and its placement state:
-    /// ARC identities, Aura surface/toplevel associations, bounds barriers,
-    /// and configures held behind them.
+    /// Single owner of this connection's ARC bounds policy state: ARC
+    /// identities, Aura surface/toplevel associations, bounds barriers, and
+    /// configures held behind them. Built from `placement`.
     pub(crate) window_placement: WindowPlacementState,
     /// Host wl_output IDs advertised to the guest.
     pub output_host_ids: Vec<u32>,
@@ -1271,7 +1267,28 @@ impl Context {
             .take_guest_owner_if(host_keyboard_id, key, expected)
     }
 
-    pub fn new(gpu_accel: bool, xdg_decoration: bool) -> Self {
+    /// Create the state for one client connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
+    /// * `placement` - the process-wide placement configuration, resolved
+    ///   once in `main`; `Context` never reads placement variables itself.
+    pub fn new(gpu_accel: bool, xdg_decoration: bool, placement: Arc<PlacementConfig>) -> Self {
+        Self::with_vm_identifier(
+            gpu_accel,
+            xdg_decoration,
+            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            placement,
+        )
+    }
+
+    fn with_vm_identifier(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        vm_identifier: String,
+        placement: Arc<PlacementConfig>,
+    ) -> Self {
         // Initialize allocator
         let allocator = match Allocator::new() {
             Ok(alloc) => Some(alloc),
@@ -1280,74 +1297,7 @@ impl Context {
                 None
             }
         };
-
-        let (accelerators, accelerators_valid) =
-            match crate::accelerator::host_accelerators_from_environment() {
-                Ok(list) => (list, true),
-                Err(error) => {
-                    // A malformed accelerator config should not crash the proxy —
-                    // that would break every app in the container. Degrade to no
-                    // filtering (all keys forwarded to the guest), but retain the
-                    // invalid state so placement shortcuts cannot accidentally
-                    // bypass a conflict check against an empty list. A non-UTF-8
-                    // value is malformed rather than unset for the same reason.
-                    warn!("{}. Accelerator filtering disabled.", error);
-                    (Vec::new(), false)
-                }
-            };
-        let window_placement = WindowPlacementState::from_environment();
-        let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
-            Ok(Some(value)) => value,
-            Ok(None) => String::new(),
-            Err(()) => {
-                warn!(
-                    "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS (value is not UTF-8). \
-                 Window placement shortcuts disabled."
-                );
-                String::new()
-            }
-        };
-        let window_placement_shortcuts = if !window_placement.uses_arc_bounds() {
-            if !window_placement_env.trim().is_empty() {
-                warn!(
-                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored because the ARC bounds policy \
-                     is off (SOMMELIER_WINDOW_BOUNDS_AS_ARC unset, or no ARC task-ID block)"
-                );
-            }
-            Vec::new()
-        } else if !accelerators_valid {
-            if !window_placement_env.trim().is_empty() {
-                warn!(
-                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is disabled because \
-                     SOMMELIER_ACCELERATORS is invalid"
-                );
-            }
-            Vec::new()
-        } else {
-            match crate::accelerator::parse_window_placement_shortcuts(&window_placement_env) {
-                Ok(bindings) => {
-                    if let Some(conflict) = bindings
-                        .iter()
-                        .find(|binding| accelerators.contains(&binding.accelerator))
-                    {
-                        warn!(
-                            "Window placement shortcut {:?} conflicts with SOMMELIER_ACCELERATORS; placement shortcuts disabled",
-                            conflict
-                        );
-                        Vec::new()
-                    } else {
-                        bindings
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        "Invalid SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS '{}': {}. Window placement shortcuts disabled.",
-                        window_placement_env, error
-                    );
-                    Vec::new()
-                }
-            }
-        };
+        let window_placement = WindowPlacementState::new(placement.arc_id_allocator());
         Self {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),
@@ -1389,9 +1339,7 @@ impl Context {
             key_generations: KeyGenerationRegistry::default(),
             keyboard_repeatable_keys: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
-            accelerators,
-            window_placement_shortcuts,
-            window_placement_shortcut_updates: None,
+            placement,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1418,7 +1366,7 @@ impl Context {
             xdg_decoration,
             host_zaura_shell_id: None,
             host_zaura_shell_version: 0,
-            vm_identifier: resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            vm_identifier,
             window_placement,
             output_host_ids: Vec::new(),
             output_states: HashMap::new(),
@@ -1454,62 +1402,50 @@ impl Context {
         self.clipboard_pumps.retain(|pump| !pump.is_finished());
     }
 
-    /// Test-only constructor that overrides `SOMMELIER_ACCELERATORS` after construction.
+    /// Test-only constructor that reads no environment variable and
+    /// reserves no ARC task-ID block.
     ///
-    /// `Context::new` reads `SOMMELIER_ACCELERATORS` from the environment, so
-    /// using it in unit tests would make test outcomes depend on whether the
-    /// developer's shell has that variable set. This constructor calls `new()`
-    /// and then immediately replaces `ctx.accelerators` with the supplied list,
-    /// ensuring tests always run against a known accelerator configuration
-    /// regardless of the environment.
+    /// The ARC bounds policy is off and `accelerators` are the host
+    /// accelerators. The VM identifier is the default `termina`.
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        let mut ctx = Self::new(gpu_accel, xdg_decoration);
-        ctx.accelerators = accelerators;
-        ctx.window_placement_shortcuts.clear();
-        // Keep unit tests deterministic even when the developer's shell uses
-        // the runtime-only ARC bounds workaround for an isolated proxy.
-        ctx.window_placement = WindowPlacementState::for_test();
-        ctx
+        Self::with_vm_identifier(
+            gpu_accel,
+            xdg_decoration,
+            resolve_vm_identifier(None),
+            Arc::new(PlacementConfig::for_test(accelerators)),
+        )
     }
 
-    /// Follow the shared shortcut configuration file for this connection.
-    ///
-    /// The bindings are adopted only when this connection's ARC bounds policy
-    /// is active (the process gate is on and an identity block was reserved);
-    /// otherwise placement could never be applied and no chord is consumed.
-    /// Startup guarantees `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` is unset when
-    /// a configuration file is in use, so the file is the only source.
-    pub(crate) fn follow_window_placement_shortcuts(
-        &mut self,
-        mut subscription: crate::window_shortcuts::ShortcutSubscription,
-    ) {
-        if !self.window_placement.uses_arc_bounds() {
-            debug!("window shortcut config ignored: ARC bounds policy is inactive");
-            return;
-        }
-        self.window_placement_shortcuts = subscription.current().to_vec();
-        self.window_placement_shortcut_updates = Some(subscription);
+    /// Test-only constructor from an explicit placement configuration, for
+    /// example `PlacementConfig::arc_bounds_for_test`.
+    #[cfg(test)]
+    pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
+        Self::with_vm_identifier(false, false, resolve_vm_identifier(None), placement.into())
     }
 
-    /// Adopt a shortcut generation published by a reload, if one is pending.
+    /// Return whether the host keeps this chord (`SOMMELIER_ACCELERATORS`).
+    pub(crate) fn is_host_accelerator(&self, chord: &crate::accelerator::Accelerator) -> bool {
+        self.placement.is_host_accelerator(chord)
+    }
+
+    /// Return the placement action bound to a chord.
     ///
-    /// Called on the key-press path before a chord is matched, so every press
-    /// sees one complete generation. Keys already captured as compositor
-    /// shortcuts are tracked by key ownership, not by binding, so dropping a
-    /// binding cannot strand a held key.
-    pub(crate) fn refresh_window_placement_shortcuts(&mut self) {
-        if let Some(bindings) = self
-            .window_placement_shortcut_updates
-            .as_mut()
-            .and_then(crate::window_shortcuts::ShortcutSubscription::take_update)
-        {
-            self.window_placement_shortcuts = bindings.to_vec();
-        }
+    /// `None` unless the ARC bounds policy is active and the current binding
+    /// generation binds the chord. A generation published by a reload is
+    /// adopted here, on the next lookup, so every key press sees one complete
+    /// generation. Keys already captured as compositor shortcuts are tracked
+    /// by key ownership, not by binding, so a dropped binding cannot strand
+    /// a held key.
+    pub(crate) fn placement_action_for(
+        &self,
+        chord: &crate::accelerator::Accelerator,
+    ) -> Option<crate::window_layout::WindowLayoutAction> {
+        self.placement.action_for(chord)
     }
 
     /// Return the first output, in advertisement order, that is usable for
@@ -1663,77 +1599,40 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
         .unwrap_or_else(|| "termina".to_string())
 }
 
-/// Read an environment value only when it is valid UTF-8.
-///
-/// Unix environment variables are arbitrary byte strings. Configuration
-/// parsers in this module operate on `&str`, so a non-UTF-8 value must be
-/// reported distinctly from an unset variable instead of silently becoming an
-/// empty (and potentially valid-looking) configuration.
-fn utf8_env(name: &str) -> Result<Option<String>, ()> {
-    decode_utf8_env(std::env::var_os(name))
-}
-
-fn decode_utf8_env(value: Option<std::ffi::OsString>) -> Result<Option<String>, ()> {
-    match value {
-        None => Ok(None),
-        Some(value) => value.into_string().map(Some).map_err(|_| ()),
-    }
-}
-
-/// Interpret an environment flag without treating mere presence as enabled.
-/// This keeps `VAR=0`, `VAR=false`, and an exported empty value disabled while
-/// accepting the conventional explicit true spellings.
-fn env_flag_is_true(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-impl Default for Context {
-    fn default() -> Self {
-        Self::new(false, false)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::os::fd::{FromRawFd, OwnedFd};
 
-    fn shortcut_source(
-        dir: &crate::test_support::TempDir,
-        text: &str,
-    ) -> crate::window_shortcuts::ShortcutConfigSource {
-        let path = dir.write("shortcuts.toml", text.as_bytes());
-        crate::window_shortcuts::ShortcutConfigSource::load(path, Vec::new()).unwrap()
+    fn alt_q() -> crate::accelerator::Accelerator {
+        crate::accelerator::parse_accelerator("<Alt>q").unwrap()
     }
 
     #[test]
-    fn followed_shortcut_config_refreshes_only_after_a_valid_reload() {
+    fn context_adopts_only_valid_reloads_on_the_next_lookup() {
+        use crate::window_layout::WindowLayoutAction;
         let dir = crate::test_support::TempDir::new("context-shortcut-follow");
-        let source = shortcut_source(
-            &dir,
-            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
+        let path = dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
-        ctx.follow_window_placement_shortcuts(source.subscribe());
-        assert_eq!(ctx.window_placement_shortcuts.len(), 1);
+        let placement = Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&path),
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
+        let ctx = Context::with_placement_for_test(Arc::clone(&placement));
         assert_eq!(
-            ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left
+            ctx.placement_action_for(&alt_q()),
+            Some(WindowLayoutAction::Left)
         );
 
         dir.write("shortcuts.toml", b"version = 1\nbindings = 3\n");
-        assert!(source.reload().is_err());
-        ctx.refresh_window_placement_shortcuts();
+        assert!(placement.reload().unwrap().is_err());
         assert_eq!(
-            ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left,
+            ctx.placement_action_for(&alt_q()),
+            Some(WindowLayoutAction::Left),
             "an invalid reload keeps the last known-good bindings"
         );
 
@@ -1741,16 +1640,11 @@ mod tests {
             "shortcuts.toml",
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
         );
-        source.reload().unwrap();
+        placement.reload().unwrap().unwrap();
         assert_eq!(
-            ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left,
-            "a connection adopts a reload only when it next matches a key"
-        );
-        ctx.refresh_window_placement_shortcuts();
-        assert_eq!(
-            ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Right
+            ctx.placement_action_for(&alt_q()),
+            Some(WindowLayoutAction::Right),
+            "the next lookup adopts the reloaded generation"
         );
         assert!(
             ctx.window_placement.uses_arc_bounds(),
@@ -1759,19 +1653,25 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_config_is_ignored_without_an_active_arc_policy() {
-        let dir = crate::test_support::TempDir::new("context-shortcut-gate");
-        let source = shortcut_source(
-            &dir,
-            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
-        );
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.follow_window_placement_shortcuts(source.subscribe());
-        assert!(ctx.window_placement_shortcuts.is_empty());
-        source.reload().unwrap();
-        ctx.refresh_window_placement_shortcuts();
-        assert!(ctx.window_placement_shortcuts.is_empty());
+    fn shortcuts_are_ignored_without_an_active_arc_policy() {
+        let ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left")],
+            None,
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
+        assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(!ctx.window_placement.uses_arc_bounds());
+    }
+
+    #[test]
+    fn test_context_reads_no_placement_environment() {
+        let accelerators = vec![alt_q()];
+        let ctx = Context::new_for_test(true, false, accelerators);
+        assert!(ctx.gpu_accel);
+        assert!(ctx.is_host_accelerator(&alt_q()));
+        assert_eq!(ctx.placement_action_for(&alt_q()), None);
+        assert!(!ctx.window_placement.uses_arc_bounds());
+        assert_eq!(ctx.vm_identifier, "termina");
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
@@ -1944,26 +1844,6 @@ mod tests {
         ctx.surface_left_output(100, 30);
         assert!(!ctx.surface_output_ids.contains_key(&100));
         assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
-    }
-
-    #[test]
-    fn explicit_environment_true_values_are_required() {
-        assert!(env_flag_is_true(Some("true")));
-        assert!(env_flag_is_true(Some(" YES ")));
-        assert!(!env_flag_is_true(None));
-        assert!(!env_flag_is_true(Some("")));
-        assert!(!env_flag_is_true(Some("false")));
-        assert!(!env_flag_is_true(Some("1please")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_environment_values_are_not_treated_as_unset() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let value = std::ffi::OsString::from_vec(vec![0xff, b'a']);
-        assert_eq!(decode_utf8_env(Some(value)), Err(()));
-        assert_eq!(decode_utf8_env(None), Ok(None));
     }
 
     #[test]
@@ -2266,7 +2146,7 @@ mod tests {
     #[test]
     fn guest_id_and_host_id_raw_round_trip() {
         // Verify the typed constructors round-trip through the same inner u32.
-        let ctx = Context::new(false, false);
+        let ctx = Context::new_for_test(false, false, Vec::new());
         let mut ctx = ctx;
         ctx.last_sender_id = 42;
         let gid = GuestId::from_request_sender(&ctx);

@@ -1834,8 +1834,9 @@ mod tests {
 
     #[test]
     fn late_zaura_shell_binding_attaches_existing_outputs() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        );
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
@@ -1872,11 +1873,18 @@ mod tests {
     /// already exists, and return whether the retry attached its Aura
     /// toplevel.
     fn late_zaura_shell_attaches_existing_toplevel(arc_identity_available: bool) -> bool {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
-        if !arc_identity_available {
-            ctx.window_placement.set_arc_id_allocator_for_test(None);
-        }
+        let arc_ids = if arc_identity_available {
+            crate::arc_task_ids::ArcIdAllocator::block_for_test()
+        } else {
+            crate::arc_task_ids::ArcIdAllocator::exhausted_for_test()
+        };
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::resolve_for_test(
+                &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+                None,
+                arc_ids,
+            ),
+        );
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
