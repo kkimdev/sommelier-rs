@@ -40,7 +40,9 @@ pub(crate) use self::input::{
     PreeditRegionPlan, SeatFocusChange, TextInputActivationBarrierRegistry, TextInputState,
 };
 pub use self::outputs::OutputState;
-pub(crate) use self::outputs::{is_valid_transform, transformed_extent};
+pub(crate) use self::outputs::{
+    is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
+};
 pub(crate) use self::render::{
     BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
     SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
@@ -896,29 +898,9 @@ pub struct Context {
     /// identities, Aura surface/toplevel associations, bounds barriers, and
     /// configures held behind them. Built from `placement`.
     pub(crate) window_placement: WindowPlacementState,
-    /// Host wl_output IDs advertised to the guest.
-    pub output_host_ids: Vec<u32>,
-    /// Output mode/scale/insets keyed by host wl_output ID.
-    pub output_states: HashMap<u32, OutputState>,
-    /// Double-buffered output metadata collected until `wl_output.done`.
-    /// Version-1 outputs, which have no done event, update `output_states`
-    /// directly in the compositor handler.
-    pub pending_output_states: HashMap<u32, OutputState>,
-    /// Host output object → (global name, advertisement generation) from
-    /// which the object was bound.  The generation prevents a delayed
-    /// global_remove for an old advertisement from retiring a replacement.
-    pub output_host_global_bindings: HashMap<u32, (u32, u64)>,
-    /// Output objects whose host global disappeared.  Their Wayland object
-    /// lifetime remains valid until release, but they are no longer eligible
-    /// for compositor-owned placement.
-    pub inactive_output_host_ids: HashSet<u32>,
-    /// Host wl_surface ID → host wl_output IDs currently entered by that
-    /// surface. A surface may be visible on more than one output at once;
-    /// selection remains deterministic by following output advertisement
-    /// order.
-    pub surface_output_ids: HashMap<u32, HashSet<u32>>,
-    /// Host-only Aura output objects keyed by their host wl_output object ID.
-    pub zaura_output_to_wl_output: HashMap<u32, u32>,
+    /// Single owner of the bound host outputs, their placement metadata,
+    /// their Aura output objects, and which outputs each surface entered.
+    pub(crate) outputs: OutputRegistry,
     /// Synthetic GTK shell bindings and their activation token state.
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
@@ -1301,13 +1283,7 @@ impl Context {
             host_zaura_shell_version: 0,
             vm_identifier,
             window_placement,
-            output_host_ids: Vec::new(),
-            output_states: HashMap::new(),
-            pending_output_states: HashMap::new(),
-            output_host_global_bindings: HashMap::new(),
-            inactive_output_host_ids: HashSet::new(),
-            surface_output_ids: HashMap::new(),
-            zaura_output_to_wl_output: HashMap::new(),
+            outputs: OutputRegistry::default(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
             xdg_surface_to_wl_surface: HashMap::new(),
@@ -1379,147 +1355,6 @@ impl Context {
         chord: &crate::accelerator::Accelerator,
     ) -> Option<crate::window_layout::WindowLayoutAction> {
         self.placement.action_for(chord)
-    }
-
-    /// Return the first output, in advertisement order, that is usable for
-    /// placement: still live (neither inactive nor awaiting destruction) and
-    /// with complete metadata, so that its work area can be computed.
-    pub fn primary_output(&self) -> Option<(u32, OutputState)> {
-        self.output_host_ids
-            .iter()
-            .find_map(|&host_id| self.usable_output(host_id))
-    }
-
-    /// Return the output to use for placement of a focused surface.
-    ///
-    /// `wl_surface.enter`/`leave` maintain a set because a surface can span
-    /// outputs. Iterating `output_host_ids` makes the choice deterministic
-    /// even when several entered outputs are simultaneously usable.
-    ///
-    /// Only a surface with no output association (created before its first
-    /// enter event, or whose outputs all went away) falls back to
-    /// [`Self::primary_output`]. If the surface has entered outputs but none
-    /// is usable yet, this returns `None`: another output would move the
-    /// window to a different monitor.
-    pub fn output_for_surface(&self, host_surface_id: u32) -> Option<(u32, OutputState)> {
-        // `surface_left_output` and output retirement delete empty sets, so
-        // a present entry always names at least one entered output.
-        match self.surface_output_ids.get(&host_surface_id) {
-            Some(entered) => self
-                .output_host_ids
-                .iter()
-                .filter(|host_id| entered.contains(host_id))
-                .find_map(|&host_id| self.usable_output(host_id)),
-            None => self.primary_output(),
-        }
-    }
-
-    fn usable_output(&self, host_id: u32) -> Option<(u32, OutputState)> {
-        if self.shadow_table.is_pending_destroy_host(host_id)
-            || self.inactive_output_host_ids.contains(&host_id)
-        {
-            return None;
-        }
-        let state = *self.output_states.get(&host_id)?;
-        state.work_area().map(|_| (host_id, state))
-    }
-
-    /// Mutably access the current output snapshot while collecting a new
-    /// `wl_output` event group. The returned state is committed on `done` for
-    /// version-2+ outputs; v1 callers may copy it directly to `output_states`.
-    pub fn pending_output_state(&mut self, host_output_id: u32) -> &mut OutputState {
-        let initial = self
-            .output_states
-            .get(&host_output_id)
-            .copied()
-            .unwrap_or_default();
-        self.pending_output_states
-            .entry(host_output_id)
-            .or_insert(initial)
-    }
-
-    /// Publish one complete output metadata snapshot after `wl_output.done`.
-    pub fn commit_output_state(&mut self, host_output_id: u32) {
-        if let Some(state) = self.pending_output_states.remove(&host_output_id) {
-            self.output_states.insert(host_output_id, state);
-        }
-    }
-
-    /// Whether this output advertises the atomic metadata barrier introduced
-    /// by wl_output version 2. Unknown test-only registrations are treated as
-    /// versioned outputs and therefore require an explicit done event.
-    pub fn output_uses_done(&self, host_output_id: u32) -> bool {
-        self.shadow_table
-            .host_object_version(host_output_id)
-            .is_none_or(|version| version >= 2)
-    }
-
-    /// Record that a surface entered a host output. Unknown or inactive
-    /// outputs are intentionally ignored; their events may be in flight after
-    /// a global removal and must not steer a new placement operation.
-    pub fn surface_entered_output(&mut self, host_surface_id: u32, host_output_id: u32) {
-        if !self.output_host_ids.contains(&host_output_id)
-            || self.inactive_output_host_ids.contains(&host_output_id)
-            || self.shadow_table.is_pending_destroy_host(host_output_id)
-        {
-            return;
-        }
-        self.surface_output_ids
-            .entry(host_surface_id)
-            .or_default()
-            .insert(host_output_id);
-    }
-
-    /// Remove one output association from a surface, deleting the empty set.
-    pub fn surface_left_output(&mut self, host_surface_id: u32, host_output_id: u32) {
-        let Some(outputs) = self.surface_output_ids.get_mut(&host_surface_id) else {
-            return;
-        };
-        outputs.remove(&host_output_id);
-        if outputs.is_empty() {
-            self.surface_output_ids.remove(&host_surface_id);
-        }
-    }
-
-    fn remove_output_from_surface_associations(&mut self, host_output_id: u32) {
-        self.surface_output_ids.retain(|_, outputs| {
-            outputs.remove(&host_output_id);
-            !outputs.is_empty()
-        });
-    }
-
-    /// Retire placement metadata as soon as the guest releases a wl_output.
-    /// The shadow mapping itself remains reserved until the host's
-    /// `wl_display.delete_id`, but a released output must never be selected
-    /// for a later placement operation. It leaves `output_host_ids`, so it
-    /// needs no inactive marker either: keeping one would grow the set
-    /// forever.
-    pub fn remove_output_state(&mut self, host_output_id: u32) {
-        self.output_host_ids
-            .retain(|candidate| *candidate != host_output_id);
-        self.output_states.remove(&host_output_id);
-        self.pending_output_states.remove(&host_output_id);
-        self.output_host_global_bindings.remove(&host_output_id);
-        self.inactive_output_host_ids.remove(&host_output_id);
-        self.remove_output_from_surface_associations(host_output_id);
-    }
-
-    /// Mark every bound output from one removed host-global generation
-    /// inactive without destroying its still-valid Wayland object.
-    pub fn deactivate_output_bindings(&mut self, global_name: u32, generation: u64) {
-        let retired = self
-            .output_host_global_bindings
-            .iter()
-            .filter_map(|(&host_output_id, &(bound_name, bound_generation))| {
-                (bound_name == global_name && bound_generation == generation)
-                    .then_some(host_output_id)
-            })
-            .collect::<Vec<_>>();
-        for host_output_id in retired {
-            self.inactive_output_host_ids.insert(host_output_id);
-            self.pending_output_states.remove(&host_output_id);
-            self.remove_output_from_surface_associations(host_output_id);
-        }
     }
 }
 
@@ -1640,38 +1475,6 @@ mod tests {
 
         assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
         assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
-    }
-
-    #[test]
-    fn surface_output_selection_never_jumps_to_another_output() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.output_host_ids = vec![20, 30];
-        let usable = OutputState {
-            mode_width: 1920,
-            mode_height: 1080,
-            aura_current_scale: Some(1000),
-            aura_device_scale_factor: Some(1000),
-            ..Default::default()
-        };
-        ctx.output_states.insert(20, usable);
-        ctx.output_states.insert(30, usable);
-        ctx.surface_entered_output(100, 30);
-        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(30));
-
-        // The entered output's metadata is incomplete: the surface is on
-        // output 30, so selecting output 20 would move it to another monitor.
-        ctx.output_states
-            .get_mut(&30)
-            .unwrap()
-            .aura_device_scale_factor = None;
-        assert_eq!(ctx.output_for_surface(100), None);
-        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(20));
-
-        // Only a surface with no output association falls back.
-        assert_eq!(ctx.output_for_surface(200).map(|(id, _)| id), Some(20));
-        ctx.surface_left_output(100, 30);
-        assert!(!ctx.surface_output_ids.contains_key(&100));
-        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
     }
 
     #[test]

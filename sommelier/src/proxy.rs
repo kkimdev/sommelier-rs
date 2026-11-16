@@ -3454,6 +3454,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn released_output_events_never_reach_the_output_handlers() {
+        use crate::protocols::wayland::wl_output::{
+            WlOutputHandler, EVT_DONE, EVT_GEOMETRY, EVT_MODE, EVT_SCALE,
+        };
+        // The wl_output handlers rely on this filter instead of checking for
+        // a pending destructor themselves.
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_output".to_string(), 3);
+        ctx.last_sender_id = 10;
+        WlOutputHandler::on_release(&mut crate::handler::compositor::CompositorHandler, &mut ctx);
+        for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
+            assert!(
+                pending_host_event_is_stale(&ctx, 20, opcode, Some(10)),
+                "opcode {opcode}"
+            );
+        }
+    }
+
     fn test_buffer_state() -> crate::state::BufferState {
         use crate::state::{BufferState, PoolInner, PoolState};
         use std::sync::{Arc, RwLock};

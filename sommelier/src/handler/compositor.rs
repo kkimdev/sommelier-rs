@@ -151,6 +151,21 @@ fn wait_for_native_buffer(ctx: &mut Context, guest_buffer_id: u32) -> std::io::R
 
 impl WlCompositorHandler for CompositorHandler {}
 
+/// `wl_output.mode.current` from the vendored protocol.
+const WL_OUTPUT_MODE_CURRENT: u32 = 1;
+/// `zaura_output.scale_property.current` from the vendored protocol.
+const ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT: u32 = 1;
+
+/// `zaura_shell.get_aura_output` exists since this version.
+const ZAURA_SHELL_GET_AURA_OUTPUT_SINCE: u32 = 2;
+/// `zaura_output.release` exists since this version. Older `zaura_output`
+/// objects have no destructor request.
+const ZAURA_OUTPUT_RELEASE_SINCE: u32 = 38;
+
+/// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
+/// forwarded unchanged. Events from a released output never get here: the
+/// proxy suppresses host events for objects awaiting `delete_id`. Events
+/// from an output whose global was removed change nothing.
 impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler {
     fn on_geometry(
         &mut self,
@@ -164,27 +179,21 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         _model: &String,
         transform: i32,
     ) -> Action {
-        if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
-            return Action::Drop;
-        }
-        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
-            return Action::Forward;
-        }
         let host_output_id = ctx.last_sender_id;
-        let output = ctx.pending_output_state(host_output_id);
-        output.origin_x = x;
-        output.origin_y = y;
-        if is_valid_transform(transform) {
-            output.transform = transform;
-        } else {
+        let valid_transform = is_valid_transform(transform);
+        let live = ctx.outputs.update(host_output_id, |output| {
+            output.origin_x = x;
+            output.origin_y = y;
+            if valid_transform {
+                output.transform = transform;
+            }
+        });
+        if live && !valid_transform {
             log::warn!(
                 "Ignoring invalid wl_output.transform={} for host output {}",
                 transform,
                 host_output_id
             );
-        }
-        if !ctx.output_uses_done(host_output_id) {
-            ctx.commit_output_state(host_output_id);
         }
         Action::Forward
     }
@@ -197,31 +206,20 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         height: i32,
         _refresh: i32,
     ) -> Action {
-        if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
-            return Action::Drop;
-        }
-        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
-            return Action::Forward;
-        }
-        let host_output_id = ctx.last_sender_id;
-        let output = ctx.pending_output_state(host_output_id);
-        if flags & 1 != 0 || output.mode_width <= 0 || output.mode_height <= 0 {
-            output.mode_width = width;
-            output.mode_height = height;
-        }
-        if !ctx.output_uses_done(host_output_id) {
-            ctx.commit_output_state(host_output_id);
-        }
+        ctx.outputs.update(ctx.last_sender_id, |output| {
+            if flags & WL_OUTPUT_MODE_CURRENT != 0
+                || output.mode_width <= 0
+                || output.mode_height <= 0
+            {
+                output.mode_width = width;
+                output.mode_height = height;
+            }
+        });
         Action::Forward
     }
 
     fn on_done(&mut self, ctx: &mut Context) -> Action {
-        let host_output_id = ctx.last_sender_id;
-        if !ctx.shadow_table.is_pending_destroy_host(host_output_id)
-            && !ctx.inactive_output_host_ids.contains(&host_output_id)
-        {
-            ctx.commit_output_state(host_output_id);
-        }
+        ctx.outputs.commit(ctx.last_sender_id);
         Action::Forward
     }
 
@@ -240,18 +238,12 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             );
             return Action::Drop;
         };
-        ctx.remove_output_state(host_output_id);
-        if let Some(zaura_output_host_id) = ctx
-            .zaura_output_to_wl_output
-            .iter()
-            .find_map(|(&zaura_id, &output_id)| (output_id == host_output_id).then_some(zaura_id))
-        {
-            ctx.zaura_output_to_wl_output.remove(&zaura_output_host_id);
+        if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
             let version = ctx
                 .shadow_table
                 .host_object_version(zaura_output_host_id)
                 .unwrap_or(ctx.host_zaura_shell_version);
-            if version >= 38 {
+            if version >= ZAURA_OUTPUT_RELEASE_SINCE {
                 let message = crate::wire::MessageBuilder::new()
                     .build_message(zaura_output_host_id, REQ_RELEASE_AURA_OUTPUT);
                 ctx.client_to_host_queue.push((message, Vec::new()));
@@ -273,7 +265,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
     }
 }
 
-/// `zaura_output` is host-only, so none of its events reach the guest.
+/// `zaura_output` is host-only, so none of its events reach the guest. Its
+/// events for an unknown or no longer live output are stale and dropped
+/// (see [`crate::state::OutputRegistry::aura_event_target`]).
 ///
 /// `logical_transform` is deliberately not handled: Exo's `wl_output.mode` is
 /// the panel's native pixel size, and only the `wl_output.geometry` (panel)
@@ -288,7 +282,7 @@ impl ZauraOutputHandler for CompositorHandler {
         bottom: i32,
         right: i32,
     ) -> Action {
-        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
             return Action::Drop;
         };
         if top < 0 || left < 0 || bottom < 0 || right < 0 {
@@ -305,66 +299,48 @@ impl ZauraOutputHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        let output = ctx.pending_output_state(wl_output_id);
-        output.insets_top = top;
-        output.insets_left = left;
-        output.insets_bottom = bottom;
-        output.insets_right = right;
-        publish_aura_output_update(ctx, wl_output_id);
+        ctx.outputs.update(wl_output_id, |output| {
+            output.insets_top = top;
+            output.insets_left = left;
+            output.insets_bottom = bottom;
+            output.insets_right = right;
+        });
         Action::Drop
     }
 
     fn on_scale(&mut self, ctx: &mut Context, flags: u32, scale: u32) -> Action {
-        // zaura_output.scale_property.current from the vendored protocol.
         // Preferred scales describe choices, not the active DP geometry.
-        const CURRENT: u32 = 1;
-        if flags & CURRENT == 0 {
+        if flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT == 0 {
             return Action::Drop;
         }
-        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
             return Action::Drop;
         };
         if scale == 0 {
             log::warn!("Ignoring invalid zaura_output.scale=0");
             return Action::Drop;
         }
-        ctx.pending_output_state(wl_output_id).aura_current_scale = Some(scale);
-        publish_aura_output_update(ctx, wl_output_id);
+        ctx.outputs.update(wl_output_id, |output| {
+            output.aura_current_scale = Some(scale);
+        });
         Action::Drop
     }
 
     fn on_device_scale_factor(&mut self, ctx: &mut Context, scale: u32) -> Action {
-        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
+        let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
             return Action::Drop;
         };
         if scale == 0 {
             log::warn!("Ignoring invalid zaura_output.device_scale_factor=0");
             return Action::Drop;
         }
-        ctx.pending_output_state(wl_output_id)
-            .aura_device_scale_factor = Some(scale);
-        publish_aura_output_update(ctx, wl_output_id);
+        ctx.outputs.update(wl_output_id, |output| {
+            output.aura_device_scale_factor = Some(scale);
+        });
         Action::Drop
     }
 }
 
-/// Resolves the host `wl_output` behind the current `zaura_output` event.
-/// Events for unknown, inactive, or releasing outputs are stale and must not
-/// update placement geometry.
-fn live_aura_output_host_id(ctx: &Context) -> Option<u32> {
-    let wl_output_id = *ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id)?;
-    (!ctx.inactive_output_host_ids.contains(&wl_output_id)
-        && !ctx.shadow_table.is_pending_destroy_host(wl_output_id))
-    .then_some(wl_output_id)
-}
-
-/// Publishes an Aura output update unless the output batches changes behind
-/// `wl_output.done`.
-fn publish_aura_output_update(ctx: &mut Context, wl_output_id: u32) {
-    if !ctx.output_uses_done(wl_output_id) {
-        ctx.commit_output_state(wl_output_id);
-    }
-}
 // ChromiumOS reserves headroom around the i32 damage range before applying
 // compositor scaling. This keeps the host compositor's x + width arithmetic
 // from overflowing when clients submit extreme but representable damage.
@@ -525,21 +501,25 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
-/// Create the internal Aura output extension used for output work-area
-/// insets.  The guest still sees the normal wl_output object; this binding is
-/// host-only and is released before that paired wl_output is destroyed.
+/// Create or reuse the host-only `zaura_output` of a live output.
+///
+/// It carries the Aura scale factors and work-area insets that placement
+/// needs (see [`ZauraOutputHandler`]). The guest only sees the plain
+/// `wl_output`; `wl_output.release` releases this child first.
+///
+/// # Returns
+///
+/// The `zaura_output` host ID, or `None` when the output is not live or no
+/// `zaura_shell` that supports Aura outputs is bound yet.
 pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> Option<u32> {
-    if let Some(existing_id) =
-        ctx.zaura_output_to_wl_output
-            .iter()
-            .find_map(|(&zaura_output_id, &output_id)| {
-                (output_id == wl_output_host_id).then_some(zaura_output_id)
-            })
-    {
+    if let Some(existing_id) = ctx.outputs.aura_output(wl_output_host_id) {
         return Some(existing_id);
     }
+    if !ctx.outputs.is_live(wl_output_host_id) {
+        return None;
+    }
     let zaura_shell_host_id = ctx.host_zaura_shell_id?;
-    if ctx.host_zaura_shell_version < 2 {
+    if ctx.host_zaura_shell_version < ZAURA_SHELL_GET_AURA_OUTPUT_SINCE {
         return None;
     }
 
@@ -557,8 +537,8 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> 
         return None;
     };
     ctx.client_to_host_queue.push((message, Vec::new()));
-    ctx.zaura_output_to_wl_output
-        .insert(zaura_output_host_id, wl_output_host_id);
+    ctx.outputs
+        .attach_aura_output(wl_output_host_id, zaura_output_host_id);
     Some(zaura_output_host_id)
 }
 
@@ -1219,7 +1199,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     .retire_host_interface(zaura_surface_host_id);
             }
         }
-        ctx.surface_output_ids.remove(&wl_surface_host_id);
+        ctx.outputs.surface_destroyed(wl_surface_host_id);
         let gtk_surface_ids = ctx
             .gtk_surfaces
             .iter()
@@ -1302,19 +1282,15 @@ impl WlSurfaceHandler for CompositorHandler {
             // normal destroy race into a protocol error.
             return Action::Drop;
         }
-        if ctx.inactive_output_host_ids.contains(&output) {
-            // A removed global may still have a live bound wl_output object;
-            // its lifecycle events remain valid for the guest, but the
-            // association must not steer compositor-owned placement.
-            return Action::Forward;
-        }
-        ctx.surface_entered_output(host_surface_id, output);
+        // An output whose global was removed is still a valid guest object,
+        // so the event is forwarded; the registry ignores it for placement.
+        ctx.outputs.surface_entered(host_surface_id, output);
         Action::Forward
     }
 
     fn on_leave(&mut self, ctx: &mut Context, output: u32) -> Action {
         let host_surface_id = ctx.last_sender_id;
-        ctx.surface_left_output(host_surface_id, output);
+        ctx.outputs.surface_left(host_surface_id, output);
         if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
             || ctx.shadow_table.is_pending_destroy_host(output)
         {
@@ -2286,26 +2262,58 @@ mod tests {
         );
     }
 
+    const OUTPUT_HOST: u32 = 20;
+    const AURA_OUTPUT_HOST: u32 = 21;
+
+    /// Bind host output 20 at `version` with `committed` metadata, and give
+    /// it the v38 Aura output 21.
+    fn bind_output_with_aura(
+        ctx: &mut Context,
+        version: u32,
+        committed: crate::state::OutputState,
+    ) {
+        ctx.outputs.bind(
+            OUTPUT_HOST,
+            version,
+            crate::state::GlobalBinding {
+                name: 7,
+                generation: 1,
+            },
+        );
+        ctx.outputs.update(OUTPUT_HOST, |state| *state = committed);
+        ctx.outputs.commit(OUTPUT_HOST);
+        ctx.outputs
+            .attach_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
+        ctx.shadow_table.track_host_interface_with_version(
+            AURA_OUTPUT_HOST,
+            "zaura_output".into(),
+            38,
+        );
+    }
+
+    fn committed_work_area(ctx: &Context) -> Option<(i32, i32, i32, i32)> {
+        ctx.outputs
+            .committed_for_test(OUTPUT_HOST)
+            .expect("live output")
+            .work_area()
+    }
+
     #[test]
     fn fractional_aura_scale_defines_logical_work_area() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.output_host_ids.push(output_host);
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
+        bind_output_with_aura(&mut ctx, 3, Default::default());
         let mut handler = CompositorHandler;
 
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
         handler.on_device_scale_factor(&mut ctx, 1250);
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
 
         assert_eq!(
-            ctx.output_states[&output_host].work_area(),
+            committed_work_area(&ctx),
             Some((0, 0, 3072, 1728)),
             "Aura bounds use fractional DP scale, not rounded wl_output.scale"
         );
@@ -2314,135 +2322,102 @@ mod tests {
     #[test]
     fn aura_scale_updates_wait_for_done_and_ignore_preferred_or_zero_factors() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.output_states.insert(
-            output_host,
+        bind_output_with_aura(
+            &mut ctx,
+            3,
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
                 ..Default::default()
             },
         );
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
         let mut handler = CompositorHandler;
 
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         assert_eq!(handler.on_device_scale_factor(&mut ctx, 0), Action::Drop);
         assert_eq!(
             ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0),
             Action::Drop
         );
-        assert!(ctx.pending_output_states.is_empty());
-        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+        assert!(!ctx.outputs.has_pending_for_test());
+        assert_eq!(committed_work_area(&ctx), None);
 
         handler.on_device_scale_factor(&mut ctx, 1250);
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+        assert_eq!(committed_work_area(&ctx), None);
 
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        assert_eq!(ctx.output_states[&output_host].work_area(), None);
-        ctx.last_sender_id = output_host;
+        assert_eq!(committed_work_area(&ctx), None);
+        ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((0, 0, 3072, 1728))
-        );
+        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
 
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 2, 1200);
         handler.on_device_scale_factor(&mut ctx, 0);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0);
-        assert!(ctx.pending_output_states.is_empty());
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((0, 0, 3072, 1728))
-        );
+        assert!(!ctx.outputs.has_pending_for_test());
+        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
 
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 3, 1200);
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((0, 0, 3072, 1728))
-        );
-        ctx.last_sender_id = output_host;
+        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((0, 0, 2560, 1440))
-        );
+        assert_eq!(committed_work_area(&ctx), Some((0, 0, 2560, 1440)));
     }
 
     #[test]
     fn aura_scale_events_ignore_unknown_inactive_and_released_outputs() {
-        let output_host = 20;
-        let aura_output_host = 21;
+        let global = crate::state::GlobalBinding {
+            name: 7,
+            generation: 1,
+        };
         for retired in 0..3 {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             if retired != 0 {
-                ctx.zaura_output_to_wl_output
-                    .insert(aura_output_host, output_host);
+                bind_output_with_aura(&mut ctx, 3, Default::default());
                 if retired == 1 {
-                    ctx.inactive_output_host_ids.insert(output_host);
+                    ctx.outputs.deactivate(global);
                 } else {
-                    ctx.shadow_table.map_id(10, output_host);
-                    ctx.shadow_table.mark_pending_destroy(10);
+                    ctx.outputs.release(OUTPUT_HOST);
                 }
             }
-            ctx.last_sender_id = aura_output_host;
+            ctx.last_sender_id = AURA_OUTPUT_HOST;
             let mut handler = CompositorHandler;
             assert_eq!(handler.on_device_scale_factor(&mut ctx, 1250), Action::Drop);
             assert_eq!(
                 ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000),
                 Action::Drop
             );
-            assert!(ctx.pending_output_states.is_empty());
-            assert!(ctx.output_states.is_empty());
+            assert!(!ctx.outputs.has_pending_for_test());
+            assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), None);
         }
     }
 
     #[test]
     fn aura_scale_events_publish_immediately_for_version_one_output() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.shadow_table
-            .track_host_interface_with_version(output_host, "wl_output".into(), 1);
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
+        bind_output_with_aura(&mut ctx, 1, Default::default());
         let mut handler = CompositorHandler;
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        assert_eq!(ctx.output_states[&output_host].work_area(), None);
-        ctx.last_sender_id = aura_output_host;
+        assert_eq!(committed_work_area(&ctx), None);
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         handler.on_device_scale_factor(&mut ctx, 1250);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((0, 0, 3072, 1728))
-        );
-        assert!(ctx.pending_output_states.is_empty());
+        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        assert!(!ctx.outputs.has_pending_for_test());
     }
 
     #[test]
     fn output_geometry_and_aura_insets_define_logical_work_area() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.output_host_ids.push(output_host);
-        ctx.output_states.insert(output_host, Default::default());
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
-        ctx.shadow_table.track_host_interface_with_version(
-            aura_output_host,
-            "zaura_output".into(),
-            38,
-        );
+        bind_output_with_aura(&mut ctx, 3, Default::default());
         let mut handler = CompositorHandler;
 
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         assert_eq!(
             handler.on_geometry(
                 &mut ctx,
@@ -2458,86 +2433,76 @@ mod tests {
             Action::Forward
         );
         handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         assert_eq!(handler.on_insets(&mut ctx, 24, 8, 48, 16), Action::Drop);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
         handler.on_device_scale_factor(&mut ctx, 2000);
-        assert_eq!(ctx.output_states[&output_host].mode_width, 0);
-        ctx.last_sender_id = output_host;
+        assert_eq!(
+            ctx.outputs
+                .committed_for_test(OUTPUT_HOST)
+                .map(|state| state.mode_width),
+            Some(0)
+        );
+        ctx.last_sender_id = OUTPUT_HOST;
         assert_eq!(
             WlOutputHandler::on_done(&mut handler, &mut ctx),
             Action::Forward
         );
 
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((1928, 40, 1896, 1008))
-        );
+        assert_eq!(committed_work_area(&ctx), Some((1928, 40, 1896, 1008)));
     }
 
     #[test]
     fn negative_aura_insets_are_rejected_without_mutating_output_state() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.output_states.insert(
-            output_host,
-            crate::state::OutputState {
-                insets_top: 1,
-                insets_left: 2,
-                insets_bottom: 3,
-                insets_right: 4,
-                ..Default::default()
-            },
-        );
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
-        ctx.shadow_table.track_host_interface_with_version(
-            aura_output_host,
-            "zaura_output".into(),
-            38,
-        );
-        ctx.last_sender_id = aura_output_host;
+        let insets = crate::state::OutputState {
+            insets_top: 1,
+            insets_left: 2,
+            insets_bottom: 3,
+            insets_right: 4,
+            ..Default::default()
+        };
+        bind_output_with_aura(&mut ctx, 3, insets);
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
 
         assert_eq!(
             ZauraOutputHandler::on_insets(&mut CompositorHandler, &mut ctx, -1, 2, 3, 4),
             Action::Drop
         );
-        assert_eq!(ctx.output_states[&output_host].insets_top, 1);
-        assert_eq!(ctx.output_states[&output_host].insets_left, 2);
-        assert_eq!(ctx.output_states[&output_host].insets_bottom, 3);
-        assert_eq!(ctx.output_states[&output_host].insets_right, 4);
-        assert!(ctx.pending_output_states.is_empty());
+        assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), Some(insets));
+        assert!(!ctx.outputs.has_pending_for_test());
     }
 
     #[test]
-    fn inactive_output_ignores_late_aura_insets() {
+    fn inactive_output_ignores_late_wl_output_and_aura_events() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.output_states.insert(
-            output_host,
-            crate::state::OutputState {
-                insets_top: 1,
-                insets_left: 2,
-                insets_bottom: 3,
-                insets_right: 4,
-                ..Default::default()
-            },
-        );
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
-        ctx.inactive_output_host_ids.insert(output_host);
-        ctx.last_sender_id = aura_output_host;
+        bind_output_with_aura(&mut ctx, 3, Default::default());
+        ctx.outputs.deactivate(crate::state::GlobalBinding {
+            name: 7,
+            generation: 1,
+        });
+        let mut handler = CompositorHandler;
 
+        // The guest still owns a valid wl_output, so its events are
+        // forwarded, but they must not repopulate retired metadata.
+        ctx.last_sender_id = OUTPUT_HOST;
         assert_eq!(
-            ZauraOutputHandler::on_insets(&mut CompositorHandler, &mut ctx, 10, 20, 30, 40),
+            handler.on_mode(&mut ctx, 1, 3840, 2160, 60),
+            Action::Forward
+        );
+        assert_eq!(
+            WlOutputHandler::on_done(&mut handler, &mut ctx),
+            Action::Forward
+        );
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
+        assert_eq!(
+            ZauraOutputHandler::on_insets(&mut handler, &mut ctx, 10, 20, 30, 40),
             Action::Drop
         );
-        assert_eq!(
-            ctx.output_states[&output_host].insets_top, 1,
-            "late insets must not repopulate retired placement metadata"
-        );
+        assert!(!ctx.outputs.has_pending_for_test());
+        assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), None);
+        // Release still tears the Aura child down.
+        assert_eq!(ctx.outputs.release(OUTPUT_HOST), Some(AURA_OUTPUT_HOST));
     }
 
     /// Send one Exo display-metrics group: `wl_output.geometry` (panel
@@ -2549,10 +2514,8 @@ mod tests {
         panel_transform: i32,
         logical_transform: i32,
     ) {
-        let output_host = 20;
-        let aura_output_host = 21;
         let mut handler = CompositorHandler;
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         handler.on_geometry(
             ctx,
             0,
@@ -2565,18 +2528,16 @@ mod tests {
             panel_transform,
         );
         handler.on_mode(ctx, 1, mode.0, mode.1, 60);
-        ctx.last_sender_id = aura_output_host;
+        ctx.last_sender_id = AURA_OUTPUT_HOST;
         ZauraOutputHandler::on_scale(&mut handler, ctx, 1, 1000);
         handler.on_device_scale_factor(ctx, 1000);
         ZauraOutputHandler::on_logical_transform(&mut handler, ctx, logical_transform);
-        ctx.last_sender_id = output_host;
+        ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, ctx);
     }
 
     #[test]
     fn work_area_rotates_native_mode_by_the_panel_transform() {
-        let output_host = 20;
-        let aura_output_host = 21;
         // (native mode, panel transform, logical transform, work area).
         for (mode, panel, logical, expected) in [
             // A landscape panel rotated by 90 degrees: both transforms agree.
@@ -2589,12 +2550,10 @@ mod tests {
             ((1600, 2560), 2, 1, (0, 0, 1600, 2560)),
         ] {
             let mut ctx = Context::new_for_test(false, false, vec![]);
-            ctx.output_host_ids.push(output_host);
-            ctx.zaura_output_to_wl_output
-                .insert(aura_output_host, output_host);
+            bind_output_with_aura(&mut ctx, 3, Default::default());
             send_rotated_output_metrics(&mut ctx, mode, panel, logical);
             assert_eq!(
-                ctx.output_states[&output_host].work_area(),
+                committed_work_area(&ctx),
                 Some(expected),
                 "mode {mode:?}, panel {panel}, logical {logical}"
             );
@@ -2605,7 +2564,8 @@ mod tests {
     fn surface_enter_leave_tracks_multiple_outputs() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let mut handler = CompositorHandler;
-        ctx.output_host_ids = vec![20, 30];
+        ctx.outputs.bind_for_test(20, Default::default());
+        ctx.outputs.bind_for_test(30, Default::default());
         ctx.last_sender_id = 100;
         assert_eq!(
             WlSurfaceHandler::on_enter(&mut handler, &mut ctx, 20),
@@ -2616,16 +2576,17 @@ mod tests {
             Action::Forward
         );
         assert_eq!(
-            ctx.surface_output_ids[&100],
-            [20, 30]
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>()
+            ctx.outputs.entered_for_test(100),
+            Some(&[20, 30].into_iter().collect())
         );
         assert_eq!(
             WlSurfaceHandler::on_leave(&mut handler, &mut ctx, 20),
             Action::Forward
         );
-        assert_eq!(ctx.surface_output_ids[&100], [30].into_iter().collect());
+        assert_eq!(
+            ctx.outputs.entered_for_test(100),
+            Some(&[30].into_iter().collect())
+        );
     }
 
     #[test]
@@ -2638,7 +2599,7 @@ mod tests {
         let output_host = 20;
         ctx.shadow_table.map_id(surface_guest, surface_host);
         ctx.shadow_table.map_id(output_guest, output_host);
-        ctx.output_host_ids.push(output_host);
+        ctx.outputs.bind_for_test(output_host, Default::default());
 
         ctx.last_sender_id = surface_host;
         ctx.shadow_table.mark_pending_destroy(surface_guest);
@@ -2667,22 +2628,31 @@ mod tests {
     }
 
     #[test]
+    fn surface_enter_of_an_inactive_output_is_forwarded_but_not_recorded() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.outputs.bind_for_test(20, Default::default());
+        ctx.outputs.deactivate(crate::state::GlobalBinding {
+            name: 20,
+            generation: 1,
+        });
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            WlSurfaceHandler::on_enter(&mut CompositorHandler, &mut ctx, 20),
+            Action::Forward
+        );
+        assert_eq!(ctx.outputs.entered_for_test(100), None);
+    }
+
+    #[test]
     fn releasing_output_removes_it_from_placement_selection() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_guest = 10;
-        let output_host = 20;
-        let aura_output_host = 21;
-        ctx.shadow_table.map_id(output_guest, output_host);
+        ctx.shadow_table.map_id(output_guest, OUTPUT_HOST);
         ctx.shadow_table
             .track_interface_with_version(output_guest, "wl_output".into(), 3);
-        ctx.shadow_table.track_host_interface_with_version(
-            aura_output_host,
-            "zaura_output".into(),
-            38,
-        );
-        ctx.output_host_ids.push(output_host);
-        ctx.output_states.insert(
-            output_host,
+        bind_output_with_aura(
+            &mut ctx,
+            3,
             crate::state::OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
@@ -2691,8 +2661,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
+        assert!(ctx.outputs.primary().is_some());
         let mut handler = CompositorHandler;
         // wl_output.release is a client request, so the sender is the guest
         // object ID even though the queued destructor targets the host ID.
@@ -2702,25 +2671,22 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.client_to_host_queue.len(), 2);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[0].0), aura_output_host);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue[0].0), AURA_OUTPUT_HOST);
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[0].0),
             REQ_RELEASE_AURA_OUTPUT
         );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), output_host);
+        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), OUTPUT_HOST);
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[1].0),
             REQ_RELEASE_WL_OUTPUT
         );
-        assert!(ctx.primary_output().is_none());
-        assert!(!ctx.output_states.contains_key(&output_host));
+        assert!(ctx.outputs.primary().is_none());
+        assert!(ctx.outputs.is_empty_for_test());
         assert!(ctx.shadow_table.is_pending_destroy_guest(output_guest));
-        assert!(!ctx
-            .zaura_output_to_wl_output
-            .contains_key(&aura_output_host));
         assert!(ctx
             .shadow_table
-            .is_pending_destroy_host_only(aura_output_host));
+            .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
     }
 
     #[test]
@@ -2732,11 +2698,12 @@ mod tests {
             ctx.shadow_table.map_id(output_guest, output_host);
             ctx.shadow_table
                 .track_interface_with_version(output_guest, "wl_output".into(), 3);
-            ctx.output_host_ids.push(output_host);
-            ctx.output_host_global_bindings
-                .insert(output_host, (output_host, 1));
+            ctx.outputs.bind_for_test(output_host, Default::default());
         }
-        ctx.deactivate_output_bindings(20, 1);
+        ctx.outputs.deactivate(crate::state::GlobalBinding {
+            name: 20,
+            generation: 1,
+        });
         for output_guest in [10, 11] {
             ctx.last_sender_id = output_guest;
             assert_eq!(
@@ -2744,11 +2711,9 @@ mod tests {
                 Action::Drop
             );
         }
-        assert!(ctx.output_host_ids.is_empty());
-        assert!(ctx.output_host_global_bindings.is_empty());
         assert!(
-            ctx.inactive_output_host_ids.is_empty(),
-            "a released output must not stay in the inactive set forever"
+            ctx.outputs.is_empty_for_test(),
+            "a released output must leave no record behind"
         );
     }
 

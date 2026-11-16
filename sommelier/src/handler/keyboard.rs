@@ -88,7 +88,7 @@ enum PlacementSkip {
     /// The focused xdg_toplevel has no host object.
     UnmappedToplevel,
     /// No output with complete metadata can host the surface (see
-    /// `Context::output_for_surface`).
+    /// `OutputRegistry::for_surface`).
     NoUsableOutput,
     /// The rectangle has an empty extent, an edge that rounds onto the work
     /// area border, or overflowing coordinates on this output.
@@ -454,7 +454,7 @@ impl KeyboardHandler {
         let (output_host_id, output) = ctx
             .shadow_table
             .get_host_id(guest_wl_surface_id)
-            .and_then(|host_surface_id| ctx.output_for_surface(host_surface_id))
+            .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
             .ok_or(PlacementSkip::NoUsableOutput)?;
         let (x, y, width, height) =
             Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
@@ -1836,8 +1836,7 @@ mod tests {
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
                 mode_width: 3840,
@@ -1918,8 +1917,7 @@ mod tests {
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids = vec![primary_output, secondary_output];
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             primary_output,
             crate::state::OutputState {
                 mode_width: 1920,
@@ -1929,7 +1927,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             secondary_output,
             crate::state::OutputState {
                 origin_x: 1920,
@@ -1940,7 +1938,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.surface_entered_output(host_surface, secondary_output);
+        ctx.outputs.surface_entered(host_surface, secondary_output);
 
         assert_eq!(
             KeyboardHandler::apply_window_layout(
@@ -2003,8 +2001,7 @@ mod tests {
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
                 mode_width: 3840,
@@ -2055,8 +2052,7 @@ mod tests {
     fn placement_is_skipped_rather_than_moved_to_another_output() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         let entered_output = 26;
-        ctx.output_host_ids.push(entered_output);
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             entered_output,
             crate::state::OutputState {
                 origin_x: 3840,
@@ -2067,9 +2063,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        ctx.surface_entered_output(22, entered_output);
+        ctx.outputs.surface_entered(22, entered_output);
         assert!(
-            ctx.primary_output().is_some(),
+            ctx.outputs.primary().is_some(),
             "another output is usable, but the surface is not on it"
         );
 
@@ -2106,8 +2102,7 @@ mod tests {
         focus_keyboard(&mut ctx, host_keyboard, 11, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
                 mode_width: 3840,
@@ -2814,8 +2809,7 @@ mod tests {
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
-        ctx.output_host_ids.push(output);
-        ctx.output_states.insert(
+        ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
                 mode_width: 3840,

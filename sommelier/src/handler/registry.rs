@@ -29,7 +29,9 @@ use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal};
+use crate::state::{
+    Context, GlobalBinding, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal,
+};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -940,13 +942,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // delivered zaura_shell. Retry every already-live output now
                 // that the shell object and its version are available; the
                 // output bind path cannot do this retroactively on its own.
-                for output_host_id in ctx.output_host_ids.clone() {
-                    if !ctx.inactive_output_host_ids.contains(&output_host_id)
-                        && !ctx.shadow_table.is_pending_destroy_host(output_host_id)
-                    {
-                        let _ =
-                            crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
-                    }
+                for output_host_id in ctx.outputs.live_outputs() {
+                    // `None` means this shell cannot create Aura outputs;
+                    // placement then waits for metadata that never comes,
+                    // which is the same as having no zaura_shell.
+                    let _ = crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived. Their guest-side associations are recorded
@@ -1073,7 +1073,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // global advertisement disappears, but it must stop feeding
             // compositor-owned placement.  Match the exact advertisement
             // generation so a delayed remove cannot retire a replacement.
-            ctx.deactivate_output_bindings(name, generation);
+            ctx.outputs.deactivate(GlobalBinding { name, generation });
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
         }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
@@ -1271,13 +1271,13 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         if interface == "wl_output" {
             // Register the output only once its bind is queued, so the
             // failure paths above have no output state to undo.
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
-            ctx.output_host_global_bindings
-                .insert(host_new_id, (name, generation));
-            ctx.inactive_output_host_ids.remove(&host_new_id);
+            ctx.outputs.bind(
+                host_new_id,
+                bind_version,
+                GlobalBinding { name, generation },
+            );
             if ctx.window_placement.uses_arc_bounds() {
-                // Host-only Aura output metadata (insets, scale, transform).
+                // Host-only Aura output metadata (scale factors and insets).
                 // A missing shell is retried when zaura_shell binds, so a
                 // failure here is not an error.
                 let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
@@ -1776,36 +1776,29 @@ mod tests {
         let output = "wl_output".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
-        let generation = ctx.global_generations[&10];
         let bind = (output.clone(), 3, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        let output_host = ctx
-            .output_host_global_bindings
-            .keys()
-            .copied()
-            .next()
-            .expect("bound output host object");
-        ctx.output_states.insert(
-            output_host,
-            crate::state::OutputState {
+        let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
+        assert!(ctx.outputs.update(output_host, |state| {
+            *state = crate::state::OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
-            },
-        );
-        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(output_host));
+            };
+        }));
+        ctx.outputs.commit(output_host);
+        assert_eq!(ctx.outputs.primary().map(|(id, _)| id), Some(output_host));
 
         ctx.last_sender_id = 1;
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(
-            ctx.output_host_global_bindings[&output_host],
-            (10, generation)
-        );
-        assert!(ctx.output_states.contains_key(&output_host));
-        assert!(ctx.inactive_output_host_ids.contains(&output_host));
-        assert!(ctx.primary_output().is_none());
+        assert!(!ctx.outputs.is_live(output_host));
+        assert!(ctx.outputs.primary().is_none());
+        // The object itself stays valid until the guest releases it.
+        assert_eq!(ctx.shadow_table.get_host_id(20), Some(output_host));
+        assert_eq!(ctx.outputs.release(output_host), None);
+        assert!(ctx.outputs.is_empty_for_test());
     }
 
     #[test]
@@ -1826,10 +1819,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx.output_host_ids.is_empty());
-        assert!(ctx.output_states.is_empty());
-        assert!(ctx.output_host_global_bindings.is_empty());
-        assert!(ctx.inactive_output_host_ids.is_empty());
+        assert!(ctx.outputs.is_empty_for_test());
     }
 
     #[test]
@@ -1854,8 +1844,7 @@ mod tests {
         assert!(ctx.fatal_protocol_error);
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
-        assert!(ctx.output_host_ids.is_empty());
-        assert!(ctx.output_host_global_bindings.is_empty());
+        assert!(ctx.outputs.is_empty_for_test());
     }
 
     #[test]
@@ -1875,22 +1864,17 @@ mod tests {
             handler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20)),
             Action::Drop
         );
-        let output_host = *ctx
-            .output_host_global_bindings
-            .keys()
-            .next()
-            .expect("bound output");
-        assert!(
-            ctx.zaura_output_to_wl_output.is_empty(),
+        let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
+        assert_eq!(
+            ctx.outputs.aura_output(output_host),
+            None,
             "Aura output must wait for the shell binding"
         );
 
         let shell = "zaura_shell".to_string();
         assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
         assert!(
-            ctx.zaura_output_to_wl_output
-                .values()
-                .any(|&output_id| output_id == output_host),
+            ctx.outputs.aura_output(output_host).is_some(),
             "late shell binding must attach every already-bound output"
         );
     }
