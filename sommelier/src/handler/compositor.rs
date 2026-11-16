@@ -866,6 +866,14 @@ impl WlSurfaceHandler for CompositorHandler {
             .surfaces
             .get(&wl_surface_guest_id)
             .and_then(|surface| surface.current_buffer_id());
+        // xdg objects are separate guest objects, but their roles resolve
+        // back to this wl_surface. End them now so a later client ID reuse
+        // cannot associate a new toplevel with the destroyed surface. Their
+        // Aura toplevels, like the Aura surface, are released before the
+        // wl_surface destructor queued below.
+        for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
+            window_placement::release_toplevel(ctx, xdg_toplevel_id);
+        }
         // Retire the surface's ARC identity and release the host Aura
         // surface created for it.
         ctx.window_placement.forget_surface(wl_surface_guest_id);
@@ -907,12 +915,6 @@ impl WlSurfaceHandler for CompositorHandler {
         crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
         for keyboard_id in focus_update.retired_keyboards {
             ctx.key_generations.clear_keyboard(keyboard_id);
-        }
-        // xdg objects are separate guest objects, but their roles resolve
-        // back to this wl_surface. End them now so a later client ID reuse
-        // cannot associate a new toplevel with the destroyed surface.
-        for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
-            window_placement::release_toplevel(ctx, xdg_toplevel_id);
         }
         // The host destructor is queued above. Retain the numeric mapping
         // until the host acknowledges it with wl_display.delete_id so the
@@ -1379,9 +1381,11 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
 impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let xdg_surface_id = ctx.last_sender_id;
-        // A malformed client can destroy xdg_surface before its
-        // xdg_toplevel. End the toplevel's role too, so a later app_id
-        // cannot reach an unrelated surface after ID reuse.
+        // Destroying an xdg_surface before its xdg_toplevel is a protocol
+        // error (`xdg_surface.defunct_role_object`) that ends the session,
+        // so the order of the forwarded destructor and the queued Aura
+        // release does not matter. End the role anyway, so the toplevel's
+        // later requests cannot reach an unrelated surface after ID reuse.
         if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
             window_placement::release_toplevel(ctx, xdg_toplevel_id);
         }

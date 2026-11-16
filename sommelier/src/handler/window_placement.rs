@@ -1373,6 +1373,41 @@ mod tests {
         );
     }
 
+    /// A wl_surface destroyed under a live XDG toplevel ends the toplevel's
+    /// role: its Aura toplevel and Aura surface are both released before
+    /// the wl_surface destructor.
+    #[test]
+    fn wl_surface_destroy_releases_its_aura_children_first() {
+        use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE as REQ_RELEASE_AURA_SURFACE;
+        use crate::protocols::wayland::wl_surface::{WlSurfaceHandler, REQ_DESTROY};
+
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) =
+            setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
+        let wl_surface_guest = 100;
+        let aura_toplevel = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("toplevel");
+        let aura_surface = ensure_host_zaura_surface(&mut ctx, wl_surface_guest).expect("surface");
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = wl_surface_guest;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+        let queued = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                (aura_toplevel, REQ_RELEASE_AURA_TOPLEVEL),
+                (aura_surface, REQ_RELEASE_AURA_SURFACE),
+                (wl_surface_host, REQ_DESTROY),
+            ]
+        );
+    }
+
     #[test]
     fn xdg_toplevel_destroy_reserves_aura_id_until_host_delete_id() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
