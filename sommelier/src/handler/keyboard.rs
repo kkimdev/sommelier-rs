@@ -1555,10 +1555,7 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 24,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
@@ -1663,10 +1660,7 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, surface);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 24,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {

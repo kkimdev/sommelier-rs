@@ -1251,10 +1251,7 @@ mod tests {
             Arc::new(PlacementConfig::arc_bounds_for_test("")),
         );
         let ctx = &mut client.ctx;
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: ZAURA_SHELL_HOST,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
         ctx.shadow_table.map_id(XDG_SURFACE, XDG_SURFACE_HOST);
         ctx.shadow_table
             .track_interface_with_version(XDG_SURFACE, "xdg_surface".to_string(), 6);
@@ -1681,10 +1678,7 @@ mod tests {
         ctx.gtk_shells
             .insert(GTK_SHELL, crate::state::GtkShellState::default());
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: AURA_SHELL,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(AURA_SHELL);
         ctx.shadow_table.track_host_interface_with_version(
             AURA_SHELL,
             "zaura_shell".to_string(),

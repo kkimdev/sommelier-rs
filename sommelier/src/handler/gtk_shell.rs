@@ -207,10 +207,7 @@ mod tests {
             "wl_surface".to_string(),
             4,
         );
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: ZAURA_SHELL_HOST,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
         ctx.shadow_table.track_host_interface_with_version(
             ZAURA_SHELL_HOST,
             "zaura_shell".to_string(),

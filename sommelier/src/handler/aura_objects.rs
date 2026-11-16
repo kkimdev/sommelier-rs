@@ -195,7 +195,8 @@ mod tests {
 
     #[test]
     fn create_queues_the_shell_request_with_the_shell_version() {
-        let version = 17;
+        // The oldest shell that can create every child.
+        let version = zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
         for child in ALL {
             let mut ctx = ctx_with_shell(version);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");

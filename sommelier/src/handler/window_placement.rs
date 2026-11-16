@@ -821,10 +821,7 @@ mod tests {
             .map_id(xdg_surface_id, xdg_surface_id + 100);
         ctx.shadow_table
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: zaura_shell_host,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(zaura_shell_host);
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
@@ -934,10 +931,7 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, 12);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 24,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             25,
             crate::state::OutputState {
@@ -1070,10 +1064,7 @@ mod tests {
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 24,
-            version: 38,
-        });
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             primary_output,
             crate::state::OutputState {

@@ -962,6 +962,16 @@ impl Context {
         !self.post_dispatch.is_empty()
     }
 
+    /// Bind host object `id` as the internal `zaura_shell` at the vendored
+    /// protocol's version, as the registry would.
+    #[cfg(test)]
+    pub(crate) fn bind_aura_shell_for_test(&mut self, id: u32) {
+        self.host_zaura_shell = Some(HostAuraShell {
+            id,
+            version: crate::protocols::aura_shell::zaura_shell::VERSION,
+        });
+    }
+
     /// Take the work deferred while dispatching the current message.
     pub(crate) fn take_post_dispatch(&mut self) -> Vec<PostDispatch> {
         std::mem::take(&mut self.post_dispatch)
