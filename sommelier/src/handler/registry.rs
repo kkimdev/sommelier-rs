@@ -29,7 +29,9 @@ use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
-use crate::state::{Context, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal};
+use crate::state::{
+    Context, GlobalBinding, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal,
+};
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
@@ -89,33 +91,6 @@ fn next_global_generation(ctx: &mut Context) -> u64 {
     let generation = ctx.next_global_generation.max(1);
     ctx.next_global_generation = generation.wrapping_add(1).max(1);
     generation
-}
-
-/// Return the advertisement generation that a bind of global `name` through
-/// `registry_host_id` refers to: that registry's own view, else the
-/// connection-wide current generation.
-///
-/// Bound objects record it so a delayed `global_remove` of an older
-/// advertisement cannot retire a binding of its replacement.
-fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> u64 {
-    let generation = ctx
-        .registry_global_generations
-        .get(&registry_host_id)
-        .and_then(|generations| generations.get(&name))
-        .copied()
-        .or_else(|| ctx.global_generations.get(&name).copied());
-    // A missing generation is unreachable: `guest_bind_is_allowed` admits
-    // only names in `host_globals`, which are added only after
-    // `note_registry_global` has recorded a generation for the name, and
-    // generations are never removed. Generation 0 is a safe fallback anyway:
-    // `next_global_generation` starts at 1, so 0 never matches a removal, and
-    // the only effect would be that `global_remove` cannot retire the
-    // binding; it stays valid until the guest destroys it.
-    debug_assert!(
-        generation.is_some(),
-        "bound global {name} has no advertisement generation"
-    );
-    generation.unwrap_or_default()
 }
 
 fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
@@ -512,12 +487,23 @@ fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
     }
 }
 
-fn guest_bind_is_allowed(
+/// Decide whether the guest may bind global `name` as `interface` at
+/// `requested_version` through the registry that sent the request.
+///
+/// # Returns
+///
+/// The advertisement generation the bind refers to, or `None` to reject the
+/// bind. Bound objects record the generation so that a delayed
+/// `global_remove` of an older advertisement cannot retire a binding of its
+/// replacement. A registry that has seen the name must agree with the
+/// connection-wide generation (checked below), so that generation is the
+/// one bound.
+fn admit_guest_bind(
     ctx: &Context,
     name: u32,
     interface: &str,
     requested_version: u32,
-) -> bool {
+) -> Option<u64> {
     let interface_is_supported = WL_ALLOWED.contains(&interface)
         || XDG_ALLOWED.contains(&interface)
         || DMABUF_ALLOWED.contains(&interface)
@@ -528,14 +514,12 @@ fn guest_bind_is_allowed(
         || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
         || interface == "wl_data_device_manager";
     if !interface_is_supported {
-        return false;
+        return None;
     }
 
-    let Some(global) = ctx.host_globals.get(&name) else {
-        return false;
-    };
+    let global = ctx.host_globals.get(&name)?;
     if ctx.removed_host_globals.contains(&name) {
-        return false;
+        return None;
     }
 
     // A global is advertised independently on each wl_registry object. Once
@@ -550,7 +534,7 @@ fn guest_bind_is_allowed(
     {
         if let Some(names) = ctx.registry_global_names.get(&registry_host_id) {
             if !names.contains(&name) {
-                return false;
+                return None;
             }
             let registry_generation = ctx
                 .registry_global_generations
@@ -558,7 +542,7 @@ fn guest_bind_is_allowed(
                 .and_then(|generations| generations.get(&name))
                 .copied();
             if registry_generation != ctx.global_generations.get(&name).copied() {
-                return false;
+                return None;
             }
         }
     }
@@ -567,7 +551,16 @@ fn guest_bind_is_allowed(
     // on_global records the synthetic interface under the same numeric name.
     // Checking the advertised version here also prevents a client from
     // forwarding a bind for a protocol version that the proxy did not expose.
-    global.interface == interface && requested_version > 0 && requested_version <= global.version
+    let version_is_advertised = global.interface == interface
+        && requested_version > 0
+        && requested_version <= global.version;
+    if !version_is_advertised {
+        return None;
+    }
+    // `note_registry_global` records a generation before any name enters
+    // `host_globals`, and generations are never removed, so this lookup
+    // cannot fail for an advertised name.
+    ctx.global_generations.get(&name).copied()
 }
 
 pub struct RegistryHandler;
@@ -952,13 +945,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // delivered zaura_shell. Retry every already-live output now
                 // that the shell object and its version are available; the
                 // output bind path cannot do this retroactively on its own.
-                for output_host_id in ctx.output_host_ids.clone() {
-                    if !ctx.inactive_output_host_ids.contains(&output_host_id)
-                        && !ctx.shadow_table.is_pending_destroy_host(output_host_id)
-                    {
-                        let _ =
-                            crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
-                    }
+                for output_host_id in ctx.outputs.live_outputs() {
+                    // `None` means this shell cannot create Aura outputs;
+                    // placement then waits for metadata that never comes,
+                    // which is the same as having no zaura_shell.
+                    let _ = crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived. Their guest-side associations are recorded
@@ -1018,7 +1009,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // The SHM implementation is a v1 compatibility shim. Advertise
             // the capped version explicitly instead of forwarding a host v2
             // global: otherwise clients bind v2 and are rejected by
-            // `guest_bind_is_allowed` even though v1 is fully supported.
+            // `admit_guest_bind` even though v1 is fully supported.
             let visible = queue_synthetic_global(ctx, name, interface, 1);
             record_registry_global_visibility(ctx, name, visible);
 
@@ -1085,7 +1076,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // global advertisement disappears, but it must stop feeding
             // compositor-owned placement.  Match the exact advertisement
             // generation so a delayed remove cannot retire a replacement.
-            ctx.deactivate_output_bindings(name, generation);
+            ctx.outputs.deactivate(GlobalBinding { name, generation });
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
         }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
@@ -1159,7 +1150,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // id is (interface, version, new_id)
         let (interface, version, guest_new_id) = id;
 
-        if !guest_bind_is_allowed(ctx, name, interface, *version) {
+        let Some(generation) = admit_guest_bind(ctx, name, interface, *version) else {
             error!(
                 "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
                 name, interface, version
@@ -1174,7 +1165,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 ),
             );
             return Action::Drop;
-        }
+        };
 
         if interface == "wl_shm" {
             // Do NOT forward wl_shm to host. We emulate it.
@@ -1268,21 +1259,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         if interface == "wl_output" {
             // Register the output only once its bind is queued, so the
             // failure paths above have no output state to undo.
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
-            let generation = bound_global_generation(ctx, registry_host_id, name);
-            ctx.output_host_global_bindings
-                .insert(host_new_id, (name, generation));
-            ctx.inactive_output_host_ids.remove(&host_new_id);
+            ctx.outputs.bind(
+                host_new_id,
+                bind_version,
+                GlobalBinding { name, generation },
+            );
             if ctx.window_placement.uses_arc_bounds() {
-                // Host-only Aura output metadata (insets, scale, transform).
+                // Host-only Aura output metadata (scale factors and insets).
                 // A missing shell is retried when zaura_shell binds, so a
                 // failure here is not an error.
                 let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
             }
         }
         if interface == "zwp_linux_dmabuf_v1" {
-            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
@@ -1775,37 +1764,29 @@ mod tests {
         let output = "wl_output".to_string();
 
         assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
-        let generation = ctx.global_generations[&10];
         let bind = (output.clone(), 3, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        let output_host = ctx
-            .output_host_global_bindings
-            .keys()
-            .copied()
-            .next()
-            .expect("bound output host object");
-        ctx.output_states.insert(
-            output_host,
-            crate::state::OutputState {
+        let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
+        assert!(ctx.outputs.update(output_host, |state| {
+            *state = crate::state::OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
-            },
-        );
-        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(output_host));
+            };
+        }));
+        ctx.outputs.commit(output_host);
+        assert_eq!(ctx.outputs.primary().map(|(id, _)| id), Some(output_host));
 
         ctx.last_sender_id = 1;
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(
-            ctx.output_host_global_bindings[&output_host],
-            (10, generation)
-        );
-        assert!(ctx.output_states.contains_key(&output_host));
-        assert!(ctx.inactive_output_host_ids.contains(&output_host));
-        assert!(ctx.primary_output().is_none());
+        assert!(!ctx.outputs.is_live(output_host));
+        assert!(ctx.outputs.primary().is_none());
+        // The object itself stays valid until the guest releases it.
+        assert_eq!(ctx.shadow_table.get_host_id(20), Some(output_host));
+        assert_eq!(ctx.outputs.release(output_host), None);
+        assert!(ctx.outputs.is_empty_for_test());
     }
 
     #[test]
@@ -1826,10 +1807,33 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx.output_host_ids.is_empty());
-        assert!(ctx.output_states.is_empty());
-        assert!(ctx.output_host_global_bindings.is_empty());
-        assert!(ctx.inactive_output_host_ids.is_empty());
+        assert!(ctx.outputs.is_empty_for_test());
+    }
+
+    #[test]
+    fn bind_without_an_advertisement_generation_is_refused() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        // Reachable only through a proxy bookkeeping bug, not a guest error:
+        // a name in `host_globals` whose advertisement generation was never
+        // recorded. It is rejected like an unadvertised global.
+        ctx.host_globals.insert(
+            10,
+            HostGlobal {
+                interface: "wl_output".to_string(),
+                version: 3,
+            },
+        );
+
+        let bind = ("wl_output".to_string(), 3, 20);
+        assert_eq!(RegistryHandler.on_bind(&mut ctx, 10, &bind), Action::Drop);
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
+        assert!(ctx.outputs.is_empty_for_test());
     }
 
     #[test]
@@ -1849,22 +1853,17 @@ mod tests {
             handler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20)),
             Action::Drop
         );
-        let output_host = *ctx
-            .output_host_global_bindings
-            .keys()
-            .next()
-            .expect("bound output");
-        assert!(
-            ctx.zaura_output_to_wl_output.is_empty(),
+        let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
+        assert_eq!(
+            ctx.outputs.aura_output_for_test(output_host),
+            None,
             "Aura output must wait for the shell binding"
         );
 
         let shell = "zaura_shell".to_string();
         assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
         assert!(
-            ctx.zaura_output_to_wl_output
-                .values()
-                .any(|&output_id| output_id == output_host),
+            ctx.outputs.aura_output_for_test(output_host).is_some(),
             "late shell binding must attach every already-bound output"
         );
     }
@@ -1971,6 +1970,8 @@ mod tests {
                 version: 1,
             },
         );
+        // on_global records a generation for every advertised name.
+        ctx.global_generations.insert(7, 1);
         ctx.host_shm_id = Some(2);
         ctx.shadow_table
             .track_host_interface(2, "wl_shm".to_string());
@@ -2009,6 +2010,8 @@ mod tests {
                 version: 1,
             },
         );
+        // on_global records a generation for every advertised name.
+        ctx.global_generations.insert(9, 1);
         ctx.host_text_input_manager_v1_id = Some(2);
         ctx.shadow_table
             .track_host_interface(2, "zwp_text_input_manager_v1".to_string());

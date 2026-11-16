@@ -221,9 +221,10 @@ test uses `/dev/wl0`.
 
 With the ARC policy gate and placement bindings configured, Sommelier
 consumes the bound chords and places the focused XDG toplevel in the selected
-work-area region of the output that surface has entered. Only a surface with
-no current output association uses the first usable output; a window is never
-moved to another monitor. A matched chord never reaches the guest, even when
+work-area region of the output that surface has entered (the first usable
+one, in the order the guest bound them, when it spans several). Only a surface
+with no current output association uses the first usable output; a window is
+never moved to another monitor. A matched chord never reaches the guest, even when
 the placement is skipped (for example, with no focused toplevel or before the
 output's metadata is complete); the reason is logged. A chord that the host
 IME consumes is neither placed nor delivered. For example:
@@ -239,12 +240,20 @@ which source wins, the failure policy (a configuration problem is logged and
 disables placement shortcuts; it never stops the proxy), reloading, and the
 precision rectangles need.
 
-Work areas use Aura's current output scale and device scale factor, then apply
-the logical rotation and insets. Placement waits for both scale factors to be
-available in the committed output metadata; the rounded integer
+A work area starts from the output's `wl_output.mode`, which Exo reports in
+the panel's native orientation. It is rotated by the `wl_output.geometry`
+(panel) transform, divided by Aura's current output scale and device scale
+factor, and then shrunk by the Aura insets. `zaura_output.logical_transform`
+is not used: it omits the panel's mounting orientation, so it would turn a
+portrait-native panel the wrong way. Placement waits for both scale factors to
+be available in the committed output metadata; the rounded integer
 `wl_output.scale` is insufficient for fractional display scaling. Aura reports
 these factors in thousandths, so unusual scale settings may still differ
-slightly from the host's exact logical dimensions.
+slightly from the host's exact logical dimensions. Rotated displays and
+multi-monitor output selection follow Exo's source and are covered by unit
+tests, but have not been verified on a host. Exo's `wl_output.mode` is the
+panel's `bounds_in_native` size, which can include overscan, so on an
+overscanned display the work area may be slightly too large.
 
 No placement shortcut is active by default. The policy gate remains opt-in
 because it changes the ChromeOS window-policy namespace. The ARC policy may
@@ -258,7 +267,9 @@ single owner of this policy's per-connection state: the per-surface ARC
 identities, the host Aura surface/toplevel associations, the host-sync bounds
 barriers, and the configures held behind them. Handlers query and mutate that
 state only through its methods, and surface/toplevel teardown releases it in
-one place. [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
+one place. `OutputRegistry` in `sommelier/src/state/outputs.rs` likewise owns
+the bound outputs: their metadata, liveness, Aura output objects, and which
+outputs each surface has entered. [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
 explains the ARC application-ID namespaces, the identity allocator, and why
 `.session.*` restore identities are never fabricated.
 
