@@ -727,10 +727,14 @@ fn generate_interface(interface: &Interface) -> TokenStream {
         }
     }
 
+    // The XML owns the newest version of each interface, as it owns each
+    // message's since-version; nothing newer can be decoded.
+    let interface_version = interface.version;
     quote! {
         pub mod #mod_name {
             use super::*;
 
+            pub const VERSION: u32 = #interface_version;
             #(#request_opcodes)*
             #(#event_opcodes)*
 

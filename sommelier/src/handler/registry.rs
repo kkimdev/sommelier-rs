@@ -72,7 +72,7 @@ const _: () = assert!(
 /// vendored `third_party/protocols/aura-shell.xml`. The generated code knows
 /// no request or event added after it, so binding a newer host shell would
 /// let Exo send Aura events whose unknown opcodes end the client's session.
-const ZAURA_SHELL_MAX_VERSION: u32 = 38;
+const ZAURA_SHELL_MAX_VERSION: u32 = crate::protocols::aura_shell::zaura_shell::VERSION;
 
 /// Version ceilings used by ChromiumOS Sommelier's client-facing globals.
 ///
