@@ -1725,7 +1725,7 @@ mod tests {
         assert_eq!(ctx.window_placement_shortcuts.len(), 1);
         assert_eq!(
             ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left
+            crate::window_layout::WindowLayoutAction::Left
         );
 
         dir.write("shortcuts.toml", b"version = 1\nbindings = 3\n");
@@ -1733,7 +1733,7 @@ mod tests {
         ctx.refresh_window_placement_shortcuts();
         assert_eq!(
             ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left,
+            crate::window_layout::WindowLayoutAction::Left,
             "an invalid reload keeps the last known-good bindings"
         );
 
@@ -1744,13 +1744,13 @@ mod tests {
         source.reload().unwrap();
         assert_eq!(
             ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Left,
+            crate::window_layout::WindowLayoutAction::Left,
             "a connection adopts a reload only when it next matches a key"
         );
         ctx.refresh_window_placement_shortcuts();
         assert_eq!(
             ctx.window_placement_shortcuts[0].action,
-            crate::accelerator::WindowLayoutAction::Right
+            crate::window_layout::WindowLayoutAction::Right
         );
         assert!(
             ctx.window_placement.uses_arc_bounds(),

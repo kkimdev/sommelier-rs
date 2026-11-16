@@ -16,13 +16,18 @@ limitations under the License.
 
 //! Work-area geometry for compositor-owned window placement.
 //!
-//! [`NormalizedRect`] is the single description of *where* a placement
-//! shortcut puts a window: `[x, y, width, height]` as fractions of the
-//! output work area. The nine named [`WindowLayoutAction`] presets are
-//! expressed as such rectangles ([`WindowLayoutAction::rect`]), and every
-//! placement — named or configured — goes through
-//! [`NormalizedRect::to_work_area_bounds`], so there is exactly one rounding
-//! rule.
+//! This module owns *where* a placement shortcut puts a window:
+//!
+//! * [`WindowLayoutAction`] - the placement vocabulary: nine named presets
+//!   plus an arbitrary configured rectangle, and the one parser for the
+//!   preset names ([`WindowLayoutAction::from_name`]).
+//! * [`NormalizedRect`] - `[x, y, width, height]` as fractions of the output
+//!   work area. Every action resolves to one ([`WindowLayoutAction::rect`]),
+//!   and every placement goes through [`NormalizedRect::to_work_area_bounds`],
+//!   so there is exactly one rounding rule.
+//!
+//! The module depends on nothing else in the crate; the configuration
+//! parsers and the keyboard handler depend on it.
 //!
 //! # Rounding
 //!
@@ -46,8 +51,6 @@ limitations under the License.
 
 use thiserror::Error;
 
-use crate::accelerator::WindowLayoutAction;
-
 /// Edge-fraction tolerance for floating-point representation error.
 ///
 /// `x + width` may exceed `1.0` by at most this much, and an edge this close
@@ -60,6 +63,26 @@ const EDGE_TOLERANCE: f64 = 1e-9;
 /// so the bias corrects representation error without moving any edge that
 /// was meant to fall between pixels.
 const PIXEL_BIAS: f64 = 1e-6;
+
+/// Actions that may be bound to compositor-owned window placement shortcuts.
+///
+/// Every action resolves to a normalized work-area rectangle through
+/// [`WindowLayoutAction::rect`], so named presets and configured rectangles
+/// share one rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum WindowLayoutAction {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Fullscreen,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+    /// An arbitrary validated rectangle from the shortcut configuration file.
+    Rect(NormalizedRect),
+}
 
 /// Reasons a rectangle is not a valid normalized work-area rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -209,6 +232,35 @@ fn edge(fraction: f64, extent: i32) -> Option<i32> {
 }
 
 impl WindowLayoutAction {
+    /// Resolve a named preset, case-insensitively.
+    ///
+    /// This is the one parser for preset names; both configuration sources
+    /// use it.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
+    ///   `right`, `bottom-left`, `bottom`, or `bottom-right`, optionally
+    ///   surrounded by whitespace.
+    ///
+    /// # Returns
+    ///
+    /// The matching preset, or `None` for any other spelling.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "top-left" => Some(Self::TopLeft),
+            "top" => Some(Self::Top),
+            "top-right" => Some(Self::TopRight),
+            "left" => Some(Self::Left),
+            "fullscreen" => Some(Self::Fullscreen),
+            "right" => Some(Self::Right),
+            "bottom-left" => Some(Self::BottomLeft),
+            "bottom" => Some(Self::Bottom),
+            "bottom-right" => Some(Self::BottomRight),
+            _ => None,
+        }
+    }
+
     /// Return the normalized work-area rectangle for this action.
     ///
     /// The named presets split the work area into halves; a configured
@@ -477,6 +529,31 @@ mod tests {
                 Ok(action.rect()),
                 "{action:?}"
             );
+        }
+    }
+
+    #[test]
+    fn preset_names_parse_case_insensitively_and_reject_others() {
+        let names = [
+            "top-left",
+            "top",
+            "top-right",
+            "left",
+            "fullscreen",
+            "right",
+            "bottom-left",
+            "bottom",
+            "bottom-right",
+        ];
+        for (name, action) in names.into_iter().zip(PRESETS) {
+            assert_eq!(WindowLayoutAction::from_name(name), Some(action));
+        }
+        assert_eq!(
+            WindowLayoutAction::from_name(" Top-Left "),
+            Some(WindowLayoutAction::TopLeft)
+        );
+        for other in ["", "tile", "top_left", "window.place"] {
+            assert_eq!(WindowLayoutAction::from_name(other), None, "{other:?}");
         }
     }
 }

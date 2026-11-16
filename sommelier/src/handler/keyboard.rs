@@ -26,7 +26,6 @@ limitations under the License.
 //!
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
-use crate::accelerator::WindowLayoutAction;
 use crate::protocols::aura_shell::zaura_surface::REQ_UNSET_SNAP;
 use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
 use crate::protocols::wayland::wl_keyboard;
@@ -34,6 +33,7 @@ use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
+use crate::window_layout::WindowLayoutAction;
 use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
 

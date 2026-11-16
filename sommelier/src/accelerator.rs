@@ -35,6 +35,8 @@ limitations under the License.
 
 use xkbcommon::xkb;
 
+use crate::window_layout::WindowLayoutAction;
+
 /// Modifier bitmask constants.
 ///
 /// These bit positions follow the sommelier C convention, not X11's `Mod*Mask`
@@ -66,56 +68,6 @@ pub(crate) fn keysym_to_lower(sym: u32) -> u32 {
 pub struct Accelerator {
     pub modifiers: u32,
     pub symbol: u32,
-}
-
-/// Actions that may be bound to compositor-owned window placement shortcuts.
-///
-/// The binding is deliberately parsed from configuration rather than inferred
-/// from a fixed set of keysyms in the keyboard event path.  This keeps keyboard
-/// ownership policy at the process boundary and lets deployments choose a
-/// layout without changing the proxy binary.
-///
-/// Every action resolves to a normalized work-area rectangle through
-/// [`WindowLayoutAction::rect`] (see `crate::window_layout`), so named presets
-/// and configured rectangles share one rounding rule.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum WindowLayoutAction {
-    TopLeft,
-    Top,
-    TopRight,
-    Left,
-    Fullscreen,
-    Right,
-    BottomLeft,
-    Bottom,
-    BottomRight,
-    /// An arbitrary validated rectangle from the shortcut configuration file.
-    Rect(crate::window_layout::NormalizedRect),
-}
-
-/// Resolve a named placement action, case-insensitively.
-///
-/// # Arguments
-///
-/// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
-///   `right`, `bottom-left`, `bottom`, or `bottom-right`.
-///
-/// # Returns
-///
-/// The matching preset, or `None` for any other spelling.
-pub(crate) fn parse_window_layout_action(name: &str) -> Option<WindowLayoutAction> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "top-left" => Some(WindowLayoutAction::TopLeft),
-        "top" => Some(WindowLayoutAction::Top),
-        "top-right" => Some(WindowLayoutAction::TopRight),
-        "left" => Some(WindowLayoutAction::Left),
-        "fullscreen" => Some(WindowLayoutAction::Fullscreen),
-        "right" => Some(WindowLayoutAction::Right),
-        "bottom-left" => Some(WindowLayoutAction::BottomLeft),
-        "bottom" => Some(WindowLayoutAction::Bottom),
-        "bottom-right" => Some(WindowLayoutAction::BottomRight),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -255,7 +207,7 @@ pub(crate) fn parse_window_placement_shortcuts(
         })?;
         let accelerator = parse_accelerator(chord.trim())
             .map_err(|error| format!("binding {} has invalid chord: {}", index, error))?;
-        let action = parse_window_layout_action(action).ok_or_else(|| {
+        let action = WindowLayoutAction::from_name(action).ok_or_else(|| {
             format!(
                 "binding {} has unsupported action {:?}",
                 index,

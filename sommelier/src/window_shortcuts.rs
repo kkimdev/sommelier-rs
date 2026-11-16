@@ -58,11 +58,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::accelerator::{
-    parse_accelerator, parse_window_layout_action, Accelerator, ParseError, WindowLayoutAction,
-    WindowPlacementShortcut,
-};
-use crate::window_layout::{NormalizedRect, RectError};
+use crate::accelerator::{parse_accelerator, Accelerator, ParseError, WindowPlacementShortcut};
+use crate::window_layout::{NormalizedRect, RectError, WindowLayoutAction};
 
 /// The only schema version this build understands.
 pub(crate) const CONFIG_VERSION: i64 = 1;
@@ -237,7 +234,7 @@ pub(crate) fn parse_shortcut_config(
         }
         let action = match (binding.action, binding.rect) {
             (Some(name), None) => {
-                parse_window_layout_action(&name).ok_or(ShortcutConfigError::UnknownAction {
+                WindowLayoutAction::from_name(&name).ok_or(ShortcutConfigError::UnknownAction {
                     index,
                     action: name,
                 })?
