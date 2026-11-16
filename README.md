@@ -251,7 +251,9 @@ be available in the committed output metadata; the rounded integer
 these factors in thousandths, so unusual scale settings may still differ
 slightly from the host's exact logical dimensions. Rotated displays and
 multi-monitor output selection follow Exo's source and are covered by unit
-tests, but have not been verified on a host.
+tests, but have not been verified on a host. Exo's `wl_output.mode` is the
+panel's `bounds_in_native` size, which can include overscan, so on an
+overscanned display the work area may be slightly too large.
 
 No placement shortcut is active by default. The policy gate remains opt-in
 because it changes the ChromeOS window-policy namespace. The ARC policy may

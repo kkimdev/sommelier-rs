@@ -1104,13 +1104,17 @@ wrote one field, and the last event won.
 
 **After.** `OutputRegistry` in `sommelier/src/state/outputs.rs` is the only
 owner. Its fields are private, and it keeps one record per bound host output:
-the `GlobalBinding` (name and generation) it came from, its bound version,
-its `zaura_output`, and a `Live { committed, pending }` / `Inactive` state. A
+the `GlobalBinding` (name and generation) it came from, whether its bound
+version batches events until `wl_output.done`, its `zaura_output`, and a
+`Live { committed, pending }` / `Inactive` state. A
 reverse `zaura_output` index replaces the scans, and the surface-to-output
 associations moved in too. Handlers call `bind`, `release` (which returns the
 `zaura_output` to tear down), `deactivate`, `update` (the one publish rule
 for `wl_output` and `zaura_output` events), `commit`, `aura_event_target`,
-`surface_entered` / `surface_left` / `surface_destroyed`. Placement asks
+`ensure_aura_output` (which alone decides whether a `zaura_output` may be
+created), and `surface_entered` / `surface_left` / `surface_destroyed`.
+`admit_guest_bind` returns the generation a bind refers to, so a bind cannot
+proceed without one. Placement asks
 `for_surface` and `primary`. The same module owns `is_valid_transform` and
 `transformed_extent`, which surface buffer transforms use too.
 
@@ -1123,7 +1127,7 @@ for `wl_output` and `zaura_output` events), `commit`, `aura_event_target`,
 - Named since-versions replace the literals 2 and 38 for `get_aura_output`
   and `zaura_output.release`.
 - `state.rs` shrank from 2834 to 2465 lines, and `compositor.rs` from 6172 to
-  6144. The new `outputs.rs` has 715 lines, of which 410 are production code.
+  6147. The new `outputs.rs` has 757 lines, of which 428 are production code.
 
 **Behavior changes**, each with a regression test that failed before:
 
