@@ -406,13 +406,19 @@ pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
 ///
 /// Aura children (`zaura_surface`, `zaura_toplevel`, `zaura_output`) take
 /// the version of the `zaura_shell` that created them, and the proxy
-/// records it when it creates each one. The lookup misses only for an ID
-/// that is not a live Aura child; the current shell version is then the
-/// version such a child would have been created with.
+/// records it when it creates each one. Every caller passes a live child,
+/// so a missing version is a bookkeeping bug and fails the debug assertion.
+/// Release builds fall back to the current shell version, the version the
+/// child would have been created with: at worst that sends or skips one
+/// version-gated request, which is better than crashing every client of
+/// the proxy.
 pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
-    ctx.shadow_table
-        .host_object_version(aura_object_host_id)
-        .unwrap_or(ctx.host_zaura_shell_version)
+    let version = ctx.shadow_table.host_object_version(aura_object_host_id);
+    debug_assert!(
+        version.is_some(),
+        "Aura child {aura_object_host_id} has no recorded version"
+    );
+    version.unwrap_or(ctx.host_zaura_shell_version)
 }
 
 /// Create or reuse the host Aura object associated with a guest wl_surface.
@@ -2728,7 +2734,14 @@ mod tests {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.last_sender_id = xdg_toplevel_id;
 
+        // An Aura surface created earlier, tracked the way
+        // ensure_host_zaura_surface records it.
         let zaura_surface_host = 99u32;
+        ctx.shadow_table.track_host_interface_with_version(
+            zaura_surface_host,
+            "zaura_surface".to_string(),
+            38,
+        );
         ctx.window_placement
             .remember_aura_surface(wl_surface_host, zaura_surface_host);
 
