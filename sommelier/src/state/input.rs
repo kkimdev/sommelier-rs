@@ -528,6 +528,20 @@ pub enum GuestKeyOwner {
     ImeRecovery,
 }
 
+impl GuestKeyOwner {
+    /// The arbitration contract for compositor shortcuts; this is its only
+    /// definition.
+    ///
+    /// A compositor shortcut may own a key generation only while no channel
+    /// owns it (the first press, which also places the window) or while it
+    /// already owns it (a duplicate press, or a repeat of the consumed
+    /// chord). A generation that another channel delivered or recovered
+    /// belongs to that channel, and the chord is not acted on.
+    pub(crate) const fn admits_compositor_shortcut(owner: Option<Self>) -> bool {
+        matches!(owner, None | Some(Self::CompositorShortcut))
+    }
+}
+
 /// Normalized guest-delivery input from every host key channel.
 ///
 /// Handlers decode protocol-specific fields and provide policy facts, while
@@ -1274,6 +1288,46 @@ impl KeyGenerationRegistry {
         }
     }
 
+    /// Route a `wl_keyboard` event to the channel that owns its generation.
+    ///
+    /// This applies [`GuestKeyOwner::admits_compositor_shortcut`] inside the
+    /// reducer, so the reducer stays consistent even if a caller routes an
+    /// event to the wrong channel:
+    ///
+    /// * A physical press or release of a generation a compositor shortcut
+    ///   owns is the shortcut's duplicate press or its release.
+    /// * A shortcut press of a generation the contract does not admit is
+    ///   rejected and becomes the owner's duplicate physical press. A shortcut
+    ///   release of a generation the shortcut does not own is a physical
+    ///   release. Both rejections are logged, because the keyboard handler
+    ///   never routes them.
+    fn arbitrate(event: GuestKeyEvent, owner: Option<GuestKeyOwner>) -> GuestKeyEvent {
+        let shortcut_owned = owner == Some(GuestKeyOwner::CompositorShortcut);
+        match event {
+            GuestKeyEvent::PhysicalPress { .. } if shortcut_owned => {
+                GuestKeyEvent::CompositorShortcutPress
+            }
+            GuestKeyEvent::PhysicalRelease if shortcut_owned => {
+                GuestKeyEvent::CompositorShortcutRelease
+            }
+            GuestKeyEvent::CompositorShortcutPress
+                if !GuestKeyOwner::admits_compositor_shortcut(owner) =>
+            {
+                log::warn!("rejecting a compositor shortcut press of a key owned by {owner:?}");
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: false,
+                    ime_repeat_active: false,
+                }
+            }
+            GuestKeyEvent::CompositorShortcutRelease if !shortcut_owned => {
+                log::warn!("rejecting a compositor shortcut release of a key owned by {owner:?}");
+                GuestKeyEvent::PhysicalRelease
+            }
+            event => event,
+        }
+    }
+
     /// Apply the only guest-delivery ownership transition for one key event.
     ///
     /// Physical state and peek provenance are observed separately because they
@@ -1286,7 +1340,7 @@ impl KeyGenerationRegistry {
         key: u32,
         event: GuestKeyEvent,
     ) -> GuestKeyDecision {
-        match event {
+        match Self::arbitrate(event, self.guest_owner(keyboard, key)) {
             GuestKeyEvent::PhysicalPress {
                 repeated,
                 host_accelerator,
@@ -1372,6 +1426,10 @@ impl KeyGenerationRegistry {
             }
             GuestKeyEvent::CompositorShortcutPress => {
                 let owner = self.guest_owner(keyboard, key);
+                debug_assert!(
+                    GuestKeyOwner::admits_compositor_shortcut(owner),
+                    "arbitrate routes only admitted shortcut presses here"
+                );
                 if owner.is_none() {
                     let claimed =
                         self.claim_guest_owner(keyboard, key, GuestKeyOwner::CompositorShortcut);
@@ -1384,15 +1442,12 @@ impl KeyGenerationRegistry {
                 }
             }
             GuestKeyEvent::CompositorShortcutRelease => {
-                let owned =
-                    self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
-                if owned {
-                    self.take_guest_owner(keyboard, key);
-                }
+                let taken = self.take_guest_owner(keyboard, key);
+                debug_assert_eq!(taken, Some(GuestKeyOwner::CompositorShortcut));
                 GuestKeyDecision {
                     delivery: GuestKeyDelivery::Drop,
                     ack_handled: Some(true),
-                    ends_repeat: owned,
+                    ends_repeat: true,
                 }
             }
             GuestKeyEvent::TextInputPress { serial } => {
@@ -2781,6 +2836,122 @@ mod tests {
                 assert_eq!(ctx.guest_key_owner(keyboard, key), model);
             }
         }
+    }
+
+    #[test]
+    fn compositor_shortcut_arbitration_admits_only_unowned_or_shortcut_keys() {
+        assert!(GuestKeyOwner::admits_compositor_shortcut(None));
+        assert!(GuestKeyOwner::admits_compositor_shortcut(Some(
+            GuestKeyOwner::CompositorShortcut
+        )));
+        for owner in [
+            GuestKeyOwner::Physical,
+            GuestKeyOwner::TextInputKeysym,
+            GuestKeyOwner::ImeRecovery,
+        ] {
+            assert!(!GuestKeyOwner::admits_compositor_shortcut(Some(owner)));
+        }
+    }
+
+    /// The reducer used to ack a shortcut press or release as handled
+    /// whatever owned the key. An event that breaks the arbitration contract
+    /// is now rejected: it is decided as the owner's physical event.
+    #[test]
+    fn compositor_shortcut_press_is_rejected_for_another_owner() {
+        let keyboard = HostId(10);
+        let key = 16;
+        for owner in [
+            GuestKeyOwner::Physical,
+            GuestKeyOwner::TextInputKeysym,
+            GuestKeyOwner::ImeRecovery,
+        ] {
+            let mut registry = KeyGenerationRegistry::default();
+            registry.observe_physical_state(keyboard, key, 1);
+            assert!(registry.claim_guest_owner(keyboard, key, owner));
+            let mut reference = KeyGenerationRegistry::default();
+            reference.observe_physical_state(keyboard, key, 1);
+            assert!(reference.claim_guest_owner(keyboard, key, owner));
+
+            let decision = registry.transition_guest_key(
+                keyboard,
+                key,
+                GuestKeyEvent::CompositorShortcutPress,
+            );
+            let duplicate = reference.transition_guest_key(
+                keyboard,
+                key,
+                GuestKeyEvent::PhysicalPress {
+                    repeated: false,
+                    host_accelerator: false,
+                    ime_repeat_active: false,
+                },
+            );
+            assert_eq!(decision, duplicate, "{owner:?}");
+            assert_eq!(decision.delivery, GuestKeyDelivery::Drop, "{owner:?}");
+            assert_eq!(
+                decision.ack_handled,
+                Some(owner != GuestKeyOwner::ImeRecovery),
+                "{owner:?}"
+            );
+            assert_eq!(registry.guest_owner(keyboard, key), Some(owner));
+
+            // A shortcut release of that generation is a physical release.
+            let release = registry.transition_guest_key(
+                keyboard,
+                key,
+                GuestKeyEvent::CompositorShortcutRelease,
+            );
+            assert_eq!(
+                release,
+                reference.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
+                "{owner:?}"
+            );
+            assert_eq!(
+                registry.guest_owner(keyboard, key),
+                reference.guest_owner(keyboard, key)
+            );
+        }
+    }
+
+    #[test]
+    fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
+        let keyboard = HostId(10);
+        let key = 16;
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(keyboard, key, 1);
+        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+        let consumed = GuestKeyDecision {
+            delivery: GuestKeyDelivery::Drop,
+            ack_handled: Some(true),
+            ends_repeat: false,
+        };
+        for repeated in [false, true] {
+            assert_eq!(
+                registry.transition_guest_key(
+                    keyboard,
+                    key,
+                    GuestKeyEvent::PhysicalPress {
+                        repeated,
+                        host_accelerator: false,
+                        ime_repeat_active: false,
+                    },
+                ),
+                consumed,
+                "repeated: {repeated}"
+            );
+            assert_eq!(
+                registry.guest_owner(keyboard, key),
+                Some(GuestKeyOwner::CompositorShortcut)
+            );
+        }
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
+            GuestKeyDecision {
+                ends_repeat: true,
+                ..consumed
+            }
+        );
+        assert_eq!(registry.guest_owner(keyboard, key), None);
     }
 
     #[test]

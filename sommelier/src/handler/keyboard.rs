@@ -1034,13 +1034,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             _ => KeyClass::Guest,
         };
         let compositor_shortcut = match state {
-            // Placement is a side effect, so arbitrate ownership first. A
-            // generation already delivered (or recovered) through another
-            // channel keeps its normal path; a duplicate press of a consumed
-            // shortcut stays consumed without placing the window again.
+            // Placement is a side effect, so arbitrate ownership first, with
+            // the one contract in `GuestKeyOwner::admits_compositor_shortcut`.
+            // A duplicate press of a consumed shortcut stays consumed without
+            // placing the window again.
             WL_KEY_PRESSED => match (guest_owner, key_class) {
                 (Some(GuestKeyOwner::CompositorShortcut), _) => true,
-                (None, KeyClass::Placement(action)) => {
+                (owner, KeyClass::Placement(action))
+                    if GuestKeyOwner::admits_compositor_shortcut(owner) =>
+                {
                     // The policy owns every matched chord, so the chord is
                     // consumed whether or not the window can move now; a
                     // skip must not leak the key to the guest. Release and
