@@ -1535,20 +1535,16 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
     }
 
     fn on_origin_change(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
-        let host_id = ctx.last_sender_id;
-        let barrier_active = ctx.window_placement.has_active_barrier(host_id);
         log::debug!(
-            "zaura_toplevel.origin_change host={} origin=({}, {}) barrier_active={}",
-            host_id,
+            "zaura_toplevel.origin_change host={} origin=({}, {})",
+            ctx.last_sender_id,
             x,
-            y,
-            barrier_active
+            y
         );
-
-        // xdg_toplevel has no origin-change event. A subsequent Aura
-        // configure carries the authoritative size/state, and the window
-        // placement path only needs the barrier to suppress stale host
-        // notifications while Exo catches up.
+        // xdg_toplevel has no origin-change event and the proxy keeps no
+        // window origin, so the event is always dropped, whether or not a
+        // placement barrier is active. A subsequent Aura configure carries
+        // the authoritative size and state.
         Action::Drop
     }
 }

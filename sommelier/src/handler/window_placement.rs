@@ -1706,21 +1706,24 @@ mod tests {
     }
 
     #[test]
-    fn aura_origin_change_is_consumed_during_bounds_barrier() {
+    fn aura_origin_change_is_dropped_with_or_without_a_bounds_barrier() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
-        queue_window_bounds_barrier(&mut ctx, aura_id);
         ctx.last_sender_id = aura_id;
-
-        let action =
+        let origin_change = |ctx: &mut Context| {
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_origin_change(
                 &mut CompositorHandler,
-                &mut ctx,
+                ctx,
                 123,
                 456,
-            );
-        assert_eq!(action, Action::Drop);
+            )
+        };
+
+        assert_eq!(origin_change(&mut ctx), Action::Drop);
+        queue_window_bounds_barrier(&mut ctx, aura_id);
+        ctx.last_sender_id = aura_id;
+        assert_eq!(origin_change(&mut ctx), Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
     }
 }
