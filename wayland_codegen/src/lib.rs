@@ -159,6 +159,28 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_since_constants_from_protocol_xml() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path = manifest_dir.join("../third_party/protocols/aura-shell.xml");
+        let protocol = parse(protocol_path).expect("Failed to parse aura-shell.xml");
+        let code = generator::generate(&protocol);
+        let compact = without_whitespace(&code);
+
+        assert!(
+            compact.contains("pubconstREQ_SET_WINDOW_BOUNDS_SINCE:u32=29u32;"),
+            "a request's since attribute must become a named constant"
+        );
+        assert!(
+            compact.contains("pubconstREQ_GET_AURA_SURFACE_SINCE:u32=1u32;"),
+            "a request without since exists from version 1"
+        );
+        assert!(
+            compact.contains("pubconstEVT_CONFIGURE_SINCE:u32="),
+            "events get since constants too"
+        );
+    }
+
+    #[test]
     fn test_request_object_validation_accepts_local_only_objects() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let protocol_path = manifest_dir.join("../third_party/protocols/gtk-shell.xml");
