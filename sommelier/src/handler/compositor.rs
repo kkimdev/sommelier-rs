@@ -224,30 +224,6 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         Action::Forward
     }
 
-    fn on_scale(&mut self, ctx: &mut Context, factor: i32) -> Action {
-        if ctx.shadow_table.is_pending_destroy_host(ctx.last_sender_id) {
-            return Action::Drop;
-        }
-        if ctx.inactive_output_host_ids.contains(&ctx.last_sender_id) {
-            return Action::Forward;
-        }
-        let host_output_id = ctx.last_sender_id;
-        let output = ctx.pending_output_state(host_output_id);
-        if factor > 0 {
-            output.scale = factor;
-        } else {
-            log::warn!(
-                "Ignoring invalid wl_output.scale={} for host output {}",
-                factor,
-                ctx.last_sender_id
-            );
-        }
-        if !ctx.output_uses_done(host_output_id) {
-            ctx.commit_output_state(host_output_id);
-        }
-        Action::Forward
-    }
-
     fn on_release(&mut self, ctx: &mut Context) -> Action {
         // This is a client→host request, so `last_sender_id` is the guest
         // wl_output ID. Translate it before touching host-side output state or
@@ -2329,7 +2305,6 @@ mod tests {
 
         ctx.last_sender_id = output_host;
         handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
         ctx.last_sender_id = aura_output_host;
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
         handler.on_device_scale_factor(&mut ctx, 1250);
@@ -2353,7 +2328,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
-                scale: 2,
                 ..Default::default()
             },
         );
@@ -2491,7 +2465,6 @@ mod tests {
             Action::Forward
         );
         handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
         ctx.last_sender_id = aura_output_host;
         assert_eq!(handler.on_insets(&mut ctx, 24, 8, 48, 16), Action::Drop);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
@@ -2720,7 +2693,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()

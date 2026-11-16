@@ -728,7 +728,6 @@ pub struct OutputState {
     pub origin_y: i32,
     pub mode_width: i32,
     pub mode_height: i32,
-    pub scale: i32,
     /// Current `zaura_output.scale`, in thousandths. Preferred-only scale
     /// entries do not affect the current output geometry.
     pub aura_current_scale: Option<u32>,
@@ -1522,7 +1521,7 @@ impl Context {
     pub fn output_uses_done(&self, host_output_id: u32) -> bool {
         self.shadow_table
             .host_object_version(host_output_id)
-            .is_none_or(|version| version >= 2 || version == u32::MAX)
+            .is_none_or(|version| version >= 2)
     }
 
     /// Record that a surface entered a host output. Unknown or inactive
@@ -1720,7 +1719,6 @@ mod tests {
             origin_y: 16,
             mode_width: 3840,
             mode_height: 2160,
-            scale: 2,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(2000),
             insets_top: 24,
@@ -1737,8 +1735,6 @@ mod tests {
         let output = OutputState {
             mode_width: 3840,
             mode_height: 2160,
-            // Exo rounds its effective 2.5 factor upward on wl_output.
-            scale: 3,
             aura_current_scale: Some(1250),
             aura_device_scale_factor: Some(2000),
             ..Default::default()
@@ -1753,7 +1749,6 @@ mod tests {
             origin_y: 16,
             mode_width: 3840,
             mode_height: 2160,
-            scale: 2,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1250),
             transform: 1,
@@ -1770,7 +1765,6 @@ mod tests {
         let mut output = OutputState {
             mode_width: 3840,
             mode_height: 2160,
-            scale: 2,
             ..Default::default()
         };
         for (current, device) in [
@@ -1796,7 +1790,6 @@ mod tests {
         let output = OutputState {
             mode_width: 100,
             mode_height: 100,
-            scale: 2,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(2000),
             insets_top: 60,
@@ -1810,7 +1803,6 @@ mod tests {
         let output = OutputState {
             mode_width: 1920,
             mode_height: 1080,
-            scale: 1,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
             transform: 1,
@@ -1826,7 +1818,6 @@ mod tests {
         let usable = OutputState {
             mode_width: 1920,
             mode_height: 1080,
-            scale: 1,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
             ..Default::default()

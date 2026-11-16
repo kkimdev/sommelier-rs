@@ -1712,7 +1712,6 @@ mod tests {
         let output = crate::state::OutputState {
             mode_width: 3840,
             mode_height: 2160,
-            scale: 1,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
             ..Default::default()
@@ -1761,7 +1760,6 @@ mod tests {
             origin_x: i32::MAX,
             mode_width: 4,
             mode_height: 4,
-            scale: 1,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
             ..Default::default()
@@ -1783,7 +1781,6 @@ mod tests {
         let tiny_output = crate::state::OutputState {
             mode_width: 1,
             mode_height: 1,
-            scale: 1,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
             ..Default::default()
@@ -1845,7 +1842,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
@@ -1928,7 +1924,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
@@ -1940,7 +1935,6 @@ mod tests {
                 origin_x: 1920,
                 mode_width: 1920,
                 mode_height: 1080,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
@@ -2015,7 +2009,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
-                scale: 2,
                 aura_current_scale: Some(1000),
                 // The device scale event has not arrived yet.
                 ..Default::default()
@@ -2069,7 +2062,6 @@ mod tests {
                 origin_x: 3840,
                 mode_width: 1920,
                 mode_height: 1080,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 // The device scale event for this output has not arrived.
                 ..Default::default()
@@ -2120,7 +2112,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
@@ -2829,7 +2820,6 @@ mod tests {
             crate::state::OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
-                scale: 1,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
