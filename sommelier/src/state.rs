@@ -718,7 +718,6 @@ pub struct GtkShellState {
 pub struct GtkSurfaceState {
     pub shell_id: u32,
     pub wl_surface_id: u32,
-    pub host_zaura_surface_id: Option<u32>,
 }
 
 pub struct Context {

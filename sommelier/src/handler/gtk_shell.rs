@@ -60,7 +60,6 @@ impl GtkShell1Handler for GtkShellHandler {
             return Action::Drop;
         };
 
-        let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
@@ -71,13 +70,12 @@ impl GtkShell1Handler for GtkShellHandler {
             GtkSurfaceState {
                 shell_id,
                 wl_surface_id,
-                host_zaura_surface_id,
             },
         );
         if let Some(shell) = ctx.gtk_shells.get_mut(&shell_id) {
             shell.surfaces.insert(gtk_surface_id);
         }
-        if let Some(zaura_surface_id) = host_zaura_surface_id {
+        if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
             queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
         }
         Action::Drop
@@ -93,17 +91,17 @@ impl GtkShell1Handler for GtkShellHandler {
             return Action::Drop;
         };
         shell.startup_id.clone_from(startup_id);
-        let zaura_surface_ids = shell
+        // Two GTK surfaces may wrap one wl_surface; it has one Aura surface.
+        let wl_surface_ids = shell
             .surfaces
             .iter()
-            .filter_map(|surface_id| {
-                ctx.gtk_surfaces
-                    .get(surface_id)
-                    .and_then(|surface| surface.host_zaura_surface_id)
-            })
-            .collect::<std::collections::HashSet<_>>();
-        for zaura_surface_id in zaura_surface_ids {
-            queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
+            .filter_map(|surface_id| ctx.gtk_surfaces.get(surface_id))
+            .map(|surface| surface.wl_surface_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for wl_surface_id in wl_surface_ids {
+            if let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) {
+                queue_startup_id(ctx, zaura_surface_id, startup_id.as_deref());
+            }
         }
         Action::Drop
     }
@@ -127,15 +125,14 @@ impl GtkSurface1Handler for GtkShellHandler {
         let Some(application_id) = application_id.as_deref() else {
             return Action::Drop;
         };
-        let Some((zaura_surface_id, wl_surface_id)) = ctx
+        let Some(wl_surface_id) = ctx
             .gtk_surfaces
             .get(&ctx.last_sender_id)
-            .and_then(|surface| {
-                surface
-                    .host_zaura_surface_id
-                    .map(|id| (id, surface.wl_surface_id))
-            })
+            .map(|surface| surface.wl_surface_id)
         else {
+            return Action::Drop;
+        };
+        let Some(zaura_surface_id) = ensure_host_zaura_surface(ctx, wl_surface_id) else {
             return Action::Drop;
         };
         // `zaura_surface.set_application_id` is also the metadata Exo uses
@@ -328,6 +325,52 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    /// A GTK surface created while no `zaura_shell` is bound (for example
+    /// between a shell's `global_remove` and its re-advertisement) gets its
+    /// Aura surface once a shell is bound again, instead of losing its
+    /// metadata for good.
+    #[test]
+    fn gtk_metadata_reaches_a_shell_bound_after_the_surface() {
+        let mut ctx = setup_ctx();
+        ctx.host_zaura_shell_id = None;
+        ctx.last_sender_id = GTK_SHELL;
+        let mut handler = GtkShellHandler;
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        assert!(ctx.client_to_host_queue.is_empty());
+
+        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
+        ctx.last_sender_id = GTK_SURFACE;
+        handler.on_set_dbus_properties(
+            &mut ctx,
+            &Some("com.example.Terminal".to_string()),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        );
+        ctx.last_sender_id = GTK_SHELL;
+        handler.on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));
+
+        let zaura_surface = ctx
+            .aura_surfaces
+            .get(WL_SURFACE_HOST)
+            .expect("the late shell creates the Aura surface");
+        let queued = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|(message, _)| (sender(message), opcode(message)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                (ZAURA_SHELL_HOST, REQ_GET_AURA_SURFACE),
+                (zaura_surface, REQ_SET_APPLICATION_ID),
+                (zaura_surface, REQ_SET_STARTUP_ID),
+            ]
         );
     }
 
