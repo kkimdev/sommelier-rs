@@ -1872,14 +1872,16 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         };
-        // The Aura child is valid only while the xdg role exists. Queue the
-        // role destructor first, then release the Aura child, and retain the
-        // guest ID until the host acknowledges the destructor.
+        // zaura_toplevel is an extension child of this xdg_toplevel. Release
+        // it before the role destructor, matching the zaura_output/wl_output
+        // and zaura_surface/wl_surface order, so the host never holds an Aura
+        // child whose parent role is already gone. Retain the guest ID until
+        // the host acknowledges the role destructor.
+        release_zaura_toplevel(ctx, xdg_toplevel_id);
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
         ctx.xdg_toplevel_to_wl_surface.remove(&xdg_toplevel_id);
         ctx.xdg_surface_to_xdg_toplevel
             .retain(|_, toplevel_id| *toplevel_id != xdg_toplevel_id);
-        release_zaura_toplevel(ctx, xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
         Action::Drop
     }
@@ -4925,13 +4927,18 @@ mod tests {
         assert!(!ctx
             .xdg_toplevel_to_zaura_toplevel
             .contains_key(&xdg_toplevel_id));
+        // Child-first: the Aura extension is released before its xdg role.
+        let queued = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+            .collect::<Vec<_>>();
         assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[0].0),
-            REQ_DESTROY_XDG_TOPLEVEL
-        );
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_RELEASE_AURA_TOPLEVEL
+            queued,
+            vec![
+                (aura_id, REQ_RELEASE_AURA_TOPLEVEL),
+                (xdg_toplevel_id + 100, REQ_DESTROY_XDG_TOPLEVEL),
+            ]
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
