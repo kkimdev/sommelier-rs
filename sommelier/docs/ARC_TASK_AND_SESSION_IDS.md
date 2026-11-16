@@ -54,26 +54,8 @@ the normal Guest OS namespace, which preserves shelf/application matching:
 org.chromium.guest_os.<vm>.wayland.<app>
 ```
 
-`<id>` comes from the process-shared allocator in
-`sommelier/src/arc_task_ids.rs`:
-
-- The private pool is `2,000,000,000..=2,147,483,646`; `0`, negative values,
-  and `INT_MAX` are never produced.
-- The pool is split into blocks of 1,000,000 IDs (the last block is partial).
-  Each Sommelier process reserves one block with an advisory `flock` on a lock
-  file under `$XDG_RUNTIME_DIR/sommelier/arc-task-blocks`, starting the search
-  at a random block and allocating from a random offset inside it, wrapping
-  within the block.
-- Exclusivity holds only among proxies that share one `$XDG_RUNTIME_DIR`.
-  Proxies in other runtime directories (other containers or VMs attached to
-  the same host compositor) coordinate nothing; the random block and offset
-  only make an overlap unlikely.
-- If no block can be reserved at startup, the ARC bounds policy is disabled
-  for the process instead of using a potentially colliding identity.
-- A process never hands out an ID twice. Destroying a surface forgets its
-  identity without returning it to the block, and a block is never refilled.
-  Once it is exhausted, new surfaces skip the ARC policy until the proxy
-  restarts.
+`<id>` comes from the process-wide allocator described in
+[Sommelier's task-ID allocator](#sommeliers-task-id-allocator).
 
 `WindowPlacementState` (`sommelier/src/state/window_placement.rs`) owns the
 per-surface identity: it is allocated on first use (normally when an XDG
@@ -121,11 +103,48 @@ skipped, and allocation wraps within the user's range. Chromium's host parser
 generally converts the decimal suffix into an ARC task identity; it does not
 create a real Android task for an arbitrary number.
 
-Sommelier's fabricated task-form IDs therefore come from a positive private
-pool far above the task ranges of realistic Android users and below `INT_MAX`
-(`2,000,000,000..=2,147,483,646`), and one process never hands out the same ID
-twice. This is a namespace convention, not a guarantee against future ChromeOS
-changes or ARC tracker collisions.
+## Sommelier's task-ID allocator
+
+`sommelier/src/arc_task_ids.rs` implements this section; the facts live here
+only.
+
+- **Pool.** IDs come from `2,000,000,000..=2,147,483,646`: positive, far
+  above the task ranges of realistic Android users (see
+  [the real allocator](#the-real-arc-task-id-allocator)), and below `INT_MAX`,
+  which the host parser treats as a sentinel. `0` and negative values are never
+  produced.
+- **Blocks.** The pool is split into 148 blocks of 1,000,000 IDs; the last
+  block is partial.
+- **Reservation on first use.** Nothing is reserved at startup. The first
+  client connection that starts while `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set
+  reserves one block for the whole process. The search starts at a random
+  block and walks every block once.
+- **Lock.** A block is reserved by an exclusive, non-blocking `flock` on
+  `$XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<first>-<last>.lock`. Missing
+  directories are created with mode `0700` and missing lock files with `0600`;
+  symlinks are not followed. The open descriptor holds the lock until the process exits,
+  so the kernel releases it even after a crash. A block whose lock file is
+  held by another process, or cannot be opened or locked for any other reason,
+  is skipped.
+- **Private runtime directory.** `$XDG_RUNTIME_DIR` must be owned by the user
+  and have no group or other permissions, as the XDG Base Directory
+  specification requires. This is the trust boundary: no other user can
+  create, replace, or remove lock files, and processes of the same user are
+  trusted. Otherwise no block is reserved.
+- **Exclusivity scope.** Two live proxies never hold the same block if they
+  share one `$XDG_RUNTIME_DIR`. Proxies in other runtime directories (other
+  containers or VMs attached to the same host compositor) coordinate nothing;
+  the random block and the random offset only make an overlap unlikely.
+- **Within a block.** IDs are handed out in order from a random offset,
+  wrapping inside the block. A process never hands out an ID twice:
+  destroying a surface forgets its identity without returning it, and a block
+  is never refilled. Once it is exhausted (logged once), new surfaces skip the
+  ARC policy until the proxy restarts.
+- **Failure.** If `XDG_RUNTIME_DIR` is unset or not private, the lock directory
+  cannot be created, `getrandom` fails, or no block can be locked, the ARC
+  bounds policy is disabled for the whole process instead of using an
+  identity that could collide. The failure is logged once and cached; later
+  connections do not retry.
 
 ## Restore-session threshold
 
