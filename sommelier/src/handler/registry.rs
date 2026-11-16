@@ -1883,8 +1883,7 @@ mod tests {
                 &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
                 None,
                 arc_ids,
-            )
-            .unwrap(),
+            ),
         );
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);

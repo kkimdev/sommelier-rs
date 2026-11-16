@@ -1617,14 +1617,11 @@ mod tests {
             "shortcuts.toml",
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
         );
-        let placement = Arc::new(
-            PlacementConfig::resolve_for_test(
-                &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-                Some(&path),
-                crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-            )
-            .unwrap(),
-        );
+        let placement = Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&path),
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
         let ctx = Context::with_placement_for_test(Arc::clone(&placement));
         assert_eq!(
             ctx.placement_action_for(&alt_q()),
@@ -1657,14 +1654,11 @@ mod tests {
 
     #[test]
     fn shortcuts_are_ignored_without_an_active_arc_policy() {
-        let ctx = Context::with_placement_for_test(
-            PlacementConfig::resolve_for_test(
-                &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left")],
-                None,
-                crate::arc_task_ids::ArcIdAllocator::block_for_test(),
-            )
-            .unwrap(),
-        );
+        let ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left")],
+            None,
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(!ctx.window_placement.uses_arc_bounds());
     }

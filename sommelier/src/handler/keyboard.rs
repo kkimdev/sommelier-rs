@@ -1657,14 +1657,11 @@ mod tests {
     fn placement_binding_is_guest_input_without_arc_bounds_policy() {
         let mut handler = KeyboardHandler::new();
         // The gate is off, so the configured binding is ignored at startup.
-        let mut ctx = Context::with_placement_for_test(
-            PlacementConfig::resolve_for_test(
-                &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
-                None,
-                ArcIdAllocator::block_for_test(),
-            )
-            .unwrap(),
-        );
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
+            None,
+            ArcIdAllocator::block_for_test(),
+        ));
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
@@ -1678,21 +1675,18 @@ mod tests {
     #[test]
     fn host_accelerator_and_placement_classify_from_one_chord() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::with_placement_for_test(
-            PlacementConfig::resolve_for_test(
-                &[
-                    ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-                    ("SOMMELIER_ACCELERATORS", "<Control>a"),
-                    (
-                        "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
-                        "<Control>q=top-left",
-                    ),
-                ],
-                None,
-                ArcIdAllocator::block_for_test(),
-            )
-            .unwrap(),
-        );
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
+            &[
+                ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+                ("SOMMELIER_ACCELERATORS", "<Control>a"),
+                (
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
+                    "<Control>q=top-left",
+                ),
+            ],
+            None,
+            ArcIdAllocator::block_for_test(),
+        ));
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
@@ -2229,14 +2223,11 @@ mod tests {
         document: &[u8],
     ) -> std::sync::Arc<PlacementConfig> {
         let path = dir.write("shortcuts.toml", document);
-        std::sync::Arc::new(
-            PlacementConfig::resolve_for_test(
-                &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
-                Some(&path),
-                ArcIdAllocator::block_for_test(),
-            )
-            .unwrap(),
-        )
+        std::sync::Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&path),
+            ArcIdAllocator::block_for_test(),
+        ))
     }
 
     #[test]
@@ -2265,17 +2256,14 @@ mod tests {
 
     #[test]
     fn placement_without_an_arc_identity_creates_no_aura_toplevel() {
-        let (mut handler, mut ctx, key) = placeable_fixture(
-            PlacementConfig::resolve_for_test(
-                &[
-                    ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-                    ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left"),
-                ],
-                None,
-                ArcIdAllocator::exhausted_for_test(),
-            )
-            .unwrap(),
-        );
+        let (mut handler, mut ctx, key) = placeable_fixture(PlacementConfig::resolve_for_test(
+            &[
+                ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+                ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left"),
+            ],
+            None,
+            ArcIdAllocator::exhausted_for_test(),
+        ));
         assert_eq!(
             KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
             Err(PlacementSkip::NoAuraToplevel)

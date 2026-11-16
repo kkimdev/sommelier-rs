@@ -98,9 +98,10 @@ struct Args {
     ///
     /// Used only while the ARC bounds policy is active
     /// (SOMMELIER_WINDOW_BOUNDS_AS_ARC), and mutually exclusive with
-    /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An invalid file is a startup
-    /// error (exit 2); SIGHUP reloads it and keeps the previous bindings if
-    /// the new file is invalid. See docs/WINDOW_SHORTCUT_CONFIGURATION.md.
+    /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An unusable file is logged and
+    /// leaves placement shortcuts disabled; SIGHUP reloads it and keeps the
+    /// previous bindings if the new file is invalid. See
+    /// docs/WINDOW_SHORTCUT_CONFIGURATION.md.
     #[arg(long, value_name = "PATH")]
     window_shortcuts_config: Option<std::path::PathBuf>,
 
@@ -121,16 +122,14 @@ async fn main() {
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
     let shortcuts_file = args.window_shortcuts_config.as_deref();
-    // Install the reload handler before the file is first read, so a SIGHUP
-    // sent by whoever just wrote the file can never terminate the proxy.
-    let reload_signal = shortcuts_file.map(|_| install_reload_signal());
-    let placement = match placement_config::PlacementConfig::from_environment(shortcuts_file) {
-        Ok(config) => Arc::new(config),
-        Err(error) => {
-            log::error!("{}", error);
-            std::process::exit(2);
-        }
-    };
+    // The reload handler is installed right after argument parsing, before
+    // the file is first read, so it is already in place for the first read.
+    let reload_signal = shortcuts_file.and_then(|_| install_reload_signal());
+    // Never fatal: a configuration problem is logged once and leaves
+    // placement shortcuts disabled, because this proxy serves every app.
+    let placement = Arc::new(placement_config::PlacementConfig::from_environment(
+        shortcuts_file,
+    ));
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
@@ -159,18 +158,20 @@ async fn main() {
 ///
 /// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
 /// the signal through its own self-pipe; the proxy's accept loop runs the
-/// reload. Failure to install is fatal (exit 1) because the documented
-/// reload contract could not be honored.
-fn install_reload_signal() -> tokio::signal::unix::Signal {
-    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(signal) => signal,
-        Err(error) => {
+/// reload.
+///
+/// # Returns
+///
+/// `None` when the handler cannot be installed. That is logged and is not
+/// fatal: the proxy runs without reloads.
+fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .inspect_err(|error| {
             log::error!(
-                "Failed to install the SIGHUP shortcut reload handler: {}",
+                "Failed to install the SIGHUP shortcut reload handler; reloads are disabled: {}",
                 error
             );
-            std::process::exit(1);
-        }
-    }
+        })
+        .ok()
 }
 mod test_xkb;

@@ -2283,8 +2283,7 @@ mod tests {
                 &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
                 None,
                 crate::arc_task_ids::ArcIdAllocator::exhausted_for_test(),
-            )
-            .unwrap(),
+            ),
         );
         assert!(ctx.window_placement.arc_application_id(10).is_none());
         assert!(!ctx.window_placement.has_arc_application_ids());
