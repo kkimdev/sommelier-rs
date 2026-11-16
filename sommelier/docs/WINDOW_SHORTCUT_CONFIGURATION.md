@@ -88,9 +88,9 @@ SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscre
 ```
 
 A comma-separated list of `CHORD=ACTION` entries. Whitespace around each
-chord and action is ignored, and so are empty entries. Only the named actions
-(see below) are available; use the file for rectangles. A list can move to
-the file unchanged.
+chord and action is ignored, and so are empty entries. Only the
+[named actions](#named-actions) are available; use the file for rectangles.
+A list can move to the file unchanged.
 
 ## File format
 
@@ -122,19 +122,20 @@ action = "fullscreen"
     (`<Control>`/`<Ctrl>`, `<Alt>`/`<Meta>`, `<Shift>`,
     `<Super>`/`<Win>`/`<Search>`) followed by an XKB keysym name. Matching is
     exact on modifiers and case-insensitive on the keysym.
-  - `action` is one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
-    `right`, `bottom-left`, `bottom`, `bottom-right` (case-insensitive). These
-    are the same names as the environment variable, so a list can be moved to
-    the file unchanged. `fullscreen` fills the work area; it is ordinary
-    placement, not native fullscreen.
+  - `action` is one of the [named actions](#named-actions)
+    (case-insensitive).
   - `rect` is `[x, y, width, height]`. Integers such as `[0, 0, 1, 1]` are
     accepted.
 - Unknown keys anywhere are rejected, so a misspelt field cannot be silently
   ignored.
 
-Named actions are shared with the environment list
-(`WindowLayoutAction::from_name` is the one name parser) and keep the common
-layouts readable. Each named action is defined as a rectangle:
+### Named actions
+
+The environment list and the file share these names
+(`WindowLayoutAction::from_name` is the one name parser). Each stands for a
+fixed rectangle: `WindowLayoutAction::rect` in
+`sommelier/src/window_layout.rs` defines the values, a unit test there pins
+them, and this table presents them.
 
 | Action | Rectangle |
 | --- | --- |
@@ -147,6 +148,9 @@ layouts readable. Each named action is defined as a rectangle:
 | `bottom-left` | `[0.0, 0.5, 0.5, 0.5]` |
 | `bottom` | `[0.0, 0.5, 1.0, 0.5]` |
 | `bottom-right` | `[0.5, 0.5, 0.5, 0.5]` |
+
+`fullscreen` fills the work area; it is ordinary placement, not native
+fullscreen.
 
 ## Validation
 

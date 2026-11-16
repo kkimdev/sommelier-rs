@@ -255,9 +255,9 @@ impl WindowLayoutAction {
     ///
     /// # Arguments
     ///
-    /// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
-    ///   `right`, `bottom-left`, `bottom`, or `bottom-right`, optionally
-    ///   surrounded by whitespace.
+    /// * `name` - a preset name, optionally surrounded by whitespace. The
+    ///   match below is the list of names; the "Named actions" table in
+    ///   `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` presents it.
     ///
     /// # Returns
     ///
@@ -279,8 +279,10 @@ impl WindowLayoutAction {
 
     /// Return the normalized work-area rectangle for this action.
     ///
-    /// The named presets split the work area into halves; a configured
-    /// [`WindowLayoutAction::Rect`] returns its own rectangle.
+    /// The match below defines the named presets' rectangles; the "Named
+    /// actions" table in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`
+    /// presents them. A configured [`WindowLayoutAction::Rect`] returns its
+    /// own rectangle.
     pub(crate) fn rect(self) -> NormalizedRect {
         // The presets are exact binary fractions inside the unit square, so
         // validation could not change them; a test proves that this
