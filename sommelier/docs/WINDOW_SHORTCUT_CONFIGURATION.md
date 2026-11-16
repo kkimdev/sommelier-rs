@@ -50,15 +50,15 @@ problem is logged once per process instead. The rules apply in this order:
    shortcuts disabled: no binding is active and no chord is consumed. The ARC
    policy itself stays active. With an invalid `SOMMELIER_ACCELERATORS`, key
    filtering is disabled too.
-3. **A file can recover by reload.** If the file was given alone and its path
-   resolved, `SIGHUP` re-reads it, so a fixed file activates its bindings
-   without a restart (see [Reloading](#reloading)). The other unusable cases
-   have nothing to reload and need a restart: both sources given, an invalid
-   environment list, a file path that cannot be resolved, and an invalid
-   `SOMMELIER_ACCELERATORS`, which is read only at startup.
-4. **Host accelerators alone only lose filtering.** Without a binding source,
-   a malformed `SOMMELIER_ACCELERATORS` logs one warning and disables key
-   filtering, so every key goes to the guest.
+3. **A file can recover by reload.** If the file was the only source, its
+   path resolved, and `SOMMELIER_ACCELERATORS` is valid, `SIGHUP` re-reads
+   it, so a fixed file activates its bindings without a restart (see
+   [Reloading](#reloading)). Every other unusable case needs a restart; the
+   table below says which.
+4. **Host accelerators alone only lose filtering.** Without a usable binding
+   source (no source, or the policy is off), a malformed
+   `SOMMELIER_ACCELERATORS` logs one warning and disables key filtering, so
+   every key goes to the guest.
 
 | Policy (gate and ARC block) | Binding source | Result |
 | --- | --- | --- |
