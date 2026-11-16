@@ -434,16 +434,7 @@ pub(crate) fn ensure_host_zaura_surface(
     let mut builder = crate::wire::MessageBuilder::new();
     builder.write_u32(zaura_surface_host_id);
     builder.write_u32(wl_surface_host_id);
-    let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE) else {
-        log::warn!(
-            "Unable to encode Aura surface request for wl_surface {}",
-            wl_surface_guest_id
-        );
-        ctx.shadow_table
-            .remove_host_interface(zaura_surface_host_id);
-        return None;
-    };
-
+    let message = builder.build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE);
     ctx.client_to_host_queue.push((message, Vec::new()));
     ctx.window_placement
         .remember_aura_surface(wl_surface_host_id, zaura_surface_host_id);

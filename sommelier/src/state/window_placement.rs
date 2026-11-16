@@ -211,13 +211,6 @@ impl WindowPlacementState {
         self.debug_assert_consistent();
     }
 
-    /// Allow the ARC identity to be queued again after the request that
-    /// carried it was rolled back before reaching the host.
-    pub(crate) fn unmark_arc_application_id_applied(&mut self, wl_surface_guest_id: u32) {
-        self.arc_application_ids_applied
-            .remove(&wl_surface_guest_id);
-    }
-
     #[cfg(test)]
     pub(crate) fn has_arc_application_ids(&self) -> bool {
         !self.arc_application_ids.is_empty()
@@ -511,17 +504,6 @@ mod tests {
         // Identities are never recycled: a reused guest ID gets a new one.
         let second = state.arc_application_id(10).expect("ARC identity");
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn applied_flag_can_be_rolled_back_without_losing_identity() {
-        let mut state = active();
-        let identity = state.arc_application_id(10).expect("ARC identity");
-        state.mark_arc_application_id_applied(10);
-        assert!(state.arc_application_id_applied(10));
-        state.unmark_arc_application_id_applied(10);
-        assert!(!state.arc_application_id_applied(10));
-        assert_eq!(state.arc_application_id(10), Some(identity));
     }
 
     #[test]
