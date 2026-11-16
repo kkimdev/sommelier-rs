@@ -381,6 +381,16 @@ impl KeyboardHandler {
         action.rect().to_work_area_bounds(output.work_area()?)
     }
 
+    /// Place the focused toplevel for a placement shortcut.
+    ///
+    /// Target resolution (focused toplevel, output, work-area bounds) is
+    /// shared; the bounds request itself belongs to the active placement
+    /// backend.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the backend queued the placement, so the caller consumes
+    /// the shortcut key. `false` leaves the key with the client.
     fn apply_window_layout(
         ctx: &mut Context,
         host_keyboard_id: HostId,
@@ -403,14 +413,6 @@ impl KeyboardHandler {
             );
             return false;
         };
-        let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
-            log::debug!(
-                "window layout {:?} ignored: guest xdg_toplevel {} has no host mapping",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
         let Some((output_host_id, output)) = ctx
             .shadow_table
             .get_host_id(guest_wl_surface_id)
@@ -424,11 +426,40 @@ impl KeyboardHandler {
             );
             return false;
         };
-        let Some((x, y, width, height)) = Self::bounds_for_action(action, output) else {
+        let Some(bounds) = Self::bounds_for_action(action, output) else {
             log::debug!(
                 "window layout {:?} ignored: invalid output geometry {:?}",
                 action,
                 output
+            );
+            return false;
+        };
+        Self::apply_arc_window_bounds(
+            ctx,
+            action,
+            guest_xdg_toplevel_id,
+            guest_wl_surface_id,
+            output_host_id,
+            bounds,
+        )
+    }
+
+    /// ARC bounds backend: reset the window state and queue
+    /// `zaura_toplevel.set_window_bounds` behind a `wl_display.sync` barrier.
+    /// The whole batch is rolled back if any part cannot be queued.
+    fn apply_arc_window_bounds(
+        ctx: &mut Context,
+        action: WindowLayoutAction,
+        guest_xdg_toplevel_id: u32,
+        guest_wl_surface_id: u32,
+        output_host_id: u32,
+        (x, y, width, height): (i32, i32, i32, i32),
+    ) -> bool {
+        let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
+            log::debug!(
+                "window layout {:?} ignored: guest xdg_toplevel {} has no host mapping",
+                action,
+                guest_xdg_toplevel_id
             );
             return false;
         };
