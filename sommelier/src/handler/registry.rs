@@ -1199,24 +1199,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
-        if interface == "wl_output" {
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
-            let registry_host_id = ctx
-                .shadow_table
-                .get_host_id(ctx.last_sender_id)
-                .unwrap_or(ctx.last_sender_id);
-            let generation = ctx
-                .registry_global_generations
-                .get(&registry_host_id)
-                .and_then(|generations| generations.get(&name))
-                .copied()
-                .or_else(|| ctx.global_generations.get(&name).copied())
-                .unwrap_or_default();
-            ctx.output_host_global_bindings
-                .insert(host_new_id, (name, generation));
-            ctx.inactive_output_host_ids.remove(&host_new_id);
-        }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
         // guest metadata at v4 so feedback requests are accepted locally,
@@ -1252,18 +1234,32 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
-            if interface == "wl_output" {
-                ctx.remove_output_state(host_new_id);
-            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         }
-        if interface == "wl_output" && ctx.window_placement.uses_arc_bounds() {
-            // The Aura output extension carries the logical work-area insets
-            // that wl_output itself does not expose. It is host-only; the
-            // guest continues to receive the ordinary wl_output events.
-            let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
+        if interface == "wl_output" {
+            // Register the output only once its bind is queued, so the
+            // failure paths above have no output state to undo.
+            ctx.output_host_ids.push(host_new_id);
+            ctx.output_states.entry(host_new_id).or_default();
+            let generation = ctx
+                .registry_global_generations
+                .get(&registry_host_id)
+                .and_then(|generations| generations.get(&name))
+                .copied()
+                .or_else(|| ctx.global_generations.get(&name).copied())
+                .unwrap_or_default();
+            ctx.output_host_global_bindings
+                .insert(host_new_id, (name, generation));
+            ctx.inactive_output_host_ids.remove(&host_new_id);
+            if ctx.window_placement.uses_arc_bounds() {
+                // The Aura output extension carries the logical work-area
+                // insets that wl_output itself does not expose. It is
+                // host-only; the guest continues to receive the ordinary
+                // wl_output events.
+                let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
+            }
         }
         if interface == "zwp_linux_dmabuf_v1" {
             let generation = ctx
@@ -1796,6 +1792,30 @@ mod tests {
         assert!(ctx.output_states.contains_key(&output_host));
         assert!(ctx.inactive_output_host_ids.contains(&output_host));
         assert!(ctx.primary_output().is_none());
+    }
+
+    #[test]
+    fn output_bind_through_an_unmapped_registry_registers_no_output() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+
+        // Guest registry 2 has no host object, so the bind cannot be sent.
+        ctx.last_sender_id = 2;
+        assert_eq!(
+            handler.on_bind(&mut ctx, 10, &(output, 3, 20)),
+            Action::Drop
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert!(ctx.output_host_ids.is_empty());
+        assert!(ctx.output_states.is_empty());
+        assert!(ctx.output_host_global_bindings.is_empty());
+        assert!(ctx.inactive_output_host_ids.is_empty());
     }
 
     #[test]
