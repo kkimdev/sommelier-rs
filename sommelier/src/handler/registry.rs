@@ -93,21 +93,6 @@ fn next_global_generation(ctx: &mut Context) -> u64 {
     generation
 }
 
-/// Return the advertisement generation that a bind of global `name` through
-/// `registry_host_id` refers to: that registry's own view, else the
-/// connection-wide current generation.
-///
-/// Bound objects record it so a delayed `global_remove` of an older
-/// advertisement cannot retire a binding of its replacement. `None` means
-/// the name was never advertised; `on_bind` refuses such a bind.
-fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> Option<u64> {
-    ctx.registry_global_generations
-        .get(&registry_host_id)
-        .and_then(|generations| generations.get(&name))
-        .copied()
-        .or_else(|| ctx.global_generations.get(&name).copied())
-}
-
 fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
     let registry_id = ctx.last_sender_id;
     let current_generation = ctx.global_generations.get(&name).copied();
@@ -502,12 +487,23 @@ fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
     }
 }
 
-fn guest_bind_is_allowed(
+/// Decide whether the guest may bind global `name` as `interface` at
+/// `requested_version` through the registry that sent the request.
+///
+/// # Returns
+///
+/// The advertisement generation the bind refers to, or `None` to reject the
+/// bind. Bound objects record the generation so that a delayed
+/// `global_remove` of an older advertisement cannot retire a binding of its
+/// replacement. A registry that has seen the name must agree with the
+/// connection-wide generation (checked below), so that generation is the
+/// one bound.
+fn admit_guest_bind(
     ctx: &Context,
     name: u32,
     interface: &str,
     requested_version: u32,
-) -> bool {
+) -> Option<u64> {
     let interface_is_supported = WL_ALLOWED.contains(&interface)
         || XDG_ALLOWED.contains(&interface)
         || DMABUF_ALLOWED.contains(&interface)
@@ -518,14 +514,12 @@ fn guest_bind_is_allowed(
         || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
         || interface == "wl_data_device_manager";
     if !interface_is_supported {
-        return false;
+        return None;
     }
 
-    let Some(global) = ctx.host_globals.get(&name) else {
-        return false;
-    };
+    let global = ctx.host_globals.get(&name)?;
     if ctx.removed_host_globals.contains(&name) {
-        return false;
+        return None;
     }
 
     // A global is advertised independently on each wl_registry object. Once
@@ -540,7 +534,7 @@ fn guest_bind_is_allowed(
     {
         if let Some(names) = ctx.registry_global_names.get(&registry_host_id) {
             if !names.contains(&name) {
-                return false;
+                return None;
             }
             let registry_generation = ctx
                 .registry_global_generations
@@ -548,7 +542,7 @@ fn guest_bind_is_allowed(
                 .and_then(|generations| generations.get(&name))
                 .copied();
             if registry_generation != ctx.global_generations.get(&name).copied() {
-                return false;
+                return None;
             }
         }
     }
@@ -557,7 +551,16 @@ fn guest_bind_is_allowed(
     // on_global records the synthetic interface under the same numeric name.
     // Checking the advertised version here also prevents a client from
     // forwarding a bind for a protocol version that the proxy did not expose.
-    global.interface == interface && requested_version > 0 && requested_version <= global.version
+    let version_is_advertised = global.interface == interface
+        && requested_version > 0
+        && requested_version <= global.version;
+    if !version_is_advertised {
+        return None;
+    }
+    // `note_registry_global` records a generation before any name enters
+    // `host_globals`, and generations are never removed, so this lookup
+    // cannot fail for an advertised name.
+    ctx.global_generations.get(&name).copied()
 }
 
 pub struct RegistryHandler;
@@ -1006,7 +1009,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // The SHM implementation is a v1 compatibility shim. Advertise
             // the capped version explicitly instead of forwarding a host v2
             // global: otherwise clients bind v2 and are rejected by
-            // `guest_bind_is_allowed` even though v1 is fully supported.
+            // `admit_guest_bind` even though v1 is fully supported.
             let visible = queue_synthetic_global(ctx, name, interface, 1);
             record_registry_global_visibility(ctx, name, visible);
 
@@ -1147,7 +1150,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // id is (interface, version, new_id)
         let (interface, version, guest_new_id) = id;
 
-        if !guest_bind_is_allowed(ctx, name, interface, *version) {
+        let Some(generation) = admit_guest_bind(ctx, name, interface, *version) else {
             error!(
                 "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
                 name, interface, version
@@ -1162,7 +1165,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 ),
             );
             return Action::Drop;
-        }
+        };
 
         if interface == "wl_shm" {
             // Do NOT forward wl_shm to host. We emulate it.
@@ -1238,21 +1241,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // Do not leave a guest→host mapping behind when the registry
             // itself has already been destroyed or was never mapped.
             ctx.shadow_table.remove_id(*guest_new_id);
-            return Action::Drop;
-        };
-        // Every name that `guest_bind_is_allowed` admits was recorded with a
-        // generation by `note_registry_global`, and generations are never
-        // removed. Refuse rather than invent one: a made-up generation could
-        // never be retired by `global_remove`.
-        let Some(generation) = bound_global_generation(ctx, registry_host_id, name) else {
-            error!("Bind for global {name} has no advertisement generation");
-            ctx.shadow_table.remove_id(*guest_new_id);
-            queue_protocol_error(
-                ctx,
-                registry_guest_id,
-                0,
-                format!("invalid bind for unadvertised global {name}"),
-            );
             return Action::Drop;
         };
         let bind_version = host_version;
@@ -1829,8 +1817,9 @@ mod tests {
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
             .track_interface(1, "wl_registry".to_string());
-        // Reachable only through a bookkeeping bug: an admitted name whose
-        // advertisement was never recorded.
+        // Reachable only through a proxy bookkeeping bug, not a guest error:
+        // a name in `host_globals` whose advertisement generation was never
+        // recorded. It is rejected like an unadvertised global.
         ctx.host_globals.insert(
             10,
             HostGlobal {
@@ -1981,6 +1970,8 @@ mod tests {
                 version: 1,
             },
         );
+        // on_global records a generation for every advertised name.
+        ctx.global_generations.insert(7, 1);
         ctx.host_shm_id = Some(2);
         ctx.shadow_table
             .track_host_interface(2, "wl_shm".to_string());
@@ -2019,6 +2010,8 @@ mod tests {
                 version: 1,
             },
         );
+        // on_global records a generation for every advertised name.
+        ctx.global_generations.insert(9, 1);
         ctx.host_text_input_manager_v1_id = Some(2);
         ctx.shadow_table
             .track_host_interface(2, "zwp_text_input_manager_v1".to_string());
