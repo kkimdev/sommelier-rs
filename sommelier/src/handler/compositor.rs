@@ -2538,16 +2538,20 @@ mod tests {
 
     #[test]
     fn work_area_rotates_native_mode_by_the_panel_transform() {
-        // (native mode, panel transform, logical transform, work area).
+        // (native mode, panel transform, logical transform, work area). The
+        // transforms are the wire values Exo sends: its `OutputTransform`
+        // inverts the rotation, so ROTATE_90 is `transform.270` (3).
         for (mode, panel, logical, expected) in [
-            // A landscape panel rotated by 90 degrees: both transforms agree.
-            ((1920, 1080), 1, 1, (0, 0, 1080, 1920)),
-            // A portrait-native panel (`kRightUp`) at rotation 0: Exo sends
-            // panel transform 90 and logical transform 0, and the screen is
-            // landscape. The logical transform alone left it portrait.
-            ((1600, 2560), 1, 0, (0, 0, 2560, 1600)),
-            // The same panel rotated by 90 degrees: panel 180, logical 90.
-            ((1600, 2560), 2, 1, (0, 0, 1600, 2560)),
+            // A landscape panel at rotation 90: both transforms agree.
+            ((1920, 1080), 3, 3, (0, 0, 1080, 1920)),
+            // A portrait-native panel (`kRightUp`) at rotation 0: its panel
+            // rotation is ROTATE_90 (wire value 3) and its logical rotation
+            // ROTATE_0 (0), and the screen is landscape. The logical
+            // transform alone left it portrait.
+            ((1600, 2560), 3, 0, (0, 0, 2560, 1600)),
+            // The same panel at rotation 90: panel ROTATE_180 (wire value 2),
+            // logical ROTATE_90 (wire value 3).
+            ((1600, 2560), 2, 3, (0, 0, 1600, 2560)),
         ] {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             bind_output_with_aura(&mut ctx, 3, Default::default());
