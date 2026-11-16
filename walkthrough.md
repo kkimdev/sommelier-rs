@@ -749,3 +749,32 @@ a redundant placement batch for one chord (no key is lost).
 Validation on the final head: serial and parallel workspace tests (Sommelier
 600 passed / 1 ignored, sample GUI 12, codegen 7), strict Clippy,
 `cargo fmt --check`, and `git diff --check` pass.
+
+## 2026-11-16 — Host placement acceptance
+
+CI on the review-fix head failed only on a new Rust 1.100 Clippy lint
+(`chunks_exact_to_as_chunks`) in the Aura configure-state helpers; both sites
+now use `as_chunks::<4>()`, which still drops a malformed trailing partial
+entry. CI passes on x86_64 and aarch64.
+
+The release build of that head ran as an isolated proxy on `wayland-9` with
+`SOMMELIER_WINDOW_BOUNDS_AS_ARC=1` and the nine `<Alt>` shortcuts, serving
+`gtk3-widget-factory` on the single 3840x2160 output. The primary Sommelier
+service on `wayland-2` was not touched. An earlier attempt recorded no
+placements because the test window never received keyboard focus; it was not
+a placement failure.
+
+- All nine shortcuts placed the window. At 100% display size the work area was
+  3840x2112 (48 px shelf inset), e.g. Left `(0, 0, 1920, 2112)` and
+  BottomRight `(1920, 1056, 1920, 1056)`. At the 125% display-size setting it
+was 3200x1752 (combined Aura scale 1.2 on this panel), e.g.
+  Fullscreen `(0, 0, 3200, 1752)` and Right `(1600, 0, 1600, 1752)`.
+- The user confirmed the window landed in each half and quadrant, Fullscreen
+  worked, and context menus, menubar submenus, combo popups, and tooltips
+  opened next to the moved window at both display sizes.
+- No placement was skipped and no errors were logged.
+
+Still unverified: multi-monitor placement (this host exposes one output),
+rotated or portrait-native panels, and popups on a toplevel repaired through
+the late zaura_shell path. Logs are kept in the untracked local evidence
+directory `_local/evidence/pr9-hostval-2026-11-16/` in the primary checkout.
