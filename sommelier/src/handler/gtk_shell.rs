@@ -15,10 +15,14 @@ limitations under the License.
 */
 
 use crate::handler::compositor::{
-    ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
+    aura_object_version, ensure_host_zaura_surface, native_wayland_app_id,
+    wayland_string_fits_message,
 };
 use crate::handler::window_placement::apply_arc_identity;
-use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
+use crate::protocols::aura_shell::zaura_surface::{
+    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_SET_STARTUP_ID,
+    REQ_SET_STARTUP_ID_SINCE,
+};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::state::{Context, GtkSurfaceState};
@@ -27,11 +31,7 @@ use crate::wire::{Action, MessageBuilder};
 pub struct GtkShellHandler;
 
 fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option<&str>) {
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_surface_id)
-        .unwrap_or(ctx.host_zaura_shell_version);
-    if version < 4 {
+    if aura_object_version(ctx, zaura_surface_id) < REQ_SET_STARTUP_ID_SINCE {
         return;
     }
 
@@ -145,11 +145,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         else {
             return Action::Drop;
         };
-        let version = ctx
-            .shadow_table
-            .host_object_version(zaura_surface_id)
-            .unwrap_or(ctx.host_zaura_shell_version);
-        if version < 5 {
+        if aura_object_version(ctx, zaura_surface_id) < REQ_SET_APPLICATION_ID_SINCE {
             return Action::Drop;
         }
 

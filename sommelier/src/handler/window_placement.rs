@@ -27,18 +27,35 @@ limitations under the License.
 //! [`crate::state::WindowPlacementState`]; protocol handlers translate wire
 //! events and delegate here.
 
-use crate::handler::compositor::ensure_host_zaura_surface;
-use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL;
-use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP};
+use crate::handler::compositor::{aura_object_version, ensure_host_zaura_surface};
+use crate::protocols::aura_shell::zaura_shell::{
+    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE,
+};
+use crate::protocols::aura_shell::zaura_surface::{
+    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_UNSET_SNAP,
+};
 use crate::protocols::aura_shell::zaura_toplevel::{
-    REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL, REQ_SET_SUPPORTS_SCREEN_COORDINATES,
-    REQ_SET_WINDOW_BOUNDS,
+    REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
+    REQ_SET_SUPPORTS_SCREEN_COORDINATES, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
+    REQ_SET_WINDOW_BOUNDS, REQ_SET_WINDOW_BOUNDS_SINCE,
 };
 use crate::protocols::wayland::wl_display::REQ_SYNC;
 use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
 use crate::state::{Context, HostId};
 use crate::window_layout::{Rect, WindowLayoutAction};
 use crate::wire::MessageBuilder;
+
+/// The `zaura_shell` version a placement Aura toplevel needs.
+///
+/// Placement creates the toplevel only to send
+/// `set_supports_screen_coordinates` and `set_window_bounds`, so it requires
+/// the newest of the requests it uses; the assertion below keeps that true
+/// if the vendored protocol changes.
+const PLACEMENT_TOPLEVEL_SINCE: u32 = REQ_SET_WINDOW_BOUNDS_SINCE;
+const _: () = assert!(
+    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE <= PLACEMENT_TOPLEVEL_SINCE
+        && REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE <= PLACEMENT_TOPLEVEL_SINCE
+);
 
 /// Why a consumed placement chord did not move the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,11 +248,7 @@ pub(crate) fn apply_arc_identity(
     let Some(application_id) = ctx.window_placement.arc_application_id(wl_surface_guest_id) else {
         return false;
     };
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_surface_host_id)
-        .unwrap_or(ctx.host_zaura_shell_version);
-    if version < 5 {
+    if aura_object_version(ctx, zaura_surface_host_id) < REQ_SET_APPLICATION_ID_SINCE {
         log::warn!(
             "Unable to apply ARC application identity to zaura_surface {}",
             zaura_surface_host_id
@@ -267,7 +280,7 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
 
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     let zaura_shell_host_id = ctx.host_zaura_shell_id?;
-    if ctx.host_zaura_shell_version < 29 {
+    if ctx.host_zaura_shell_version < PLACEMENT_TOPLEVEL_SINCE {
         return None;
     }
 
@@ -378,11 +391,7 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
     else {
         return;
     };
-    let version = ctx
-        .shadow_table
-        .host_object_version(zaura_toplevel_host_id)
-        .unwrap_or(ctx.host_zaura_shell_version);
-    if version >= 38 {
+    if aura_object_version(ctx, zaura_toplevel_host_id) >= REQ_RELEASE_AURA_TOPLEVEL_SINCE {
         let message =
             MessageBuilder::new().build_message(zaura_toplevel_host_id, REQ_RELEASE_AURA_TOPLEVEL);
         ctx.client_to_host_queue.push((message, Vec::new()));

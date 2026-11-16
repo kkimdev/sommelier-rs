@@ -20,8 +20,9 @@ use crate::protocols::aura_shell::zaura_output::{
     ZauraOutputHandler, REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT,
 };
 use crate::protocols::aura_shell::zaura_shell::{REQ_GET_AURA_OUTPUT, REQ_GET_AURA_SURFACE};
-use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
-use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
+use crate::protocols::aura_shell::zaura_surface::{
+    REQ_RELEASE, REQ_RELEASE_SINCE, REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE,
+};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
@@ -404,6 +405,19 @@ pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
         .checked_add(4)
         .and_then(|header_and_length| header_and_length.checked_add(padded_length))
         .is_some_and(|total| total <= 0xffff)
+}
+
+/// Return the negotiated version of a host Aura child object.
+///
+/// Aura children (`zaura_surface`, `zaura_toplevel`, `zaura_output`) take
+/// the version of the `zaura_shell` that created them, and the proxy
+/// records it when it creates each one. The lookup misses only for an ID
+/// that is not a live Aura child; the current shell version is then the
+/// version such a child would have been created with.
+pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
+    ctx.shadow_table
+        .host_object_version(aura_object_host_id)
+        .unwrap_or(ctx.host_zaura_shell_version)
 }
 
 /// Create or reuse the host Aura object associated with a guest wl_surface.
@@ -970,19 +984,15 @@ impl WlSurfaceHandler for CompositorHandler {
             .window_placement
             .release_surface(wl_surface_guest_id, wl_surface_host_id)
         {
-            let zaura_surface_version = ctx
-                .shadow_table
-                .host_object_version(zaura_surface_host_id)
-                .unwrap_or(ctx.host_zaura_shell_version);
-            if zaura_surface_version >= 38 {
+            if aura_object_version(ctx, zaura_surface_host_id) >= REQ_RELEASE_SINCE {
                 let builder = crate::wire::MessageBuilder::new();
                 let msg = builder.build_message(zaura_surface_host_id, REQ_RELEASE);
                 ctx.client_to_host_queue.push((msg, Vec::new()));
                 ctx.shadow_table
                     .mark_pending_destroy_host(zaura_surface_host_id);
             } else {
-                // zaura_surface.release was introduced in v38. On older
-                // hosts the object has no destructor request. Retire its
+                // Before zaura_surface.release the object has no
+                // destructor request. Retire its
                 // dispatch metadata immediately so stale events cannot
                 // reach a destroyed guest surface, while retaining the
                 // numeric ID reservation until connection teardown.
@@ -1637,11 +1647,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         if let Some(&wl_surface_guest_id) = ctx.xdg_toplevel_to_wl_surface.get(&xdg_toplevel_id) {
             if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
             {
-                let zaura_surface_version = ctx
-                    .shadow_table
-                    .host_object_version(zaura_surface_host_id)
-                    .unwrap_or(ctx.host_zaura_shell_version);
-                if zaura_surface_version < 5 {
+                if aura_object_version(ctx, zaura_surface_host_id) < REQ_SET_APPLICATION_ID_SINCE {
                     return Action::Drop;
                 }
                 if ctx.window_placement.uses_arc_bounds() {
