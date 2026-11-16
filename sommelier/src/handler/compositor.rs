@@ -2029,10 +2029,11 @@ fn xdg_toplevel_state_since(state: u32) -> Option<u32> {
 /// array is a sequence of native-endian u32 values; a trailing partial entry
 /// is malformed and dropped.
 fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
-    states
-        .chunks_exact(4)
+    let (entries, _malformed_tail) = states.as_chunks::<4>();
+    entries
+        .iter()
         .filter(|entry| {
-            let state = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let state = u32::from_ne_bytes(**entry);
             xdg_toplevel_state_since(state).is_some_and(|since| since <= guest_version)
         })
         .flatten()
@@ -5027,8 +5028,10 @@ mod tests {
     fn configure_states(message: &[u8]) -> Vec<u32> {
         let length = u32::from_ne_bytes(message[16..20].try_into().unwrap()) as usize;
         message[20..20 + length]
-            .chunks_exact(4)
-            .map(|entry| u32::from_ne_bytes(entry.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|entry| u32::from_ne_bytes(*entry))
             .collect()
     }
 
