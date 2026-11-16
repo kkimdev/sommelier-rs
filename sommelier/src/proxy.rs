@@ -3861,12 +3861,14 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     display: &str,
     local_compositor: Option<String>,
     gpu_accel: bool,
     xdg_decoration: bool,
     virtio_wayland: Option<String>,
+    vm_identifier: String,
     placement: Arc<PlacementConfig>,
     mut reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
@@ -3980,7 +3982,12 @@ pub async fn run(
                             let mut client = Client::new(
                                 client_conn,
                                 host_conn,
-                                Context::new(gpu_accel, xdg_decoration, Arc::clone(&placement)),
+                                Context::new(
+                                    gpu_accel,
+                                    xdg_decoration,
+                                    vm_identifier.clone(),
+                                    Arc::clone(&placement),
+                                ),
                             );
                             if let Some(channel) = virtwayland_channel_ref {
                                 client.ctx.virtwayland_channel = Some(channel);

@@ -930,7 +930,8 @@ pub struct Context {
     /// The internal host zaura_shell binding (not exposed to the guest), if
     /// one is bound.
     pub(crate) host_zaura_shell: Option<HostAuraShell>,
-    /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
+    /// VM identifier for ChromeOS guest_os app ID formatting, resolved once
+    /// in `main` (see [`vm_identifier_from_environment`]).
     pub vm_identifier: String,
     /// This connection's ARC bounds policy state (see
     /// [`WindowPlacementState`] for what it owns). Built from `placement`.
@@ -1266,9 +1267,16 @@ impl Context {
     /// # Arguments
     ///
     /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
+    /// * `vm_identifier` - the VM namespace of application IDs, resolved
+    ///   once in `main` (see [`vm_identifier_from_environment`]).
     /// * `placement` - the process-wide placement configuration, resolved
     ///   once in `main`; `Context` never reads placement variables itself.
-    pub fn new(gpu_accel: bool, xdg_decoration: bool, placement: Arc<PlacementConfig>) -> Self {
+    pub fn new(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        vm_identifier: String,
+        placement: Arc<PlacementConfig>,
+    ) -> Self {
         // `Allocator::new` reads `SOMMELIER_DRM_DEVICE` and probes the DRM
         // render nodes; without one, buffers fall back to VirtWL or SHM.
         let allocator = match Allocator::new() {
@@ -1281,7 +1289,7 @@ impl Context {
         Self::from_parts(
             gpu_accel,
             xdg_decoration,
-            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            vm_identifier,
             allocator,
             placement,
         )
@@ -1444,6 +1452,28 @@ impl Context {
     ) -> Option<crate::window_layout::WindowLayoutAction> {
         self.placement.action_for(chord)
     }
+}
+
+/// The variable that names the VM in ChromeOS application IDs.
+const VM_IDENTIFIER_VARIABLE: &str = "SOMMELIER_VM_IDENTIFIER";
+
+/// Read the VM namespace of ChromeOS application IDs from
+/// [`VM_IDENTIFIER_VARIABLE`] (see [`resolve_vm_identifier`]).
+///
+/// A value that is not UTF-8 is logged and replaced by the default.
+pub(crate) fn vm_identifier_from_environment() -> String {
+    let value = std::env::var_os(VM_IDENTIFIER_VARIABLE).and_then(|value| {
+        value
+            .into_string()
+            .inspect_err(|value| {
+                warn!(
+                    "Ignoring non-UTF-8 {}={:?}; using the default",
+                    VM_IDENTIFIER_VARIABLE, value
+                );
+            })
+            .ok()
+    });
+    resolve_vm_identifier(value)
 }
 
 /// Resolve the VM namespace used in ChromeOS application IDs.
