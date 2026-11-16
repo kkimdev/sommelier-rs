@@ -235,8 +235,8 @@ SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscre
 
 [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
 owns the configuration contract: both binding sources and the TOML schema,
-which source wins, the failure policy (an explicitly requested but invalid
-configuration stops startup with exit status 2), reloading, and the
+which source wins, the failure policy (a configuration problem is logged and
+disables placement shortcuts; it never stops the proxy), reloading, and the
 precision rectangles need.
 
 Work areas use Aura's current output scale and device scale factor, then apply

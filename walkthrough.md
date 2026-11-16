@@ -1044,12 +1044,17 @@ imported each other, and so did `window_shortcuts.rs` and `state.rs`.
   and `main` sit on top. There are no cycles.
 - A7: `main` installs the `SIGHUP` handler before the file is first read.
 - A5: `GuestKeyOwner::admits_compositor_shortcut` is the only statement of
-  the shortcut arbitration contract. The key reducer routes every event to
-  the channel that owns its generation and rejects a shortcut event the
-  contract does not admit, instead of acking it.
+  the shortcut arbitration contract. The key reducer's `arbitrate` routes
+  every event to the channel that owns its generation, and rejects a
+  shortcut event the contract does not admit instead of acking it. Routing
+  has one owner: `on_key` sends `CompositorShortcutPress` only for the press
+  that claims an unowned key and runs placement, and it sends repeats,
+  releases and duplicate presses as physical events.
 - A6: both model-based key tests now produce the `CompositorShortcut`
-  owner. The extended trace test found that a physical press of a
-  shortcut-owned key tripped an assertion; the A5 routing fixes that.
+  owner. The extended trace test found that calling the reducer API directly
+  with a physical press of a shortcut-owned key tripped an assertion.
+  `on_key` never sent that combination, so this was not a production bug;
+  `arbitrate` now defines it.
 - H7: the precision a rect needs is documented and tested (16 significant
   digits land on the intended pixel up to 1,000,000 pixels; `0.3333333`
   can land one pixel short). A test pins every preset to
@@ -1058,10 +1063,16 @@ imported each other, and so did `window_shortcuts.rs` and `state.rs`.
 
 **Behavior changes.**
 
-- An explicitly requested but invalid `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`
-  now stops startup with exit status 2 while the policy is active, as an
-  invalid file already did. Before, it logged a warning on every connection
-  and ran without shortcuts.
+- A placement configuration problem never stops the proxy (lead decision,
+  which replaces an earlier exit-2 draft of this PR). Both sources follow one
+  policy: both sources given, an invalid or non-UTF-8 environment list, an
+  unusable file path or file, or an invalid `SOMMELIER_ACCELERATORS` while a
+  source is requested each log one error per process, and the proxy runs
+  with placement shortcuts disabled. Before, a bad environment list logged a
+  warning on every connection, while a bad file or both sources stopped
+  startup with exit status 2. A file that was unusable at startup is
+  activated by a later valid `SIGHUP` reload. A `SIGHUP` handler that cannot
+  be installed is logged instead of exiting.
 - Shortcuts requested while the gate is off, or while no ARC block can be
   reserved, log one warning per process, and neither source is read.
 - The ARC block is reserved at startup instead of on the first connection.
@@ -1072,7 +1083,7 @@ Deliberately not done: `Context::new` still reads `SOMMELIER_VM_IDENTIFIER`
 (the test constructors do not), and the GBM allocator it creates reads
 `SOMMELIER_DRM_DEVICE`. Neither is placement configuration.
 
-Validation (monorepo dev shell, locked, serial): Sommelier 663 passed /
+Validation (monorepo dev shell, locked, serial): Sommelier 664 passed /
 1 ignored (650 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. Not host-validated: no Sommelier process was started.

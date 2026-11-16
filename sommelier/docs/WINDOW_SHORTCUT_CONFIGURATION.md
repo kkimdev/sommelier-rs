@@ -17,45 +17,59 @@ reloading, and the precision a rectangle needs. The README links here.
 
 `PlacementConfig::from_environment` reads every setting once, at startup, so
 a change to the environment needs a restart. A variable that is empty or only
-whitespace counts as unset. A value that is not UTF-8 counts as set and
-invalid.
+whitespace counts as unset. For `SOMMELIER_ACCELERATORS` and
+`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, a value that is not UTF-8 counts as
+set and invalid; for the gate it means off, as the table says.
 
 ## Resolution at startup
 
 At startup the settings resolve to one process-wide configuration that every
-client connection shares. The rules apply in this order, and any warning is
-logged once per process:
+client connection shares. **A configuration problem never stops the proxy**:
+Sommelier is the Wayland proxy for every app in the container, so exiting
+would close them all and could restart-loop under a service manager. Each
+problem is logged once per process instead. The rules apply in this order:
 
-1. **One binding source.** Giving `--window-shortcuts-config` while
-   `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` is set is a startup error (exit
-   status 2), even with the gate off.
-2. **The policy needs the gate and an ARC block.** With the gate off nothing
+1. **The policy needs the gate and an ARC block.** With the gate off nothing
    is reserved. With the gate on, the proxy reserves its block of ARC task
    IDs (see
    [Sommelier's task-ID allocator](ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator));
    if that fails, the policy is off for the whole process. While the policy
-   is off, a binding source is ignored with one warning and is not read or
-   validated, and no chord is consumed.
-3. **Invalid configuration fails startup.** While the policy is active, a
-   requested binding source must be completely valid, and so must
-   `SOMMELIER_ACCELERATORS`, because every binding is checked against it.
-   Otherwise startup fails with exit status 2. The same rule covers both
-   sources, so a mistake is noticed instead of the proxy quietly running
-   without shortcuts.
-4. **Host accelerators alone never fail startup.** Without a binding source,
+   is off, any requested binding source (one or both) is ignored with one
+   warning and is not read or validated, and no chord is consumed.
+2. **An unusable binding source disables shortcuts.** While the policy is
+   active, a requested source is unusable in these cases:
+   - both sources are given;
+   - the environment list is not UTF-8 or fails validation;
+   - the file path cannot be resolved, or the file is missing, unreadable,
+     or fails validation;
+   - `SOMMELIER_ACCELERATORS` is invalid, so no binding can be checked
+     against it.
+
+   Each case logs one error that says why. The proxy then runs with placement
+   shortcuts disabled: no binding is active and no chord is consumed. The ARC
+   policy itself stays active. With an invalid `SOMMELIER_ACCELERATORS`, key
+   filtering is disabled too.
+3. **A file can recover by reload.** If the file was given alone and its path
+   resolved, `SIGHUP` re-reads it, so a fixed file activates its bindings
+   without a restart (see [Reloading](#reloading)). The other unusable cases
+   have nothing to reload: the conflict and the environment list need a
+   restart, and so does an invalid `SOMMELIER_ACCELERATORS`, because it is
+   read only at startup.
+4. **Host accelerators alone only lose filtering.** Without a binding source,
    a malformed `SOMMELIER_ACCELERATORS` logs one warning and disables key
-   filtering, so every key goes to the guest. The variable predates
-   placement, and stopping the proxy would break every app in the
-   container.
+   filtering, so every key goes to the guest.
 
 | Policy (gate and ARC block) | Binding source | Result |
 | --- | --- | --- |
-| any | both | Startup error (exit 2). |
 | off | none | No placement. |
-| off | one | One warning; the source is not read. No placement. |
+| off | one or both | One warning; no source is read. No placement. |
 | active | none | The ARC metadata path only; no chord is consumed. |
 | active | one, valid | The bindings are active. |
-| active | one, invalid, or `SOMMELIER_ACCELERATORS` invalid | Startup error (exit 2). |
+| active | both | One error; shortcuts disabled; no reload. |
+| active | environment list invalid or not UTF-8 | One error; shortcuts disabled; no reload. |
+| active | file missing, unreadable or invalid | One error; shortcuts disabled until a valid `SIGHUP` reload. |
+| active | file path cannot be resolved | One error; shortcuts disabled; no reload. |
+| active | one, with `SOMMELIER_ACCELERATORS` invalid | One error; shortcuts and key filtering disabled; no reload. |
 
 While the policy is active, a chord that matches a binding is always
 consumed, even when the placement is skipped (for example, with no focused
@@ -213,8 +227,10 @@ kill -HUP "$SOMMELIER_PID"
   startup `SOMMELIER_ACCELERATORS` list. Only a valid document replaces the
   bindings, as one atomic swap; the log says how many bindings are active.
 - If the file is missing, unreadable, or invalid, the error is logged and the
-  last known-good bindings stay active. Deleting the file does not disable
-  shortcuts; install a file with no bindings instead.
+  last known-good bindings stay active. If the file was unusable at startup,
+  those are no bindings, and the first valid reload activates the file.
+  Deleting the file does not disable shortcuts; install a file with no
+  bindings instead.
 - Every connection sees the new generation from its next key press. A key
   already captured as a shortcut stays captured until it is released, even
   if its binding was removed, so the guest never sees an unpaired release.
@@ -222,11 +238,12 @@ kill -HUP "$SOMMELIER_PID"
 - A reload never changes the gate, the ARC policy, ARC identities, Aura
   objects, or pending bounds barriers, and it never re-reads an environment
   variable.
-- With `--window-shortcuts-config`, the `SIGHUP` handler is installed before
-  the file is first read, so a `SIGHUP` never terminates the proxy. If the
-  file is not in use (the policy is off), `SIGHUP` is logged and ignored.
-  Without the option, `SIGHUP` keeps its default action and terminates the
-  proxy.
+- With `--window-shortcuts-config`, the `SIGHUP` handler is installed right
+  after argument parsing, before the file is first read. If no file is in use
+  (the policy is off, or startup could not use the file at all), `SIGHUP` is
+  logged and ignored. If the handler cannot be installed, that is logged and
+  the proxy runs without reloads. Without the option, `SIGHUP` keeps its
+  default action and terminates the proxy.
 
 Signal delivery goes through Tokio's signal driver (an internal self-pipe), and
 the reload runs on the proxy's single-threaded event loop between client
@@ -243,7 +260,7 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
 | `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; `bounds_for_action` delegates to the rounding rule. |
-| `sommelier/src/main.rs` | The `--window-shortcuts-config` option, the `SIGHUP` handler, and startup errors (exit 2). |
+| `sommelier/src/main.rs` | The `--window-shortcuts-config` option and the `SIGHUP` handler. |
 | `sommelier/src/proxy.rs` | Shares the configuration with every connection and runs reloads in the accept loop. |
 
 ## Not carried over from the earlier draft
@@ -259,8 +276,9 @@ These parts were intentionally not reintroduced:
   `rect` or a named `action`.
 - Rounding each edge to the nearest pixel. Flooring is required to keep the
   named actions' bounds identical on odd work-area sizes.
-- Failing startup on a malformed `SOMMELIER_ACCELERATORS` alone, and
-  rejecting empty list elements in it. That would change deployments without
-  placement shortcuts; only a binding source fails closed on it.
+- Failing startup on any configuration error, including a malformed
+  `SOMMELIER_ACCELERATORS`, and rejecting empty list elements in it. The
+  proxy serves every app in the container, so a configuration error only
+  disables what depends on it (see [Resolution at startup](#resolution-at-startup)).
 - A per-instance control socket for selecting a different path at runtime.
   `SIGHUP` reloads the startup path; a socket remains a possible follow-up.

@@ -115,7 +115,8 @@ only.
   produced.
 - **Blocks.** The pool is split into 148 blocks of 1,000,000 IDs; the last
   block is partial.
-- **Reservation at startup.** When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set,
+- **Reservation at startup.** When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set to
+  a true value (see [the settings](WINDOW_SHORTCUT_CONFIGURATION.md#settings)),
   the proxy reserves one block for the whole process while it resolves its
   placement configuration at startup, before it accepts a client. The search
   starts at a random block and walks every block once.
