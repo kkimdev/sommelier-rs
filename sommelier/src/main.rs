@@ -16,6 +16,8 @@ limitations under the License.
 
 #![deny(clippy::debug_assert_with_mut_call)]
 
+use std::sync::Arc;
+
 use clap::Parser;
 
 mod accelerator;
@@ -23,6 +25,7 @@ mod allocator;
 mod arc_task_ids;
 mod connection;
 mod handler;
+mod placement_config;
 mod proxy;
 mod state;
 #[cfg(test)]
@@ -30,7 +33,6 @@ mod test_support;
 mod virtwl;
 mod virtwl_channel;
 mod window_layout;
-mod window_shortcuts;
 mod wire;
 
 mod protocols {
@@ -94,10 +96,11 @@ struct Args {
 
     /// Read window placement shortcut bindings from a versioned TOML file.
     ///
-    /// Used only when SOMMELIER_WINDOW_BOUNDS_AS_ARC is set, and mutually
-    /// exclusive with SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An invalid file is
-    /// a startup error; SIGHUP reloads it and keeps the previous bindings if
-    /// the new file is invalid.
+    /// Used only while the ARC bounds policy is active
+    /// (SOMMELIER_WINDOW_BOUNDS_AS_ARC), and mutually exclusive with
+    /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An invalid file is a startup
+    /// error (exit 2); SIGHUP reloads it and keeps the previous bindings if
+    /// the new file is invalid. See docs/WINDOW_SHORTCUT_CONFIGURATION.md.
     #[arg(long, value_name = "PATH")]
     window_shortcuts_config: Option<std::path::PathBuf>,
 
@@ -117,15 +120,15 @@ async fn main() {
     let gpu_accel = args.gpu_accel;
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
-    let window_shortcuts = match window_shortcuts::startup_source_from_environment(
-        args.window_shortcuts_config.as_deref(),
-    ) {
-        Ok(source) => source,
+    let shortcuts_file = args.window_shortcuts_config.as_deref();
+    let placement = match placement_config::PlacementConfig::from_environment(shortcuts_file) {
+        Ok(config) => Arc::new(config),
         Err(error) => {
             log::error!("{}", error);
             std::process::exit(2);
         }
     };
+    let reload_signal = shortcuts_file.map(|_| install_reload_signal());
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
@@ -144,8 +147,28 @@ async fn main() {
         gpu_accel,
         xdg_decoration,
         virtio_wl,
-        window_shortcuts,
+        placement,
+        reload_signal,
     )
     .await;
+}
+
+/// Install the `SIGHUP` handler that reloads the shortcut configuration file.
+///
+/// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
+/// the signal through its own self-pipe; the proxy's accept loop runs the
+/// reload. Failure to install is fatal (exit 1) because the documented
+/// reload contract could not be honored.
+fn install_reload_signal() -> tokio::signal::unix::Signal {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            log::error!(
+                "Failed to install the SIGHUP shortcut reload handler: {}",
+                error
+            );
+            std::process::exit(1);
+        }
+    }
 }
 mod test_xkb;

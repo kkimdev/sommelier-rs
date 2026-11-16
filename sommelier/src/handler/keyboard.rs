@@ -348,28 +348,18 @@ impl KeyboardHandler {
     /// Decide who owns a key from its chord alone.
     ///
     /// Both key channels (`wl_keyboard.key` and `peek_key`) ask this one
-    /// classification. A placement binding counts only while the ARC bounds
-    /// policy is active. Configuration validation rejects a chord that is
+    /// classification. `PlacementConfig` holds bindings only while the ARC
+    /// bounds policy is active, and its validator rejects a chord that is
     /// both a host accelerator and a binding; if one slipped through, the
     /// host keeps its accelerator.
-    ///
-    /// Side effect: while the policy is active, this first adopts a reloaded
-    /// shortcut generation, if one is pending.
-    fn classify_key(&self, ctx: &mut Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
+    fn classify_key(&self, ctx: &Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
         let Some(chord) = self.current_chord(host_keyboard_id, key) else {
             return KeyClass::Guest;
         };
-        let class = if ctx.accelerators.contains(&chord) {
+        let class = if ctx.is_host_accelerator(&chord) {
             KeyClass::HostAccelerator
-        } else if ctx.window_placement.uses_arc_bounds() {
-            // Adopt a reloaded shortcut generation before matching.
-            ctx.refresh_window_placement_shortcuts();
-            ctx.window_placement_shortcuts
-                .iter()
-                .find(|binding| binding.accelerator == chord)
-                .map_or(KeyClass::Guest, |binding| {
-                    KeyClass::Placement(binding.action)
-                })
+        } else if let Some(action) = ctx.placement_action_for(&chord) {
+            KeyClass::Placement(action)
         } else {
             KeyClass::Guest
         };
@@ -1440,6 +1430,8 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arc_task_ids::ArcIdAllocator;
+    use crate::placement_config::PlacementConfig;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
@@ -1617,13 +1609,11 @@ mod tests {
     #[test]
     fn window_layout_actions_cover_nine_alt_keys() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
+            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,\
+             <Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
+        ));
         ctx.last_sender_id = 5;
-        ctx.window_placement_shortcuts = crate::accelerator::parse_window_placement_shortcuts(
-            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,<Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
-        )
-        .unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         handler
             .modifiers
@@ -1643,7 +1633,7 @@ mod tests {
         for (sym, action) in expected {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
             assert_eq!(
-                handler.classify_key(&mut ctx, HostId(5), key),
+                handler.classify_key(&ctx, HostId(5), key),
                 KeyClass::Placement(action)
             );
         }
@@ -1652,37 +1642,29 @@ mod tests {
     #[test]
     fn window_layout_requires_exact_alt_modifier() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
+            "<Alt>q=top-left",
+        ));
         ctx.last_sender_id = 5;
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
         handler.modifiers.insert(HostId(5), 0);
-        assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), key),
-            KeyClass::Guest
-        );
+        assert_eq!(handler.classify_key(&ctx, HostId(5), key), KeyClass::Guest);
         handler.modifiers.insert(
             HostId(5),
             crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
         );
-        assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), key),
-            KeyClass::Guest
-        );
+        assert_eq!(handler.classify_key(&ctx, HostId(5), key), KeyClass::Guest);
     }
 
     #[test]
     fn window_layout_honors_non_alt_configured_modifier() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
+            "<Control>q=top-left",
+        ));
         ctx.last_sender_id = 5;
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
@@ -1690,7 +1672,7 @@ mod tests {
             .modifiers
             .insert(HostId(5), crate::accelerator::CONTROL_MASK);
         assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), key),
+            handler.classify_key(&ctx, HostId(5), key),
             KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
     }
@@ -1698,34 +1680,44 @@ mod tests {
     #[test]
     fn placement_binding_is_guest_input_without_arc_bounds_policy() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The gate is off, so the configured binding is ignored at startup.
+        let mut ctx = Context::with_placement_for_test(
+            PlacementConfig::resolve_for_test(
+                &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
+                None,
+                ArcIdAllocator::block_for_test(),
+            )
+            .unwrap(),
+        );
         ctx.last_sender_id = 5;
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
         handler
             .modifiers
             .insert(HostId(5), crate::accelerator::ALT_MASK);
 
-        assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), key),
-            KeyClass::Guest
-        );
+        assert_eq!(handler.classify_key(&ctx, HostId(5), key), KeyClass::Guest);
     }
 
     #[test]
     fn host_accelerator_and_placement_classify_from_one_chord() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(
-            false,
-            false,
-            crate::accelerator::parse_accelerators("<Control>a").unwrap(),
+        let mut ctx = Context::with_placement_for_test(
+            PlacementConfig::resolve_for_test(
+                &[
+                    ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+                    ("SOMMELIER_ACCELERATORS", "<Control>a"),
+                    (
+                        "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
+                        "<Control>q=top-left",
+                    ),
+                ],
+                None,
+                ArcIdAllocator::block_for_test(),
+            )
+            .unwrap(),
         );
-        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
         let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
@@ -1735,17 +1727,14 @@ mod tests {
             .insert(HostId(5), crate::accelerator::CONTROL_MASK);
 
         assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), a),
+            handler.classify_key(&ctx, HostId(5), a),
             KeyClass::HostAccelerator
         );
         assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), q),
+            handler.classify_key(&ctx, HostId(5), q),
             KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
-        assert_eq!(
-            handler.classify_key(&mut ctx, HostId(5), z),
-            KeyClass::Guest
-        );
+        assert_eq!(handler.classify_key(&ctx, HostId(5), z), KeyClass::Guest);
     }
 
     #[test]
@@ -1872,8 +1861,7 @@ mod tests {
         let xdg_toplevel = 13u32;
         let host_xdg_toplevel = 23u32;
         let output = 25u32;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -1956,8 +1944,7 @@ mod tests {
         let host_xdg_toplevel = 23u32;
         let primary_output = 25u32;
         let secondary_output = 26u32;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -2042,10 +2029,9 @@ mod tests {
         let host_surface = 22;
         let xdg_toplevel = 13;
         let output = 25;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
+            "<Alt>q=top-left",
+        ));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
@@ -2073,7 +2059,7 @@ mod tests {
             .modifiers
             .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
         assert_eq!(
-            handler.classify_key(&mut ctx, HostId(host_keyboard), key),
+            handler.classify_key(&ctx, HostId(host_keyboard), key),
             KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
 
@@ -2139,14 +2125,18 @@ mod tests {
     /// Host keyboard 5 (extended keyboard 50) focused on a placeable
     /// xdg_toplevel 13 with `<Alt>q=top-left` configured and Alt held.
     fn placeable_shortcut_fixture() -> (KeyboardHandler, Context, u32) {
+        placeable_fixture(PlacementConfig::arc_bounds_for_test("<Alt>q=top-left"))
+    }
+
+    /// [`placeable_shortcut_fixture`] with an explicit configuration.
+    fn placeable_fixture(
+        placement: impl Into<std::sync::Arc<PlacementConfig>>,
+    ) -> (KeyboardHandler, Context, u32) {
         let host_keyboard = 5;
         let surface = 12;
         let xdg_toplevel = 13;
         let output = 25;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
-        ctx.window_placement_shortcuts =
-            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        let mut ctx = Context::with_placement_for_test(placement);
         map_keyboard(&mut ctx, 10, host_keyboard, 50, 11);
         ctx.shadow_table.map_id(surface, 22);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
@@ -2257,14 +2247,33 @@ mod tests {
         assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
     }
 
+    /// A placement configuration whose bindings come from a file.
+    fn file_placement(
+        dir: &crate::test_support::TempDir,
+        document: &[u8],
+    ) -> std::sync::Arc<PlacementConfig> {
+        let path = dir.write("shortcuts.toml", document);
+        std::sync::Arc::new(
+            PlacementConfig::resolve_for_test(
+                &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+                Some(&path),
+                ArcIdAllocator::block_for_test(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn placement_chord_is_consumed_when_its_rect_is_not_representable() {
-        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let dir = crate::test_support::TempDir::new("keyboard-sliver");
         // 0.0001 of the 3840-pixel work area floors onto the left border.
+        let (mut handler, mut ctx, key) = placeable_fixture(file_placement(
+            &dir,
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.0001, 0.0, 0.9999, 1.0]\n",
+        ));
         let sliver = WindowLayoutAction::Rect(
             crate::window_layout::NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap(),
         );
-        ctx.window_placement_shortcuts[0].action = sliver;
         assert_eq!(
             KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), sliver),
             Err(PlacementSkip::RectNotRepresentable)
@@ -2280,8 +2289,17 @@ mod tests {
 
     #[test]
     fn placement_without_an_arc_identity_creates_no_aura_toplevel() {
-        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
-        ctx.window_placement.set_arc_id_allocator_for_test(None);
+        let (mut handler, mut ctx, key) = placeable_fixture(
+            PlacementConfig::resolve_for_test(
+                &[
+                    ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+                    ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left"),
+                ],
+                None,
+                ArcIdAllocator::exhausted_for_test(),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
             Err(PlacementSkip::NoAuraToplevel)
@@ -2292,22 +2310,21 @@ mod tests {
 
     #[test]
     fn shortcut_config_reload_takes_effect_on_the_next_press() {
-        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
-        let keyboard = HostId(5);
         let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
-        let path = dir.write("shortcuts.toml", b"version = 1\n");
-        let source = crate::window_shortcuts::ShortcutConfigSource::load(path, Vec::new()).unwrap();
-        ctx.follow_window_placement_shortcuts(source.subscribe());
-        assert!(
-            ctx.window_placement_shortcuts.is_empty(),
-            "the followed file is the only binding source"
+        let placement = file_placement(&dir, b"version = 1\n");
+        let (mut handler, mut ctx, key) = placeable_fixture(std::sync::Arc::clone(&placement));
+        let keyboard = HostId(5);
+        assert_eq!(
+            handler.classify_key(&ctx, keyboard, key),
+            KeyClass::Guest,
+            "the file is the only binding source"
         );
 
         dir.write(
             "shortcuts.toml",
             b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
         );
-        source.reload().unwrap();
+        placement.reload().unwrap().unwrap();
         assert_eq!(
             handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
             Action::Drop,
@@ -2322,7 +2339,7 @@ mod tests {
         // Removing the binding while the key is held still suppresses the
         // matching release: ownership, not the binding, owns the release.
         dir.write("shortcuts.toml", b"version = 1\n");
-        source.reload().unwrap();
+        placement.reload().unwrap().unwrap();
         assert_eq!(
             handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
             Action::Drop
@@ -2834,8 +2851,7 @@ mod tests {
         let xdg_toplevel = 13u32;
         let host_xdg_toplevel = 23u32;
         let output = 25u32;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
@@ -3238,7 +3254,7 @@ mod tests {
     #[test]
     fn keymap_loads_from_non_rewound_memfd() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
 
         let dummy_ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let keymap = xkb::Keymap::new_from_names(
@@ -3354,7 +3370,7 @@ mod tests {
     #[test]
     fn on_release_destroys_extended_keyboard_and_cleans_map() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
 
         // Use DISTINCT guest (5) and host (10) IDs to verify that on_release
         // correctly translates the guest sender ID to the host key, rather than
@@ -3438,7 +3454,7 @@ mod tests {
 
     #[test]
     fn bind_extended_keyboard_is_idempotent() {
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.host_keyboard_extension_id = Some(HostId(99));
 
         // First call: should send get_extended_keyboard.
@@ -3485,7 +3501,7 @@ mod tests {
     #[test]
     fn on_keymap_ignores_zero_size() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         // A zero-size keymap must be rejected gracefully (mmap(len=0) is UB).
         // fd=0 (stdin) won't be mmap'd because the size check fires first.
         let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, 0, 0 /* size=0 */);
@@ -3503,7 +3519,7 @@ mod tests {
     #[test]
     fn no_keymap_format_leaves_no_keyboard_state() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         // Format 0 = WL_KEYMAP_FORMAT_NO_KEYMAP; forward without loading.
         let action = handler.on_keymap(&mut ctx, 0 /* format=no_keymap */, 0, 100);
         assert_eq!(action, Action::Forward);
@@ -3513,7 +3529,7 @@ mod tests {
     #[test]
     fn unsupported_keymap_format_clears_previous_keyboard_state() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         load_test_keymap(&mut handler, &mut ctx);
 
         assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
@@ -3524,7 +3540,7 @@ mod tests {
     #[test]
     fn keymap_without_trailing_nul_is_rejected_without_panicking() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         load_test_keymap(&mut handler, &mut ctx);
 
         use nix::sys::memfd::{memfd_create, MFdFlags};
@@ -3550,7 +3566,7 @@ mod tests {
     #[test]
     fn keymap_size_larger_than_fd_is_rejected_without_sigbus() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         load_test_keymap(&mut handler, &mut ctx);
 
         use nix::sys::memfd::{memfd_create, MFdFlags};
@@ -3582,7 +3598,7 @@ mod tests {
     #[test]
     fn no_keymap_event_clears_previous_keyboard_state() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let ctrl_mask = 1 << keymap.mod_get_index("Control");
@@ -3601,7 +3617,7 @@ mod tests {
     #[test]
     fn no_keymap_event_does_not_clear_another_keyboard() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 5;
         load_test_keymap(&mut handler, &mut ctx);
         ctx.last_sender_id = 6;
@@ -3628,7 +3644,7 @@ mod tests {
     #[test]
     fn on_keymap_logs_error_on_invalid_utf8() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
 
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::ffi::CString;
@@ -3660,7 +3676,7 @@ mod tests {
     #[test]
     fn on_keymap_logs_error_on_invalid_xkb_string() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
 
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::ffi::CString;
@@ -3698,7 +3714,7 @@ mod tests {
         // Regression: if host_keyboard_extension_id is Some (protocol available)
         // but the keyboard hasn't been registered via on_enter yet, send_ack_key
         // must not panic or silently send a garbage ack. No queue entry expected.
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.host_keyboard_extension_id = Some(HostId(99)); // protocol bound
                                                            // keyboard_to_extended_keyboard is empty (on_enter not yet received)
 
@@ -3712,7 +3728,7 @@ mod tests {
 
     #[test]
     fn send_ack_key_keeps_existing_child_alive_after_manager_global_remove() {
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         // The manager global may disappear after the child was created. The
         // child mapping and dispatch object have an independent lifetime, so
         // ack_key must still be routed even though the manager field is gone.
@@ -5208,7 +5224,7 @@ mod tests {
     #[test]
     fn invalid_keymap_clears_context_keyboard_state() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 5;
         load_test_keymap(&mut handler, &mut ctx);
         ctx.key_generations
@@ -5307,7 +5323,7 @@ mod tests {
     fn opcode_encoding_get_extended_keyboard_is_zero() {
         // Regression: get_extended_keyboard uses opcode 0. Verify the wire
         // message encodes it correctly (not accidentally a non-zero opcode).
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.host_keyboard_extension_id = Some(HostId(99));
 
         KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(10));
@@ -5505,7 +5521,7 @@ mod tests {
     #[test]
     fn keymap_reload_preserves_forwarded_key_release_pairing() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let wl_key_a =
@@ -5544,7 +5560,7 @@ mod tests {
     #[test]
     fn modifiers_reset_on_release() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
 
         ctx.shadow_table.map_id(5, 10); // guest 5 <-> host 10
 
@@ -5573,7 +5589,7 @@ mod tests {
     #[test]
     fn on_release_with_unknown_guest_id_forwards_gracefully() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         // last_sender_id 999 is not in the shadow table.
         ctx.last_sender_id = 999;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
@@ -5586,7 +5602,7 @@ mod tests {
     #[test]
     fn on_release_before_host_mapping_cleans_guest_seat_routing() {
         let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new(false, false);
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.keyboard_to_seat.insert(5, 7);
         ctx.last_sender_id = 5;
 

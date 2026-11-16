@@ -2210,7 +2210,16 @@ mod tests {
     }
 
     fn setup_ctx() -> (Context, u32, u32, u32) {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        setup_ctx_with(crate::placement_config::PlacementConfig::for_test(
+            Vec::new(),
+        ))
+    }
+
+    /// [`setup_ctx`] with an explicit placement configuration.
+    fn setup_ctx_with(
+        placement: crate::placement_config::PlacementConfig,
+    ) -> (Context, u32, u32, u32) {
+        let mut ctx = Context::with_placement_for_test(placement);
         let wl_surface_guest = 100u32;
         let wl_surface_host = 200u32;
         let zaura_shell_host = 300u32;
@@ -2236,8 +2245,9 @@ mod tests {
 
     #[test]
     fn arc_policy_identity_is_unique_and_stable_per_surface() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        );
         let first = ctx
             .window_placement
             .arc_application_id(10)
@@ -2267,18 +2277,23 @@ mod tests {
     }
 
     #[test]
-    fn arc_policy_identity_fails_closed_without_allocator() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.window_placement.set_arc_bounds_for_test(true);
-        ctx.window_placement.set_arc_id_allocator_for_test(None);
+    fn arc_policy_identity_fails_closed_when_the_block_is_exhausted() {
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::resolve_for_test(
+                &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+                None,
+                crate::arc_task_ids::ArcIdAllocator::exhausted_for_test(),
+            )
+            .unwrap(),
+        );
         assert!(ctx.window_placement.arc_application_id(10).is_none());
         assert!(!ctx.window_placement.has_arc_application_ids());
     }
 
     #[test]
     fn arc_policy_identity_is_applied_before_placement_without_app_id() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
+            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         let zaura_surface_host = ensure_host_zaura_surface(&mut ctx, 100).expect("Aura surface");
         assert!(ensure_arc_application_id_on_surface(
             &mut ctx,
@@ -3268,8 +3283,8 @@ mod tests {
 
     #[test]
     fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.window_placement.set_arc_bounds_for_test(true);
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
+            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         ctx.last_sender_id = xdg_toplevel_id;
 
         let mut handler = CompositorHandler;

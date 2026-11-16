@@ -14,28 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Parser for the `SOMMELIER_ACCELERATORS` environment variable.
+//! Keyboard chords: the [`Accelerator`] type and its parser.
 //!
-//! The variable holds a comma-separated list of key combinations that the
-//! **host compositor** should handle. Each entry is a keysym name optionally
-//! preceded by modifier tags:
+//! A chord is a keysym name optionally preceded by modifier tags, the
+//! spelling used by `SOMMELIER_ACCELERATORS` and by placement bindings:
 //!
 //! ```text
-//! SOMMELIER_ACCELERATORS="Super_L,<Alt>bracketleft,<Alt>bracketright,<Control>space"
+//! Super_L,<Alt>bracketleft,<Alt>bracketright,<Control>space
 //! ```
 //!
 //! Accepted modifier tags (case-insensitive):
 //!   `<Control>` / `<Ctrl>`, `<Alt>` / `<Meta>`,
 //!   `<Shift>`, `<Super>` / `<Win>` / `<Search>`.
 //!
-//! Keys matching this list are acked as `NOT_HANDLED` via
-//! `zcr_extended_keyboard_v1.ack_key`, causing the host to process the
-//! accelerator. All other keys are acked as `HANDLED`, keeping them in the
-//! guest.
+//! This module only parses; `crate::placement_config` decides what the
+//! parsed chords mean (host accelerators or placement bindings).
 
 use xkbcommon::xkb;
-
-use crate::window_layout::WindowLayoutAction;
 
 /// Modifier bitmask constants.
 ///
@@ -68,12 +63,6 @@ pub(crate) fn keysym_to_lower(sym: u32) -> u32 {
 pub struct Accelerator {
     pub modifiers: u32,
     pub symbol: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct WindowPlacementShortcut {
-    pub(crate) accelerator: Accelerator,
-    pub(crate) action: WindowLayoutAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +126,7 @@ pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> 
     })
 }
 
-/// Parse a `SOMMELIER_ACCELERATORS`-style string into a list of accelerators.
+/// Parse a comma-separated chord list (the `SOMMELIER_ACCELERATORS` format).
 pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
     let mut result = Vec::new();
     for token in s.split(',') {
@@ -151,85 +140,6 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
         result.push(parse_accelerator(token)?);
     }
     Ok(result)
-}
-
-/// Read and parse `SOMMELIER_ACCELERATORS` from the process environment.
-///
-/// # Returns
-///
-/// The host accelerator list; an unset variable means an empty list.
-///
-/// # Errors
-///
-/// Returns a diagnostic when the value is not UTF-8 or does not parse. Callers
-/// decide whether that degrades filtering or fails closed.
-pub(crate) fn host_accelerators_from_environment() -> Result<Vec<Accelerator>, String> {
-    host_accelerators_from_value(std::env::var("SOMMELIER_ACCELERATORS"))
-}
-
-fn host_accelerators_from_value(
-    value: Result<String, std::env::VarError>,
-) -> Result<Vec<Accelerator>, String> {
-    match value {
-        Ok(value) => parse_accelerators(&value)
-            .map_err(|error| format!("Invalid SOMMELIER_ACCELERATORS '{}': {}", value, error)),
-        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err("Invalid SOMMELIER_ACCELERATORS (value is not UTF-8)".to_string())
-        }
-    }
-}
-
-/// Parse compositor-owned window placement bindings.
-///
-/// The format is a comma-separated list of `CHORD=ACTION` pairs, for example:
-///
-/// ```text
-/// <Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen
-/// ```
-///
-/// Empty entries are ignored for consistency with `SOMMELIER_ACCELERATORS`.
-/// Duplicate chords are rejected so a deployment cannot depend on ordering.
-pub(crate) fn parse_window_placement_shortcuts(
-    value: &str,
-) -> Result<Vec<WindowPlacementShortcut>, String> {
-    let mut bindings = Vec::new();
-    for (index, raw_binding) in value.split(',').enumerate() {
-        let raw_binding = raw_binding.trim();
-        if raw_binding.is_empty() {
-            continue;
-        }
-        let (chord, action) = raw_binding.split_once('=').ok_or_else(|| {
-            format!(
-                "binding {} must use CHORD=ACTION syntax, got {:?}",
-                index, raw_binding
-            )
-        })?;
-        let accelerator = parse_accelerator(chord.trim())
-            .map_err(|error| format!("binding {} has invalid chord: {}", index, error))?;
-        let action = WindowLayoutAction::from_name(action).ok_or_else(|| {
-            format!(
-                "binding {} has unsupported action {:?}",
-                index,
-                action.trim()
-            )
-        })?;
-        if bindings
-            .iter()
-            .any(|binding: &WindowPlacementShortcut| binding.accelerator == accelerator)
-        {
-            return Err(format!(
-                "binding {} duplicates accelerator {:?}",
-                index,
-                chord.trim()
-            ));
-        }
-        bindings.push(WindowPlacementShortcut {
-            accelerator,
-            action,
-        });
-    }
-    Ok(bindings)
 }
 
 #[cfg(test)]
@@ -327,51 +237,5 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].modifiers, SUPER_MASK);
         assert_eq!(list[0].symbol, xkb::keysyms::KEY_space);
-    }
-
-    #[test]
-    fn host_accelerator_environment_value_is_unset_valid_or_invalid() {
-        use std::env::VarError;
-        assert_eq!(
-            host_accelerators_from_value(Err(VarError::NotPresent)),
-            Ok(Vec::new())
-        );
-        assert_eq!(
-            host_accelerators_from_value(Ok("<Alt>a".to_string())),
-            Ok(vec![parse_accelerator("<Alt>a").unwrap()])
-        );
-        assert!(host_accelerators_from_value(Ok("<Hyper>a".to_string()))
-            .unwrap_err()
-            .starts_with("Invalid SOMMELIER_ACCELERATORS '<Hyper>a'"));
-        assert!(
-            host_accelerators_from_value(Err(VarError::NotUnicode(std::ffi::OsString::from("x"))))
-                .unwrap_err()
-                .contains("not UTF-8")
-        );
-    }
-
-    #[test]
-    fn parse_window_placement_shortcuts_accepts_bindings() {
-        let bindings =
-            parse_window_placement_shortcuts("<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen")
-                .unwrap();
-        assert_eq!(bindings.len(), 3);
-        assert_eq!(bindings[0].accelerator.modifiers, ALT_MASK);
-        assert_eq!(bindings[0].accelerator.symbol, xkb::keysyms::KEY_q);
-        assert_eq!(bindings[0].action, WindowLayoutAction::TopLeft);
-        assert_eq!(bindings[2].action, WindowLayoutAction::Fullscreen);
-    }
-
-    #[test]
-    fn parse_window_placement_shortcuts_rejects_duplicates_and_bad_actions() {
-        assert!(parse_window_placement_shortcuts("<Alt>q=top,<Alt>q=left")
-            .unwrap_err()
-            .contains("duplicates"));
-        assert!(parse_window_placement_shortcuts("<Alt>q=tile")
-            .unwrap_err()
-            .contains("unsupported action"));
-        assert!(parse_window_placement_shortcuts("<Alt>q")
-            .unwrap_err()
-            .contains("CHORD=ACTION"));
     }
 }
