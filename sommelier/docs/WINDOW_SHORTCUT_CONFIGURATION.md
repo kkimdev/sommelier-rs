@@ -77,9 +77,17 @@ problem is logged once per process instead. The rules apply in this order:
 While the policy is active, a chord that matches a binding is always
 consumed: it never reaches the guest, even when the placement is skipped
 (for example, with no focused toplevel, before the output's metadata is
-complete, or for a rectangle the output cannot represent), and the reason is
-logged. A chord listed in `SOMMELIER_ACCELERATORS` stays with the host. A
-chord that the host IME consumes is neither placed nor delivered.
+complete, or for a rectangle the output cannot represent). A chord listed in
+`SOMMELIER_ACCELERATORS` stays with the host. A chord that the host IME
+consumes is neither placed nor delivered.
+
+Every skip is logged with its reason. A skip that persists until the
+configuration or the proxy changes (a rectangle the output cannot represent,
+or a toplevel that cannot get an Aura toplevel) is logged at `info`, which
+the default log filter shows. Skips that depend on transient focus or output
+state are logged at `debug`; set `RUST_LOG=debug` to see them.
+`PlacementSkip::log_level` in `sommelier/src/handler/keyboard.rs` owns this
+split.
 
 ## Environment list format
 
