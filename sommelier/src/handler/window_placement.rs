@@ -20,10 +20,10 @@ limitations under the License.
 //! The keyboard handler decides that a chord is a placement shortcut; this
 //! module moves the focused window. It owns the Aura toplevel that carries
 //! `zaura_toplevel.set_window_bounds`, the surface's ARC policy identity
-//! (see `docs/ARC_TASK_AND_SESSION_IDS.md`), the host-stream barrier that
-//! orders each bounds request, the configures held behind that barrier, and
-//! the translation of `zaura_toplevel.configure` into the guest's
-//! `xdg_toplevel.configure`. Its per-connection state lives in
+//! (see `sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`), the host-stream
+//! barrier that orders each bounds request, the configures held behind that
+//! barrier, and the translation of `zaura_toplevel.configure` into the
+//! guest's `xdg_toplevel.configure`. Its per-connection state lives in
 //! [`crate::state::WindowPlacementState`]; protocol handlers translate wire
 //! events and delegate here, one call per event:
 //!
