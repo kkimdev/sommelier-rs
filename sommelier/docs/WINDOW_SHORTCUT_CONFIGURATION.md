@@ -2,10 +2,8 @@
 
 Compositor-owned window placement shortcuts move the focused XDG toplevel
 with one `zaura_toplevel.set_window_bounds` request when a configured chord is
-pressed. This document is the single owner of their contract: the settings,
-which source wins, what happens when a setting is invalid, how a chord is
-handled, the precision a rectangle needs, which output and work area a
-placement uses, and reloading. The README links here.
+pressed. This document is the single owner of their contract; the README
+and the code link here instead of restating it.
 
 ## Settings
 
@@ -16,6 +14,8 @@ placement uses, and reloading. The README links here.
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Binding source: a `CHORD=ACTION` list with named actions only. It never reloads. |
 | `--window-shortcuts-config PATH` | Binding source: a versioned TOML file with named actions or arbitrary rectangles. `SIGHUP` reloads it. |
 
+The two binding sources are mutually exclusive; giving both is a
+configuration problem (see [Resolution at startup](#resolution-at-startup)).
 `PlacementConfig::from_environment` reads every setting once, at startup, so
 a change to the environment needs a restart. A variable that is empty or only
 whitespace counts as unset. For `SOMMELIER_ACCELERATORS` and
