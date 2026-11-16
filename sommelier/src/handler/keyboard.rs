@@ -1301,16 +1301,21 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                         .host_accelerator_suppressed(host_keyboard_id, key);
                     // peek_key may trail the wl_keyboard press it describes.
                     // A generation already consumed by a compositor shortcut
-                    // must not become an IME recovery candidate.
+                    // must not become an IME recovery candidate, even if a
+                    // reload has since removed its binding.
                     // Only a still-held generation is the one this peek
                     // describes; a released one is retired by the new press.
                     let consumed_by_shortcut = pressed_before
                         && ctx.guest_key_owner(host_keyboard_id, key)
                             == Some(GuestKeyOwner::CompositorShortcut);
+                    // Only guest input may be recovered or delivered through
+                    // the IME channel. Host accelerators and placement chords
+                    // belong to the host and to Sommelier: if text-input
+                    // claimed one first, the wl_keyboard press that follows
+                    // would find the guest already owning it.
                     let eligible = !already_dropped_as_accelerator
                         && !consumed_by_shortcut
-                        && self.classify_key(ctx, host_keyboard_id, key)
-                            != KeyClass::HostAccelerator;
+                        && self.classify_key(ctx, host_keyboard_id, key) == KeyClass::Guest;
                     let sequence = ctx.key_generations.observe_peek_press(
                         host_keyboard_id,
                         key,
@@ -2174,8 +2179,17 @@ mod tests {
         assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
+    /// Contract: whoever delivers a key generation to the guest first owns
+    /// it, and placement never acts on a key the guest already received.
+    ///
+    /// Here text-input delivered the keysym before any `peek_key` for this
+    /// generation, so nothing could classify it as a placement chord yet.
+    /// The guest saw the press, so placing the window as well would make
+    /// one key do two things. With a preceding `peek_key`, a placement chord
+    /// never reaches the guest this way: see
+    /// `peeked_placement_chord_is_not_claimed_by_text_input_or_ime_recovery`.
     #[test]
-    fn shortcut_press_after_text_input_delivery_keeps_text_input_ownership() {
+    fn chord_delivered_by_text_input_before_peek_belongs_to_the_guest() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         let keyboard = HostId(5);
         assert_eq!(
@@ -2208,8 +2222,14 @@ mod tests {
         );
     }
 
+    /// Same contract as
+    /// `chord_delivered_by_text_input_before_peek_belongs_to_the_guest`, for
+    /// a generation that IME recovery already replayed to the guest as a
+    /// balanced pair. Only an eligible peek generation can be recovered, and
+    /// a peeked placement chord is never eligible, so this state means the
+    /// key was not classified as a placement chord when it was recovered.
     #[test]
-    fn shortcut_press_after_ime_recovery_keeps_the_recovered_pair_only() {
+    fn chord_recovered_by_ime_belongs_to_the_guest() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         let keyboard = HostId(5);
         assert_eq!(
@@ -2235,6 +2255,57 @@ mod tests {
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
         assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert_eq!(queued_window_bounds(&ctx), 0);
+    }
+
+    #[test]
+    fn peeked_placement_chord_is_not_claimed_by_text_input_or_ime_recovery() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+
+        // peek_key reports the physical press before the IME channel and the
+        // wl_keyboard event for the same generation.
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert!(
+            ctx.key_generations
+                .peek(keyboard, key)
+                .is_some_and(|press| !press.eligible),
+            "a placement chord must never become an IME recovery candidate"
+        );
+        assert_eq!(
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 2 })
+                .delivery,
+            GuestKeyDelivery::Drop,
+            "text-input must not deliver a placement chord to the guest"
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "the chord stays Sommelier's"
+        );
+        assert_eq!(queued_window_bounds(&ctx), 1, "the window is placed");
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
     }
 
     #[test]
