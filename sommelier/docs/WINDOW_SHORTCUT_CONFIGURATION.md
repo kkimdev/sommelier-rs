@@ -2,9 +2,8 @@
 
 Compositor-owned window placement shortcuts move the focused XDG toplevel
 with one `zaura_toplevel.set_window_bounds` request when a configured chord is
-pressed. This document is the single owner of their configuration contract:
-the settings, which source wins, what happens when a setting is invalid,
-reloading, and the precision a rectangle needs. The README links here.
+pressed. This document is the single owner of their contract; the README
+and the code link here instead of restating it.
 
 ## Settings
 
@@ -15,6 +14,8 @@ reloading, and the precision a rectangle needs. The README links here.
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Binding source: a `CHORD=ACTION` list with named actions only. It never reloads. |
 | `--window-shortcuts-config PATH` | Binding source: a versioned TOML file with named actions or arbitrary rectangles. `SIGHUP` reloads it. |
 
+The two binding sources are mutually exclusive; giving both is a
+configuration problem (see [Resolution at startup](#resolution-at-startup)).
 `PlacementConfig::from_environment` reads every setting once, at startup, so
 a change to the environment needs a restart. A variable that is empty or only
 whitespace counts as unset. For `SOMMELIER_ACCELERATORS` and
@@ -49,15 +50,15 @@ problem is logged once per process instead. The rules apply in this order:
    shortcuts disabled: no binding is active and no chord is consumed. The ARC
    policy itself stays active. With an invalid `SOMMELIER_ACCELERATORS`, key
    filtering is disabled too.
-3. **A file can recover by reload.** If the file was given alone and its path
-   resolved, `SIGHUP` re-reads it, so a fixed file activates its bindings
-   without a restart (see [Reloading](#reloading)). The other unusable cases
-   have nothing to reload: the conflict and the environment list need a
-   restart, and so does an invalid `SOMMELIER_ACCELERATORS`, because it is
-   read only at startup.
-4. **Host accelerators alone only lose filtering.** Without a binding source,
-   a malformed `SOMMELIER_ACCELERATORS` logs one warning and disables key
-   filtering, so every key goes to the guest.
+3. **A file can recover by reload.** If the file was the only source, its
+   path resolved, and `SOMMELIER_ACCELERATORS` is valid, `SIGHUP` re-reads
+   it, so a fixed file activates its bindings without a restart (see
+   [Reloading](#reloading)). Every other unusable case needs a restart; the
+   table below says which.
+4. **Host accelerators alone only lose filtering.** Without a usable binding
+   source (no source, or the policy is off), a malformed
+   `SOMMELIER_ACCELERATORS` logs one warning and disables key filtering, so
+   every key goes to the guest.
 
 | Policy (gate and ARC block) | Binding source | Result |
 | --- | --- | --- |
@@ -71,9 +72,23 @@ problem is logged once per process instead. The rules apply in this order:
 | active | file path cannot be resolved | One error; shortcuts disabled; no reload. |
 | active | one, with `SOMMELIER_ACCELERATORS` invalid | One error; shortcuts and key filtering disabled; no reload. |
 
+## Chord handling
+
 While the policy is active, a chord that matches a binding is always
-consumed, even when the placement is skipped (for example, with no focused
-toplevel). A chord listed in `SOMMELIER_ACCELERATORS` stays with the host.
+consumed: it never reaches the guest, even when the placement is skipped
+(for example, with no focused toplevel, before the output's metadata is
+complete, or for a rectangle the output cannot represent). A chord listed in
+`SOMMELIER_ACCELERATORS` stays with the host. A chord that the host IME
+consumes is neither placed nor delivered.
+
+Every skip is logged with its reason. A skip that persists until the
+configuration or the proxy changes is logged at `info`, which the default
+log filter shows: a rectangle the output cannot represent, or no Aura
+toplevel (ARC identities exhausted, or `zaura_shell` missing or too old).
+The other skips (no focused toplevel, no usable output yet, no Aura surface)
+are logged at `debug`; set `RUST_LOG=debug` to see them.
+`PlacementSkip::log_level` in `sommelier/src/handler/window_placement.rs`
+owns this split.
 
 ## Environment list format
 
@@ -82,9 +97,9 @@ SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscre
 ```
 
 A comma-separated list of `CHORD=ACTION` entries. Whitespace around each
-chord and action is ignored, and so are empty entries. Only the named actions
-(see below) are available; use the file for rectangles. A list can move to
-the file unchanged.
+chord and action is ignored, and so are empty entries. Only the
+[named actions](#named-actions) are available; use the file for rectangles.
+A list can move to the file unchanged.
 
 ## File format
 
@@ -114,21 +129,24 @@ action = "fullscreen"
 - Each binding has a `chord` and **exactly one** of `action` or `rect`.
   - `chord` uses the `SOMMELIER_ACCELERATORS` spelling: modifier tags
     (`<Control>`/`<Ctrl>`, `<Alt>`/`<Meta>`, `<Shift>`,
-    `<Super>`/`<Win>`/`<Search>`) followed by an XKB keysym name. Matching is
-    exact on modifiers and case-insensitive on the keysym.
-  - `action` is one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
-    `right`, `bottom-left`, `bottom`, `bottom-right` (case-insensitive). These
-    are the same names as the environment variable, so a list can be moved to
-    the file unchanged. `fullscreen` fills the work area; it is ordinary
-    placement, not native fullscreen.
+    `<Super>`/`<Win>`/`<Search>`, case-insensitive) followed by an XKB
+    keysym name. Matching is exact on modifiers and case-insensitive on the
+    keysym. This is the one list of modifier tags; `parse_accelerator` in
+    `sommelier/src/accelerator.rs` implements it.
+  - `action` is one of the [named actions](#named-actions)
+    (case-insensitive).
   - `rect` is `[x, y, width, height]`. Integers such as `[0, 0, 1, 1]` are
     accepted.
 - Unknown keys anywhere are rejected, so a misspelt field cannot be silently
   ignored.
 
-Named actions are shared with the environment list
-(`WindowLayoutAction::from_name` is the one name parser) and keep the common
-layouts readable. Each named action is defined as a rectangle:
+### Named actions
+
+The environment list and the file share these names
+(`WindowLayoutAction::from_name` is the one name parser). Each stands for a
+fixed rectangle: `WindowLayoutAction::rect` in
+`sommelier/src/window_layout.rs` defines the values, and a unit test keeps
+this table and the code in sync.
 
 | Action | Rectangle |
 | --- | --- |
@@ -141,6 +159,9 @@ layouts readable. Each named action is defined as a rectangle:
 | `bottom-left` | `[0.0, 0.5, 0.5, 0.5]` |
 | `bottom` | `[0.0, 0.5, 1.0, 0.5]` |
 | `bottom-right` | `[0.5, 0.5, 0.5, 0.5]` |
+
+`fullscreen` fills the work area; it is ordinary placement, not native
+fullscreen.
 
 ## Validation
 
@@ -175,11 +196,38 @@ extent up to 1,000,000 pixels. Exact binary fractions such as `0.5` or
 one pixel short: `0.3333333 * 1920 = 639.99994` floors to `639`, not `640`.
 Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
+## Output and work area
+
+A placement uses an output that the focused surface has entered, so a window
+never jumps to another monitor; only a surface currently on no output (before
+its first enter, or after all its outputs went away) uses the first usable
+output. `OutputRegistry::for_surface` in
+`sommelier/src/state/outputs.rs` owns the exact rule, including which output
+wins when the surface spans several and when an output counts as usable.
+
+The work area is the output's logical screen area minus Aura's insets (the
+shelf and other reserved margins), in the coordinates that
+`zaura_toplevel.set_window_bounds` uses. `OutputState::work_area` in the same
+file owns how it is measured from the output's metadata, including why the
+`wl_output.geometry` panel transform is used rather than
+`zaura_output.logical_transform`. Placement waits until Aura has sent both
+its current output scale and its device scale factor; the rounded
+`wl_output.scale` cannot describe fractional display scaling.
+
+Known limits:
+
+- Aura reports both scale factors in thousandths, so unusual scale settings
+  may still differ slightly from the host's exact logical dimensions.
+- Exo's `wl_output.mode` is the panel's `bounds_in_native` size, which can
+  include overscan, so on an overscanned display the work area may be
+  slightly too large.
+- Rotated displays and multi-monitor output selection follow Exo's source and
+  are covered by unit tests, but have not been verified on a host.
+
 ## From rectangle to window bounds
 
-At key time the focused surface's output work area `(X, Y, W, H)` comes from
-`OutputState::work_area`; the [README](../../README.md#configuration) explains
-which output is chosen and how its work area is measured. Each rectangle edge
+At key time the focused surface's [work area](#output-and-work-area)
+`(X, Y, W, H)` becomes the frame of the rectangle. Each rectangle edge
 fraction `f` becomes a pixel offset:
 
 ```text
@@ -200,11 +248,11 @@ bounds = (X + left, Y + top, right - left, bottom - top)
   so their bounds are exactly what the dedicated half-split code produced
   before (a unit test compares both across small, odd, and extreme sizes).
   For an odd width the left half gets the smaller share.
-- The placement is skipped (the chord is still consumed) when the work area
-  is unavailable, when an edge strictly inside
-  `(0, 1)` rounds onto the work-area border (the output is too small to
-  represent the rectangle), when a rounded extent is empty, or when
-  `X + left` / `Y + top` overflows.
+- The placement is skipped (the chord is still [consumed](#chord-handling))
+  when the work area is unavailable, when an edge strictly inside `(0, 1)`
+  rounds onto the work-area border (the output is too small to represent the
+  rectangle), when a rounded extent is empty, or when `X + left` /
+  `Y + top` overflows.
 
 The owner of this rule is `NormalizedRect::to_work_area_bounds` in
 `sommelier/src/window_layout.rs`.
@@ -257,7 +305,7 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/placement_config.rs` | `PlacementConfig`: startup resolution of every setting, both binding parsers, the one validator, the hardened file read, the current binding generation, and reload. |
 | `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
-| `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
+| `sommelier/src/state.rs` | `Context` holds the connection's `WindowPlacementState` and `OutputRegistry`; `placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
 | `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |

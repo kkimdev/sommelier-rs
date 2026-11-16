@@ -43,9 +43,9 @@ The current published binary is the
 | x86_64 | `sommelier_rs_virtwl-v0.2.6-x86_64` |
 | aarch64/arm64 | `sommelier_rs_virtwl-v0.2.6-aarch64` |
 
-Every release also includes `SHA256SUMS`. The release workflow builds on
-GitHub-hosted Ubuntu 24.04 runners, runs the x86_64 regression suite, and
-publishes the release only after both architecture builds succeed.
+Every release also includes `SHA256SUMS`. See
+[CI and release workflow](#ci-and-release-workflow) for how releases are
+built.
 
 ## Install and run in Crostini
 
@@ -206,11 +206,11 @@ test uses `/dev/wl0`.
 
 | Variable/option | Purpose |
 | --- | --- |
-| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. |
+| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. With the ARC policy it also holds the [task-ID block locks](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator), and must then be private to the user. |
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
-| `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window placement (`1`, `true`, `yes`, or `on`). See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
+| `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window placement. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
@@ -219,15 +219,10 @@ test uses `/dev/wl0`.
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
 | `--window-shortcuts-config PATH` | Optional TOML file of placement bindings (named actions or work-area rects), reloaded on `SIGHUP`. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
-With the ARC policy gate and placement bindings configured, Sommelier
-consumes the bound chords and places the focused XDG toplevel in the selected
-work-area region of the output that surface has entered (the first usable
-one, in the order the guest bound them, when it spans several). Only a surface
-with no current output association uses the first usable output; a window is
-never moved to another monitor. A matched chord never reaches the guest, even when
-the placement is skipped (for example, with no focused toplevel or before the
-output's metadata is complete); the reason is logged. A chord that the host
-IME consumes is neither placed nor delivered. For example:
+Compositor-owned window placement is opt-in, and no placement shortcut is
+active by default. With the ARC policy gate and placement bindings
+configured, Sommelier consumes the bound chords and moves the focused XDG
+toplevel to a region of its output's work area. For example:
 
 ```text
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
@@ -235,45 +230,9 @@ SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscre
 ```
 
 [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
-owns the configuration contract: both binding sources and the TOML schema,
-which source wins, the failure policy (a configuration problem is logged and
-disables placement shortcuts; it never stops the proxy), reloading, and the
-precision rectangles need.
-
-A work area starts from the output's `wl_output.mode`, which Exo reports in
-the panel's native orientation. It is rotated by the `wl_output.geometry`
-(panel) transform, divided by Aura's current output scale and device scale
-factor, and then shrunk by the Aura insets. `zaura_output.logical_transform`
-is not used: it omits the panel's mounting orientation, so it would turn a
-portrait-native panel the wrong way. Placement waits for both scale factors to
-be available in the committed output metadata; the rounded integer
-`wl_output.scale` is insufficient for fractional display scaling. Aura reports
-these factors in thousandths, so unusual scale settings may still differ
-slightly from the host's exact logical dimensions. Rotated displays and
-multi-monitor output selection follow Exo's source and are covered by unit
-tests, but have not been verified on a host. Exo's `wl_output.mode` is the
-panel's `bounds_in_native` size, which can include overscan, so on an
-overscanned display the work area may be slightly too large.
-
-No placement shortcut is active by default. The policy gate remains opt-in
-because it changes the ChromeOS window-policy namespace. The ARC policy may
-still be enabled without bindings for deployments that need the metadata path
-but no compositor-owned chords.
-
-`PlacementConfig` in `sommelier/src/placement_config.rs` owns the
-process-wide configuration, and every connection shares it.
-`sommelier/src/handler/window_placement.rs` performs placement: protocol
-handlers delegate to it, and it sends the Aura requests and orders them.
-`WindowPlacementState` in `sommelier/src/state/window_placement.rs` is the
-single owner of this policy's per-connection state: the per-surface ARC
-identities, the host Aura surface/toplevel associations, the host-sync bounds
-barriers, and the configures held behind them. Handlers query and mutate that
-state only through its methods, and surface/toplevel teardown releases it in
-one place. `OutputRegistry` in `sommelier/src/state/outputs.rs` likewise owns
-the bound outputs: their metadata, liveness, Aura output objects, and which
-outputs each surface has entered. [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
-explains the ARC application-ID namespaces, the identity allocator, and why
-`.session.*` restore identities are never fabricated.
+owns the placement contract, and
+[`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
+explains the ARC application-ID workaround it relies on.
 
 ## CI and release workflow
 
@@ -294,8 +253,10 @@ git tag -a virtwl-v0.2.6 personal/virtwl -m "Release virtwl-v0.2.6"
 git push personal refs/tags/virtwl-v0.2.6
 ```
 
-The release workflow builds both architectures, creates `SHA256SUMS`, uploads
-all assets while the release is a draft, and then publishes the prerelease.
+The release workflow builds both architectures on GitHub-hosted Ubuntu
+24.04 runners, runs the x86_64 regression suite, creates `SHA256SUMS`, and
+uploads all assets while the release is a draft. It publishes the
+prerelease only after both architecture builds succeed.
 The fork currently keeps `virtwl` as its only development branch.
 
 ## Repository layout

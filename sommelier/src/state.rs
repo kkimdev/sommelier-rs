@@ -889,17 +889,17 @@ pub struct Context {
     pub xdg_decoration: bool,
     /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
     pub host_zaura_shell_id: Option<u32>,
-    /// Bound version of zaura_shell (capped at 38 in registry). Used to guard
-    /// opcodes that require specific protocol versions.
+    /// Bound version of zaura_shell, clamped by the `zaura_shell` bind in
+    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Used to
+    /// guard opcodes that require specific protocol versions.
     pub host_zaura_shell_version: u32,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
-    /// Single owner of this connection's ARC bounds policy state: ARC
-    /// identities, Aura surface/toplevel associations, bounds barriers, and
-    /// configures held behind them. Built from `placement`.
+    /// This connection's ARC bounds policy state (see
+    /// [`WindowPlacementState`] for what it owns). Built from `placement`.
     pub(crate) window_placement: WindowPlacementState,
-    /// Single owner of the bound host outputs, their placement metadata,
-    /// their Aura output objects, and which outputs each surface entered.
+    /// This connection's bound host outputs (see [`OutputRegistry`] for what
+    /// it owns).
     pub(crate) outputs: OutputRegistry,
     /// Synthetic GTK shell bindings and their activation token state.
     pub gtk_shells: HashMap<u32, GtkShellState>,

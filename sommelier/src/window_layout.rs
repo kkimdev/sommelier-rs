@@ -255,9 +255,9 @@ impl WindowLayoutAction {
     ///
     /// # Arguments
     ///
-    /// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
-    ///   `right`, `bottom-left`, `bottom`, or `bottom-right`, optionally
-    ///   surrounded by whitespace.
+    /// * `name` - a preset name, optionally surrounded by whitespace. This
+    ///   function's `match` is the list of names; the "Named actions" table
+    ///   in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` presents it.
     ///
     /// # Returns
     ///
@@ -279,8 +279,10 @@ impl WindowLayoutAction {
 
     /// Return the normalized work-area rectangle for this action.
     ///
-    /// The named presets split the work area into halves; a configured
-    /// [`WindowLayoutAction::Rect`] returns its own rectangle.
+    /// This function's `match` defines the named presets' rectangles; the
+    /// "Named actions" table in
+    /// `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` presents them. A
+    /// configured [`WindowLayoutAction::Rect`] returns its own rectangle.
     pub(crate) fn rect(self) -> NormalizedRect {
         // The presets are exact binary fractions inside the unit square, so
         // validation could not change them; a test proves that this
@@ -592,6 +594,60 @@ mod tests {
     fn presets_equal_the_validated_rect_of_the_same_values() {
         assert_eq!(PRESET_COMPONENTS.map(|(action, _)| action), PRESETS);
         for (action, [x, y, width, height]) in PRESET_COMPONENTS {
+            assert_eq!(
+                NormalizedRect::new(x, y, width, height),
+                Ok(action.rect()),
+                "{action:?}"
+            );
+        }
+    }
+
+    /// The user-facing "Named actions" table must list every preset, each
+    /// once, with the rectangle `rect` defines.
+    #[test]
+    fn named_actions_doc_table_matches_the_presets() {
+        const DOC: &str = include_str!("../docs/WINDOW_SHORTCUT_CONFIGURATION.md");
+        let rows: Vec<(WindowLayoutAction, [f64; 4])> = DOC
+            .lines()
+            .skip_while(|line| line.trim() != "### Named actions")
+            .skip(1)
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            // The header row and the separator row.
+            .skip(2)
+            .map(|line| {
+                let cells: Vec<&str> = line
+                    .split('|')
+                    .map(|cell| cell.trim().trim_matches('`'))
+                    .filter(|cell| !cell.is_empty())
+                    .collect();
+                let [name, rect] = cells[..] else {
+                    panic!("a row has an action and a rectangle: {line:?}");
+                };
+                let action = WindowLayoutAction::from_name(name)
+                    .unwrap_or_else(|| panic!("unknown action {name:?}"));
+                let values: Vec<f64> = rect
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|value| value.trim().parse().expect("a number"))
+                    .collect();
+                let rect = values
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("four values: {line:?}"));
+                (action, rect)
+            })
+            .collect();
+
+        assert_eq!(rows.len(), PRESETS.len(), "one row per preset");
+        for preset in PRESETS {
+            assert_eq!(
+                rows.iter().filter(|(action, _)| *action == preset).count(),
+                1,
+                "{preset:?} appears once"
+            );
+        }
+        for (action, [x, y, width, height]) in rows {
             assert_eq!(
                 NormalizedRect::new(x, y, width, height),
                 Ok(action.rect()),

@@ -1242,3 +1242,86 @@ codegen 8 (7 before), `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
 targets, `cargo fmt --check`, and `git diff --check` pass, and every commit
 builds with strict Clippy. Not host-validated: no Sommelier process was
 started.
+
+## 2026-11-17 — Docs have one owner per fact
+
+Cleanup PR F for review findings D1 and D2. Earlier PRs had already fixed
+most D1 claims: the process-wide ARC failure, the lock-file location and the
+private `$XDG_RUNTIME_DIR` requirement (B), the never-fatal configuration
+policy (C), and the rotation caveat and the zaura_output and output-choice
+comments (E1). The ARC doc's "reservation at startup", which the review
+flagged, became true when C moved the reservation into
+`PlacementConfig::from_environment`, before the proxy accepts a client.
+This PR checked every claim against the current code and fixed what was
+still wrong or stated twice. Behavior is unchanged; the only Rust changes
+are doc comments, the `--help` text, and one new test.
+
+**Still wrong, now fixed.**
+
+- The README's `XDG_RUNTIME_DIR` row did not mention the ARC lock files or
+  the private-directory requirement. It now links to the allocator section.
+- The README called `SOMMELIER_ACCELERATORS` a list of keysyms; it holds
+  chords such as `<Alt>tab`.
+- The README and the doc intro both said "which source wins", but giving
+  both binding sources is an error. The settings now say the two sources
+  are mutually exclusive.
+- `WindowLayoutAction::rect` said the presets split the work area into
+  halves; they include quarters and the whole area.
+- The reload rule said a file given alone reloads, but an invalid
+  `SOMMELIER_ACCELERATORS` leaves no reload path. The rule now names all
+  three conditions and leaves each case's outcome to the resolution table.
+  The rule for host accelerators alone now covers the policy-off case too.
+- "The reason is logged" implied every skipped placement is visible, but
+  the transient skips log at `debug` under the default `info` filter. The
+  doc now states the split and names `PlacementSkip::log_level` as its
+  owner.
+- `HANDOVER.md` still named `virtwl-v0.2.1-r1` as the current release and
+  said `--gpu-accel` was disabled. It now links to the README.
+- The `--window-shortcuts-config` help used a crate-relative doc path; it
+  now gives the GitHub URL. The keyboard module doc uses the repository
+  path.
+
+**One owner per fact.**
+
+- `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` owns the placement
+  contract. It took over the user-facing behavior that the README restated:
+  chord handling (a matched chord is always consumed), which output and work
+  area a placement uses, and the thousandths, overscan and not-host-verified
+  caveats. It names `OutputRegistry::for_surface` and
+  `OutputState::work_area` as the owners of the exact rules instead of
+  restating their doc comments, and it no longer points back to the README.
+- The README keeps an overview, the example, and one sentence linking to
+  that doc. It no longer keeps its own table of contents for the doc, the
+  gate's accepted spellings, or a list of which type owns which state (the
+  module docs own that, and the doc's code map indexes them).
+- `WindowLayoutAction::rect` owns the preset rectangles. The doc presents
+  them once, in a "Named actions" table, and the action names are no longer
+  listed in two more places. The new test
+  `named_actions_doc_table_matches_the_presets` reads the table with
+  `include_str!` and fails if a value, a missing or duplicated row, or a new
+  preset makes the doc and the code disagree.
+- The doc owns the list of chord modifier tags; the accelerator module doc
+  points to it.
+- The README describes the release workflow once, in "CI and release
+  workflow", and the handover links to the README's repository layout.
+- The allocator facts were already consolidated by PR B; the README and
+  the module comment only link to them.
+
+After rebasing onto PR D: the doc points at `PlacementSkip::log_level` in
+`sommelier/src/handler/window_placement.rs` and names each skip by its
+level, since D removed two variants. The `state.rs` row of the code map
+says that `Context` holds the connection's `WindowPlacementState` and
+`OutputRegistry`. The `Context` field docs for those two no longer restate
+their "single owner" summaries; they link to the types. The `zaura_shell`
+version field doc no longer repeats the registry's literal 38. The
+registry's upper bound is still an unnamed literal in the `zaura_shell`
+bind; naming it is code, not docs, and is left for a follow-up.
+
+Validation (monorepo dev shell, locked, serial), rebased on PR D:
+Sommelier 678 passed / 1 ignored (677 on D, plus the doc-table test),
+sample GUI 12, codegen 8, `gui_smoke` 0 run / 1 ignored. Strict Clippy on
+all targets, `cargo fmt --check`, and `git diff --check` pass, and this PR
+adds no `cargo doc` warning. Every relative Markdown link and anchor in the
+README, the handover, the walkthrough and `sommelier/docs/` resolves. The
+doc-table test was checked to fail for a changed value, a dropped row, and
+a duplicated row. Not host-validated: no Sommelier process was started.
