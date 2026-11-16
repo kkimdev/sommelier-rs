@@ -439,7 +439,6 @@ impl KeyboardHandler {
             .shadow_table
             .get_host_id(guest_wl_surface_id)
             .and_then(|host_surface_id| ctx.output_for_surface(host_surface_id))
-            .or_else(|| ctx.primary_output())
             .ok_or(PlacementSkip::NoUsableOutput)?;
         let (x, y, width, height) =
             Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
@@ -2061,6 +2060,40 @@ mod tests {
                 .all(|message| message_sender(message) == 50),
             "only keyboard acknowledgments may be queued when placement lacks geometry"
         );
+    }
+
+    #[test]
+    fn placement_is_skipped_rather_than_moved_to_another_output() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let entered_output = 26;
+        ctx.output_host_ids.push(entered_output);
+        ctx.output_states.insert(
+            entered_output,
+            crate::state::OutputState {
+                origin_x: 3840,
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                aura_current_scale: Some(1000),
+                // The device scale event for this output has not arrived.
+                ..Default::default()
+            },
+        );
+        ctx.surface_entered_output(22, entered_output);
+        assert!(
+            ctx.primary_output().is_some(),
+            "another output is usable, but the surface is not on it"
+        );
+
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoUsableOutput)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
     /// Host keyboard 5 (extended keyboard 50) focused on a placeable

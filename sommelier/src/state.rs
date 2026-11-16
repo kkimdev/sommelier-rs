@@ -1512,7 +1512,9 @@ impl Context {
         }
     }
 
-    /// Return the first output with a usable mode.
+    /// Return the first output, in advertisement order, that is usable for
+    /// placement: still live (neither inactive nor awaiting destruction) and
+    /// with complete metadata, so that its work area can be computed.
     pub fn primary_output(&self) -> Option<(u32, OutputState)> {
         self.output_host_ids
             .iter()
@@ -1523,21 +1525,24 @@ impl Context {
     ///
     /// `wl_surface.enter`/`leave` maintain a set because a surface can span
     /// outputs. Iterating `output_host_ids` makes the choice deterministic
-    /// even when several entered outputs are simultaneously usable. If the
-    /// association is empty or stale, fall back to the first usable output so
-    /// a surface created before its first enter event remains placeable.
+    /// even when several entered outputs are simultaneously usable.
+    ///
+    /// Only a surface with no output association (created before its first
+    /// enter event, or whose outputs all went away) falls back to
+    /// [`Self::primary_output`]. If the surface has entered outputs but none
+    /// is usable yet, this returns `None`: another output would move the
+    /// window to a different monitor.
     pub fn output_for_surface(&self, host_surface_id: u32) -> Option<(u32, OutputState)> {
-        let associated = self.surface_output_ids.get(&host_surface_id);
-        associated
-            .and_then(|associated| {
-                self.output_host_ids.iter().find_map(|&host_id| {
-                    associated
-                        .contains(&host_id)
-                        .then(|| self.usable_output(host_id))
-                        .flatten()
-                })
-            })
-            .or_else(|| self.primary_output())
+        // `surface_left_output` and output retirement delete empty sets, so
+        // a present entry always names at least one entered output.
+        match self.surface_output_ids.get(&host_surface_id) {
+            Some(entered) => self
+                .output_host_ids
+                .iter()
+                .filter(|host_id| entered.contains(host_id))
+                .find_map(|&host_id| self.usable_output(host_id)),
+            None => self.primary_output(),
+        }
     }
 
     fn usable_output(&self, host_id: u32) -> Option<(u32, OutputState)> {
@@ -1909,29 +1914,36 @@ mod tests {
     }
 
     #[test]
-    fn surface_output_selection_prefers_entered_output_and_falls_back() {
+    fn surface_output_selection_never_jumps_to_another_output() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.output_host_ids = vec![20, 30];
-        for output in ctx.output_host_ids.clone() {
-            ctx.output_states.insert(
-                output,
-                OutputState {
-                    mode_width: 1920,
-                    mode_height: 1080,
-                    scale: 1,
-                    aura_current_scale: Some(1000),
-                    aura_device_scale_factor: Some(1000),
-                    ..Default::default()
-                },
-            );
-        }
+        let usable = OutputState {
+            mode_width: 1920,
+            mode_height: 1080,
+            scale: 1,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1000),
+            ..Default::default()
+        };
+        ctx.output_states.insert(20, usable);
+        ctx.output_states.insert(30, usable);
         ctx.surface_entered_output(100, 30);
         assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(30));
 
-        ctx.inactive_output_host_ids.insert(30);
-        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
+        // The entered output's metadata is incomplete: the surface is on
+        // output 30, so selecting output 20 would move it to another monitor.
+        ctx.output_states
+            .get_mut(&30)
+            .unwrap()
+            .aura_device_scale_factor = None;
+        assert_eq!(ctx.output_for_surface(100), None);
+        assert_eq!(ctx.primary_output().map(|(id, _)| id), Some(20));
+
+        // Only a surface with no output association falls back.
+        assert_eq!(ctx.output_for_surface(200).map(|(id, _)| id), Some(20));
         ctx.surface_left_output(100, 30);
         assert!(!ctx.surface_output_ids.contains_key(&100));
+        assert_eq!(ctx.output_for_surface(100).map(|(id, _)| id), Some(20));
     }
 
     #[test]
