@@ -174,9 +174,16 @@ mod tests {
             compact.contains("pubconstREQ_GET_AURA_SURFACE_SINCE:u32=1u32;"),
             "a request without since exists from version 1"
         );
+        let zaura_toplevel_start = compact
+            .find("pubmodzaura_toplevel{")
+            .expect("zaura_toplevel module");
+        let zaura_toplevel = &compact[zaura_toplevel_start..];
+        let zaura_toplevel = &zaura_toplevel[..zaura_toplevel
+            .find("pubmodzaura_popup{")
+            .unwrap_or(zaura_toplevel.len())];
         assert!(
-            compact.contains("pubconstEVT_CONFIGURE_SINCE:u32="),
-            "events get since constants too"
+            zaura_toplevel.contains("pubconstEVT_CONFIGURE_SINCE:u32=29u32;"),
+            "events get since constants too, scoped to their interface"
         );
     }
 
