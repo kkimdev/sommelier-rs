@@ -50,6 +50,15 @@ const WL_COMPOSITOR_VERSION: u32 = 4;
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
+/// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
+/// Sommelier uses. Every Aura child takes its shell's version, so this
+/// floor is what lets the Aura metadata paths send `set_application_id`
+/// without a per-object version check.
+const ZAURA_SHELL_MIN_VERSION: u32 = 6;
+const _: () = assert!(
+    crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID_SINCE
+        <= ZAURA_SHELL_MIN_VERSION
+);
 
 /// Version ceilings used by ChromiumOS Sommelier's client-facing globals.
 ///
@@ -619,13 +628,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // advertisement.
         ctx.removed_host_globals.remove(&name);
 
-        if interface == "zaura_shell" && version < 6 {
-            // Sommelier's aura integration requires set_application_id (v5)
-            // and only binds the shell when the host provides the v6+
-            // contract used by ChromiumOS.
+        if interface == "zaura_shell" && version < ZAURA_SHELL_MIN_VERSION {
             log::debug!(
-                "Ignoring zaura_shell v{}; minimum supported version is 6",
-                version
+                "Ignoring zaura_shell v{}; minimum supported version is {}",
+                version,
+                ZAURA_SHELL_MIN_VERSION
             );
             record_registry_global_visibility(ctx, name, false);
             return Action::Drop;
