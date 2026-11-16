@@ -47,10 +47,26 @@ const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 3;
 const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
 const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const WL_COMPOSITOR_VERSION: u32 = 4;
-// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
+/// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
+/// The `wl_output` ceiling; [`advertised_global_version`] says why. The
+/// vendored XML is newer: v4 adds the `name` and `description` events.
+const WL_OUTPUT_VERSION: u32 = 3;
+/// The `wl_seat` ceiling; [`advertised_global_version`] says why. The
+/// vendored XML is newer: v6 to v10 add touch shape and orientation,
+/// high-resolution scroll and scroll-direction events.
+const WL_SEAT_VERSION: u32 = 5;
+/// The newest `wl_data_device_manager` the proxy advertises: the vendored
+/// XML's, which the generated code forwards in full.
+const WL_DATA_DEVICE_MANAGER_VERSION: u32 =
+    crate::protocols::wayland::wl_data_device_manager::VERSION;
+/// The newest `zcr_keyboard_extension_v1` the proxy binds: the vendored
+/// XML's. The proxy handles all of it, including the v2 `peek_key` event
+/// that reports keys the IME consumed.
+const KEYBOARD_EXTENSION_VERSION: u32 =
+    crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::VERSION;
 /// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
 /// Sommelier uses. Every Aura child takes its shell's version, so this
 /// floor is what lets the proxy create Aura surfaces and outputs, and send
@@ -96,9 +112,9 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
         // legacy damage request. Hosts below v3 retain their original version;
         // the proxy does not expose v5/v6 surface semantics.
         "wl_compositor" => WL_COMPOSITOR_VERSION,
-        "wl_output" => 3,
-        "wl_seat" => 5,
-        "wl_data_device_manager" => 3,
+        "wl_output" => WL_OUTPUT_VERSION,
+        "wl_seat" => WL_SEAT_VERSION,
+        "wl_data_device_manager" => WL_DATA_DEVICE_MANAGER_VERSION,
         "xdg_wm_base" => XDG_SHELL_VERSION,
         "zwp_linux_dmabuf_v1" => LINUX_DMABUF_CLIENT_VERSION,
         _ => host_version,
@@ -107,7 +123,7 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
 }
 
 fn keyboard_extension_version(host_version: u32) -> u32 {
-    host_version.min(2)
+    host_version.min(KEYBOARD_EXTENSION_VERSION)
 }
 
 fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) -> bool {
