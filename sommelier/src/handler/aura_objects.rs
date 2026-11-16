@@ -58,20 +58,11 @@ impl AuraChild {
 
     /// The `zaura_shell` request that creates this child. Each takes the new
     /// child's ID followed by the parent object it extends.
-    const fn get_request(self) -> VersionedRequest {
+    const fn get_opcode(self) -> u16 {
         match self {
-            Self::Surface => VersionedRequest {
-                opcode: zaura_shell::REQ_GET_AURA_SURFACE,
-                since: zaura_shell::REQ_GET_AURA_SURFACE_SINCE,
-            },
-            Self::Toplevel => VersionedRequest {
-                opcode: zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
-                since: zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE,
-            },
-            Self::Output => VersionedRequest {
-                opcode: zaura_shell::REQ_GET_AURA_OUTPUT,
-                since: zaura_shell::REQ_GET_AURA_OUTPUT_SINCE,
-            },
+            Self::Surface => zaura_shell::REQ_GET_AURA_SURFACE,
+            Self::Toplevel => zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
+            Self::Output => zaura_shell::REQ_GET_AURA_OUTPUT,
         }
     }
 
@@ -119,10 +110,13 @@ pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u3
 /// the `zaura_shell` request that creates it. The caller records the
 /// returned ID with the child's association owner.
 ///
+/// Every bound shell can create Aura surfaces and outputs (see the registry's
+/// `ZAURA_SHELL_MIN_VERSION`); the one caller that creates a toplevel checks
+/// the newer version placement needs first.
+///
 /// # Returns
 ///
-/// `None`, queueing nothing, when no `zaura_shell` is bound or the bound
-/// shell predates the child's creation request.
+/// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
     create_from_parts(
         &mut ctx.shadow_table,
@@ -145,10 +139,6 @@ fn create_from_parts(
     parent_host_id: u32,
 ) -> Option<u32> {
     let shell_host_id = shell_host_id?;
-    let get = child.get_request();
-    if shell_version < get.since {
-        return None;
-    }
     let child_host_id = shadow_table.allocate_host_id();
     shadow_table.track_host_interface_with_version(
         child_host_id,
@@ -158,7 +148,7 @@ fn create_from_parts(
     let mut builder = MessageBuilder::new();
     builder.write_u32(child_host_id);
     builder.write_u32(parent_host_id);
-    let message = builder.build_message(shell_host_id, get.opcode);
+    let message = builder.build_message(shell_host_id, child.get_opcode());
     client_to_host_queue.push((message, Vec::new()));
     Some(child_host_id)
 }
@@ -227,7 +217,7 @@ pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: 
 /// # Returns
 ///
 /// The `zaura_output` host ID, or `None` when the output has none and is not
-/// live, or no `zaura_shell` that supports Aura outputs is bound yet.
+/// live, or no `zaura_shell` is bound yet.
 pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> Option<u32> {
     let shadow_table = &mut ctx.shadow_table;
     let client_to_host_queue = &mut ctx.client_to_host_queue;
@@ -272,11 +262,11 @@ mod tests {
 
     #[test]
     fn create_queues_the_shell_request_with_the_shell_version() {
+        let version = 17;
         for child in ALL {
-            let version = child.get_request().since;
             let mut ctx = ctx_with_shell(version);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
-            assert_eq!(queued(&ctx), vec![(SHELL_HOST, child.get_request().opcode)]);
+            assert_eq!(queued(&ctx), vec![(SHELL_HOST, child.get_opcode())]);
             assert_eq!(
                 ctx.client_to_host_queue[0].0[8..16],
                 [id.to_ne_bytes(), PARENT_HOST.to_ne_bytes()].concat()
@@ -290,12 +280,9 @@ mod tests {
     }
 
     #[test]
-    fn create_needs_a_shell_that_has_the_request() {
+    fn create_needs_a_bound_shell() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         assert_eq!(create(&mut ctx, AuraChild::Surface, PARENT_HOST), None);
-
-        let mut ctx = ctx_with_shell(AuraChild::Output.get_request().since - 1);
-        assert_eq!(create(&mut ctx, AuraChild::Output, PARENT_HOST), None);
         assert!(ctx.client_to_host_queue.is_empty());
     }
 
@@ -311,9 +298,7 @@ mod tests {
             assert!(ctx.shadow_table.is_pending_destroy_host_only(id));
 
             let mut ctx = ctx_with_shell(since - 1);
-            let Some(id) = create(&mut ctx, child, PARENT_HOST) else {
-                continue;
-            };
+            let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
             ctx.client_to_host_queue.clear();
             release(&mut ctx, child, id);
             assert!(

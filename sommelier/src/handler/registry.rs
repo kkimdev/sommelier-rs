@@ -56,10 +56,17 @@ const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
 /// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
 /// Sommelier uses. Every Aura child takes its shell's version, so this
-/// floor is what lets the XDG and GTK metadata paths and placement send
-/// `set_application_id` and `set_startup_id` without a per-object version
+/// floor is what lets the proxy create Aura surfaces and outputs, and send
+/// `set_application_id` and `set_startup_id`, without a per-object version
 /// check. The assertions keep that true if the vendored protocol changes.
 const ZAURA_SHELL_MIN_VERSION: u32 = 6;
+const _: () = assert!(
+    crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE_SINCE
+        <= ZAURA_SHELL_MIN_VERSION
+);
+const _: () = assert!(
+    crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_OUTPUT_SINCE <= ZAURA_SHELL_MIN_VERSION
+);
 const _: () = assert!(
     crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID_SINCE
         <= ZAURA_SHELL_MIN_VERSION
@@ -914,10 +921,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // that the shell object and its version are available; the
                 // output bind path cannot do this retroactively on its own.
                 for output_host_id in ctx.outputs.live_outputs() {
-                    // `None` means this shell cannot create Aura outputs;
-                    // placement then waits for metadata that never comes,
-                    // which is the same as having no zaura_shell.
-                    let _ = crate::handler::aura_objects::ensure_zaura_output(ctx, output_host_id);
+                    // The output registry records the new Aura output.
+                    crate::handler::aura_objects::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived.
