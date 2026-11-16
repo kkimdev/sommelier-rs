@@ -2764,9 +2764,11 @@ mod tests {
             Operation::Claim(GuestKeyOwner::Physical),
             Operation::Claim(GuestKeyOwner::TextInputKeysym),
             Operation::Claim(GuestKeyOwner::ImeRecovery),
+            Operation::Claim(GuestKeyOwner::CompositorShortcut),
             Operation::Take(GuestKeyOwner::Physical),
             Operation::Take(GuestKeyOwner::TextInputKeysym),
             Operation::Take(GuestKeyOwner::ImeRecovery),
+            Operation::Take(GuestKeyOwner::CompositorShortcut),
         ];
         let sequence_len = 5;
         let sequence_count = operations.len().pow(sequence_len);
