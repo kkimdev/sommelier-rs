@@ -321,40 +321,58 @@ mod tests {
         );
     }
 
-    /// A GTK surface created while no `zaura_shell` is bound (for example
-    /// between a shell's `global_remove` and its re-advertisement) gets its
-    /// Aura surface once a shell is bound again, instead of losing its
-    /// metadata for good.
+    /// A GTK surface created between a `zaura_shell`'s `global_remove` and
+    /// its re-advertisement has no Aura surface. GTK requests issued after
+    /// a new shell is bound create one; nothing replays the requests issued
+    /// while no shell was bound.
     #[test]
-    fn gtk_metadata_reaches_a_shell_bound_after_the_surface() {
+    fn gtk_requests_after_a_shell_rebind_reach_the_new_shell() {
+        use crate::handler::registry::RegistryHandler;
+        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+
+        const REGISTRY: u32 = 1;
+        const SHELL_NAME: u32 = 7;
         let mut ctx = setup_ctx();
         ctx.host_zaura_shell = None;
-        ctx.last_sender_id = GTK_SHELL;
+        ctx.shadow_table.map_id(REGISTRY, REGISTRY);
+        ctx.shadow_table
+            .track_interface(REGISTRY, "wl_registry".to_string());
+        let shell = "zaura_shell".to_string();
         let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
-        assert!(ctx.client_to_host_queue.is_empty());
+        let set_application_id = |ctx: &mut Context| {
+            ctx.last_sender_id = GTK_SURFACE;
+            GtkShellHandler.on_set_dbus_properties(
+                ctx,
+                &Some("com.example.Terminal".to_string()),
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+            );
+        };
 
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: ZAURA_SHELL_HOST,
-            version: 38,
-        });
-        ctx.last_sender_id = GTK_SURFACE;
-        handler.on_set_dbus_properties(
-            &mut ctx,
-            &Some("com.example.Terminal".to_string()),
-            &None,
-            &None,
-            &None,
-            &None,
-            &None,
-        );
+        ctx.last_sender_id = REGISTRY;
+        RegistryHandler.on_global(&mut ctx, SHELL_NAME, &shell, 38);
+        RegistryHandler.on_global_remove(&mut ctx, SHELL_NAME);
+        assert_eq!(ctx.host_zaura_shell, None);
+        ctx.last_sender_id = GTK_SHELL;
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        set_application_id(&mut ctx);
+        assert_eq!(ctx.aura_surfaces.get(WL_SURFACE_HOST), None);
+
+        ctx.last_sender_id = REGISTRY;
+        RegistryHandler.on_global(&mut ctx, SHELL_NAME, &shell, 38);
+        let shell_host = ctx.host_zaura_shell.expect("rebound zaura_shell").id;
+        ctx.client_to_host_queue.clear();
         ctx.last_sender_id = GTK_SHELL;
         handler.on_set_startup_id(&mut ctx, &Some("launch-token".to_string()));
+        set_application_id(&mut ctx);
 
         let zaura_surface = ctx
             .aura_surfaces
             .get(WL_SURFACE_HOST)
-            .expect("the late shell creates the Aura surface");
+            .expect("set_startup_id creates the Aura surface");
         let queued = ctx
             .client_to_host_queue
             .iter()
@@ -363,9 +381,9 @@ mod tests {
         assert_eq!(
             queued,
             vec![
-                (ZAURA_SHELL_HOST, REQ_GET_AURA_SURFACE),
-                (zaura_surface, REQ_SET_APPLICATION_ID),
+                (shell_host, REQ_GET_AURA_SURFACE),
                 (zaura_surface, REQ_SET_STARTUP_ID),
+                (zaura_surface, REQ_SET_APPLICATION_ID),
             ]
         );
     }
