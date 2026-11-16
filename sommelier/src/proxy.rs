@@ -17,7 +17,7 @@ limitations under the License.
 use crate::connection::WaylandConnection;
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
-use crate::state::{Context, ShadowTable};
+use crate::state::{Context, PostDispatch, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{ProtocolError, WireMessage};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -118,6 +118,17 @@ fn pending_host_event_is_stale(
         && !allows_deferred_buffer_release
         && !allows_orphan_dmabuf_created
         && !allows_orphan_dmabuf_failed
+}
+
+/// Apply the work a handler deferred until its message was forwarded (see
+/// [`PostDispatch`]).
+fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
+    match effect {
+        PostDispatch::XdgToplevelCreated {
+            xdg_surface,
+            xdg_toplevel,
+        } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
+    }
 }
 
 fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
@@ -449,6 +460,10 @@ impl Client {
             let target_sender_id =
                 translated_sender_id(&self.ctx.shadow_table, direction, sender_id);
 
+            debug_assert!(
+                !self.ctx.has_post_dispatch(),
+                "deferred work belongs to the message that deferred it"
+            );
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode, guest_id);
             let interface = match direction {
@@ -461,9 +476,6 @@ impl Client {
                 }
             };
 
-            let is_xdg_surface_get_toplevel = matches!(direction, Direction::ClientToHost)
-                && interface.as_deref() == Some("xdg_surface")
-                && opcode == crate::protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL;
             let mut consumed_fds = 0;
             let result = if let Some(interface) = interface {
                 let mut msg =
@@ -501,25 +513,6 @@ impl Client {
                     );
                     Err(ProtocolError::TrailingData)
                 } else {
-                    // The compositor handler may reject a malformed or
-                    // dropped request after decoding it. Only create the
-                    // internal Aura child after payload validation and when
-                    // the guest request produced a real host message;
-                    // otherwise a failed get_toplevel would leave an
-                    // orphaned host-only object and placement metadata
-                    // behind.
-                    if is_xdg_surface_get_toplevel
-                        && res.as_ref().is_ok_and(Option::is_some)
-                        && packet.len() >= 12
-                    {
-                        let guest_xdg_toplevel_id =
-                            u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                        crate::handler::compositor::record_xdg_toplevel(
-                            &mut self.ctx,
-                            sender_id,
-                            guest_xdg_toplevel_id,
-                        );
-                    }
                     res
                 }
             } else {
@@ -566,6 +559,9 @@ impl Client {
                 Ok(None)
             };
 
+            // Deferred work belongs to this message alone: it is applied
+            // only if the message is forwarded, and discarded otherwise.
+            let post_dispatch = self.ctx.take_post_dispatch();
             match result {
                 Ok(Some((mut data, fds))) => {
                     log::debug!("  -> translated ({} bytes, {} fds)", data.len(), fds.len());
@@ -586,6 +582,9 @@ impl Client {
 
                     out_buffer.extend_from_slice(&data);
                     out_fds.extend(fds);
+                    for effect in post_dispatch {
+                        apply_post_dispatch(&mut self.ctx, effect);
+                    }
                 }
                 Ok(None) => {
                     log::debug!("  -> dropped (unhandled)");
@@ -1261,6 +1260,138 @@ mod tests {
             client.ctx.window_placement.aura_toplevel_count() == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
         );
+    }
+
+    /// The (sender, opcode) of every message written to `peer` until EOF.
+    fn sent_messages(peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u16)> {
+        use std::io::Read;
+
+        let mut stream = Vec::new();
+        peer.read_to_end(&mut stream)
+            .expect("the peer stream should be readable");
+        let mut sent = Vec::new();
+        let mut rest = stream.as_slice();
+        while let Some((header, _)) = rest.split_first_chunk::<8>() {
+            let sender = u32::from_ne_bytes(header[0..4].try_into().unwrap());
+            let word = u32::from_ne_bytes(header[4..8].try_into().unwrap());
+            sent.push((sender, (word & 0xffff) as u16));
+            rest = &rest[(word >> 16) as usize..];
+        }
+        sent
+    }
+
+    /// A forwarded `xdg_surface.get_toplevel` records the XDG role and
+    /// attaches the placement Aura toplevel, whose requests follow the
+    /// forwarded request on the host stream.
+    #[tokio::test]
+    async fn forwarded_get_toplevel_records_the_role_after_the_request() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        const XDG_SURFACE: u32 = 10;
+        const XDG_SURFACE_HOST: u32 = 20;
+        const XDG_TOPLEVEL: u32 = 11;
+        const WL_SURFACE: u32 = 12;
+        const ZAURA_SHELL_HOST: u32 = 40;
+
+        let (guest_proxy, _guest_peer) =
+            UnixStream::pair().expect("guest socket pair should be created");
+        let (host_proxy, mut host_peer) =
+            UnixStream::pair().expect("host socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(guest_proxy.into_raw_fd()),
+            WaylandConnection::new(host_proxy.into_raw_fd()),
+            false,
+            false,
+            Arc::new(PlacementConfig::arc_bounds_for_test("")),
+        );
+        let ctx = &mut client.ctx;
+        ctx.host_zaura_shell_id = Some(ZAURA_SHELL_HOST);
+        ctx.host_zaura_shell_version = 38;
+        ctx.shadow_table.map_id(XDG_SURFACE, XDG_SURFACE_HOST);
+        ctx.shadow_table
+            .track_interface_with_version(XDG_SURFACE, "xdg_surface".to_string(), 6);
+        ctx.shadow_table.set_host_version(XDG_SURFACE_HOST, 6);
+        ctx.shadow_table.map_id(WL_SURFACE, 22);
+        ctx.xdg_roles.add_xdg_surface(XDG_SURFACE, WL_SURFACE);
+
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(XDG_TOPLEVEL);
+        let request = builder.build_message(
+            XDG_SURFACE,
+            protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL,
+        );
+        client.client_conn.read_buf.extend_from_slice(&request);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert_eq!(
+            client.ctx.xdg_roles.wl_surface_of_toplevel(XDG_TOPLEVEL),
+            Some(WL_SURFACE)
+        );
+        let aura_toplevel = client
+            .ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(XDG_TOPLEVEL)
+            .expect("placement Aura toplevel");
+        assert!(!client.ctx.has_post_dispatch());
+        drop(client);
+
+        assert_eq!(
+            sent_messages(&mut host_peer),
+            vec![
+                (
+                    XDG_SURFACE_HOST,
+                    protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL
+                ),
+                (
+                    ZAURA_SHELL_HOST,
+                    protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL
+                ),
+                (
+                    aura_toplevel,
+                    protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES
+                ),
+            ]
+        );
+    }
+
+    /// A get_toplevel whose handler ran but whose message is then rejected
+    /// (here for trailing payload bytes) records no role and creates no
+    /// Aura toplevel: the deferred work is discarded with the message.
+    #[tokio::test]
+    async fn rejected_get_toplevel_discards_its_deferred_work() {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (client_socket, host_socket) =
+            UnixStream::pair().expect("test socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            false,
+            false,
+            Arc::new(PlacementConfig::arc_bounds_for_test("")),
+        );
+        let ctx = &mut client.ctx;
+        ctx.host_zaura_shell_id = Some(40);
+        ctx.host_zaura_shell_version = 38;
+        ctx.shadow_table.map_id(10, 20);
+        ctx.shadow_table
+            .track_interface_with_version(10, "xdg_surface".to_string(), 6);
+        ctx.shadow_table.set_host_version(20, 6);
+        ctx.shadow_table.map_id(12, 22);
+        ctx.xdg_roles.add_xdg_surface(10, 12);
+
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(30);
+        builder.write_u32(0);
+        let request =
+            builder.build_message(10, protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL);
+        client.client_conn.read_buf.extend_from_slice(&request);
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        assert_eq!(client.ctx.xdg_roles.toplevel_of_xdg_surface(10), None);
+        assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
+        assert!(!client.ctx.has_post_dispatch());
     }
 
     #[tokio::test]

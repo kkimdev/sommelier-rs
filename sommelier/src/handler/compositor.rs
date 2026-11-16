@@ -31,8 +31,8 @@ use crate::protocols::xdg_shell::xdg_toplevel::{
     REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
 };
 use crate::state::{
-    is_valid_transform, transformed_extent, Context, DamageRect, SurfaceAttachment, SurfaceCommit,
-    SurfaceState, ViewportState,
+    is_valid_transform, transformed_extent, Context, DamageRect, PostDispatch, SurfaceAttachment,
+    SurfaceCommit, SurfaceState, ViewportState,
 };
 use crate::wire::Action;
 use log::trace;
@@ -385,23 +385,23 @@ pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
         .is_some_and(|total| total <= 0xffff)
 }
 
-/// Commit the guest-side XDG role association after the generated dispatcher
-/// has accepted and mapped `get_toplevel`. Keeping this after dispatch avoids
-/// stale application/surface state when validation rejects the request.
-/// The placement Aura toplevel is attached only after the role is recorded,
-/// so it never exists for a rejected request.
+/// Record the XDG role of a forwarded `xdg_surface.get_toplevel`
+/// ([`PostDispatch::XdgToplevelCreated`]). Running only after the forward
+/// avoids stale application/surface state when validation rejects the
+/// request. The placement Aura toplevel is attached only after the role is
+/// recorded, so it never exists for a rejected request, and the forward
+/// has mapped the toplevel's host ID that it extends.
 pub(crate) fn record_xdg_toplevel(
     ctx: &mut Context,
     xdg_surface_guest_id: u32,
     xdg_toplevel_guest_id: u32,
 ) {
-    if ctx
-        .shadow_table
-        .get_host_id(xdg_toplevel_guest_id)
-        .is_none()
-    {
-        return;
-    }
+    debug_assert!(
+        ctx.shadow_table
+            .get_host_id(xdg_toplevel_guest_id)
+            .is_some(),
+        "a forwarded get_toplevel has mapped its new ID"
+    );
     let Some(wl_surface_guest_id) = ctx
         .xdg_roles
         .add_toplevel(xdg_surface_guest_id, xdg_toplevel_guest_id)
@@ -1403,7 +1403,11 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         Action::Forward
     }
 
-    fn on_get_toplevel(&mut self, _ctx: &mut Context, _id: u32) -> Action {
+    fn on_get_toplevel(&mut self, ctx: &mut Context, id: u32) -> Action {
+        ctx.defer_until_forwarded(PostDispatch::XdgToplevelCreated {
+            xdg_surface: ctx.last_sender_id,
+            xdg_toplevel: id,
+        });
         Action::Forward
     }
 }

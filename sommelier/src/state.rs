@@ -722,6 +722,21 @@ pub struct GtkSurfaceState {
     pub wl_surface_id: u32,
 }
 
+/// Work a request handler defers until the proxy has forwarded the request.
+///
+/// A handler runs before the generated dispatcher maps the request's new
+/// IDs and encodes it, and the request can still be rejected after the
+/// handler returns. Work that must only happen for a forwarded request, or
+/// that needs a new ID's host mapping, is recorded with
+/// [`Context::defer_until_forwarded`]. The proxy loop takes it after every
+/// message and applies it only when the message was forwarded. Requests it
+/// queues follow the forwarded bytes and the requests the handler queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostDispatch {
+    /// `xdg_surface.get_toplevel` created `xdg_toplevel` from `xdg_surface`.
+    XdgToplevelCreated { xdg_surface: u32, xdg_toplevel: u32 },
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, Arc<PoolState>>,
@@ -745,6 +760,9 @@ pub struct Context {
     /// A queued `wl_display.error` must be flushed before the client session
     /// is torn down. This is set by fatal protocol validation paths.
     pub fatal_protocol_error: bool,
+    /// Work deferred by the handler of the message being dispatched; see
+    /// [`PostDispatch`].
+    post_dispatch: Vec<PostDispatch>,
     /// Monotonic serial source for synthetic keyboard compatibility events.
     pub synthetic_keyboard_serial: u32,
     pub allocator: Option<Allocator>,
@@ -930,6 +948,22 @@ pub(crate) struct LocalBufferCopyResources<'a> {
 }
 
 impl Context {
+    /// Defer `effect` until the message being dispatched is forwarded; it is
+    /// discarded if the message is dropped or rejected.
+    pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
+        self.post_dispatch.push(effect);
+    }
+
+    /// Whether work deferred by a dispatched message has not been taken.
+    pub(crate) fn has_post_dispatch(&self) -> bool {
+        !self.post_dispatch.is_empty()
+    }
+
+    /// Take the work deferred while dispatching the current message.
+    pub(crate) fn take_post_dispatch(&mut self) -> Vec<PostDispatch> {
+        std::mem::take(&mut self.post_dispatch)
+    }
+
     pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: u32) -> Option<HostId> {
         self.shadow_table
             .get_host_id(guest_buffer_id)
@@ -1229,6 +1263,7 @@ impl Context {
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
             fatal_protocol_error: false,
+            post_dispatch: Vec::new(),
             synthetic_keyboard_serial: 0,
             allocator,
             #[cfg(test)]
