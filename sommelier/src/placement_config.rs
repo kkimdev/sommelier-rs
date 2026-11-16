@@ -401,9 +401,9 @@ impl PlacementConfig {
             if let Some(source) = &source {
                 // The allocator logs why it could not reserve a block.
                 let reason = if gate {
-                    "no ARC task-ID block could be reserved"
+                    "no ARC task-ID block could be reserved".to_string()
                 } else {
-                    "SOMMELIER_WINDOW_BOUNDS_AS_ARC is not set to a true value"
+                    format!("{ARC_BOUNDS_VARIABLE} is not set to a true value")
                 };
                 log::warn!(
                     "Window placement shortcuts from {} are ignored and not read: the ARC \
