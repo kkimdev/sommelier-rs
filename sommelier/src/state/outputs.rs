@@ -42,7 +42,9 @@ pub(crate) fn is_valid_transform(transform: i32) -> bool {
 /// Width and height of a `width` x `height` extent after `transform`.
 ///
 /// The odd enum values are the 90 and 270 degree rotations, flipped or not,
-/// and swap the axes; the even values keep them.
+/// and swap the axes; the even values keep them. `transform` must satisfy
+/// [`is_valid_transform`]: callers validate it on input, and other values
+/// give a meaningless result.
 pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i32, i32) {
     if transform & 1 == 1 {
         (height, width)
@@ -201,10 +203,14 @@ impl OutputRegistry {
     ///   wait for `wl_output.done`.
     /// * `global` - the advertisement it was bound from.
     pub(crate) fn bind(&mut self, output: u32, version: u32, global: GlobalBinding) {
-        debug_assert!(
-            !self.records.contains_key(&output),
-            "host output {output} is bound twice"
-        );
+        // Host IDs are not reused before the release that removes the
+        // record, so a second bind is a bookkeeping bug. Release builds keep
+        // the existing record rather than listing the output twice in `order`.
+        let already_bound = self.records.contains_key(&output);
+        debug_assert!(!already_bound, "host output {output} is bound twice");
+        if already_bound {
+            return;
+        }
         self.order.push(output);
         self.records.insert(
             output,
@@ -347,7 +353,7 @@ impl OutputRegistry {
 
     /// The committed metadata of `output` if placement may use it: the
     /// output is live and its work area is known.
-    pub(crate) fn usable(&self, output: u32) -> Option<OutputState> {
+    fn usable(&self, output: u32) -> Option<OutputState> {
         match self.records.get(&output)?.liveness {
             Liveness::Live { committed, .. } => committed.work_area().map(|_| committed),
             Liveness::Inactive => None,
