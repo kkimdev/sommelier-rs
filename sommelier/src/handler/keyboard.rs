@@ -68,6 +68,18 @@ const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
 const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
 const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
 
+/// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyClass {
+    /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
+    HostAccelerator,
+    /// Bound to a placement action while the ARC bounds policy is active:
+    /// Sommelier owns the chord.
+    Placement(WindowLayoutAction),
+    /// Ordinary guest input.
+    Guest,
+}
+
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
@@ -247,23 +259,26 @@ impl KeyboardHandler {
             .install_enter_snapshot(host_keyboard_id, pressed_keys);
     }
 
-    /// Check if the pressed key matches any configured host accelerators.
-    fn is_host_accelerator(
+    /// Resolve the chord a key forms under its keyboard's current XKB state.
+    ///
+    /// This is the only place a chord is computed, so host accelerators and
+    /// placement bindings always match against the same value.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the keyboard has no keymap yet, when the evdev keycode
+    /// overflows the XKB offset, or when the key has no single keysym at the
+    /// current level. Such a key is never an accelerator or a binding.
+    fn current_chord(
         &self,
         host_keyboard_id: HostId,
-        accelerators: &[crate::accelerator::Accelerator],
         key: u32,
-    ) -> bool {
-        let Some(state) = self.states.get(&host_keyboard_id) else {
-            return false;
-        };
-        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
-
+    ) -> Option<crate::accelerator::Accelerator> {
+        let state = self.states.get(&host_keyboard_id)?;
         let Some(xkb_raw_keycode) = key.checked_add(8) else {
             log::warn!("Ignoring overflowing evdev keycode {}", key);
-            return false;
+            return None;
         };
-        let xkb_keycode = xkb::Keycode::new(xkb_raw_keycode);
         // Use key_get_one_sym so that the full XKB state (including active shift
         // level) is considered. key_get_syms_by_level at level 0 would always
         // return the unshifted symbol, causing <Shift>-modified accelerators to
@@ -271,28 +286,54 @@ impl KeyboardHandler {
         //
         // key_get_one_sym returns KEY_NoSymbol when more than one keysym is
         // mapped to this key at the current shift level (e.g. dead keys or
-        // Unicode combining sequences). In that case we conservatively return
-        // false (do not treat the key as a host accelerator), which is the
-        // correct safe default: we'd rather forward an unknown key to the guest
-        // than accidentally suppress it.
-        let sym = state.key_get_one_sym(xkb_keycode);
+        // Unicode combining sequences). Such a key forms no chord: we'd rather
+        // forward an unknown key to the guest than accidentally suppress it.
+        let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
         if sym.raw() == xkb::keysyms::KEY_NoSymbol {
-            return false;
+            return None;
         }
-        let lower_sym = crate::accelerator::keysym_to_lower(sym.raw());
-        for acc in accelerators {
-            if modifiers == acc.modifiers && lower_sym == acc.symbol {
-                log::trace!(
-                    "Accelerator match: keyboard={}, key={}, modifiers={:#x}, sym={:#x}",
-                    host_keyboard_id.0,
-                    key,
-                    modifiers,
-                    lower_sym
-                );
-                return true;
-            }
-        }
-        false
+        // No wl_keyboard.modifiers event yet means no modifier is held; see
+        // `on_modifiers`.
+        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
+        Some(crate::accelerator::Accelerator {
+            modifiers,
+            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
+        })
+    }
+
+    /// Decide who owns a key from its chord alone.
+    ///
+    /// Both key channels (`wl_keyboard.key` and `peek_key`) ask this one
+    /// classification. A placement binding counts only while the ARC bounds
+    /// policy is active. Configuration validation rejects a chord that is
+    /// both a host accelerator and a binding; if one slipped through, the
+    /// host keeps its accelerator.
+    fn classify_key(&self, ctx: &mut Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
+        let Some(chord) = self.current_chord(host_keyboard_id, key) else {
+            return KeyClass::Guest;
+        };
+        let class = if ctx.accelerators.contains(&chord) {
+            KeyClass::HostAccelerator
+        } else if ctx.window_placement.uses_arc_bounds() {
+            // Adopt a reloaded shortcut generation before matching.
+            ctx.refresh_window_placement_shortcuts();
+            ctx.window_placement_shortcuts
+                .iter()
+                .find(|binding| binding.accelerator == chord)
+                .map_or(KeyClass::Guest, |binding| {
+                    KeyClass::Placement(binding.action)
+                })
+        } else {
+            KeyClass::Guest
+        };
+        log::trace!(
+            "key class: keyboard={} key={} chord={:?} class={:?}",
+            host_keyboard_id.0,
+            key,
+            chord,
+            class
+        );
+        class
     }
 
     /// Resolve the focused guest xdg_toplevel and its backing wl_surface.
@@ -311,36 +352,6 @@ impl KeyboardHandler {
             .find_map(|(&xdg_toplevel_id, &surface_id)| {
                 (surface_id == active_surface).then_some((xdg_toplevel_id, surface_id))
             })
-    }
-
-    fn window_layout_action(
-        &self,
-        ctx: &Context,
-        host_keyboard_id: HostId,
-        key: u32,
-    ) -> Option<WindowLayoutAction> {
-        let state = self.states.get(&host_keyboard_id)?;
-        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
-        let xkb_raw_keycode = key.checked_add(8)?;
-        let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
-        log::trace!(
-            "window layout candidate: keyboard={} key={} sym={:#x} modifiers={:#x}",
-            host_keyboard_id.0,
-            key,
-            sym.raw(),
-            modifiers
-        );
-        let accelerator = crate::accelerator::Accelerator {
-            modifiers,
-            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
-        };
-        let action = ctx
-            .window_placement_shortcuts
-            .iter()
-            .find(|binding| binding.accelerator == accelerator)
-            .map(|binding| binding.action);
-        log::trace!("window layout candidate resolved to {:?}", action);
-        action
     }
 
     fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
@@ -386,13 +397,8 @@ impl KeyboardHandler {
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
     ) -> bool {
-        if !ctx.window_placement.uses_arc_bounds() {
-            log::trace!(
-                "window layout {:?} ignored: ARC bounds policy is disabled",
-                action
-            );
-            return false;
-        }
+        // `classify_key` yields placement actions only while the ARC bounds
+        // policy is active, so this path never runs without it.
         let Some((guest_xdg_toplevel_id, guest_wl_surface_id)) =
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
         else {
@@ -1024,22 +1030,21 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         }
 
         let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
+        let key_class = match state {
+            WL_KEY_PRESSED | WL_KEY_REPEATED => self.classify_key(ctx, host_keyboard_id, key),
+            _ => KeyClass::Guest,
+        };
         let compositor_shortcut = match state {
             // Placement is a side effect, so arbitrate ownership first. A
             // generation already delivered (or recovered) through another
             // channel keeps its normal path; a duplicate press of a consumed
             // shortcut stays consumed without placing the window again.
-            WL_KEY_PRESSED => match guest_owner {
-                Some(GuestKeyOwner::CompositorShortcut) => true,
-                Some(_) => false,
-                None => {
-                    // Adopt a reloaded shortcut generation before matching.
-                    ctx.refresh_window_placement_shortcuts();
-                    self.window_layout_action(ctx, host_keyboard_id, key)
-                        .is_some_and(|action| {
-                            Self::apply_window_layout(ctx, host_keyboard_id, action)
-                        })
+            WL_KEY_PRESSED => match (guest_owner, key_class) {
+                (Some(GuestKeyOwner::CompositorShortcut), _) => true,
+                (None, KeyClass::Placement(action)) => {
+                    Self::apply_window_layout(ctx, host_keyboard_id, action)
                 }
+                _ => false,
             },
             WL_KEY_REPEATED | WL_KEY_RELEASED => {
                 guest_owner == Some(GuestKeyOwner::CompositorShortcut)
@@ -1056,8 +1061,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
-                let host_accelerator = !compositor_shortcut
-                    && self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                let host_accelerator =
+                    !compositor_shortcut && key_class == KeyClass::HostAccelerator;
                 if host_accelerator {
                     // A host accelerator can also be visible through peek_key.
                     // It must never become a later IME recovery candidate.
@@ -1304,7 +1309,8 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                             == Some(GuestKeyOwner::CompositorShortcut);
                     let eligible = !already_dropped_as_accelerator
                         && !consumed_by_shortcut
-                        && !self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                        && self.classify_key(ctx, host_keyboard_id, key)
+                            != KeyClass::HostAccelerator;
                     let sequence = ctx.key_generations.observe_peek_press(
                         host_keyboard_id,
                         key,
@@ -1574,6 +1580,7 @@ mod tests {
     fn window_layout_actions_cover_nine_alt_keys() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts = crate::accelerator::parse_window_placement_shortcuts(
             "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,<Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
@@ -1598,8 +1605,8 @@ mod tests {
         for (sym, action) in expected {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
             assert_eq!(
-                handler.window_layout_action(&ctx, HostId(5), key),
-                Some(action)
+                handler.classify_key(&mut ctx, HostId(5), key),
+                KeyClass::Placement(action)
             );
         }
     }
@@ -1608,6 +1615,7 @@ mod tests {
     fn window_layout_requires_exact_alt_modifier() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
@@ -1615,18 +1623,25 @@ mod tests {
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
         handler.modifiers.insert(HostId(5), 0);
-        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
         handler.modifiers.insert(
             HostId(5),
             crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
         );
-        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
     }
 
     #[test]
     fn window_layout_honors_non_alt_configured_modifier() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
@@ -1637,19 +1652,62 @@ mod tests {
             .modifiers
             .insert(HostId(5), crate::accelerator::CONTROL_MASK);
         assert_eq!(
-            handler.window_layout_action(&ctx, HostId(5), key),
-            Some(WindowLayoutAction::TopLeft)
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
     }
 
     #[test]
-    fn window_layout_is_disabled_without_arc_bounds_policy() {
+    fn placement_binding_is_guest_input_without_arc_bounds_policy() {
+        let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert!(!KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(5),
-            WindowLayoutAction::Fullscreen,
-        ));
+        ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        handler
+            .modifiers
+            .insert(HostId(5), crate::accelerator::ALT_MASK);
+
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
+    }
+
+    #[test]
+    fn host_accelerator_and_placement_classify_from_one_chord() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(
+            false,
+            false,
+            crate::accelerator::parse_accelerators("<Control>a").unwrap(),
+        );
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        let z = find_keycode(&keymap, xkb::keysyms::KEY_z).expect("KEY_z not found");
+        handler
+            .modifiers
+            .insert(HostId(5), crate::accelerator::CONTROL_MASK);
+
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), a),
+            KeyClass::HostAccelerator
+        );
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), q),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
+        );
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), z),
+            KeyClass::Guest
+        );
     }
 
     #[test]
@@ -1968,8 +2026,8 @@ mod tests {
             .modifiers
             .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
         assert_eq!(
-            handler.window_layout_action(&ctx, HostId(host_keyboard), key),
-            Some(WindowLayoutAction::TopLeft)
+            handler.classify_key(&mut ctx, HostId(host_keyboard), key),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
 
         assert_eq!(
@@ -3124,25 +3182,25 @@ mod tests {
     }
 
     #[test]
-    fn is_host_accelerator_returns_false_without_xkb_state() {
+    fn no_chord_without_xkb_state() {
         let handler = KeyboardHandler::new(); // no keymap loaded
-        let accelerators = crate::accelerator::parse_accelerators("<Control>a").unwrap();
-        // Must degrade gracefully, not panic.
-        assert!(
-            !handler.is_host_accelerator(HostId(0), &accelerators, 30),
-            "should return false when XKB state is not initialised"
+                                              // Must degrade gracefully, not panic.
+        assert_eq!(
+            handler.current_chord(HostId(0), 30),
+            None,
+            "a key forms no chord before the XKB state is initialised"
         );
     }
 
     #[test]
-    fn overflowing_evdev_keycode_is_not_an_accelerator() {
-        let handler = KeyboardHandler::new();
-        assert!(
-            !handler.is_host_accelerator(
-                HostId(0),
-                &crate::accelerator::parse_accelerators("a").unwrap(),
-                u32::MAX,
-            ),
+    fn overflowing_evdev_keycode_forms_no_chord() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+        assert_eq!(
+            handler.current_chord(HostId(5), u32::MAX),
+            None,
             "keycode + XKB offset must be checked before arithmetic"
         );
     }
