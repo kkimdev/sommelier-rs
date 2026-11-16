@@ -844,11 +844,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 // The policy owns every matched chord, so the chord is
                 // consumed whether or not the window can move now; a skip
                 // must not leak the key to the guest.
-                if let Err(reason) = crate::handler::window_placement::apply_window_layout(
-                    ctx,
-                    host_keyboard_id,
-                    action,
-                ) {
+                if let Err(reason) =
+                    crate::handler::window_placement::place_focused(ctx, host_keyboard_id, action)
+                {
                     log::log!(
                         reason.log_level(),
                         "window layout {:?} skipped for keyboard {}: {:?}",
@@ -1625,7 +1623,7 @@ mod tests {
         );
 
         assert_eq!(
-            crate::handler::window_placement::apply_window_layout(
+            crate::handler::window_placement::place_focused(
                 &mut ctx,
                 HostId(5),
                 WindowLayoutAction::TopLeft
@@ -1751,7 +1749,7 @@ mod tests {
         // The focused surface is not (or no longer) an xdg_toplevel.
         ctx.xdg_toplevel_to_wl_surface.clear();
         assert_eq!(
-            crate::handler::window_placement::apply_window_layout(
+            crate::handler::window_placement::place_focused(
                 &mut ctx,
                 HostId(5),
                 WindowLayoutAction::TopLeft
@@ -1791,7 +1789,7 @@ mod tests {
             crate::window_layout::NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap(),
         );
         assert_eq!(
-            crate::handler::window_placement::apply_window_layout(&mut ctx, HostId(5), sliver),
+            crate::handler::window_placement::place_focused(&mut ctx, HostId(5), sliver),
             Err(crate::handler::window_placement::PlacementSkip::RectNotRepresentable)
         );
         assert_eq!(
@@ -1814,7 +1812,7 @@ mod tests {
             ArcIdAllocator::exhausted_for_test(),
         ));
         assert_eq!(
-            crate::handler::window_placement::apply_window_layout(
+            crate::handler::window_placement::place_focused(
                 &mut ctx,
                 HostId(5),
                 WindowLayoutAction::TopLeft

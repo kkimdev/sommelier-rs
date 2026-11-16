@@ -952,23 +952,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     let _ = crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
-                // global arrived. Their guest-side associations are recorded
-                // after a successful get_toplevel dispatch, so a late shell
-                // can safely attach the missing Aura child here as well,
-                // through the same identity gate as get_toplevel. A role
-                // that still cannot attach is retried lazily by placement.
-                for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx
-                    .xdg_toplevel_to_wl_surface
-                    .iter()
-                    .map(|(&toplevel, &surface)| (toplevel, surface))
-                    .collect::<Vec<_>>()
-                {
-                    let _ = crate::handler::window_placement::attach_placement_toplevel(
-                        ctx,
-                        xdg_toplevel_guest_id,
-                        wl_surface_guest_id,
-                    );
-                }
+                // global arrived.
+                crate::handler::window_placement::attach_recorded_toplevels(ctx);
             }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 

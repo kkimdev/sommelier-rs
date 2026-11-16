@@ -15,9 +15,7 @@ limitations under the License.
 */
 
 use crate::handler::display::queue_protocol_error;
-use crate::handler::window_placement::{
-    ensure_arc_application_id_on_surface, queue_guest_xdg_configure, release_zaura_toplevel,
-};
+use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::{
     ZauraOutputHandler, REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT,
 };
@@ -495,21 +493,29 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> 
 /// Commit the guest-side XDG role association after the generated dispatcher
 /// has accepted and mapped `get_toplevel`. Keeping this after dispatch avoids
 /// stale application/surface state when validation rejects the request.
+/// The placement Aura toplevel is attached only after the role is recorded,
+/// so it never exists for a rejected request.
 pub(crate) fn record_xdg_toplevel(
     ctx: &mut Context,
     xdg_surface_guest_id: u32,
     xdg_toplevel_guest_id: u32,
-) -> Option<u32> {
-    let wl_surface_guest_id = ctx
-        .xdg_surface_to_wl_surface
-        .get(&xdg_surface_guest_id)
-        .copied()?;
-    ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
+) {
+    let Some(&wl_surface_guest_id) = ctx.xdg_surface_to_wl_surface.get(&xdg_surface_guest_id)
+    else {
+        return;
+    };
+    if ctx
+        .shadow_table
+        .get_host_id(xdg_toplevel_guest_id)
+        .is_none()
+    {
+        return;
+    }
     ctx.xdg_surface_to_xdg_toplevel
         .insert(xdg_surface_guest_id, xdg_toplevel_guest_id);
     ctx.xdg_toplevel_to_wl_surface
         .insert(xdg_toplevel_guest_id, wl_surface_guest_id);
-    Some(wl_surface_guest_id)
+    window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1042,7 +1048,7 @@ impl WlSurfaceHandler for CompositorHandler {
             })
             .collect::<Vec<_>>();
         for toplevel_id in orphaned_toplevels {
-            release_zaura_toplevel(ctx, toplevel_id);
+            window_placement::release_toplevel(ctx, toplevel_id);
         }
         let orphaned_xdg_surfaces = ctx
             .xdg_surface_to_wl_surface
@@ -1538,7 +1544,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
                 })
                 .collect::<Vec<_>>();
             for toplevel_id in orphaned_toplevels {
-                release_zaura_toplevel(ctx, toplevel_id);
+                window_placement::release_toplevel(ctx, toplevel_id);
             }
             ctx.xdg_toplevel_to_wl_surface
                 .retain(|_, surface_id| *surface_id != wl_surface_id);
@@ -1551,24 +1557,7 @@ impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorH
         let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
             return Action::Drop;
         };
-        let Some(&guest_xdg_toplevel_id) =
-            ctx.xdg_surface_to_xdg_toplevel.get(&guest_xdg_surface_id)
-        else {
-            return Action::Forward;
-        };
-        let Some(zaura_toplevel_host_id) = ctx
-            .window_placement
-            .aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)
-        else {
-            return Action::Forward;
-        };
-        if ctx.window_placement.hold_surface_configure(
-            zaura_toplevel_host_id,
-            crate::state::PendingWindowBoundsSurfaceConfigure {
-                guest_xdg_surface_id,
-                serial,
-            },
-        ) {
+        if window_placement::hold_surface_configure(ctx, guest_xdg_surface_id, serial) {
             return Action::Drop;
         }
         Action::Forward
@@ -1605,7 +1594,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // and zaura_surface/wl_surface order, so the host never holds an Aura
         // child whose parent role is already gone. Retain the guest ID until
         // the host acknowledges the role destructor.
-        release_zaura_toplevel(ctx, xdg_toplevel_id);
+        window_placement::release_toplevel(ctx, xdg_toplevel_id);
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
         ctx.xdg_toplevel_to_wl_surface.remove(&xdg_toplevel_id);
         ctx.xdg_surface_to_xdg_toplevel
@@ -1665,7 +1654,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                     return Action::Drop;
                 }
                 if ctx.window_placement.uses_arc_bounds() {
-                    if !ensure_arc_application_id_on_surface(
+                    if !window_placement::apply_arc_identity(
                         ctx,
                         wl_surface_guest_id,
                         zaura_surface_host_id,
@@ -1712,20 +1701,12 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         else {
             return Action::Drop;
         };
-        let Some(zaura_toplevel_host_id) = ctx
-            .window_placement
-            .aura_toplevel_for_xdg_toplevel(guest_xdg_toplevel_id)
-        else {
-            return Action::Forward;
-        };
-        if ctx.window_placement.hold_configure(
-            zaura_toplevel_host_id,
-            crate::state::PendingWindowBoundsConfigure {
-                guest_xdg_toplevel_id,
-                width,
-                height,
-                states: states.to_vec(),
-            },
+        if window_placement::hold_toplevel_configure(
+            ctx,
+            guest_xdg_toplevel_id,
+            width,
+            height,
+            states,
         ) {
             return Action::Drop;
         }
@@ -1737,43 +1718,22 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
     fn on_configure(
         &mut self,
         ctx: &mut Context,
-        _x: i32,
-        _y: i32,
+        x: i32,
+        y: i32,
         width: i32,
         height: i32,
         states: &[u8],
     ) -> Action {
-        let host_id = ctx.last_sender_id;
-        let Some(guest_xdg_toplevel_id) =
-            ctx.window_placement.xdg_toplevel_for_aura_toplevel(host_id)
-        else {
-            return Action::Drop;
-        };
-
-        let barrier_active = ctx.window_placement.has_active_barrier(host_id);
-        log::debug!(
-            "zaura_toplevel.configure host={} guest={} bounds={}x{} origin=({}, {}) barrier_active={}",
-            host_id,
-            guest_xdg_toplevel_id,
+        // The placement module delivers the translated event itself.
+        window_placement::translate_aura_configure(
+            ctx,
+            ctx.last_sender_id,
+            x,
+            y,
             width,
             height,
-            _x,
-            _y,
-            barrier_active
+            states,
         );
-
-        if ctx.window_placement.hold_configure(
-            host_id,
-            crate::state::PendingWindowBoundsConfigure {
-                guest_xdg_toplevel_id,
-                width,
-                height,
-                states: states.to_vec(),
-            },
-        ) {
-            return Action::Drop;
-        }
-        let _ = queue_guest_xdg_configure(ctx, guest_xdg_toplevel_id, width, height, states);
         Action::Drop
     }
 

@@ -64,16 +64,7 @@ impl WlCallbackHandler for CallbackHandler {
             }
             return Action::Drop;
         }
-        if crate::handler::window_placement::complete_window_bounds_barrier(ctx, host_id) {
-            // A sync callback is host-only and terminal at `done`. Keep its
-            // numeric ID reserved until the host's subsequent delete_id, but
-            // stop treating duplicate/stale events as live callbacks.
-            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
-                log::warn!(
-                    "window-bounds barrier callback {} was not tracked as host-only",
-                    host_id
-                );
-            }
+        if crate::handler::window_placement::complete_barrier(ctx, host_id) {
             return Action::Drop;
         }
         let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);

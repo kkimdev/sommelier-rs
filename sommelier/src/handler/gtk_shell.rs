@@ -17,7 +17,7 @@ limitations under the License.
 use crate::handler::compositor::{
     ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
 };
-use crate::handler::window_placement::ensure_arc_application_id_on_surface;
+use crate::handler::window_placement::apply_arc_identity;
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
@@ -159,7 +159,7 @@ impl GtkSurface1Handler for GtkShellHandler {
         // layout path opts the surface into ARC policy and the shared helper
         // ensures GTK cannot overwrite it with the normal Crostini namespace.
         if ctx.window_placement.uses_arc_bounds() {
-            if !ensure_arc_application_id_on_surface(ctx, wl_surface_id, zaura_surface_id) {
+            if !apply_arc_identity(ctx, wl_surface_id, zaura_surface_id) {
                 log::warn!(
                     "Unable to apply ARC policy identity for GTK wl_surface {}",
                     wl_surface_id

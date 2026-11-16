@@ -514,24 +514,11 @@ impl Client {
                     {
                         let guest_xdg_toplevel_id =
                             u32::from_ne_bytes(packet[8..12].try_into().unwrap());
-                        if let Some(wl_surface_guest_id) =
-                            crate::handler::compositor::record_xdg_toplevel(
-                                &mut self.ctx,
-                                sender_id,
-                                guest_xdg_toplevel_id,
-                            )
-                        {
-                            // Attach only after the generated dispatcher has
-                            // accepted and mapped the new role. The ID is not
-                            // needed here: a missing shell is retried when
-                            // zaura_shell is bound, and placement attaches
-                            // lazily through the same helper.
-                            let _ = crate::handler::window_placement::attach_placement_toplevel(
-                                &mut self.ctx,
-                                guest_xdg_toplevel_id,
-                                wl_surface_guest_id,
-                            );
-                        }
+                        crate::handler::compositor::record_xdg_toplevel(
+                            &mut self.ctx,
+                            sender_id,
+                            guest_xdg_toplevel_id,
+                        );
                     }
                     res
                 }
