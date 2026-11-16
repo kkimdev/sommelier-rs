@@ -47,7 +47,7 @@ use crate::protocols::aura_shell::zaura_shell::{
     REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE,
 };
 use crate::protocols::aura_shell::zaura_surface::{
-    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_UNSET_SNAP,
+    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
 };
 use crate::protocols::aura_shell::zaura_toplevel::{
     REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
@@ -141,11 +141,19 @@ fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) 
     ctx.client_to_host_queue.push((message, Vec::new()));
 }
 
+/// Leave fullscreen, maximized and snapped state before new bounds apply.
+///
+/// The Aura surface may predate `unset_snap`: it keeps the version of the
+/// `zaura_shell` generation that created it, even after a newer shell is
+/// bound. Such a surface cannot be snapped by this proxy, and sending it
+/// the request would be a protocol error, so it is skipped.
 fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surface_id: u32) {
     queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_FULLSCREEN);
     queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_MAXIMIZED);
-    let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    if aura_object_version(ctx, zaura_surface_id) >= REQ_UNSET_SNAP_SINCE {
+        let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
+        ctx.client_to_host_queue.push((message, Vec::new()));
+    }
 }
 
 /// Resolve the screen bounds for a placement action on an output.
@@ -987,6 +995,52 @@ mod tests {
         );
         assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert!(!ctx.window_placement.arc_application_id_applied(12));
+    }
+
+    /// `zaura_surface.unset_snap` exists only from version 16. An Aura
+    /// surface created under an older `zaura_shell` generation keeps its
+    /// version after the shell is re-advertised at a newer one, so placement
+    /// must not send it the request (Exo would reject the unknown method and
+    /// disconnect the client). A new enough surface still gets it.
+    #[test]
+    fn unset_snap_is_sent_only_to_an_aura_surface_that_has_it() {
+        for (surface_version, expect_unset_snap) in [
+            (REQ_UNSET_SNAP_SINCE - 1, false),
+            (REQ_UNSET_SNAP_SINCE, true),
+        ] {
+            let (mut ctx, host_keyboard, xdg_toplevel) = focused_toplevel_ctx();
+            let aura_surface = 0x7000;
+            ctx.shadow_table.track_host_interface_with_version(
+                aura_surface,
+                "zaura_surface".to_string(),
+                surface_version,
+            );
+            ctx.window_placement.remember_aura_surface(22, aura_surface);
+
+            assert_eq!(
+                place_focused(&mut ctx, HostId(host_keyboard), WindowLayoutAction::TopLeft),
+                Ok(()),
+                "zaura_surface v{surface_version}"
+            );
+            let sent_unset_snap = ctx.client_to_host_queue.iter().any(|message| {
+                message_sender(message) == aura_surface && message_opcode(message) == REQ_UNSET_SNAP
+            });
+            assert_eq!(
+                sent_unset_snap, expect_unset_snap,
+                "zaura_surface v{surface_version}"
+            );
+            let aura_toplevel = ctx
+                .window_placement
+                .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
+                .expect("Aura toplevel");
+            assert!(
+                ctx.client_to_host_queue.iter().any(|message| {
+                    message_sender(message) == aura_toplevel
+                        && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+                }),
+                "the bounds request does not depend on unset_snap"
+            );
+        }
     }
 
     #[test]
