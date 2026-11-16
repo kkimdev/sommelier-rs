@@ -227,7 +227,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             return Action::Drop;
         };
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
-            aura_objects::release(ctx, aura_objects::AuraChild::Output, zaura_output_host_id);
+            aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
         }
         // `zaura_output` is an internal child of the wl_output and must be
         // released first. Returning Forward here would put the original

@@ -313,7 +313,7 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
         return None;
     }
     let zaura_toplevel_host_id =
-        aura_objects::create(ctx, AuraChild::Toplevel, xdg_toplevel_host_id)?;
+        aura_objects::create(ctx, AuraChild::TOPLEVEL, xdg_toplevel_host_id)?;
     let coordinate_message = MessageBuilder::new()
         .build_message(zaura_toplevel_host_id, REQ_SET_SUPPORTS_SCREEN_COORDINATES);
     ctx.client_to_host_queue
@@ -401,7 +401,7 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
         .window_placement
         .take_aura_toplevel(xdg_toplevel_guest_id)
     {
-        aura_objects::release(ctx, AuraChild::Toplevel, zaura_toplevel_host_id);
+        aura_objects::release(ctx, AuraChild::TOPLEVEL, zaura_toplevel_host_id);
     }
 }
 
