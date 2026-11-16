@@ -169,12 +169,9 @@ fn reserve_block(runtime_dir: &Path, random: u64) -> io::Result<ReservedBlock> {
 
     let first_index = (random >> 32) as u32 % ARC_ID_BLOCK_COUNT;
     let offset_seed = random as u32;
-    let mut last_error = None;
     for step in 0..ARC_ID_BLOCK_COUNT {
         let (first_id, last_id) = block_bounds((first_index + step) % ARC_ID_BLOCK_COUNT);
-        // Older Sommelier builds use the same name, so mixed versions still
-        // exclude each other.
-        let path = directory.join(format!("{first_id}-{last_id}.lock"));
+        let path = directory.join(lock_file_name(first_id, last_id));
         match lock_exclusive(&path) {
             Ok(lock) => {
                 info!("Reserved ARC task-ID block {first_id}..={last_id}");
@@ -183,17 +180,31 @@ fn reserve_block(runtime_dir: &Path, random: u64) -> io::Result<ReservedBlock> {
                     _lock: lock,
                 });
             }
-            Err(error) => {
+            // Another live proxy holds this block: the expected case.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 debug!("Skipping ARC task-ID block {}: {error}", path.display());
-                last_error = Some(error);
+            }
+            Err(error) => {
+                warn!(
+                    "Skipping unusable ARC task-ID block {}: {error}",
+                    path.display()
+                );
             }
         }
     }
-    Err(io::Error::other(format!(
-        "no ARC task-ID block in {} could be locked (last error: {})",
-        directory.display(),
-        last_error.map_or_else(String::new, |error| error.to_string()),
-    )))
+    Err(io::Error::new(
+        io::ErrorKind::ResourceBusy,
+        format!(
+            "every ARC task-ID block in {} is locked or unusable",
+            directory.display()
+        ),
+    ))
+}
+
+/// Older Sommelier builds use the same name, so mixed versions still exclude
+/// each other.
+fn lock_file_name(first_id: u32, last_id: u32) -> String {
+    format!("{first_id}-{last_id}.lock")
 }
 
 /// Require `path` to be a directory that only this user can access, as the
@@ -273,7 +284,7 @@ mod tests {
         runtime
             .path()
             .join(LOCK_DIRECTORY)
-            .join(format!("{first_id}-{last_id}.lock"))
+            .join(lock_file_name(first_id, last_id))
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -285,7 +296,7 @@ mod tests {
         assert!(ARC_ID_POOL_END < i32::MAX as u32);
         assert_eq!(
             block_bounds(0),
-            (ARC_ID_POOL_START, ARC_ID_POOL_START + 999_999)
+            (ARC_ID_POOL_START, ARC_ID_POOL_START + ARC_ID_BLOCK_SIZE - 1)
         );
         assert_eq!(block_bounds(ARC_ID_BLOCK_COUNT - 1).1, ARC_ID_POOL_END);
         for index in 1..ARC_ID_BLOCK_COUNT {
@@ -329,6 +340,9 @@ mod tests {
         let second = reserve_block(runtime.path(), seeds(0, 0)).expect("second block");
         assert_eq!(first.ids.first_id, block_bounds(0).0);
         assert_eq!(second.ids.first_id, block_bounds(1).0);
+        // A held block reports `WouldBlock`, which is skipped quietly.
+        let held = lock_exclusive(&lock_path(&runtime, 0)).expect_err("block 0 is held");
+        assert_eq!(held.kind(), io::ErrorKind::WouldBlock);
         drop(first);
         let reclaimed = reserve_block(runtime.path(), seeds(0, 0)).expect("reclaimed block");
         assert_eq!(reclaimed.ids.first_id, block_bounds(0).0);
@@ -380,7 +394,7 @@ mod tests {
             fs::create_dir(lock_path(&runtime, block)).expect("block every lock file");
         }
         let error = reserve_block(runtime.path(), seeds(0, 0)).expect_err("no free block");
-        assert!(error.to_string().contains("could be locked"), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
     }
 
     #[test]
@@ -393,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn random_seeds_come_from_getrandom() {
+    fn random_draws_differ() {
         // Two equal 64-bit draws have probability 2^-64.
         assert_ne!(random_u64().expect("random"), random_u64().expect("random"));
     }
