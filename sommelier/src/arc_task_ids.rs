@@ -19,15 +19,30 @@ limitations under the License.
 //! The ARC bounds workaround needs one identity per live surface.  A local
 //! process counter is not sufficient because multiple Sommelier processes can
 //! be alive at once (and PID/serial truncation can collide).  Reserve one
-//! numeric block with an advisory file lock and allocate monotonically from
-//! that block.  The lock is held by the open descriptor for the lifetime of
-//! the allocator, so a second process skips the block while the first is live.
+//! numeric block with an advisory file lock and allocate from that block,
+//! starting at a random offset and wrapping within it.  The lock is held by
+//! the open descriptor for the lifetime of the allocator, so a second process
+//! skips the block while the first is live.
+//!
+//! Limits of the guarantee:
+//!
+//! - Exclusivity holds only between proxies that share one
+//!   `$XDG_RUNTIME_DIR`.  Proxies in other runtime directories (other
+//!   containers or VMs attached to the same host compositor) coordinate
+//!   nothing; the random block and random in-block offset only make an
+//!   overlap unlikely.
+//! - The generation guard lives in `$XDG_RUNTIME_DIR` itself.  Replacing the
+//!   whole runtime directory (or deleting the guard) while an allocator is
+//!   alive starts an independent namespace, with the same caveat as above.
+//! - Each process reserves one block and never refills it; identities are not
+//!   recycled.  After the block is exhausted, allocation fails and the ARC
+//!   policy is skipped for new surfaces instead of reusing an identity.
 
 use std::ffi::CString;
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -52,8 +67,38 @@ struct BlockState {
     /// older allocator still owns a block.
     directory_guard: Option<File>,
     start_id: u32,
-    next_id: u64,
     end_id: u32,
+    /// Offset from `start_id` of the next identity; wraps within the block.
+    next_offset: u64,
+    /// Identities handed out so far; the block is exhausted once this equals
+    /// the block length, regardless of where the offset started.
+    allocated: u64,
+}
+
+impl BlockState {
+    fn new(
+        lock_file: Option<File>,
+        directory_guard: Option<File>,
+        start_id: u32,
+        end_id: u32,
+        offset_seed: u32,
+    ) -> Self {
+        debug_assert!(start_id <= end_id);
+        let mut block = Self {
+            lock_file,
+            directory_guard,
+            start_id,
+            end_id,
+            next_offset: 0,
+            allocated: 0,
+        };
+        block.next_offset = u64::from(offset_seed) % block.len();
+        block
+    }
+
+    fn len(&self) -> u64 {
+        u64::from(self.end_id) - u64::from(self.start_id) + 1
+    }
 }
 
 impl Drop for BlockState {
@@ -100,33 +145,40 @@ impl ArcIdAllocator {
             )
         })?;
         let runtime_dir = PathBuf::from(runtime_dir);
-        validate_directory(&runtime_dir, None)?;
+        open_validated_directory(&runtime_dir, None)?;
 
         let block_dir = runtime_dir.join("sommelier").join("arc-task-blocks");
         ensure_private_directory(&block_dir)?;
 
-        let mut random = [0_u8; 4];
-        File::open("/dev/urandom")?.read_exact(&mut random)?;
-        let start_index = u32::from_ne_bytes(random) % ARC_ID_BLOCK_COUNT;
-        Self::acquire_in_directory_with_guard(&block_dir, &runtime_dir, start_index)
+        let mut random = File::open("/dev/urandom")?;
+        let mut index_bytes = [0_u8; 4];
+        let mut offset_bytes = [0_u8; 4];
+        random.read_exact(&mut index_bytes)?;
+        random.read_exact(&mut offset_bytes)?;
+        let start_index = u32::from_ne_bytes(index_bytes) % ARC_ID_BLOCK_COUNT;
+        let offset_seed = u32::from_ne_bytes(offset_bytes);
+        Self::acquire_in_directory_with_guard(&block_dir, &runtime_dir, start_index, offset_seed)
     }
 
     #[cfg(test)]
-    fn acquire_in_directory(directory: &Path, start_index: u32) -> io::Result<Arc<Self>> {
-        Self::acquire_in_directory_with_guard(directory, directory, start_index)
+    fn acquire_in_directory(
+        directory: &Path,
+        start_index: u32,
+        offset_seed: u32,
+    ) -> io::Result<Arc<Self>> {
+        Self::acquire_in_directory_with_guard(directory, directory, start_index, offset_seed)
     }
 
     fn acquire_in_directory_with_guard(
         directory: &Path,
         guard_directory: &Path,
         start_index: u32,
+        offset_seed: u32,
     ) -> io::Result<Arc<Self>> {
-        validate_directory(directory, Some(0o700))?;
-        validate_directory(guard_directory, None)?;
         // Keep a descriptor for the validated directory and use openat for
         // every lock file. Re-opening a lock pathname after validation could
         // otherwise redirect an acquisition into a replacement directory.
-        let directory_file = open_directory(directory)?;
+        let directory_file = open_validated_directory(directory, Some(0o700))?;
         let directory_metadata = directory_file.metadata()?;
         let path_metadata = fs::symlink_metadata(directory)?;
         if path_metadata.dev() != directory_metadata.dev()
@@ -136,6 +188,10 @@ impl ArcIdAllocator {
                 "ARC identity lock directory changed while opening",
             ));
         }
+        // The guard records this directory generation while any allocator is
+        // alive, so a later replacement of the directory is rejected by every
+        // subsequent acquisition. That shared guard, not a post-lock path
+        // re-check (which would itself race), is what keeps one namespace.
         let directory_guard = establish_directory_guard(&directory_metadata, guard_directory)?;
         let start_index = start_index % ARC_ID_BLOCK_COUNT;
         for offset in 0..ARC_ID_BLOCK_COUNT {
@@ -147,14 +203,6 @@ impl ArcIdAllocator {
 
             match try_lock(&file) {
                 Ok(()) => {
-                    let current_directory_metadata = directory_file.metadata()?;
-                    if current_directory_metadata.dev() != directory_metadata.dev()
-                        || current_directory_metadata.ino() != directory_metadata.ino()
-                    {
-                        return Err(io::Error::other(
-                            "ARC identity lock directory changed while acquiring",
-                        ));
-                    }
                     info!(
                         "Reserved ARC identity block {}-{} using {}",
                         start_id,
@@ -162,13 +210,13 @@ impl ArcIdAllocator {
                         path.display()
                     );
                     return Ok(Arc::new(Self {
-                        block: Mutex::new(BlockState {
-                            lock_file: Some(file),
-                            directory_guard: Some(directory_guard),
+                        block: Mutex::new(BlockState::new(
+                            Some(file),
+                            Some(directory_guard),
                             start_id,
-                            next_id: u64::from(start_id),
                             end_id,
-                        }),
+                            offset_seed,
+                        )),
                     }));
                 }
                 Err(error)
@@ -194,29 +242,31 @@ impl ArcIdAllocator {
             .block
             .lock()
             .map_err(|_| io::Error::other("ARC identity allocator mutex poisoned"))?;
-        if block.next_id > u64::from(block.end_id) {
+        let len = block.len();
+        if block.allocated >= len {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 "ARC identity block is exhausted",
             ));
         }
-        let id = block.next_id as u32;
-        debug_assert!(id >= block.start_id);
-        block.next_id += 1;
+        let id = u32::try_from(u64::from(block.start_id) + block.next_offset)
+            .map_err(|_| io::Error::other("ARC identity offset out of range"))?;
+        debug_assert!(id >= block.start_id && id <= block.end_id);
+        block.next_offset = (block.next_offset + 1) % len;
+        block.allocated += 1;
         Ok(id)
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(start_id: u32, end_id: u32) -> Arc<Self> {
+        Self::for_test_with_offset(start_id, end_id, 0)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_offset(start_id: u32, end_id: u32, offset_seed: u32) -> Arc<Self> {
         assert!(start_id <= end_id);
         Arc::new(Self {
-            block: Mutex::new(BlockState {
-                lock_file: None,
-                directory_guard: None,
-                start_id,
-                next_id: u64::from(start_id),
-                end_id,
-            }),
+            block: Mutex::new(BlockState::new(None, None, start_id, end_id, offset_seed)),
         })
     }
 
@@ -245,6 +295,21 @@ fn open_directory(path: &Path) -> io::Result<File> {
     options.read(true);
     options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
     options.open(path)
+}
+
+/// Open a directory without following a final symlink and validate the
+/// owner and mode of the opened descriptor, so a path swapped between a
+/// check and the open cannot substitute an unvalidated directory.
+fn open_validated_directory(path: &Path, expected_mode: Option<u32>) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("ARC identity path must be absolute: {}", path.display()),
+        ));
+    }
+    let file = open_directory(path)?;
+    validate_directory_metadata(path, &file.metadata()?, expected_mode)?;
+    Ok(file)
 }
 
 fn read_directory_identity(file: &mut File, path: &Path) -> io::Result<Option<DirectoryIdentity>> {
@@ -324,7 +389,7 @@ fn establish_directory_guard(
     directory_metadata: &Metadata,
     guard_directory: &Path,
 ) -> io::Result<File> {
-    let guard_directory_file = open_directory(guard_directory)?;
+    let guard_directory_file = open_validated_directory(guard_directory, None)?;
     let guard_path = guard_directory.join(DIRECTORY_GUARD_FILE);
     let mut guard = open_lock_file_at(
         guard_directory_file.as_raw_fd(),
@@ -338,12 +403,18 @@ fn establish_directory_guard(
             // No live allocator holds the shared guard, so a new directory
             // generation may adopt the marker. Downgrade to a shared lock
             // before returning so this allocator participates in the guard.
-            match read_directory_identity(&mut guard, &guard_path)? {
-                None => write_directory_identity(&mut guard, &guard_path, expected)?,
-                Some(actual) if actual != expected => {
-                    write_directory_identity(&mut guard, &guard_path, expected)?
+            // An unparsable marker (for example a torn write) has no live
+            // owner either, so it is replaced like a stale generation.
+            let current = match read_directory_identity(&mut guard, &guard_path) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    warn!("Replacing unreadable ARC directory identity guard: {error}");
+                    None
                 }
-                Some(_) => {}
+                Err(error) => return Err(error),
+            };
+            if current != Some(expected) {
+                write_directory_identity(&mut guard, &guard_path, expected)?;
             }
             flock_shared(&guard)?;
         }
@@ -427,19 +498,20 @@ fn block_bounds(index: u32) -> (u32, u32) {
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
-    fs::set_permissions(path, Permissions::from_mode(0o700))?;
-    validate_directory(path, Some(0o700))
+    // New components are created private. An existing leaf is tightened
+    // through its descriptor: the O_NOFOLLOW open rejects a symlink, so the
+    // chmod can never be redirected to the link target.
+    DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    let directory = open_directory(path)?;
+    directory.set_permissions(Permissions::from_mode(0o700))?;
+    validate_directory_metadata(path, &directory.metadata()?, Some(0o700))
 }
 
-fn validate_directory(path: &Path, expected_mode: Option<u32>) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("ARC identity path must be absolute: {}", path.display()),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path)?;
+fn validate_directory_metadata(
+    path: &Path,
+    metadata: &Metadata,
+    expected_mode: Option<u32>,
+) -> io::Result<()> {
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotADirectory,
@@ -492,15 +564,18 @@ fn validate_lock_file(path: &Path, file: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_directory() -> PathBuf {
+        static SEQUENCE: AtomicU32 = AtomicU32::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "sommelier-arc-id-block-{}-{nonce}",
+            "sommelier-arc-id-block-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create test directory");
@@ -523,13 +598,13 @@ mod tests {
     #[test]
     fn flock_assigns_distinct_blocks_and_releases_on_drop() {
         let directory = temporary_directory();
-        let first = ArcIdAllocator::acquire_in_directory(&directory, 0).expect("first block");
+        let first = ArcIdAllocator::acquire_in_directory(&directory, 0, 0).expect("first block");
         let first_range = first.block_range();
-        let second = ArcIdAllocator::acquire_in_directory(&directory, 0).expect("second block");
+        let second = ArcIdAllocator::acquire_in_directory(&directory, 0, 0).expect("second block");
         assert_ne!(first_range, second.block_range());
         drop(first);
         drop(second);
-        let reclaimed = ArcIdAllocator::acquire_in_directory(&directory, 0)
+        let reclaimed = ArcIdAllocator::acquire_in_directory(&directory, 0, 0)
             .expect("released block can be reused");
         assert_eq!(reclaimed.block_range(), first_range);
         drop(reclaimed);
@@ -544,19 +619,19 @@ mod tests {
         fs::set_permissions(&directory, Permissions::from_mode(0o700))
             .expect("restrict block directory");
 
-        let first = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0)
+        let first = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0, 0)
             .expect("first allocator reserves the block");
         fs::remove_dir_all(&directory).expect("remove block directory");
         fs::create_dir(&directory).expect("recreate block directory");
         fs::set_permissions(&directory, Permissions::from_mode(0o700))
             .expect("restrict recreated block directory");
 
-        let error = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0)
+        let error = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0, 0)
             .expect_err("a recreated directory must not split the lock namespace");
         assert_eq!(error.kind(), io::ErrorKind::Other);
 
         drop(first);
-        let recovered = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0)
+        let recovered = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0, 0)
             .expect("the marker can be adopted after the old allocator exits");
         drop(recovered);
         fs::remove_dir_all(parent).expect("remove test directories");
@@ -574,7 +649,7 @@ mod tests {
         fs::set_permissions(&directory, Permissions::from_mode(0o700))
             .expect("restrict block directory");
 
-        let first = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0)
+        let first = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0, 0)
             .expect("first allocator reserves the block");
         fs::remove_dir_all(&sommelier).expect("remove Sommelier directory");
         fs::create_dir(&sommelier).expect("recreate Sommelier directory");
@@ -584,12 +659,12 @@ mod tests {
         fs::set_permissions(&directory, Permissions::from_mode(0o700))
             .expect("restrict recreated block directory");
 
-        let error = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0)
+        let error = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0, 0)
             .expect_err("a recreated parent must not split the lock namespace");
         assert_eq!(error.kind(), io::ErrorKind::Other);
 
         drop(first);
-        let recovered = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0)
+        let recovered = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &runtime, 0, 0)
             .expect("the marker can be adopted after the old allocator exits");
         drop(recovered);
         fs::remove_dir_all(runtime).expect("remove test directories");
@@ -600,5 +675,152 @@ mod tests {
         assert!(ARC_ID_POOL_END < i32::MAX as u32);
         assert_eq!(block_bounds(0).0, ARC_ID_POOL_START);
         assert_eq!(block_bounds(ARC_ID_BLOCK_COUNT - 1).1, ARC_ID_POOL_END);
+    }
+
+    fn first_block_lock_name() -> String {
+        let (start_id, end_id) = block_bounds(0);
+        format!("{start_id}-{end_id}.lock")
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).expect("stat").mode() & 0o7777
+    }
+
+    #[test]
+    fn allocator_starts_at_offset_and_wraps_before_reporting_exhaustion() {
+        // A seed of 4 in a three-identity block starts at offset 1.
+        let allocator = ArcIdAllocator::for_test_with_offset(10, 12, 4);
+        assert_eq!(allocator.allocate().unwrap(), 11);
+        assert_eq!(allocator.allocate().unwrap(), 12);
+        assert_eq!(allocator.allocate().unwrap(), 10);
+        for _ in 0..2 {
+            assert_eq!(
+                allocator.allocate().unwrap_err().kind(),
+                io::ErrorKind::AddrNotAvailable
+            );
+        }
+    }
+
+    #[test]
+    fn offset_seed_stays_inside_the_partial_last_block() {
+        let directory = temporary_directory();
+        let allocator =
+            ArcIdAllocator::acquire_in_directory(&directory, ARC_ID_BLOCK_COUNT - 1, u32::MAX)
+                .expect("last block");
+        let (start_id, end_id) = allocator.block_range();
+        assert_eq!(end_id, ARC_ID_POOL_END);
+        let id = allocator.allocate().expect("identity");
+        assert!((start_id..=end_id).contains(&id));
+        drop(allocator);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn independent_runtime_directories_sharing_a_block_start_at_distinct_offsets() {
+        // Proxies in different runtime directories cannot see each other's
+        // locks. Choosing the same block must not imply the same identities.
+        let first_directory = temporary_directory();
+        let second_directory = temporary_directory();
+        let first =
+            ArcIdAllocator::acquire_in_directory(&first_directory, 3, 17).expect("first namespace");
+        let second = ArcIdAllocator::acquire_in_directory(&second_directory, 3, 900_017)
+            .expect("second namespace");
+        let (start_id, _) = first.block_range();
+        assert_eq!(first.block_range(), second.block_range());
+        assert_eq!(first.allocate().unwrap(), start_id + 17);
+        assert_eq!(second.allocate().unwrap(), start_id + 900_017);
+        drop((first, second));
+        fs::remove_dir_all(first_directory).expect("remove first directory");
+        fs::remove_dir_all(second_directory).expect("remove second directory");
+    }
+
+    #[test]
+    fn unparsable_guard_marker_is_replaced_when_no_allocator_is_live() {
+        let parent = temporary_directory();
+        let directory = parent.join("arc-task-blocks");
+        fs::create_dir(&directory).expect("create block directory");
+        fs::set_permissions(&directory, Permissions::from_mode(0o700))
+            .expect("restrict block directory");
+        let guard_path = parent.join(DIRECTORY_GUARD_FILE);
+        fs::write(&guard_path, b"12345").expect("write torn marker");
+        fs::set_permissions(&guard_path, Permissions::from_mode(0o600)).expect("restrict guard");
+
+        let allocator = ArcIdAllocator::acquire_in_directory_with_guard(&directory, &parent, 0, 0)
+            .expect("a torn marker without a live owner is recoverable");
+        let metadata = fs::metadata(&directory).expect("stat block directory");
+        assert_eq!(
+            fs::read_to_string(&guard_path).expect("read guard"),
+            format!("{} {}\n", metadata.dev(), metadata.ino())
+        );
+        drop(allocator);
+        fs::remove_dir_all(parent).expect("remove test directories");
+    }
+
+    #[test]
+    fn symlinked_lock_file_is_rejected_without_touching_its_target() {
+        let directory = temporary_directory();
+        let elsewhere = temporary_directory();
+        let target = elsewhere.join("target");
+        fs::write(&target, b"keep").expect("write target");
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).expect("target mode");
+        std::os::unix::fs::symlink(&target, directory.join(first_block_lock_name()))
+            .expect("plant lock symlink");
+
+        assert!(ArcIdAllocator::acquire_in_directory(&directory, 0, 0).is_err());
+        assert_eq!(fs::read(&target).expect("read target"), b"keep");
+        assert_eq!(mode_of(&target), 0o644);
+        fs::remove_dir_all(directory).expect("remove test directory");
+        fs::remove_dir_all(elsewhere).expect("remove target directory");
+    }
+
+    #[test]
+    fn lock_file_with_unsafe_mode_is_rejected() {
+        let directory = temporary_directory();
+        let lock_path = directory.join(first_block_lock_name());
+        fs::write(&lock_path, b"").expect("create lock file");
+        fs::set_permissions(&lock_path, Permissions::from_mode(0o644)).expect("lock mode");
+
+        let error = ArcIdAllocator::acquire_in_directory(&directory, 0, 0)
+            .expect_err("a group-readable lock file is not trusted");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn block_directory_with_unsafe_mode_is_rejected() {
+        let directory = temporary_directory();
+        fs::set_permissions(&directory, Permissions::from_mode(0o755)).expect("widen mode");
+
+        let error = ArcIdAllocator::acquire_in_directory(&directory, 0, 0)
+            .expect_err("a non-private block directory is not trusted");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn private_directory_setup_does_not_chmod_through_a_symlink() {
+        let runtime = temporary_directory();
+        let target = runtime.join("target");
+        fs::create_dir(&target).expect("create target");
+        fs::set_permissions(&target, Permissions::from_mode(0o755)).expect("target mode");
+        let link = runtime.join("arc-task-blocks");
+        std::os::unix::fs::symlink(&target, &link).expect("plant directory symlink");
+
+        assert!(ensure_private_directory(&link).is_err());
+        assert_eq!(mode_of(&target), 0o755);
+        fs::remove_dir_all(runtime).expect("remove test directories");
+    }
+
+    #[test]
+    fn private_directory_setup_creates_and_tightens_owner_only_directories() {
+        let runtime = temporary_directory();
+        let created = runtime.join("sommelier").join("arc-task-blocks");
+        ensure_private_directory(&created).expect("create private directory");
+        assert_eq!(mode_of(&created), 0o700);
+
+        fs::set_permissions(&created, Permissions::from_mode(0o755)).expect("widen mode");
+        ensure_private_directory(&created).expect("tighten existing directory");
+        assert_eq!(mode_of(&created), 0o700);
+        fs::remove_dir_all(runtime).expect("remove test directories");
     }
 }

@@ -244,6 +244,10 @@ for deployments that need the metadata path but no compositor-owned chords. When
 the policy is enabled, Sommelier reserves a process-shared ARC task-identity
 block under `$XDG_RUNTIME_DIR/sommelier`; if that reservation cannot be made,
 the policy is disabled rather than using a potentially colliding identity.
+Exclusivity holds only among proxies sharing one `$XDG_RUNTIME_DIR`; proxies in
+other containers or VMs pick a random block and offset, which makes overlap
+unlikely but not impossible. A block is never refilled, so after its identities
+are exhausted new surfaces skip the ARC policy until the proxy restarts.
 
 ## CI and release workflow
 
