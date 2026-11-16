@@ -23,9 +23,9 @@ limitations under the License.
 //! Super_L,<Alt>bracketleft,<Alt>bracketright,<Control>space
 //! ```
 //!
-//! Accepted modifier tags (case-insensitive):
-//!   `<Control>` / `<Ctrl>`, `<Alt>` / `<Meta>`,
-//!   `<Shift>`, `<Super>` / `<Win>` / `<Search>`.
+//! The accepted modifier tags are listed once, in the `chord` rule of the
+//! file format in `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`;
+//! [`parse_accelerator`] implements that list.
 //!
 //! This module only parses; `crate::placement_config` decides what the
 //! parsed chords mean (host accelerators or placement bindings).

@@ -128,8 +128,10 @@ action = "fullscreen"
 - Each binding has a `chord` and **exactly one** of `action` or `rect`.
   - `chord` uses the `SOMMELIER_ACCELERATORS` spelling: modifier tags
     (`<Control>`/`<Ctrl>`, `<Alt>`/`<Meta>`, `<Shift>`,
-    `<Super>`/`<Win>`/`<Search>`) followed by an XKB keysym name. Matching is
-    exact on modifiers and case-insensitive on the keysym.
+    `<Super>`/`<Win>`/`<Search>`, case-insensitive) followed by an XKB
+    keysym name. Matching is exact on modifiers and case-insensitive on the
+    keysym. This is the one list of modifier tags; `parse_accelerator` in
+    `sommelier/src/accelerator.rs` implements it.
   - `action` is one of the [named actions](#named-actions)
     (case-insensitive).
   - `rect` is `[x, y, width, height]`. Integers such as `[0, 0, 1, 1]` are
@@ -196,8 +198,9 @@ Both statements have unit tests in `sommelier/src/window_layout.rs`.
 ## Output and work area
 
 A placement uses an output that the focused surface has entered, so a window
-never jumps to another monitor; only a surface that has entered no output
-uses the first usable output. `OutputRegistry::for_surface` in
+never jumps to another monitor; only a surface currently on no output (before
+its first enter, or after all its outputs went away) uses the first usable
+output. `OutputRegistry::for_surface` in
 `sommelier/src/state/outputs.rs` owns the exact rule, including which output
 wins when the surface spans several and when an output counts as usable.
 
