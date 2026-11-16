@@ -22,6 +22,7 @@ pub mod gtk_shell;
 pub mod keyboard;
 pub mod linux_dmabuf;
 pub mod registry;
+pub mod remote_shell;
 pub mod seat;
 pub mod shm;
 pub mod text_input;

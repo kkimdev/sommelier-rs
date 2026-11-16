@@ -135,6 +135,7 @@ struct SommelierHandler {
     registry: crate::handler::registry::RegistryHandler,
     compositor: crate::handler::compositor::CompositorHandler,
     gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
+    remote_shell: crate::handler::remote_shell::RemoteShellHandler,
     callback: crate::handler::callback::CallbackHandler,
     shm: crate::handler::shm::ShmHandler,
     linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
@@ -156,6 +157,7 @@ impl SommelierHandler {
             registry: crate::handler::registry::RegistryHandler,
             compositor: crate::handler::compositor::CompositorHandler,
             gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
+            remote_shell: crate::handler::remote_shell::RemoteShellHandler,
             callback: crate::handler::callback::CallbackHandler,
             shm: crate::handler::shm::ShmHandler,
             linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
@@ -3790,6 +3792,14 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
     gtk_surface1: gtk_shell
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
+
+// Host-only remote-shell objects for the experimental placement backend.
+// Guests never see this global, so only host events reach these handlers.
+protocols::remote_shell_unstable_v2::impl_sommelier_delegates!(SommelierHandler, {
+    zcr_remote_shell_v2: remote_shell,
+    zcr_remote_surface_v2: remote_shell
+});
+impl protocols::remote_shell_unstable_v2::ProtocolHandler for SommelierHandler {}
 
 pub async fn run(
     display: &str,
