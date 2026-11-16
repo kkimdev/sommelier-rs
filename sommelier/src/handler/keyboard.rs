@@ -80,6 +80,29 @@ enum KeyClass {
     Guest,
 }
 
+/// Why a consumed placement chord did not move the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementSkip {
+    /// The keyboard focus is not on an xdg_toplevel.
+    NoFocusedToplevel,
+    /// The focused xdg_toplevel has no host object.
+    UnmappedToplevel,
+    /// No output with complete metadata can host the surface (see
+    /// `Context::output_for_surface`).
+    NoUsableOutput,
+    /// The rectangle has an empty extent, an edge that rounds onto the work
+    /// area border, or overflowing coordinates on this output.
+    RectNotRepresentable,
+    /// The host Aura toplevel is unavailable (no or too old zaura_shell).
+    NoAuraToplevel,
+    /// The host Aura surface is unavailable (no zaura_shell).
+    NoAuraSurface,
+    /// The surface's ARC policy identity could not be allocated or sent.
+    ArcIdentityUnavailable,
+    /// The ordering barrier for the bounds request could not be queued.
+    BarrierUnavailable,
+}
+
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
@@ -392,72 +415,40 @@ impl KeyboardHandler {
         action.rect().to_work_area_bounds(output.work_area()?)
     }
 
+    /// Place the focused toplevel for one consumed placement chord.
+    ///
+    /// # Returns
+    ///
+    /// `Err` names why the window was not moved. The chord stays consumed
+    /// either way (see `on_key`); a skip queues no placement request.
     fn apply_window_layout(
         ctx: &mut Context,
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
-    ) -> bool {
+    ) -> Result<(), PlacementSkip> {
         // `classify_key` yields placement actions only while the ARC bounds
         // policy is active, so this path never runs without it.
-        let Some((guest_xdg_toplevel_id, guest_wl_surface_id)) =
+        let (guest_xdg_toplevel_id, guest_wl_surface_id) =
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no active xdg_toplevel for keyboard {}",
-                action,
-                host_keyboard_id.0
-            );
-            return false;
-        };
-        let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
-            log::debug!(
-                "window layout {:?} ignored: guest xdg_toplevel {} has no host mapping",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some((output_host_id, output)) = ctx
+                .ok_or(PlacementSkip::NoFocusedToplevel)?;
+        let host_xdg_toplevel_id = ctx
+            .shadow_table
+            .get_host_id(guest_xdg_toplevel_id)
+            .ok_or(PlacementSkip::UnmappedToplevel)?;
+        let (output_host_id, output) = ctx
             .shadow_table
             .get_host_id(guest_wl_surface_id)
             .and_then(|host_surface_id| ctx.output_for_surface(host_surface_id))
             .or_else(|| ctx.primary_output())
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no usable output for xdg_toplevel {}",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some((x, y, width, height)) = Self::bounds_for_action(action, output) else {
-            log::debug!(
-                "window layout {:?} ignored: invalid output geometry {:?}",
-                action,
-                output
-            );
-            return false;
-        };
-        let Some(zaura_toplevel_id) =
+            .ok_or(PlacementSkip::NoUsableOutput)?;
+        let (x, y, width, height) =
+            Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
+        let zaura_toplevel_id =
             crate::handler::compositor::ensure_zaura_toplevel(ctx, guest_xdg_toplevel_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no zaura_toplevel for xdg_toplevel {}",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some(zaura_surface_id) =
+                .ok_or(PlacementSkip::NoAuraToplevel)?;
+        let zaura_surface_id =
             crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no zaura_surface for wl_surface {}",
-                action,
-                guest_wl_surface_id
-            );
-            return false;
-        };
+                .ok_or(PlacementSkip::NoAuraSurface)?;
         // Setup requests may already be staged above us, but the ARC policy
         // identity belongs to this placement batch and must roll back with
         // the state-reset and bounds requests if the barrier cannot be queued.
@@ -470,13 +461,8 @@ impl KeyboardHandler {
             guest_wl_surface_id,
             zaura_surface_id,
         ) {
-            log::debug!(
-                "window layout {:?} ignored: unable to apply ARC policy identity to wl_surface {}",
-                action,
-                guest_wl_surface_id
-            );
             Self::rollback_window_layout_batch(ctx, placement_queue_start);
-            return false;
+            return Err(PlacementSkip::ArcIdentityUnavailable);
         }
 
         // Keep every request emitted by this shortcut in one rollback
@@ -493,11 +479,6 @@ impl KeyboardHandler {
         let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
         ctx.client_to_host_queue.push((message, Vec::new()));
         if !crate::handler::compositor::queue_window_bounds_barrier(ctx, zaura_toplevel_id) {
-            log::warn!(
-                "window layout {:?}: failed to queue host sync barrier for zaura_toplevel {}",
-                action,
-                zaura_toplevel_id
-            );
             // Do not publish a partial placement batch without its ordering
             // barrier.  Removing only the final bounds request would leave
             // the state-reset requests in the host stream and make the next
@@ -511,7 +492,7 @@ impl KeyboardHandler {
                 ctx.window_placement
                     .unmark_arc_application_id_applied(guest_wl_surface_id);
             }
-            return false;
+            return Err(PlacementSkip::BarrierUnavailable);
         }
         log::info!(
             "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
@@ -524,7 +505,7 @@ impl KeyboardHandler {
             height,
             output_host_id
         );
-        true
+        Ok(())
     }
 
     fn reset_host_keyboard_modifiers(&mut self, host_keyboard_id: HostId) {
@@ -1042,7 +1023,20 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             WL_KEY_PRESSED => match (guest_owner, key_class) {
                 (Some(GuestKeyOwner::CompositorShortcut), _) => true,
                 (None, KeyClass::Placement(action)) => {
-                    Self::apply_window_layout(ctx, host_keyboard_id, action)
+                    // The policy owns every matched chord, so the chord is
+                    // consumed whether or not the window can move now; a
+                    // skip must not leak the key to the guest. Release and
+                    // repeat follow the CompositorShortcut owner claimed
+                    // below.
+                    if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
+                        log::debug!(
+                            "window layout {:?} skipped for keyboard {}: {:?}",
+                            action,
+                            host_keyboard_id.0,
+                            reason
+                        );
+                    }
+                    true
                 }
                 _ => false,
             },
@@ -1861,11 +1855,14 @@ mod tests {
             },
         );
 
-        assert!(KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(host_keyboard),
-            WindowLayoutAction::Fullscreen,
-        ));
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(
+                &mut ctx,
+                HostId(host_keyboard),
+                WindowLayoutAction::Fullscreen,
+            ),
+            Ok(())
+        );
         let opcodes: Vec<u16> = ctx
             .client_to_host_queue
             .iter()
@@ -1955,11 +1952,14 @@ mod tests {
         );
         ctx.surface_entered_output(host_surface, secondary_output);
 
-        assert!(KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(host_keyboard),
-            WindowLayoutAction::Fullscreen,
-        ));
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(
+                &mut ctx,
+                HostId(host_keyboard),
+                WindowLayoutAction::Fullscreen,
+            ),
+            Ok(())
+        );
         let aura_toplevel = ctx
             .window_placement
             .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
@@ -1991,8 +1991,11 @@ mod tests {
         );
     }
 
+    /// A matched chord belongs to Sommelier while the policy is active, so
+    /// it is consumed even when placement has to be skipped. The skip leaves
+    /// no Aura objects or barriers behind.
     #[test]
-    fn placement_key_is_forwarded_while_aura_scale_metadata_is_incomplete() {
+    fn placement_chord_is_consumed_while_aura_scale_metadata_is_incomplete() {
         let keyboard = 10;
         let host_keyboard = 5;
         let seat = 11;
@@ -2037,15 +2040,16 @@ mod tests {
 
         assert_eq!(
             handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
-            Action::Forward
+            Action::Drop,
+            "a skipped placement must not leak the chord to the guest"
         );
         assert_eq!(
             ctx.guest_key_owner(HostId(host_keyboard), key),
-            Some(GuestKeyOwner::Physical)
+            Some(GuestKeyOwner::CompositorShortcut)
         );
         assert_eq!(
             handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
-            Action::Forward
+            Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
@@ -2130,6 +2134,65 @@ mod tests {
         let field =
             |offset: usize| i32::from_ne_bytes(bounds.0[offset..offset + 4].try_into().unwrap());
         [field(8), field(12), field(16), field(20)]
+    }
+
+    /// Press, repeat, and release of a consumed chord whose placement was
+    /// skipped: every event stays with Sommelier and none reaches the guest.
+    fn assert_skipped_chord_is_consumed(
+        handler: &mut KeyboardHandler,
+        ctx: &mut Context,
+        key: u32,
+    ) {
+        let keyboard = HostId(5);
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "a matched chord is consumed even when placement is skipped"
+        );
+        assert_eq!(queued_window_bounds(ctx), 0, "placement was skipped");
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+        assert_eq!(
+            handler.on_key(ctx, 2, 130, key, WL_KEY_REPEATED),
+            Action::Drop
+        );
+        assert_eq!(
+            handler.on_key(ctx, 3, 160, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
+    }
+
+    #[test]
+    fn placement_chord_is_consumed_without_a_focused_toplevel() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        // The focused surface is not (or no longer) an xdg_toplevel.
+        ctx.xdg_toplevel_to_wl_surface.clear();
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoFocusedToplevel)
+        );
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
+    }
+
+    #[test]
+    fn placement_chord_is_consumed_when_its_rect_is_not_representable() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        // 0.0001 of the 3840-pixel work area floors onto the left border.
+        let sliver = WindowLayoutAction::Rect(
+            crate::window_layout::NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap(),
+        );
+        ctx.window_placement_shortcuts[0].action = sliver;
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), sliver),
+            Err(PlacementSkip::RectNotRepresentable)
+        );
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
     }
 
     #[test]
@@ -2658,11 +2721,10 @@ mod tests {
             (WindowLayoutAction::Right, 1920),
         ] {
             ctx.client_to_host_queue.clear();
-            assert!(KeyboardHandler::apply_window_layout(
-                &mut ctx,
-                HostId(host_keyboard),
-                action,
-            ));
+            assert_eq!(
+                KeyboardHandler::apply_window_layout(&mut ctx, HostId(host_keyboard), action),
+                Ok(())
+            );
             let opcodes: Vec<u16> = ctx
                 .client_to_host_queue
                 .iter()
