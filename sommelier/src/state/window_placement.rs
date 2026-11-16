@@ -28,9 +28,6 @@ limitations under the License.
 //! perform.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
-use log::warn;
 
 use crate::arc_task_ids::ArcIdAllocator;
 
@@ -83,9 +80,9 @@ pub(crate) struct WindowPlacementState {
     /// ARC window so Exo permits `zaura_toplevel.set_window_bounds`.
     arc_bounds: bool,
     /// Process-shared allocator backing the fabricated ARC policy identities.
-    /// `None` means the allocator could not reserve a collision-free block;
+    /// `None` means the process could not reserve a collision-free block;
     /// identity allocation then fails closed.
-    arc_id_allocator: Option<Arc<ArcIdAllocator>>,
+    arc_id_allocator: Option<&'static ArcIdAllocator>,
     /// Guest wl_surface ID → ARC policy identity, stable for the surface's
     /// lifetime.
     arc_application_ids: HashMap<u32, String>,
@@ -134,22 +131,16 @@ impl WindowPlacementState {
     /// IDs are the capability that makes the direct Aura bounds policy safe
     /// to attempt, so if the process cannot reserve a collision-free identity
     /// block the entire workaround stays off rather than creating Aura
-    /// objects that can never be authorized.
+    /// objects that can never be authorized. The allocator logs that failure
+    /// once for the process.
     pub(crate) fn from_environment() -> Self {
-        let requested = Self::arc_bounds_requested();
-        let arc_id_allocator = if requested {
+        let arc_id_allocator = if Self::arc_bounds_requested() {
             crate::arc_task_ids::process_allocator()
         } else {
             None
         };
-        let arc_bounds = requested && arc_id_allocator.is_some();
-        if requested && !arc_bounds {
-            warn!(
-                "SOMMELIER_WINDOW_BOUNDS_AS_ARC is disabled because no collision-free ARC identity block could be reserved"
-            );
-        }
         Self {
-            arc_bounds,
+            arc_bounds: arc_id_allocator.is_some(),
             arc_id_allocator,
             ..Self::default()
         }
@@ -175,7 +166,10 @@ impl WindowPlacementState {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_arc_id_allocator_for_test(&mut self, allocator: Option<Arc<ArcIdAllocator>>) {
+    pub(crate) fn set_arc_id_allocator_for_test(
+        &mut self,
+        allocator: Option<&'static ArcIdAllocator>,
+    ) {
         self.arc_id_allocator = allocator;
     }
 
@@ -228,7 +222,8 @@ impl WindowPlacementState {
     /// # Returns
     ///
     /// `None` when the ARC bounds policy is disabled, no allocator is
-    /// available, or the allocator's block is exhausted.
+    /// available, or the allocator's block is exhausted (which the allocator
+    /// logs once).
     pub(crate) fn arc_application_id(&mut self, wl_surface_guest_id: u32) -> Option<String> {
         if !self.arc_bounds {
             return None;
@@ -237,7 +232,7 @@ impl WindowPlacementState {
         if let Some(application_id) = self.arc_application_ids.get(&wl_surface_guest_id) {
             return Some(application_id.clone());
         }
-        let id = allocator.allocate().ok()?;
+        let id = allocator.allocate()?;
         let application_id = format!("{ARC_APPLICATION_ID_PREFIX}{id}");
         self.arc_application_ids
             .insert(wl_surface_guest_id, application_id.clone());
