@@ -24,7 +24,8 @@ use crate::protocols::wayland::{wl_display, wl_keyboard};
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId, SeatFocusChange,
+    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
+    InternalCallback, SeatFocusChange,
 };
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
@@ -1348,10 +1349,13 @@ fn queue_host_deactivation_barrier(
 
     ctx.shadow_table
         .track_host_interface_with_version(callback_id.0, "wl_callback".to_string(), 1);
-    if !ctx
-        .text_input_activation_barriers
-        .install(callback_id, guest_id, host_v1_id)
-    {
+    if !ctx.internal_callbacks.register(
+        callback_id,
+        InternalCallback::TextInputDrained {
+            text_input: guest_id,
+            host_text_input: host_v1_id,
+        },
+    ) {
         log::error!("Text-input {} already has an activation barrier", guest_id);
         ctx.shadow_table.remove_host_interface(callback_id.0);
         ctx.fatal_protocol_error = true;
@@ -1359,12 +1363,12 @@ fn queue_host_deactivation_barrier(
     }
 
     let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
-        ctx.text_input_activation_barriers.complete(callback_id);
+        ctx.internal_callbacks.complete(callback_id);
         ctx.shadow_table.remove_host_interface(callback_id.0);
         return false;
     };
     if !state.begin_host_draining(callback_id) {
-        ctx.text_input_activation_barriers.complete(callback_id);
+        ctx.internal_callbacks.complete(callback_id);
         ctx.shadow_table.remove_host_interface(callback_id.0);
         log::error!(
             "Text-input {} was not active when its drain barrier was installed",
@@ -1381,27 +1385,21 @@ fn queue_host_deactivation_barrier(
     true
 }
 
-/// Complete one host activation barrier and reconcile the newest guest state.
-///
-/// Returns `true` when `callback_id` belongs to this subsystem.
-pub(crate) fn complete_host_activation_barrier(ctx: &mut Context, callback_id: HostId) -> bool {
-    let Some((guest_id, host_v1_id)) = ctx.text_input_activation_barriers.complete(callback_id)
-    else {
-        return false;
-    };
-    if !ctx.shadow_table.mark_pending_destroy_host(callback_id.0) {
-        log::warn!(
-            "Text-input activation callback {} was not tracked as host-only",
-            callback_id.0
-        );
-    }
+/// Complete one host activation barrier
+/// ([`InternalCallback::TextInputDrained`]) and reconcile the newest guest
+/// state.
+pub(crate) fn complete_host_activation_barrier(
+    ctx: &mut Context,
+    callback_id: HostId,
+    guest_id: u32,
+    host_v1_id: u32,
+) {
     let completed = ctx.text_inputs.get_mut(&guest_id).is_some_and(|state| {
         state.host_v1_id == host_v1_id && state.complete_host_draining(callback_id)
     });
     if completed {
         update_host_activation(ctx, guest_id);
     }
-    true
 }
 
 /// Reconcile the host-side activation state of a reused text-input-v1 object.

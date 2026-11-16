@@ -40,6 +40,30 @@ fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option
     }
 }
 
+/// The `gtk_shell1.capabilities` bitfield this proxy announces: it
+/// implements none of the optional capabilities (global app menu, global
+/// menu bar, desktop icons).
+const GTK_SHELL_CAPABILITIES: u32 = 0;
+
+/// Announce a synthetic `gtk_shell1`'s capabilities once the internal
+/// `zaura_shell` bind it relies on has reached the compositor (see
+/// [`crate::state::InternalCallback::GtkShellCapabilities`]). A shell the
+/// guest has destroyed meanwhile gets nothing.
+pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: u32) {
+    if !ctx.gtk_shells.contains_key(&gtk_shell_id)
+        || !ctx.shadow_table.is_local_only_guest_object(gtk_shell_id)
+    {
+        return;
+    }
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(GTK_SHELL_CAPABILITIES);
+    let message = builder.build_message(
+        gtk_shell_id,
+        crate::protocols::gtk::gtk_shell1::EVT_CAPABILITIES,
+    );
+    ctx.host_to_client_queue.push((message, Vec::new()));
+}
+
 impl GtkShell1Handler for GtkShellHandler {
     fn on_get_gtk_surface(
         &mut self,

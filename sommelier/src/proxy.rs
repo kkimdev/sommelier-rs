@@ -2711,7 +2711,7 @@ mod tests {
             done.build_message(callback_id.0, wl_callback::EVT_DONE),
         );
         assert!(
-            !ctx.text_input_activation_barriers.contains(callback_id),
+            ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the activation barrier"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
@@ -2861,7 +2861,7 @@ mod tests {
             raw_callback_done(callback_id.0),
         );
         assert!(
-            !ctx.text_input_activation_barriers.contains(callback_id),
+            ctx.internal_callbacks.get(callback_id).is_none(),
             "the old callback must be consumed even after guest ID reuse"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
@@ -3019,7 +3019,7 @@ mod tests {
             raw_callback_done(callback_id.0),
         );
         assert!(
-            !ctx.text_input_activation_barriers.contains(callback_id),
+            ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the old focus barrier"
         );
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));

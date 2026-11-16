@@ -46,6 +46,7 @@ limitations under the License.
 use crate::handler::aura_objects::{
     self, aura_object_version, ensure_host_zaura_surface, AuraChild,
 };
+use crate::handler::callback::queue_internal_sync;
 use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
 use crate::protocols::aura_shell::zaura_surface::{
     REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
@@ -54,9 +55,8 @@ use crate::protocols::aura_shell::zaura_toplevel::{
     REQ_SET_SUPPORTS_SCREEN_COORDINATES, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
     REQ_SET_WINDOW_BOUNDS, REQ_SET_WINDOW_BOUNDS_SINCE,
 };
-use crate::protocols::wayland::wl_display::REQ_SYNC;
 use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
-use crate::state::{Context, HostId};
+use crate::state::{Context, HostId, InternalCallback};
 use crate::window_layout::{Rect, WindowLayoutAction};
 use crate::wire::MessageBuilder;
 
@@ -416,23 +416,36 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
 /// already been delivered. Keep the callback host ID reserved through its
 /// subsequent `wl_display.delete_id`, just like the other internal barriers.
 fn queue_window_bounds_barrier(ctx: &mut Context, zaura_toplevel_host_id: u32) {
-    let callback_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        callback_host_id,
-        "wl_callback".to_string(),
-        1,
-    );
-
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(callback_host_id);
-    let message = builder.build_message(1, REQ_SYNC);
-
     // A new shortcut supersedes the previous barrier for this toplevel. The
-    // old callback remains tracked until its terminal event so its host ID
+    // old callback remains pending until its terminal event so its host ID
     // cannot be recycled while Exo still has the object alive.
+    let callback = queue_internal_sync(
+        ctx,
+        InternalCallback::WindowBoundsBarrier {
+            zaura_toplevel: zaura_toplevel_host_id,
+        },
+    );
+    ctx.window_placement
+        .register_barrier(callback.0, zaura_toplevel_host_id);
+}
+
+/// Make `callback_host_id`, already tracked as a host-only `wl_callback`,
+/// the newest bounds barrier of `zaura_toplevel_host_id`, as
+/// `queue_window_bounds_barrier` does without queueing the request.
+#[cfg(test)]
+pub(crate) fn register_window_bounds_barrier_for_test(
+    ctx: &mut Context,
+    callback_host_id: u32,
+    zaura_toplevel_host_id: u32,
+) {
+    assert!(ctx.internal_callbacks.register(
+        HostId(callback_host_id),
+        InternalCallback::WindowBoundsBarrier {
+            zaura_toplevel: zaura_toplevel_host_id,
+        },
+    ));
     ctx.window_placement
         .register_barrier(callback_host_id, zaura_toplevel_host_id);
-    ctx.client_to_host_queue.push((message, Vec::new()));
 }
 
 /// Return the `xdg_toplevel` version that introduced `state`, per the
@@ -513,27 +526,21 @@ fn queue_guest_xdg_surface_configure(ctx: &mut Context, guest_xdg_surface_id: u3
     ctx.host_to_client_queue.push((message, Vec::new()));
 }
 
-/// Handle `wl_callback.done` for a bounds barrier.
+/// Handle `wl_callback.done` for a bounds barrier
+/// ([`InternalCallback::WindowBoundsBarrier`]), which the callback handler
+/// has already retired.
 ///
-/// Retires the callback and flushes the newest configures retained behind
-/// it. Older callbacks flush nothing: a newer barrier owns the pending
-/// configures and flushes them on its own `done`. The callback is host-only
-/// and terminal at `done`; its numeric ID stays reserved until the host's
-/// `wl_display.delete_id`.
-///
-/// # Returns
-///
-/// `false`, doing nothing, when `callback_host_id` is not a bounds barrier.
-pub(crate) fn complete_barrier(ctx: &mut Context, callback_host_id: u32) -> bool {
-    let Some(held) = ctx.window_placement.complete_barrier(callback_host_id) else {
-        return false;
-    };
-    if !ctx.shadow_table.mark_pending_destroy_host(callback_host_id) {
-        log::warn!(
-            "window-bounds barrier callback {} was not tracked as host-only",
-            callback_host_id
-        );
-    }
+/// Flushes the newest configures retained behind it. Older callbacks flush
+/// nothing: a newer barrier owns the pending configures and flushes them on
+/// its own `done`.
+pub(crate) fn complete_barrier(
+    ctx: &mut Context,
+    callback_host_id: u32,
+    zaura_toplevel_host_id: u32,
+) {
+    let held = ctx
+        .window_placement
+        .complete_barrier(callback_host_id, zaura_toplevel_host_id);
     if let Some(configure) = held.configure {
         queue_guest_xdg_configure(
             ctx,
@@ -546,7 +553,6 @@ pub(crate) fn complete_barrier(ctx: &mut Context, callback_host_id: u32) -> bool
     if let Some(configure) = held.surface_configure {
         queue_guest_xdg_surface_configure(ctx, configure.guest_xdg_surface_id, configure.serial);
     }
-    true
 }
 
 /// Hold a host `xdg_surface.configure` behind an active bounds barrier.
@@ -745,6 +751,17 @@ mod tests {
             guest_seat,
             guest_surface,
             host_surface,
+        );
+    }
+
+    /// Deliver the host `wl_callback.done` of `callback_host_id`.
+    fn done(ctx: &mut Context, callback_host_id: u32) {
+        use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+
+        ctx.last_sender_id = callback_host_id;
+        assert_eq!(
+            crate::handler::callback::CallbackHandler.on_done(ctx, 0),
+            Action::Drop
         );
     }
 
@@ -1221,8 +1238,7 @@ mod tests {
         );
         ctx.shadow_table
             .track_host_interface_with_version(callback_host, "wl_callback".into(), 1);
-        ctx.window_placement
-            .register_barrier(callback_host, aura_toplevel_host);
+        register_window_bounds_barrier_for_test(&mut ctx, callback_host, aura_toplevel_host);
         let mut handler = CompositorHandler;
         ctx.last_sender_id = aura_toplevel_host;
         assert_eq!(
@@ -1240,7 +1256,7 @@ mod tests {
         assert!(ctx.host_to_client_queue.is_empty());
         assert!(ctx.window_placement.has_held_configure(aura_toplevel_host));
 
-        assert!(complete_barrier(&mut ctx, callback_host));
+        done(&mut ctx, callback_host);
         assert!(!ctx.window_placement.has_active_barrier(aura_toplevel_host));
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
@@ -1264,8 +1280,7 @@ mod tests {
         );
         ctx.shadow_table
             .track_host_interface_with_version(callback_host, "wl_callback".into(), 1);
-        ctx.window_placement
-            .register_barrier(callback_host, aura_toplevel_host);
+        register_window_bounds_barrier_for_test(&mut ctx, callback_host, aura_toplevel_host);
         ctx.last_sender_id = xdg_surface_host;
         assert_eq!(
             XdgSurfaceHandler::on_configure(&mut CompositorHandler, &mut ctx, 77),
@@ -1286,7 +1301,7 @@ mod tests {
         );
         assert!(ctx.host_to_client_queue.is_empty());
 
-        assert!(complete_barrier(&mut ctx, callback_host));
+        done(&mut ctx, callback_host);
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         assert_eq!(
             msg_opcode(&ctx.host_to_client_queue[0].0),
@@ -1462,8 +1477,10 @@ mod tests {
         );
         let callback_id = u32::from_ne_bytes(message[8..12].try_into().unwrap());
         assert_eq!(
-            ctx.window_placement.barrier_for_callback(callback_id),
-            Some(aura_id)
+            ctx.internal_callbacks.get(HostId(callback_id)),
+            Some(InternalCallback::WindowBoundsBarrier {
+                zaura_toplevel: aura_id
+            })
         );
         assert_eq!(
             ctx.window_placement.active_barrier_for_toplevel(aura_id),
@@ -1615,7 +1632,7 @@ mod tests {
         assert_eq!(action, Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
 
-        complete_barrier(&mut ctx, callback_id);
+        done(&mut ctx, callback_id);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(configure_states(&ctx.host_to_client_queue[0].0), vec![2]);
     }

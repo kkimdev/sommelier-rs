@@ -16,6 +16,7 @@ limitations under the License.
 
 mod aura_surfaces;
 mod input;
+mod internal_callbacks;
 mod outputs;
 mod render;
 mod window_placement;
@@ -40,8 +41,9 @@ pub(crate) use self::input::{
     ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
     GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
-    PreeditRegionPlan, SeatFocusChange, TextInputActivationBarrierRegistry, TextInputState,
+    PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
+pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
@@ -892,14 +894,9 @@ pub struct Context {
     pub dmabuf_capabilities: HashMap<u64, DmabufCapabilityState>,
     /// Generation collected by the current internal host dmabuf binding.
     pub host_dmabuf_generation: Option<u64>,
-    /// Host-only wl_callback IDs used as capability-discovery barriers.
-    pub dmabuf_capability_callbacks: HashMap<u32, u64>,
-    /// Host sync callbacks that make a synthetic GTK shell binding visible
-    /// only after the internal Aura shell bind has reached the compositor.
-    pub gtk_shell_capability_callbacks: HashMap<u32, u32>,
-    /// Host callback generations that drain stale text-input events before
-    /// reactivation of a reused v1 object.
-    pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
+    /// Host-only wl_callback barriers the proxy issued for itself, and what
+    /// each one waits for.
+    pub(crate) internal_callbacks: InternalCallbacks,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
@@ -1309,9 +1306,7 @@ impl Context {
             synthetic_feedback_refresh_pending: HashSet::new(),
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,
-            dmabuf_capability_callbacks: HashMap::new(),
-            gtk_shell_capability_callbacks: HashMap::new(),
-            text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
+            internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,

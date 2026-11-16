@@ -1595,7 +1595,7 @@ mod tests {
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
         assert_eq!(ctx.aura_surfaces.count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(
             ctx.client_to_host_queue
                 .iter()
@@ -1744,7 +1744,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
     }
 
     #[test]
@@ -1908,7 +1908,7 @@ mod tests {
             "the release must close the guest press delivered by text-input"
         );
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert_eq!(
             queued_window_bounds(&ctx),
             0,
@@ -1947,7 +1947,7 @@ mod tests {
             "the recovered pair is already balanced"
         );
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
@@ -2057,7 +2057,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(queued_window_bounds(&ctx), 1);
-        let barriers = ctx.window_placement.barrier_count();
+        let barriers = ctx.internal_callbacks.count();
 
         assert_eq!(
             handler.on_key(&mut ctx, 2, 130, key, WL_KEY_PRESSED),
@@ -2069,7 +2069,7 @@ mod tests {
             1,
             "a duplicate press must not place the window again"
         );
-        assert_eq!(ctx.window_placement.barrier_count(), barriers);
+        assert_eq!(ctx.internal_callbacks.count(), barriers);
         assert_eq!(
             ctx.guest_key_owner(keyboard, key),
             Some(GuestKeyOwner::CompositorShortcut)

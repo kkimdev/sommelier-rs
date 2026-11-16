@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::callback::queue_internal_sync;
 use crate::handler::display::queue_protocol_error;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
@@ -28,11 +29,12 @@ use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
-use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
+use crate::protocols::wayland::{wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
 use crate::state::{
-    Context, GlobalBinding, GtkShellState, HostGlobal, HostId, PendingDmabufGlobal,
+    Context, GlobalBinding, GtkShellState, HostGlobal, HostId, InternalCallback,
+    PendingDmabufGlobal,
 };
 use crate::wire::{Action, MessageBuilder};
 use log::error;
@@ -312,57 +314,6 @@ fn queue_internal_bind(
                 interface,
                 error
             );
-            false
-        }
-    }
-}
-
-fn queue_dmabuf_capability_barrier(ctx: &mut Context, generation: u64) -> bool {
-    let callback_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table
-        .track_host_interface_with_version(callback_id, "wl_callback".to_string(), 1);
-
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(callback_id);
-    match builder.try_build_message(1, wl_display::REQ_SYNC) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.dmabuf_capability_callbacks
-                .insert(callback_id, generation);
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Unable to encode linux-dmabuf capability barrier for generation {}: {}",
-                generation,
-                error
-            );
-            ctx.shadow_table.remove_host_interface(callback_id);
-            false
-        }
-    }
-}
-
-fn queue_gtk_shell_capability_barrier(ctx: &mut Context, gtk_shell_id: u32) -> bool {
-    let callback_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table
-        .track_host_interface_with_version(callback_id, "wl_callback".to_string(), 1);
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(callback_id);
-    match builder.try_build_message(1, wl_display::REQ_SYNC) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.gtk_shell_capability_callbacks
-                .insert(callback_id, gtk_shell_id);
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Unable to encode GTK shell capability barrier for object {}: {}",
-                gtk_shell_id,
-                error
-            );
-            ctx.shadow_table.remove_host_interface(callback_id);
             false
         }
     }
@@ -776,9 +727,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 host_id,
             );
             if bound && can_synthesize_feedback {
-                if !queue_dmabuf_capability_barrier(ctx, generation) {
-                    ctx.fatal_protocol_error = true;
-                }
+                queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
             } else if !bound {
                 ctx.fatal_protocol_error = true;
             }
@@ -1210,9 +1159,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
             ctx.gtk_shells
                 .insert(*guest_new_id, GtkShellState::default());
-            if !queue_gtk_shell_capability_barrier(ctx, *guest_new_id) {
-                ctx.fatal_protocol_error = true;
-            }
+            queue_internal_sync(
+                ctx,
+                InternalCallback::GtkShellCapabilities {
+                    gtk_shell: *guest_new_id,
+                },
+            );
             return Action::Drop;
         }
 
@@ -1313,8 +1265,8 @@ impl wl_fixes::WlFixesHandler for RegistryHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_global_version, keyboard_extension_version, queue_dmabuf_capability_barrier,
-        should_bind_internal_dmabuf, RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
+        advertised_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
+        RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
     };
     use crate::handler::callback::CallbackHandler;
     use crate::handler::linux_dmabuf::LinuxDmabufHandler;
@@ -1326,7 +1278,7 @@ mod tests {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_fixes::WlFixesHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-    use crate::state::{Context, HostGlobal, HostId};
+    use crate::state::{Context, HostGlobal, HostId, InternalCallback};
     use crate::wire::Action;
 
     #[test]
@@ -1342,30 +1294,6 @@ mod tests {
             should_bind_internal_dmabuf(false, true),
             "a virtwl channel with dmabuf support must be probed and bound even \
              when the guest-facing GPU path is disabled"
-        );
-    }
-
-    #[test]
-    fn dmabuf_capability_barrier_is_a_tracked_host_callback() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert!(queue_dmabuf_capability_barrier(&mut ctx, 9));
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
-            1,
-            "wl_display must own the sync request"
-        );
-        assert_eq!(
-            u16::from_ne_bytes(message[4..6].try_into().unwrap()),
-            crate::protocols::wayland::wl_display::REQ_SYNC
-        );
-        let callback_id = u32::from_ne_bytes(message[8..12].try_into().unwrap());
-        assert_eq!(ctx.dmabuf_capability_callbacks.get(&callback_id), Some(&9));
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(callback_id),
-            Some(&"wl_callback".to_string())
         );
     }
 
@@ -1482,10 +1410,20 @@ mod tests {
         assert!(ctx.gtk_shells.contains_key(&50));
         assert!(ctx.host_to_client_queue.is_empty());
         let callback_id = ctx
-            .gtk_shell_capability_callbacks
+            .client_to_host_queue
             .iter()
-            .find_map(|(&callback_id, &shell_id)| (shell_id == 50).then_some(callback_id))
+            .rev()
+            .find(|(message, _)| {
+                message[0..4] == 1u32.to_ne_bytes()
+                    && u16::from_ne_bytes(message[4..6].try_into().unwrap())
+                        == crate::protocols::wayland::wl_display::REQ_SYNC
+            })
+            .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
             .expect("GTK capability callback");
+        assert_eq!(
+            ctx.internal_callbacks.get(HostId(callback_id)),
+            Some(InternalCallback::GtkShellCapabilities { gtk_shell: 50 })
+        );
         ctx.last_sender_id = callback_id;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
@@ -1657,7 +1595,7 @@ mod tests {
             })
         );
         assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert!(ctx.dmabuf_capability_callbacks.is_empty());
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert_eq!(
             ctx.client_to_host_queue.len(),
             1,

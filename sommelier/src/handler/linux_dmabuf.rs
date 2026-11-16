@@ -192,10 +192,7 @@ pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, generation: u64) -> 
 
 pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation: u64) {
     let referenced = ctx.host_dmabuf_generation == Some(generation)
-        || ctx
-            .dmabuf_capability_callbacks
-            .values()
-            .any(|&value| value == generation)
+        || ctx.internal_callbacks.awaits_dmabuf_generation(generation)
         || ctx
             .dmabuf_guest_generations
             .values()
