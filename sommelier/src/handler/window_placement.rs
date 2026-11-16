@@ -25,7 +25,22 @@ limitations under the License.
 //! the translation of `zaura_toplevel.configure` into the guest's
 //! `xdg_toplevel.configure`. Its per-connection state lives in
 //! [`crate::state::WindowPlacementState`]; protocol handlers translate wire
-//! events and delegate here.
+//! events and delegate here, one call per event:
+//!
+//! | Caller | Entry point |
+//! | :--- | :--- |
+//! | consumed placement chord (`wl_keyboard.key`) | [`place_focused`] |
+//! | `xdg_surface.get_toplevel`, after dispatch | [`attach_toplevel`] |
+//! | `zaura_shell` bound late | [`attach_recorded_toplevels`] |
+//! | XDG role teardown | [`release_toplevel`] |
+//! | XDG and GTK application IDs | [`apply_arc_identity`] |
+//! | `wl_callback.done` | [`complete_barrier`] |
+//! | `xdg_surface.configure` | [`hold_surface_configure`] |
+//! | `xdg_toplevel.configure` | [`hold_toplevel_configure`] |
+//! | `zaura_toplevel.configure` | [`translate_aura_configure`] |
+//!
+//! The host Aura surface is not placement's: XDG and GTK metadata share it,
+//! so `crate::handler::compositor::ensure_host_zaura_surface` owns it.
 
 use crate::handler::compositor::{aura_object_version, ensure_host_zaura_surface};
 use crate::protocols::aura_shell::zaura_shell::{
@@ -57,12 +72,16 @@ const _: () = assert!(
         && REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE <= PLACEMENT_TOPLEVEL_SINCE
 );
 
+// ── Placing the focused window ────────────────────────────────────────────
+
 /// Why a consumed placement chord did not move the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlacementSkip {
     /// The keyboard focus is not on an xdg_toplevel.
     NoFocusedToplevel,
-    /// The focused xdg_toplevel has no host object.
+    /// The focused xdg_toplevel has no host object. The role maps keep only
+    /// mapped toplevels, so this guards a cross-owner lookup rather than a
+    /// state the current code produces.
     UnmappedToplevel,
     /// No output with complete metadata can host the surface (see
     /// `OutputRegistry::for_surface`).
@@ -218,6 +237,8 @@ pub(crate) fn place_focused(
     );
     Ok(())
 }
+
+// ── ARC policy identity and the Aura toplevel ─────────────────────────────
 
 /// Queue the surface's ARC policy identity to its host Aura surface, once.
 ///
@@ -376,10 +397,10 @@ pub(crate) fn attach_recorded_toplevels(ctx: &mut Context) {
 
 /// Release the placement Aura toplevel of a guest XDG toplevel.
 ///
-/// Every path that ends the XDG role (its destructor, or the destruction of
-/// its xdg_surface or wl_surface) calls this before the role's own host
-/// destructor, so the host never holds an Aura child whose parent is gone.
-/// Does nothing when the toplevel has no Aura toplevel.
+/// Called when the XDG role ends: by the `xdg_toplevel` destructor, before
+/// it queues the role's host destructor, and when the `xdg_surface` or
+/// `wl_surface` beneath the role is destroyed. Does nothing when the
+/// toplevel has no Aura toplevel.
 pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
     // A toplevel can be destroyed while a placement barrier is still in
     // flight. The owner keeps the callback tracked until its terminal host
@@ -409,6 +430,8 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
             .retire_host_interface(zaura_toplevel_host_id);
     }
 }
+
+// ── Bounds barrier and configures ─────────────────────────────────────────
 
 /// Queue a host `wl_display.sync` immediately after a
 /// `zaura_toplevel.set_window_bounds` request.

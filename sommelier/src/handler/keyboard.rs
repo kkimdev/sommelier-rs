@@ -23,6 +23,8 @@ limitations under the License.
 //! Keys listed in `SOMMELIER_ACCELERATORS` are acked as `NOT_HANDLED` (host
 //! runs the accelerator, key is not forwarded to guest). All other keys are
 //! acked as `HANDLED` (guest receives the key, host skips the accelerator).
+//! A chord bound to a placement action is consumed here and placed by
+//! [`crate::handler::window_placement::place_focused`].
 //!
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 

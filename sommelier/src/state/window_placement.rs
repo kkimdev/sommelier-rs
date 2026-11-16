@@ -26,9 +26,9 @@ limitations under the License.
 //! cannot update one side of an association, or retire a toplevel, without
 //! the matching cleanup.
 //!
-//! Wire encoding stays in the protocol handlers; this type only answers
-//! ownership questions and returns the IDs whose host teardown the caller must
-//! perform.
+//! Wire encoding stays in `crate::handler::window_placement`; this type only
+//! answers ownership questions and returns the IDs whose host teardown the
+//! caller must perform.
 
 use std::collections::{HashMap, HashSet};
 
