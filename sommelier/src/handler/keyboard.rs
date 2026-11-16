@@ -1033,36 +1033,27 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             WL_KEY_PRESSED | WL_KEY_REPEATED => self.classify_key(ctx, host_keyboard_id, key),
             _ => KeyClass::Guest,
         };
-        let compositor_shortcut = match state {
-            // Placement is a side effect, so arbitrate ownership first, with
-            // the one contract in `GuestKeyOwner::admits_compositor_shortcut`.
-            // A duplicate press of a consumed shortcut stays consumed without
-            // placing the window again.
-            WL_KEY_PRESSED => match (guest_owner, key_class) {
-                (Some(GuestKeyOwner::CompositorShortcut), _) => true,
-                (owner, KeyClass::Placement(action))
-                    if GuestKeyOwner::admits_compositor_shortcut(owner) =>
-                {
-                    // The policy owns every matched chord, so the chord is
-                    // consumed whether or not the window can move now; a
-                    // skip must not leak the key to the guest. Release and
-                    // repeat follow the CompositorShortcut owner claimed
-                    // below.
-                    if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
-                        log::log!(
-                            reason.log_level(),
-                            "window layout {:?} skipped for keyboard {}: {:?}",
-                            action,
-                            host_keyboard_id.0,
-                            reason
-                        );
-                    }
-                    true
+        // Only the press that claims an unowned key generation for a
+        // placement chord is routed here, because it runs placement (a side
+        // effect) first. A duplicate press, a repeat and a release are sent
+        // as physical events: the reducer's `arbitrate` routes them to the
+        // channel that owns the generation (see
+        // `GuestKeyOwner::admits_compositor_shortcut`).
+        let claims_shortcut = match (state, guest_owner, key_class) {
+            (WL_KEY_PRESSED, None, KeyClass::Placement(action)) => {
+                // The policy owns every matched chord, so the chord is
+                // consumed whether or not the window can move now; a skip
+                // must not leak the key to the guest.
+                if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
+                    log::log!(
+                        reason.log_level(),
+                        "window layout {:?} skipped for keyboard {}: {:?}",
+                        action,
+                        host_keyboard_id.0,
+                        reason
+                    );
                 }
-                _ => false,
-            },
-            WL_KEY_REPEATED | WL_KEY_RELEASED => {
-                guest_owner == Some(GuestKeyOwner::CompositorShortcut)
+                true
             }
             _ => false,
         };
@@ -1076,47 +1067,30 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
+                // A Sommelier-owned shortcut is not guest input, and neither
+                // is a host accelerator: neither may become an IME recovery
+                // candidate if peek_key raced ahead of this event.
+                let compositor_shortcut =
+                    claims_shortcut || guest_owner == Some(GuestKeyOwner::CompositorShortcut);
                 let host_accelerator =
                     !compositor_shortcut && key_class == KeyClass::HostAccelerator;
-                if host_accelerator {
-                    // A host accelerator can also be visible through peek_key.
-                    // It must never become a later IME recovery candidate.
+                if compositor_shortcut || host_accelerator {
                     Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
                 }
-                if compositor_shortcut {
-                    // A Sommelier-owned shortcut is not guest input and must
-                    // not become an IME recovery candidate if peek_key raced
-                    // ahead of the regular keyboard event.
-                    Self::invalidate_peek_key_press(ctx, host_keyboard_id, key);
-                }
-                if compositor_shortcut {
-                    ctx.transition_guest_key(
-                        host_keyboard_id,
-                        key,
-                        GuestKeyEvent::CompositorShortcutPress,
-                    )
+                let event = if claims_shortcut {
+                    GuestKeyEvent::CompositorShortcutPress
                 } else {
-                    ctx.transition_guest_key(
-                        host_keyboard_id,
-                        key,
-                        GuestKeyEvent::PhysicalPress {
-                            repeated,
-                            host_accelerator,
-                            ime_repeat_active: backspace_repeat_active,
-                        },
-                    )
-                }
+                    GuestKeyEvent::PhysicalPress {
+                        repeated,
+                        host_accelerator,
+                        ime_repeat_active: backspace_repeat_active,
+                    }
+                };
+                ctx.transition_guest_key(host_keyboard_id, key, event)
             }
             WL_KEY_RELEASED => {
-                let decision = if compositor_shortcut {
-                    ctx.transition_guest_key(
-                        host_keyboard_id,
-                        key,
-                        GuestKeyEvent::CompositorShortcutRelease,
-                    )
-                } else {
-                    ctx.transition_guest_key(host_keyboard_id, key, GuestKeyEvent::PhysicalRelease)
-                };
+                let decision =
+                    ctx.transition_guest_key(host_keyboard_id, key, GuestKeyEvent::PhysicalRelease);
                 if key == EVDEV_KEY_BACKSPACE && decision.ends_repeat {
                     if let Some(guest_seat) = guest_seat {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
