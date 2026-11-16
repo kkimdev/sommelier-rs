@@ -249,6 +249,15 @@ other containers or VMs pick a random block and offset, which makes overlap
 unlikely but not impossible. A block is never refilled, so after its identities
 are exhausted new surfaces skip the ARC policy until the proxy restarts.
 
+`WindowPlacementState` in `sommelier/src/state/window_placement.rs` is the
+single owner of this policy's per-connection state: the per-surface ARC
+identities, the host Aura surface/toplevel associations, the host-sync bounds
+barriers, and the configures held behind them. Handlers query and mutate that
+state only through its methods, and surface/toplevel teardown releases it in
+one place. [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
+explains the ARC application-ID namespaces, the identity allocator, and why
+`.session.*` restore identities are never fabricated.
+
 ## CI and release workflow
 
 The `virtwl` branch CI builds x86_64 and aarch64, runs executable tests on

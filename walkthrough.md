@@ -778,3 +778,57 @@ Still unverified: multi-monitor placement (this host exposes one output),
 rotated or portrait-native panels, and popups on a toplevel repaired through
 the late zaura_shell path. Logs are kept in the untracked local evidence
 directory `_local/evidence/pr9-hostval-2026-11-16/` in the primary checkout.
+
+## 2026-11-16 — Re-deriving PR #10 on the merged core
+
+The old PR #10 refactor (`822a990`, revised by `50cd8cd`) was written against
+the pre-review placement core and no longer cherry-picks. Its intent was
+re-applied to the merged PR #9 core as a pure refactor: the placement state
+that was spread across `Context` fields and handler-local bookkeeping now has
+one owner, `WindowPlacementState` in `sommelier/src/state/window_placement.rs`
+(`Context::window_placement`).
+
+What moved into `WindowPlacementState`:
+
+- Policy gate: `window_bounds_as_arc` and `arc_id_allocator`, including the
+  `SOMMELIER_WINDOW_BOUNDS_AS_ARC` / allocator fail-closed resolution
+  (`from_environment`, `uses_arc_bounds`).
+- ARC identities: `arc_application_ids` and `arc_application_ids_applied`
+  (`arc_application_id`, which replaces `compositor::ensure_arc_application_id`;
+  `arc_application_id_applied`, `mark_…`, and `unmark_…` for the
+  `apply_window_layout` rollback). `ARC_APPLICATION_ID_PREFIX` moved with them.
+- Aura associations: `wl_surface_to_zaura_surface` and
+  `xdg_toplevel_to_zaura_toplevel`, plus a reverse toplevel map that replaces
+  the linear search in `zaura_toplevel.configure`.
+- Barriers and held configures: `window_bounds_barriers`,
+  `active_window_bounds_barriers`, `pending_window_bounds_configures`, and
+  `pending_window_bounds_surface_configures` (`register_barrier`,
+  `complete_barrier`, `has_active_barrier`, `hold_configure`,
+  `hold_surface_configure`). The two `PendingWindowBounds*` types moved too.
+- Cleanup: `release_surface` retires a surface's ARC identity, applied flag, and
+  Aura surface association; `take_aura_toplevel` retires the toplevel
+  association, its active barrier gate, and its held configures, while older
+  callbacks stay owned until their terminal `done`.
+
+Wire encoding, request ordering, and rollback stay in the handlers, so
+shortcut ownership arbitration in `on_key`, the Aura scale work area,
+version-filtered configure states, `zaura_toplevel.release` before
+`xdg_toplevel.destroy`, and the placement-batch rollback with ARC identity
+re-allow are unchanged.
+
+Dropped from `822a990`/`50cd8cd` because they only applied to the old core:
+the `SOMMELIER_WINDOW_BOUNDS_SELF_PARENT` backend and `WindowPlacementMode`,
+per-toplevel origin tracking and prediction, the fixed
+`org.chromium.arc.2147483647` / `.session.*` identities (superseded by the
+reviewed `arc_task_ids` allocator), the `window_placement` renames, and the
+GTK change that resolves the Aura surface lazily instead of using
+`GtkSurfaceState::host_zaura_surface_id` (it would send startup IDs and D-Bus
+metadata to Aura surfaces created after the GTK surface, which is a behavior
+change). `sommelier/docs/ARC_TASK_AND_SESSION_IDS.md` is included with its
+fixed-ID section rewritten to describe the current allocator.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 609 passed /
+1 ignored (600 before plus 9 `WindowPlacementState` unit tests), sample GUI 12,
+codegen 7, `gui_smoke` 0 run / 1 ignored; strict Clippy on all targets,
+`cargo fmt --check`, and `git diff --check` pass. No Sommelier process was
+started or restarted.

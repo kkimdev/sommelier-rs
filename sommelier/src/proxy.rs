@@ -519,17 +519,17 @@ impl Client {
                                 guest_xdg_toplevel_id,
                             )
                         {
-                            if self.ctx.window_bounds_as_arc {
+                            if self.ctx.window_placement.uses_arc_bounds() {
                                 // Allocate the ARC policy identity only after
                                 // the generated dispatcher has accepted and
                                 // mapped the new role. Exhaustion fails closed:
                                 // do not create an Aura child that placement
                                 // could never authorize.
-                                if crate::handler::compositor::ensure_arc_application_id(
-                                    &mut self.ctx,
-                                    wl_surface_guest_id,
-                                )
-                                .is_some()
+                                if self
+                                    .ctx
+                                    .window_placement
+                                    .arc_application_id(wl_surface_guest_id)
+                                    .is_some()
                                 {
                                     let _ = crate::handler::compositor::ensure_zaura_toplevel(
                                         &mut self.ctx,
@@ -1253,11 +1253,14 @@ mod tests {
             false,
             false,
         );
-        client.ctx.window_bounds_as_arc = true;
-        client.ctx.arc_id_allocator = Some(crate::arc_task_ids::ArcIdAllocator::for_test(
-            crate::arc_task_ids::ARC_ID_POOL_START,
-            crate::arc_task_ids::ARC_ID_POOL_START + 16,
-        ));
+        client.ctx.window_placement.set_arc_bounds_for_test(true);
+        client
+            .ctx
+            .window_placement
+            .set_arc_id_allocator_for_test(Some(crate::arc_task_ids::ArcIdAllocator::for_test(
+                crate::arc_task_ids::ARC_ID_POOL_START,
+                crate::arc_task_ids::ARC_ID_POOL_START + 16,
+            )));
         client.ctx.host_zaura_shell_id = Some(40);
         client.ctx.host_zaura_shell_version = 38;
         client.ctx.shadow_table.map_id(10, 20);
@@ -1279,7 +1282,7 @@ mod tests {
             "a request from a pending xdg_surface must terminate the session"
         );
         assert!(
-            client.ctx.xdg_toplevel_to_zaura_toplevel.is_empty(),
+            client.ctx.window_placement.aura_toplevel_count() == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
         );
     }
