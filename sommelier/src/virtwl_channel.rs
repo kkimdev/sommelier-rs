@@ -460,8 +460,9 @@ mod tests {
         add_nonblocking_flag, close_raw_fds, close_returned_fd, dmabuf_probe_supported,
         owned_fds_from_txn, VirtWaylandChannel, DEFAULT_BUFFER_SIZE, MAX_SEND_SIZE,
     };
+    use crate::protocols::wayland::wl_display;
     use crate::virtwl::virtwl_ioctl_txn;
-    use crate::wire::MessageBuilder;
+    use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
     use nix::fcntl::OFlag;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
@@ -532,7 +533,10 @@ mod tests {
         let mut sync = MessageBuilder::new();
         sync.write_u32(2);
         channel
-            .send(&sync.build_message(1, 0), &[])
+            .send(
+                &sync.build_message(WL_DISPLAY_ID, wl_display::REQ_SYNC),
+                &[],
+            )
             .await
             .expect("send wl_display.sync through live VirtWL");
         let (reply, fds) = tokio::time::timeout(Duration::from_secs(5), recv_task)

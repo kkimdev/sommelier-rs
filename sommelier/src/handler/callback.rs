@@ -18,13 +18,8 @@ use crate::protocols;
 use crate::protocols::wayland::wl_callback::WlCallbackHandler;
 use crate::protocols::wayland::wl_display::REQ_SYNC;
 use crate::state::{Context, HostId, InternalCallback};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
 use log::debug;
-
-/// The `wl_display` singleton is object 1 on every connection.
-const WL_DISPLAY_ID: u32 = 1;
-/// `wl_callback` has only ever had version 1.
-const WL_CALLBACK_VERSION: u32 = 1;
 
 pub struct CallbackHandler;
 
@@ -40,10 +35,9 @@ pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback
     ctx.shadow_table.track_host_interface_with_version(
         callback.0,
         "wl_callback".to_string(),
-        WL_CALLBACK_VERSION,
+        protocols::wayland::wl_callback::VERSION,
     );
-    let registered = ctx.internal_callbacks.register(callback, waits_for);
-    debug_assert!(registered, "a newly allocated host ID cannot be pending");
+    ctx.internal_callbacks.register(callback, waits_for);
     let mut builder = MessageBuilder::new();
     builder.write_u32(callback.0);
     let message = builder.build_message(WL_DISPLAY_ID, REQ_SYNC);
@@ -107,22 +101,15 @@ impl WlCallbackHandler for CallbackHandler {
             // 1. Send done event to client
             let mut builder = MessageBuilder::new();
             builder.write_u32(callback_data);
-
-            if let Ok(done_msg) =
-                builder.try_build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE)
-            {
-                ctx.host_to_client_queue.push((done_msg, Vec::new()));
-            }
+            let done = builder.build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE);
+            ctx.host_to_client_queue.push((done, Vec::new()));
 
             // 2. Send delete_id to client
-            let mut builder2 = MessageBuilder::new();
-            builder2.write_u32(guest_id);
-
-            if let Ok(del_msg) =
-                builder2.try_build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
-            {
-                ctx.host_to_client_queue.push((del_msg, Vec::new()));
-            }
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(guest_id);
+            let delete_id =
+                builder.build_message(WL_DISPLAY_ID, protocols::wayland::wl_display::EVT_DELETE_ID);
+            ctx.host_to_client_queue.push((delete_id, Vec::new()));
 
             // The terminal event destroys the callback on both sides, but the
             // host numeric ID cannot be reused until its later delete_id.
@@ -191,10 +178,10 @@ mod tests {
         );
         ctx.dmabuf_capabilities.entry(generation).or_default();
         ctx.host_dmabuf_generation = Some(generation);
-        assert!(ctx.internal_callbacks.register(
+        ctx.internal_callbacks.register(
             HostId(callback_id),
             InternalCallback::DmabufCapabilities { generation },
-        ));
+        );
         ctx.last_sender_id = callback_id;
 
         let mut handler = CallbackHandler;

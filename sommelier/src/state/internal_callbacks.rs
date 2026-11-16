@@ -57,21 +57,14 @@ pub(crate) struct InternalCallbacks {
 }
 
 impl InternalCallbacks {
-    /// Record what a newly issued callback waits for.
-    ///
-    /// # Returns
-    ///
-    /// `false`, recording nothing, when `callback` is already pending.
-    #[must_use = "a callback ID that is already pending is a bookkeeping bug"]
-    pub(crate) fn register(&mut self, callback: HostId, waits_for: InternalCallback) -> bool {
-        if self.by_callback.contains_key(&callback) {
-            return false;
-        }
-        self.by_callback.insert(callback, waits_for);
-        true
+    /// Record what a newly issued callback waits for. Its host ID was just
+    /// allocated, so it cannot be pending already.
+    pub(crate) fn register(&mut self, callback: HostId, waits_for: InternalCallback) {
+        let previous = self.by_callback.insert(callback, waits_for);
+        debug_assert!(previous.is_none(), "a pending callback ID was reused");
     }
 
-    /// Retire a callback at its terminal `done`, or when it was never sent.
+    /// Retire a callback at its terminal `done`.
     ///
     /// # Returns
     ///
@@ -107,11 +100,7 @@ mod tests {
     fn a_callback_is_pending_from_register_until_complete() {
         let mut callbacks = InternalCallbacks::default();
         let waits_for = InternalCallback::DmabufCapabilities { generation: 7 };
-        assert!(callbacks.register(HostId(40), waits_for));
-        assert!(!callbacks.register(
-            HostId(40),
-            InternalCallback::GtkShellCapabilities { gtk_shell: 3 }
-        ));
+        callbacks.register(HostId(40), waits_for);
         assert_eq!(callbacks.get(HostId(40)), Some(waits_for));
         assert!(callbacks.awaits_dmabuf_generation(7));
         assert!(!callbacks.awaits_dmabuf_generation(8));

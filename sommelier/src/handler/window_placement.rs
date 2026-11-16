@@ -441,12 +441,12 @@ pub(crate) fn register_window_bounds_barrier_for_test(
     callback_host_id: u32,
     zaura_toplevel_host_id: u32,
 ) {
-    assert!(ctx.internal_callbacks.register(
+    ctx.internal_callbacks.register(
         HostId(callback_host_id),
         InternalCallback::WindowBoundsBarrier {
             zaura_toplevel: zaura_toplevel_host_id,
         },
-    ));
+    );
     ctx.window_placement
         .register_barrier(callback_host_id, zaura_toplevel_host_id);
 }

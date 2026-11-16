@@ -18,6 +18,9 @@ use std::convert::TryInto;
 use std::fmt;
 use std::os::unix::io::RawFd;
 
+/// The object ID of the `wl_display` singleton on every connection.
+pub const WL_DISPLAY_ID: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Forward,

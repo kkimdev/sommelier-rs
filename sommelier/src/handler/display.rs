@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, HostId};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
@@ -56,7 +56,7 @@ pub(crate) fn queue_protocol_error(
     builder.write_string(diagnostic);
     let _ = queue_message(
         &mut ctx.host_to_client_queue,
-        1,
+        WL_DISPLAY_ID,
         wl_display::EVT_ERROR,
         builder,
     );
@@ -76,7 +76,7 @@ pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
     builder.write_u32(guest_id);
     queue_message(
         &mut ctx.host_to_client_queue,
-        1,
+        WL_DISPLAY_ID,
         wl_display::EVT_DELETE_ID,
         builder,
     )
@@ -131,7 +131,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 
         queue_message(
             &mut ctx.client_to_host_queue,
-            1,
+            WL_DISPLAY_ID,
             wl_display::REQ_GET_REGISTRY,
             builder,
         );
@@ -151,7 +151,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 
         queue_message(
             &mut ctx.client_to_host_queue,
-            1,
+            WL_DISPLAY_ID,
             wl_display::REQ_SYNC,
             builder,
         );
@@ -195,7 +195,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 
             queue_message(
                 &mut ctx.host_to_client_queue,
-                1,
+                WL_DISPLAY_ID,
                 wl_display::EVT_DELETE_ID,
                 builder,
             );
@@ -233,7 +233,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 
         queue_message(
             &mut ctx.host_to_client_queue,
-            1,
+            WL_DISPLAY_ID,
             wl_display::EVT_ERROR,
             builder,
         );

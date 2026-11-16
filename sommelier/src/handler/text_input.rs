@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::callback::queue_internal_sync;
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::{wl_display, wl_keyboard};
+use crate::protocols::wayland::wl_keyboard;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
@@ -1317,72 +1318,46 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 }
 
+/// Deactivate a reused host text-input-v1 object behind a drain barrier
+/// ([`InternalCallback::TextInputDrained`]).
+///
+/// The ordered host stream is the proof: deactivate first, then sync.
+/// Draining rejects stale host events until the callback's `done`. Nothing
+/// is queued when the guest object is gone, or, as a fatal error, when its
+/// host object is not active.
 fn queue_host_deactivation_barrier(
     ctx: &mut Context,
     guest_id: u32,
     host_v1_id: u32,
     host_seat: u32,
-) -> bool {
-    let callback_id = HostId(ctx.shadow_table.allocate_host_id());
-
-    let mut deactivate = MessageBuilder::new();
-    deactivate.write_u32(host_seat);
-    let Ok(deactivate) = deactivate.try_build_message(host_v1_id, 1) else {
-        log::error!(
-            "Unable to encode text-input deactivation for guest {}",
-            guest_id
-        );
-        ctx.fatal_protocol_error = true;
-        return false;
+) {
+    let Some(state) = ctx.text_inputs.get(&guest_id) else {
+        return;
     };
-
-    let mut sync = MessageBuilder::new();
-    sync.write_u32(callback_id.0);
-    let Ok(sync) = sync.try_build_message(1, wl_display::REQ_SYNC) else {
-        log::error!(
-            "Unable to encode text-input activation barrier for guest {}",
-            guest_id
-        );
-        ctx.fatal_protocol_error = true;
-        return false;
-    };
-
-    ctx.shadow_table
-        .track_host_interface_with_version(callback_id.0, "wl_callback".to_string(), 1);
-    if !ctx.internal_callbacks.register(
-        callback_id,
-        InternalCallback::TextInputDrained {
-            text_input: guest_id,
-            host_text_input: host_v1_id,
-        },
-    ) {
-        log::error!("Text-input {} already has an activation barrier", guest_id);
-        ctx.shadow_table.remove_host_interface(callback_id.0);
-        ctx.fatal_protocol_error = true;
-        return false;
-    }
-
-    let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
-        ctx.internal_callbacks.complete(callback_id);
-        ctx.shadow_table.remove_host_interface(callback_id.0);
-        return false;
-    };
-    if !state.begin_host_draining(callback_id) {
-        ctx.internal_callbacks.complete(callback_id);
-        ctx.shadow_table.remove_host_interface(callback_id.0);
+    if !state.host_is_active() {
         log::error!(
             "Text-input {} was not active when its drain barrier was installed",
             guest_id
         );
         ctx.fatal_protocol_error = true;
-        return false;
+        return;
     }
-
-    // The ordered host stream is the proof: deactivate first, then sync.
-    // Draining rejects stale host events until callback.done.
+    let mut deactivate = MessageBuilder::new();
+    deactivate.write_u32(host_seat);
+    let deactivate = deactivate.build_message(host_v1_id, zwp_text_input_v1::REQ_DEACTIVATE);
     ctx.client_to_host_queue.push((deactivate, Vec::new()));
-    ctx.client_to_host_queue.push((sync, Vec::new()));
-    true
+    let callback = queue_internal_sync(
+        ctx,
+        InternalCallback::TextInputDrained {
+            text_input: guest_id,
+            host_text_input: host_v1_id,
+        },
+    );
+    let draining = ctx
+        .text_inputs
+        .get_mut(&guest_id)
+        .is_some_and(|state| state.begin_host_draining(callback));
+    debug_assert!(draining, "the host object was checked to be active above");
 }
 
 /// Complete one host activation barrier
@@ -2001,6 +1976,7 @@ mod tests {
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+    use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
 
