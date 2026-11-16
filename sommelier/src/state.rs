@@ -1562,14 +1562,16 @@ impl Context {
     /// Retire placement metadata as soon as the guest releases a wl_output.
     /// The shadow mapping itself remains reserved until the host's
     /// `wl_display.delete_id`, but a released output must never be selected
-    /// for a later placement operation.
+    /// for a later placement operation. It leaves `output_host_ids`, so it
+    /// needs no inactive marker either: keeping one would grow the set
+    /// forever.
     pub fn remove_output_state(&mut self, host_output_id: u32) {
         self.output_host_ids
             .retain(|candidate| *candidate != host_output_id);
         self.output_states.remove(&host_output_id);
         self.pending_output_states.remove(&host_output_id);
         self.output_host_global_bindings.remove(&host_output_id);
-        self.inactive_output_host_ids.insert(host_output_id);
+        self.inactive_output_host_ids.remove(&host_output_id);
         self.remove_output_from_surface_associations(host_output_id);
     }
 

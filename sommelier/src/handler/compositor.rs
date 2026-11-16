@@ -2759,6 +2759,35 @@ mod tests {
     }
 
     #[test]
+    fn released_outputs_leave_no_liveness_bookkeeping() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut handler = CompositorHandler;
+        // Output 20 lost its global before release; output 30 did not.
+        for (output_guest, output_host) in [(10, 20), (11, 30)] {
+            ctx.shadow_table.map_id(output_guest, output_host);
+            ctx.shadow_table
+                .track_interface_with_version(output_guest, "wl_output".into(), 3);
+            ctx.output_host_ids.push(output_host);
+            ctx.output_host_global_bindings
+                .insert(output_host, (output_host, 1));
+        }
+        ctx.deactivate_output_bindings(20, 1);
+        for output_guest in [10, 11] {
+            ctx.last_sender_id = output_guest;
+            assert_eq!(
+                WlOutputHandler::on_release(&mut handler, &mut ctx),
+                Action::Drop
+            );
+        }
+        assert!(ctx.output_host_ids.is_empty());
+        assert!(ctx.output_host_global_bindings.is_empty());
+        assert!(
+            ctx.inactive_output_host_ids.is_empty(),
+            "a released output must not stay in the inactive set forever"
+        );
+    }
+
+    #[test]
     fn releasing_unmapped_output_reports_a_protocol_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 10;
