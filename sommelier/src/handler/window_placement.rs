@@ -79,10 +79,6 @@ const _: () = assert!(
 pub(crate) enum PlacementSkip {
     /// The keyboard focus is not on an xdg_toplevel.
     NoFocusedToplevel,
-    /// The focused xdg_toplevel has no host object. The role maps keep only
-    /// mapped toplevels, so this guards a cross-owner lookup rather than a
-    /// state the current code produces.
-    UnmappedToplevel,
     /// No output with complete metadata can host the surface (see
     /// `OutputRegistry::for_surface`).
     NoUsableOutput,
@@ -110,7 +106,6 @@ impl PlacementSkip {
         match self {
             Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
             Self::NoFocusedToplevel
-            | Self::UnmappedToplevel
             | Self::NoUsableOutput
             | Self::NoAuraSurface
             | Self::ArcIdentityUnavailable => log::Level::Debug,
@@ -118,22 +113,42 @@ impl PlacementSkip {
     }
 }
 
-/// Resolve the focused guest xdg_toplevel and its backing wl_surface.
-fn active_xdg_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<(u32, u32)> {
+/// The xdg_toplevel a keyboard focuses, with the IDs placement needs.
+struct FocusedToplevel {
+    xdg_toplevel_guest_id: u32,
+    xdg_toplevel_host_id: u32,
+    wl_surface_guest_id: u32,
+}
+
+/// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
+fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
     let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id)?.0;
     let guest_seat_id = *ctx.keyboard_to_seat.get(&guest_keyboard_id)?;
-    let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
+    let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx
         .keyboard_focus
-        .keyboard_owns_surface(host_keyboard_id, active_surface)
+        .keyboard_owns_surface(host_keyboard_id, wl_surface_guest_id)
     {
         return None;
     }
-    ctx.xdg_toplevel_to_wl_surface
-        .iter()
-        .find_map(|(&xdg_toplevel_id, &surface_id)| {
-            (surface_id == active_surface).then_some((xdg_toplevel_id, surface_id))
-        })
+    let xdg_toplevel_guest_id =
+        ctx.xdg_toplevel_to_wl_surface
+            .iter()
+            .find_map(|(&xdg_toplevel_id, &surface_id)| {
+                (surface_id == wl_surface_guest_id).then_some(xdg_toplevel_id)
+            })?;
+    // `record_xdg_toplevel` records only mapped toplevels, and every path
+    // that unmaps one removes its record first, so the lookup cannot miss.
+    let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id);
+    debug_assert!(
+        xdg_toplevel_host_id.is_some(),
+        "recorded xdg_toplevel {xdg_toplevel_guest_id} has no host object"
+    );
+    Some(FocusedToplevel {
+        xdg_toplevel_guest_id,
+        xdg_toplevel_host_id: xdg_toplevel_host_id?,
+        wl_surface_guest_id,
+    })
 }
 
 fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
@@ -197,12 +212,11 @@ pub(crate) fn place_focused(
         ctx.window_placement.uses_arc_bounds(),
         "classify_key yields placement actions only while the ARC bounds policy is active"
     );
-    let (guest_xdg_toplevel_id, guest_wl_surface_id) =
-        active_xdg_toplevel(ctx, host_keyboard_id).ok_or(PlacementSkip::NoFocusedToplevel)?;
-    let host_xdg_toplevel_id = ctx
-        .shadow_table
-        .get_host_id(guest_xdg_toplevel_id)
-        .ok_or(PlacementSkip::UnmappedToplevel)?;
+    let FocusedToplevel {
+        xdg_toplevel_guest_id: guest_xdg_toplevel_id,
+        xdg_toplevel_host_id: host_xdg_toplevel_id,
+        wl_surface_guest_id: guest_wl_surface_id,
+    } = focused_toplevel(ctx, host_keyboard_id).ok_or(PlacementSkip::NoFocusedToplevel)?;
     let (output_host_id, output) = ctx
         .shadow_table
         .get_host_id(guest_wl_surface_id)
