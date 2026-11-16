@@ -1248,11 +1248,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 "wl_buffer".to_string(),
                 version,
             );
-            if crate::handler::shm::queue_host_buffer_destroy(ctx, buffer) {
-                ctx.shadow_table.mark_pending_destroy_host(buffer);
-            } else {
-                ctx.shadow_table.remove_host_interface(buffer);
-            }
+            crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
+            ctx.shadow_table.mark_pending_destroy_host(buffer);
             ctx.orphaned_dmabuf_params.remove(&host_params_id);
             ctx.pending_native_creates.remove(&HostId(host_params_id));
             // If delete_id for params arrived first, the host params interface
@@ -1288,11 +1285,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                     "wl_buffer".to_string(),
                     version,
                 );
-                if crate::handler::shm::queue_host_buffer_destroy(ctx, buffer) {
-                    ctx.shadow_table.mark_pending_destroy_host(buffer);
-                } else {
-                    ctx.shadow_table.remove_host_interface(buffer);
-                }
+                crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
+                ctx.shadow_table.mark_pending_destroy_host(buffer);
                 ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;

@@ -1106,40 +1106,23 @@ fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
     if ctx.shadow_table.get_host_id(guest_id) != Some(host_id) {
         return;
     }
-    let queued_destroy = queue_host_buffer_destroy(ctx, host_id);
+    queue_host_buffer_destroy(ctx, host_id);
     ctx.shadow_table.remove_guest_mapping(guest_id);
-    if queued_destroy {
-        if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
-            ctx.fatal_protocol_error = true;
-        }
-    } else {
-        // The connection is already fatal when the fixed-size destroy could
-        // not be queued, so no host object can safely remain addressable.
-        ctx.shadow_table.remove_host_interface(host_id);
+    if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
+        ctx.fatal_protocol_error = true;
     }
 }
 
-fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) -> bool {
-    let queued = queue_message(
-        &mut ctx.client_to_host_queue,
+fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
+    let destroy = MessageBuilder::new().build_message(
         params_id,
         crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::REQ_DESTROY,
-        MessageBuilder::new(),
-        Vec::new(),
     );
-    if queued {
-        // Keep the numeric ID reserved until the host's wl_display.delete_id
-        // acknowledgement arrives. The destroy request is ordered after all
-        // already-queued params requests.
-        ctx.shadow_table.mark_pending_destroy_host(params_id);
-    } else {
-        // An empty destroy request should never exceed the wire limit. If a
-        // future wire implementation rejects it, do not leave a local ID
-        // reservation behind after the host params object is unreachable.
-        ctx.shadow_table.remove_host_interface(params_id);
-        ctx.fatal_protocol_error = true;
-    }
-    queued
+    ctx.client_to_host_queue.push((destroy, Vec::new()));
+    // Keep the numeric ID reserved until the host's wl_display.delete_id
+    // acknowledgement arrives. The destroy request is ordered after all
+    // already-queued params requests.
+    ctx.shadow_table.mark_pending_destroy_host(params_id);
 }
 
 fn cleanup_direct_dmabuf_failure(
@@ -1151,29 +1134,17 @@ fn cleanup_direct_dmabuf_failure(
 ) {
     unmap_destination(dest_ptr, dest_size);
     if params_queued {
-        let _ = queue_host_params_destroy(ctx, params_id);
+        queue_host_params_destroy(ctx, params_id);
     } else {
         ctx.shadow_table.remove_host_interface(params_id);
     }
 }
 
-pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) -> bool {
-    let builder = MessageBuilder::new();
-    let queued = queue_message(
-        &mut ctx.client_to_host_queue,
-        host_id,
-        0,
-        builder,
-        Vec::new(),
-    );
-    if !queued {
-        // This is a fixed-size destructor request, so failure indicates a
-        // broken wire builder rather than a recoverable client error. Tear
-        // down the connection instead of pretending the host object was
-        // retired and allowing its ID to be reused.
-        ctx.fatal_protocol_error = true;
-    }
-    queued
+/// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
+pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
+    let destroy =
+        MessageBuilder::new().build_message(host_id, protocols::wayland::wl_buffer::REQ_DESTROY);
+    ctx.client_to_host_queue.push((destroy, Vec::new()));
 }
 
 fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
@@ -1270,13 +1241,12 @@ pub(crate) fn retire_eligible_buffers(ctx: &mut Context) {
         .collect();
 
     for (guest_id, host_id) in candidates {
-        if queue_host_buffer_destroy(ctx, host_id.0) {
-            // Keep the guest↔host mapping and empty registry generation
-            // reserved until wl_display.delete_id acknowledges the host
-            // destructor. Server-created generations are removed immediately
-            // because neither side emits delete_id.
-            retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
-        }
+        queue_host_buffer_destroy(ctx, host_id.0);
+        // Keep the guest↔host mapping and empty registry generation reserved
+        // until wl_display.delete_id acknowledges the host destructor.
+        // Server-created generations are removed immediately because neither
+        // side emits delete_id.
+        retire_destroyed_buffer_mapping(ctx, guest_id, host_id);
     }
 }
 
@@ -1841,7 +1811,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             // create_immed is processed before this destructor in the ordered
             // host stream. Reserve the params ID until wl_display.delete_id
             // acknowledges its destruction.
-            let _ = queue_host_params_destroy(ctx, params_id);
+            queue_host_params_destroy(ctx, params_id);
 
             ctx.shadow_table.map_id(id, host_buffer_id);
             ctx.shadow_table
@@ -2013,25 +1983,9 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 return Action::Drop;
             }
 
-            // wl_shm_pool.destroy()
-            let builder = MessageBuilder::new();
-            if !queue_message(
-                &mut ctx.client_to_host_queue,
-                host_pool_id,
-                1,
-                builder,
-                Vec::new(),
-            ) {
-                rollback_queued_host_messages(&mut ctx.client_to_host_queue, queue_start);
-                unmap_destination(dest_ptr, dest_size);
-                release_temporary_host_pool(ctx, host_pool_id);
-                queue_buffer_creation_error(
-                    ctx,
-                    pool_id,
-                    "unable to queue wl_shm pool destruction",
-                );
-                return Action::Drop;
-            }
+            let pool_destroy = MessageBuilder::new()
+                .build_message(host_pool_id, protocols::wayland::wl_shm_pool::REQ_DESTROY);
+            ctx.client_to_host_queue.push((pool_destroy, Vec::new()));
 
             // The three requests are emitted in one ordered stream:
             // create_pool, create_buffer, destroy. Once queued, a later
@@ -2185,9 +2139,8 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
         }
 
         if let Some(host_id) = host_id {
-            if queue_host_buffer_destroy(ctx, host_id) {
-                retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
-            }
+            queue_host_buffer_destroy(ctx, host_id);
+            retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
         }
         clear_surface_buffer_references(ctx, guest_id);
         Action::Drop
@@ -2209,10 +2162,9 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 return Action::Drop;
             }
             record_host_buffer_release(ctx, guest_id);
-            if queue_host_buffer_destroy(ctx, host_id) {
-                retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
-                clear_surface_buffer_references(ctx, guest_id);
-            }
+            queue_host_buffer_destroy(ctx, host_id);
+            retire_destroyed_buffer_mapping(ctx, guest_id, HostId(host_id));
+            clear_surface_buffer_references(ctx, guest_id);
             return Action::Drop;
         }
 

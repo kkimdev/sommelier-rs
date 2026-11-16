@@ -1679,12 +1679,9 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
         // Stop extension events and remove all local routing state.
         if let Some(host_ext_id) = state.host_ext_id {
-            push_msg(
-                &mut ctx.client_to_host_queue,
-                host_ext_id,
-                zcr_extended_text_input_v1::REQ_DESTROY,
-                MessageBuilder::new(),
-            );
+            let destroy = MessageBuilder::new()
+                .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_DESTROY);
+            ctx.client_to_host_queue.push((destroy, Vec::new()));
             ctx.shadow_table.mark_pending_destroy_host(host_ext_id);
         }
         // The v3 object is guest-facing but backed by a v1 host object whose
