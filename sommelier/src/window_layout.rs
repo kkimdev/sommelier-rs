@@ -602,6 +602,60 @@ mod tests {
         }
     }
 
+    /// The user-facing "Named actions" table must list every preset, each
+    /// once, with the rectangle `rect` defines.
+    #[test]
+    fn named_actions_doc_table_matches_the_presets() {
+        const DOC: &str = include_str!("../docs/WINDOW_SHORTCUT_CONFIGURATION.md");
+        let rows: Vec<(WindowLayoutAction, [f64; 4])> = DOC
+            .lines()
+            .skip_while(|line| line.trim() != "### Named actions")
+            .skip(1)
+            .skip_while(|line| !line.starts_with('|'))
+            .take_while(|line| line.starts_with('|'))
+            // The header row and the separator row.
+            .skip(2)
+            .map(|line| {
+                let cells: Vec<&str> = line
+                    .split('|')
+                    .map(|cell| cell.trim().trim_matches('`'))
+                    .filter(|cell| !cell.is_empty())
+                    .collect();
+                let [name, rect] = cells[..] else {
+                    panic!("a row has an action and a rectangle: {line:?}");
+                };
+                let action = WindowLayoutAction::from_name(name)
+                    .unwrap_or_else(|| panic!("unknown action {name:?}"));
+                let values: Vec<f64> = rect
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|value| value.trim().parse().expect("a number"))
+                    .collect();
+                let rect = values
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("four values: {line:?}"));
+                (action, rect)
+            })
+            .collect();
+
+        assert_eq!(rows.len(), PRESETS.len(), "one row per preset");
+        for preset in PRESETS {
+            assert_eq!(
+                rows.iter().filter(|(action, _)| *action == preset).count(),
+                1,
+                "{preset:?} appears once"
+            );
+        }
+        for (action, [x, y, width, height]) in rows {
+            assert_eq!(
+                NormalizedRect::new(x, y, width, height),
+                Ok(action.rect()),
+                "{action:?}"
+            );
+        }
+    }
+
     #[test]
     fn preset_names_parse_case_insensitively_and_reject_others() {
         let names = [

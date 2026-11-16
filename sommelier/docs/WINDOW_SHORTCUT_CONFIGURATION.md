@@ -142,8 +142,8 @@ action = "fullscreen"
 The environment list and the file share these names
 (`WindowLayoutAction::from_name` is the one name parser). Each stands for a
 fixed rectangle: `WindowLayoutAction::rect` in
-`sommelier/src/window_layout.rs` defines the values, a unit test there pins
-them, and this table presents them.
+`sommelier/src/window_layout.rs` defines the values, and a unit test keeps
+this table and the code in sync.
 
 | Action | Rectangle |
 | --- | --- |
