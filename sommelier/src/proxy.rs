@@ -519,29 +519,16 @@ impl Client {
                                 guest_xdg_toplevel_id,
                             )
                         {
-                            if self.ctx.window_placement.uses_arc_bounds() {
-                                // Allocate the ARC policy identity only after
-                                // the generated dispatcher has accepted and
-                                // mapped the new role. Exhaustion fails closed:
-                                // do not create an Aura child that placement
-                                // could never authorize.
-                                if self
-                                    .ctx
-                                    .window_placement
-                                    .arc_application_id(wl_surface_guest_id)
-                                    .is_some()
-                                {
-                                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
-                                        &mut self.ctx,
-                                        guest_xdg_toplevel_id,
-                                    );
-                                } else {
-                                    log::warn!(
-                                        "Unable to allocate ARC policy identity for wl_surface {}",
-                                        wl_surface_guest_id
-                                    );
-                                }
-                            }
+                            // Attach only after the generated dispatcher has
+                            // accepted and mapped the new role. The ID is not
+                            // needed here: a missing shell is retried when
+                            // zaura_shell is bound, and placement attaches
+                            // lazily through the same helper.
+                            let _ = crate::handler::compositor::attach_placement_toplevel(
+                                &mut self.ctx,
+                                guest_xdg_toplevel_id,
+                                wl_surface_guest_id,
+                            );
                         }
                     }
                     res

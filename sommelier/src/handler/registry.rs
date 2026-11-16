@@ -936,16 +936,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived. Their guest-side associations are recorded
                 // after a successful get_toplevel dispatch, so a late shell
-                // can safely attach the missing Aura child here as well.
-                for xdg_toplevel_guest_id in ctx
+                // can safely attach the missing Aura child here as well,
+                // through the same identity gate as get_toplevel. A role
+                // that still cannot attach is retried lazily by placement.
+                for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx
                     .xdg_toplevel_to_wl_surface
-                    .keys()
-                    .copied()
+                    .iter()
+                    .map(|(&toplevel, &surface)| (toplevel, surface))
                     .collect::<Vec<_>>()
                 {
-                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                    let _ = crate::handler::compositor::attach_placement_toplevel(
                         ctx,
                         xdg_toplevel_guest_id,
+                        wl_surface_guest_id,
                     );
                 }
             }
@@ -1828,6 +1831,46 @@ mod tests {
                 .values()
                 .any(|&output_id| output_id == output_host),
             "late shell binding must attach every already-bound output"
+        );
+    }
+
+    /// Bind zaura_shell after one XDG toplevel (guest 13 on wl_surface 12)
+    /// already exists, and return whether the retry attached its Aura
+    /// toplevel.
+    fn late_zaura_shell_attaches_existing_toplevel(arc_identity_available: bool) -> bool {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        if !arc_identity_available {
+            ctx.window_placement.set_arc_id_allocator_for_test(None);
+        }
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.map_id(12, 22);
+        ctx.shadow_table.map_id(13, 23);
+        ctx.xdg_toplevel_to_wl_surface.insert(13, 12);
+
+        let shell = "zaura_shell".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 11, &shell, 38),
+            Action::Drop
+        );
+        ctx.window_placement
+            .aura_toplevel_for_xdg_toplevel(13)
+            .is_some()
+    }
+
+    #[test]
+    fn late_zaura_shell_binding_attaches_toplevels_only_with_an_arc_identity() {
+        assert!(
+            late_zaura_shell_attaches_existing_toplevel(true),
+            "late shell binding must attach every recorded toplevel"
+        );
+        assert!(
+            !late_zaura_shell_attaches_existing_toplevel(false),
+            "a toplevel without an ARC identity can never be placed, so it \
+             must not get an Aura toplevel"
         );
     }
 

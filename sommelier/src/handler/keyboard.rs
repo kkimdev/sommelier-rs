@@ -93,11 +93,13 @@ enum PlacementSkip {
     /// The rectangle has an empty extent, an edge that rounds onto the work
     /// area border, or overflowing coordinates on this output.
     RectNotRepresentable,
-    /// The host Aura toplevel is unavailable (no or too old zaura_shell).
+    /// The host Aura toplevel cannot be attached: no ARC policy identity
+    /// could be allocated, or zaura_shell is missing or too old.
     NoAuraToplevel,
     /// The host Aura surface is unavailable (no zaura_shell).
     NoAuraSurface,
-    /// The surface's ARC policy identity could not be allocated or sent.
+    /// The surface's ARC policy identity could not be sent to its Aura
+    /// surface.
     ArcIdentityUnavailable,
     /// The ordering barrier for the bounds request could not be queued.
     BarrierUnavailable,
@@ -442,9 +444,12 @@ impl KeyboardHandler {
             .ok_or(PlacementSkip::NoUsableOutput)?;
         let (x, y, width, height) =
             Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
-        let zaura_toplevel_id =
-            crate::handler::compositor::ensure_zaura_toplevel(ctx, guest_xdg_toplevel_id)
-                .ok_or(PlacementSkip::NoAuraToplevel)?;
+        let zaura_toplevel_id = crate::handler::compositor::attach_placement_toplevel(
+            ctx,
+            guest_xdg_toplevel_id,
+            guest_wl_surface_id,
+        )
+        .ok_or(PlacementSkip::NoAuraToplevel)?;
         let zaura_surface_id =
             crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
                 .ok_or(PlacementSkip::NoAuraSurface)?;
@@ -465,7 +470,7 @@ impl KeyboardHandler {
         }
 
         // Keep every request emitted by this shortcut in one rollback
-        // boundary.  `ensure_zaura_toplevel`/`ensure_host_zaura_surface`
+        // boundary.  `attach_placement_toplevel`/`ensure_host_zaura_surface`
         // may already have staged setup requests above us, so the offset
         // must be captured immediately before the placement-owned batch.
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
@@ -2226,6 +2231,18 @@ mod tests {
         );
         assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+    }
+
+    #[test]
+    fn placement_without_an_arc_identity_creates_no_aura_toplevel() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        ctx.window_placement.set_arc_id_allocator_for_test(None);
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoAuraToplevel)
+        );
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
     }
 
     #[test]
