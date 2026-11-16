@@ -1310,7 +1310,8 @@ impl Context {
         let window_placement_shortcuts = if !window_placement.uses_arc_bounds() {
             if !window_placement_env.trim().is_empty() {
                 warn!(
-                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored unless SOMMELIER_WINDOW_BOUNDS_AS_ARC is set"
+                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS is ignored because the ARC bounds policy \
+                     is off (SOMMELIER_WINDOW_BOUNDS_AS_ARC unset, or no ARC task-ID block)"
                 );
             }
             Vec::new()
