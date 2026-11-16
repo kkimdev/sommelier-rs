@@ -691,7 +691,10 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::MessageBuilder;
+    use nix::sys::memfd::{memfd_create, MFdFlags};
+    use std::ffi::CString;
     use std::fs;
     use std::io::Write;
 
@@ -3149,28 +3152,36 @@ mod tests {
 
     #[test]
     fn early_output_cleanup_preserves_incoming_fd_ownership() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let mut output = vec![pipe_fds[1]];
-        close_pending_output_fds(&mut output, &[pipe_fds[1]]);
+        // A memfd has a unique inode for this ownership assertion; pipe
+        // read/write ends share an inode and eventfds share an anonymous-inode
+        // inode on Linux.
+        let incoming_name = CString::new("sommelier-proxy-incoming-fd-test").unwrap();
+        let incoming_fd = memfd_create(incoming_name.as_c_str(), MFdFlags::MFD_CLOEXEC)
+            .expect("memfd_create")
+            .into_raw_fd();
+        let incoming_identity = fd_identity(incoming_fd);
+        let mut output = vec![incoming_fd];
+        close_pending_output_fds(&mut output, &[incoming_fd]);
 
         // The incoming connection still owns this descriptor; the cleanup
         // helper must not close it before the connection drains/drops.
-        assert_ne!(unsafe { libc::fcntl(pipe_fds[1], libc::F_GETFD) }, -1);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        assert!(
+            any_fd_has_identity(incoming_identity),
+            "protected incoming descriptor must remain open"
+        );
+        assert_eq!(unsafe { libc::close(incoming_fd) }, 0);
 
-        let mut second_pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
-        let fd = second_pipe[1];
+        let output_name = CString::new("sommelier-proxy-output-fd-test").unwrap();
+        let fd = memfd_create(output_name.as_c_str(), MFdFlags::MFD_CLOEXEC)
+            .expect("memfd_create")
+            .into_raw_fd();
+        let output_identity = fd_identity(fd);
         let mut output = vec![fd];
         close_pending_output_fds(&mut output, &[]);
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        unsafe {
-            libc::close(second_pipe[0]);
-        }
+        assert!(
+            !any_fd_has_identity(output_identity),
+            "unprotected queued descriptor must be closed"
+        );
     }
 
     #[test]

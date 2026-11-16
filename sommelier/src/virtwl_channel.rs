@@ -354,13 +354,11 @@ impl VirtWaylandChannel {
             let txn = unsafe { &mut *(buf_ptr as *mut virtwl_ioctl_txn) };
 
             txn.len = data.len() as u32;
-            for (i, fd) in fds.iter().enumerate() {
-                txn.fds[i] = *fd;
-            }
-            // Fill remaining FDs with -1
-            for i in fds.len()..VIRTWL_SEND_MAX_ALLOCS {
-                txn.fds[i] = -1;
-            }
+            // `send` bounds `fds.len()` by VIRTWL_SEND_MAX_ALLOCS; unused
+            // slots are -1.
+            let (used, unused) = txn.fds.split_at_mut(fds.len());
+            used.copy_from_slice(fds);
+            unused.fill(-1);
 
             // Copy data after header
             unsafe {

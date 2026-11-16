@@ -1459,6 +1459,7 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
+    use crate::test_support::{any_fd_has_identity, fd_identity, TestFdIdentity};
     use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -1485,40 +1486,6 @@ mod tests {
             // into `File`, which owns it until the pending generation drops.
             sync_fds: vec![unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) }.into()],
         }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct TestFdIdentity {
-        device: libc::dev_t,
-        inode: libc::ino_t,
-    }
-
-    fn fd_identity(fd: i32) -> TestFdIdentity {
-        let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
-        assert_eq!(
-            unsafe { libc::fstat(fd, &mut metadata) },
-            0,
-            "stat test synchronization descriptor"
-        );
-        TestFdIdentity {
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-        }
-    }
-
-    fn any_fd_has_identity(identity: TestFdIdentity) -> bool {
-        std::fs::read_dir("/proc/self/fd")
-            .expect("read process descriptor directory")
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-            .filter_map(|fd| {
-                let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
-                (unsafe { libc::fstat(fd, &mut metadata) } == 0).then_some(TestFdIdentity {
-                    device: metadata.st_dev,
-                    inode: metadata.st_ino,
-                })
-            })
-            .any(|current| current == identity)
     }
 
     fn orphan_old_params_and_reuse_guest_id() -> (Context, LinuxDmabufHandler, i32, TestFdIdentity)
@@ -1585,6 +1552,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(attached_fd >= 1000);
+        let attached_identity = fd_identity(attached_fd);
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -1601,7 +1569,10 @@ mod tests {
             vec![attached_fd]
         ));
         assert!(queue.is_empty());
-        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
+        assert!(
+            !any_fd_has_identity(attached_identity),
+            "rejecting an oversized message must close its descriptors"
+        );
     }
 
     #[test]
