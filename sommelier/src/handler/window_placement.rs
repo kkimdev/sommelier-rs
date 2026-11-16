@@ -1385,6 +1385,55 @@ mod tests {
         );
     }
 
+    /// A `zaura_shell` older than `set_window_bounds` cannot place, so no
+    /// Aura toplevel is created for it; the first version that can, does.
+    #[test]
+    fn placement_toplevel_needs_a_shell_with_set_window_bounds() {
+        for (shell_version, expect_toplevel) in [
+            (PLACEMENT_TOPLEVEL_SINCE - 1, false),
+            (PLACEMENT_TOPLEVEL_SINCE, true),
+        ] {
+            let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
+                setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
+            ctx.host_zaura_shell_version = shell_version;
+            attach_toplevel(&mut ctx, xdg_toplevel_id, 100);
+            assert_eq!(
+                ctx.window_placement
+                    .aura_toplevel_for_xdg_toplevel(xdg_toplevel_id)
+                    .is_some(),
+                expect_toplevel,
+                "zaura_shell v{shell_version}"
+            );
+            assert_eq!(
+                ctx.client_to_host_queue.is_empty(),
+                !expect_toplevel,
+                "zaura_shell v{shell_version}"
+            );
+        }
+    }
+
+    /// Before `zaura_toplevel.release` the Aura toplevel has no destructor:
+    /// releasing the XDG role retires its ID without a request, and the ID
+    /// stays reserved for the connection.
+    #[test]
+    fn aura_toplevel_without_release_is_retired_silently() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.host_zaura_shell_version = REQ_RELEASE_AURA_TOPLEVEL_SINCE - 1;
+        let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
+        ctx.client_to_host_queue.clear();
+
+        release_toplevel(&mut ctx, xdg_toplevel_id);
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            ctx.window_placement
+                .aura_toplevel_for_xdg_toplevel(xdg_toplevel_id),
+            None
+        );
+        assert_eq!(ctx.shadow_table.get_host_interface(aura_id), None);
+        assert!(!ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(!ctx.shadow_table.is_host_id_available(aura_id));
+    }
+
     #[test]
     fn ensure_zaura_toplevel_requests_screen_coordinates() {
         let (mut ctx, xdg_toplevel_id, zaura_shell_host, _wl_surface_host) = setup_ctx();
