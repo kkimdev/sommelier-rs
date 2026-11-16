@@ -84,10 +84,12 @@ impl GtkShell1Handler for GtkShellHandler {
             return Action::Drop;
         };
 
+        // A new object takes its parent's version.
+        let version = ctx.shadow_table.guest_object_version_or_unknown(shell_id);
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
-            1,
+            version,
         );
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
@@ -247,6 +249,25 @@ mod tests {
         assert_eq!(
             ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id,
             WL_SURFACE_GUEST
+        );
+    }
+
+    #[test]
+    fn gtk_surface_takes_its_shell_version() {
+        let mut ctx = setup_ctx();
+        // Every vendored gtk-shell interface is v1, so an artificial shell
+        // version shows where the surface's version comes from.
+        let shell_version = 7;
+        ctx.shadow_table.track_interface_with_version(
+            GTK_SHELL,
+            "gtk_shell1".to_string(),
+            shell_version,
+        );
+        ctx.last_sender_id = GTK_SHELL;
+        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        assert_eq!(
+            ctx.shadow_table.guest_object_version(GTK_SURFACE),
+            Some(shell_version)
         );
     }
 

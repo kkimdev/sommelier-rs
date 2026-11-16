@@ -21,7 +21,7 @@ use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
-use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
+use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
@@ -880,10 +880,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     name,
                     HostGlobal {
                         interface: "gtk_shell1".to_string(),
-                        version: 1,
+                        version: gtk_shell1::VERSION,
                     },
                 );
-                let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+                let visible = queue_synthetic_global(ctx, name, "gtk_shell1", gtk_shell1::VERSION);
                 record_registry_global_visibility(ctx, name, visible);
                 return Action::Drop;
             }
@@ -908,10 +908,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 name,
                 HostGlobal {
                     interface: "gtk_shell1".to_string(),
-                    version: 1,
+                    version: gtk_shell1::VERSION,
                 },
             );
-            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", gtk_shell1::VERSION);
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
