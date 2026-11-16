@@ -305,15 +305,9 @@ impl ZauraOutputHandler for CompositorHandler {
         bottom: i32,
         right: i32,
     ) -> Action {
-        let zaura_output_id = ctx.last_sender_id;
-        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&zaura_output_id) else {
+        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
             return Action::Drop;
         };
-        if ctx.inactive_output_host_ids.contains(&wl_output_id)
-            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
-        {
-            return Action::Drop;
-        }
         if top < 0 || left < 0 || bottom < 0 || right < 0 {
             // Negative work-area insets are malformed. Clamping them to zero
             // would silently expand the usable area beyond the compositor's
@@ -333,9 +327,7 @@ impl ZauraOutputHandler for CompositorHandler {
         output.insets_left = left;
         output.insets_bottom = bottom;
         output.insets_right = right;
-        if !ctx.output_uses_done(wl_output_id) {
-            ctx.commit_output_state(wl_output_id);
-        }
+        publish_aura_output_update(ctx, wl_output_id);
         Action::Drop
     }
 
@@ -346,56 +338,36 @@ impl ZauraOutputHandler for CompositorHandler {
         if flags & CURRENT == 0 {
             return Action::Drop;
         }
-        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id) else {
+        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
             return Action::Drop;
         };
-        if ctx.inactive_output_host_ids.contains(&wl_output_id)
-            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
-        {
-            return Action::Drop;
-        }
         if scale == 0 {
             log::warn!("Ignoring invalid zaura_output.scale=0");
             return Action::Drop;
         }
         ctx.pending_output_state(wl_output_id).aura_current_scale = Some(scale);
-        if !ctx.output_uses_done(wl_output_id) {
-            ctx.commit_output_state(wl_output_id);
-        }
+        publish_aura_output_update(ctx, wl_output_id);
         Action::Drop
     }
 
     fn on_device_scale_factor(&mut self, ctx: &mut Context, scale: u32) -> Action {
-        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id) else {
+        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
             return Action::Drop;
         };
-        if ctx.inactive_output_host_ids.contains(&wl_output_id)
-            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
-        {
-            return Action::Drop;
-        }
         if scale == 0 {
             log::warn!("Ignoring invalid zaura_output.device_scale_factor=0");
             return Action::Drop;
         }
         ctx.pending_output_state(wl_output_id)
             .aura_device_scale_factor = Some(scale);
-        if !ctx.output_uses_done(wl_output_id) {
-            ctx.commit_output_state(wl_output_id);
-        }
+        publish_aura_output_update(ctx, wl_output_id);
         Action::Drop
     }
 
     fn on_logical_transform(&mut self, ctx: &mut Context, transform: i32) -> Action {
-        let zaura_output_id = ctx.last_sender_id;
-        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&zaura_output_id) else {
+        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
             return Action::Drop;
         };
-        if ctx.inactive_output_host_ids.contains(&wl_output_id)
-            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
-        {
-            return Action::Drop;
-        }
         if !(0..=7).contains(&transform) {
             log::warn!(
                 "Ignoring invalid zaura_output.logical_transform={} for host output {}",
@@ -405,10 +377,26 @@ impl ZauraOutputHandler for CompositorHandler {
             return Action::Drop;
         }
         ctx.pending_output_state(wl_output_id).transform = transform;
-        if !ctx.output_uses_done(wl_output_id) {
-            ctx.commit_output_state(wl_output_id);
-        }
+        publish_aura_output_update(ctx, wl_output_id);
         Action::Drop
+    }
+}
+
+/// Resolves the host `wl_output` behind the current `zaura_output` event.
+/// Events for unknown, inactive, or releasing outputs are stale and must not
+/// update placement geometry.
+fn live_aura_output_host_id(ctx: &Context) -> Option<u32> {
+    let wl_output_id = *ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id)?;
+    (!ctx.inactive_output_host_ids.contains(&wl_output_id)
+        && !ctx.shadow_table.is_pending_destroy_host(wl_output_id))
+    .then_some(wl_output_id)
+}
+
+/// Publishes an Aura output update unless the output batches changes behind
+/// `wl_output.done`.
+fn publish_aura_output_update(ctx: &mut Context, wl_output_id: u32) {
+    if !ctx.output_uses_done(wl_output_id) {
+        ctx.commit_output_state(wl_output_id);
     }
 }
 // ChromiumOS reserves headroom around the i32 damage range before applying
