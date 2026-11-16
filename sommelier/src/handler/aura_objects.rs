@@ -29,7 +29,7 @@ limitations under the License.
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
-use crate::state::Context;
+use crate::state::{Context, HostAuraShell};
 use crate::wire::MessageBuilder;
 
 /// What the proxy needs to know about one kind of host Aura child.
@@ -108,24 +108,55 @@ pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -
     Some(child_host_id)
 }
 
-/// Release a host Aura child whose association owner has forgotten it.
-///
-/// From the child's `release` since-version on, the destructor is queued and
-/// the host ID stays reserved until the compositor acknowledges it with
-/// `wl_display.delete_id`, so a recycled ID never receives the late
-/// acknowledgement. Older children have no destructor: their dispatch
-/// metadata is retired so stale host events cannot reach them, and the
-/// numeric ID stays reserved for the rest of the connection.
+/// Release a host Aura child whose association owner has forgotten it (see
+/// [`release_host_only`]).
 ///
 /// Callers release a child before they queue the destructor of the object
 /// it extends, so the host never holds an Aura child whose parent is gone.
 pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
-    if aura_object_version(ctx, child_host_id) >= child.release_since {
-        let message = MessageBuilder::new().build_message(child_host_id, child.release_opcode);
+    let version = aura_object_version(ctx, child_host_id);
+    release_host_only(
+        ctx,
+        child_host_id,
+        version,
+        child.release_opcode,
+        child.release_since,
+    );
+}
+
+/// Release the internal `zaura_shell` binding after its `global_remove`
+/// (see [`release_host_only`]). Its children stay usable.
+pub(crate) fn release_shell(ctx: &mut Context, shell: HostAuraShell) {
+    release_host_only(
+        ctx,
+        shell.id,
+        shell.version,
+        zaura_shell::REQ_RELEASE,
+        zaura_shell::REQ_RELEASE_SINCE,
+    );
+}
+
+/// Release a host-only Aura object of negotiated `version`.
+///
+/// From the `release_since` version on, the destructor is queued and the
+/// host ID stays reserved until the compositor acknowledges it with
+/// `wl_display.delete_id`, so a recycled ID never receives the late
+/// acknowledgement. Older objects have no destructor: their dispatch
+/// metadata is retired so stale host events cannot reach them, and the
+/// numeric ID stays reserved for the rest of the connection.
+fn release_host_only(
+    ctx: &mut Context,
+    host_id: u32,
+    version: u32,
+    release_opcode: u16,
+    release_since: u32,
+) {
+    if version >= release_since {
+        let message = MessageBuilder::new().build_message(host_id, release_opcode);
         ctx.client_to_host_queue.push((message, Vec::new()));
-        ctx.shadow_table.mark_pending_destroy_host(child_host_id);
+        ctx.shadow_table.mark_pending_destroy_host(host_id);
     } else {
-        ctx.shadow_table.retire_host_interface(child_host_id);
+        ctx.shadow_table.retire_host_interface(host_id);
     }
 }
 
