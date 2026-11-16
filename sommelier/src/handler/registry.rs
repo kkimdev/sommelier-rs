@@ -96,26 +96,14 @@ fn next_global_generation(ctx: &mut Context) -> u64 {
 /// connection-wide current generation.
 ///
 /// Bound objects record it so a delayed `global_remove` of an older
-/// advertisement cannot retire a binding of its replacement.
-fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> u64 {
-    let generation = ctx
-        .registry_global_generations
+/// advertisement cannot retire a binding of its replacement. `None` means
+/// the name was never advertised; `on_bind` refuses such a bind.
+fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> Option<u64> {
+    ctx.registry_global_generations
         .get(&registry_host_id)
         .and_then(|generations| generations.get(&name))
         .copied()
-        .or_else(|| ctx.global_generations.get(&name).copied());
-    // A missing generation is unreachable: `guest_bind_is_allowed` admits
-    // only names in `host_globals`, which are added only after
-    // `note_registry_global` has recorded a generation for the name, and
-    // generations are never removed. Generation 0 is a safe fallback anyway:
-    // `next_global_generation` starts at 1, so 0 never matches a removal, and
-    // the only effect would be that `global_remove` cannot retire the
-    // binding; it stays valid until the guest destroys it.
-    debug_assert!(
-        generation.is_some(),
-        "bound global {name} has no advertisement generation"
-    );
-    generation.unwrap_or_default()
+        .or_else(|| ctx.global_generations.get(&name).copied())
 }
 
 fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
@@ -1252,6 +1240,21 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
+        // Every name that `guest_bind_is_allowed` admits was recorded with a
+        // generation by `note_registry_global`, and generations are never
+        // removed. Refuse rather than invent one: a made-up generation could
+        // never be retired by `global_remove`.
+        let Some(generation) = bound_global_generation(ctx, registry_host_id, name) else {
+            error!("Bind for global {name} has no advertisement generation");
+            ctx.shadow_table.remove_id(*guest_new_id);
+            queue_protocol_error(
+                ctx,
+                registry_guest_id,
+                0,
+                format!("invalid bind for unadvertised global {name}"),
+            );
+            return Action::Drop;
+        };
         let bind_version = host_version;
         if !queue_internal_bind(
             ctx,
@@ -1270,7 +1273,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // failure paths above have no output state to undo.
             ctx.output_host_ids.push(host_new_id);
             ctx.output_states.entry(host_new_id).or_default();
-            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.output_host_global_bindings
                 .insert(host_new_id, (name, generation));
             ctx.inactive_output_host_ids.remove(&host_new_id);
@@ -1282,7 +1284,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
         }
         if interface == "zwp_linux_dmabuf_v1" {
-            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
@@ -1830,6 +1831,32 @@ mod tests {
         assert!(ctx.output_states.is_empty());
         assert!(ctx.output_host_global_bindings.is_empty());
         assert!(ctx.inactive_output_host_ids.is_empty());
+    }
+
+    #[test]
+    fn bind_without_an_advertisement_generation_is_refused() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        // Reachable only through a bookkeeping bug: an admitted name whose
+        // advertisement was never recorded.
+        ctx.host_globals.insert(
+            10,
+            HostGlobal {
+                interface: "wl_output".to_string(),
+                version: 3,
+            },
+        );
+
+        let bind = ("wl_output".to_string(), 3, 20);
+        assert_eq!(RegistryHandler.on_bind(&mut ctx, 10, &bind), Action::Drop);
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
+        assert!(ctx.output_host_ids.is_empty());
+        assert!(ctx.output_host_global_bindings.is_empty());
     }
 
     #[test]
