@@ -1032,9 +1032,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             WL_KEY_PRESSED => match guest_owner {
                 Some(GuestKeyOwner::CompositorShortcut) => true,
                 Some(_) => false,
-                None => self
-                    .window_layout_action(ctx, host_keyboard_id, key)
-                    .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
+                None => {
+                    // Adopt a reloaded shortcut generation before matching.
+                    ctx.refresh_window_placement_shortcuts();
+                    self.window_layout_action(ctx, host_keyboard_id, key)
+                        .is_some_and(|action| {
+                            Self::apply_window_layout(ctx, host_keyboard_id, action)
+                        })
+                }
             },
             WL_KEY_REPEATED | WL_KEY_RELEASED => {
                 guest_owner == Some(GuestKeyOwner::CompositorShortcut)
@@ -2043,6 +2048,72 @@ mod tests {
                     && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
             })
             .count()
+    }
+
+    /// The `[x, y, width, height]` of the single queued bounds request.
+    fn queued_bounds_payload(ctx: &Context) -> [i32; 4] {
+        let aura_toplevel = ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(13)
+            .expect("Aura toplevel mapping");
+        let bounds = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| {
+                message_sender(message) == aura_toplevel
+                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+            })
+            .expect("window bounds request");
+        let field =
+            |offset: usize| i32::from_ne_bytes(bounds.0[offset..offset + 4].try_into().unwrap());
+        [field(8), field(12), field(16), field(20)]
+    }
+
+    #[test]
+    fn shortcut_config_reload_takes_effect_on_the_next_press() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
+        let path = dir.write("shortcuts.toml", b"version = 1\n");
+        let source = crate::window_shortcuts::ShortcutConfigSource::load(path, Vec::new()).unwrap();
+        ctx.follow_window_placement_shortcuts(source.subscribe());
+        assert!(
+            ctx.window_placement_shortcuts.is_empty(),
+            "the followed file is the only binding source"
+        );
+
+        dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
+        );
+        source.reload().unwrap();
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "the reloaded chord is consumed by the compositor"
+        );
+        assert_eq!(queued_bounds_payload(&ctx), [960, 0, 1920, 2160]);
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        // Removing the binding while the key is held still suppresses the
+        // matching release: ownership, not the binding, owns the release.
+        dir.write("shortcuts.toml", b"version = 1\n");
+        source.reload().unwrap();
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        ctx.client_to_host_queue.clear();
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 102, key, WL_KEY_PRESSED),
+            Action::Forward,
+            "a removed binding is delivered to the guest"
+        );
+        assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
     #[test]

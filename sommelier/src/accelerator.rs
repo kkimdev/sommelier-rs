@@ -76,9 +76,9 @@ pub struct Accelerator {
 /// layout without changing the proxy binary.
 ///
 /// Every action resolves to a normalized work-area rectangle through
-/// [`WindowLayoutAction::rect`] (see `crate::window_layout`), so every
-/// placement shares one rounding rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`WindowLayoutAction::rect`] (see `crate::window_layout`), so named presets
+/// and configured rectangles share one rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WindowLayoutAction {
     TopLeft,
     Top,
@@ -89,6 +89,8 @@ pub(crate) enum WindowLayoutAction {
     BottomLeft,
     Bottom,
     BottomRight,
+    /// An arbitrary validated rectangle from the shortcut configuration file.
+    Rect(crate::window_layout::NormalizedRect),
 }
 
 /// Resolve a named placement action, case-insensitively.
@@ -116,7 +118,7 @@ pub(crate) fn parse_window_layout_action(name: &str) -> Option<WindowLayoutActio
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowPlacementShortcut {
     pub(crate) accelerator: Accelerator,
     pub(crate) action: WindowLayoutAction,

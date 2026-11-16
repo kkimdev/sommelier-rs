@@ -26,7 +26,9 @@ limitations under the License.
 //!
 //! # Rounding
 //!
-//! A rectangle is stored as its four edge fractions.
+//! A rectangle is stored as its four edge fractions. On validation, an edge
+//! within [`EDGE_TOLERANCE`] of `0` or `1` snaps to exactly `0` or `1`, which
+//! absorbs decimal-to-binary error such as `0.7 + 0.3` or `2 * (1 / 3)`.
 //!
 //! For a work area `(X, Y, W, H)` each edge fraction `f` maps to the pixel
 //! offset `floor(f * W + PIXEL_BIAS)` (or `H`), computed in `f64` and clamped
@@ -42,7 +44,15 @@ limitations under the License.
 //! inside the unit interval that lands on the work-area border, or an empty
 //! extent after rounding.
 
+use thiserror::Error;
+
 use crate::accelerator::WindowLayoutAction;
+
+/// Edge-fraction tolerance for floating-point representation error.
+///
+/// `x + width` may exceed `1.0` by at most this much, and an edge this close
+/// to `0` or `1` snaps onto the work-area border.
+const EDGE_TOLERANCE: f64 = 1e-9;
 
 /// Sub-pixel bias added before flooring an edge to a pixel offset.
 ///
@@ -51,11 +61,28 @@ use crate::accelerator::WindowLayoutAction;
 /// was meant to fall between pixels.
 const PIXEL_BIAS: f64 = 1e-6;
 
+/// Reasons a rectangle is not a valid normalized work-area rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum RectError {
+    /// A component is NaN or infinite.
+    #[error("rect components must be finite numbers")]
+    NonFinite,
+    /// `x` or `y` is outside `[0, 1)`.
+    #[error("rect origin must satisfy 0 <= x < 1 and 0 <= y < 1")]
+    OriginOutOfRange,
+    /// `width` or `height` is outside `(0, 1]`.
+    #[error("rect size must satisfy 0 < width <= 1 and 0 < height <= 1")]
+    SizeOutOfRange,
+    /// The rectangle extends past the right or bottom work-area edge.
+    #[error("rect must satisfy x + width <= 1 and y + height <= 1")]
+    ExceedsWorkArea,
+}
+
 /// A rectangle expressed as fractions of the active output work area.
 ///
-/// Every edge is finite and inside `[0, 1]` with `left < right` and
-/// `top < bottom` (before pixel rounding). The fields are private so no
-/// caller can bypass that invariant.
+/// Instances are always validated: every edge is finite and inside `[0, 1]`
+/// with `left < right` and `top < bottom` (before pixel rounding). The fields
+/// are private so no caller can bypass that invariant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct NormalizedRect {
     left: f64,
@@ -65,6 +92,43 @@ pub(crate) struct NormalizedRect {
 }
 
 impl NormalizedRect {
+    /// Validate and construct a normalized rectangle.
+    ///
+    /// # Arguments
+    ///
+    /// * `x`, `y` - origin as a fraction of the work-area width/height.
+    /// * `width`, `height` - size as a fraction of the work-area width/height.
+    ///
+    /// # Returns
+    ///
+    /// The rectangle when every bound holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RectError`] for non-finite values, an origin outside
+    /// `[0, 1)`, a size outside `(0, 1]`, or a rectangle that extends past
+    /// the work area by more than floating-point representation error.
+    pub(crate) fn new(x: f64, y: f64, width: f64, height: f64) -> Result<Self, RectError> {
+        if ![x, y, width, height].iter().all(|value| value.is_finite()) {
+            return Err(RectError::NonFinite);
+        }
+        if !(0.0..1.0).contains(&x) || !(0.0..1.0).contains(&y) {
+            return Err(RectError::OriginOutOfRange);
+        }
+        if !(width > 0.0 && width <= 1.0 && height > 0.0 && height <= 1.0) {
+            return Err(RectError::SizeOutOfRange);
+        }
+        if x + width > 1.0 + EDGE_TOLERANCE || y + height > 1.0 + EDGE_TOLERANCE {
+            return Err(RectError::ExceedsWorkArea);
+        }
+        Ok(Self {
+            left: snap_edge(x),
+            top: snap_edge(y),
+            right: snap_edge(x + width),
+            bottom: snap_edge(y + height),
+        })
+    }
+
     /// Map this rectangle to integer bounds inside a work area.
     ///
     /// # Arguments
@@ -91,6 +155,28 @@ impl NormalizedRect {
             right - left,
             bottom - top,
         ))
+    }
+
+    /// Return `[x, y, width, height]` of the validated (snapped) rectangle.
+    #[cfg(test)]
+    pub(crate) fn components(self) -> [f64; 4] {
+        [
+            self.left,
+            self.top,
+            self.right - self.left,
+            self.bottom - self.top,
+        ]
+    }
+}
+
+/// Snap an edge fraction within [`EDGE_TOLERANCE`] of a border onto it.
+fn snap_edge(fraction: f64) -> f64 {
+    if fraction < EDGE_TOLERANCE {
+        0.0
+    } else if fraction > 1.0 - EDGE_TOLERANCE {
+        1.0
+    } else {
+        fraction
     }
 }
 
@@ -125,7 +211,8 @@ fn edge(fraction: f64, extent: i32) -> Option<i32> {
 impl WindowLayoutAction {
     /// Return the normalized work-area rectangle for this action.
     ///
-    /// The named presets split the work area into halves.
+    /// The named presets split the work area into halves; a configured
+    /// [`WindowLayoutAction::Rect`] returns its own rectangle.
     pub(crate) fn rect(self) -> NormalizedRect {
         const fn preset(x: f64, y: f64, width: f64, height: f64) -> NormalizedRect {
             NormalizedRect {
@@ -145,6 +232,7 @@ impl WindowLayoutAction {
             Self::BottomLeft => preset(0.0, 0.5, 0.5, 0.5),
             Self::Bottom => preset(0.0, 0.5, 1.0, 0.5),
             Self::BottomRight => preset(0.5, 0.5, 0.5, 0.5),
+            Self::Rect(rect) => rect,
         }
     }
 }
@@ -217,6 +305,7 @@ mod tests {
             Left => Some((x, y, half_width, height)),
             Fullscreen => Some((x, y, width, height)),
             Right => Some((x.checked_add(half_width)?, y, width - half_width, height)),
+            Rect(_) => unreachable!("only named presets have a legacy formula"),
         }
     }
 
@@ -261,7 +350,65 @@ mod tests {
     }
 
     #[test]
-    fn preset_mapping_refuses_degenerate_or_overflowing_bounds() {
+    fn custom_rect_floors_both_edges_inside_offset_work_area() {
+        let rect = NormalizedRect::new(0.25, 0.1, 0.5, 0.8).unwrap();
+        // Edges: x 0.25*1366=341.5→341, 0.75*1366=1024.5→1024;
+        //        y 0.1*720=72, 0.9*720=648.
+        assert_eq!(
+            rect.to_work_area_bounds((10, 48, 1366, 720)),
+            Some((351, 120, 683, 576))
+        );
+    }
+
+    #[test]
+    fn adjacent_thirds_share_boundaries_and_tile_the_work_area() {
+        let third = 1.0 / 3.0;
+        let rects = [
+            NormalizedRect::new(0.0, 0.0, third, 1.0).unwrap(),
+            NormalizedRect::new(third, 0.0, third, 1.0).unwrap(),
+            NormalizedRect::new(2.0 * third, 0.0, third, 1.0).unwrap(),
+        ];
+        for width in [3, 100, 1366, 1920, 2559] {
+            let bounds: Vec<_> = rects
+                .iter()
+                .map(|rect| rect.to_work_area_bounds((0, 0, width, 10)).unwrap())
+                .collect();
+            assert_eq!(bounds[0].0, 0);
+            assert_eq!(bounds[0].0 + bounds[0].2, bounds[1].0, "width {width}");
+            assert_eq!(bounds[1].0 + bounds[1].2, bounds[2].0, "width {width}");
+            assert_eq!(bounds[2].0 + bounds[2].2, width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn decimal_sum_within_tolerance_above_one_is_accepted_and_snapped() {
+        let (x, width) = (0.1, 0.900_000_000_000_000_1);
+        assert!(
+            x + width > 1.0,
+            "the binary sum must overshoot for this test"
+        );
+        let rect = NormalizedRect::new(x, 0.7, width, 0.3).unwrap();
+        let [left, _, snapped_width, _] = rect.components();
+        assert_eq!(left + snapped_width, 1.0);
+        assert_eq!(
+            rect.to_work_area_bounds((0, 0, 1000, 1000)),
+            Some((100, 700, 900, 300))
+        );
+    }
+
+    #[test]
+    fn mapping_refuses_degenerate_or_overflowing_bounds() {
+        let sliver = NormalizedRect::new(0.3, 0.0, 0.05, 1.0).unwrap();
+        // 0.3*5 = 1.5 → 1 and 0.35*5 = 1.75 → 1: empty after rounding.
+        assert_eq!(sliver.to_work_area_bounds((0, 0, 5, 5)), None);
+        // An interior edge collapsing onto the border is refused:
+        // 0.1 * 5 = 0.5 floors onto the left border.
+        let right_nine_tenths = NormalizedRect::new(0.1, 0.0, 0.9, 1.0).unwrap();
+        assert_eq!(right_nine_tenths.to_work_area_bounds((0, 0, 5, 5)), None);
+        assert_eq!(
+            right_nine_tenths.to_work_area_bounds((0, 0, 10, 5)),
+            Some((1, 0, 9, 5))
+        );
         let full = WindowLayoutAction::Fullscreen.rect();
         assert_eq!(full.to_work_area_bounds((0, 0, 0, 10)), None);
         assert_eq!(full.to_work_area_bounds((0, 0, 10, -1)), None);
@@ -270,5 +417,66 @@ mod tests {
         assert_eq!(right.to_work_area_bounds((i32::MAX, 0, 4, 4)), None);
         assert_eq!(right.to_work_area_bounds((0, 0, 1, 4)), None);
         assert_eq!(right.to_work_area_bounds((0, 0, 3, 4)), Some((1, 0, 2, 4)));
+    }
+
+    #[test]
+    fn edges_near_a_border_snap_onto_it() {
+        let rect = NormalizedRect::new(1e-12, 0.0, 1.0 - 1e-12, 1.0 - 2e-12).unwrap();
+        assert_eq!(rect.components(), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(rect.to_work_area_bounds((0, 0, 7, 9)), Some((0, 0, 7, 9)));
+    }
+
+    #[test]
+    fn configured_rect_action_maps_its_own_rectangle() {
+        let rect = NormalizedRect::new(0.1, 0.2, 0.3, 0.4).unwrap();
+        assert_eq!(WindowLayoutAction::Rect(rect).rect(), rect);
+    }
+
+    #[test]
+    fn new_rejects_each_invalid_component_class() {
+        assert_eq!(
+            NormalizedRect::new(f64::NAN, 0.0, 0.5, 0.5),
+            Err(RectError::NonFinite)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.0, 0.0, f64::INFINITY, 0.5),
+            Err(RectError::NonFinite)
+        );
+        assert_eq!(
+            NormalizedRect::new(-0.1, 0.0, 0.5, 0.5),
+            Err(RectError::OriginOutOfRange)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.0, 1.0, 0.5, 0.5),
+            Err(RectError::OriginOutOfRange)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.0, 0.0, 0.0, 0.5),
+            Err(RectError::SizeOutOfRange)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.0, 0.0, 0.5, 1.5),
+            Err(RectError::SizeOutOfRange)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.6, 0.0, 0.5, 0.5),
+            Err(RectError::ExceedsWorkArea)
+        );
+        assert_eq!(
+            NormalizedRect::new(0.0, 0.5, 0.5, 0.500_001),
+            Err(RectError::ExceedsWorkArea)
+        );
+    }
+
+    #[test]
+    fn preset_rects_pass_validation() {
+        for action in PRESETS {
+            let [x, y, width, height] = action.rect().components();
+            assert_eq!(
+                NormalizedRect::new(x, y, width, height),
+                Ok(action.rect()),
+                "{action:?}"
+            );
+        }
     }
 }
