@@ -33,7 +33,7 @@ limitations under the License.
 //! | `xdg_surface.get_toplevel`, after dispatch | [`attach_toplevel`] |
 //! | `zaura_shell` bound late | [`attach_recorded_toplevels`] |
 //! | XDG role teardown | [`release_toplevel`] |
-//! | XDG and GTK application IDs | [`apply_arc_identity`] |
+//! | XDG and GTK application IDs | [`set_aura_application_id`] |
 //! | `wl_callback.done` | [`complete_barrier`] |
 //! | `xdg_surface.configure` | [`hold_surface_configure`] |
 //! | `xdg_toplevel.configure` | [`hold_toplevel_configure`] |
@@ -255,30 +255,77 @@ pub(crate) fn place_focused(
 
 // ── ARC policy identity and the Aura toplevel ─────────────────────────────
 
+/// Send the application ID the guest set (through XDG or GTK) to the
+/// surface's host Aura surface, creating that surface if needed. Nothing is
+/// sent while no `zaura_shell` is bound.
+///
+/// `zaura_surface.set_application_id` is also what Exo checks before it
+/// accepts `zaura_toplevel.set_window_bounds`. While the ARC bounds policy
+/// is active, the surface's ARC identity therefore replaces the guest's ID
+/// (see [`apply_arc_identity`]); otherwise the guest's ID is sent in the
+/// Guest OS namespace. The Aura surface needs no version check: the
+/// registry binds no `zaura_shell` older than `set_application_id`.
+///
+/// # Arguments
+///
+/// * `native_application_id` - the guest's ID in the Guest OS namespace
+///   (`compositor::native_wayland_app_id`). An ID too long for one message
+///   is dropped with a warning.
+pub(crate) fn set_aura_application_id(
+    ctx: &mut Context,
+    wl_surface_guest_id: u32,
+    native_application_id: &str,
+) {
+    let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
+        return;
+    };
+    log::debug!(
+        "Set application ID to {} on zaura_surface (host_id={})",
+        native_application_id,
+        zaura_surface_host_id
+    );
+    if ctx.window_placement.uses_arc_bounds() {
+        if !apply_arc_identity(ctx, wl_surface_guest_id, zaura_surface_host_id) {
+            log::warn!(
+                "Unable to apply ARC policy identity for wl_surface {}",
+                wl_surface_guest_id
+            );
+        }
+        return;
+    }
+    let mut builder = MessageBuilder::new();
+    builder.write_string(native_application_id);
+    match builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID) {
+        Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
+        Err(error) => log::warn!(
+            "Dropping the application ID of zaura_surface {}: {}",
+            zaura_surface_host_id,
+            error
+        ),
+    }
+}
+
 /// Queue the surface's ARC policy identity to its host Aura surface, once.
 ///
 /// While the ARC bounds policy is active, this identity replaces every
-/// application ID the guest sets on the Aura surface (XDG and GTK), because
-/// Exo authorizes `set_window_bounds` only for it. An XDG client may omit
+/// application ID the guest sets on the Aura surface, because Exo
+/// authorizes `set_window_bounds` only for it. An XDG client may omit
 /// `xdg_toplevel.set_app_id`, so placement also applies it before the first
 /// bounds request. The applied set keeps repeated calls from emitting
 /// duplicate metadata requests.
 ///
 /// # Returns
 ///
-/// `true` when the identity is (or already was) queued, or the policy is
-/// off; `false` when no identity can be allocated (the block is exhausted).
-/// The Aura surface needs no version check: the registry binds no
-/// `zaura_shell` older than `set_application_id`.
-pub(crate) fn apply_arc_identity(
+/// `true` when the identity is (or already was) queued; `false` when no
+/// identity can be allocated (the block is exhausted).
+fn apply_arc_identity(
     ctx: &mut Context,
     wl_surface_guest_id: u32,
     zaura_surface_host_id: u32,
 ) -> bool {
-    if !ctx.window_placement.uses_arc_bounds()
-        || ctx
-            .window_placement
-            .arc_application_id_applied(wl_surface_guest_id)
+    if ctx
+        .window_placement
+        .arc_application_id_applied(wl_surface_guest_id)
     {
         return true;
     }

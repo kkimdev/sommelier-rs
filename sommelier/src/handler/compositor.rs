@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
+use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
-use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
@@ -1486,40 +1485,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
-            if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
-            {
-                if ctx.window_placement.uses_arc_bounds() {
-                    if !window_placement::apply_arc_identity(
-                        ctx,
-                        wl_surface_guest_id,
-                        zaura_surface_host_id,
-                    ) {
-                        log::warn!(
-                            "Unable to apply ARC policy identity for wl_surface {}",
-                            wl_surface_guest_id
-                        );
-                        return Action::Drop;
-                    }
-                } else {
-                    let mut builder = crate::wire::MessageBuilder::new();
-                    builder.write_string(&native_app_id);
-                    let Ok(msg) =
-                        builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID)
-                    else {
-                        log::warn!(
-                            "Dropping oversized aura application ID for xdg_toplevel {}",
-                            xdg_toplevel_id
-                        );
-                        return Action::Drop;
-                    };
-                    ctx.client_to_host_queue.push((msg, Vec::new()));
-                }
-                log::debug!(
-                    "Set application ID to {} on zaura_surface (host_id={})",
-                    app_id,
-                    zaura_surface_host_id
-                );
-            }
+            window_placement::set_aura_application_id(ctx, wl_surface_guest_id, &native_app_id);
         }
         Action::Drop
     }
