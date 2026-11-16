@@ -2273,14 +2273,21 @@ mod tests {
         assert!(ctx.finish_surface_destroy_use(buffer, false));
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::NeverSubmitted)
+            Some(RenderBufferUse::ReleaseOwed)
         );
+        assert!(!ctx.buffer_is_submitted(buffer));
+        assert!(!ctx.buffer_is_released(buffer));
         assert_eq!(
             ctx.render_buffers.lifecycle(HostId(host_buffer)),
             Some(RenderBufferLifecycle::GuestAlive(
-                RenderBufferUse::NeverSubmitted
+                RenderBufferUse::ReleaseOwed
             ))
         );
+        assert!(
+            ctx.mark_buffer_released(buffer),
+            "the release the host owed for the ended use is expected"
+        );
+        assert_eq!(ctx.host_buffer_use(buffer), Some(RenderBufferUse::Released));
     }
 
     #[test]
@@ -2313,7 +2320,7 @@ mod tests {
         assert!(ctx.finish_surface_destroy_use(buffer, false));
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::NeverSubmitted)
+            Some(RenderBufferUse::ReleaseOwed)
         );
     }
 
@@ -2381,14 +2388,14 @@ mod tests {
                         assert!(registry.submit(host_buffer));
                     }
                     Operation::Release => {
-                        let expected = matches!(&model, RenderBufferUse::AwaitingRelease { .. });
+                        let expected = model.owes_release();
                         if expected {
                             model = RenderBufferUse::Released;
                         }
                         assert_eq!(registry.release(host_buffer), expected);
                     }
                     Operation::Detach => {
-                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        let expected = model.may_be_current();
                         if matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
                             model = awaiting_release(true);
                         }
@@ -2398,9 +2405,9 @@ mod tests {
                         );
                     }
                     Operation::LastSurfaceDestroy => {
-                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        let expected = model.may_be_current();
                         if model == awaiting_release(false) {
-                            model = RenderBufferUse::NeverSubmitted;
+                            model = RenderBufferUse::ReleaseOwed;
                         }
                         assert_eq!(registry.end_last_surface_use(host_buffer, false), expected);
                     }
@@ -2528,34 +2535,26 @@ mod tests {
                         true
                     }
                     (_, Operation::Release) => {
-                        let awaiting =
-                            matches!(&use_state, RenderBufferUse::AwaitingRelease { .. });
-                        if awaiting {
+                        let owed = use_state.owes_release();
+                        if owed {
                             use_state = RenderBufferUse::Released;
                         }
-                        awaiting
+                        owed
                     }
-                    (_, Operation::Detach) => match &use_state {
-                        RenderBufferUse::AwaitingRelease { .. } => {
+                    (_, Operation::Detach) => {
+                        let may_be_current = use_state.may_be_current();
+                        if use_state.is_awaiting_release() {
                             use_state = awaiting_release(true);
-                            true
                         }
-                        RenderBufferUse::Released => true,
-                        RenderBufferUse::NeverSubmitted => false,
-                    },
-                    (_, Operation::LastSurfaceDestroy) => match &use_state {
-                        RenderBufferUse::AwaitingRelease {
-                            has_detached_use: false,
-                        } => {
-                            use_state = RenderBufferUse::NeverSubmitted;
-                            true
+                        may_be_current
+                    }
+                    (_, Operation::LastSurfaceDestroy) => {
+                        let may_be_current = use_state.may_be_current();
+                        if use_state == awaiting_release(false) {
+                            use_state = RenderBufferUse::ReleaseOwed;
                         }
-                        RenderBufferUse::AwaitingRelease {
-                            has_detached_use: true,
-                        }
-                        | RenderBufferUse::Released => true,
-                        RenderBufferUse::NeverSubmitted => false,
-                    },
+                        may_be_current
+                    }
                     (ModelOwnership::GuestAlive, Operation::GuestDestroy) => {
                         ownership = ModelOwnership::GuestDestroyed;
                         true

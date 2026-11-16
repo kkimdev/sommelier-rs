@@ -1102,7 +1102,7 @@ fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
 fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
     if ctx.render_buffer_host_id(guest_id).is_some() && !ctx.mark_buffer_released(guest_id) {
         log::warn!(
-            "Ignoring wl_buffer.release without an awaiting render use for guest {}",
+            "Ignoring wl_buffer.release that no render use owes for guest {}",
             guest_id
         );
     }

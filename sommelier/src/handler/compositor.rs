@@ -2829,6 +2829,51 @@ mod tests {
     }
 
     #[test]
+    fn release_owed_after_surface_destroy_is_expected() {
+        // A GTK client's exit: the surface showing a submitted buffer is
+        // destroyed first, and Exo then releases the buffer it no longer
+        // shows while the guest still owns it.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        register_test_native(&mut ctx, buffer_id, (1, 1));
+        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
+        assert!(ctx.mark_buffer_submitted(buffer_id));
+
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
+            Action::Drop
+        );
+        assert!(
+            !ctx.buffer_is_submitted(buffer_id),
+            "the ordered surface destructor ends the buffer's use"
+        );
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Forward,
+            "the guest still gets its wl_buffer.release"
+        );
+        assert!(
+            ctx.buffer_is_released(buffer_id),
+            "the owed release is recorded instead of being ignored as unexpected"
+        );
+        assert!(
+            !ctx.mark_buffer_released(buffer_id),
+            "a second release is still unexpected"
+        );
+    }
+
+    #[test]
     fn attaching_idle_shm_buffer_without_commit_keeps_release_edge() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
@@ -4283,7 +4328,7 @@ mod tests {
         assert_eq!(
             buffer_lifecycle(&ctx, guest_buffer),
             Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::NeverSubmitted
+                RenderBufferUse::ReleaseOwed
             )),
             "destroying the only committed surface closes its compositor-use interval"
         );

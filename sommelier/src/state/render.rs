@@ -502,6 +502,17 @@ pub enum RenderBufferUse {
         has_detached_use: bool,
     },
     Released,
+    /// The use ended before its release arrived: the last surface showing
+    /// the buffer was destroyed while it awaited `wl_buffer.release`. The
+    /// ordered surface destructor proves the use over, so the buffer is
+    /// idle, but the host may still send the release it owed (Exo does).
+    /// Exactly one release is expected; it moves the buffer to `Released`.
+    ///
+    /// Known limit: a release carries no serial. If the guest commits the
+    /// buffer again before the owed release arrives, that release lands on
+    /// the new use, and the host's later release for the new use is logged
+    /// as unexpected.
+    ReleaseOwed,
 }
 
 impl RenderBufferUse {
@@ -513,6 +524,24 @@ impl RenderBufferUse {
 
     pub(super) fn is_awaiting_release(&self) -> bool {
         matches!(self, Self::AwaitingRelease { .. })
+    }
+
+    /// Whether the host still owes a `wl_buffer.release` for this use.
+    pub(super) fn owes_release(&self) -> bool {
+        match self {
+            Self::AwaitingRelease { .. } | Self::ReleaseOwed => true,
+            Self::NeverSubmitted | Self::Released => false,
+        }
+    }
+
+    /// Whether a surface may hold the buffer as its committed content.
+    /// Nothing committed a `NeverSubmitted` buffer, and the last surface
+    /// that showed a `ReleaseOwed` buffer is gone.
+    pub(super) fn may_be_current(&self) -> bool {
+        match self {
+            Self::AwaitingRelease { .. } | Self::Released => true,
+            Self::NeverSubmitted | Self::ReleaseOwed => false,
+        }
     }
 }
 
@@ -725,7 +754,7 @@ impl RenderBufferRegistry {
         self.entries
             .get(&host_id)
             .and_then(RenderBuffer::active)
-            .is_some_and(|buffer| !matches!(buffer.use_state, RenderBufferUse::NeverSubmitted))
+            .is_some_and(|buffer| buffer.use_state.may_be_current())
     }
 
     pub(super) fn submit(&mut self, host_id: HostId) -> bool {
@@ -738,7 +767,9 @@ impl RenderBufferRegistry {
         };
         match &mut buffer.use_state {
             RenderBufferUse::AwaitingRelease { .. } => {}
-            RenderBufferUse::NeverSubmitted | RenderBufferUse::Released => {
+            RenderBufferUse::NeverSubmitted
+            | RenderBufferUse::Released
+            | RenderBufferUse::ReleaseOwed => {
                 buffer.use_state = RenderBufferUse::awaiting();
             }
         }
@@ -753,7 +784,7 @@ impl RenderBufferRegistry {
         else {
             return false;
         };
-        if !buffer.use_state.is_awaiting_release() {
+        if !buffer.use_state.owes_release() {
             return false;
         }
         buffer.use_state = RenderBufferUse::Released;
@@ -774,7 +805,7 @@ impl RenderBufferRegistry {
                 true
             }
             RenderBufferUse::Released => true,
-            RenderBufferUse::NeverSubmitted => false,
+            RenderBufferUse::NeverSubmitted | RenderBufferUse::ReleaseOwed => false,
         }
     }
 
@@ -796,12 +827,12 @@ impl RenderBufferRegistry {
         match &mut buffer.use_state {
             RenderBufferUse::AwaitingRelease { has_detached_use } => {
                 if !*has_detached_use {
-                    buffer.use_state = RenderBufferUse::NeverSubmitted;
+                    buffer.use_state = RenderBufferUse::ReleaseOwed;
                 }
                 true
             }
             RenderBufferUse::Released => true,
-            RenderBufferUse::NeverSubmitted => false,
+            RenderBufferUse::NeverSubmitted | RenderBufferUse::ReleaseOwed => false,
         }
     }
 
