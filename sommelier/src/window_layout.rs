@@ -78,14 +78,6 @@ impl Rect {
     }
 }
 
-/// Adopt an `(x, y, width, height)` tuple, the shape
-/// [`crate::state::OutputState::work_area`] still returns.
-impl From<(i32, i32, i32, i32)> for Rect {
-    fn from((x, y, width, height): (i32, i32, i32, i32)) -> Self {
-        Self::new(x, y, width, height)
-    }
-}
-
 /// Actions that may be bound to compositor-owned window placement shortcuts.
 ///
 /// Every action resolves to a normalized work-area rectangle through

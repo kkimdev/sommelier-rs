@@ -27,6 +27,7 @@ limitations under the License.
 //! the only statements of the `wl_output.transform` enum rules; surfaces'
 //! buffer transforms use them too.
 
+use crate::window_layout::Rect;
 use std::collections::{HashMap, HashSet};
 
 /// `wl_output.transform.normal`, the lowest enum value.
@@ -92,8 +93,7 @@ pub struct OutputState {
 }
 
 impl OutputState {
-    /// The output's work area, `(x, y, width, height)` in logical screen
-    /// coordinates.
+    /// The output's work area in logical screen coordinates.
     ///
     /// The native pixel mode is rotated by the panel transform, divided by
     /// both Aura scale factors (floored), and shrunk by the logical insets.
@@ -102,7 +102,7 @@ impl OutputState {
     ///
     /// `None` until both Aura factors are known, and for an empty or
     /// overflowing area.
-    pub fn work_area(self) -> Option<(i32, i32, i32, i32)> {
+    pub fn work_area(self) -> Option<Rect> {
         let scale = u64::from(self.aura_current_scale?)
             .checked_mul(u64::from(self.aura_device_scale_factor?))?;
         let (mode_width, mode_height) =
@@ -130,7 +130,7 @@ impl OutputState {
         if width <= 0 || height <= 0 {
             return None;
         }
-        Some((x, y, width, height))
+        Some(Rect::new(x, y, width, height))
     }
 }
 
@@ -517,7 +517,7 @@ mod tests {
             insets_right: 16,
             ..Default::default()
         };
-        assert_eq!(output.work_area(), Some((1928, 40, 1896, 1008)));
+        assert_eq!(output.work_area(), Some(Rect::new(1928, 40, 1896, 1008)));
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
             aura_device_scale_factor: Some(2000),
             ..Default::default()
         };
-        assert_eq!(output.work_area(), Some((0, 0, 1536, 864)));
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 1536, 864)));
     }
 
     #[test]
@@ -547,7 +547,7 @@ mod tests {
             insets_bottom: 48,
             insets_right: 16,
         };
-        assert_eq!(output.work_area(), Some((1928, 40, 1704, 3000)));
+        assert_eq!(output.work_area(), Some(Rect::new(1928, 40, 1704, 3000)));
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
             panel_transform: 1,
             ..Default::default()
         };
-        assert_eq!(output.work_area(), Some((0, 0, 1080, 1920)));
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 1080, 1920)));
     }
 
     fn usable_state() -> OutputState {

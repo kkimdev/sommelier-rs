@@ -181,9 +181,7 @@ fn bounds_for_action(
     action: WindowLayoutAction,
     output: crate::state::OutputState,
 ) -> Option<Rect> {
-    action
-        .rect()
-        .to_work_area_bounds(Rect::from(output.work_area()?))
+    action.rect().to_work_area_bounds(output.work_area()?)
 }
 
 /// Place the focused toplevel for one consumed placement chord.

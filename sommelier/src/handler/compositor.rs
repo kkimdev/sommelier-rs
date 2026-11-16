@@ -1773,6 +1773,7 @@ mod tests {
     use crate::state::{
         BufferState, Context, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
     };
+    use crate::window_layout::Rect;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::{Arc, RwLock};
 
@@ -1858,7 +1859,7 @@ mod tests {
         );
     }
 
-    fn committed_work_area(ctx: &Context) -> Option<(i32, i32, i32, i32)> {
+    fn committed_work_area(ctx: &Context) -> Option<Rect> {
         ctx.outputs
             .committed_for_test(OUTPUT_HOST)
             .expect("live output")
@@ -1881,7 +1882,7 @@ mod tests {
 
         assert_eq!(
             committed_work_area(&ctx),
-            Some((0, 0, 3072, 1728)),
+            Some(Rect::new(0, 0, 3072, 1728)),
             "Aura bounds use fractional DP scale, not rounded wl_output.scale"
         );
     }
@@ -1919,20 +1920,20 @@ mod tests {
         assert_eq!(committed_work_area(&ctx), None);
         ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
 
         ctx.last_sender_id = AURA_OUTPUT_HOST;
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 2, 1200);
         handler.on_device_scale_factor(&mut ctx, 0);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0);
         assert!(!ctx.outputs.has_pending_for_test());
-        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
 
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 3, 1200);
-        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
         ctx.last_sender_id = OUTPUT_HOST;
         WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(committed_work_area(&ctx), Some((0, 0, 2560, 1440)));
+        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 2560, 1440)));
     }
 
     #[test]
@@ -1974,7 +1975,7 @@ mod tests {
         ctx.last_sender_id = AURA_OUTPUT_HOST;
         handler.on_device_scale_factor(&mut ctx, 1250);
         ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        assert_eq!(committed_work_area(&ctx), Some((0, 0, 3072, 1728)));
+        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
         assert!(!ctx.outputs.has_pending_for_test());
     }
 
@@ -2016,7 +2017,10 @@ mod tests {
             Action::Forward
         );
 
-        assert_eq!(committed_work_area(&ctx), Some((1928, 40, 1896, 1008)));
+        assert_eq!(
+            committed_work_area(&ctx),
+            Some(Rect::new(1928, 40, 1896, 1008))
+        );
     }
 
     #[test]
@@ -2110,15 +2114,15 @@ mod tests {
         // inverts the rotation, so ROTATE_90 is `transform.270` (3).
         for (mode, panel, logical, expected) in [
             // A landscape panel at rotation 90: both transforms agree.
-            ((1920, 1080), 3, 3, (0, 0, 1080, 1920)),
+            ((1920, 1080), 3, 3, Rect::new(0, 0, 1080, 1920)),
             // A portrait-native panel (`kRightUp`) at rotation 0: its panel
             // rotation is ROTATE_90 (wire value 3) and its logical rotation
             // ROTATE_0 (0), and the screen is landscape. The logical
             // transform alone left it portrait.
-            ((1600, 2560), 3, 0, (0, 0, 2560, 1600)),
+            ((1600, 2560), 3, 0, Rect::new(0, 0, 2560, 1600)),
             // The same panel at rotation 90: panel ROTATE_180 (wire value 2),
             // logical ROTATE_90 (wire value 3).
-            ((1600, 2560), 2, 3, (0, 0, 1600, 2560)),
+            ((1600, 2560), 2, 3, Rect::new(0, 0, 1600, 2560)),
         ] {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             bind_output_with_aura(&mut ctx, 3, Default::default());
