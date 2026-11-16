@@ -1081,7 +1081,8 @@ imported each other, and so did `window_shortcuts.rs` and `state.rs`.
 
 Deliberately not done: `Context::new` still reads `SOMMELIER_VM_IDENTIFIER`
 (the test constructors do not), and the GBM allocator it creates reads
-`SOMMELIER_DRM_DEVICE`. Neither is placement configuration.
+`SOMMELIER_DRM_DEVICE`. Neither is placement configuration. (Later,
+"Closing the deferred residuals" moved the identifier read to `main`.)
 
 Validation (monorepo dev shell, locked, serial): Sommelier 664 passed /
 1 ignored (650 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
@@ -1227,14 +1228,17 @@ Line counts against the rebased base (total / production before
 `window_placement.rs` 1643/723 (new).
 
 Deliberately not done: `ensure_zaura_output` still builds its fixed-size
-request with `try_build_message`, which belongs with the output registry; the
+request with `try_build_message`, which belongs with the output registry
+(since #26 it uses `build_message` through `aura_objects::create`); the
 `zaura_shell` bind cap (38) is not a since-version; the `xdg_toplevel` state
 table already mirrors the XML in one place. The XDG and GTK metadata paths
 still check `set_application_id` and `set_startup_id` versions that the
 shell floor now guarantees; they are outside placement. Other handlers'
 fixed-size
 `try_build_message` calls (`wl_surface.destroy`, `xdg_toplevel.destroy`,
-callback events) are outside placement.
+callback events) are outside placement. (The callback events moved to
+`build_message` in #26, and the surface and toplevel requests in "Closing
+the deferred residuals".)
 
 Validation (monorepo dev shell, locked, serial): Sommelier 677 passed /
 1 ignored (675 before: two rollback tests deleted; `unset_snap`,
@@ -1389,7 +1393,8 @@ session too, so the replaced toplevel is left to its own destructor.
 
 Deliberately not done: `record_xdg_toplevel` stays beside the XDG
 handlers, since it is handler logic over `XdgRoles::add_toplevel`. Other
-fixed-size `try_build_message` calls outside these paths are untouched.
+fixed-size `try_build_message` calls outside these paths are untouched
+(converted since "Closing the deferred residuals").
 
 Validation (monorepo dev shell, locked, serial), rebased on PR F:
 Sommelier 692 passed / 1 ignored (678 before), sample GUI 12, codegen 9,
@@ -1428,10 +1433,103 @@ The last cleanup PR of the series (PR G). Behavior is unchanged.
   the barrier it ignores (A1). `.venv` is ignored.
 
 Not done: the bare request opcodes in `text_input.rs`, and the fixed `1`
-that synthetic text-input objects register with, are not version checks.
+that synthetic text-input objects register with, are not version checks
+(both closed since "Closing the deferred residuals").
 
 Validation (monorepo dev shell, locked, serial): Sommelier 694 passed /
 1 ignored (692 before, plus the doc pin and the GTK version test), sample
 GUI 12, codegen 9, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
 targets and on every commit, `cargo fmt --check`, and `git diff --check`
 pass. Not host-validated: no Sommelier process was started.
+
+## 2026-11-17 — Closing the deferred residuals
+
+The "not done" notes of the sections above, closed in one PR. One fix;
+everything else keeps behavior.
+
+- **Text-input opcodes.** Every wire message `text_input.rs` builds uses
+  the generated `REQ_*` / `EVT_*` constant of the interface it addresses,
+  and the "opcode N" comments are gone. The guest v3 events built in
+  several places (`enter`, `preedit_string`, `commit_string`,
+  `delete_surrounding_text`) each have one `push_*_to` helper beside
+  `push_done_to`, and `leave` matches `enter`. The tests still assert the
+  literal opcodes, unchanged.
+- **Text-input versions.** A new object takes its parent's version: the
+  guest `zwp_text_input_v3` its guest manager's, the host
+  `zwp_text_input_v1` its host manager's, as the extension child already
+  did. One helper advertises the synthetic `zwp_text_input_manager_v3`
+  at its XML `VERSION`, and the host bind caps `TEXT_INPUT_MANAGER_VERSION`
+  and `TEXT_INPUT_EXTENSION_VERSION` are the generated `VERSION`s. Every
+  version is unchanged (1, and 11 for the extension);
+  `child_objects_inherit_their_manager_versions` pins the inheritance.
+- **Fixed-size messages.** A message of only ints, object IDs and fds
+  cannot exceed the wire limit, so every one the handlers build uses
+  `build_message`, and the unreachable error, rollback and
+  `return Action::Drop` branches after them are gone: the `wl_surface`
+  and `xdg_toplevel` requests, the buffer, params, temporary
+  `wl_shm_pool` and text-input-extension destructors, every request
+  `shm.rs` sends, the fixed-size text-input events and host requests,
+  `wl_display.get_registry` / `sync` / `delete_id`, and the fixed-size
+  dma-buf feedback events and params requests. `shm.rs`'s
+  `queue_message`, `rollback_queued_host_messages`,
+  `release_temporary_host_pool`, `cleanup_direct_dmabuf_failure` and
+  `unmap_destination` go with them, `linux_dmabuf.rs`'s `queue_message`
+  loses its unused descriptor parameter, and `process_params` no longer
+  takes a CREATE callback (create_immed's own unreachable check for an
+  unmapped params object is gone too). Only messages that carry strings or arrays stay
+  fallible: the text-input `preedit_string`, `commit_string` and
+  `set_surrounding_text`, `set_app_id`, `set_startup_id`,
+  `set_application_id`, the `xdg_toplevel` configure states, the
+  data-offer `receive`, the registry `global` and `bind`, the
+  `wl_display` errors, and the dma-buf feedback device and tranche
+  events.
+- **SHM backings.** `ShmBacking` says which path a guest `wl_shm` buffer
+  takes. `Shared` carries only the VirtWL fd, laid out exactly like the
+  guest buffer, so the copy path lost its unreachable size, offset and
+  stride checks and its no-mapping branch; `valid_buffer_layout` returns
+  the `i32` size a `wl_shm` pool needs. `Dmabuf` carries the host factory
+  and a `DmabufAllocation`, which holds the `DmabufLayout` its allocator
+  validated (each plane as the `u32` offset and stride `add` sends, plane
+  1 only for NV12), so the consumer re-checks nothing. `DmabufLayout`'s
+  fields are private to a submodule, so `validate_dmabuf_layout` is its
+  only constructor. GBM's plane-1 descriptor is still sent as returned:
+  `same_dma_buf_object` identifies a dma-buf by inode, which holds only
+  from Linux 5.3. Both paths duplicate their descriptors into `OwnedFd`s
+  before they map, reserve or queue anything, so their live failures (no
+  host `wl_shm`, dup, mmap) leave nothing to undo. The temporary pool and
+  the params object take their parents' versions. `on_create_buffer`
+  validates the request and dispatches to `select_shm_backing`, one
+  function per backing and one `register_shm_buffer` tail.
+- **Host-object retirement.** `Context::retire_destroyed_host_object` is
+  the one way to retire a host-only object, and makes a refused
+  retirement fatal; `mark_pending_destroy_host` is private to `state.rs`.
+  Its callers used to treat a refusal three ways: fatal, a warning (the
+  `wl_callback` paths) or ignored
+  (`retiring_a_destroyed_host_object_requires_a_live_host_only_object`).
+- **VM identifier.** `state::vm_identifier_from_environment` owns
+  `SOMMELIER_VM_IDENTIFIER` and its empty-means-`termina` rule; `main`
+  calls it once, like `PlacementConfig::from_environment`, and
+  `Context::new` takes the result. A non-UTF-8 value now logs a warning
+  before falling back to `termina`. The GBM allocator still reads
+  `SOMMELIER_DRM_DEVICE`.
+- **Release after a surface destroy (fix).** Every GTK client exit logged
+  `Ignoring wl_buffer.release without an awaiting render use`. Destroying
+  the last surface showing a submitted buffer reset its use to
+  `NeverSubmitted`, so the release Exo then owes for it looked
+  unexpected. The destructor now ends the use in `ReleaseOwed`, idle like
+  `NeverSubmitted` but owed exactly one release, which moves it to
+  `Released`. A further release is still logged. `owes_release` and
+  `may_be_current` are the one owner of each predicate, for the registry
+  and its two transition models. The guest still receives the release,
+  and buffer retirement is unchanged
+  (`release_owed_after_surface_destroy_is_expected`, which failed before).
+  Known limit: a release carries no serial, so if the guest commits the
+  buffer again before the owed release arrives, that release lands on the
+  new use and Exo's later one is logged.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 691 passed /
+1 ignored (694 before: the release regression and retirement tests
+added; five tests of deleted helpers and parameters removed), sample GUI 12,
+codegen 9, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets
+and on every commit, `cargo fmt --check`, and `git diff --check` pass.
+Not host-validated: no Sommelier process was started.
