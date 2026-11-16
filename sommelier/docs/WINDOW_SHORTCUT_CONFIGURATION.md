@@ -2,9 +2,10 @@
 
 Compositor-owned window placement shortcuts move the focused XDG toplevel
 with one `zaura_toplevel.set_window_bounds` request when a configured chord is
-pressed. This document is the single owner of their configuration contract:
-the settings, which source wins, what happens when a setting is invalid,
-reloading, and the precision a rectangle needs. The README links here.
+pressed. This document is the single owner of their contract: the settings,
+which source wins, what happens when a setting is invalid, how a chord is
+handled, the precision a rectangle needs, which output and work area a
+placement uses, and reloading. The README links here.
 
 ## Settings
 
@@ -71,9 +72,14 @@ problem is logged once per process instead. The rules apply in this order:
 | active | file path cannot be resolved | One error; shortcuts disabled; no reload. |
 | active | one, with `SOMMELIER_ACCELERATORS` invalid | One error; shortcuts and key filtering disabled; no reload. |
 
+## Chord handling
+
 While the policy is active, a chord that matches a binding is always
-consumed, even when the placement is skipped (for example, with no focused
-toplevel). A chord listed in `SOMMELIER_ACCELERATORS` stays with the host.
+consumed: it never reaches the guest, even when the placement is skipped
+(for example, with no focused toplevel, before the output's metadata is
+complete, or for a rectangle the output cannot represent), and the reason is
+logged. A chord listed in `SOMMELIER_ACCELERATORS` stays with the host. A
+chord that the host IME consumes is neither placed nor delivered.
 
 ## Environment list format
 
@@ -175,11 +181,37 @@ extent up to 1,000,000 pixels. Exact binary fractions such as `0.5` or
 one pixel short: `0.3333333 * 1920 = 639.99994` floors to `639`, not `640`.
 Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
+## Output and work area
+
+A placement uses an output that the focused surface has entered, so a window
+never jumps to another monitor; only a surface that has entered no output
+uses the first usable output. `OutputRegistry::for_surface` in
+`sommelier/src/state/outputs.rs` owns the exact rule, including which output
+wins when the surface spans several and when an output counts as usable.
+
+The work area is the output's logical screen area minus Aura's insets (the
+shelf and other reserved margins), in the coordinates that
+`zaura_toplevel.set_window_bounds` uses. `OutputState::work_area` in the same
+file owns how it is measured from the output's metadata, including why the
+`wl_output.geometry` panel transform is used rather than
+`zaura_output.logical_transform`. Placement waits until Aura has sent both
+its current output scale and its device scale factor; the rounded
+`wl_output.scale` cannot describe fractional display scaling.
+
+Known limits:
+
+- Aura reports both scale factors in thousandths, so unusual scale settings
+  may still differ slightly from the host's exact logical dimensions.
+- Exo's `wl_output.mode` is the panel's `bounds_in_native` size, which can
+  include overscan, so on an overscanned display the work area may be
+  slightly too large.
+- Rotated displays and multi-monitor output selection follow Exo's source and
+  are covered by unit tests, but have not been verified on a host.
+
 ## From rectangle to window bounds
 
-At key time the focused surface's output work area `(X, Y, W, H)` comes from
-`OutputState::work_area`; the [README](../../README.md#configuration) explains
-which output is chosen and how its work area is measured. Each rectangle edge
+At key time the focused surface's [work area](#output-and-work-area)
+`(X, Y, W, H)` becomes the frame of the rectangle. Each rectangle edge
 fraction `f` becomes a pixel offset:
 
 ```text
@@ -200,11 +232,11 @@ bounds = (X + left, Y + top, right - left, bottom - top)
   so their bounds are exactly what the dedicated half-split code produced
   before (a unit test compares both across small, odd, and extreme sizes).
   For an odd width the left half gets the smaller share.
-- The placement is skipped (the chord is still consumed) when the work area
-  is unavailable, when an edge strictly inside
-  `(0, 1)` rounds onto the work-area border (the output is too small to
-  represent the rectangle), when a rounded extent is empty, or when
-  `X + left` / `Y + top` overflows.
+- The placement is skipped (the chord is still [consumed](#chord-handling))
+  when the work area is unavailable, when an edge strictly inside `(0, 1)`
+  rounds onto the work-area border (the output is too small to represent the
+  rectangle), when a rounded extent is empty, or when `X + left` /
+  `Y + top` overflows.
 
 The owner of this rule is `NormalizedRect::to_work_area_bounds` in
 `sommelier/src/window_layout.rs`.
