@@ -26,15 +26,12 @@ limitations under the License.
 //!
 //! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
-use crate::protocols::aura_shell::zaura_surface::REQ_UNSET_SNAP;
-use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
 use crate::protocols::wayland::wl_keyboard;
-use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
-use crate::window_layout::{Rect, WindowLayoutAction};
-use crate::wire::{Action, MessageBuilder};
+use crate::window_layout::WindowLayoutAction;
+use crate::wire::Action;
 use xkbcommon::xkb;
 
 /// `wl_keyboard.key` state values (Wayland spec §wl_keyboard.key).
@@ -78,50 +75,6 @@ enum KeyClass {
     Placement(WindowLayoutAction),
     /// Ordinary guest input.
     Guest,
-}
-
-/// Why a consumed placement chord did not move the window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlacementSkip {
-    /// The keyboard focus is not on an xdg_toplevel.
-    NoFocusedToplevel,
-    /// The focused xdg_toplevel has no host object.
-    UnmappedToplevel,
-    /// No output with complete metadata can host the surface (see
-    /// `OutputRegistry::for_surface`).
-    NoUsableOutput,
-    /// The rectangle has an empty extent, an edge that rounds onto the work
-    /// area border, or overflowing coordinates on this output.
-    RectNotRepresentable,
-    /// The host Aura toplevel cannot be attached: no ARC policy identity
-    /// could be allocated, or zaura_shell is missing or too old.
-    NoAuraToplevel,
-    /// The host Aura surface is unavailable (no zaura_shell).
-    NoAuraSurface,
-    /// The surface's ARC policy identity could not be sent to its Aura
-    /// surface.
-    ArcIdentityUnavailable,
-    /// The ordering barrier for the bounds request could not be queued.
-    BarrierUnavailable,
-}
-
-impl PlacementSkip {
-    /// Log level for a skip. A rect the output cannot represent, or an Aura
-    /// toplevel that cannot be attached (old or missing zaura_shell, or ARC
-    /// identities exhausted), persists until the configuration or the proxy
-    /// changes, so it is logged at info. Other skips depend on transient
-    /// focus or output state and stay at debug.
-    fn log_level(self) -> log::Level {
-        match self {
-            Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
-            Self::NoFocusedToplevel
-            | Self::UnmappedToplevel
-            | Self::NoUsableOutput
-            | Self::NoAuraSurface
-            | Self::ArcIdentityUnavailable
-            | Self::BarrierUnavailable => log::Level::Debug,
-        }
-    }
 }
 
 /// A private, read-only view of a keymap fd mapped into the process address space.
@@ -371,161 +324,6 @@ impl KeyboardHandler {
             class
         );
         class
-    }
-
-    /// Resolve the focused guest xdg_toplevel and its backing wl_surface.
-    fn active_xdg_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<(u32, u32)> {
-        let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id)?.0;
-        let guest_seat_id = *ctx.keyboard_to_seat.get(&guest_keyboard_id)?;
-        let active_surface = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
-        if !ctx
-            .keyboard_focus
-            .keyboard_owns_surface(host_keyboard_id, active_surface)
-        {
-            return None;
-        }
-        ctx.xdg_toplevel_to_wl_surface
-            .iter()
-            .find_map(|(&xdg_toplevel_id, &surface_id)| {
-                (surface_id == active_surface).then_some((xdg_toplevel_id, surface_id))
-            })
-    }
-
-    fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
-        let message = MessageBuilder::new().build_message(host_xdg_toplevel_id, opcode);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-    }
-
-    fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surface_id: u32) {
-        Self::queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_FULLSCREEN);
-        Self::queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_MAXIMIZED);
-        let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-    }
-
-    /// Roll back every request belonging to one placement batch.
-    ///
-    /// Setup requests for the focused role may precede the batch and must
-    /// remain queued; the placement-owned state reset and bounds request must
-    /// either be sent together with their barrier or be removed together.
-    fn rollback_window_layout_batch(ctx: &mut Context, queue_start: usize) {
-        debug_assert!(
-            queue_start <= ctx.client_to_host_queue.len(),
-            "placement queue rollback boundary must remain valid"
-        );
-        ctx.client_to_host_queue.truncate(queue_start);
-    }
-
-    /// Resolve the screen bounds for a placement action on an output.
-    ///
-    /// The action's normalized rectangle is mapped into the output work area
-    /// by [`crate::window_layout::NormalizedRect::to_work_area_bounds`], which
-    /// owns the rounding rule. Returns `None` when the output has no usable
-    /// work area or the rectangle cannot be represented in it.
-    fn bounds_for_action(
-        action: WindowLayoutAction,
-        output: crate::state::OutputState,
-    ) -> Option<Rect> {
-        action
-            .rect()
-            .to_work_area_bounds(Rect::from(output.work_area()?))
-    }
-
-    /// Place the focused toplevel for one consumed placement chord.
-    ///
-    /// # Returns
-    ///
-    /// `Err` names why the window was not moved. The chord stays consumed
-    /// either way (see `on_key`); a skip queues no placement request.
-    fn apply_window_layout(
-        ctx: &mut Context,
-        host_keyboard_id: HostId,
-        action: WindowLayoutAction,
-    ) -> Result<(), PlacementSkip> {
-        debug_assert!(
-            ctx.window_placement.uses_arc_bounds(),
-            "classify_key yields placement actions only while the ARC bounds policy is active"
-        );
-        let (guest_xdg_toplevel_id, guest_wl_surface_id) =
-            Self::active_xdg_toplevel(ctx, host_keyboard_id)
-                .ok_or(PlacementSkip::NoFocusedToplevel)?;
-        let host_xdg_toplevel_id = ctx
-            .shadow_table
-            .get_host_id(guest_xdg_toplevel_id)
-            .ok_or(PlacementSkip::UnmappedToplevel)?;
-        let (output_host_id, output) = ctx
-            .shadow_table
-            .get_host_id(guest_wl_surface_id)
-            .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
-            .ok_or(PlacementSkip::NoUsableOutput)?;
-        let bounds =
-            Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
-        let zaura_toplevel_id = crate::handler::compositor::attach_placement_toplevel(
-            ctx,
-            guest_xdg_toplevel_id,
-            guest_wl_surface_id,
-        )
-        .ok_or(PlacementSkip::NoAuraToplevel)?;
-        let zaura_surface_id =
-            crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
-                .ok_or(PlacementSkip::NoAuraSurface)?;
-        // Setup requests may already be staged above us, but the ARC policy
-        // identity belongs to this placement batch and must roll back with
-        // the state-reset and bounds requests if the barrier cannot be queued.
-        let placement_queue_start = ctx.client_to_host_queue.len();
-        let arc_identity_was_applied = ctx
-            .window_placement
-            .arc_application_id_applied(guest_wl_surface_id);
-        if !crate::handler::compositor::ensure_arc_application_id_on_surface(
-            ctx,
-            guest_wl_surface_id,
-            zaura_surface_id,
-        ) {
-            Self::rollback_window_layout_batch(ctx, placement_queue_start);
-            return Err(PlacementSkip::ArcIdentityUnavailable);
-        }
-
-        // Keep every request emitted by this shortcut in one rollback
-        // boundary.  `attach_placement_toplevel`/`ensure_host_zaura_surface`
-        // may already have staged setup requests above us, so the offset
-        // must be captured immediately before the placement-owned batch.
-        Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
-        let mut builder = MessageBuilder::new();
-        builder.write_i32(bounds.x);
-        builder.write_i32(bounds.y);
-        builder.write_i32(bounds.width);
-        builder.write_i32(bounds.height);
-        builder.write_u32(output_host_id);
-        let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-        if !crate::handler::compositor::queue_window_bounds_barrier(ctx, zaura_toplevel_id) {
-            // Do not publish a partial placement batch without its ordering
-            // barrier.  Removing only the final bounds request would leave
-            // the state-reset requests in the host stream and make the next
-            // shortcut observe a half-applied operation.
-            Self::rollback_window_layout_batch(ctx, placement_queue_start);
-            if !arc_identity_was_applied {
-                // `ensure_arc_application_id_on_surface` marks the identity
-                // as applied when it queues the metadata request. If the
-                // placement batch is rolled back before reaching the host,
-                // allow the next attempt to queue that request again.
-                ctx.window_placement
-                    .unmark_arc_application_id_applied(guest_wl_surface_id);
-            }
-            return Err(PlacementSkip::BarrierUnavailable);
-        }
-        log::info!(
-            "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
-            action,
-            guest_xdg_toplevel_id,
-            zaura_toplevel_id,
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height,
-            output_host_id
-        );
-        Ok(())
     }
 
     fn reset_host_keyboard_modifiers(&mut self, host_keyboard_id: HostId) {
@@ -1046,7 +844,11 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 // The policy owns every matched chord, so the chord is
                 // consumed whether or not the window can move now; a skip
                 // must not leak the key to the guest.
-                if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
+                if let Err(reason) = crate::handler::window_placement::apply_window_layout(
+                    ctx,
+                    host_keyboard_id,
+                    action,
+                ) {
                     log::log!(
                         reason.log_level(),
                         "window layout {:?} skipped for keyboard {}: {:?}",
@@ -1410,6 +1212,7 @@ mod tests {
     use super::*;
     use crate::arc_task_ids::ArcIdAllocator;
     use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
@@ -1710,95 +1513,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_bounds_use_two_by_two_work_area_cells() {
-        let output = crate::state::OutputState {
-            mode_width: 3840,
-            mode_height: 2160,
-            aura_current_scale: Some(1000),
-            aura_device_scale_factor: Some(1000),
-            ..Default::default()
-        };
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopLeft, output),
-            Some(Rect::new(0, 0, 1920, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Top, output),
-            Some(Rect::new(0, 0, 3840, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopRight, output),
-            Some(Rect::new(1920, 0, 1920, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Left, output),
-            Some(Rect::new(0, 0, 1920, 2160))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, output),
-            Some(Rect::new(0, 0, 3840, 2160))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomLeft, output),
-            Some(Rect::new(0, 1080, 1920, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Bottom, output),
-            Some(Rect::new(0, 1080, 3840, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomRight, output),
-            Some(Rect::new(1920, 1080, 1920, 1080))
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
-            Some(Rect::new(1920, 0, 1920, 2160))
-        );
-    }
-
-    #[test]
-    fn grid_bounds_reject_coordinate_overflow() {
-        let output = crate::state::OutputState {
-            origin_x: i32::MAX,
-            mode_width: 4,
-            mode_height: 4,
-            aura_current_scale: Some(1000),
-            aura_device_scale_factor: Some(1000),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopRight, output),
-            None
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomRight, output),
-            None
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
-            None
-        );
-
-        let tiny_output = crate::state::OutputState {
-            mode_width: 1,
-            mode_height: 1,
-            aura_current_scale: Some(1000),
-            aura_device_scale_factor: Some(1000),
-            ..Default::default()
-        };
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::TopLeft, tiny_output),
-            None,
-            "split layouts must never emit zero-sized bounds"
-        );
-        assert_eq!(
-            KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, tiny_output),
-            Some(Rect::new(0, 0, 1, 1))
-        );
-    }
-
-    #[test]
     fn compositor_shortcut_is_handled_and_release_is_suppressed() {
         let keyboard = HostId(5);
         let key = 24;
@@ -1818,167 +1532,6 @@ mod tests {
         assert_eq!(release.ack_handled, Some(true));
         assert!(release.ends_repeat);
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
-    }
-
-    #[test]
-    fn apply_window_layout_queues_bounds_after_state_reset() {
-        let keyboard = 10u32;
-        let host_keyboard = 5u32;
-        let seat = 11u32;
-        let surface = 12u32;
-        let host_surface = 22u32;
-        let xdg_toplevel = 13u32;
-        let host_xdg_toplevel = 23u32;
-        let output = 25u32;
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
-        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
-        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.outputs.bind_for_test(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            KeyboardHandler::apply_window_layout(
-                &mut ctx,
-                HostId(host_keyboard),
-                WindowLayoutAction::Fullscreen,
-            ),
-            Ok(())
-        );
-        let opcodes: Vec<u16> = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                (word2 & 0xffff) as u16
-            })
-            .collect();
-        assert_eq!(
-            opcodes,
-            vec![
-                crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
-                crate::protocols::aura_shell::zaura_toplevel::REQ_SET_SUPPORTS_SCREEN_COORDINATES,
-                crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE,
-                crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID,
-                REQ_UNSET_FULLSCREEN,
-                REQ_UNSET_MAXIMIZED,
-                REQ_UNSET_SNAP,
-                REQ_SET_WINDOW_BOUNDS,
-                crate::protocols::wayland::wl_display::REQ_SYNC,
-            ]
-        );
-        let bounds = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                    == ctx
-                        .window_placement
-                        .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
-                        .unwrap()
-                    && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
-            })
-            .expect("window bounds request")
-            .0
-            .as_slice();
-        assert_eq!(i32::from_ne_bytes(bounds[8..12].try_into().unwrap()), 0);
-        assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
-        assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 3840);
-        assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
-    }
-
-    #[test]
-    fn placement_uses_the_focused_surfaces_entered_output() {
-        let keyboard = 10u32;
-        let host_keyboard = 5u32;
-        let seat = 11u32;
-        let surface = 12u32;
-        let host_surface = 22u32;
-        let xdg_toplevel = 13u32;
-        let host_xdg_toplevel = 23u32;
-        let primary_output = 25u32;
-        let secondary_output = 26u32;
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
-        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
-        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.outputs.bind_for_test(
-            primary_output,
-            crate::state::OutputState {
-                mode_width: 1920,
-                mode_height: 1080,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-        ctx.outputs.bind_for_test(
-            secondary_output,
-            crate::state::OutputState {
-                origin_x: 1920,
-                mode_width: 1920,
-                mode_height: 1080,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-        ctx.outputs.surface_entered(host_surface, secondary_output);
-
-        assert_eq!(
-            KeyboardHandler::apply_window_layout(
-                &mut ctx,
-                HostId(host_keyboard),
-                WindowLayoutAction::Fullscreen,
-            ),
-            Ok(())
-        );
-        let aura_toplevel = ctx
-            .window_placement
-            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
-            .expect("Aura toplevel mapping");
-        let bounds = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|message| {
-                message_sender(message) == aura_toplevel
-                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
-            })
-            .expect("window bounds request");
-        assert_eq!(
-            i32::from_ne_bytes(bounds.0[8..12].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(i32::from_ne_bytes(bounds.0[12..16].try_into().unwrap()), 0);
-        assert_eq!(
-            i32::from_ne_bytes(bounds.0[16..20].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(
-            i32::from_ne_bytes(bounds.0[20..24].try_into().unwrap()),
-            1080
-        );
-        assert_eq!(
-            u32::from_ne_bytes(bounds.0[24..28].try_into().unwrap()),
-            secondary_output
-        );
     }
 
     /// A matched chord belongs to Sommelier while the policy is active, so
@@ -2072,8 +1625,12 @@ mod tests {
         );
 
         assert_eq!(
-            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
-            Err(PlacementSkip::NoUsableOutput)
+            crate::handler::window_placement::apply_window_layout(
+                &mut ctx,
+                HostId(5),
+                WindowLayoutAction::TopLeft
+            ),
+            Err(crate::handler::window_placement::PlacementSkip::NoUsableOutput)
         );
         assert_eq!(
             handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
@@ -2194,11 +1751,15 @@ mod tests {
         // The focused surface is not (or no longer) an xdg_toplevel.
         ctx.xdg_toplevel_to_wl_surface.clear();
         assert_eq!(
-            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
-            Err(PlacementSkip::NoFocusedToplevel)
+            crate::handler::window_placement::apply_window_layout(
+                &mut ctx,
+                HostId(5),
+                WindowLayoutAction::TopLeft
+            ),
+            Err(crate::handler::window_placement::PlacementSkip::NoFocusedToplevel)
         );
         assert_eq!(
-            PlacementSkip::NoFocusedToplevel.log_level(),
+            crate::handler::window_placement::PlacementSkip::NoFocusedToplevel.log_level(),
             log::Level::Debug,
             "a transient skip stays at debug"
         );
@@ -2230,11 +1791,11 @@ mod tests {
             crate::window_layout::NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap(),
         );
         assert_eq!(
-            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), sliver),
-            Err(PlacementSkip::RectNotRepresentable)
+            crate::handler::window_placement::apply_window_layout(&mut ctx, HostId(5), sliver),
+            Err(crate::handler::window_placement::PlacementSkip::RectNotRepresentable)
         );
         assert_eq!(
-            PlacementSkip::RectNotRepresentable.log_level(),
+            crate::handler::window_placement::PlacementSkip::RectNotRepresentable.log_level(),
             log::Level::Info,
             "a persistent misconfiguration is visible at info"
         );
@@ -2253,8 +1814,12 @@ mod tests {
             ArcIdAllocator::exhausted_for_test(),
         ));
         assert_eq!(
-            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
-            Err(PlacementSkip::NoAuraToplevel)
+            crate::handler::window_placement::apply_window_layout(
+                &mut ctx,
+                HostId(5),
+                WindowLayoutAction::TopLeft
+            ),
+            Err(crate::handler::window_placement::PlacementSkip::NoAuraToplevel)
         );
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
         assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
@@ -2773,107 +2338,6 @@ mod tests {
         assert!(!ctx.window_placement.has_active_barrier(aura_toplevel));
         assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
         assert_eq!(ctx.text_inputs[&guest_text_input], state_after_activation);
-    }
-
-    #[test]
-    fn placement_batch_rollback_removes_all_partial_state_requests() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.client_to_host_queue.push((vec![0xaa], Vec::new()));
-        let queue_start = ctx.client_to_host_queue.len();
-
-        KeyboardHandler::clear_window_state(&mut ctx, 23, 24);
-        ctx.client_to_host_queue.push((vec![0xbb], Vec::new()));
-        assert_eq!(ctx.client_to_host_queue.len(), queue_start + 4);
-
-        KeyboardHandler::rollback_window_layout_batch(&mut ctx, queue_start);
-        assert_eq!(
-            ctx.client_to_host_queue,
-            vec![(vec![0xaa], Vec::new())],
-            "failed placement must not leave state-reset or bounds requests queued"
-        );
-    }
-
-    #[test]
-    fn left_and_right_use_direct_bounds_instead_of_snap_requests() {
-        let keyboard = 10u32;
-        let host_keyboard = 5u32;
-        let seat = 11u32;
-        let surface = 12u32;
-        let host_surface = 22u32;
-        let xdg_toplevel = 13u32;
-        let host_xdg_toplevel = 23u32;
-        let output = 25u32;
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
-        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
-        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
-        ctx.outputs.bind_for_test(
-            output,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-
-        for (action, expected_x) in [
-            (WindowLayoutAction::Left, 0),
-            (WindowLayoutAction::Right, 1920),
-        ] {
-            ctx.client_to_host_queue.clear();
-            assert_eq!(
-                KeyboardHandler::apply_window_layout(&mut ctx, HostId(host_keyboard), action),
-                Ok(())
-            );
-            let opcodes: Vec<u16> = ctx
-                .client_to_host_queue
-                .iter()
-                .map(|(message, _)| {
-                    let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                    (word2 & 0xffff) as u16
-                })
-                .collect();
-            assert!(
-                opcodes.contains(&REQ_SET_WINDOW_BOUNDS),
-                "{action:?} must use set_window_bounds"
-            );
-            assert!(
-                !opcodes.contains(&crate::protocols::aura_shell::zaura_surface::REQ_SET_SNAP_LEFT),
-                "{action:?} must not use set_snap_left"
-            );
-            assert!(
-                !opcodes.contains(&crate::protocols::aura_shell::zaura_surface::REQ_SET_SNAP_RIGHT),
-                "{action:?} must not use set_snap_right"
-            );
-            let bounds = ctx
-                .client_to_host_queue
-                .iter()
-                .find(|(message, _)| {
-                    let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                    u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                        == ctx
-                            .window_placement
-                            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
-                            .unwrap()
-                        && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
-                })
-                .expect("window bounds request")
-                .0
-                .as_slice();
-            assert_eq!(
-                i32::from_ne_bytes(bounds[8..12].try_into().unwrap()),
-                expected_x
-            );
-            assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
-            assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 1920);
-            assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
-        }
     }
 
     #[test]

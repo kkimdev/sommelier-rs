@@ -25,3 +25,4 @@ pub mod registry;
 pub mod seat;
 pub mod shm;
 pub mod text_input;
+pub mod window_placement;

@@ -526,7 +526,7 @@ impl Client {
                             // needed here: a missing shell is retried when
                             // zaura_shell is bound, and placement attaches
                             // lazily through the same helper.
-                            let _ = crate::handler::compositor::attach_placement_toplevel(
+                            let _ = crate::handler::window_placement::attach_placement_toplevel(
                                 &mut self.ctx,
                                 guest_xdg_toplevel_id,
                                 wl_surface_guest_id,

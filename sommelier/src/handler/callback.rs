@@ -64,7 +64,7 @@ impl WlCallbackHandler for CallbackHandler {
             }
             return Action::Drop;
         }
-        if crate::handler::compositor::complete_window_bounds_barrier(ctx, host_id) {
+        if crate::handler::window_placement::complete_window_bounds_barrier(ctx, host_id) {
             // A sync callback is host-only and terminal at `done`. Keep its
             // numeric ID reserved until the host's subsequent delete_id, but
             // stop treating duplicate/stale events as live callbacks.

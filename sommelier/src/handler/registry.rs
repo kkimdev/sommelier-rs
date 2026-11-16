@@ -963,7 +963,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     .map(|(&toplevel, &surface)| (toplevel, surface))
                     .collect::<Vec<_>>()
                 {
-                    let _ = crate::handler::compositor::attach_placement_toplevel(
+                    let _ = crate::handler::window_placement::attach_placement_toplevel(
                         ctx,
                         xdg_toplevel_guest_id,
                         wl_surface_guest_id,

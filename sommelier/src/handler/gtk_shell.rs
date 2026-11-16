@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use crate::handler::compositor::{
-    ensure_arc_application_id_on_surface, ensure_host_zaura_surface, native_wayland_app_id,
-    wayland_string_fits_message,
+    ensure_host_zaura_surface, native_wayland_app_id, wayland_string_fits_message,
 };
+use crate::handler::window_placement::ensure_arc_application_id_on_surface;
 use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
