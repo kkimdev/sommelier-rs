@@ -121,11 +121,11 @@ only.
   block and walks every block once.
 - **Lock.** A block is reserved by an exclusive, non-blocking `flock` on
   `$XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<first>-<last>.lock`. Missing
-  directories are created with mode `0700` and missing lock files with `0600`;
-  symlinks are not followed. The open descriptor holds the lock until the process exits,
-  so the kernel releases it even after a crash. A block whose lock file is
-  held by another process, or cannot be opened or locked for any other reason,
-  is skipped.
+  directories are created with mode `0700` and missing lock files with `0600`,
+  both further restricted by the umask. The open descriptor holds the lock
+  until the process exits, so the kernel releases it even after a crash. A
+  block whose lock file is held by another process, is a symlink (skipped, not
+  followed), or cannot be opened or locked for any other reason is skipped.
 - **Private runtime directory.** `$XDG_RUNTIME_DIR` must be owned by the user
   and have no group or other permissions, as the XDG Base Directory
   specification requires. This is the trust boundary: no other user can
@@ -135,6 +135,9 @@ only.
   share one `$XDG_RUNTIME_DIR`. Proxies in other runtime directories (other
   containers or VMs attached to the same host compositor) coordinate nothing;
   the random block and the random offset only make an overlap unlikely.
+  Deleting or replacing the lock directory, or a held lock file, while a proxy
+  runs lets a later proxy lock a new file of the same name and reuse that
+  block; nothing detects this.
 - **Within a block.** IDs are handed out in order from a random offset,
   wrapping inside the block. A process never hands out an ID twice:
   destroying a surface forgets its identity without returning it, and a block
