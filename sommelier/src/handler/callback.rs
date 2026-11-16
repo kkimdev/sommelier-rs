@@ -16,55 +16,78 @@ limitations under the License.
 
 use crate::protocols;
 use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-use crate::state::{Context, HostId};
-use crate::wire::{Action, MessageBuilder};
+use crate::protocols::wayland::wl_display::REQ_SYNC;
+use crate::state::{Context, HostId, InternalCallback};
+use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
 use log::debug;
 
 pub struct CallbackHandler;
 
+/// Issue a host-only `wl_display.sync` whose `done` means `waits_for` has
+/// happened (see [`InternalCallback`]).
+///
+/// # Returns
+///
+/// The callback's host ID, which stays reserved until the host's
+/// `wl_display.delete_id`.
+pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> HostId {
+    let callback = HostId(ctx.shadow_table.allocate_host_id());
+    ctx.shadow_table.track_host_interface_with_version(
+        callback.0,
+        "wl_callback".to_string(),
+        protocols::wayland::wl_callback::VERSION,
+    );
+    ctx.internal_callbacks.register(callback, waits_for);
+    let mut builder = MessageBuilder::new();
+    builder.write_u32(callback.0);
+    let message = builder.build_message(WL_DISPLAY_ID, REQ_SYNC);
+    ctx.client_to_host_queue.push((message, Vec::new()));
+    callback
+}
+
 impl WlCallbackHandler for CallbackHandler {
     fn on_done(&mut self, ctx: &mut Context, callback_data: u32) -> Action {
         let host_id = ctx.last_sender_id;
-        if crate::handler::text_input::complete_host_activation_barrier(ctx, HostId(host_id)) {
-            return Action::Drop;
-        }
-        if let Some(generation) = ctx.dmabuf_capability_callbacks.remove(&host_id) {
-            // wl_callback.done destroys the host callback resource. Reserve its
-            // numeric ID until wl_display.delete_id arrives, while making any
-            // duplicate event undispatchable immediately.
+        if let Some(waits_for) = ctx.internal_callbacks.complete(HostId(host_id)) {
+            // wl_callback.done destroys the host callback resource. Reserve
+            // its numeric ID until wl_display.delete_id arrives, while making
+            // any duplicate event undispatchable immediately.
             if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
                 log::warn!(
-                    "linux-dmabuf capability callback {} was not tracked as host-only",
-                    host_id
+                    "internal callback {} ({:?}) was not tracked as host-only",
+                    host_id,
+                    waits_for
                 );
             }
-            crate::handler::linux_dmabuf::LinuxDmabufHandler::complete_capability_discovery(
-                ctx, generation,
-            );
-            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
-            return Action::Drop;
-        }
-        if let Some(gtk_shell_id) = ctx.gtk_shell_capability_callbacks.remove(&host_id) {
-            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
-                log::warn!(
-                    "GTK shell capability callback {} was not tracked as host-only",
-                    host_id
-                );
-            }
-            if ctx.gtk_shells.contains_key(&gtk_shell_id)
-                && ctx.shadow_table.is_local_only_guest_object(gtk_shell_id)
-            {
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(0);
-                if let Ok(message) = builder
-                    .try_build_message(gtk_shell_id, protocols::gtk::gtk_shell1::EVT_CAPABILITIES)
-                {
-                    ctx.host_to_client_queue.push((message, Vec::new()));
+            match waits_for {
+                InternalCallback::DmabufCapabilities { generation } => {
+                    crate::handler::linux_dmabuf::LinuxDmabufHandler::complete_capability_discovery(
+                        ctx, generation,
+                    );
+                    crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(
+                        ctx, generation,
+                    );
+                }
+                InternalCallback::GtkShellCapabilities { gtk_shell } => {
+                    crate::handler::gtk_shell::announce_capabilities(ctx, gtk_shell);
+                }
+                InternalCallback::TextInputDrained {
+                    text_input,
+                    host_text_input,
+                } => crate::handler::text_input::complete_host_activation_barrier(
+                    ctx,
+                    HostId(host_id),
+                    text_input,
+                    host_text_input,
+                ),
+                InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
+                    crate::handler::window_placement::complete_barrier(
+                        ctx,
+                        host_id,
+                        zaura_toplevel,
+                    );
                 }
             }
-            return Action::Drop;
-        }
-        if crate::handler::window_placement::complete_barrier(ctx, host_id) {
             return Action::Drop;
         }
         let guest_id = ctx.shadow_table.get_guest_id(host_id).unwrap_or(0);
@@ -78,22 +101,15 @@ impl WlCallbackHandler for CallbackHandler {
             // 1. Send done event to client
             let mut builder = MessageBuilder::new();
             builder.write_u32(callback_data);
-
-            if let Ok(done_msg) =
-                builder.try_build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE)
-            {
-                ctx.host_to_client_queue.push((done_msg, Vec::new()));
-            }
+            let done = builder.build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE);
+            ctx.host_to_client_queue.push((done, Vec::new()));
 
             // 2. Send delete_id to client
-            let mut builder2 = MessageBuilder::new();
-            builder2.write_u32(guest_id);
-
-            if let Ok(del_msg) =
-                builder2.try_build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
-            {
-                ctx.host_to_client_queue.push((del_msg, Vec::new()));
-            }
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(guest_id);
+            let delete_id =
+                builder.build_message(WL_DISPLAY_ID, protocols::wayland::wl_display::EVT_DELETE_ID);
+            ctx.host_to_client_queue.push((delete_id, Vec::new()));
 
             // The terminal event destroys the callback on both sides, but the
             // host numeric ID cannot be reused until its later delete_id.
@@ -117,10 +133,38 @@ impl WlCallbackHandler for CallbackHandler {
 mod tests {
     use super::CallbackHandler;
     use crate::handler::display::DisplayHandler;
+    use crate::handler::window_placement::register_window_bounds_barrier_for_test;
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::state::Context;
+    use crate::state::{Context, HostId, InternalCallback};
     use crate::wire::Action;
+
+    #[test]
+    fn internal_sync_is_a_tracked_host_callback() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let waits_for = InternalCallback::DmabufCapabilities { generation: 9 };
+        let callback = super::queue_internal_sync(&mut ctx, waits_for);
+        assert_eq!(ctx.client_to_host_queue.len(), 1);
+        let message = &ctx.client_to_host_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            1,
+            "wl_display must own the sync request"
+        );
+        assert_eq!(
+            u16::from_ne_bytes(message[4..6].try_into().unwrap()),
+            crate::protocols::wayland::wl_display::REQ_SYNC
+        );
+        assert_eq!(
+            u32::from_ne_bytes(message[8..12].try_into().unwrap()),
+            callback.0
+        );
+        assert_eq!(ctx.internal_callbacks.get(callback), Some(waits_for));
+        assert_eq!(
+            ctx.shadow_table.get_host_interface(callback.0),
+            Some(&"wl_callback".to_string())
+        );
+    }
 
     #[test]
     fn internal_dmabuf_callback_completes_exact_generation() {
@@ -134,14 +178,16 @@ mod tests {
         );
         ctx.dmabuf_capabilities.entry(generation).or_default();
         ctx.host_dmabuf_generation = Some(generation);
-        ctx.dmabuf_capability_callbacks
-            .insert(callback_id, generation);
+        ctx.internal_callbacks.register(
+            HostId(callback_id),
+            InternalCallback::DmabufCapabilities { generation },
+        );
         ctx.last_sender_id = callback_id;
 
         let mut handler = CallbackHandler;
         assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
         assert!(ctx.dmabuf_capabilities[&generation].ready);
-        assert!(!ctx.dmabuf_capability_callbacks.contains_key(&callback_id));
+        assert_eq!(ctx.internal_callbacks.get(HostId(callback_id)), None);
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
     }
 
@@ -184,13 +230,12 @@ mod tests {
             "wl_callback".to_string(),
             1,
         );
-        ctx.window_placement
-            .register_barrier(callback_id, zaura_toplevel_id);
+        register_window_bounds_barrier_for_test(&mut ctx, callback_id, zaura_toplevel_id);
         ctx.last_sender_id = callback_id;
 
         let mut handler = CallbackHandler;
         assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
         assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
         assert!(!ctx.shadow_table.is_host_id_available(callback_id));
@@ -216,10 +261,8 @@ mod tests {
                 1,
             );
         }
-        ctx.window_placement
-            .register_barrier(old_callback_id, zaura_toplevel_id);
-        ctx.window_placement
-            .register_barrier(new_callback_id, zaura_toplevel_id);
+        register_window_bounds_barrier_for_test(&mut ctx, old_callback_id, zaura_toplevel_id);
+        register_window_bounds_barrier_for_test(&mut ctx, new_callback_id, zaura_toplevel_id);
 
         let mut handler = CallbackHandler;
         ctx.last_sender_id = old_callback_id;
@@ -233,14 +276,16 @@ mod tests {
             .shadow_table
             .is_pending_destroy_host_only(old_callback_id));
         assert_eq!(
-            ctx.window_placement.barrier_for_callback(new_callback_id),
-            Some(zaura_toplevel_id)
+            ctx.internal_callbacks.get(HostId(new_callback_id)),
+            Some(InternalCallback::WindowBoundsBarrier {
+                zaura_toplevel: zaura_toplevel_id
+            })
         );
 
         ctx.last_sender_id = new_callback_id;
         assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
         assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(ctx
             .shadow_table
             .is_pending_destroy_host_only(new_callback_id));

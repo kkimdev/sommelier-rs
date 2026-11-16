@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod aura_surfaces;
 mod input;
+mod internal_callbacks;
 mod outputs;
 mod render;
 mod window_placement;
+mod xdg_roles;
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{OwnedFd, RawFd};
@@ -25,6 +28,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
 
+pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
@@ -37,8 +41,9 @@ pub(crate) use self::input::{
     ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
     GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
     KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
-    PreeditRegionPlan, SeatFocusChange, TextInputActivationBarrierRegistry, TextInputState,
+    PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
+pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
@@ -52,6 +57,7 @@ pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
     PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, WindowPlacementState,
 };
+pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -716,7 +722,34 @@ pub struct GtkShellState {
 pub struct GtkSurfaceState {
     pub shell_id: u32,
     pub wl_surface_id: u32,
-    pub host_zaura_surface_id: Option<u32>,
+}
+
+/// Work a request handler defers until the proxy has forwarded the request.
+///
+/// A handler runs before the generated dispatcher maps the request's new
+/// IDs and encodes it, and the request can still be rejected after the
+/// handler returns. Work that must only happen for a forwarded request, or
+/// that needs a new ID's host mapping, is recorded with
+/// [`Context::defer_until_forwarded`]. The proxy loop takes it after every
+/// message and applies it only when the message was forwarded. Requests it
+/// queues follow the forwarded bytes and the requests the handler queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostDispatch {
+    /// `xdg_surface.get_toplevel` created `xdg_toplevel` from `xdg_surface`.
+    XdgToplevelCreated { xdg_surface: u32, xdg_toplevel: u32 },
+}
+
+/// The proxy's internal host `zaura_shell` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostAuraShell {
+    pub(crate) id: u32,
+    /// The registry name of the global it was bound from, so its
+    /// `global_remove` releases exactly this binding.
+    pub(crate) global_name: u32,
+    /// The bound version, clamped by the `zaura_shell` bind in
+    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Every
+    /// Aura child created from this binding takes it.
+    pub(crate) version: u32,
 }
 
 pub struct Context {
@@ -742,6 +775,9 @@ pub struct Context {
     /// A queued `wl_display.error` must be flushed before the client session
     /// is torn down. This is set by fatal protocol validation paths.
     pub fatal_protocol_error: bool,
+    /// Work deferred by the handler of the message being dispatched; see
+    /// [`PostDispatch`].
+    post_dispatch: Vec<PostDispatch>,
     /// Monotonic serial source for synthetic keyboard compatibility events.
     pub synthetic_keyboard_serial: u32,
     pub allocator: Option<Allocator>,
@@ -762,7 +798,6 @@ pub struct Context {
     pub host_text_input_manager_v1_global_name: Option<u32>,
     pub host_text_input_extension_v1_global_name: Option<u32>,
     pub host_keyboard_extension_global_name: Option<u32>,
-    pub host_zaura_shell_global_name: Option<u32>,
     /// Formats observed from the host's SHM or dmabuf capability events that
     /// the SHM bridge can actually copy. ARGB/XRGB are always available per
     /// the wl_shm contract; optional formats are added only after the host
@@ -871,14 +906,9 @@ pub struct Context {
     pub dmabuf_capabilities: HashMap<u64, DmabufCapabilityState>,
     /// Generation collected by the current internal host dmabuf binding.
     pub host_dmabuf_generation: Option<u64>,
-    /// Host-only wl_callback IDs used as capability-discovery barriers.
-    pub dmabuf_capability_callbacks: HashMap<u32, u64>,
-    /// Host sync callbacks that make a synthetic GTK shell binding visible
-    /// only after the internal Aura shell bind has reached the compositor.
-    pub gtk_shell_capability_callbacks: HashMap<u32, u32>,
-    /// Host callback generations that drain stale text-input events before
-    /// reactivation of a reused v1 object.
-    pub text_input_activation_barriers: TextInputActivationBarrierRegistry,
+    /// Host-only wl_callback barriers the proxy issued for itself, and what
+    /// each one waits for.
+    pub(crate) internal_callbacks: InternalCallbacks,
     /// Guest-facing v4 globals withheld until the internal v3 binding has
     /// delivered its complete legacy format/modifier capability set.
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
@@ -887,12 +917,9 @@ pub struct Context {
     pub dmabuf_guest_generations: HashMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
-    /// Host-side zaura_shell object ID (bound internally, not exposed to guest).
-    pub host_zaura_shell_id: Option<u32>,
-    /// Bound version of zaura_shell, clamped by the `zaura_shell` bind in
-    /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Used to
-    /// guard opcodes that require specific protocol versions.
-    pub host_zaura_shell_version: u32,
+    /// The internal host zaura_shell binding (not exposed to the guest), if
+    /// one is bound.
+    pub(crate) host_zaura_shell: Option<HostAuraShell>,
     /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
     pub vm_identifier: String,
     /// This connection's ARC bounds policy state (see
@@ -905,12 +932,10 @@ pub struct Context {
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
-    /// Tracks xdg_surface → wl_surface associations (guest IDs).
-    pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
-    /// Tracks xdg_surface → xdg_toplevel associations (guest IDs).
-    pub xdg_surface_to_xdg_toplevel: HashMap<u32, u32>,
-    /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
-    pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
+    /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
+    pub(crate) aura_surfaces: AuraSurfaces,
+    /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
+    pub(crate) xdg_roles: XdgRoles,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -928,6 +953,33 @@ pub(crate) struct LocalBufferCopyResources<'a> {
 }
 
 impl Context {
+    /// Defer `effect` until the message being dispatched is forwarded; it is
+    /// discarded if the message is dropped or rejected.
+    pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
+        self.post_dispatch.push(effect);
+    }
+
+    /// Whether work deferred by a dispatched message has not been taken.
+    pub(crate) fn has_post_dispatch(&self) -> bool {
+        !self.post_dispatch.is_empty()
+    }
+
+    /// Bind host object `id` as the internal `zaura_shell` at the vendored
+    /// protocol's version, as the registry would.
+    #[cfg(test)]
+    pub(crate) fn bind_aura_shell_for_test(&mut self, id: u32) {
+        self.host_zaura_shell = Some(HostAuraShell {
+            id,
+            global_name: id,
+            version: crate::protocols::aura_shell::zaura_shell::VERSION,
+        });
+    }
+
+    /// Take the work deferred while dispatching the current message.
+    pub(crate) fn take_post_dispatch(&mut self) -> Vec<PostDispatch> {
+        std::mem::take(&mut self.post_dispatch)
+    }
+
     pub(crate) fn render_buffer_host_id(&self, guest_buffer_id: u32) -> Option<HostId> {
         self.shadow_table
             .get_host_id(guest_buffer_id)
@@ -1227,6 +1279,7 @@ impl Context {
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
             fatal_protocol_error: false,
+            post_dispatch: Vec::new(),
             synthetic_keyboard_serial: 0,
             allocator,
             #[cfg(test)]
@@ -1239,7 +1292,6 @@ impl Context {
             host_text_input_manager_v1_global_name: None,
             host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_zaura_shell_global_name: None,
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),
@@ -1272,23 +1324,19 @@ impl Context {
             synthetic_feedback_refresh_pending: HashSet::new(),
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,
-            dmabuf_capability_callbacks: HashMap::new(),
-            gtk_shell_capability_callbacks: HashMap::new(),
-            text_input_activation_barriers: TextInputActivationBarrierRegistry::default(),
+            internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
             dmabuf_guest_generations: HashMap::new(),
             gpu_accel,
             xdg_decoration,
-            host_zaura_shell_id: None,
-            host_zaura_shell_version: 0,
+            host_zaura_shell: None,
             vm_identifier,
             window_placement,
             outputs: OutputRegistry::default(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
-            xdg_surface_to_wl_surface: HashMap::new(),
-            xdg_surface_to_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_to_wl_surface: HashMap::new(),
+            aura_surfaces: AuraSurfaces::default(),
+            xdg_roles: XdgRoles::default(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }

@@ -18,13 +18,15 @@ limitations under the License.
 //!
 //! [`WindowPlacementState`] is the single owner of one connection's state
 //! for the opt-in ARC bounds policy: the per-surface ARC policy identities,
-//! the host Aura surface/toplevel associations, the host-stream sync barriers
-//! that order `zaura_toplevel.set_window_bounds`, and the configures held
-//! behind those barriers. Whether the policy is active is decided once per
-//! process by `crate::placement_config::PlacementConfig`, which hands this
-//! state the process's ARC task-ID block. The maps are private so handlers
-//! cannot update one side of an association, or retire a toplevel, without
-//! the matching cleanup.
+//! the placement Aura toplevel of each XDG toplevel, which host-stream sync
+//! barrier currently orders each toplevel's `zaura_toplevel.set_window_bounds`,
+//! and the configures held behind it. The barrier callbacks themselves are
+//! pending in `crate::state::InternalCallbacks`, and the host Aura surface
+//! is shared (`crate::state::AuraSurfaces`). Whether the policy is active is
+//! decided once per process by `crate::placement_config::PlacementConfig`,
+//! which hands this state the process's ARC task-ID block. The maps are
+//! private so handlers cannot update one side of an association, or retire
+//! a toplevel, without the matching cleanup.
 //!
 //! Wire encoding stays in `crate::handler::window_placement`; this type only
 //! answers ownership questions and returns the IDs whose host teardown the
@@ -91,20 +93,14 @@ pub(crate) struct WindowPlacementState {
     /// paired host Aura surface. Keeping this separate from the allocated
     /// identity avoids repeating the metadata request on every placement.
     arc_application_ids_applied: HashSet<u32>,
-    /// Host wl_surface ID → host zaura_surface ID. XDG, GTK, and placement
-    /// metadata share this one Aura child per surface.
-    aura_surface_by_wl_surface: HashMap<u32, u32>,
     /// Guest xdg_toplevel ID → host zaura_toplevel ID.
     aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
     /// Reverse of `aura_toplevel_by_xdg_toplevel`, used to route host Aura
     /// toplevel events back to the guest role.
     xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
-    /// Host sync callback ID → Aura toplevel ID. A callback stays here until
-    /// its terminal `done`, even after it is superseded or its toplevel is
-    /// released, so its host ID is never mistaken for an ordinary callback.
-    barrier_toplevels: HashMap<u32, u32>,
-    /// The newest barrier for each live Aura toplevel; only it gates
-    /// configure delivery.
+    /// The newest barrier callback for each live Aura toplevel; only it gates
+    /// configure delivery. Every barrier, including superseded ones, stays
+    /// pending in `crate::state::InternalCallbacks` until its `done`.
     active_barriers: HashMap<u32, u32>,
     /// Latest toplevel configure held while the active barrier is live.
     held_configures: HashMap<u32, PendingWindowBoundsConfigure>,
@@ -126,10 +122,8 @@ impl WindowPlacementState {
             arc_id_allocator,
             arc_application_ids: HashMap::new(),
             arc_application_ids_applied: HashSet::new(),
-            aura_surface_by_wl_surface: HashMap::new(),
             aura_toplevel_by_xdg_toplevel: HashMap::new(),
             xdg_toplevel_by_aura_toplevel: HashMap::new(),
-            barrier_toplevels: HashMap::new(),
             active_barriers: HashMap::new(),
             held_configures: HashMap::new(),
             held_surface_configures: HashMap::new(),
@@ -156,11 +150,6 @@ impl WindowPlacementState {
             self.aura_toplevel_by_xdg_toplevel.len(),
             self.xdg_toplevel_by_aura_toplevel.len()
         );
-        debug_assert!(self.active_barriers.iter().all(
-            |(zaura_toplevel_host_id, callback_host_id)| {
-                self.barrier_toplevels.get(callback_host_id) == Some(zaura_toplevel_host_id)
-            }
-        ));
         debug_assert!(self
             .held_configures
             .keys()
@@ -216,56 +205,13 @@ impl WindowPlacementState {
         !self.arc_application_ids.is_empty()
     }
 
-    // ── Aura surfaces ─────────────────────────────────────────────────────
-
-    /// Return the Aura surface associated with a host wl_surface.
-    pub(crate) fn aura_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
-        self.aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .copied()
-    }
-
-    /// Record the Aura surface created for a host wl_surface.
-    pub(crate) fn remember_aura_surface(
-        &mut self,
-        wl_surface_host_id: u32,
-        zaura_surface_host_id: u32,
-    ) {
-        let previous = self
-            .aura_surface_by_wl_surface
-            .insert(wl_surface_host_id, zaura_surface_host_id);
-        debug_assert!(
-            previous.is_none_or(|previous| previous == zaura_surface_host_id),
-            "replacing a live Aura surface would orphan its destructor"
-        );
-    }
-
-    /// Remove all placement state owned by a destroyed guest wl_surface.
-    ///
-    /// The guest ID owns the ARC identity while the host ID owns the Aura
-    /// surface association; the destructor is the one boundary that knows
-    /// both.
-    ///
-    /// # Returns
-    ///
-    /// The Aura surface whose host teardown the caller must perform.
-    #[must_use = "the returned Aura surface ID identifies host teardown work"]
-    pub(crate) fn release_surface(
-        &mut self,
-        wl_surface_guest_id: u32,
-        wl_surface_host_id: u32,
-    ) -> Option<u32> {
+    /// Forget the ARC identity of a destroyed guest wl_surface. Identities
+    /// are never recycled: a reused guest ID is allocated a new one.
+    pub(crate) fn forget_surface(&mut self, wl_surface_guest_id: u32) {
         self.arc_application_ids.remove(&wl_surface_guest_id);
         self.arc_application_ids_applied
             .remove(&wl_surface_guest_id);
-        let zaura_surface_host_id = self.aura_surface_by_wl_surface.remove(&wl_surface_host_id);
         self.debug_assert_consistent();
-        zaura_surface_host_id
-    }
-
-    #[cfg(test)]
-    pub(crate) fn aura_surface_count(&self) -> usize {
-        self.aura_surface_by_wl_surface.len()
     }
 
     // ── Aura toplevels ────────────────────────────────────────────────────
@@ -340,34 +286,27 @@ impl WindowPlacementState {
 
     // ── Bounds barriers and held configures ───────────────────────────────
 
-    /// Register a newly queued host sync callback as the newest barrier for
-    /// an Aura toplevel. The previous barrier stays owned until its terminal
-    /// event but no longer gates configures.
+    /// Make a newly queued barrier callback the one that gates an Aura
+    /// toplevel's configures. A previous barrier no longer gates them.
     pub(crate) fn register_barrier(&mut self, callback_host_id: u32, zaura_toplevel_host_id: u32) {
-        debug_assert!(
-            !self.barrier_toplevels.contains_key(&callback_host_id),
-            "a live barrier callback ID cannot be reused"
-        );
         self.active_barriers
             .insert(zaura_toplevel_host_id, callback_host_id);
-        self.barrier_toplevels
-            .insert(callback_host_id, zaura_toplevel_host_id);
         self.debug_assert_consistent();
     }
 
-    /// Retire a barrier callback at its terminal `done` event.
+    /// Retire a barrier callback of `zaura_toplevel_host_id` at its terminal
+    /// `done` event.
     ///
     /// # Returns
     ///
-    /// `None` when `callback_host_id` is not a placement barrier. Otherwise
-    /// the configures held behind it, which are empty unless it was still the
-    /// newest barrier of its toplevel.
+    /// The configures held behind it, which are empty unless it was still the
+    /// newest barrier of a toplevel that is still attached.
     #[must_use = "held configures must be delivered to the guest"]
     pub(crate) fn complete_barrier(
         &mut self,
         callback_host_id: u32,
-    ) -> Option<HeldWindowBoundsConfigures> {
-        let zaura_toplevel_host_id = self.barrier_toplevels.remove(&callback_host_id)?;
+        zaura_toplevel_host_id: u32,
+    ) -> HeldWindowBoundsConfigures {
         let mut held = HeldWindowBoundsConfigures::default();
         if self.active_barriers.get(&zaura_toplevel_host_id) == Some(&callback_host_id) {
             self.active_barriers.remove(&zaura_toplevel_host_id);
@@ -375,7 +314,7 @@ impl WindowPlacementState {
             held.surface_configure = self.held_surface_configures.remove(&zaura_toplevel_host_id);
         }
         self.debug_assert_consistent();
-        Some(held)
+        held
     }
 
     /// Return whether a placement barrier currently gates this toplevel.
@@ -420,18 +359,8 @@ impl WindowPlacementState {
     }
 
     #[cfg(test)]
-    pub(crate) fn barrier_for_callback(&self, callback_host_id: u32) -> Option<u32> {
-        self.barrier_toplevels.get(&callback_host_id).copied()
-    }
-
-    #[cfg(test)]
     pub(crate) fn active_barrier_for_toplevel(&self, zaura_toplevel_host_id: u32) -> Option<u32> {
         self.active_barriers.get(&zaura_toplevel_host_id).copied()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn barrier_count(&self) -> usize {
-        self.barrier_toplevels.len()
     }
 
     #[cfg(test)]
@@ -487,19 +416,16 @@ mod tests {
     }
 
     #[test]
-    fn surface_release_retires_identity_applied_flag_and_aura_surface() {
+    fn forgetting_a_surface_retires_its_identity_and_applied_flag() {
         let mut state = active();
         let first = state.arc_application_id(10).expect("ARC identity");
         assert_eq!(state.arc_application_id(10), Some(first.clone()));
         state.mark_arc_application_id_applied(10);
-        state.remember_aura_surface(50, 60);
-        assert_eq!(state.aura_surface_for_wl_surface(50), Some(60));
 
-        assert_eq!(state.release_surface(10, 50), Some(60));
-        assert_eq!(state.aura_surface_for_wl_surface(50), None);
+        state.forget_surface(10);
         assert!(!state.arc_application_id_applied(10));
         assert!(!state.has_arc_application_ids());
-        assert_eq!(state.release_surface(10, 50), None, "release is idempotent");
+        state.forget_surface(10);
 
         // Identities are never recycled: a reused guest ID gets a new one.
         let second = state.arc_application_id(10).expect("ARC identity");
@@ -520,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn taking_toplevel_clears_gate_and_held_configures_but_keeps_callback_owned() {
+    fn taking_toplevel_clears_gate_and_held_configures() {
         let mut state = inactive();
         state.remember_aura_toplevel(10, 77);
         state.register_barrier(40, 77);
@@ -530,13 +456,11 @@ mod tests {
         assert_eq!(state.take_aura_toplevel(10), Some(77));
         assert!(!state.has_active_barrier(77));
         assert!(!state.has_held_configure(77));
-        assert_eq!(state.barrier_for_callback(40), Some(77));
         assert_eq!(
-            state.complete_barrier(40),
-            Some(HeldWindowBoundsConfigures::default()),
+            state.complete_barrier(40, 77),
+            HeldWindowBoundsConfigures::default(),
             "a released toplevel's held configures must not be delivered"
         );
-        assert_eq!(state.barrier_count(), 0);
     }
 
     #[test]
@@ -556,11 +480,11 @@ mod tests {
         assert!(state.hold_surface_configure(77, surface_configure(2)));
 
         assert_eq!(
-            state.complete_barrier(40),
-            Some(HeldWindowBoundsConfigures {
+            state.complete_barrier(40, 77),
+            HeldWindowBoundsConfigures {
                 configure: Some(newest),
                 surface_configure: Some(surface_configure(2)),
-            })
+            }
         );
         assert!(!state.has_active_barrier(77));
     }
@@ -574,24 +498,14 @@ mod tests {
         assert!(state.hold_configure(77, configure(10)));
 
         assert_eq!(
-            state.complete_barrier(40),
-            Some(HeldWindowBoundsConfigures::default())
+            state.complete_barrier(40, 77),
+            HeldWindowBoundsConfigures::default()
         );
         assert_eq!(state.active_barrier_for_toplevel(77), Some(41));
         assert!(state.has_held_configure(77));
 
-        let held = state.complete_barrier(41).expect("placement barrier");
+        let held = state.complete_barrier(41, 77);
         assert_eq!(held.configure, Some(configure(10)));
-        assert_eq!(state.barrier_count(), 0);
-    }
-
-    #[test]
-    fn unknown_callback_is_not_a_placement_barrier() {
-        let mut state = inactive();
-        assert_eq!(state.complete_barrier(40), None);
-        state.remember_aura_toplevel(10, 77);
-        state.register_barrier(40, 77);
-        assert!(state.complete_barrier(40).is_some());
-        assert_eq!(state.complete_barrier(40), None, "done is terminal");
+        assert!(!state.has_active_barrier(77));
     }
 }

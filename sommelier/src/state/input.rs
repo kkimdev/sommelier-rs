@@ -1779,42 +1779,6 @@ impl KeyboardFocusRegistry {
         }
     }
 }
-/// Internal `wl_display.sync` barriers that separate host text-input
-/// activation generations.
-///
-/// Host text-input-v1 objects have no destructor and are reused across guest
-/// focus changes. A deactivate followed by this barrier proves that every
-/// event from the previous activation has been dispatched while
-/// [`HostActivationState::Draining`], before the object may be activated again.
-#[derive(Default)]
-pub struct TextInputActivationBarrierRegistry {
-    by_callback: HashMap<HostId, (u32, u32)>,
-}
-
-impl TextInputActivationBarrierRegistry {
-    pub(crate) fn install(
-        &mut self,
-        callback: HostId,
-        guest_text_input: u32,
-        host_v1_id: u32,
-    ) -> bool {
-        if self.by_callback.contains_key(&callback) {
-            return false;
-        }
-        self.by_callback
-            .insert(callback, (guest_text_input, host_v1_id));
-        true
-    }
-
-    pub(crate) fn complete(&mut self, callback: HostId) -> Option<(u32, u32)> {
-        self.by_callback.remove(&callback)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn contains(&self, callback: HostId) -> bool {
-        self.by_callback.contains_key(&callback)
-    }
-}
 
 #[cfg(test)]
 mod tests {

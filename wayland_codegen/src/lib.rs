@@ -159,6 +159,23 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_interface_version_from_protocol_xml() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path = manifest_dir.join("../third_party/protocols/aura-shell.xml");
+        let protocol = parse(protocol_path).expect("Failed to parse aura-shell.xml");
+        let compact = without_whitespace(&generator::generate(&protocol));
+
+        let zaura_shell_start = compact
+            .find("pubmodzaura_shell{")
+            .expect("zaura_shell module");
+        assert!(
+            compact[zaura_shell_start..]
+                .starts_with("pubmodzaura_shell{usesuper::*;pubconstVERSION:u32=38u32;"),
+            "an interface's XML version must become its VERSION constant"
+        );
+    }
+
+    #[test]
     fn test_generate_since_constants_from_protocol_xml() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let protocol_path = manifest_dir.join("../third_party/protocols/aura-shell.xml");

@@ -1552,10 +1552,10 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
@@ -1593,8 +1593,8 @@ mod tests {
         );
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.aura_surface_count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.aura_surfaces.count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(
             ctx.client_to_host_queue
                 .iter()
@@ -1657,10 +1657,10 @@ mod tests {
         map_keyboard(&mut ctx, 10, host_keyboard, 50, 11);
         ctx.shadow_table.map_id(surface, 22);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, surface);
-        ctx.host_zaura_shell_id = Some(24);
-        ctx.host_zaura_shell_version = 38;
+        ctx.bind_aura_shell_for_test(24);
         ctx.outputs.bind_for_test(
             output,
             crate::state::OutputState {
@@ -1742,14 +1742,14 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
     }
 
     #[test]
     fn placement_chord_is_consumed_without_a_focused_toplevel() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         // The focused surface is not (or no longer) an xdg_toplevel.
-        ctx.xdg_toplevel_to_wl_surface.clear();
+        ctx.xdg_roles = crate::state::XdgRoles::default();
         assert_eq!(
             crate::handler::window_placement::place_focused(
                 &mut ctx,
@@ -1906,7 +1906,7 @@ mod tests {
             "the release must close the guest press delivered by text-input"
         );
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert_eq!(
             queued_window_bounds(&ctx),
             0,
@@ -1945,7 +1945,7 @@ mod tests {
             "the recovered pair is already balanced"
         );
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
+        assert_eq!(ctx.internal_callbacks.count(), 0);
         assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
@@ -2055,7 +2055,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(queued_window_bounds(&ctx), 1);
-        let barriers = ctx.window_placement.barrier_count();
+        let barriers = ctx.internal_callbacks.count();
 
         assert_eq!(
             handler.on_key(&mut ctx, 2, 130, key, WL_KEY_PRESSED),
@@ -2067,7 +2067,7 @@ mod tests {
             1,
             "a duplicate press must not place the window again"
         );
-        assert_eq!(ctx.window_placement.barrier_count(), barriers);
+        assert_eq!(ctx.internal_callbacks.count(), barriers);
         assert_eq!(
             ctx.guest_key_owner(keyboard, key),
             Some(GuestKeyOwner::CompositorShortcut)
@@ -2184,8 +2184,8 @@ mod tests {
         assert_eq!(queued_window_bounds(&ctx), 2);
 
         let aura_surface = ctx
-            .window_placement
-            .aura_surface_for_wl_surface(22)
+            .aura_surfaces
+            .get(22)
             .expect("placement must create the Aura surface");
         assert_eq!(
             ctx.client_to_host_queue

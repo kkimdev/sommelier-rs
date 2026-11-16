@@ -19,6 +19,35 @@ limitations under the License.
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
+/// The sender object ID of an encoded Wayland message.
+pub fn msg_sender(message: &[u8]) -> u32 {
+    u32::from_ne_bytes(message[0..4].try_into().unwrap())
+}
+
+/// The opcode of an encoded Wayland message.
+pub fn msg_opcode(message: &[u8]) -> u16 {
+    (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+}
+
+/// The `(sender, opcode)` of every message in a proxy message queue.
+pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
+    queue
+        .iter()
+        .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+        .collect()
+}
+
+/// The `(sender, opcode)` of every message in a Wayland byte stream.
+pub fn stream_headers(mut stream: &[u8]) -> Vec<(u32, u16)> {
+    let mut headers = Vec::new();
+    while stream.len() >= 8 {
+        let length = (u32::from_ne_bytes(stream[4..8].try_into().unwrap()) >> 16) as usize;
+        headers.push((msg_sender(stream), msg_opcode(stream)));
+        stream = &stream[length..];
+    }
+    headers
+}
+
 /// The `(device, inode)` pair of an open file description.
 ///
 /// Descriptor numbers are recycled immediately after `close`, so under the

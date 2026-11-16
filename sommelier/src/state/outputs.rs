@@ -272,35 +272,20 @@ impl OutputRegistry {
             .collect()
     }
 
-    /// The `zaura_output` of `output`, created on first use.
-    ///
-    /// # Arguments
-    ///
-    /// * `create` - queues a new `zaura_output` for `output` and returns its
-    ///   host ID, or `None` when one cannot be created. It runs only when the
-    ///   output is live and has none yet.
-    ///
-    /// # Returns
-    ///
-    /// The existing `zaura_output` (even for an inactive output, whose
-    /// release still has to tear it down), else `None` for an output that is
-    /// unknown or not live, else the result of `create`, which is recorded.
-    pub(crate) fn ensure_aura_output(
-        &mut self,
-        output: u32,
-        create: impl FnOnce() -> Option<u32>,
-    ) -> Option<u32> {
-        let record = self.records.get_mut(&output)?;
-        if record.aura_output.is_some() {
-            return record.aura_output;
+    /// The `zaura_output` created for `output`, if any. An inactive output
+    /// keeps its own, because its release still has to tear it down.
+    pub(crate) fn aura_output(&self, output: u32) -> Option<u32> {
+        self.records.get(&output)?.aura_output
+    }
+
+    /// Record the `zaura_output` created for a live output that had none.
+    /// Only a live output may get one (see [`Self::is_live`]).
+    pub(crate) fn remember_aura_output(&mut self, output: u32, aura_output: u32) {
+        debug_assert!(self.is_live(output) && self.aura_output(output).is_none());
+        if let Some(record) = self.records.get_mut(&output) {
+            record.aura_output = Some(aura_output);
+            self.aura_outputs.insert(aura_output, output);
         }
-        if !matches!(record.liveness, Liveness::Live { .. }) {
-            return None;
-        }
-        let aura_output = create()?;
-        record.aura_output = Some(aura_output);
-        self.aura_outputs.insert(aura_output, output);
-        Some(aura_output)
     }
 
     /// The live output that an event from `aura_output` describes.
@@ -462,11 +447,6 @@ impl OutputRegistry {
                 }
             )
         })
-    }
-
-    /// The `zaura_output` already created for `output`, if any.
-    pub(crate) fn aura_output_for_test(&self, output: u32) -> Option<u32> {
-        self.records.get(&output)?.aura_output
     }
 
     /// The outputs `surface` has entered.
@@ -696,15 +676,11 @@ mod tests {
     #[test]
     fn aura_output_events_reach_only_their_live_output() {
         let mut outputs = OutputRegistry::default();
-        assert_eq!(outputs.ensure_aura_output(20, || Some(21)), None, "unbound");
+        assert_eq!(outputs.aura_output(20), None, "unbound");
         outputs.bind_for_test(20, OutputState::default());
-        assert_eq!(outputs.ensure_aura_output(20, || None), None);
-        assert_eq!(outputs.aura_output_for_test(20), None);
-        assert_eq!(outputs.ensure_aura_output(20, || Some(21)), Some(21));
-        assert_eq!(
-            outputs.ensure_aura_output(20, || unreachable!("reused")),
-            Some(21)
-        );
+        assert_eq!(outputs.aura_output(20), None);
+        outputs.remember_aura_output(20, 21);
+        assert_eq!(outputs.aura_output(20), Some(21));
         assert_eq!(outputs.aura_event_target(21), Some(20));
         assert_eq!(outputs.aura_event_target(22), None);
 
@@ -713,21 +689,8 @@ mod tests {
             generation: 1,
         });
         assert_eq!(outputs.aura_event_target(21), None);
-        assert_eq!(
-            outputs.ensure_aura_output(20, || unreachable!("reused")),
-            Some(21),
-            "release still needs it"
-        );
-
-        outputs.bind_for_test(30, OutputState::default());
-        outputs.deactivate(GlobalBinding {
-            name: 30,
-            generation: 1,
-        });
-        assert_eq!(
-            outputs.ensure_aura_output(30, || unreachable!("not live")),
-            None
-        );
+        assert_eq!(outputs.aura_output(20), Some(21), "release still needs it");
+        assert!(!outputs.is_live(20), "an inactive output gets no new one");
     }
 
     #[test]
@@ -735,7 +698,7 @@ mod tests {
         let mut outputs = OutputRegistry::default();
         outputs.bind_for_test(20, usable_state());
         outputs.bind_for_test(30, usable_state());
-        outputs.ensure_aura_output(20, || Some(21));
+        outputs.remember_aura_output(20, 21);
         outputs.surface_entered(100, 20);
 
         assert_eq!(outputs.release(20), Some(21));

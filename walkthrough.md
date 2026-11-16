@@ -1325,3 +1325,74 @@ adds no `cargo doc` warning. Every relative Markdown link and anchor in the
 README, the handover, the walkthrough and `sommelier/docs/` resolves. The
 doc-table test was checked to fail for a changed value, a dropped row, and
 a duplicated row. Not host-validated: no Sommelier process was started.
+
+## 2026-11-17 — Aura objects, XDG roles and internal callbacks
+
+Cleanup PR E2 for review findings S3, S4, S5, S11 and H1, plus the
+version checks PR D left behind.
+
+**Before.** The host `zaura_surface` map lived in `WindowPlacementState`,
+and GTK cached its own copy of the ID. Aura children were created and released
+in three places, each with its own copy of the release rule. Three public
+`Context` maps held the XDG role links, and three destructors kept them
+in step. The proxy loop special-cased `xdg_surface.get_toplevel`.
+`wl_callback.done` checked four maps for the proxy's own barriers.
+
+**After.**
+
+- `handler/aura_objects.rs` creates, versions and releases every host
+  Aura child from a table of `AuraChild::{SURFACE, TOPLEVEL, OUTPUT}`,
+  and releases the `zaura_shell` binding by the same rule.
+  `state/aura_surfaces.rs` owns the one Aura surface of each
+  `wl_surface`. Placement keeps its Aura toplevels and `OutputRegistry`
+  its Aura outputs. `Context::host_zaura_shell` is one
+  `Option<HostAuraShell { id, global_name, version }>`.
+- GTK resolves the Aura surface through `ensure_host_zaura_surface` on
+  every request. `window_placement::set_aura_application_id` alone
+  resolves the Aura surface and chooses between the ARC identity and the
+  namespaced guest ID for XDG and GTK.
+- `state/xdg_roles.rs` keeps one record per `xdg_surface`. Its remove
+  methods return the toplevels whose roles ended, and the destructors
+  release those.
+- A handler defers work with `Context::defer_until_forwarded`. The proxy
+  loop applies it only to a forwarded message. Requests it queues follow
+  the forwarded bytes and the handler's own queued requests.
+- `state/internal_callbacks.rs` records what each host-only
+  `wl_display.sync` waits for. `callback::queue_internal_sync` issues all
+  four kinds, including the text-input drain barrier, and `done`
+  dispatches through one match.
+- Unreachable version checks are gone; compile-time assertions next to
+  `ZAURA_SHELL_MIN_VERSION` cover what the floor implies. Codegen emits
+  each interface's `VERSION`, and `ZAURA_SHELL_MAX_VERSION` is
+  `zaura_shell::VERSION`.
+
+**Behavior changes**, each with a regression test:
+
+- `wl_surface.destroy` releases the Aura toplevels of the roles it ends
+  before its own destructor, not after
+  (`wl_surface_destroy_releases_its_aura_children_first`).
+- A GTK surface created while no `zaura_shell` was bound had lost its
+  metadata for good. GTK requests issued after a new shell is bound now
+  reach it. Requests issued before the rebind are not replayed
+  (`gtk_requests_after_a_shell_rebind_reach_the_new_shell`).
+- Malformed clients only: destroying one of two `xdg_surface`s on a
+  `wl_surface` ends only its own toplevel role, not every toplevel on
+  the `wl_surface`
+  (`destroying_one_of_two_xdg_surfaces_ends_only_its_toplevel`).
+
+`xdg_surface.destroy` is forwarded, so the host sees it before the
+queued `zaura_toplevel.release`. That is harmless, since destroying an
+`xdg_surface` before its toplevel is `defunct_role_object`, which ends
+the session. A second `get_toplevel` (`already_constructed`) ends the
+session too, so the replaced toplevel is left to its own destructor.
+
+Deliberately not done: `record_xdg_toplevel` stays beside the XDG
+handlers, since it is handler logic over `XdgRoles::add_toplevel`. Other
+fixed-size `try_build_message` calls outside these paths are untouched.
+
+Validation (monorepo dev shell, locked, serial), rebased on PR F:
+Sommelier 692 passed / 1 ignored (678 before), sample GUI 12, codegen 9,
+`gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets,
+`cargo fmt --check`, and `git diff --check` pass, every commit builds with
+strict Clippy, and this PR adds no `cargo doc` warning. Not
+host-validated: no Sommelier process was started.
