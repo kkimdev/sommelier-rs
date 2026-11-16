@@ -1242,3 +1242,61 @@ codegen 8 (7 before), `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
 targets, `cargo fmt --check`, and `git diff --check` pass, and every commit
 builds with strict Clippy. Not host-validated: no Sommelier process was
 started.
+
+## 2026-11-17 — Docs have one owner per fact
+
+Cleanup PR F for review findings D1 and D2. Earlier PRs had already fixed
+most D1 claims: the process-wide ARC failure, the lock-file location and the
+private `$XDG_RUNTIME_DIR` requirement (B), the never-fatal configuration
+policy (C), and the rotation caveat and the zaura_output and output-choice
+comments (E1). The ARC doc's "reservation at startup", which the review
+flagged, became true when C moved the reservation into
+`PlacementConfig::from_environment`, before the proxy accepts a client. This PR checked every claim against the current code and
+fixed what was still wrong or stated twice. Only doc comments changed in
+Rust; behavior is unchanged.
+
+**Still wrong, now fixed.**
+
+- The README's `XDG_RUNTIME_DIR` row did not mention the ARC lock files or
+  the private-directory requirement. It now links to the allocator section.
+- The README called `SOMMELIER_ACCELERATORS` a list of keysyms; it holds
+  chords such as `<Alt>tab`.
+- `WindowLayoutAction::rect` said the presets split the work area into
+  halves; they include quarters and the whole area.
+- The reload rule named "the conflict" without defining it and left out the
+  unresolvable file path. It now lists all four cases that need a restart.
+- `HANDOVER.md` still named `virtwl-v0.2.1-r1` as the current release and
+  said `--gpu-accel` was disabled. It now links to the README.
+- The `--window-shortcuts-config` help used a crate-relative doc path.
+
+**One owner per fact.**
+
+- `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md` now owns the
+  user-facing placement behavior that the README restated: chord handling
+  (a matched chord is always consumed), which output and work area a
+  placement uses, and the thousandths, overscan and not-host-verified
+  caveats. It names `OutputRegistry::for_surface` and
+  `OutputState::work_area` as the owners of the exact rules instead of
+  restating their doc comments. It no longer points back to the README.
+- The README keeps an overview, the example, and links. It no longer lists
+  which type owns which state; the module docs own that, and the shortcut
+  doc's code map indexes them.
+- `WindowLayoutAction::rect` owns the preset rectangles, and a unit test pins
+  them. The shortcut doc presents them once, in a "Named actions" table, and
+  the action names are no longer listed in two more places.
+- The allocator facts were already consolidated by PR B; the README and
+  the module comment only link to them.
+
+Left for the placement-module PR (D), whose files this PR does not touch:
+the `Context` field docs in `state.rs` restate the "single owner" summaries
+of `WindowPlacementState` and `OutputRegistry`, and the `zaura_shell` field
+doc repeats the registry's literal 38.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 675 passed /
+1 ignored (unchanged), sample GUI 12, codegen 7, `gui_smoke` 0 run /
+1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. Every relative Markdown link and anchor in the
+README, the handover, the walkthrough and `sommelier/docs/` resolves, and a
+script confirmed that the "Named actions" table matches
+`WindowLayoutAction::rect`. Not host-validated: no Sommelier process was
+started.
