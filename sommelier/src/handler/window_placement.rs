@@ -648,6 +648,30 @@ pub(crate) fn hold_toplevel_configure(
     else {
         return false;
     };
+    hold_toplevel_configure_behind_barrier(
+        ctx,
+        zaura_toplevel_host_id,
+        guest_xdg_toplevel_id,
+        width,
+        height,
+        states,
+    )
+}
+
+/// Hold a toplevel configure, from either the XDG or the Aura toplevel,
+/// behind the active barrier of `zaura_toplevel_host_id`.
+///
+/// # Returns
+///
+/// `false`, holding nothing, when no barrier gates the toplevel.
+fn hold_toplevel_configure_behind_barrier(
+    ctx: &mut Context,
+    zaura_toplevel_host_id: u32,
+    guest_xdg_toplevel_id: u32,
+    width: i32,
+    height: i32,
+    states: &[u8],
+) -> bool {
     ctx.window_placement.hold_configure(
         zaura_toplevel_host_id,
         crate::state::PendingWindowBoundsConfigure {
@@ -693,14 +717,13 @@ pub(crate) fn translate_aura_configure(
         ctx.window_placement
             .has_active_barrier(zaura_toplevel_host_id)
     );
-    if !ctx.window_placement.hold_configure(
+    if !hold_toplevel_configure_behind_barrier(
+        ctx,
         zaura_toplevel_host_id,
-        crate::state::PendingWindowBoundsConfigure {
-            guest_xdg_toplevel_id,
-            width,
-            height,
-            states: states.to_vec(),
-        },
+        guest_xdg_toplevel_id,
+        width,
+        height,
+        states,
     ) {
         queue_guest_xdg_configure(ctx, guest_xdg_toplevel_id, width, height, states);
     }
