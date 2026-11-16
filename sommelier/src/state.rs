@@ -743,6 +743,9 @@ pub(crate) enum PostDispatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostAuraShell {
     pub(crate) id: u32,
+    /// The registry name of the global it was bound from, so its
+    /// `global_remove` releases exactly this binding.
+    pub(crate) global_name: u32,
     /// The bound version, clamped by the `zaura_shell` bind in
     /// `handler/registry.rs` (at least `ZAURA_SHELL_MIN_VERSION`). Every
     /// Aura child created from this binding takes it.
@@ -795,7 +798,6 @@ pub struct Context {
     pub host_text_input_manager_v1_global_name: Option<u32>,
     pub host_text_input_extension_v1_global_name: Option<u32>,
     pub host_keyboard_extension_global_name: Option<u32>,
-    pub host_zaura_shell_global_name: Option<u32>,
     /// Formats observed from the host's SHM or dmabuf capability events that
     /// the SHM bridge can actually copy. ARGB/XRGB are always available per
     /// the wl_shm contract; optional formats are added only after the host
@@ -968,6 +970,7 @@ impl Context {
     pub(crate) fn bind_aura_shell_for_test(&mut self, id: u32) {
         self.host_zaura_shell = Some(HostAuraShell {
             id,
+            global_name: id,
             version: crate::protocols::aura_shell::zaura_shell::VERSION,
         });
     }
@@ -1289,7 +1292,6 @@ impl Context {
             host_text_input_manager_v1_global_name: None,
             host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_zaura_shell_global_name: None,
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),

@@ -332,7 +332,9 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx.host_text_input_manager_v1_global_name == Some(name)
         || ctx.host_text_input_extension_v1_global_name == Some(name)
         || ctx.host_keyboard_extension_global_name == Some(name)
-        || ctx.host_zaura_shell_global_name == Some(name)
+        || ctx
+            .host_zaura_shell
+            .is_some_and(|shell| shell.global_name == name)
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -398,9 +400,10 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // is released. Keep both maps and the child dispatch registrations so
         // queued peek_key events remain routable after the manager disappears.
     }
-    if ctx.host_zaura_shell_global_name == Some(name) {
-        let shell = ctx.host_zaura_shell.take();
-        ctx.host_zaura_shell_global_name = None;
+    if let Some(shell) = ctx
+        .host_zaura_shell
+        .take_if(|shell| shell.global_name == name)
+    {
         // `global_remove` invalidates only the advertised global name. Already
         // created `zaura_surface` children have their own protocol lifetime
         // and remain usable until their owning wl_surface is destroyed. Keep
@@ -412,18 +415,12 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // Release only the internally bound manager, matching ChromiumOS'
         // registry remover. New children cannot be created until a replacement
         // shell global is advertised and rebound.
-        if let Some(HostAuraShell {
-            id: host_id,
-            version: shell_version,
-        }) = shell
-        {
-            if shell_version >= ZAURA_SHELL_RELEASE_SINCE {
-                let message = MessageBuilder::new().build_message(host_id, ZAURA_SHELL_RELEASE);
-                ctx.client_to_host_queue.push((message, Vec::new()));
-                ctx.shadow_table.mark_pending_destroy_host(host_id);
-            } else {
-                ctx.shadow_table.retire_host_interface(host_id);
-            }
+        if shell.version >= ZAURA_SHELL_RELEASE_SINCE {
+            let message = MessageBuilder::new().build_message(shell.id, ZAURA_SHELL_RELEASE);
+            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.shadow_table.mark_pending_destroy_host(shell.id);
+        } else {
+            ctx.shadow_table.retire_host_interface(shell.id);
         }
     }
     ctx.hidden_host_globals.remove(&name);
@@ -892,9 +889,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let bound_version = std::cmp::min(version, ZAURA_SHELL_MAX_VERSION);
             ctx.host_zaura_shell = Some(HostAuraShell {
                 id: host_id,
+                global_name: name,
                 version: bound_version,
             });
-            ctx.host_zaura_shell_global_name = Some(name);
             ctx.shadow_table.track_host_interface_with_version(
                 host_id,
                 "zaura_shell".to_string(),

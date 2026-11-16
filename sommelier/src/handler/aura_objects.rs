@@ -188,6 +188,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
             id: SHELL_HOST,
+            global_name: SHELL_HOST,
             version,
         });
         ctx
