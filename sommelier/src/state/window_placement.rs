@@ -22,12 +22,11 @@ limitations under the License.
 //! barrier currently orders each toplevel's `zaura_toplevel.set_window_bounds`,
 //! and the configures held behind it. The barrier callbacks themselves are
 //! pending in `crate::state::InternalCallbacks`, and the host Aura surface
-//! is not placement's: XDG and GTK metadata share it through
-//! `crate::state::AuraSurfaces`. Whether the policy is active is decided
-//! once per process by `crate::placement_config::PlacementConfig`, which
-//! hands this state the process's ARC task-ID block. The maps are private so handlers
-//! cannot update one side of an association, or retire a toplevel, without
-//! the matching cleanup.
+//! is shared (`crate::state::AuraSurfaces`). Whether the policy is active is
+//! decided once per process by `crate::placement_config::PlacementConfig`,
+//! which hands this state the process's ARC task-ID block. The maps are
+//! private so handlers cannot update one side of an association, or retire
+//! a toplevel, without the matching cleanup.
 //!
 //! Wire encoding stays in `crate::handler::window_placement`; this type only
 //! answers ownership questions and returns the IDs whose host teardown the

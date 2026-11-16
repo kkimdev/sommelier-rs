@@ -930,8 +930,7 @@ pub struct Context {
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
-    /// The one host Aura surface of each host wl_surface, shared by XDG and
-    /// GTK metadata and placement.
+    /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
     pub(crate) aura_surfaces: AuraSurfaces,
     /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
     pub(crate) xdg_roles: XdgRoles,

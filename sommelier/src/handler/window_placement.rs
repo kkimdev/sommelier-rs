@@ -39,9 +39,9 @@ limitations under the License.
 //! | `xdg_toplevel.configure` | [`hold_toplevel_configure`] |
 //! | `zaura_toplevel.configure` | [`translate_aura_configure`] |
 //!
-//! The host Aura surface is not placement's: XDG and GTK metadata share it,
-//! so `crate::handler::aura_objects::ensure_host_zaura_surface` owns it. The
-//! same module creates and releases the placement Aura toplevel.
+//! The host Aura surface is shared ([`crate::state::AuraSurfaces`]), and
+//! `crate::handler::aura_objects` creates and releases it and the placement
+//! Aura toplevel.
 
 use crate::handler::aura_objects::{
     self, aura_object_version, ensure_host_zaura_surface, AuraChild,
@@ -438,15 +438,10 @@ pub(crate) fn attach_recorded_toplevels(ctx: &mut Context) {
 
 /// Release the placement Aura toplevel of a guest XDG toplevel.
 ///
-/// Called when the XDG role ends: by the `xdg_toplevel` destructor, before
-/// it queues the role's host destructor, and when the `xdg_surface` or
-/// `wl_surface` beneath the role is destroyed. Does nothing when the
-/// toplevel has no Aura toplevel.
+/// Called whenever the XDG role ends (see `XdgRoles`' remove methods). Does
+/// nothing when the toplevel has no Aura toplevel. A barrier still in flight
+/// stays pending until its `done` but no longer gates anything.
 pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
-    // A toplevel can be destroyed while a placement barrier is still in
-    // flight. The owner keeps the callback tracked until its terminal host
-    // events, but it no longer gates a replacement object that happens to use
-    // the same logical toplevel entry.
     if let Some(zaura_toplevel_host_id) = ctx
         .window_placement
         .take_aura_toplevel(xdg_toplevel_guest_id)

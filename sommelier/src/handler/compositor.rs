@@ -228,10 +228,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
             aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
         }
-        // `zaura_output` is an internal child of the wl_output and must be
-        // released first. Returning Forward here would put the original
-        // wl_output.release ahead of the queued Aura release in proxy.rs.
-        // Queue the translated wl_output destructor explicitly instead.
+        // The Aura child goes first (see `aura_objects::release`). Returning
+        // Forward would put wl_output.release ahead of the queued Aura
+        // release, so queue the translated destructor explicitly.
         ctx.shadow_table.mark_pending_destroy(guest_output_id);
         let release_message =
             crate::wire::MessageBuilder::new().build_message(host_output_id, REQ_RELEASE_WL_OUTPUT);
@@ -868,8 +867,8 @@ impl WlSurfaceHandler for CompositorHandler {
         // xdg objects are separate guest objects, but their roles resolve
         // back to this wl_surface. End them now so a later client ID reuse
         // cannot associate a new toplevel with the destroyed surface. Their
-        // Aura toplevels, like the Aura surface, are released before the
-        // wl_surface destructor queued below.
+        // Aura toplevels and the Aura surface go before the wl_surface
+        // destructor queued below (see `aura_objects::release`).
         for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
             window_placement::release_toplevel(ctx, xdg_toplevel_id);
         }
@@ -1432,11 +1431,9 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         };
-        // zaura_toplevel is an extension child of this xdg_toplevel. Release
-        // it before the role destructor, matching the zaura_output/wl_output
-        // and zaura_surface/wl_surface order, so the host never holds an Aura
-        // child whose parent role is already gone. Retain the guest ID until
-        // the host acknowledges the role destructor.
+        // The Aura toplevel goes before the role destructor (see
+        // `aura_objects::release`). Retain the guest ID until the host
+        // acknowledges the role destructor.
         window_placement::release_toplevel(ctx, xdg_toplevel_id);
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
         ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);

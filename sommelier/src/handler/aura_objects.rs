@@ -129,11 +129,8 @@ pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
     }
 }
 
-/// Create or reuse the host Aura surface of a guest wl_surface.
-///
-/// XDG and GTK metadata and placement all target the same host surface, and
-/// Exo rejects a second `zaura_surface` for one `wl_surface`, so every path
-/// resolves it here.
+/// Create or reuse the one host Aura surface of a guest wl_surface (see
+/// [`crate::state::AuraSurfaces`]).
 ///
 /// # Returns
 ///
@@ -154,7 +151,7 @@ pub(crate) fn ensure_host_zaura_surface(
 }
 
 /// Release the Aura surface of a host wl_surface that is being destroyed,
-/// if it has one. Called before the wl_surface destructor is queued.
+/// if it has one.
 pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: u32) {
     if let Some(zaura_surface_host_id) = ctx.aura_surfaces.take(wl_surface_host_id) {
         release(ctx, AuraChild::SURFACE, zaura_surface_host_id);
