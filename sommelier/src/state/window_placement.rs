@@ -22,8 +22,9 @@ limitations under the License.
 //! that order `zaura_toplevel.set_window_bounds`, and the configures held
 //! behind those barriers. Whether the policy is active is decided once per
 //! process by `crate::placement_config::PlacementConfig`, which hands this
-//! state the process's ARC task-ID block. The maps are private so handlers cannot update one side of
-//! an association, or retire a toplevel, without the matching cleanup.
+//! state the process's ARC task-ID block. The maps are private so handlers
+//! cannot update one side of an association, or retire a toplevel, without
+//! the matching cleanup.
 //!
 //! Wire encoding stays in the protocol handlers; this type only answers
 //! ownership questions and returns the IDs whose host teardown the caller must

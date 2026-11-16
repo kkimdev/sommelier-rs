@@ -29,42 +29,18 @@ limitations under the License.
 //! The module depends on nothing else in the crate; the configuration
 //! parsers and the keyboard handler depend on it.
 //!
-//! # Rounding
+//! # Rules
 //!
-//! A rectangle is stored as its four edge fractions. An edge within
-//! [`EDGE_TOLERANCE`] of `0` or `1` *is* that border: it snaps onto it, and
-//! only an edge further outside the unit interval is out of range. This
-//! absorbs decimal-to-binary error such as `0.7 + 0.3` or `2 * (1 / 3)`.
-//!
-//! For a work area `(X, Y, W, H)` each edge fraction `f` maps to the pixel
-//! offset `floor(f * W + PIXEL_BIAS)` (or `H`), computed in `f64` and clamped
-//! to `[0, W]`. The window is `(X + left, Y + top, right - left, bottom -
-//! top)`. Flooring shared edge fractions keeps adjacent rectangles sharing one
-//! boundary, and for the half splits used by the presets it reproduces integer
-//! division (`W / 2`) exactly.
-//!
-//! # Precision
-//!
-//! `PIXEL_BIAS` (one millionth of a pixel) only absorbs representation
-//! error. A fraction written with 16 significant digits, which is what most
-//! languages print for an `f64` (`1 / 3` prints as `0.3333333333333333`),
-//! therefore lands on the pixel its exact value names for every extent up to
-//! 1,000,000 pixels. A shorter decimal that was rounded *down* can land one
-//! pixel short as soon as its error times the extent reaches the bias:
-//! `0.3333333 * 1920 = 639.99994` floors to `639`, not `640`.
-//!
-//! A placement is refused (`None`) instead of emitting degenerate bounds when
-//! the work area is too small to represent the rectangle: an edge strictly
-//! inside the unit interval that lands on the work-area border, or an empty
-//! extent after rounding.
+//! The rules this module implements are specified once, in
+//! `sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`: the edge band in
+//! "Validation", the precision a rect needs in "Precision", and the pixel
+//! mapping in "From rectangle to window bounds". The constants and the unit
+//! tests below are the code side of that contract.
 
 use thiserror::Error;
 
-/// Distance within which an edge fraction is a work-area border.
-///
-/// It is the only floating-point tolerance on fractions: an edge this close
-/// to `0` or `1` snaps onto the border, so `x + width` may exceed `1.0` by at
-/// most this much.
+/// Distance within which an edge fraction is a work-area border (the edge
+/// band; see the module rules).
 const EDGE_TOLERANCE: f64 = 1e-9;
 
 /// Sub-pixel bias added before flooring an edge to a pixel offset.
@@ -172,8 +148,8 @@ impl NormalizedRect {
     ///
     /// # Returns
     ///
-    /// `(x, y, width, height)` screen bounds using the module-level rounding
-    /// rule, or `None` when the work area is empty, too small to represent the
+    /// `(x, y, width, height)` screen bounds using the rounding rule (see the
+    /// module rules), or `None` when the work area is empty, too small to represent the
     /// rectangle without collapsing an interior edge, or the absolute
     /// coordinates overflow `i32`.
     pub(crate) fn to_work_area_bounds(
@@ -230,7 +206,7 @@ fn span(start: f64, end: f64, extent: i32) -> Option<(i32, i32)> {
     (end > start).then_some((start, end))
 }
 
-/// Round an edge fraction to a pixel offset; see the module rounding rule.
+/// Round an edge fraction to a pixel offset (see the module rules).
 fn edge(fraction: f64, extent: i32) -> Option<i32> {
     debug_assert!(fraction.is_finite() && (0.0..=1.0).contains(&fraction));
     // `fraction * extent` is at most `i32::MAX` plus the bias, so the cast
@@ -610,7 +586,7 @@ mod tests {
         format!("{value:.15e}").parse().unwrap()
     }
 
-    /// The precision contract in the module docs: 16 significant digits land
+    /// The precision contract in the configuration doc: 16 significant digits land
     /// every edge on the pixel its exact fraction names.
     #[test]
     fn sixteen_significant_digits_land_on_the_intended_pixel() {
@@ -636,7 +612,7 @@ mod tests {
 
     #[test]
     fn a_short_decimal_rounded_down_can_land_one_pixel_short() {
-        // The counterexample quoted in the module docs.
+        // The counterexample quoted in the configuration doc.
         let third = NormalizedRect::new(0.3333333, 0.0, 0.6666667, 1.0).unwrap();
         assert_eq!(
             third.to_work_area_bounds((0, 0, 1920, 1)),
