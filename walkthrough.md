@@ -918,7 +918,7 @@ What changed in `sommelier/src/arc_task_ids.rs` (826 → 414 lines; about
   per-block error at warn. Lock file names are unchanged, so older and newer builds
   still exclude each other.
 - Random seeds come from `getrandom(2)` instead of opening `/dev/urandom`.
-- `ArcIdAllocator` is now a pure range, offset and atomic counter. The lock
+- `ArcIdAllocator` is now a pure range, offset and issued-ID counter (behind a `Mutex`; `AtomicU32::fetch_update` is deprecated in Rust 1.100). The lock
   descriptor sits beside it in a never-dropped static, so the `Option<File>`
   test fields, the no-op `Drop` and the test-only guard-directory parameter
   are gone, and reservation tests run in a temporary runtime directory.

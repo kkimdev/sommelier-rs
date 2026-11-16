@@ -28,8 +28,7 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use log::{debug, info, warn};
 
@@ -54,7 +53,7 @@ pub(crate) struct ArcIdAllocator {
     len: u32,
     start_offset: u32,
     /// IDs handed out so far; never exceeds `len`.
-    issued: AtomicU32,
+    issued: Mutex<u32>,
 }
 
 impl ArcIdAllocator {
@@ -66,7 +65,7 @@ impl ArcIdAllocator {
             first_id,
             len,
             start_offset: offset_seed % len,
-            issued: AtomicU32::new(0),
+            issued: Mutex::new(0),
         }
     }
 
@@ -78,14 +77,19 @@ impl ArcIdAllocator {
     ///
     /// Exhaustion is logged once, when the last ID is handed out.
     pub(crate) fn allocate(&self) -> Option<u32> {
-        // The read-modify-write alone makes every `issued` value unique, and
-        // nothing else is published through it, so `Relaxed` is enough.
-        let issued = self
-            .issued
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |issued| {
-                (issued < self.len).then_some(issued + 1)
-            })
-            .ok()?;
+        let issued = {
+            // A poisoned lock still holds a valid count: the critical section
+            // below cannot panic between reading and writing it.
+            let mut issued = self
+                .issued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *issued == self.len {
+                return None;
+            }
+            *issued += 1;
+            *issued - 1
+        };
         if issued + 1 == self.len {
             warn!(
                 "ARC task-ID block {}..={} is exhausted; later surfaces get no ARC identity",
