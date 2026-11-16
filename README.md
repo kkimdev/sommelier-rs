@@ -226,8 +226,8 @@ work-area region of the output that surface has entered. Only a surface that
 has not entered any output yet uses the first usable output; a window is never
 moved to another monitor. A matched chord never reaches the guest, even when
 the placement is skipped (for example, with no focused toplevel or before the
-output's metadata is complete); the reason is logged at debug level. For
-example:
+output's metadata is complete); the reason is logged at debug level. A chord
+that the host IME consumes is neither placed nor delivered. For example:
 
 ```text
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1

@@ -1311,9 +1311,19 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                     // belong to the host and to Sommelier: if text-input
                     // claimed one first, the wl_keyboard press that follows
                     // would find the guest already owning it.
+                    let key_class = self.classify_key(ctx, host_keyboard_id, key);
+                    if let KeyClass::Placement(action) = key_class {
+                        log::debug!(
+                            "peek_key: placement chord {:?} on keyboard {}; it is placed only \
+                             by the matching wl_keyboard.key, so if the host IME consumes it \
+                             the chord is neither placed nor delivered",
+                            action,
+                            host_keyboard_id.0
+                        );
+                    }
                     let eligible = !already_dropped_as_accelerator
                         && !consumed_by_shortcut
-                        && self.classify_key(ctx, host_keyboard_id, key) == KeyClass::Guest;
+                        && key_class == KeyClass::Guest;
                     let sequence = ctx.key_generations.observe_peek_press(
                         host_keyboard_id,
                         key,
@@ -2419,6 +2429,51 @@ mod tests {
             Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+    }
+
+    /// The host IME consumed the chord, so no `wl_keyboard.key` arrives.
+    /// The chord is neither placed (placement runs only on
+    /// `wl_keyboard.key`) nor delivered to the guest through text-input.
+    #[test]
+    fn placement_chord_consumed_by_the_host_ime_is_neither_placed_nor_delivered() {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
+
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        add_composing_text_input_on_placed_surface(&mut ctx);
+        let keyboard = HostId(5);
+        let guest_messages = ctx.host_to_client_queue.len();
+
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        // Exo swaps the unstable protocol's field names: `serial` carries the
+        // timestamp and `time` the Wayland serial.
+        ctx.last_sender_id = 140;
+        let mut text_input = crate::handler::text_input::TextInputV1Handler;
+        assert_eq!(
+            text_input.on_keysym(&mut ctx, 100, 2, xkb::keysyms::KEY_q, WL_KEY_PRESSED, 0),
+            Action::Drop
+        );
+        assert_eq!(
+            text_input.on_keysym(&mut ctx, 101, 3, xkb::keysyms::KEY_q, WL_KEY_RELEASED, 0),
+            Action::Drop
+        );
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            guest_messages,
+            "nothing reaches the guest"
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(queued_window_bounds(&ctx), 0);
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
     }
 
     #[test]
