@@ -1307,13 +1307,24 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                 (host_ext_id, host_ext_manager_id)
             });
 
+        // A new object takes its parent's version: the guest text input its
+        // guest manager's, and each host object its host manager's.
         ctx.shadow_table.map_id(id, host_v1_id);
-        ctx.shadow_table
-            .track_interface_with_version(id, "zwp_text_input_v3".to_string(), 1);
+        let guest_manager_version = ctx
+            .shadow_table
+            .guest_object_version_or_unknown(ctx.last_sender_id);
+        ctx.shadow_table.track_interface_with_version(
+            id,
+            "zwp_text_input_v3".to_string(),
+            guest_manager_version,
+        );
+        let host_manager_version = ctx
+            .shadow_table
+            .host_object_version_or_unknown(host_manager_id);
         ctx.shadow_table.track_host_interface_with_version(
             host_v1_id,
             "zwp_text_input_v1".to_string(),
-            1,
+            host_manager_version,
         );
         if let Some((host_ext_id, host_ext_manager_id)) = host_ext {
             let host_ext_version = ctx
@@ -3709,32 +3720,43 @@ mod tests {
     }
 
     #[test]
-    fn child_extension_object_inherits_manager_version() {
+    fn child_objects_inherit_their_manager_versions() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.host_text_input_manager_v1_id = Some(2);
         ctx.host_text_input_extension_v1_id = Some(3);
+        // Both text-input protocols are v1, so artificial manager versions
+        // show where each child's version comes from.
         ctx.shadow_table.track_host_interface_with_version(
             2,
             "zwp_text_input_manager_v1".to_string(),
-            1,
+            4,
         );
         ctx.shadow_table.track_host_interface_with_version(
             3,
             "zcr_text_input_extension_v1".to_string(),
             7,
         );
+        ctx.shadow_table.track_interface_with_version(
+            40,
+            "zwp_text_input_manager_v3".to_string(),
+            5,
+        );
         ctx.last_sender_id = 40;
 
         let mut handler = TextInputManagerV3Handler;
         assert_eq!(handler.on_get_text_input(&mut ctx, 20, 30), Action::Drop);
-        let child_id = ctx.text_inputs[&20]
-            .host_ext_id
-            .expect("extended text input child");
+        let state = &ctx.text_inputs[&20];
+        let child_id = state.host_ext_id.expect("extended text input child");
         assert_eq!(
             ctx.shadow_table.host_object_version(child_id),
             Some(7),
             "version guards must use the manager's negotiated host version"
         );
+        assert_eq!(
+            ctx.shadow_table.host_object_version(state.host_v1_id),
+            Some(4)
+        );
+        assert_eq!(ctx.shadow_table.guest_object_version(20), Some(5));
     }
 
     #[test]

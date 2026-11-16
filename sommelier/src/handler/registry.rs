@@ -24,7 +24,9 @@ use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCAL
 use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
-use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
+use crate::protocols::text_input_unstable_v3::{
+    zwp_text_input_manager_v3, ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED,
+};
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_fixes, wl_registry};
@@ -45,8 +47,15 @@ use log::error;
 /// when the host supports it.
 const LINUX_DMABUF_CAPABILITY_VERSION: u32 =
     crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
-const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
-const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
+/// The newest host `zwp_text_input_manager_v1` the proxy binds: the vendored
+/// XML's. The generated code knows no message added after it, so a newer
+/// binding could deliver events whose unknown opcodes end the session.
+const TEXT_INPUT_MANAGER_VERSION: u32 =
+    crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1::VERSION;
+/// The newest host `zcr_text_input_extension_v1` the proxy binds, for the
+/// same reason.
+const TEXT_INPUT_EXTENSION_VERSION: u32 =
+    crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::VERSION;
 const WL_COMPOSITOR_VERSION: u32 = 4;
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
@@ -448,6 +457,22 @@ fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
     ctx.removed_host_globals.remove(&name);
 }
 
+/// Advertise the synthetic `zwp_text_input_manager_v3` that the host
+/// `zwp_text_input_manager_v1` global `name` stands behind.
+fn advertise_text_input_manager_v3(ctx: &mut Context, name: u32) {
+    let interface = "zwp_text_input_manager_v3";
+    let version = zwp_text_input_manager_v3::VERSION;
+    ctx.host_globals.insert(
+        name,
+        HostGlobal {
+            interface: interface.to_string(),
+            version,
+        },
+    );
+    let visible = queue_synthetic_global(ctx, name, interface, version);
+    record_registry_global_visibility(ctx, name, visible);
+}
+
 fn record_registry_global_visibility(ctx: &mut Context, name: u32, visible: bool) {
     ctx.registry_global_visibility
         .entry(ctx.last_sender_id)
@@ -751,15 +776,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         } else if interface == "zwp_text_input_manager_v1" {
             let bound_version = version.min(TEXT_INPUT_MANAGER_VERSION);
             if ctx.host_text_input_manager_v1_id.is_some() {
-                ctx.host_globals.insert(
-                    name,
-                    HostGlobal {
-                        interface: "zwp_text_input_manager_v3".to_string(),
-                        version: 1,
-                    },
-                );
-                let visible = queue_synthetic_global(ctx, name, "zwp_text_input_manager_v3", 1);
-                record_registry_global_visibility(ctx, name, visible);
+                advertise_text_input_manager_v3(ctx, name);
                 return Action::Drop;
             }
             let host_id = ctx.shadow_table.allocate_host_id();
@@ -774,17 +791,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bound_version,
             );
 
-            let client_version = 1;
-            ctx.host_globals.insert(
-                name,
-                HostGlobal {
-                    interface: "zwp_text_input_manager_v3".to_string(),
-                    version: client_version,
-                },
-            );
-            let visible =
-                queue_synthetic_global(ctx, name, "zwp_text_input_manager_v3", client_version);
-            record_registry_global_visibility(ctx, name, visible);
+            advertise_text_input_manager_v3(ctx, name);
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
