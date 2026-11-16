@@ -456,8 +456,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                     mapping_and_writing.push(quote! {
                                         let object_version = ctx
                                             .shadow_table
-                                            .guest_object_version(msg.sender_id)
-                                            .unwrap_or(u32::MAX);
+                                            .guest_object_version_or_unknown(msg.sender_id);
                                         let host_object_version = ctx
                                             .shadow_table
                                             .get_host_id(msg.sender_id)
@@ -654,8 +653,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                     mapping_and_writing.push(quote! {
                                         let object_version = ctx
                                             .shadow_table
-                                            .host_object_version(msg.sender_id)
-                                            .unwrap_or(u32::MAX);
+                                            .host_object_version_or_unknown(msg.sender_id);
                                         let guest_id = ctx.shadow_table.allocate_guest_server_id();
                                         ctx.shadow_table.map_id(guest_id, #name);
                                         ctx.shadow_table.track_interface_with_version(

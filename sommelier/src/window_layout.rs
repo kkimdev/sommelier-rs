@@ -50,9 +50,10 @@ const EDGE_TOLERANCE: f64 = 1e-9;
 
 /// Sub-pixel bias added before flooring an edge to a pixel offset.
 ///
-/// The worst-case product error for an `i32` extent is below `1e-6` pixels,
-/// so the bias corrects representation error without moving any edge that
-/// was meant to fall between pixels.
+/// The worst-case product error for an `i32` extent is below this bias, so
+/// the bias corrects representation error. It moves an edge by at most the
+/// bias: only an edge less than `1e-6` px below a pixel boundary lands on
+/// the next pixel.
 const PIXEL_BIAS: f64 = 1e-6;
 
 /// An integer rectangle in logical screen coordinates.
@@ -653,6 +654,29 @@ mod tests {
                 Ok(action.rect()),
                 "{action:?}"
             );
+        }
+    }
+
+    /// The user-facing doc states each rounding constant once, by name and
+    /// with the value the code uses.
+    #[test]
+    fn doc_states_each_rounding_constant_once() {
+        const DOC: &str = include_str!("../docs/WINDOW_SHORTCUT_CONFIGURATION.md");
+        // Match prose, not layout: a reflow or a capitalized sentence start
+        // must not fail the test.
+        let doc = DOC
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        for (name, constant) in [
+            ("edge tolerance", EDGE_TOLERANCE),
+            ("pixel bias", PIXEL_BIAS),
+        ] {
+            let value = format!("{constant:e}");
+            assert_eq!(doc.matches(&value).count(), 1, "{value} is stated once");
+            let statement = format!("{name} is `{value}`");
+            assert!(doc.contains(&statement), "the doc says \"{statement}\"");
         }
     }
 

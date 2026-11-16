@@ -27,6 +27,7 @@ limitations under the License.
 //! the only statements of the `wl_output.transform` enum rules; surfaces'
 //! buffer transforms use them too.
 
+use crate::protocols::wayland::wl_output;
 use crate::window_layout::Rect;
 use std::collections::{HashMap, HashSet};
 
@@ -54,6 +55,10 @@ pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i3
     }
 }
 
+/// Units per 1.0 of an Aura scale factor: `zaura_output` sends both scale
+/// factors in thousandths.
+const AURA_SCALE_UNITS: u64 = 1000;
+
 /// Host output geometry used for compositor-owned window layout requests.
 ///
 /// `wl_output.mode` reports pixel dimensions while Aura window bounds use
@@ -70,8 +75,8 @@ pub struct OutputState {
     /// orientation (Exo sends `bounds_in_native`).
     pub mode_width: i32,
     pub mode_height: i32,
-    /// Current `zaura_output.scale`, in thousandths. Preferred-only scale
-    /// entries do not affect the current output geometry.
+    /// Current `zaura_output.scale`, in thousandths (`AURA_SCALE_UNITS`).
+    /// Preferred-only scale entries do not affect the current output geometry.
     pub aura_current_scale: Option<u32>,
     /// `zaura_output.device_scale_factor`, in thousandths. Both Aura factors
     /// must arrive before this output can authorize placement.
@@ -109,11 +114,12 @@ impl OutputState {
             transformed_extent(self.panel_transform, self.mode_width, self.mode_height);
         // Legacy Aura factors are quantized to thousandths, so retain their
         // precision until the final division and conservatively floor DP
-        // extents. Checked conversion rejects malformed or overflowing modes.
+        // extents. `scale` is the product of two factors, so its unit is
+        // squared. Checked conversion rejects malformed or overflowing modes.
         let logical_extent = |pixels: i32| {
             let extent = u64::try_from(pixels)
                 .ok()?
-                .checked_mul(1_000_000)?
+                .checked_mul(AURA_SCALE_UNITS * AURA_SCALE_UNITS)?
                 .checked_div(scale)?;
             i32::try_from(extent).ok()
         };
@@ -133,10 +139,6 @@ impl OutputState {
         Some(Rect::new(x, y, width, height))
     }
 }
-
-/// `wl_output.done` exists since this version. Older outputs have no event
-/// group barrier, so each event applies as it arrives.
-const WL_OUTPUT_DONE_SINCE: u32 = 2;
 
 /// The registry advertisement that an output object was bound from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +169,8 @@ enum Liveness {
 #[derive(Debug)]
 struct OutputRecord {
     global: GlobalBinding,
-    /// Version 2+ outputs batch events until `wl_output.done`.
+    /// Outputs with `wl_output.done` batch events until it arrives. Older
+    /// outputs have no event group barrier, so each event applies at once.
     batches_until_done: bool,
     /// Host-only `zaura_output` extending this output, once created.
     aura_output: Option<u32>,
@@ -216,7 +219,7 @@ impl OutputRegistry {
             output,
             OutputRecord {
                 global,
-                batches_until_done: version >= WL_OUTPUT_DONE_SINCE,
+                batches_until_done: version >= wl_output::EVT_DONE_SINCE,
                 aura_output: None,
                 liveness: Liveness::Live {
                     committed: OutputState::default(),

@@ -1112,7 +1112,8 @@ associations moved in too. Handlers call `bind`, `release` (which returns the
 `zaura_output` to tear down), `deactivate`, `update` (the one publish rule
 for `wl_output` and `zaura_output` events), `commit`, `aura_event_target`,
 `ensure_aura_output` (which alone decides whether a `zaura_output` may be
-created), and `surface_entered` / `surface_left` / `surface_destroyed`.
+created; since moved to `aura_objects::ensure_zaura_output`, #26), and
+`surface_entered` / `surface_left` / `surface_destroyed`.
 `admit_guest_bind` returns the generation a bind refers to, so a bind cannot
 proceed without one. Placement asks
 `for_surface` and `primary`. The same module owns `is_valid_transform` and
@@ -1396,3 +1397,41 @@ Sommelier 692 passed / 1 ignored (678 before), sample GUI 12, codegen 9,
 `cargo fmt --check`, and `git diff --check` pass, every commit builds with
 strict Clippy, and this PR adds no `cargo doc` warning. Not
 host-validated: no Sommelier process was started.
+
+## 2026-11-17 — Residual review items
+
+The last cleanup PR of the series (PR G). Behavior is unchanged.
+
+- **Protocol versions (H3).** Since-version checks use the generated
+  `*_SINCE` constants. `ShadowTable` owns the "no negotiated version" rule
+  (`*_object_version_or_unknown`, `is_unknown_version`), so no caller,
+  generated code included, names the sentinel. Registry ceilings are named:
+  `wl_data_device_manager` and the keyboard extension take the generated
+  `VERSION`; `wl_output` and `wl_seat` keep ChromiumOS's lower caps.
+  `linux_dmabuf::GUEST_DMABUF_VERSION` is the one owner of the guest dmabuf
+  version (three copies before). A synthetic `gtk_surface1` takes its
+  shell's version, and `gtk_shell1` is advertised at its XML `VERSION`.
+- **Test seams (H5).** `Context::new` creates the GBM allocator and passes
+  it to `Context::from_parts`, which reads no environment; the test
+  constructors pass `None`. `Client::new` takes its `Context`, so the
+  proxy tests no longer read `SOMMELIER_VM_IDENTIFIER` or
+  `SOMMELIER_DRM_DEVICE` or probe `/dev/dri`.
+  `test_contexts_read_no_environment` pins the test constructors.
+- **Rounding constants (D2).** The shortcut doc states `EDGE_TOLERANCE`
+  and `PIXEL_BIAS` once each, and `doc_states_each_rounding_constant_once`
+  ties them to the code, ignoring line breaks and case. The bias claim is
+  now exact: it moves an edge by at most `1e-6` px.
+- **Smaller items.** `AURA_SCALE_UNITS` names the thousandths in
+  `OutputState::work_area` (NEW-3). The ARC-off log formats
+  `ARC_BOUNDS_VARIABLE` (NEW-4). The guest key owner model covers
+  `CompositorShortcut` (A6). `zaura_toplevel.origin_change` no longer reads
+  the barrier it ignores (A1). `.venv` is ignored.
+
+Not done: the bare request opcodes in `text_input.rs`, and the fixed `1`
+that synthetic text-input objects register with, are not version checks.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 694 passed /
+1 ignored (692 before, plus the doc pin and the GTK version test), sample
+GUI 12, codegen 9, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
+targets and on every commit, `cargo fmt --check`, and `git diff --check`
+pass. Not host-validated: no Sommelier process was started.

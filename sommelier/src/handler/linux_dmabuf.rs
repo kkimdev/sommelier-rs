@@ -31,7 +31,12 @@ use std::os::unix::io::{IntoRawFd, RawFd};
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
 /// libdrm headers so the proxy remains buildable in the minimal Nix shell.
 const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
-const FEEDBACK_VERSION: u32 = 4;
+/// The newest `zwp_linux_dmabuf_v1` offered to guests: the version that
+/// added the feedback objects, which the proxy synthesizes. v5 changes
+/// tranche semantics that the proxy does not translate, so it is never
+/// offered. A feedback object takes its factory's version, so it has this
+/// one too.
+pub(crate) const GUEST_DMABUF_VERSION: u32 = zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE;
 const MAX_FEEDBACK_FORMATS: usize = u16::MAX as usize + 1;
 // A Wayland message has a 16-bit byte length. Account for the 8-byte header
 // and 4-byte array length, then keep the uint16 index payload 4-byte aligned.
@@ -448,7 +453,7 @@ impl LinuxDmabufHandler {
         ctx.shadow_table.track_interface_with_version(
             guest_id,
             "zwp_linux_dmabuf_feedback_v1".to_string(),
-            FEEDBACK_VERSION,
+            GUEST_DMABUF_VERSION,
         );
         ctx.synthetic_feedback_objects.insert(guest_id, generation);
         let ready = ctx
@@ -770,7 +775,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
             .shadow_table
             .get_guest_id(ctx.last_sender_id)
             .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
-            .is_some_and(|version| version >= FEEDBACK_VERSION)
+            .is_some_and(|version| version >= zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE)
         {
             return Action::Drop;
         }
@@ -824,7 +829,7 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
             .shadow_table
             .get_guest_id(ctx.last_sender_id)
             .and_then(|guest_id| ctx.shadow_table.guest_object_version(guest_id))
-            .is_some_and(|version| version >= FEEDBACK_VERSION)
+            .is_some_and(|version| version >= zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE)
         {
             return Action::Drop;
         }
@@ -1237,8 +1242,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             }
             let version = ctx
                 .shadow_table
-                .host_object_version(host_params_id)
-                .unwrap_or(u32::MAX);
+                .host_object_version_or_unknown(host_params_id);
             ctx.shadow_table.track_host_interface_with_version(
                 buffer,
                 "wl_buffer".to_string(),
@@ -1278,8 +1282,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 }
                 let version = ctx
                     .shadow_table
-                    .host_object_version(host_params_id)
-                    .unwrap_or(u32::MAX);
+                    .host_object_version_or_unknown(host_params_id);
                 ctx.shadow_table.track_host_interface_with_version(
                     buffer,
                     "wl_buffer".to_string(),
@@ -1400,10 +1403,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // Codegen would map it if we forwarded.
         // buffer_id is new_id wl_buffer.
         let host_buffer_id = ctx.shadow_table.allocate_host_id();
-        let buffer_version = ctx
-            .shadow_table
-            .guest_object_version(params_id)
-            .unwrap_or(u32::MAX);
+        let buffer_version = ctx.shadow_table.guest_object_version_or_unknown(params_id);
         ctx.shadow_table.map_id(buffer_id, host_buffer_id);
         ctx.shadow_table.track_interface_with_version(
             buffer_id,
@@ -1745,8 +1745,7 @@ mod tests {
 
     #[test]
     fn forwards_device_id_when_no_local_allocator_exists() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.allocator = None;
+        let ctx = Context::new_for_test(false, false, Vec::new());
         let host_device = vec![1; std::mem::size_of::<libc::dev_t>()];
         assert_eq!(guest_device_bytes(&ctx, &host_device), Some(host_device));
     }
@@ -1754,7 +1753,6 @@ mod tests {
     #[test]
     fn rejects_malformed_device_id_before_forwarding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.allocator = None;
         let host_device = vec![1; std::mem::size_of::<libc::dev_t>() - 1];
         assert_eq!(guest_device_bytes(&ctx, &host_device), None);
 

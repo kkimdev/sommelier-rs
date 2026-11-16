@@ -2771,7 +2771,6 @@ mod tests {
     fn nv12_is_not_advertised_without_a_real_output_allocator() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.host_dmabuf_id = Some(7);
-        ctx.allocator = None;
         ctx.host_shm_formats.insert(WL_SHM_FORMAT_NV12);
         assert!(
             !guest_shm_format_available(&ctx, WL_SHM_FORMAT_NV12),

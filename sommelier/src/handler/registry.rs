@@ -16,11 +16,12 @@ limitations under the License.
 
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::display::queue_protocol_error;
+use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
-use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
+use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
 use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
 use crate::protocols::text_input_unstable_v3::ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED;
@@ -36,21 +37,36 @@ use crate::state::{
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
-// The guest-facing proxy only implements the pre-feedback dmabuf requests
-// plus the v4 feedback objects. Do not advertise v5: v5 adds tranche events
-// and semantics that are not translated by this proxy.
-const LINUX_DMABUF_VERSION: u32 = 4;
-// Legacy format/modifier events are needed to synthesize the v4 feedback
-// object exposed to the guest.  `create_immed` is available since v2 and
-// explicit modifier events since v3, so bind at v3 when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 3;
+/// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
+/// different fact from the guest version: the legacy format and modifier
+/// events, which are deprecated from the feedback version on, are what the
+/// proxy synthesizes the guest's feedback object from. `create_immed` is
+/// available since v2 and explicit modifier events since v3, so bind at v3
+/// when the host supports it.
+const LINUX_DMABUF_CAPABILITY_VERSION: u32 =
+    crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
 const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const WL_COMPOSITOR_VERSION: u32 = 4;
-// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
+/// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
-const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
+/// The `wl_output` ceiling; [`advertised_global_version`] says why. The
+/// vendored XML is newer: v4 adds the `name` and `description` events.
+const WL_OUTPUT_VERSION: u32 = 3;
+/// The `wl_seat` ceiling; [`advertised_global_version`] says why. The
+/// vendored XML is newer: v6 to v10 add touch shape and orientation,
+/// high-resolution scroll and scroll-direction events.
+const WL_SEAT_VERSION: u32 = 5;
+/// The newest `wl_data_device_manager` the proxy advertises: the vendored
+/// XML's, which the generated code forwards in full.
+const WL_DATA_DEVICE_MANAGER_VERSION: u32 =
+    crate::protocols::wayland::wl_data_device_manager::VERSION;
+/// The newest `zcr_keyboard_extension_v1` the proxy binds: the vendored
+/// XML's. The proxy handles all of it, including the v2 `peek_key` event
+/// that reports keys the IME consumed.
+const KEYBOARD_EXTENSION_VERSION: u32 =
+    crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1::VERSION;
 /// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
 /// Sommelier uses. Every Aura child takes its shell's version, so this
 /// floor is what lets the proxy create Aura surfaces and outputs, and send
@@ -96,18 +112,18 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
         // legacy damage request. Hosts below v3 retain their original version;
         // the proxy does not expose v5/v6 surface semantics.
         "wl_compositor" => WL_COMPOSITOR_VERSION,
-        "wl_output" => 3,
-        "wl_seat" => 5,
-        "wl_data_device_manager" => 3,
+        "wl_output" => WL_OUTPUT_VERSION,
+        "wl_seat" => WL_SEAT_VERSION,
+        "wl_data_device_manager" => WL_DATA_DEVICE_MANAGER_VERSION,
         "xdg_wm_base" => XDG_SHELL_VERSION,
-        "zwp_linux_dmabuf_v1" => LINUX_DMABUF_CLIENT_VERSION,
+        "zwp_linux_dmabuf_v1" => GUEST_DMABUF_VERSION,
         _ => host_version,
     };
     host_version.min(cap)
 }
 
 fn keyboard_extension_version(host_version: u32) -> u32 {
-    host_version.min(2)
+    host_version.min(KEYBOARD_EXTENSION_VERSION)
 }
 
 fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) -> bool {
@@ -617,7 +633,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // guest while clamping only the internal host bind to v3.
             let can_synthesize_feedback = can_synthesize_dmabuf_feedback(ctx, version);
             let client_version = if can_synthesize_feedback {
-                LINUX_DMABUF_VERSION
+                GUEST_DMABUF_VERSION
             } else {
                 if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_none() {
                     log::warn!(
@@ -864,10 +880,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     name,
                     HostGlobal {
                         interface: "gtk_shell1".to_string(),
-                        version: 1,
+                        version: gtk_shell1::VERSION,
                     },
                 );
-                let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+                let visible = queue_synthetic_global(ctx, name, "gtk_shell1", gtk_shell1::VERSION);
                 record_registry_global_visibility(ctx, name, visible);
                 return Action::Drop;
             }
@@ -892,10 +908,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 name,
                 HostGlobal {
                     interface: "gtk_shell1".to_string(),
-                    version: 1,
+                    version: gtk_shell1::VERSION,
                 },
             );
-            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", 1);
+            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", gtk_shell1::VERSION);
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
@@ -1572,7 +1588,6 @@ mod tests {
     #[test]
     fn gpu_without_allocator_exposes_host_v3_without_feedback_barrier() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.allocator = None;
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table

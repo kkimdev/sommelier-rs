@@ -419,8 +419,7 @@ impl KeyboardHandler {
                     .insert(host_extended_id, host_keyboard_id);
                 let extended_version = ctx
                     .shadow_table
-                    .host_object_version(extension_host_id.0)
-                    .unwrap_or(u32::MAX);
+                    .host_object_version_or_unknown(extension_host_id.0);
                 ctx.shadow_table.track_host_interface_with_version(
                     host_extended_id.0,
                     "zcr_extended_keyboard_v1".to_string(),

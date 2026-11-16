@@ -192,17 +192,11 @@ struct Client {
 }
 
 impl Client {
-    fn new(
-        client_conn: WaylandConnection,
-        host_conn: WaylandConnection,
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        placement: Arc<PlacementConfig>,
-    ) -> Self {
+    fn new(client_conn: WaylandConnection, host_conn: WaylandConnection, ctx: Context) -> Self {
         Self {
             client_conn,
             host_conn,
-            ctx: Context::new(gpu_accel, xdg_decoration, placement),
+            ctx,
             handler: SommelierHandler::new(),
         }
     }
@@ -765,9 +759,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         let render_request = MessageBuilder::new().build_message(7, 0);
@@ -803,9 +795,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         // Use an untracked host event so dispatch has no protocol state to
@@ -860,9 +850,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(guest_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         for (guest_id, host_id) in [
@@ -1039,9 +1027,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1094,9 +1080,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1153,9 +1137,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         let mut pipe_fds = [-1; 2];
@@ -1202,9 +1184,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(client_socket.into_raw_fd()),
             WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         // A client request with an unknown sender is malformed Wayland
@@ -1246,9 +1226,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(guest_proxy.into_raw_fd()),
             WaylandConnection::new(host_proxy.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::arc_bounds_for_test("")),
+            Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test("")),
         );
         let ctx = &mut client.ctx;
         ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
@@ -1373,9 +1351,7 @@ mod tests {
         let mut client = Client::new(
             WaylandConnection::new(guest_proxy.into_raw_fd()),
             WaylandConnection::new(host_proxy.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::for_test(Vec::new())),
+            Context::new_for_test(false, false, Vec::new()),
         );
 
         // Register one advertised global under the host-side registry ID so
@@ -4004,9 +3980,7 @@ pub async fn run(
                             let mut client = Client::new(
                                 client_conn,
                                 host_conn,
-                                gpu_accel,
-                                xdg_decoration,
-                                Arc::clone(&placement),
+                                Context::new(gpu_accel, xdg_decoration, Arc::clone(&placement)),
                             );
                             if let Some(channel) = virtwayland_channel_ref {
                                 client.ctx.virtwayland_channel = Some(channel);
