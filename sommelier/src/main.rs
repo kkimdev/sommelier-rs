@@ -121,6 +121,9 @@ async fn main() {
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
     let shortcuts_file = args.window_shortcuts_config.as_deref();
+    // Install the reload handler before the file is first read, so a SIGHUP
+    // sent by whoever just wrote the file can never terminate the proxy.
+    let reload_signal = shortcuts_file.map(|_| install_reload_signal());
     let placement = match placement_config::PlacementConfig::from_environment(shortcuts_file) {
         Ok(config) => Arc::new(config),
         Err(error) => {
@@ -128,7 +131,6 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let reload_signal = shortcuts_file.map(|_| install_reload_signal());
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
