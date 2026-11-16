@@ -61,6 +61,8 @@ impl XdgRoles {
     /// xdg_surface is unknown.
     pub(crate) fn add_toplevel(&mut self, xdg_surface: u32, xdg_toplevel: u32) -> Option<u32> {
         let role = self.by_xdg_surface.get_mut(&xdg_surface)?;
+        // A second get_toplevel is `already_constructed`, which ends the
+        // session; the replaced toplevel's own destructor releases it.
         role.toplevel = Some(xdg_toplevel);
         Some(role.wl_surface)
     }

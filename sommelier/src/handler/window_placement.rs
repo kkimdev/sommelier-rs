@@ -1403,6 +1403,50 @@ mod tests {
         );
     }
 
+    /// The (sender, opcode) of every queued host request.
+    fn queued_requests(ctx: &Context) -> Vec<(u32, u16)> {
+        ctx.client_to_host_queue
+            .iter()
+            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+            .collect()
+    }
+
+    /// A malformed client that gives one wl_surface two xdg_surfaces ends
+    /// only the destroyed xdg_surface's toplevel role.
+    #[test]
+    fn destroying_one_of_two_xdg_surfaces_ends_only_its_toplevel() {
+        let (mut ctx, first_toplevel, _zaura_shell_host, _wl_surface_host) =
+            setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
+        let (first_xdg_surface, second_xdg_surface, second_toplevel) = (500, 520, 420);
+        ctx.shadow_table.map_id(second_xdg_surface, 620);
+        ctx.shadow_table.map_id(second_toplevel, 720);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(second_xdg_surface, 100, second_toplevel);
+        let first_aura = ensure_zaura_toplevel(&mut ctx, first_toplevel).expect("toplevel");
+        let second_aura = ensure_zaura_toplevel(&mut ctx, second_toplevel).expect("toplevel");
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = first_xdg_surface;
+        assert_eq!(
+            XdgSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Forward
+        );
+        assert_eq!(
+            queued_requests(&ctx),
+            vec![(first_aura, REQ_RELEASE_AURA_TOPLEVEL)]
+        );
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(first_toplevel), None);
+        assert_eq!(
+            ctx.xdg_roles.wl_surface_of_toplevel(second_toplevel),
+            Some(100)
+        );
+        assert_eq!(
+            ctx.window_placement
+                .aura_toplevel_for_xdg_toplevel(second_toplevel),
+            Some(second_aura)
+        );
+    }
+
     /// A wl_surface destroyed under a live XDG toplevel ends the toplevel's
     /// role: its Aura toplevel and Aura surface are both released before
     /// the wl_surface destructor.
