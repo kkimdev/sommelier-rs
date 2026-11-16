@@ -206,10 +206,10 @@ test uses `/dev/wl0`.
 
 | Variable/option | Purpose |
 | --- | --- |
-| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. |
+| `XDG_RUNTIME_DIR` | Directory where the proxy creates its Wayland socket; required. With the ARC policy it also holds the [task-ID block locks](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator), and must then be private to the user. |
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
-| `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
+| `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
 | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window placement (`1`, `true`, `yes`, or `on`). See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
