@@ -82,12 +82,13 @@ complete, or for a rectangle the output cannot represent). A chord listed in
 consumes is neither placed nor delivered.
 
 Every skip is logged with its reason. A skip that persists until the
-configuration or the proxy changes (a rectangle the output cannot represent,
-or a toplevel that cannot get an Aura toplevel) is logged at `info`, which
-the default log filter shows. Skips that depend on transient focus or output
-state are logged at `debug`; set `RUST_LOG=debug` to see them.
-`PlacementSkip::log_level` in `sommelier/src/handler/keyboard.rs` owns this
-split.
+configuration or the proxy changes is logged at `info`, which the default
+log filter shows: a rectangle the output cannot represent, or no Aura
+toplevel (ARC identities exhausted, or `zaura_shell` missing or too old).
+The other skips (no focused toplevel, no usable output yet, no Aura surface)
+are logged at `debug`; set `RUST_LOG=debug` to see them.
+`PlacementSkip::log_level` in `sommelier/src/handler/window_placement.rs`
+owns this split.
 
 ## Environment list format
 
@@ -304,7 +305,7 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/placement_config.rs` | `PlacementConfig`: startup resolution of every setting, both binding parsers, the one validator, the hardened file read, the current binding generation, and reload. |
 | `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
-| `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
+| `sommelier/src/state.rs` | `Context` holds the connection's `WindowPlacementState` and `OutputRegistry`; `placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
 | `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
