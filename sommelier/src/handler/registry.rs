@@ -1588,7 +1588,6 @@ mod tests {
     #[test]
     fn gpu_without_allocator_exposes_host_v3_without_feedback_barrier() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.allocator = None;
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table

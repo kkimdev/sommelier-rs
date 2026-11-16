@@ -2280,7 +2280,6 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         let surface = 100;
         let buffer = 50;
-        ctx.allocator = None;
         register_test_native_with_sync_fds(
             &mut ctx,
             buffer,
@@ -2319,7 +2318,6 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface = 100;
         let buffer = 50;
-        ctx.allocator = None;
         let sync_fd = invalid_ioctl_fd();
         let error = crate::allocator::wait_for_dmabuf(sync_fd.as_raw_fd(), None).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));

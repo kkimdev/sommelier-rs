@@ -1264,21 +1264,8 @@ impl Context {
     /// * `placement` - the process-wide placement configuration, resolved
     ///   once in `main`; `Context` never reads placement variables itself.
     pub fn new(gpu_accel: bool, xdg_decoration: bool, placement: Arc<PlacementConfig>) -> Self {
-        Self::with_vm_identifier(
-            gpu_accel,
-            xdg_decoration,
-            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
-            placement,
-        )
-    }
-
-    fn with_vm_identifier(
-        gpu_accel: bool,
-        xdg_decoration: bool,
-        vm_identifier: String,
-        placement: Arc<PlacementConfig>,
-    ) -> Self {
-        // Initialize allocator
+        // `Allocator::new` reads `SOMMELIER_DRM_DEVICE` and probes the DRM
+        // render nodes; without one, buffers fall back to VirtWL or SHM.
         let allocator = match Allocator::new() {
             Ok(alloc) => Some(alloc),
             Err(e) => {
@@ -1286,6 +1273,23 @@ impl Context {
                 None
             }
         };
+        Self::from_parts(
+            gpu_accel,
+            xdg_decoration,
+            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            allocator,
+            placement,
+        )
+    }
+
+    /// Build the state from resolved inputs; reads no environment.
+    fn from_parts(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        vm_identifier: String,
+        allocator: Option<Allocator>,
+        placement: Arc<PlacementConfig>,
+    ) -> Self {
         let window_placement = WindowPlacementState::new(placement.arc_id_allocator());
         Self {
             shadow_table: ShadowTable::new(),
@@ -1381,30 +1385,39 @@ impl Context {
         self.clipboard_pumps.retain(|pump| !pump.is_finished());
     }
 
-    /// Test-only constructor that reads no environment variable and
-    /// reserves no ARC task-ID block.
+    /// Test-only constructor that reads no environment variable, probes no
+    /// DRM device and reserves no ARC task-ID block.
     ///
     /// The ARC bounds policy is off and `accelerators` are the host
-    /// accelerators. The VM identifier is the default `termina`.
+    /// accelerators. The VM identifier is the default `termina`, and there
+    /// is no GBM allocator.
     #[cfg(test)]
     pub fn new_for_test(
         gpu_accel: bool,
         xdg_decoration: bool,
         accelerators: Vec<crate::accelerator::Accelerator>,
     ) -> Self {
-        Self::with_vm_identifier(
+        Self::from_parts(
             gpu_accel,
             xdg_decoration,
             resolve_vm_identifier(None),
+            None,
             Arc::new(PlacementConfig::for_test(accelerators)),
         )
     }
 
     /// Test-only constructor from an explicit placement configuration, for
-    /// example `PlacementConfig::arc_bounds_for_test`.
+    /// example `PlacementConfig::arc_bounds_for_test`. Like `new_for_test`,
+    /// it reads no environment variable and has no GBM allocator.
     #[cfg(test)]
     pub(crate) fn with_placement_for_test(placement: impl Into<Arc<PlacementConfig>>) -> Self {
-        Self::with_vm_identifier(false, false, resolve_vm_identifier(None), placement.into())
+        Self::from_parts(
+            false,
+            false,
+            resolve_vm_identifier(None),
+            None,
+            placement.into(),
+        )
     }
 
     /// Return whether the host keeps this chord (`SOMMELIER_ACCELERATORS`).
@@ -1504,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_reads_no_placement_environment() {
+    fn test_contexts_read_no_environment() {
         let accelerators = vec![alt_q()];
         let ctx = Context::new_for_test(true, false, accelerators);
         assert!(ctx.gpu_accel);
@@ -1512,6 +1525,11 @@ mod tests {
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(!ctx.window_placement.uses_arc_bounds());
         assert_eq!(ctx.vm_identifier, "termina");
+        assert!(ctx.allocator.is_none(), "no DRM device is probed");
+
+        let ctx = Context::with_placement_for_test(PlacementConfig::for_test(Vec::new()));
+        assert_eq!(ctx.vm_identifier, "termina");
+        assert!(ctx.allocator.is_none(), "no DRM device is probed");
     }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
@@ -2296,10 +2314,8 @@ mod tests {
         let host_buffer = HostId(40);
 
         for mut encoded in 0..sequence_count {
-            // Exercise the lifecycle reducer directly. Constructing a full
-            // Context for every one of the 15,625 short sequences also
-            // initializes the GBM allocator, turning this bounded unit test
-            // into a multi-minute smoke test on systems without /dev/dri.
+            // Exercise the lifecycle reducer directly rather than building a
+            // full Context for every one of the 15,625 short sequences.
             let mut registry = RenderBufferRegistry::default();
             assert!(registry.register_native(host_buffer, (1, 1), Vec::new()));
             let mut model = RenderBufferUse::NeverSubmitted;

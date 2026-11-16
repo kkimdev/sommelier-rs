@@ -1740,8 +1740,7 @@ mod tests {
 
     #[test]
     fn forwards_device_id_when_no_local_allocator_exists() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.allocator = None;
+        let ctx = Context::new_for_test(false, false, Vec::new());
         let host_device = vec![1; std::mem::size_of::<libc::dev_t>()];
         assert_eq!(guest_device_bytes(&ctx, &host_device), Some(host_device));
     }
@@ -1749,7 +1748,6 @@ mod tests {
     #[test]
     fn rejects_malformed_device_id_before_forwarding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.allocator = None;
         let host_device = vec![1; std::mem::size_of::<libc::dev_t>() - 1];
         assert_eq!(guest_device_bytes(&ctx, &host_device), None);
 
