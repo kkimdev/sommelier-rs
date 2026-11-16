@@ -395,10 +395,6 @@ pub(crate) fn record_xdg_toplevel(
     xdg_surface_guest_id: u32,
     xdg_toplevel_guest_id: u32,
 ) {
-    let Some(&wl_surface_guest_id) = ctx.xdg_surface_to_wl_surface.get(&xdg_surface_guest_id)
-    else {
-        return;
-    };
     if ctx
         .shadow_table
         .get_host_id(xdg_toplevel_guest_id)
@@ -406,10 +402,12 @@ pub(crate) fn record_xdg_toplevel(
     {
         return;
     }
-    ctx.xdg_surface_to_xdg_toplevel
-        .insert(xdg_surface_guest_id, xdg_toplevel_guest_id);
-    ctx.xdg_toplevel_to_wl_surface
-        .insert(xdg_toplevel_guest_id, wl_surface_guest_id);
+    let Some(wl_surface_guest_id) = ctx
+        .xdg_roles
+        .add_toplevel(xdg_surface_guest_id, xdg_toplevel_guest_id)
+    else {
+        return;
+    };
     window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
 }
 
@@ -910,33 +908,12 @@ impl WlSurfaceHandler for CompositorHandler {
         for keyboard_id in focus_update.retired_keyboards {
             ctx.key_generations.clear_keyboard(keyboard_id);
         }
-        // xdg objects are separate guest objects, but both maps resolve back
-        // to this wl_surface. Remove stale links now so a later client ID
-        // reuse cannot associate a new toplevel with the destroyed surface.
-        let orphaned_toplevels = ctx
-            .xdg_toplevel_to_wl_surface
-            .iter()
-            .filter_map(|(&toplevel_id, &surface_id)| {
-                (surface_id == wl_surface_guest_id).then_some(toplevel_id)
-            })
-            .collect::<Vec<_>>();
-        for toplevel_id in orphaned_toplevels {
-            window_placement::release_toplevel(ctx, toplevel_id);
+        // xdg objects are separate guest objects, but their roles resolve
+        // back to this wl_surface. End them now so a later client ID reuse
+        // cannot associate a new toplevel with the destroyed surface.
+        for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
+            window_placement::release_toplevel(ctx, xdg_toplevel_id);
         }
-        let orphaned_xdg_surfaces = ctx
-            .xdg_surface_to_wl_surface
-            .iter()
-            .filter_map(|(&xdg_surface_id, &surface_id)| {
-                (surface_id == wl_surface_guest_id).then_some(xdg_surface_id)
-            })
-            .collect::<Vec<_>>();
-        for xdg_surface_id in orphaned_xdg_surfaces {
-            ctx.xdg_surface_to_xdg_toplevel.remove(&xdg_surface_id);
-        }
-        ctx.xdg_surface_to_wl_surface
-            .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-        ctx.xdg_toplevel_to_wl_surface
-            .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
         // The host destructor is queued above. Retain the numeric mapping
         // until the host acknowledges it with wl_display.delete_id so the
         // guest can safely reuse the ID only after that acknowledgement.
@@ -1387,15 +1364,14 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
 // that the shelf uses for icon matching. But the app ID arrives via
 // xdg_toplevel::set_app_id, which doesn't carry a wl_surface reference.
 //
-// We bridge this gap by tracking the chain:
-//   xdg_wm_base::get_xdg_surface(xdg_surface, wl_surface)
-//   xdg_surface::get_toplevel(xdg_toplevel)
-// so that when set_app_id fires on an xdg_toplevel, we can resolve back to
-// the underlying wl_surface and create/reuse a host zaura_surface on it.
+// `crate::state::XdgRoles` bridges this gap: these handlers record the
+// chain get_xdg_surface(xdg_surface, wl_surface) → get_toplevel(xdg_toplevel)
+// and end it in the destructors, so set_app_id can resolve the underlying
+// wl_surface and create or reuse its host zaura_surface.
 
 impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHandler {
     fn on_get_xdg_surface(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
-        ctx.xdg_surface_to_wl_surface.insert(id, surface);
+        ctx.xdg_roles.add_xdg_surface(id, surface);
         Action::Forward
     }
 }
@@ -1403,24 +1379,11 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
 impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let xdg_surface_id = ctx.last_sender_id;
-        ctx.xdg_surface_to_xdg_toplevel.remove(&xdg_surface_id);
-        if let Some(wl_surface_id) = ctx.xdg_surface_to_wl_surface.remove(&xdg_surface_id) {
-            // A malformed client can destroy xdg_surface before its
-            // xdg_toplevel. Do not leave a stale toplevel→surface association
-            // that could apply a later app_id to an unrelated surface after ID
-            // reuse.
-            let orphaned_toplevels = ctx
-                .xdg_toplevel_to_wl_surface
-                .iter()
-                .filter_map(|(&toplevel_id, &surface_id)| {
-                    (surface_id == wl_surface_id).then_some(toplevel_id)
-                })
-                .collect::<Vec<_>>();
-            for toplevel_id in orphaned_toplevels {
-                window_placement::release_toplevel(ctx, toplevel_id);
-            }
-            ctx.xdg_toplevel_to_wl_surface
-                .retain(|_, surface_id| *surface_id != wl_surface_id);
+        // A malformed client can destroy xdg_surface before its
+        // xdg_toplevel. End the toplevel's role too, so a later app_id
+        // cannot reach an unrelated surface after ID reuse.
+        if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
+            window_placement::release_toplevel(ctx, xdg_toplevel_id);
         }
         Action::Forward
     }
@@ -1469,9 +1432,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // the host acknowledges the role destructor.
         window_placement::release_toplevel(ctx, xdg_toplevel_id);
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
-        ctx.xdg_toplevel_to_wl_surface.remove(&xdg_toplevel_id);
-        ctx.xdg_surface_to_xdg_toplevel
-            .retain(|_, toplevel_id| *toplevel_id != xdg_toplevel_id);
+        ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
         Action::Drop
     }
@@ -1516,7 +1477,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         ctx.client_to_host_queue.push((message, Vec::new()));
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
-        if let Some(&wl_surface_guest_id) = ctx.xdg_toplevel_to_wl_surface.get(&xdg_toplevel_id) {
+        if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
             if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
             {
                 if ctx.window_placement.uses_arc_bounds() {
@@ -1691,12 +1652,8 @@ mod tests {
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
         ctx.host_zaura_shell_id = Some(zaura_shell_host);
         ctx.host_zaura_shell_version = 38;
-        ctx.xdg_surface_to_wl_surface
-            .insert(xdg_surface_id, wl_surface_guest);
-        ctx.xdg_toplevel_to_wl_surface
-            .insert(xdg_toplevel_id, wl_surface_guest);
-        ctx.xdg_surface_to_xdg_toplevel
-            .insert(xdg_surface_id, xdg_toplevel_id);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
     }
@@ -4214,16 +4171,15 @@ mod tests {
         ctx.last_sender_id = xdg_toplevel_id;
 
         assert!(ctx
-            .xdg_toplevel_to_wl_surface
-            .contains_key(&xdg_toplevel_id));
+            .xdg_roles
+            .wl_surface_of_toplevel(xdg_toplevel_id)
+            .is_some());
 
         ctx.last_sender_id = xdg_toplevel_id;
         let action = XdgToplevelHandler::on_destroy(&mut handler, &mut ctx);
         assert_eq!(action, Action::Drop);
 
-        assert!(!ctx
-            .xdg_toplevel_to_wl_surface
-            .contains_key(&xdg_toplevel_id));
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id), None);
     }
 
     #[test]
@@ -4759,10 +4715,9 @@ mod tests {
     fn wl_surface_destroy_removes_stale_xdg_surface_links() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let wl_surface_guest_id = 100u32;
-        ctx.xdg_surface_to_wl_surface
-            .insert(601, wl_surface_guest_id);
-        ctx.xdg_toplevel_to_wl_surface
-            .insert(602, wl_surface_guest_id);
+        ctx.xdg_roles.add_xdg_surface(601, wl_surface_guest_id);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(603, wl_surface_guest_id, 602);
         ctx.last_sender_id = wl_surface_guest_id;
 
         let mut handler = CompositorHandler;
@@ -4770,19 +4725,12 @@ mod tests {
             WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
             Action::Drop
         );
-        assert!(!ctx
-            .xdg_surface_to_wl_surface
-            .values()
-            .any(|id| *id == wl_surface_guest_id));
-        assert!(!ctx
-            .xdg_toplevel_to_wl_surface
-            .values()
-            .any(|id| *id == wl_surface_guest_id));
-        // The unrelated setup mapping is also removed because it points to
-        // the same surface; no stale association should survive destruction.
-        assert!(!ctx
-            .xdg_toplevel_to_wl_surface
-            .contains_key(&xdg_toplevel_id));
+        assert_eq!(ctx.xdg_roles.toplevel_of_xdg_surface(603), None);
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(602), None);
+        // The setup role is also ended because it is on the same surface;
+        // no stale association should survive destruction.
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id), None);
+        assert!(ctx.xdg_roles.is_empty());
     }
 
     #[test]

@@ -19,6 +19,7 @@ mod input;
 mod outputs;
 mod render;
 mod window_placement;
+mod xdg_roles;
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{OwnedFd, RawFd};
@@ -54,6 +55,7 @@ pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
     PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, WindowPlacementState,
 };
+pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
 
 /// A Wayland object ID allocated by the **guest** (client) side.
@@ -909,12 +911,8 @@ pub struct Context {
     /// The one host Aura surface of each host wl_surface, shared by XDG and
     /// GTK metadata and placement.
     pub(crate) aura_surfaces: AuraSurfaces,
-    /// Tracks xdg_surface → wl_surface associations (guest IDs).
-    pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
-    /// Tracks xdg_surface → xdg_toplevel associations (guest IDs).
-    pub xdg_surface_to_xdg_toplevel: HashMap<u32, u32>,
-    /// Tracks xdg_toplevel → wl_surface associations (guest IDs).
-    pub xdg_toplevel_to_wl_surface: HashMap<u32, u32>,
+    /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
+    pub(crate) xdg_roles: XdgRoles,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
@@ -1291,9 +1289,7 @@ impl Context {
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
             aura_surfaces: AuraSurfaces::default(),
-            xdg_surface_to_wl_surface: HashMap::new(),
-            xdg_surface_to_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_to_wl_surface: HashMap::new(),
+            xdg_roles: XdgRoles::default(),
             viewport_to_wl_surface: HashMap::new(),
             clipboard_pumps: Vec::new(),
         }

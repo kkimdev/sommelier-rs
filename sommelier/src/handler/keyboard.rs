@@ -1552,7 +1552,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
@@ -1657,7 +1658,8 @@ mod tests {
         map_keyboard(&mut ctx, 10, host_keyboard, 50, 11);
         ctx.shadow_table.map_id(surface, 22);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
@@ -1749,7 +1751,7 @@ mod tests {
     fn placement_chord_is_consumed_without_a_focused_toplevel() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         // The focused surface is not (or no longer) an xdg_toplevel.
-        ctx.xdg_toplevel_to_wl_surface.clear();
+        ctx.xdg_roles = crate::state::XdgRoles::default();
         assert_eq!(
             crate::handler::window_placement::place_focused(
                 &mut ctx,

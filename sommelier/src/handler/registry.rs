@@ -1894,7 +1894,7 @@ mod tests {
             .track_interface(1, "wl_registry".to_string());
         ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table.map_id(13, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(13, 12);
+        ctx.xdg_roles.add_toplevel_role_for_test(13 + 1000, 12, 13);
 
         let shell = "zaura_shell".to_string();
         assert_eq!(

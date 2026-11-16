@@ -126,12 +126,7 @@ fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedTo
     {
         return None;
     }
-    let xdg_toplevel_guest_id =
-        ctx.xdg_toplevel_to_wl_surface
-            .iter()
-            .find_map(|(&xdg_toplevel_id, &surface_id)| {
-                (surface_id == wl_surface_guest_id).then_some(xdg_toplevel_id)
-            })?;
+    let xdg_toplevel_guest_id = ctx.xdg_roles.toplevel_on_wl_surface(wl_surface_guest_id)?;
     // `record_xdg_toplevel` records only mapped toplevels, and every path
     // that unmaps one removes its record first, so the lookup cannot miss.
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id);
@@ -386,12 +381,7 @@ pub(crate) fn attach_toplevel(
 /// identity gate as `get_toplevel`. A toplevel that still cannot attach is
 /// retried lazily by placement.
 pub(crate) fn attach_recorded_toplevels(ctx: &mut Context) {
-    let toplevels = ctx
-        .xdg_toplevel_to_wl_surface
-        .iter()
-        .map(|(&xdg_toplevel, &wl_surface)| (xdg_toplevel, wl_surface))
-        .collect::<Vec<_>>();
-    for (xdg_toplevel_guest_id, wl_surface_guest_id) in toplevels {
+    for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx.xdg_roles.toplevels() {
         attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
     }
 }
@@ -571,7 +561,7 @@ pub(crate) fn hold_surface_configure(
     guest_xdg_surface_id: u32,
     serial: u32,
 ) -> bool {
-    let Some(&guest_xdg_toplevel_id) = ctx.xdg_surface_to_xdg_toplevel.get(&guest_xdg_surface_id)
+    let Some(guest_xdg_toplevel_id) = ctx.xdg_roles.toplevel_of_xdg_surface(guest_xdg_surface_id)
     else {
         return false;
     };
@@ -779,12 +769,8 @@ mod tests {
             .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
         ctx.host_zaura_shell_id = Some(zaura_shell_host);
         ctx.host_zaura_shell_version = 38;
-        ctx.xdg_surface_to_wl_surface
-            .insert(xdg_surface_id, wl_surface_guest);
-        ctx.xdg_toplevel_to_wl_surface
-            .insert(xdg_toplevel_id, wl_surface_guest);
-        ctx.xdg_surface_to_xdg_toplevel
-            .insert(xdg_surface_id, xdg_toplevel_id);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
     }
@@ -889,7 +875,8 @@ mod tests {
         map_keyboard(&mut ctx, 10, host_keyboard, 11);
         ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table.map_id(xdg_toplevel, 23);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, 12);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, 12);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
@@ -1022,7 +1009,8 @@ mod tests {
         map_keyboard(&mut ctx, keyboard, host_keyboard, seat);
         ctx.shadow_table.map_id(surface, host_surface);
         ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
-        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        ctx.xdg_roles
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, seat, surface);
         ctx.host_zaura_shell_id = Some(24);
         ctx.host_zaura_shell_version = 38;
