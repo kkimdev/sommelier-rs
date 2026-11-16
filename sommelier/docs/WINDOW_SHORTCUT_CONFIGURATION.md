@@ -177,10 +177,10 @@ Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
 ## From rectangle to window bounds
 
-At key time the focused surface's output work area `(X, Y, W, H)` is computed
-from the Aura scale factors, logical transform, and insets
-(`OutputState::work_area`). Each rectangle edge fraction `f` becomes a pixel
-offset:
+At key time the focused surface's output work area `(X, Y, W, H)` comes from
+`OutputState::work_area`; the [README](../../README.md#configuration) explains
+which output is chosen and how its work area is measured. Each rectangle edge
+fraction `f` becomes a pixel offset:
 
 ```text
 offset(f, W) = clamp(floor(f * W + 1e-6), 0, W)
@@ -259,6 +259,7 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
 | `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
 | `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
+| `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; `bounds_for_action` delegates to the rounding rule. |
 | `sommelier/src/main.rs` | The `--window-shortcuts-config` option and the `SIGHUP` handler. |
 | `sommelier/src/proxy.rs` | Shares the configuration with every connection and runs reloads in the accept loop. |

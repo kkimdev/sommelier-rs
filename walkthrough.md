@@ -1087,3 +1087,65 @@ Validation (monorepo dev shell, locked, serial): Sommelier 664 passed /
 1 ignored (650 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. Not host-validated: no Sommelier process was started.
+
+## 2026-11-16 — Output registry
+
+Cleanup PR E1 for review findings S2, S9, S10, the rest of C5, C6, and the
+output parts of H3 and H4.
+
+**Before.** Output state lived in seven public `Context` fields
+(`output_host_ids`, `output_states`, `pending_output_states`,
+`output_host_global_bindings`, `inactive_output_host_ids`,
+`surface_output_ids`, `zaura_output_to_wl_output`) that the registry,
+compositor and state code each mutated. The "is this output live" rule was
+restated about nine times. `inactive_output_host_ids` grew on every release.
+The `wl_output.geometry` transform and `zaura_output.logical_transform` both
+wrote one field, and the last event won.
+
+**After.** `OutputRegistry` in `sommelier/src/state/outputs.rs` is the only
+owner. Its fields are private, and it keeps one record per bound host output:
+the `GlobalBinding` (name and generation) it came from, its bound version,
+its `zaura_output`, and a `Live { committed, pending }` / `Inactive` state. A
+reverse `zaura_output` index replaces the scans, and the surface-to-output
+associations moved in too. Handlers call `bind`, `release` (which returns the
+`zaura_output` to tear down), `deactivate`, `update` (the one publish rule
+for `wl_output` and `zaura_output` events), `commit`, `aura_event_target`,
+`surface_entered` / `surface_left` / `surface_destroyed`. Placement asks
+`for_surface` and `primary`. The same module owns `is_valid_transform` and
+`transformed_extent`, which surface buffer transforms use too.
+
+- The output's liveness is the record itself, so the inactive set is gone.
+  The `wl_output` handlers' pending-destructor checks were dead: the proxy
+  suppresses host events for such objects before dispatch, and a proxy test
+  now pins that.
+- The unread `OutputState.scale` is gone. `wl_output.scale` is still
+  forwarded.
+- Named since-versions replace the literals 2 and 38 for `get_aura_output`
+  and `zaura_output.release`.
+- `state.rs` shrank from 2834 to 2465 lines, and `compositor.rs` from 6172 to
+  6144. The new `outputs.rs` has 715 lines, of which 410 are production code.
+
+**Behavior changes**, each with a regression test that failed before:
+
+- *C6, the work area follows the panel transform.* Exo sends
+  `wl_output.mode` as `ManagedDisplayInfo::bounds_in_native()` (native panel
+  pixels) and the geometry transform as `display.panel_rotation()`, which is
+  the active rotation plus the panel's mounting orientation.
+  `logical_transform` is `display.rotation()` alone. On a portrait-native
+  panel, the logical transform left the work area in the wrong orientation.
+  ChromiumOS Sommelier also ignores `logical_transform` and rotates by the
+  geometry transform. When the two transforms agree (any panel in its natural
+  mounting), results are unchanged
+  (`work_area_rotates_native_mode_by_the_panel_transform`).
+- *C5, released outputs leave nothing behind*
+  (`released_outputs_leave_no_liveness_bookkeeping`).
+- *C5, a bind without an advertisement generation is refused* instead of
+  being recorded under a made-up generation 0 that no `global_remove` could
+  match. Real traffic never reaches this path
+  (`bind_without_an_advertisement_generation_is_refused`).
+
+Validation (monorepo dev shell, locked, serial): Sommelier 675 passed /
+1 ignored (664 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
+1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. Not host-validated: no Sommelier process was started,
+and rotation and multi-monitor selection have never been checked on a host.
