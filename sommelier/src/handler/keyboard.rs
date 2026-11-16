@@ -2235,6 +2235,224 @@ mod tests {
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
     }
 
+    /// Focus `placeable_shortcut_fixture` with an enabled, host-active text
+    /// input (guest 40, host v1 140, host extension 60) that is composing a
+    /// preedit on the placed surface.
+    fn add_composing_text_input_on_placed_surface(ctx: &mut Context) -> u32 {
+        let guest_text_input = 40;
+        add_active_text_input(ctx, guest_text_input, 11, 60);
+        ctx.shadow_table
+            .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
+        // Text-input activation requests name the host seat.
+        ctx.shadow_table.map_id(11, 70);
+        ctx.shadow_table.track_interface(11, "wl_seat".to_string());
+        let state = ctx.text_inputs.get_mut(&guest_text_input).unwrap();
+        state.active_surface = Some(12);
+        state.current_preedit = "한".to_string();
+        guest_text_input
+    }
+
+    fn complete_callback(ctx: &mut Context, callback_host_id: u32) {
+        use crate::protocols::wayland::wl_callback::WlCallbackHandler;
+        ctx.last_sender_id = callback_host_id;
+        assert_eq!(
+            crate::handler::callback::CallbackHandler.on_done(ctx, 0),
+            Action::Drop
+        );
+    }
+
+    #[test]
+    fn placement_shortcuts_leave_the_focused_ime_generation_untouched() {
+        // The old generation-safe stack (#8) reset, deactivated, and replayed
+        // the host text-input generation around each shortcut because its
+        // transient ARC identity and self-parent paths changed Aura metadata
+        // per placement. The bounds-only design installs the ARC identity at
+        // most once per surface, so repeated placements must not touch the
+        // focused IME generation, including an in-progress composition.
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let guest_text_input = add_composing_text_input_on_placed_surface(&mut ctx);
+        let before = ctx.text_inputs[&guest_text_input].clone();
+
+        for (serial, time) in [(2, 100), (4, 200)] {
+            ctx.last_sender_id = 5;
+            assert_eq!(
+                handler.on_key(&mut ctx, serial, time, key, WL_KEY_PRESSED),
+                Action::Drop
+            );
+            assert_eq!(
+                handler.on_key(&mut ctx, serial + 1, time + 1, key, WL_KEY_RELEASED),
+                Action::Drop
+            );
+            let aura_toplevel = ctx
+                .window_placement
+                .aura_toplevel_for_xdg_toplevel(13)
+                .expect("placement must create the Aura toplevel");
+            let barrier = ctx
+                .window_placement
+                .active_barrier_for_toplevel(aura_toplevel)
+                .expect("placement must order its bounds behind a barrier");
+            complete_callback(&mut ctx, barrier);
+            assert!(!ctx.window_placement.has_active_barrier(aura_toplevel));
+        }
+        assert_eq!(queued_window_bounds(&ctx), 2);
+
+        let aura_surface = ctx
+            .window_placement
+            .aura_surface_for_wl_surface(22)
+            .expect("placement must create the Aura surface");
+        assert_eq!(
+            ctx.client_to_host_queue
+                .iter()
+                .filter(|message| message_sender(message) == aura_surface
+                    && message_opcode(message)
+                        == crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID)
+                .count(),
+            1,
+            "the ARC identity is installed once, not changed per placement"
+        );
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| ![140, 60].contains(&message_sender(message))),
+            "placement must not reset, deactivate, or replay host text input"
+        );
+        assert!(
+            ctx.host_to_client_queue
+                .iter()
+                .all(|message| message_sender(message) != guest_text_input),
+            "placement must not synthesize guest text-input focus or editor events"
+        );
+        assert_eq!(ctx.text_inputs[&guest_text_input], before);
+        assert_eq!(ctx.keyboard_focus.surface_for_seat(11), Some(12));
+    }
+
+    #[test]
+    fn focus_leave_during_consumed_shortcut_does_not_swallow_the_next_press() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        // Focus leaves before the chord's release, which the old surface
+        // will never receive. The consumed generation must not survive and
+        // swallow the first press after focus returns.
+        assert_eq!(handler.on_leave(&mut ctx, 3, 22), Action::Forward);
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(handler.on_enter(&mut ctx, 4, 22, &[]), Action::Forward);
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 5, 300, key, WL_KEY_PRESSED),
+            Action::Forward,
+            "a plain press after focus returns is ordinary guest input"
+        );
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::Physical)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 6, 301, key, WL_KEY_RELEASED),
+            Action::Forward
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(queued_window_bounds(&ctx), 1);
+    }
+
+    #[test]
+    fn chord_key_held_across_refocus_is_released_to_the_guest_that_saw_it() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+
+        // The host re-enters with the chord key still held. The forwarded
+        // enter's keys array reports it pressed to the guest, so its later
+        // release belongs to the guest rather than to the consumed shortcut.
+        assert_eq!(handler.on_leave(&mut ctx, 3, 22), Action::Forward);
+        assert_eq!(
+            handler.on_enter(&mut ctx, 4, 22, &key.to_ne_bytes()),
+            Action::Forward
+        );
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::Physical)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 5, 101, key, WL_KEY_RELEASED),
+            Action::Forward
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(queued_window_bounds(&ctx), 1);
+    }
+
+    #[test]
+    fn ime_focus_churn_inside_a_placement_barrier_keeps_both_barriers_separate() {
+        use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
+
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let guest_text_input = add_composing_text_input_on_placed_surface(&mut ctx);
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        let aura_toplevel = ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(13)
+            .expect("placement must create the Aura toplevel");
+        let placement_barrier = ctx
+            .window_placement
+            .active_barrier_for_toplevel(aura_toplevel)
+            .expect("placement must order its bounds behind a barrier");
+
+        // A real host focus cycle lands while the placement barrier holds
+        // configures. It drains the host IME generation through its own
+        // text-input barrier and the guest re-enables on the new enter.
+        assert_eq!(handler.on_leave(&mut ctx, 3, 22), Action::Forward);
+        let ime_barrier = ctx.text_inputs[&guest_text_input]
+            .draining_callback()
+            .expect("focus leave must drain the host IME generation");
+        assert_ne!(ime_barrier.0, placement_barrier);
+        assert!(ctx.text_inputs[&guest_text_input]
+            .current_preedit
+            .is_empty());
+        assert_eq!(handler.on_enter(&mut ctx, 4, 22, &[]), Action::Forward);
+        ctx.last_sender_id = guest_text_input;
+        let mut v3 = crate::handler::text_input::TextInputV3Handler;
+        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
+        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
+        assert!(!ctx.text_inputs[&guest_text_input].host_is_active());
+
+        // The IME barrier reactivates text input without retiring the
+        // placement barrier, which still gates configures.
+        complete_callback(&mut ctx, ime_barrier.0);
+        assert!(ctx.text_inputs[&guest_text_input].host_is_active());
+        let activate = ctx
+            .client_to_host_queue
+            .last()
+            .expect("IME barrier completion must queue activation");
+        assert_eq!(
+            (message_sender(activate), message_opcode(activate)),
+            (140, 0)
+        );
+        assert!(ctx.window_placement.has_active_barrier(aura_toplevel));
+
+        // The placement barrier then retires without disturbing the fresh
+        // IME generation.
+        let host_queue_len = ctx.client_to_host_queue.len();
+        let state_after_activation = ctx.text_inputs[&guest_text_input].clone();
+        complete_callback(&mut ctx, placement_barrier);
+        assert!(!ctx.window_placement.has_active_barrier(aura_toplevel));
+        assert_eq!(ctx.client_to_host_queue.len(), host_queue_len);
+        assert_eq!(ctx.text_inputs[&guest_text_input], state_after_activation);
+    }
+
     #[test]
     fn placement_batch_rollback_removes_all_partial_state_requests() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
