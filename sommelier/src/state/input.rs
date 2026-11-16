@@ -3223,6 +3223,8 @@ mod tests {
             TextRepeat,
             TextRelease,
             Recover,
+            ShortcutPress,
+            ShortcutRelease,
         }
 
         let operations = [
@@ -3233,6 +3235,8 @@ mod tests {
             Operation::TextRepeat,
             Operation::TextRelease,
             Operation::Recover,
+            Operation::ShortcutPress,
+            Operation::ShortcutRelease,
         ];
         let sequence_len = 6;
         let sequence_count = operations.len().pow(sequence_len);
@@ -3264,6 +3268,8 @@ mod tests {
                     Operation::TextRepeat => GuestKeyEvent::TextInputRepeat,
                     Operation::TextRelease => GuestKeyEvent::TextInputRelease { serial },
                     Operation::Recover => GuestKeyEvent::RecoverIme,
+                    Operation::ShortcutPress => GuestKeyEvent::CompositorShortcutPress,
+                    Operation::ShortcutRelease => GuestKeyEvent::CompositorShortcutRelease,
                 };
                 let owner_before = registry.guest_owner(keyboard, key);
                 let decision = registry.transition_guest_key(keyboard, key, event);
@@ -3274,9 +3280,20 @@ mod tests {
                         Operation::PhysicalPress => {
                             Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
                         }
-                        Operation::PhysicalRepeat | Operation::PhysicalRelease => Some(matches!(
+                        // An admitted shortcut press is acked as handled; a
+                        // rejected one is the owner's duplicate press.
+                        Operation::ShortcutPress => {
+                            Some(owner_before != Some(GuestKeyOwner::ImeRecovery))
+                        }
+                        Operation::PhysicalRepeat
+                        | Operation::PhysicalRelease
+                        | Operation::ShortcutRelease => Some(matches!(
                             owner_before,
-                            Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                            Some(
+                                GuestKeyOwner::Physical
+                                    | GuestKeyOwner::TextInputKeysym
+                                    | GuestKeyOwner::CompositorShortcut
+                            )
                         )),
                         Operation::TextPress
                         | Operation::TextRepeat
@@ -3288,7 +3305,7 @@ mod tests {
                 assert_eq!(
                     decision.ends_repeat,
                     match operation {
-                        Operation::PhysicalRelease => true,
+                        Operation::PhysicalRelease | Operation::ShortcutRelease => true,
                         Operation::TextRelease => {
                             owner_before == Some(GuestKeyOwner::TextInputKeysym)
                         }
@@ -3296,7 +3313,8 @@ mod tests {
                         | Operation::PhysicalRepeat
                         | Operation::TextPress
                         | Operation::TextRepeat
-                        | Operation::Recover => false,
+                        | Operation::Recover
+                        | Operation::ShortcutPress => false,
                     },
                     "only the release that closes the current generation may end repeat"
                 );
@@ -3318,7 +3336,9 @@ mod tests {
                         );
                     }
                     (
-                        Operation::PhysicalRelease | Operation::TextRelease,
+                        Operation::PhysicalRelease
+                        | Operation::TextRelease
+                        | Operation::ShortcutRelease,
                         GuestKeyDelivery::Forward,
                     ) => {
                         assert!(
@@ -3339,6 +3359,23 @@ mod tests {
                     }
                     (_, GuestKeyDelivery::Drop) => {}
                     _ => panic!("delivery kind does not match its normalized input event"),
+                }
+                match operation {
+                    Operation::ShortcutPress => assert_eq!(
+                        registry.guest_owner(keyboard, key),
+                        if GuestKeyOwner::admits_compositor_shortcut(owner_before) {
+                            Some(GuestKeyOwner::CompositorShortcut)
+                        } else {
+                            owner_before
+                        },
+                        "a shortcut claims only an admitted generation"
+                    ),
+                    Operation::ShortcutRelease
+                        if owner_before == Some(GuestKeyOwner::CompositorShortcut) =>
+                    {
+                        assert_eq!(registry.guest_owner(keyboard, key), None);
+                    }
+                    _ => {}
                 }
 
                 assert_eq!(
@@ -3552,6 +3589,7 @@ mod tests {
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::Physical),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::TextInputKeysym),
             Operation::ClaimOwner(KEY_A, GuestKeyOwner::ImeRecovery),
+            Operation::ClaimOwner(KEY_A, GuestKeyOwner::CompositorShortcut),
             Operation::ClaimTextInput(KEY_A),
             Operation::CompleteTextInput(KEY_A),
             Operation::TakePendingPhysicalRelease(KEY_A),
