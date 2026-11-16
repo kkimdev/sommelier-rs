@@ -735,9 +735,13 @@ pub struct OutputState {
     /// `zaura_output.device_scale_factor`, in thousandths. Both Aura factors
     /// must arrive before this output can authorize placement.
     pub aura_device_scale_factor: Option<u32>,
-    /// Effective logical output transform. This starts with the
-    /// `wl_output.geometry` transform and is replaced by Aura's
-    /// `logical_transform` event when available.
+    /// Panel transform from `wl_output.geometry`, the rotation that maps the
+    /// native-orientation `wl_output.mode` onto the logical screen.
+    ///
+    /// Exo sends `display.panel_rotation()` here: the active rotation plus
+    /// the panel's mounting orientation. `zaura_output.logical_transform` is
+    /// the active rotation alone, so it would leave a portrait-native panel
+    /// in the wrong orientation; it is not used.
     pub transform: i32,
     pub insets_top: i32,
     pub insets_left: i32,

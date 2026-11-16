@@ -296,6 +296,12 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
     }
 }
 
+/// `zaura_output` is host-only, so none of its events reach the guest.
+///
+/// `logical_transform` is deliberately not handled: Exo's `wl_output.mode` is
+/// the panel's native pixel size, and only the `wl_output.geometry` (panel)
+/// transform rotates it into the logical screen (see
+/// [`crate::state::OutputState::transform`]). The default handler drops it.
 impl ZauraOutputHandler for CompositorHandler {
     fn on_insets(
         &mut self,
@@ -360,23 +366,6 @@ impl ZauraOutputHandler for CompositorHandler {
         }
         ctx.pending_output_state(wl_output_id)
             .aura_device_scale_factor = Some(scale);
-        publish_aura_output_update(ctx, wl_output_id);
-        Action::Drop
-    }
-
-    fn on_logical_transform(&mut self, ctx: &mut Context, transform: i32) -> Action {
-        let Some(wl_output_id) = live_aura_output_host_id(ctx) else {
-            return Action::Drop;
-        };
-        if !(0..=7).contains(&transform) {
-            log::warn!(
-                "Ignoring invalid zaura_output.logical_transform={} for host output {}",
-                transform,
-                wl_output_id
-            );
-            return Action::Drop;
-        }
-        ctx.pending_output_state(wl_output_id).transform = transform;
         publish_aura_output_update(ctx, wl_output_id);
         Action::Drop
     }
@@ -2585,41 +2574,65 @@ mod tests {
         );
     }
 
-    #[test]
-    fn logical_transform_updates_rotated_output_work_area() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+    /// Send one Exo display-metrics group: `wl_output.geometry` (panel
+    /// transform) and `mode` (native panel pixels), the Aura factors and
+    /// `logical_transform`, then `wl_output.done`.
+    fn send_rotated_output_metrics(
+        ctx: &mut Context,
+        mode: (i32, i32),
+        panel_transform: i32,
+        logical_transform: i32,
+    ) {
         let output_host = 20;
         let aura_output_host = 21;
-        ctx.output_host_ids.push(output_host);
-        ctx.output_states.insert(
-            output_host,
-            crate::state::OutputState {
-                mode_width: 3840,
-                mode_height: 2160,
-                scale: 2,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(2000),
-                insets_top: 24,
-                insets_left: 8,
-                insets_bottom: 48,
-                insets_right: 16,
-                ..Default::default()
-            },
-        );
-        ctx.zaura_output_to_wl_output
-            .insert(aura_output_host, output_host);
-        ctx.last_sender_id = aura_output_host;
-
-        assert_eq!(
-            ZauraOutputHandler::on_logical_transform(&mut CompositorHandler, &mut ctx, 1),
-            Action::Drop
-        );
+        let mut handler = CompositorHandler;
         ctx.last_sender_id = output_host;
-        WlOutputHandler::on_done(&mut CompositorHandler, &mut ctx);
-        assert_eq!(
-            ctx.output_states[&output_host].work_area(),
-            Some((8, 24, 1056, 1848))
+        handler.on_geometry(
+            ctx,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &"make".to_string(),
+            &"model".to_string(),
+            panel_transform,
         );
+        handler.on_mode(ctx, 1, mode.0, mode.1, 60);
+        ctx.last_sender_id = aura_output_host;
+        ZauraOutputHandler::on_scale(&mut handler, ctx, 1, 1000);
+        handler.on_device_scale_factor(ctx, 1000);
+        ZauraOutputHandler::on_logical_transform(&mut handler, ctx, logical_transform);
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut handler, ctx);
+    }
+
+    #[test]
+    fn work_area_rotates_native_mode_by_the_panel_transform() {
+        let output_host = 20;
+        let aura_output_host = 21;
+        // (native mode, panel transform, logical transform, work area).
+        for (mode, panel, logical, expected) in [
+            // A landscape panel rotated by 90 degrees: both transforms agree.
+            ((1920, 1080), 1, 1, (0, 0, 1080, 1920)),
+            // A portrait-native panel (`kRightUp`) at rotation 0: Exo sends
+            // panel transform 90 and logical transform 0, and the screen is
+            // landscape. The logical transform alone left it portrait.
+            ((1600, 2560), 1, 0, (0, 0, 2560, 1600)),
+            // The same panel rotated by 90 degrees: panel 180, logical 90.
+            ((1600, 2560), 2, 1, (0, 0, 1600, 2560)),
+        ] {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            ctx.output_host_ids.push(output_host);
+            ctx.zaura_output_to_wl_output
+                .insert(aura_output_host, output_host);
+            send_rotated_output_metrics(&mut ctx, mode, panel, logical);
+            assert_eq!(
+                ctx.output_states[&output_host].work_area(),
+                Some(expected),
+                "mode {mode:?}, panel {panel}, logical {logical}"
+            );
+        }
     }
 
     #[test]
