@@ -54,11 +54,16 @@ const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
 /// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
 /// Sommelier uses. Every Aura child takes its shell's version, so this
-/// floor is what lets the Aura metadata paths send `set_application_id`
-/// without a per-object version check.
+/// floor is what lets the XDG and GTK metadata paths and placement send
+/// `set_application_id` and `set_startup_id` without a per-object version
+/// check. The assertions keep that true if the vendored protocol changes.
 const ZAURA_SHELL_MIN_VERSION: u32 = 6;
 const _: () = assert!(
     crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID_SINCE
+        <= ZAURA_SHELL_MIN_VERSION
+);
+const _: () = assert!(
+    crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID_SINCE
         <= ZAURA_SHELL_MIN_VERSION
 );
 

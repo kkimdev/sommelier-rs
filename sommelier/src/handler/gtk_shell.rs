@@ -14,13 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::aura_objects::{aura_object_version, ensure_host_zaura_surface};
+use crate::handler::aura_objects::ensure_host_zaura_surface;
 use crate::handler::compositor::{native_wayland_app_id, wayland_string_fits_message};
 use crate::handler::window_placement::apply_arc_identity;
-use crate::protocols::aura_shell::zaura_surface::{
-    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_SET_STARTUP_ID,
-    REQ_SET_STARTUP_ID_SINCE,
-};
+use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_SET_STARTUP_ID};
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::state::{Context, GtkSurfaceState};
@@ -28,11 +25,9 @@ use crate::wire::{Action, MessageBuilder};
 
 pub struct GtkShellHandler;
 
+/// Queue the GTK activation token to an Aura surface. Every Aura surface
+/// supports `set_startup_id`: the registry binds no older `zaura_shell`.
 fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option<&str>) {
-    if aura_object_version(ctx, zaura_surface_id) < REQ_SET_STARTUP_ID_SINCE {
-        return;
-    }
-
     let mut builder = MessageBuilder::new();
     builder.write_nullable_string(startup_id);
     match builder.try_build_message(zaura_surface_id, REQ_SET_STARTUP_ID) {
@@ -143,10 +138,6 @@ impl GtkSurface1Handler for GtkShellHandler {
         else {
             return Action::Drop;
         };
-        if aura_object_version(ctx, zaura_surface_id) < REQ_SET_APPLICATION_ID_SINCE {
-            return Action::Drop;
-        }
-
         // `zaura_surface.set_application_id` is also the metadata Exo uses
         // when deciding whether a window is allowed to receive arbitrary
         // `zaura_toplevel.set_window_bounds` requests. The compositor-owned

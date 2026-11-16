@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::aura_objects::{self, aura_object_version, ensure_host_zaura_surface};
+use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::handler::display::queue_protocol_error;
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
-use crate::protocols::aura_shell::zaura_surface::{
-    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE,
-};
+use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
@@ -1521,9 +1519,6 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         if let Some(&wl_surface_guest_id) = ctx.xdg_toplevel_to_wl_surface.get(&xdg_toplevel_id) {
             if let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id)
             {
-                if aura_object_version(ctx, zaura_surface_host_id) < REQ_SET_APPLICATION_ID_SINCE {
-                    return Action::Drop;
-                }
                 if ctx.window_placement.uses_arc_bounds() {
                     if !window_placement::apply_arc_identity(
                         ctx,
@@ -2712,30 +2707,6 @@ mod tests {
         assert_eq!(action, Action::Drop);
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_SET_APP_ID);
-    }
-
-    #[test]
-    fn set_app_id_noop_when_version_below_5() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        ctx.host_zaura_shell_version = 4;
-        ctx.last_sender_id = xdg_toplevel_id;
-
-        let mut handler = CompositorHandler;
-        let action = handler.on_set_app_id(&mut ctx, &"old_host".to_string());
-        assert_eq!(action, Action::Drop);
-
-        // set_application_id is skipped when the host aura-shell version is
-        // too old, but both the namespaced xdg request and Aura binding are
-        // still queued.
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_SET_APP_ID);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_GET_AURA_SURFACE
-        );
-
-        // zaura_surface should still be tracked for cleanup
-        assert!(ctx.aura_surfaces.get(wl_surface_host).is_some());
     }
 
     #[test]
