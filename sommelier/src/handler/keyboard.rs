@@ -1072,17 +1072,21 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             Self::update_host_keyboard_key_state(ctx, host_keyboard_id, key, state, serial);
         }
 
-        let layout_action = self.window_layout_action(ctx, host_keyboard_id, key);
+        let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
         let compositor_shortcut = match state {
-            WL_KEY_PRESSED => layout_action
-                .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
-            WL_KEY_REPEATED => {
-                ctx.guest_key_owner(host_keyboard_id, key)
-                    == Some(GuestKeyOwner::CompositorShortcut)
-            }
-            WL_KEY_RELEASED => {
-                ctx.guest_key_owner(host_keyboard_id, key)
-                    == Some(GuestKeyOwner::CompositorShortcut)
+            // Placement is a side effect, so arbitrate ownership first. A
+            // generation already delivered (or recovered) through another
+            // channel keeps its normal path; a duplicate press of a consumed
+            // shortcut stays consumed without placing the window again.
+            WL_KEY_PRESSED => match guest_owner {
+                Some(GuestKeyOwner::CompositorShortcut) => true,
+                Some(_) => false,
+                None => self
+                    .window_layout_action(ctx, host_keyboard_id, key)
+                    .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
+            },
+            WL_KEY_REPEATED | WL_KEY_RELEASED => {
+                guest_owner == Some(GuestKeyOwner::CompositorShortcut)
             }
             _ => false,
         };
@@ -2025,6 +2029,158 @@ mod tests {
                 .all(|message| message_sender(message) == 50),
             "only keyboard acknowledgments may be queued when placement lacks geometry"
         );
+    }
+
+    /// Host keyboard 5 (extended keyboard 50) focused on a placeable
+    /// xdg_toplevel 13 with `<Alt>q=top-left` configured and Alt held.
+    fn placeable_shortcut_fixture() -> (KeyboardHandler, Context, u32) {
+        let host_keyboard = 5;
+        let surface = 12;
+        let xdg_toplevel = 13;
+        let output = 25;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        map_keyboard(&mut ctx, 10, host_keyboard, 50, 11);
+        ctx.shadow_table.map_id(surface, 22);
+        ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        focus_keyboard(&mut ctx, host_keyboard, 11, surface);
+        ctx.host_zaura_shell_id = Some(24);
+        ctx.host_zaura_shell_version = 38;
+        ctx.output_host_ids.push(output);
+        ctx.output_states.insert(
+            output,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
+                ..Default::default()
+            },
+        );
+        ctx.last_sender_id = host_keyboard;
+        let mut handler = KeyboardHandler::new();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        handler
+            .modifiers
+            .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
+        (handler, ctx, key)
+    }
+
+    /// Number of `set_window_bounds` requests queued for xdg_toplevel 13.
+    fn queued_window_bounds(ctx: &Context) -> usize {
+        let Some(&aura_toplevel) = ctx.xdg_toplevel_to_zaura_toplevel.get(&13) else {
+            return 0;
+        };
+        ctx.client_to_host_queue
+            .iter()
+            .filter(|message| {
+                message_sender(message) == aura_toplevel
+                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+            })
+            .count()
+    }
+
+    #[test]
+    fn shortcut_press_after_text_input_delivery_keeps_text_input_ownership() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        assert_eq!(
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 1 })
+                .delivery,
+            GuestKeyDelivery::Forward,
+            "the guest already received this generation through text-input"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "the physical channel must not duplicate the guest press"
+        );
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::TextInputKeysym)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Forward,
+            "the release must close the guest press delivered by text-input"
+        );
+        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
+        assert!(ctx.window_bounds_barriers.is_empty());
+        assert_eq!(
+            queued_window_bounds(&ctx),
+            0,
+            "a key already delivered to the guest must not also place the window"
+        );
+    }
+
+    #[test]
+    fn shortcut_press_after_ime_recovery_keeps_the_recovered_pair_only() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        assert_eq!(
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme)
+                .delivery,
+            GuestKeyDelivery::EmitBalancedPair,
+            "the guest already received a balanced recovered pair"
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::ImeRecovery)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop,
+            "the recovered pair is already balanced"
+        );
+        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
+        assert!(ctx.window_bounds_barriers.is_empty());
+        assert_eq!(queued_window_bounds(&ctx), 0);
+    }
+
+    #[test]
+    fn duplicate_shortcut_press_does_not_queue_another_placement() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(queued_window_bounds(&ctx), 1);
+        let barriers = ctx.window_bounds_barriers.len();
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 130, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "a duplicate press of a consumed shortcut stays consumed"
+        );
+        assert_eq!(
+            queued_window_bounds(&ctx),
+            1,
+            "a duplicate press must not place the window again"
+        );
+        assert_eq!(ctx.window_bounds_barriers.len(), barriers);
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 160, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
     }
 
     #[test]
