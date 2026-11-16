@@ -91,6 +91,33 @@ fn next_global_generation(ctx: &mut Context) -> u64 {
     generation
 }
 
+/// Return the advertisement generation that a bind of global `name` through
+/// `registry_host_id` refers to: that registry's own view, else the
+/// connection-wide current generation.
+///
+/// Bound objects record it so a delayed `global_remove` of an older
+/// advertisement cannot retire a binding of its replacement.
+fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> u64 {
+    let generation = ctx
+        .registry_global_generations
+        .get(&registry_host_id)
+        .and_then(|generations| generations.get(&name))
+        .copied()
+        .or_else(|| ctx.global_generations.get(&name).copied());
+    // A missing generation is unreachable: `guest_bind_is_allowed` admits
+    // only names in `host_globals`, which are added only after
+    // `note_registry_global` has recorded a generation for the name, and
+    // generations are never removed. Generation 0 is a safe fallback anyway:
+    // `next_global_generation` starts at 1, so 0 never matches a removal, and
+    // the only effect would be that `global_remove` cannot retire the
+    // binding; it stays valid until the guest destroys it.
+    debug_assert!(
+        generation.is_some(),
+        "bound global {name} has no advertisement generation"
+    );
+    generation.unwrap_or_default()
+}
+
 fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
     let registry_id = ctx.last_sender_id;
     let current_generation = ctx.global_generations.get(&name).copied();
@@ -936,16 +963,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived. Their guest-side associations are recorded
                 // after a successful get_toplevel dispatch, so a late shell
-                // can safely attach the missing Aura child here as well.
-                for xdg_toplevel_guest_id in ctx
+                // can safely attach the missing Aura child here as well,
+                // through the same identity gate as get_toplevel. A role
+                // that still cannot attach is retried lazily by placement.
+                for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx
                     .xdg_toplevel_to_wl_surface
-                    .keys()
-                    .copied()
+                    .iter()
+                    .map(|(&toplevel, &surface)| (toplevel, surface))
                     .collect::<Vec<_>>()
                 {
-                    let _ = crate::handler::compositor::ensure_zaura_toplevel(
+                    let _ = crate::handler::compositor::attach_placement_toplevel(
                         ctx,
                         xdg_toplevel_guest_id,
+                        wl_surface_guest_id,
                     );
                 }
             }
@@ -1196,24 +1226,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         ctx.shadow_table.map_id(*guest_new_id, host_new_id);
         ctx.shadow_table
             .track_interface_with_version(*guest_new_id, interface.clone(), *version);
-        if interface == "wl_output" {
-            ctx.output_host_ids.push(host_new_id);
-            ctx.output_states.entry(host_new_id).or_default();
-            let registry_host_id = ctx
-                .shadow_table
-                .get_host_id(ctx.last_sender_id)
-                .unwrap_or(ctx.last_sender_id);
-            let generation = ctx
-                .registry_global_generations
-                .get(&registry_host_id)
-                .and_then(|generations| generations.get(&name))
-                .copied()
-                .or_else(|| ctx.global_generations.get(&name).copied())
-                .unwrap_or_default();
-            ctx.output_host_global_bindings
-                .insert(host_new_id, (name, generation));
-            ctx.inactive_output_host_ids.remove(&host_new_id);
-        }
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
         // guest metadata at v4 so feedback requests are accepted locally,
@@ -1249,27 +1261,28 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
-            if interface == "wl_output" {
-                ctx.remove_output_state(host_new_id);
-            }
             ctx.shadow_table.remove_id(*guest_new_id);
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         }
-        if interface == "wl_output" && ctx.window_placement.uses_arc_bounds() {
-            // The Aura output extension carries the logical work-area insets
-            // that wl_output itself does not expose. It is host-only; the
-            // guest continues to receive the ordinary wl_output events.
-            let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
+        if interface == "wl_output" {
+            // Register the output only once its bind is queued, so the
+            // failure paths above have no output state to undo.
+            ctx.output_host_ids.push(host_new_id);
+            ctx.output_states.entry(host_new_id).or_default();
+            let generation = bound_global_generation(ctx, registry_host_id, name);
+            ctx.output_host_global_bindings
+                .insert(host_new_id, (name, generation));
+            ctx.inactive_output_host_ids.remove(&host_new_id);
+            if ctx.window_placement.uses_arc_bounds() {
+                // Host-only Aura output metadata (insets, scale, transform).
+                // A missing shell is retried when zaura_shell binds, so a
+                // failure here is not an error.
+                let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
+            }
         }
         if interface == "zwp_linux_dmabuf_v1" {
-            let generation = ctx
-                .registry_global_generations
-                .get(&registry_host_id)
-                .and_then(|generations| generations.get(&name))
-                .copied()
-                .or_else(|| ctx.global_generations.get(&name).copied())
-                .unwrap_or_default();
+            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
@@ -1796,6 +1809,30 @@ mod tests {
     }
 
     #[test]
+    fn output_bind_through_an_unmapped_registry_registers_no_output() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        let mut handler = RegistryHandler;
+        let output = "wl_output".to_string();
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
+
+        // Guest registry 2 has no host object, so the bind cannot be sent.
+        ctx.last_sender_id = 2;
+        assert_eq!(
+            handler.on_bind(&mut ctx, 10, &(output, 3, 20)),
+            Action::Drop
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+        assert!(ctx.output_host_ids.is_empty());
+        assert!(ctx.output_states.is_empty());
+        assert!(ctx.output_host_global_bindings.is_empty());
+        assert!(ctx.inactive_output_host_ids.is_empty());
+    }
+
+    #[test]
     fn late_zaura_shell_binding_attaches_existing_outputs() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.window_placement.set_arc_bounds_for_test(true);
@@ -1828,6 +1865,54 @@ mod tests {
                 .values()
                 .any(|&output_id| output_id == output_host),
             "late shell binding must attach every already-bound output"
+        );
+    }
+
+    /// Bind zaura_shell after one XDG toplevel (guest 13 on wl_surface 12)
+    /// already exists, and return whether the retry attached its Aura
+    /// toplevel.
+    fn late_zaura_shell_attaches_existing_toplevel(arc_identity_available: bool) -> bool {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        if !arc_identity_available {
+            ctx.window_placement.set_arc_id_allocator_for_test(None);
+        }
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table
+            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.map_id(12, 22);
+        ctx.shadow_table.map_id(13, 23);
+        ctx.xdg_toplevel_to_wl_surface.insert(13, 12);
+
+        let shell = "zaura_shell".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 11, &shell, 38),
+            Action::Drop
+        );
+        let attached = ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(13)
+            .is_some();
+        if attached {
+            assert!(
+                ctx.window_placement.arc_application_id(12).is_some(),
+                "an attached toplevel's surface carries an ARC identity"
+            );
+        }
+        attached
+    }
+
+    #[test]
+    fn late_zaura_shell_binding_attaches_toplevels_only_with_an_arc_identity() {
+        assert!(
+            late_zaura_shell_attaches_existing_toplevel(true),
+            "late shell binding must attach every recorded toplevel"
+        );
+        assert!(
+            !late_zaura_shell_attaches_existing_toplevel(false),
+            "a toplevel without an ARC identity can never be placed, so it \
+             must not get an Aura toplevel"
         );
     }
 

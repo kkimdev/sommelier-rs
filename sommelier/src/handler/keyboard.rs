@@ -68,6 +68,62 @@ const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
 const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
 const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
 
+/// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyClass {
+    /// Listed in `SOMMELIER_ACCELERATORS`: the host runs the accelerator.
+    HostAccelerator,
+    /// Bound to a placement action while the ARC bounds policy is active:
+    /// Sommelier owns the chord.
+    Placement(WindowLayoutAction),
+    /// Ordinary guest input.
+    Guest,
+}
+
+/// Why a consumed placement chord did not move the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlacementSkip {
+    /// The keyboard focus is not on an xdg_toplevel.
+    NoFocusedToplevel,
+    /// The focused xdg_toplevel has no host object.
+    UnmappedToplevel,
+    /// No output with complete metadata can host the surface (see
+    /// `Context::output_for_surface`).
+    NoUsableOutput,
+    /// The rectangle has an empty extent, an edge that rounds onto the work
+    /// area border, or overflowing coordinates on this output.
+    RectNotRepresentable,
+    /// The host Aura toplevel cannot be attached: no ARC policy identity
+    /// could be allocated, or zaura_shell is missing or too old.
+    NoAuraToplevel,
+    /// The host Aura surface is unavailable (no zaura_shell).
+    NoAuraSurface,
+    /// The surface's ARC policy identity could not be sent to its Aura
+    /// surface.
+    ArcIdentityUnavailable,
+    /// The ordering barrier for the bounds request could not be queued.
+    BarrierUnavailable,
+}
+
+impl PlacementSkip {
+    /// Log level for a skip. A rect the output cannot represent, or an Aura
+    /// toplevel that cannot be attached (old or missing zaura_shell, or ARC
+    /// identities exhausted), persists until the configuration or the proxy
+    /// changes, so it is logged at info. Other skips depend on transient
+    /// focus or output state and stay at debug.
+    fn log_level(self) -> log::Level {
+        match self {
+            Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
+            Self::NoFocusedToplevel
+            | Self::UnmappedToplevel
+            | Self::NoUsableOutput
+            | Self::NoAuraSurface
+            | Self::ArcIdentityUnavailable
+            | Self::BarrierUnavailable => log::Level::Debug,
+        }
+    }
+}
+
 /// A private, read-only view of a keymap fd mapped into the process address space.
 ///
 /// All `unsafe` for the mmap/munmap pair is confined here:
@@ -247,23 +303,26 @@ impl KeyboardHandler {
             .install_enter_snapshot(host_keyboard_id, pressed_keys);
     }
 
-    /// Check if the pressed key matches any configured host accelerators.
-    fn is_host_accelerator(
+    /// Resolve the chord a key forms under its keyboard's current XKB state.
+    ///
+    /// This is the only place a chord is computed, so host accelerators and
+    /// placement bindings always match against the same value.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the keyboard has no keymap yet, when the evdev keycode
+    /// overflows the XKB offset, or when the key has no single keysym at the
+    /// current level. Such a key is never an accelerator or a binding.
+    fn current_chord(
         &self,
         host_keyboard_id: HostId,
-        accelerators: &[crate::accelerator::Accelerator],
         key: u32,
-    ) -> bool {
-        let Some(state) = self.states.get(&host_keyboard_id) else {
-            return false;
-        };
-        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
-
+    ) -> Option<crate::accelerator::Accelerator> {
+        let state = self.states.get(&host_keyboard_id)?;
         let Some(xkb_raw_keycode) = key.checked_add(8) else {
             log::warn!("Ignoring overflowing evdev keycode {}", key);
-            return false;
+            return None;
         };
-        let xkb_keycode = xkb::Keycode::new(xkb_raw_keycode);
         // Use key_get_one_sym so that the full XKB state (including active shift
         // level) is considered. key_get_syms_by_level at level 0 would always
         // return the unshifted symbol, causing <Shift>-modified accelerators to
@@ -271,28 +330,57 @@ impl KeyboardHandler {
         //
         // key_get_one_sym returns KEY_NoSymbol when more than one keysym is
         // mapped to this key at the current shift level (e.g. dead keys or
-        // Unicode combining sequences). In that case we conservatively return
-        // false (do not treat the key as a host accelerator), which is the
-        // correct safe default: we'd rather forward an unknown key to the guest
-        // than accidentally suppress it.
-        let sym = state.key_get_one_sym(xkb_keycode);
+        // Unicode combining sequences). Such a key forms no chord: we'd rather
+        // forward an unknown key to the guest than accidentally suppress it.
+        let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
         if sym.raw() == xkb::keysyms::KEY_NoSymbol {
-            return false;
+            return None;
         }
-        let lower_sym = crate::accelerator::keysym_to_lower(sym.raw());
-        for acc in accelerators {
-            if modifiers == acc.modifiers && lower_sym == acc.symbol {
-                log::trace!(
-                    "Accelerator match: keyboard={}, key={}, modifiers={:#x}, sym={:#x}",
-                    host_keyboard_id.0,
-                    key,
-                    modifiers,
-                    lower_sym
-                );
-                return true;
-            }
-        }
-        false
+        // No wl_keyboard.modifiers event yet means no modifier is held; see
+        // `on_modifiers`.
+        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
+        Some(crate::accelerator::Accelerator {
+            modifiers,
+            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
+        })
+    }
+
+    /// Decide who owns a key from its chord alone.
+    ///
+    /// Both key channels (`wl_keyboard.key` and `peek_key`) ask this one
+    /// classification. A placement binding counts only while the ARC bounds
+    /// policy is active. Configuration validation rejects a chord that is
+    /// both a host accelerator and a binding; if one slipped through, the
+    /// host keeps its accelerator.
+    ///
+    /// Side effect: while the policy is active, this first adopts a reloaded
+    /// shortcut generation, if one is pending.
+    fn classify_key(&self, ctx: &mut Context, host_keyboard_id: HostId, key: u32) -> KeyClass {
+        let Some(chord) = self.current_chord(host_keyboard_id, key) else {
+            return KeyClass::Guest;
+        };
+        let class = if ctx.accelerators.contains(&chord) {
+            KeyClass::HostAccelerator
+        } else if ctx.window_placement.uses_arc_bounds() {
+            // Adopt a reloaded shortcut generation before matching.
+            ctx.refresh_window_placement_shortcuts();
+            ctx.window_placement_shortcuts
+                .iter()
+                .find(|binding| binding.accelerator == chord)
+                .map_or(KeyClass::Guest, |binding| {
+                    KeyClass::Placement(binding.action)
+                })
+        } else {
+            KeyClass::Guest
+        };
+        log::trace!(
+            "key class: keyboard={} key={} chord={:?} class={:?}",
+            host_keyboard_id.0,
+            key,
+            chord,
+            class
+        );
+        class
     }
 
     /// Resolve the focused guest xdg_toplevel and its backing wl_surface.
@@ -311,36 +399,6 @@ impl KeyboardHandler {
             .find_map(|(&xdg_toplevel_id, &surface_id)| {
                 (surface_id == active_surface).then_some((xdg_toplevel_id, surface_id))
             })
-    }
-
-    fn window_layout_action(
-        &self,
-        ctx: &Context,
-        host_keyboard_id: HostId,
-        key: u32,
-    ) -> Option<WindowLayoutAction> {
-        let state = self.states.get(&host_keyboard_id)?;
-        let modifiers = self.modifiers.get(&host_keyboard_id).copied().unwrap_or(0);
-        let xkb_raw_keycode = key.checked_add(8)?;
-        let sym = state.key_get_one_sym(xkb::Keycode::new(xkb_raw_keycode));
-        log::trace!(
-            "window layout candidate: keyboard={} key={} sym={:#x} modifiers={:#x}",
-            host_keyboard_id.0,
-            key,
-            sym.raw(),
-            modifiers
-        );
-        let accelerator = crate::accelerator::Accelerator {
-            modifiers,
-            symbol: crate::accelerator::keysym_to_lower(sym.raw()),
-        };
-        let action = ctx
-            .window_placement_shortcuts
-            .iter()
-            .find(|binding| binding.accelerator == accelerator)
-            .map(|binding| binding.action);
-        log::trace!("window layout candidate resolved to {:?}", action);
-        action
     }
 
     fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
@@ -381,77 +439,44 @@ impl KeyboardHandler {
         action.rect().to_work_area_bounds(output.work_area()?)
     }
 
+    /// Place the focused toplevel for one consumed placement chord.
+    ///
+    /// # Returns
+    ///
+    /// `Err` names why the window was not moved. The chord stays consumed
+    /// either way (see `on_key`); a skip queues no placement request.
     fn apply_window_layout(
         ctx: &mut Context,
         host_keyboard_id: HostId,
         action: WindowLayoutAction,
-    ) -> bool {
-        if !ctx.window_placement.uses_arc_bounds() {
-            log::trace!(
-                "window layout {:?} ignored: ARC bounds policy is disabled",
-                action
-            );
-            return false;
-        }
-        let Some((guest_xdg_toplevel_id, guest_wl_surface_id)) =
+    ) -> Result<(), PlacementSkip> {
+        debug_assert!(
+            ctx.window_placement.uses_arc_bounds(),
+            "classify_key yields placement actions only while the ARC bounds policy is active"
+        );
+        let (guest_xdg_toplevel_id, guest_wl_surface_id) =
             Self::active_xdg_toplevel(ctx, host_keyboard_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no active xdg_toplevel for keyboard {}",
-                action,
-                host_keyboard_id.0
-            );
-            return false;
-        };
-        let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(guest_xdg_toplevel_id) else {
-            log::debug!(
-                "window layout {:?} ignored: guest xdg_toplevel {} has no host mapping",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some((output_host_id, output)) = ctx
+                .ok_or(PlacementSkip::NoFocusedToplevel)?;
+        let host_xdg_toplevel_id = ctx
+            .shadow_table
+            .get_host_id(guest_xdg_toplevel_id)
+            .ok_or(PlacementSkip::UnmappedToplevel)?;
+        let (output_host_id, output) = ctx
             .shadow_table
             .get_host_id(guest_wl_surface_id)
             .and_then(|host_surface_id| ctx.output_for_surface(host_surface_id))
-            .or_else(|| ctx.primary_output())
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no usable output for xdg_toplevel {}",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some((x, y, width, height)) = Self::bounds_for_action(action, output) else {
-            log::debug!(
-                "window layout {:?} ignored: invalid output geometry {:?}",
-                action,
-                output
-            );
-            return false;
-        };
-        let Some(zaura_toplevel_id) =
-            crate::handler::compositor::ensure_zaura_toplevel(ctx, guest_xdg_toplevel_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no zaura_toplevel for xdg_toplevel {}",
-                action,
-                guest_xdg_toplevel_id
-            );
-            return false;
-        };
-        let Some(zaura_surface_id) =
+            .ok_or(PlacementSkip::NoUsableOutput)?;
+        let (x, y, width, height) =
+            Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
+        let zaura_toplevel_id = crate::handler::compositor::attach_placement_toplevel(
+            ctx,
+            guest_xdg_toplevel_id,
+            guest_wl_surface_id,
+        )
+        .ok_or(PlacementSkip::NoAuraToplevel)?;
+        let zaura_surface_id =
             crate::handler::compositor::ensure_host_zaura_surface(ctx, guest_wl_surface_id)
-        else {
-            log::debug!(
-                "window layout {:?} ignored: no zaura_surface for wl_surface {}",
-                action,
-                guest_wl_surface_id
-            );
-            return false;
-        };
+                .ok_or(PlacementSkip::NoAuraSurface)?;
         // Setup requests may already be staged above us, but the ARC policy
         // identity belongs to this placement batch and must roll back with
         // the state-reset and bounds requests if the barrier cannot be queued.
@@ -464,17 +489,12 @@ impl KeyboardHandler {
             guest_wl_surface_id,
             zaura_surface_id,
         ) {
-            log::debug!(
-                "window layout {:?} ignored: unable to apply ARC policy identity to wl_surface {}",
-                action,
-                guest_wl_surface_id
-            );
             Self::rollback_window_layout_batch(ctx, placement_queue_start);
-            return false;
+            return Err(PlacementSkip::ArcIdentityUnavailable);
         }
 
         // Keep every request emitted by this shortcut in one rollback
-        // boundary.  `ensure_zaura_toplevel`/`ensure_host_zaura_surface`
+        // boundary.  `attach_placement_toplevel`/`ensure_host_zaura_surface`
         // may already have staged setup requests above us, so the offset
         // must be captured immediately before the placement-owned batch.
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
@@ -487,11 +507,6 @@ impl KeyboardHandler {
         let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
         ctx.client_to_host_queue.push((message, Vec::new()));
         if !crate::handler::compositor::queue_window_bounds_barrier(ctx, zaura_toplevel_id) {
-            log::warn!(
-                "window layout {:?}: failed to queue host sync barrier for zaura_toplevel {}",
-                action,
-                zaura_toplevel_id
-            );
             // Do not publish a partial placement batch without its ordering
             // barrier.  Removing only the final bounds request would leave
             // the state-reset requests in the host stream and make the next
@@ -505,7 +520,7 @@ impl KeyboardHandler {
                 ctx.window_placement
                     .unmark_arc_application_id_applied(guest_wl_surface_id);
             }
-            return false;
+            return Err(PlacementSkip::BarrierUnavailable);
         }
         log::info!(
             "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
@@ -518,7 +533,7 @@ impl KeyboardHandler {
             height,
             output_host_id
         );
-        true
+        Ok(())
     }
 
     fn reset_host_keyboard_modifiers(&mut self, host_keyboard_id: HostId) {
@@ -1024,22 +1039,35 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         }
 
         let guest_owner = ctx.guest_key_owner(host_keyboard_id, key);
+        let key_class = match state {
+            WL_KEY_PRESSED | WL_KEY_REPEATED => self.classify_key(ctx, host_keyboard_id, key),
+            _ => KeyClass::Guest,
+        };
         let compositor_shortcut = match state {
             // Placement is a side effect, so arbitrate ownership first. A
             // generation already delivered (or recovered) through another
             // channel keeps its normal path; a duplicate press of a consumed
             // shortcut stays consumed without placing the window again.
-            WL_KEY_PRESSED => match guest_owner {
-                Some(GuestKeyOwner::CompositorShortcut) => true,
-                Some(_) => false,
-                None => {
-                    // Adopt a reloaded shortcut generation before matching.
-                    ctx.refresh_window_placement_shortcuts();
-                    self.window_layout_action(ctx, host_keyboard_id, key)
-                        .is_some_and(|action| {
-                            Self::apply_window_layout(ctx, host_keyboard_id, action)
-                        })
+            WL_KEY_PRESSED => match (guest_owner, key_class) {
+                (Some(GuestKeyOwner::CompositorShortcut), _) => true,
+                (None, KeyClass::Placement(action)) => {
+                    // The policy owns every matched chord, so the chord is
+                    // consumed whether or not the window can move now; a
+                    // skip must not leak the key to the guest. Release and
+                    // repeat follow the CompositorShortcut owner claimed
+                    // below.
+                    if let Err(reason) = Self::apply_window_layout(ctx, host_keyboard_id, action) {
+                        log::log!(
+                            reason.log_level(),
+                            "window layout {:?} skipped for keyboard {}: {:?}",
+                            action,
+                            host_keyboard_id.0,
+                            reason
+                        );
+                    }
+                    true
                 }
+                _ => false,
             },
             WL_KEY_REPEATED | WL_KEY_RELEASED => {
                 guest_owner == Some(GuestKeyOwner::CompositorShortcut)
@@ -1056,8 +1084,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
                     }
                 }
-                let host_accelerator = !compositor_shortcut
-                    && self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                let host_accelerator =
+                    !compositor_shortcut && key_class == KeyClass::HostAccelerator;
                 if host_accelerator {
                     // A host accelerator can also be visible through peek_key.
                     // It must never become a later IME recovery candidate.
@@ -1296,15 +1324,31 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                         .host_accelerator_suppressed(host_keyboard_id, key);
                     // peek_key may trail the wl_keyboard press it describes.
                     // A generation already consumed by a compositor shortcut
-                    // must not become an IME recovery candidate.
+                    // must not become an IME recovery candidate, even if a
+                    // reload has since removed its binding.
                     // Only a still-held generation is the one this peek
                     // describes; a released one is retired by the new press.
                     let consumed_by_shortcut = pressed_before
                         && ctx.guest_key_owner(host_keyboard_id, key)
                             == Some(GuestKeyOwner::CompositorShortcut);
+                    // Only guest input may be recovered or delivered through
+                    // the IME channel. Host accelerators and placement chords
+                    // belong to the host and to Sommelier: if text-input
+                    // claimed one first, the wl_keyboard press that follows
+                    // would find the guest already owning it.
+                    let key_class = self.classify_key(ctx, host_keyboard_id, key);
+                    if let KeyClass::Placement(action) = key_class {
+                        log::debug!(
+                            "peek_key: placement chord {:?} on keyboard {}; it is placed only \
+                             by the matching wl_keyboard.key, so if the host IME consumes it \
+                             the chord is neither placed nor delivered",
+                            action,
+                            host_keyboard_id.0
+                        );
+                    }
                     let eligible = !already_dropped_as_accelerator
                         && !consumed_by_shortcut
-                        && !self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
+                        && key_class == KeyClass::Guest;
                     let sequence = ctx.key_generations.observe_peek_press(
                         host_keyboard_id,
                         key,
@@ -1574,6 +1618,7 @@ mod tests {
     fn window_layout_actions_cover_nine_alt_keys() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts = crate::accelerator::parse_window_placement_shortcuts(
             "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,<Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
@@ -1598,8 +1643,8 @@ mod tests {
         for (sym, action) in expected {
             let key = find_keycode(&keymap, sym).expect("layout keysym not found");
             assert_eq!(
-                handler.window_layout_action(&ctx, HostId(5), key),
-                Some(action)
+                handler.classify_key(&mut ctx, HostId(5), key),
+                KeyClass::Placement(action)
             );
         }
     }
@@ -1608,6 +1653,7 @@ mod tests {
     fn window_layout_requires_exact_alt_modifier() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
@@ -1615,18 +1661,25 @@ mod tests {
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
         handler.modifiers.insert(HostId(5), 0);
-        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
         handler.modifiers.insert(
             HostId(5),
             crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
         );
-        assert_eq!(handler.window_layout_action(&ctx, HostId(5), key), None);
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
     }
 
     #[test]
     fn window_layout_honors_non_alt_configured_modifier() {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
         ctx.last_sender_id = 5;
         ctx.window_placement_shortcuts =
             crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
@@ -1637,19 +1690,62 @@ mod tests {
             .modifiers
             .insert(HostId(5), crate::accelerator::CONTROL_MASK);
         assert_eq!(
-            handler.window_layout_action(&ctx, HostId(5), key),
-            Some(WindowLayoutAction::TopLeft)
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
     }
 
     #[test]
-    fn window_layout_is_disabled_without_arc_bounds_policy() {
+    fn placement_binding_is_guest_input_without_arc_bounds_policy() {
+        let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        assert!(!KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(5),
-            WindowLayoutAction::Fullscreen,
-        ));
+        ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        handler
+            .modifiers
+            .insert(HostId(5), crate::accelerator::ALT_MASK);
+
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), key),
+            KeyClass::Guest
+        );
+    }
+
+    #[test]
+    fn host_accelerator_and_placement_classify_from_one_chord() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(
+            false,
+            false,
+            crate::accelerator::parse_accelerators("<Control>a").unwrap(),
+        );
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        ctx.last_sender_id = 5;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Control>q=top-left").unwrap();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        let z = find_keycode(&keymap, xkb::keysyms::KEY_z).expect("KEY_z not found");
+        handler
+            .modifiers
+            .insert(HostId(5), crate::accelerator::CONTROL_MASK);
+
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), a),
+            KeyClass::HostAccelerator
+        );
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), q),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
+        );
+        assert_eq!(
+            handler.classify_key(&mut ctx, HostId(5), z),
+            KeyClass::Guest
+        );
     }
 
     #[test]
@@ -1798,11 +1894,14 @@ mod tests {
             },
         );
 
-        assert!(KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(host_keyboard),
-            WindowLayoutAction::Fullscreen,
-        ));
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(
+                &mut ctx,
+                HostId(host_keyboard),
+                WindowLayoutAction::Fullscreen,
+            ),
+            Ok(())
+        );
         let opcodes: Vec<u16> = ctx
             .client_to_host_queue
             .iter()
@@ -1892,11 +1991,14 @@ mod tests {
         );
         ctx.surface_entered_output(host_surface, secondary_output);
 
-        assert!(KeyboardHandler::apply_window_layout(
-            &mut ctx,
-            HostId(host_keyboard),
-            WindowLayoutAction::Fullscreen,
-        ));
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(
+                &mut ctx,
+                HostId(host_keyboard),
+                WindowLayoutAction::Fullscreen,
+            ),
+            Ok(())
+        );
         let aura_toplevel = ctx
             .window_placement
             .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
@@ -1928,8 +2030,11 @@ mod tests {
         );
     }
 
+    /// A matched chord belongs to Sommelier while the policy is active, so
+    /// it is consumed even when placement has to be skipped. The skip leaves
+    /// no Aura objects or barriers behind.
     #[test]
-    fn placement_key_is_forwarded_while_aura_scale_metadata_is_incomplete() {
+    fn placement_chord_is_consumed_while_aura_scale_metadata_is_incomplete() {
         let keyboard = 10;
         let host_keyboard = 5;
         let seat = 11;
@@ -1968,21 +2073,22 @@ mod tests {
             .modifiers
             .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
         assert_eq!(
-            handler.window_layout_action(&ctx, HostId(host_keyboard), key),
-            Some(WindowLayoutAction::TopLeft)
+            handler.classify_key(&mut ctx, HostId(host_keyboard), key),
+            KeyClass::Placement(WindowLayoutAction::TopLeft)
         );
 
         assert_eq!(
             handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
-            Action::Forward
+            Action::Drop,
+            "a skipped placement must not leak the chord to the guest"
         );
         assert_eq!(
             ctx.guest_key_owner(HostId(host_keyboard), key),
-            Some(GuestKeyOwner::Physical)
+            Some(GuestKeyOwner::CompositorShortcut)
         );
         assert_eq!(
             handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
-            Action::Forward
+            Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
@@ -1994,6 +2100,40 @@ mod tests {
                 .all(|message| message_sender(message) == 50),
             "only keyboard acknowledgments may be queued when placement lacks geometry"
         );
+    }
+
+    #[test]
+    fn placement_is_skipped_rather_than_moved_to_another_output() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let entered_output = 26;
+        ctx.output_host_ids.push(entered_output);
+        ctx.output_states.insert(
+            entered_output,
+            crate::state::OutputState {
+                origin_x: 3840,
+                mode_width: 1920,
+                mode_height: 1080,
+                scale: 1,
+                aura_current_scale: Some(1000),
+                // The device scale event for this output has not arrived.
+                ..Default::default()
+            },
+        );
+        ctx.surface_entered_output(22, entered_output);
+        assert!(
+            ctx.primary_output().is_some(),
+            "another output is usable, but the surface is not on it"
+        );
+
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoUsableOutput)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
     /// Host keyboard 5 (extended keyboard 50) focused on a placeable
@@ -2069,6 +2209,87 @@ mod tests {
         [field(8), field(12), field(16), field(20)]
     }
 
+    /// Press, repeat, and release of a consumed chord whose placement was
+    /// skipped: every event stays with Sommelier and none reaches the guest.
+    fn assert_skipped_chord_is_consumed(
+        handler: &mut KeyboardHandler,
+        ctx: &mut Context,
+        key: u32,
+    ) {
+        let keyboard = HostId(5);
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "a matched chord is consumed even when placement is skipped"
+        );
+        assert_eq!(queued_window_bounds(ctx), 0, "placement was skipped");
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+        assert_eq!(
+            handler.on_key(ctx, 2, 130, key, WL_KEY_REPEATED),
+            Action::Drop
+        );
+        assert_eq!(
+            handler.on_key(ctx, 3, 160, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(ctx.window_placement.barrier_count(), 0);
+    }
+
+    #[test]
+    fn placement_chord_is_consumed_without_a_focused_toplevel() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        // The focused surface is not (or no longer) an xdg_toplevel.
+        ctx.xdg_toplevel_to_wl_surface.clear();
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoFocusedToplevel)
+        );
+        assert_eq!(
+            PlacementSkip::NoFocusedToplevel.log_level(),
+            log::Level::Debug,
+            "a transient skip stays at debug"
+        );
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
+    }
+
+    #[test]
+    fn placement_chord_is_consumed_when_its_rect_is_not_representable() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        // 0.0001 of the 3840-pixel work area floors onto the left border.
+        let sliver = WindowLayoutAction::Rect(
+            crate::window_layout::NormalizedRect::new(0.0001, 0.0, 0.9999, 1.0).unwrap(),
+        );
+        ctx.window_placement_shortcuts[0].action = sliver;
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), sliver),
+            Err(PlacementSkip::RectNotRepresentable)
+        );
+        assert_eq!(
+            PlacementSkip::RectNotRepresentable.log_level(),
+            log::Level::Info,
+            "a persistent misconfiguration is visible at info"
+        );
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+    }
+
+    #[test]
+    fn placement_without_an_arc_identity_creates_no_aura_toplevel() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        ctx.window_placement.set_arc_id_allocator_for_test(None);
+        assert_eq!(
+            KeyboardHandler::apply_window_layout(&mut ctx, HostId(5), WindowLayoutAction::TopLeft),
+            Err(PlacementSkip::NoAuraToplevel)
+        );
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
+        assert_skipped_chord_is_consumed(&mut handler, &mut ctx, key);
+    }
+
     #[test]
     fn shortcut_config_reload_takes_effect_on_the_next_press() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
@@ -2116,8 +2337,17 @@ mod tests {
         assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
+    /// Contract: whoever delivers a key generation to the guest first owns
+    /// it, and placement never acts on a key the guest already received.
+    ///
+    /// Here text-input delivered the keysym before any `peek_key` for this
+    /// generation, so nothing could classify it as a placement chord yet.
+    /// The guest saw the press, so placing the window as well would make
+    /// one key do two things. With a preceding `peek_key`, a placement chord
+    /// never reaches the guest this way: see
+    /// `peeked_placement_chord_is_not_claimed_by_text_input_or_ime_recovery`.
     #[test]
-    fn shortcut_press_after_text_input_delivery_keeps_text_input_ownership() {
+    fn chord_delivered_by_text_input_before_peek_belongs_to_the_guest() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         let keyboard = HostId(5);
         assert_eq!(
@@ -2150,8 +2380,14 @@ mod tests {
         );
     }
 
+    /// Same contract as
+    /// `chord_delivered_by_text_input_before_peek_belongs_to_the_guest`, for
+    /// a generation that IME recovery already replayed to the guest as a
+    /// balanced pair. Only an eligible peek generation can be recovered, and
+    /// a peeked placement chord is never eligible, so this state means the
+    /// key was not classified as a placement chord when it was recovered.
     #[test]
-    fn shortcut_press_after_ime_recovery_keeps_the_recovered_pair_only() {
+    fn chord_recovered_by_ime_belongs_to_the_guest() {
         let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
         let keyboard = HostId(5);
         assert_eq!(
@@ -2177,6 +2413,102 @@ mod tests {
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
         assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert_eq!(queued_window_bounds(&ctx), 0);
+    }
+
+    #[test]
+    fn peeked_placement_chord_is_not_claimed_by_text_input_or_ime_recovery() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+
+        // peek_key reports the physical press before the IME channel and the
+        // wl_keyboard event for the same generation.
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert!(
+            ctx.key_generations
+                .peek(keyboard, key)
+                .is_some_and(|press| !press.eligible),
+            "a placement chord must never become an IME recovery candidate"
+        );
+        assert_eq!(
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 2 })
+                .delivery,
+            GuestKeyDelivery::Drop,
+            "text-input must not deliver a placement chord to the guest"
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "the chord stays Sommelier's"
+        );
+        assert_eq!(queued_window_bounds(&ctx), 1, "the window is placed");
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+    }
+
+    /// The host IME consumed the chord, so no `wl_keyboard.key` arrives.
+    /// The chord is neither placed (placement runs only on
+    /// `wl_keyboard.key`) nor delivered to the guest through text-input.
+    #[test]
+    fn placement_chord_consumed_by_the_host_ime_is_neither_placed_nor_delivered() {
+        use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
+
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        add_composing_text_input_on_placed_surface(&mut ctx);
+        let keyboard = HostId(5);
+        let guest_messages = ctx.host_to_client_queue.len();
+
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        // Exo swaps the unstable protocol's field names: `serial` carries the
+        // timestamp and `time` the Wayland serial.
+        ctx.last_sender_id = 140;
+        let mut text_input = crate::handler::text_input::TextInputV1Handler;
+        assert_eq!(
+            text_input.on_keysym(&mut ctx, 100, 2, xkb::keysyms::KEY_q, WL_KEY_PRESSED, 0),
+            Action::Drop
+        );
+        assert_eq!(
+            text_input.on_keysym(&mut ctx, 101, 3, xkb::keysyms::KEY_q, WL_KEY_RELEASED, 0),
+            Action::Drop
+        );
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+
+        assert_eq!(
+            ctx.host_to_client_queue.len(),
+            guest_messages,
+            "nothing reaches the guest"
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        assert_eq!(queued_window_bounds(&ctx), 0);
+        assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
     }
 
     #[test]
@@ -2529,11 +2861,10 @@ mod tests {
             (WindowLayoutAction::Right, 1920),
         ] {
             ctx.client_to_host_queue.clear();
-            assert!(KeyboardHandler::apply_window_layout(
-                &mut ctx,
-                HostId(host_keyboard),
-                action,
-            ));
+            assert_eq!(
+                KeyboardHandler::apply_window_layout(&mut ctx, HostId(host_keyboard), action),
+                Ok(())
+            );
             let opcodes: Vec<u16> = ctx
                 .client_to_host_queue
                 .iter()
@@ -3124,25 +3455,25 @@ mod tests {
     }
 
     #[test]
-    fn is_host_accelerator_returns_false_without_xkb_state() {
-        let handler = KeyboardHandler::new(); // no keymap loaded
-        let accelerators = crate::accelerator::parse_accelerators("<Control>a").unwrap();
-        // Must degrade gracefully, not panic.
-        assert!(
-            !handler.is_host_accelerator(HostId(0), &accelerators, 30),
-            "should return false when XKB state is not initialised"
+    fn no_chord_without_xkb_state() {
+        // No keymap is loaded; the lookup must degrade gracefully, not panic.
+        let handler = KeyboardHandler::new();
+        assert_eq!(
+            handler.current_chord(HostId(0), 30),
+            None,
+            "a key forms no chord before the XKB state is initialised"
         );
     }
 
     #[test]
-    fn overflowing_evdev_keycode_is_not_an_accelerator() {
-        let handler = KeyboardHandler::new();
-        assert!(
-            !handler.is_host_accelerator(
-                HostId(0),
-                &crate::accelerator::parse_accelerators("a").unwrap(),
-                u32::MAX,
-            ),
+    fn overflowing_evdev_keycode_forms_no_chord() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+        assert_eq!(
+            handler.current_chord(HostId(5), u32::MAX),
+            None,
             "keycode + XKB offset must be checked before arithmetic"
         );
     }

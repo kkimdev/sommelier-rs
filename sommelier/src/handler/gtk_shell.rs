@@ -68,10 +68,6 @@ impl GtkShell1Handler for GtkShellHandler {
         };
 
         let host_zaura_surface_id = ensure_host_zaura_surface(ctx, wl_surface_id);
-        // Allocate the surface's ARC policy identity early so the XDG and
-        // GTK metadata paths agree on it; this is a no-op unless the ARC
-        // bounds policy is active.
-        let _ = ctx.window_placement.arc_application_id(wl_surface_id);
         ctx.shadow_table.track_interface_with_version(
             gtk_surface_id,
             "gtk_surface1".to_string(),
@@ -340,6 +336,18 @@ mod tests {
                 )
                 .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn gtk_surface_creation_does_not_allocate_an_arc_identity() {
+        let mut ctx = setup_ctx();
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        ctx.last_sender_id = GTK_SHELL;
+        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        assert!(
+            !ctx.window_placement.has_arc_application_ids(),
+            "identities are allocated lazily by the paths that send them"
         );
     }
 

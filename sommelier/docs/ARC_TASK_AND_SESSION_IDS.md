@@ -58,10 +58,10 @@ org.chromium.guest_os.<vm>.wayland.<app>
 [Sommelier's task-ID allocator](#sommeliers-task-id-allocator).
 
 `WindowPlacementState` (`sommelier/src/state/window_placement.rs`) owns the
-per-surface identity: it is allocated on first use (normally when an XDG
-toplevel or GTK surface is created for the surface), shared by the XDG and GTK
-metadata paths, queued to the Aura surface at most once, and retired when the
-guest destroys the surface.
+per-surface identity: it is allocated on first use (when an XDG toplevel is
+created for the surface, or when GTK metadata or a placement first sends it),
+shared by the XDG and GTK metadata paths, queued to the Aura surface at most
+once, and retired when the guest destroys the surface.
 
 These values are a compatibility workaround. A fabricated number is not a real
 Android task, and it is not a guarantee against future ChromeOS changes or ARC

@@ -944,3 +944,60 @@ Validation (monorepo dev shell, locked, serial): Sommelier 640 passed /
 codegen 7, `gui_smoke` 0 run / 1 ignored; strict Clippy on all targets,
 `cargo fmt --check` and `git diff --check` pass. Not host-validated: no
 Sommelier process was started.
+
+## 2026-11-16 — Placement correctness fixes
+
+Behavior fixes from the consolidated placement review (PR A). Each fix has a
+regression test that failed before it and passes after.
+
+- **One chord, one classification.** `KeyboardHandler::current_chord` is the
+  only place a key's chord is computed. `classify_key` turns it into
+  `HostAccelerator`, `Placement(action)` (only while the ARC policy is
+  active), or `Guest`. `wl_keyboard.key` and `peek_key` both use it. The two
+  earlier chord computations had already diverged.
+- **Placement chords never go through IME recovery.** `peek_key` marks a
+  generation eligible for IME recovery only when it is guest input. Before,
+  when `peek_key` arrived first, text-input could deliver the chord or
+  recover it. The guest then owned the key, so the app received Alt+q and the
+  window did not move. The remaining contract is now in the test names: a
+  key the guest received before it could be classified belongs to the guest.
+- **A matched chord is always consumed.** While the policy is active, a
+  chord that matches a binding is Sommelier's even when placement is skipped:
+  no focused toplevel, incomplete output metadata, or a rect the output
+  cannot represent. `apply_window_layout` returns a `PlacementSkip` reason.
+  A reason that persists until the configuration or the proxy changes
+  (unrepresentable rect, no attachable Aura toplevel) is logged at info, and
+  the rest at debug. Repeat and release follow the consumed owner. A chord
+  that the host IME consumes never produces a `wl_keyboard.key`, so it is
+  neither placed nor delivered; `peek_key` logs such a chord at debug level.
+- **No jumps to another monitor.** `Context::output_for_surface` falls back
+  to the first usable output only when the surface has entered no output. A
+  surface whose entered outputs are not usable yet is skipped. The duplicate
+  fallback in the keyboard handler is gone.
+- **One gate for placement Aura toplevels.**
+  `compositor::attach_placement_toplevel` checks the policy, allocates the
+  ARC identity, and then creates the `zaura_toplevel`. It is used by
+  `get_toplevel`, by the late `zaura_shell` retry (which used to skip the
+  identity check), and by placement. `ensure_zaura_toplevel` is private.
+- **No early GTK identity.** `get_gtk_surface` no longer allocates an ARC
+  identity that it discarded. Identities stay lazy and surface-keyed.
+- **No leaked output entries.** A `wl_output` bind registers output state
+  only after its host bind is queued. An unmapped registry therefore leaves
+  nothing behind. The output and dmabuf bind paths share one
+  `bound_global_generation` lookup.
+
+Left for later PRs:
+
+- C: the `PlacementConfig`/environment pipeline.
+- D: moving placement out of the keyboard handler.
+- E: the output registry and Aura object owners, including the rest of C5:
+  `inactive_output_host_ids` still only grows, and
+  `bound_global_generation` still falls back to generation 0 with
+  `unwrap_or_default()`. That fallback is unreachable (see its comment), but
+  the registry should make it unrepresentable.
+
+Validation (monorepo dev shell, locked, serial), rebased on the simplified
+ARC allocator: Sommelier 650 passed / 1 ignored (640 on that base),
+sample GUI 12, codegen 7, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. These fixes have not been validated on a host: no
+Sommelier process was started.

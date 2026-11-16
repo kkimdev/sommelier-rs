@@ -220,10 +220,14 @@ test uses `/dev/wl0`.
 | `--window-shortcuts-config PATH` | Optional versioned TOML file of placement bindings (named actions or work-area rects), read only with the ARC policy gate; mutually exclusive with `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`; `SIGHUP` reloads it. |
 
 When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
-`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier handles the
-configured chords for a focused XDG toplevel and places it in the selected
-work-area region. The focused surface's active output association is preferred
-on multi-monitor setups, with a deterministic usable-output fallback. For example:
+`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier consumes the
+configured chords and places the focused XDG toplevel in the selected
+work-area region of the output that surface has entered. Only a surface with
+no current output association uses the first usable output; a window is never
+moved to another monitor. A matched chord never reaches the guest, even when
+the placement is skipped (for example, with no focused toplevel or before the
+output's metadata is complete); the reason is logged at debug level. A chord
+that the host IME consumes is neither placed nor delivered. For example:
 
 ```text
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1

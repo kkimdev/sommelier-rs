@@ -489,7 +489,8 @@ pub struct PeekKeyProvenance {
     pub time: u32,
     pub sequence: u64,
     /// The generation may recover an IME-consumed repeat. Host accelerators
-    /// permanently clear this bit for the lifetime of the generation.
+    /// and placement chords permanently clear this bit for the lifetime of
+    /// the generation.
     pub eligible: bool,
 }
 

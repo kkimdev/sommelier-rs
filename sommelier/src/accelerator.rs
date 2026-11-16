@@ -178,8 +178,8 @@ pub(crate) fn parse_accelerator(token: &str) -> Result<Accelerator, ParseError> 
     Ok(Accelerator {
         modifiers,
         // Normalise to lowercase at parse time so the Accelerator is
-        // self-contained; the match site (is_host_accelerator) also lowercases
-        // the incoming sym, but having both sides normalised makes the
+        // self-contained; the match site (KeyboardHandler::current_chord) also
+        // lowercases the incoming sym, but having both sides normalised makes the
         // invariant explicit and removes an implicit coupling.
         symbol: keysym_to_lower(sym.raw()),
     })

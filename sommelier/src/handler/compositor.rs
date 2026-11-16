@@ -606,7 +606,9 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> 
 
 /// Create or reuse the internal Aura toplevel associated with a guest
 /// `xdg_toplevel`. The object is needed for screen-coordinate bounds requests.
-pub(crate) fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
+/// Private so that every caller goes through the policy and identity gate
+/// in [`attach_placement_toplevel`].
+fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Option<u32> {
     if let Some(existing_id) = ctx
         .window_placement
         .aura_toplevel_for_xdg_toplevel(xdg_toplevel_guest_id)
@@ -651,6 +653,41 @@ pub(crate) fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u3
     ctx.window_placement
         .remember_aura_toplevel(xdg_toplevel_guest_id, zaura_toplevel_host_id);
     Some(zaura_toplevel_host_id)
+}
+
+/// Attach the host Aura toplevel that placement uses for an XDG toplevel.
+///
+/// Placement needs a `zaura_toplevel` only while the ARC bounds policy is
+/// active, and Exo authorizes bounds requests only for a surface carrying an
+/// ARC policy identity. The identity is allocated first so exhaustion fails
+/// closed: no Aura child is created that placement could never use. Every
+/// path that creates a placement toplevel (`xdg_surface.get_toplevel`, the
+/// late `zaura_shell` retry, and placement itself) goes through here.
+///
+/// # Returns
+///
+/// The host `zaura_toplevel` ID, or `None` when the policy is inactive, the
+/// identity is unavailable, or the host has no usable `zaura_shell` yet.
+pub(crate) fn attach_placement_toplevel(
+    ctx: &mut Context,
+    xdg_toplevel_guest_id: u32,
+    wl_surface_guest_id: u32,
+) -> Option<u32> {
+    if !ctx.window_placement.uses_arc_bounds() {
+        return None;
+    }
+    if ctx
+        .window_placement
+        .arc_application_id(wl_surface_guest_id)
+        .is_none()
+    {
+        log::warn!(
+            "Unable to allocate ARC policy identity for wl_surface {}",
+            wl_surface_guest_id
+        );
+        return None;
+    }
+    ensure_zaura_toplevel(ctx, xdg_toplevel_guest_id)
 }
 
 /// Commit the guest-side XDG role association after the generated dispatcher
