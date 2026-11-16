@@ -222,8 +222,8 @@ test uses `/dev/wl0`.
 When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
 `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier consumes the
 configured chords and places the focused XDG toplevel in the selected
-work-area region of the output that surface has entered. Only a surface that
-has not entered any output yet uses the first usable output; a window is never
+work-area region of the output that surface has entered. Only a surface with
+no current output association uses the first usable output; a window is never
 moved to another monitor. A matched chord never reaches the guest, even when
 the placement is skipped (for example, with no focused toplevel or before the
 output's metadata is complete); the reason is logged at debug level. A chord

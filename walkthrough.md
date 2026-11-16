@@ -964,9 +964,12 @@ regression test that failed before it and passes after.
 - **A matched chord is always consumed.** While the policy is active, a
   chord that matches a binding is Sommelier's even when placement is skipped:
   no focused toplevel, incomplete output metadata, or a rect the output
-  cannot represent. `apply_window_layout` returns a `PlacementSkip` reason,
-  which is logged at debug level. Repeat and release follow the consumed
-  owner.
+  cannot represent. `apply_window_layout` returns a `PlacementSkip` reason.
+  A reason that persists until the configuration or the proxy changes
+  (unrepresentable rect, no attachable Aura toplevel) is logged at info, and
+  the rest at debug. Repeat and release follow the consumed owner. A chord
+  that the host IME consumes never produces a `wl_keyboard.key`, so it is
+  neither placed nor delivered; `peek_key` logs such a chord at debug level.
 - **No jumps to another monitor.** `Context::output_for_surface` falls back
   to the first usable output only when the surface has entered no output. A
   surface whose entered outputs are not usable yet is skipped. The duplicate
@@ -980,14 +983,21 @@ regression test that failed before it and passes after.
   identity that it discarded. Identities stay lazy and surface-keyed.
 - **No leaked output entries.** A `wl_output` bind registers output state
   only after its host bind is queued. An unmapped registry therefore leaves
-  nothing behind.
+  nothing behind. The output and dmabuf bind paths share one
+  `bound_global_generation` lookup.
 
-Left for later PRs: the `PlacementConfig`/environment pipeline (C),
-moving placement out of the keyboard handler (D), and the output registry
-and Aura object owners (E).
+Left for later PRs:
 
-Validation (monorepo dev shell, locked, serial): Sommelier 653 passed /
-1 ignored (644 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
-1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+- C: the `PlacementConfig`/environment pipeline.
+- D: moving placement out of the keyboard handler.
+- E: the output registry and Aura object owners, including the rest of C5:
+  `inactive_output_host_ids` still only grows, and
+  `bound_global_generation` still falls back to generation 0 with
+  `unwrap_or_default()`. That fallback is unreachable (see its comment), but
+  the registry should make it unrepresentable.
+
+Validation (monorepo dev shell, locked, serial), rebased on the simplified
+ARC allocator: Sommelier 650 passed / 1 ignored (640 on that base),
+sample GUI 12, codegen 7, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. These fixes have not been validated on a host: no
 Sommelier process was started.
