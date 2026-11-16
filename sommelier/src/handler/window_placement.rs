@@ -40,17 +40,17 @@ limitations under the License.
 //! | `zaura_toplevel.configure` | [`translate_aura_configure`] |
 //!
 //! The host Aura surface is not placement's: XDG and GTK metadata share it,
-//! so `crate::handler::compositor::ensure_host_zaura_surface` owns it.
+//! so `crate::handler::aura_objects::ensure_host_zaura_surface` owns it. The
+//! same module creates and releases the placement Aura toplevel.
 
-use crate::handler::compositor::{aura_object_version, ensure_host_zaura_surface};
-use crate::protocols::aura_shell::zaura_shell::{
-    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE,
+use crate::handler::aura_objects::{
+    self, aura_object_version, ensure_host_zaura_surface, AuraChild,
 };
+use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
 use crate::protocols::aura_shell::zaura_surface::{
     REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
 };
 use crate::protocols::aura_shell::zaura_toplevel::{
-    REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
     REQ_SET_SUPPORTS_SCREEN_COORDINATES, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
     REQ_SET_WINDOW_BOUNDS, REQ_SET_WINDOW_BOUNDS_SINCE,
 };
@@ -314,26 +314,13 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
     }
 
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
-    let zaura_shell_host_id = ctx.host_zaura_shell_id?;
     if ctx.host_zaura_shell_version < PLACEMENT_TOPLEVEL_SINCE {
         return None;
     }
-
-    let zaura_toplevel_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        zaura_toplevel_host_id,
-        "zaura_toplevel".to_string(),
-        ctx.host_zaura_shell_version,
-    );
-
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(zaura_toplevel_host_id);
-    builder.write_u32(xdg_toplevel_host_id);
-    let get_message =
-        builder.build_message(zaura_shell_host_id, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL);
+    let zaura_toplevel_host_id =
+        aura_objects::create(ctx, AuraChild::Toplevel, xdg_toplevel_host_id)?;
     let coordinate_message = MessageBuilder::new()
         .build_message(zaura_toplevel_host_id, REQ_SET_SUPPORTS_SCREEN_COORDINATES);
-    ctx.client_to_host_queue.push((get_message, Vec::new()));
     ctx.client_to_host_queue
         .push((coordinate_message, Vec::new()));
     ctx.window_placement
@@ -420,28 +407,11 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
     // flight. The owner keeps the callback tracked until its terminal host
     // events, but it no longer gates a replacement object that happens to use
     // the same logical toplevel entry.
-    let Some(zaura_toplevel_host_id) = ctx
+    if let Some(zaura_toplevel_host_id) = ctx
         .window_placement
         .take_aura_toplevel(xdg_toplevel_guest_id)
-    else {
-        return;
-    };
-    if aura_object_version(ctx, zaura_toplevel_host_id) >= REQ_RELEASE_AURA_TOPLEVEL_SINCE {
-        let message =
-            MessageBuilder::new().build_message(zaura_toplevel_host_id, REQ_RELEASE_AURA_TOPLEVEL);
-        ctx.client_to_host_queue.push((message, Vec::new()));
-        // Keep the host ID reserved until the compositor acknowledges the
-        // destructor with wl_display.delete_id. Removing it immediately
-        // would allow a recycled ID to receive the late acknowledgement.
-        ctx.shadow_table
-            .mark_pending_destroy_host(zaura_toplevel_host_id);
-    } else {
-        // Older aura-shell versions do not expose a destructor. Retire the
-        // dispatch metadata but keep the numeric ID reserved for the rest of
-        // the connection so stale host events cannot target a recycled
-        // object.
-        ctx.shadow_table
-            .retire_host_interface(zaura_toplevel_host_id);
+    {
+        aura_objects::release(ctx, AuraChild::Toplevel, zaura_toplevel_host_id);
     }
 }
 
@@ -728,6 +698,11 @@ mod tests {
     use crate::handler::compositor::CompositorHandler;
     use crate::handler::display::DisplayHandler;
     use crate::placement_config::PlacementConfig;
+    use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL;
+    use crate::protocols::aura_shell::zaura_toplevel::{
+        REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL,
+        REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
+    };
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::{
@@ -1004,7 +979,7 @@ mod tests {
                 "zaura_surface".to_string(),
                 surface_version,
             );
-            ctx.window_placement.remember_aura_surface(22, aura_surface);
+            ctx.aura_surfaces.remember(22, aura_surface);
 
             assert_eq!(
                 place_focused(&mut ctx, HostId(host_keyboard), WindowLayoutAction::TopLeft),

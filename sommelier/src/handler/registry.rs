@@ -958,7 +958,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     // `None` means this shell cannot create Aura outputs;
                     // placement then waits for metadata that never comes,
                     // which is the same as having no zaura_shell.
-                    let _ = crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
+                    let _ = crate::handler::aura_objects::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived.
@@ -1262,7 +1262,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // Host-only Aura output metadata (scale factors and insets).
                 // A missing shell is retried when zaura_shell binds, so a
                 // failure here is not an error.
-                let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
+                let _ = crate::handler::aura_objects::ensure_zaura_output(ctx, host_new_id);
             }
         }
         if interface == "zwp_linux_dmabuf_v1" {
@@ -2303,13 +2303,13 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.window_placement.remember_aura_surface(50, surface_id);
+        ctx.aura_surfaces.remember(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_ne!(ctx.shadow_table.allocate_host_id(), shell_id);
         assert_ne!(ctx.shadow_table.allocate_host_id(), surface_id);
         assert_eq!(
-            ctx.window_placement.aura_surface_for_wl_surface(50),
+            ctx.aura_surfaces.get(50),
             Some(surface_id),
             "legacy aura children also survive global removal"
         );
@@ -2343,13 +2343,13 @@ mod tests {
         let surface_id = ctx.shadow_table.allocate_host_id();
         ctx.shadow_table
             .track_host_interface(surface_id, "zaura_surface".to_string());
-        ctx.window_placement.remember_aura_surface(50, surface_id);
+        ctx.aura_surfaces.remember(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_eq!(ctx.host_zaura_shell_id, None);
         assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
         assert_eq!(
-            ctx.window_placement.aura_surface_for_wl_surface(50),
+            ctx.aura_surfaces.get(50),
             Some(surface_id),
             "global removal must not destroy an existing aura child"
         );

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod aura_surfaces;
 mod input;
 mod outputs;
 mod render;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
 
+pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
@@ -905,6 +907,9 @@ pub struct Context {
     pub gtk_shells: HashMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
     pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
+    /// The one host Aura surface of each host wl_surface, shared by XDG and
+    /// GTK metadata and placement.
+    pub(crate) aura_surfaces: AuraSurfaces,
     /// Tracks xdg_surface → wl_surface associations (guest IDs).
     pub xdg_surface_to_wl_surface: HashMap<u32, u32>,
     /// Tracks xdg_surface → xdg_toplevel associations (guest IDs).
@@ -1286,6 +1291,7 @@ impl Context {
             outputs: OutputRegistry::default(),
             gtk_shells: HashMap::new(),
             gtk_surfaces: HashMap::new(),
+            aura_surfaces: AuraSurfaces::default(),
             xdg_surface_to_wl_surface: HashMap::new(),
             xdg_surface_to_xdg_toplevel: HashMap::new(),
             xdg_toplevel_to_wl_surface: HashMap::new(),

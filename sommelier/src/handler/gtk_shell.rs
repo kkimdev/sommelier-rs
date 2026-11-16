@@ -14,10 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::compositor::{
-    aura_object_version, ensure_host_zaura_surface, native_wayland_app_id,
-    wayland_string_fits_message,
-};
+use crate::handler::aura_objects::{aura_object_version, ensure_host_zaura_surface};
+use crate::handler::compositor::{native_wayland_app_id, wayland_string_fits_message};
 use crate::handler::window_placement::apply_arc_identity;
 use crate::protocols::aura_shell::zaura_surface::{
     REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_SET_STARTUP_ID,
@@ -415,10 +413,6 @@ mod tests {
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
         );
         assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));
-        assert_eq!(
-            ctx.window_placement
-                .aura_surface_for_wl_surface(WL_SURFACE_HOST),
-            None
-        );
+        assert_eq!(ctx.aura_surfaces.get(WL_SURFACE_HOST), None);
     }
 }

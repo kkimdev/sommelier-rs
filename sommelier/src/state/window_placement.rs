@@ -18,11 +18,13 @@ limitations under the License.
 //!
 //! [`WindowPlacementState`] is the single owner of one connection's state
 //! for the opt-in ARC bounds policy: the per-surface ARC policy identities,
-//! the host Aura surface/toplevel associations, the host-stream sync barriers
-//! that order `zaura_toplevel.set_window_bounds`, and the configures held
-//! behind those barriers. Whether the policy is active is decided once per
-//! process by `crate::placement_config::PlacementConfig`, which hands this
-//! state the process's ARC task-ID block. The maps are private so handlers
+//! the placement Aura toplevel of each XDG toplevel, the host-stream sync
+//! barriers that order `zaura_toplevel.set_window_bounds`, and the configures
+//! held behind those barriers. The host Aura surface is not placement's: XDG
+//! and GTK metadata share it through `crate::state::AuraSurfaces`. Whether
+//! the policy is active is decided once per process by
+//! `crate::placement_config::PlacementConfig`, which hands this state the
+//! process's ARC task-ID block. The maps are private so handlers
 //! cannot update one side of an association, or retire a toplevel, without
 //! the matching cleanup.
 //!
@@ -91,9 +93,6 @@ pub(crate) struct WindowPlacementState {
     /// paired host Aura surface. Keeping this separate from the allocated
     /// identity avoids repeating the metadata request on every placement.
     arc_application_ids_applied: HashSet<u32>,
-    /// Host wl_surface ID → host zaura_surface ID. XDG, GTK, and placement
-    /// metadata share this one Aura child per surface.
-    aura_surface_by_wl_surface: HashMap<u32, u32>,
     /// Guest xdg_toplevel ID → host zaura_toplevel ID.
     aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
     /// Reverse of `aura_toplevel_by_xdg_toplevel`, used to route host Aura
@@ -126,7 +125,6 @@ impl WindowPlacementState {
             arc_id_allocator,
             arc_application_ids: HashMap::new(),
             arc_application_ids_applied: HashSet::new(),
-            aura_surface_by_wl_surface: HashMap::new(),
             aura_toplevel_by_xdg_toplevel: HashMap::new(),
             xdg_toplevel_by_aura_toplevel: HashMap::new(),
             barrier_toplevels: HashMap::new(),
@@ -216,56 +214,13 @@ impl WindowPlacementState {
         !self.arc_application_ids.is_empty()
     }
 
-    // ── Aura surfaces ─────────────────────────────────────────────────────
-
-    /// Return the Aura surface associated with a host wl_surface.
-    pub(crate) fn aura_surface_for_wl_surface(&self, wl_surface_host_id: u32) -> Option<u32> {
-        self.aura_surface_by_wl_surface
-            .get(&wl_surface_host_id)
-            .copied()
-    }
-
-    /// Record the Aura surface created for a host wl_surface.
-    pub(crate) fn remember_aura_surface(
-        &mut self,
-        wl_surface_host_id: u32,
-        zaura_surface_host_id: u32,
-    ) {
-        let previous = self
-            .aura_surface_by_wl_surface
-            .insert(wl_surface_host_id, zaura_surface_host_id);
-        debug_assert!(
-            previous.is_none_or(|previous| previous == zaura_surface_host_id),
-            "replacing a live Aura surface would orphan its destructor"
-        );
-    }
-
-    /// Remove all placement state owned by a destroyed guest wl_surface.
-    ///
-    /// The guest ID owns the ARC identity while the host ID owns the Aura
-    /// surface association; the destructor is the one boundary that knows
-    /// both.
-    ///
-    /// # Returns
-    ///
-    /// The Aura surface whose host teardown the caller must perform.
-    #[must_use = "the returned Aura surface ID identifies host teardown work"]
-    pub(crate) fn release_surface(
-        &mut self,
-        wl_surface_guest_id: u32,
-        wl_surface_host_id: u32,
-    ) -> Option<u32> {
+    /// Forget the ARC identity of a destroyed guest wl_surface. Identities
+    /// are never recycled: a reused guest ID is allocated a new one.
+    pub(crate) fn forget_surface(&mut self, wl_surface_guest_id: u32) {
         self.arc_application_ids.remove(&wl_surface_guest_id);
         self.arc_application_ids_applied
             .remove(&wl_surface_guest_id);
-        let zaura_surface_host_id = self.aura_surface_by_wl_surface.remove(&wl_surface_host_id);
         self.debug_assert_consistent();
-        zaura_surface_host_id
-    }
-
-    #[cfg(test)]
-    pub(crate) fn aura_surface_count(&self) -> usize {
-        self.aura_surface_by_wl_surface.len()
     }
 
     // ── Aura toplevels ────────────────────────────────────────────────────
@@ -487,19 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn surface_release_retires_identity_applied_flag_and_aura_surface() {
+    fn forgetting_a_surface_retires_its_identity_and_applied_flag() {
         let mut state = active();
         let first = state.arc_application_id(10).expect("ARC identity");
         assert_eq!(state.arc_application_id(10), Some(first.clone()));
         state.mark_arc_application_id_applied(10);
-        state.remember_aura_surface(50, 60);
-        assert_eq!(state.aura_surface_for_wl_surface(50), Some(60));
 
-        assert_eq!(state.release_surface(10, 50), Some(60));
-        assert_eq!(state.aura_surface_for_wl_surface(50), None);
+        state.forget_surface(10);
         assert!(!state.arc_application_id_applied(10));
         assert!(!state.has_arc_application_ids());
-        assert_eq!(state.release_surface(10, 50), None, "release is idempotent");
+        state.forget_surface(10);
 
         // Identities are never recycled: a reused guest ID gets a new one.
         let second = state.arc_application_id(10).expect("ARC identity");

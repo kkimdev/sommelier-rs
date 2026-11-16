@@ -1593,7 +1593,7 @@ mod tests {
         );
         assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
         assert_eq!(ctx.window_placement.aura_toplevel_count(), 0);
-        assert_eq!(ctx.window_placement.aura_surface_count(), 0);
+        assert_eq!(ctx.aura_surfaces.count(), 0);
         assert_eq!(ctx.window_placement.barrier_count(), 0);
         assert!(
             ctx.client_to_host_queue
@@ -2184,8 +2184,8 @@ mod tests {
         assert_eq!(queued_window_bounds(&ctx), 2);
 
         let aura_surface = ctx
-            .window_placement
-            .aura_surface_for_wl_surface(22)
+            .aura_surfaces
+            .get(22)
             .expect("placement must create the Aura surface");
         assert_eq!(
             ctx.client_to_host_queue

@@ -14,17 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::handler::aura_objects::{self, aura_object_version, ensure_host_zaura_surface};
 use crate::handler::display::queue_protocol_error;
 use crate::handler::window_placement;
-use crate::protocols::aura_shell::zaura_output::{
-    ZauraOutputHandler, REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT,
-    REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
-};
-use crate::protocols::aura_shell::zaura_shell::{
-    REQ_GET_AURA_OUTPUT, REQ_GET_AURA_OUTPUT_SINCE, REQ_GET_AURA_SURFACE,
-};
+use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::aura_shell::zaura_surface::{
-    REQ_RELEASE, REQ_RELEASE_SINCE, REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE,
+    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE,
 };
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
@@ -234,17 +229,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             return Action::Drop;
         };
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
-            // Before zaura_output.release the object has no destructor
-            // request; its ID is retired instead.
-            if aura_object_version(ctx, zaura_output_host_id) >= REQ_RELEASE_AURA_OUTPUT_SINCE {
-                let message = crate::wire::MessageBuilder::new()
-                    .build_message(zaura_output_host_id, REQ_RELEASE_AURA_OUTPUT);
-                ctx.client_to_host_queue.push((message, Vec::new()));
-                ctx.shadow_table
-                    .mark_pending_destroy_host(zaura_output_host_id);
-            } else {
-                ctx.shadow_table.retire_host_interface(zaura_output_host_id);
-            }
+            aura_objects::release(ctx, aura_objects::AuraChild::Output, zaura_output_host_id);
         }
         // `zaura_output` is an internal child of the wl_output and must be
         // released first. Returning Forward here would put the original
@@ -400,100 +385,6 @@ pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
         .checked_add(4)
         .and_then(|header_and_length| header_and_length.checked_add(padded_length))
         .is_some_and(|total| total <= 0xffff)
-}
-
-/// Return the negotiated version of a host Aura child object.
-///
-/// Aura children (`zaura_surface`, `zaura_toplevel`, `zaura_output`) take
-/// the version of the `zaura_shell` that created them, and the proxy
-/// records it when it creates each one. Every caller passes a live child,
-/// so a missing version is a bookkeeping bug and fails the debug assertion.
-/// Release builds fall back to the current shell version, the version the
-/// child would have been created with: at worst that sends or skips one
-/// version-gated request, which is better than crashing every client of
-/// the proxy.
-pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
-    let version = ctx.shadow_table.host_object_version(aura_object_host_id);
-    debug_assert!(
-        version.is_some(),
-        "Aura child {aura_object_host_id} has no recorded version"
-    );
-    version.unwrap_or(ctx.host_zaura_shell_version)
-}
-
-/// Create or reuse the host Aura object associated with a guest wl_surface.
-///
-/// XDG and GTK metadata both target the same host surface. Exo rejects a
-/// second `zaura_surface` for one `wl_surface`, so all metadata paths must
-/// share this mapping.
-pub(crate) fn ensure_host_zaura_surface(
-    ctx: &mut Context,
-    wl_surface_guest_id: u32,
-) -> Option<u32> {
-    let wl_surface_host_id = ctx.shadow_table.get_host_id(wl_surface_guest_id)?;
-    if let Some(zaura_surface_host_id) = ctx
-        .window_placement
-        .aura_surface_for_wl_surface(wl_surface_host_id)
-    {
-        return Some(zaura_surface_host_id);
-    }
-
-    let zaura_shell_host_id = ctx.host_zaura_shell_id?;
-    let zaura_surface_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        zaura_surface_host_id,
-        "zaura_surface".to_string(),
-        ctx.host_zaura_shell_version,
-    );
-
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(zaura_surface_host_id);
-    builder.write_u32(wl_surface_host_id);
-    let message = builder.build_message(zaura_shell_host_id, REQ_GET_AURA_SURFACE);
-    ctx.client_to_host_queue.push((message, Vec::new()));
-    ctx.window_placement
-        .remember_aura_surface(wl_surface_host_id, zaura_surface_host_id);
-    Some(zaura_surface_host_id)
-}
-
-/// Return the host-only `zaura_output` of a bound output, creating it if
-/// the output is still live (see [`crate::state::OutputRegistry::ensure_aura_output`]).
-///
-/// It carries the Aura scale factors and work-area insets that placement
-/// needs (see [`ZauraOutputHandler`]). The guest only sees the plain
-/// `wl_output`; `wl_output.release` releases this child first.
-///
-/// # Returns
-///
-/// The `zaura_output` host ID, or `None` when the output has none and is not
-/// live, or no `zaura_shell` that supports Aura outputs is bound yet.
-pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> Option<u32> {
-    let zaura_shell_host_id = ctx.host_zaura_shell_id;
-    let zaura_shell_version = ctx.host_zaura_shell_version;
-    let shadow_table = &mut ctx.shadow_table;
-    let client_to_host_queue = &mut ctx.client_to_host_queue;
-    ctx.outputs.ensure_aura_output(wl_output_host_id, || {
-        let zaura_shell_host_id = zaura_shell_host_id?;
-        if zaura_shell_version < REQ_GET_AURA_OUTPUT_SINCE {
-            return None;
-        }
-        let zaura_output_host_id = shadow_table.allocate_host_id();
-        shadow_table.track_host_interface_with_version(
-            zaura_output_host_id,
-            "zaura_output".to_string(),
-            zaura_shell_version,
-        );
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_u32(zaura_output_host_id);
-        builder.write_u32(wl_output_host_id);
-        let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_OUTPUT)
-        else {
-            shadow_table.remove_host_interface(zaura_output_host_id);
-            return None;
-        };
-        client_to_host_queue.push((message, Vec::new()));
-        Some(zaura_output_host_id)
-    })
 }
 
 /// Commit the guest-side XDG role association after the generated dispatcher
@@ -979,28 +870,10 @@ impl WlSurfaceHandler for CompositorHandler {
             .surfaces
             .get(&wl_surface_guest_id)
             .and_then(|surface| surface.current_buffer_id());
-        // Retire the surface's placement state, then clean up any host-side
-        // zaura_surface we created for this wl_surface.
-        if let Some(zaura_surface_host_id) = ctx
-            .window_placement
-            .release_surface(wl_surface_guest_id, wl_surface_host_id)
-        {
-            if aura_object_version(ctx, zaura_surface_host_id) >= REQ_RELEASE_SINCE {
-                let builder = crate::wire::MessageBuilder::new();
-                let msg = builder.build_message(zaura_surface_host_id, REQ_RELEASE);
-                ctx.client_to_host_queue.push((msg, Vec::new()));
-                ctx.shadow_table
-                    .mark_pending_destroy_host(zaura_surface_host_id);
-            } else {
-                // Before zaura_surface.release the object has no
-                // destructor request. Retire its
-                // dispatch metadata immediately so stale events cannot
-                // reach a destroyed guest surface, while retaining the
-                // numeric ID reservation until connection teardown.
-                ctx.shadow_table
-                    .retire_host_interface(zaura_surface_host_id);
-            }
-        }
+        // Retire the surface's ARC identity and release the host Aura
+        // surface created for it.
+        ctx.window_placement.forget_surface(wl_surface_guest_id);
+        aura_objects::release_host_zaura_surface(ctx, wl_surface_host_id);
         ctx.outputs.surface_destroyed(wl_surface_host_id);
         let gtk_surface_ids = ctx
             .gtk_surfaces
@@ -1757,7 +1630,10 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
+    use crate::protocols::aura_shell::zaura_output::{
+        ZauraOutputHandler, REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT,
+        REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
+    };
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
@@ -2746,8 +2622,8 @@ mod tests {
             "zaura_surface".to_string(),
             38,
         );
-        ctx.window_placement
-            .remember_aura_surface(wl_surface_host, zaura_surface_host);
+        ctx.aura_surfaces
+            .remember(wl_surface_host, zaura_surface_host);
 
         let mut handler = CompositorHandler;
         let action = handler.on_set_app_id(&mut ctx, &"reused".to_string());
@@ -2859,10 +2735,7 @@ mod tests {
         );
 
         // zaura_surface should still be tracked for cleanup
-        assert!(ctx
-            .window_placement
-            .aura_surface_for_wl_surface(wl_surface_host)
-            .is_some());
+        assert!(ctx.aura_surfaces.get(wl_surface_host).is_some());
     }
 
     #[test]
@@ -4390,10 +4263,7 @@ mod tests {
         let mut handler = CompositorHandler;
         handler.on_set_app_id(&mut ctx, &"app".to_string());
 
-        let zaura_surface_host = ctx
-            .window_placement
-            .aura_surface_for_wl_surface(wl_surface_host)
-            .unwrap();
+        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
 
         let wl_surface_guest = 100u32;
         ctx.client_to_host_queue.clear();
@@ -4417,11 +4287,7 @@ mod tests {
         assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_DESTROY);
         assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), wl_surface_host);
 
-        assert_eq!(
-            ctx.window_placement
-                .aura_surface_for_wl_surface(wl_surface_host),
-            None
-        );
+        assert_eq!(ctx.aura_surfaces.get(wl_surface_host), None);
     }
 
     #[test]
@@ -5379,8 +5245,8 @@ mod tests {
         let mut handler = CompositorHandler;
         handler.on_set_app_id(&mut ctx, &"legacy".to_string());
         let zaura_surface_host = ctx
-            .window_placement
-            .aura_surface_for_wl_surface(wl_surface_host)
+            .aura_surfaces
+            .get(wl_surface_host)
             .expect("set_app_id must create the aura surface");
 
         ctx.client_to_host_queue.clear();
