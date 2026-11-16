@@ -47,7 +47,7 @@ use crate::protocols::aura_shell::zaura_shell::{
     REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE,
 };
 use crate::protocols::aura_shell::zaura_surface::{
-    REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
+    REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
 };
 use crate::protocols::aura_shell::zaura_toplevel::{
     REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
@@ -90,10 +90,6 @@ pub(crate) enum PlacementSkip {
     NoAuraToplevel,
     /// The host Aura surface is unavailable (no zaura_shell).
     NoAuraSurface,
-    /// The surface's ARC policy identity could not be sent to its Aura
-    /// surface: the Aura surface was created under an older `zaura_shell`
-    /// generation that predates `set_application_id`.
-    ArcIdentityUnavailable,
 }
 
 impl PlacementSkip {
@@ -105,10 +101,9 @@ impl PlacementSkip {
     pub(crate) fn log_level(self) -> log::Level {
         match self {
             Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
-            Self::NoFocusedToplevel
-            | Self::NoUsableOutput
-            | Self::NoAuraSurface
-            | Self::ArcIdentityUnavailable => log::Level::Debug,
+            Self::NoFocusedToplevel | Self::NoUsableOutput | Self::NoAuraSurface => {
+                log::Level::Debug
+            }
         }
     }
 }
@@ -226,13 +221,18 @@ pub(crate) fn place_focused(
             .ok_or(PlacementSkip::NoAuraToplevel)?;
     let zaura_surface_id =
         ensure_host_zaura_surface(ctx, guest_wl_surface_id).ok_or(PlacementSkip::NoAuraSurface)?;
-    // Every check that can skip placement runs before the first request of
-    // the batch below, and a failed `apply_arc_identity` queues nothing, so
-    // a skip never leaves part of a batch in the host stream. Setup requests
-    // queued above (the Aura objects) stay valid for the next attempt.
-    if !apply_arc_identity(ctx, guest_wl_surface_id, zaura_surface_id) {
-        return Err(PlacementSkip::ArcIdentityUnavailable);
-    }
+    // Every check that can skip placement has run, so a skip never leaves
+    // part of the batch below in the host stream. Setup requests queued
+    // above (the Aura objects) stay valid for the next attempt.
+    //
+    // `attach_placement_toplevel` allocated the identity, and every Aura
+    // surface supports `set_application_id` (the registry binds no older
+    // `zaura_shell`), so applying it cannot fail here.
+    let identity_applied = apply_arc_identity(ctx, guest_wl_surface_id, zaura_surface_id);
+    debug_assert!(
+        identity_applied,
+        "an attached placement toplevel's surface always takes its ARC identity"
+    );
 
     clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
     let mut builder = MessageBuilder::new();
@@ -272,8 +272,9 @@ pub(crate) fn place_focused(
 /// # Returns
 ///
 /// `true` when the identity is (or already was) queued, or the policy is
-/// off; `false` when no identity can be allocated or the Aura surface is too
-/// old to carry one.
+/// off; `false` when no identity can be allocated (the block is exhausted).
+/// The Aura surface needs no version check: the registry binds no
+/// `zaura_shell` older than `set_application_id`.
 pub(crate) fn apply_arc_identity(
     ctx: &mut Context,
     wl_surface_guest_id: u32,
@@ -289,13 +290,6 @@ pub(crate) fn apply_arc_identity(
     let Some(application_id) = ctx.window_placement.arc_application_id(wl_surface_guest_id) else {
         return false;
     };
-    if aura_object_version(ctx, zaura_surface_host_id) < REQ_SET_APPLICATION_ID_SINCE {
-        log::warn!(
-            "Unable to apply ARC application identity to zaura_surface {}",
-            zaura_surface_host_id
-        );
-        return false;
-    }
     // The identity is proxy-generated and at most
     // `ARC_APPLICATION_ID_PREFIX` plus ten digits, so it always fits.
     let mut builder = MessageBuilder::new();
@@ -990,46 +984,6 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(bounds[12..16].try_into().unwrap()), 0);
         assert_eq!(i32::from_ne_bytes(bounds[16..20].try_into().unwrap()), 3840);
         assert_eq!(i32::from_ne_bytes(bounds[20..24].try_into().unwrap()), 2160);
-    }
-
-    /// An Aura surface created under an older `zaura_shell` generation
-    /// predates `set_application_id`, so it cannot carry the ARC identity.
-    /// Placement skips before the first request of its batch, so nothing
-    /// has to be rolled back; only the reusable Aura toplevel setup stays.
-    #[test]
-    fn placement_on_a_pre_identity_aura_surface_queues_no_batch() {
-        let (mut ctx, host_keyboard, xdg_toplevel) = focused_toplevel_ctx();
-        let old_aura_surface = 0x7000;
-        ctx.shadow_table.track_host_interface_with_version(
-            old_aura_surface,
-            "zaura_surface".to_string(),
-            4,
-        );
-        ctx.window_placement
-            .remember_aura_surface(22, old_aura_surface);
-
-        assert_eq!(
-            place_focused(&mut ctx, HostId(host_keyboard), WindowLayoutAction::TopLeft),
-            Err(PlacementSkip::ArcIdentityUnavailable)
-        );
-        let queued = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|message| (message_sender(message), message_opcode(message)))
-            .collect::<Vec<_>>();
-        let aura_toplevel = ctx
-            .window_placement
-            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
-            .expect("the Aura toplevel is attached before the identity check");
-        assert_eq!(
-            queued,
-            vec![
-                (24, REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL),
-                (aura_toplevel, REQ_SET_SUPPORTS_SCREEN_COORDINATES),
-            ]
-        );
-        assert_eq!(ctx.window_placement.barrier_count(), 0);
-        assert!(!ctx.window_placement.arc_application_id_applied(12));
     }
 
     /// `zaura_surface.unset_snap` exists only from version 16. An Aura
