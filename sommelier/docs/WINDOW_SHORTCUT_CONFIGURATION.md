@@ -255,12 +255,13 @@ the 64 KiB bound and the regular-file check keep that read short.
 | File | Role |
 | --- | --- |
 | `sommelier/src/placement_config.rs` | `PlacementConfig`: startup resolution of every setting, both binding parsers, the one validator, the hardened file read, the current binding generation, and reload. |
-| `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus `Rect`) and its name parser; `NormalizedRect` validation and the work-area rounding rule. |
+| `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
 | `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
 | `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
-| `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; `bounds_for_action` delegates to the rounding rule. |
+| `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
+| `sommelier/src/handler/window_placement.rs` | Placement mechanics: the focused toplevel and its output, the Aura toplevel and ARC identity, `set_window_bounds` and its barrier, and the configures held behind it. Protocol handlers call one entry point per event (listed in its module docs). |
 | `sommelier/src/main.rs` | The `--window-shortcuts-config` option and the `SIGHUP` handler. |
 | `sommelier/src/proxy.rs` | Shares the configuration with every connection and runs reloads in the accept loop. |
 
