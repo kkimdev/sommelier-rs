@@ -63,6 +63,8 @@ pub struct OutputState {
     /// Logical screen-space origin from `wl_output.geometry`.
     pub origin_x: i32,
     pub origin_y: i32,
+    /// Current `wl_output.mode` size: device pixels in the panel's native
+    /// orientation (Exo sends `bounds_in_native`).
     pub mode_width: i32,
     pub mode_height: i32,
     /// Current `zaura_output.scale`, in thousandths. Preferred-only scale
@@ -78,7 +80,9 @@ pub struct OutputState {
     /// the panel's mounting orientation. `zaura_output.logical_transform` is
     /// the active rotation alone, so it would leave a portrait-native panel
     /// in the wrong orientation; it is not used.
-    pub transform: i32,
+    pub panel_transform: i32,
+    /// `zaura_output.insets`: work-area margins in logical screen
+    /// coordinates, applied after rotation and scaling.
     pub insets_top: i32,
     pub insets_left: i32,
     pub insets_bottom: i32,
@@ -100,7 +104,7 @@ impl OutputState {
         let scale = u64::from(self.aura_current_scale?)
             .checked_mul(u64::from(self.aura_device_scale_factor?))?;
         let (mode_width, mode_height) =
-            transformed_extent(self.transform, self.mode_width, self.mode_height);
+            transformed_extent(self.panel_transform, self.mode_width, self.mode_height);
         // Legacy Aura factors are quantized to thousandths, so retain their
         // precision until the final division and conservatively floor DP
         // extents. Checked conversion rejects malformed or overflowing modes.
@@ -514,7 +518,7 @@ mod tests {
             mode_height: 2160,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1250),
-            transform: 1,
+            panel_transform: 1,
             insets_top: 24,
             insets_left: 8,
             insets_bottom: 48,
@@ -568,7 +572,7 @@ mod tests {
             mode_height: 1080,
             aura_current_scale: Some(1000),
             aura_device_scale_factor: Some(1000),
-            transform: 1,
+            panel_transform: 1,
             ..Default::default()
         };
         assert_eq!(output.work_area(), Some((0, 0, 1080, 1920)));

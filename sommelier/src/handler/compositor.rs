@@ -185,7 +185,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             output.origin_x = x;
             output.origin_y = y;
             if valid_transform {
-                output.transform = transform;
+                output.panel_transform = transform;
             }
         });
         if live && !valid_transform {
@@ -272,7 +272,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
 /// `logical_transform` is deliberately not handled: Exo's `wl_output.mode` is
 /// the panel's native pixel size, and only the `wl_output.geometry` (panel)
 /// transform rotates it into the logical screen (see
-/// [`crate::state::OutputState::transform`]). The default handler drops it.
+/// [`crate::state::OutputState::panel_transform`]). The default handler drops it.
 impl ZauraOutputHandler for CompositorHandler {
     fn on_insets(
         &mut self,
