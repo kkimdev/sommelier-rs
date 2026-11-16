@@ -37,7 +37,8 @@ use crate::protocols::xdg_shell::xdg_toplevel::{
     REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
 };
 use crate::state::{
-    Context, DamageRect, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    is_valid_transform, transformed_extent, Context, DamageRect, SurfaceAttachment, SurfaceCommit,
+    SurfaceState, ViewportState,
 };
 use crate::wire::Action;
 use log::trace;
@@ -173,7 +174,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
         let output = ctx.pending_output_state(host_output_id);
         output.origin_x = x;
         output.origin_y = y;
-        if (0..=7).contains(&transform) {
+        if is_valid_transform(transform) {
             output.transform = transform;
         } else {
             log::warn!(
@@ -372,14 +373,6 @@ const DAMAGE_MAX: i64 = i32::MAX as i64 / 10;
 
 fn clamp_damage_edge(value: i64) -> i64 {
     value.clamp(DAMAGE_MIN, DAMAGE_MAX)
-}
-
-fn transformed_extent(transform: i32, width: i32, height: i32) -> (i32, i32) {
-    if matches!(transform, 1 | 3 | 5 | 7) {
-        (height, width)
-    } else {
-        (width, height)
-    }
 }
 
 fn logical_transformed_extent(
@@ -1430,7 +1423,7 @@ impl WlSurfaceHandler for CompositorHandler {
     }
 
     fn on_set_buffer_transform(&mut self, ctx: &mut Context, transform: i32) -> Action {
-        if !(0..=7).contains(&transform) {
+        if !is_valid_transform(transform) {
             log::warn!(
                 "Rejecting invalid wl_surface buffer transform {}",
                 transform
