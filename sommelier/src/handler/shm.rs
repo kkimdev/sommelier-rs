@@ -2258,6 +2258,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::DamageRect;
     use crate::state::{BufferState, Context, HostId, PoolInner, PoolState, RenderBufferLifecycle};
+    use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::sync::{Arc, RwLock};
@@ -3039,6 +3040,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(attached_fd >= 1000);
+        let attached_identity = fd_identity(attached_fd);
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -3048,7 +3050,10 @@ mod tests {
         rollback_queued_host_messages(&mut queue, 1);
 
         assert_eq!(queue, vec![(vec![1], Vec::new())]);
-        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
+        assert!(
+            !any_fd_has_identity(attached_identity),
+            "rollback must close the attached descriptor"
+        );
     }
 
     #[test]
@@ -3057,6 +3062,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(attached_fd >= 1000);
+        let attached_identity = fd_identity(attached_fd);
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -3073,7 +3079,10 @@ mod tests {
             vec![attached_fd]
         ));
         assert!(queue.is_empty());
-        assert_eq!(unsafe { libc::fcntl(attached_fd, libc::F_GETFD) }, -1);
+        assert!(
+            !any_fd_has_identity(attached_identity),
+            "rejecting an oversized message must close its descriptors"
+        );
     }
 
     #[test]

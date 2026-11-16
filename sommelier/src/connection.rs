@@ -438,7 +438,10 @@ impl Drop for WaylandConnection {
 #[cfg(test)]
 mod tests {
     use super::{decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection};
+    use crate::test_support::{any_fd_has_identity, fd_identity};
+    use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use std::ffi::CString;
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
@@ -480,12 +483,14 @@ mod tests {
         assert_eq!(result, 0, "pipe should be created");
 
         let read_fd = pipe_fds[0];
-        // Put the descriptor under test outside the low range used by the
-        // parallel test harness. Otherwise another test can reuse the number
-        // between Drop and the fcntl assertion, making a correct close look
-        // like a leak.
-        let pending_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(pending_fd >= 1000);
+        // Use a memfd for the received descriptor so its `(device, inode)`
+        // identity is not shared with the connection's pipe peer or another
+        // anonymous-inode object. Eventfds all report one inode on Linux.
+        let name = CString::new("sommelier-connection-fd-test").unwrap();
+        let pending_fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)
+            .expect("memfd_create")
+            .into_raw_fd();
+        let pending_identity = fd_identity(pending_fd);
         unsafe {
             libc::close(pipe_fds[1]);
         }
@@ -493,13 +498,12 @@ mod tests {
         connection.read_fds.push(pending_fd);
         drop(connection);
 
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-        let fd_state = unsafe { libc::fcntl(pending_fd, libc::F_GETFD) };
-        assert_eq!(fd_state, -1);
-        let errno = unsafe { *libc::__errno_location() };
-        assert_eq!(errno, libc::EBADF);
+        // The numeric descriptor can be reused immediately by another test,
+        // so check the memfd's identity rather than the integer.
+        assert!(
+            !any_fd_has_identity(pending_identity),
+            "dropping the connection must close the received descriptor"
+        );
     }
 
     #[test]
