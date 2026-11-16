@@ -895,3 +895,142 @@ primary Sommelier service on `wayland-2` was not touched.
   `(0, 0, 1920, 1056)`. The user confirmed each placement visually.
 - No placement was skipped. Logs are kept in the untracked local evidence
   directory `_local/evidence/pr18-hostval-2026-11-16/` in the primary checkout.
+
+## 2026-11-16 — remote-shell-v2 placement backend
+
+### Viability
+
+The global is not available on this host, and stock Crostini cannot provide it.
+
+- **Direct-host registry probe.** `_local/evidence/remote-shell-v2-2026-11-16/registry_probe.py`
+  opened a new, independent VirtWL context on `/dev/wl0`. It sent only
+  `wl_display.get_registry` and `wl_display.sync`, bound nothing, and created
+  no surfaces. The host listed 41 globals. These included `zaura_shell` v65,
+  `xdg_wm_base` v3, and `zcr_notification_shell_v1` v1, but neither
+  `zcr_remote_shell_v2` nor `zcr_remote_shell_v1`. The output is saved as
+  `host-registry.json` next to the script. The C Sommelier sockets
+  (`wayland-0`/`wayland-1`) filter unknown globals, so they could not answer
+  this question. `wayland-2` was not touched.
+- **Exo's gate.** Chromium `components/exo/wayland/server.cc` creates both
+  remote-shell globals only `if (security_delegate_ &&
+  security_delegate_->CanAccessRemoteShell())`.
+  `chrome/browser/ash/guest_os/guest_os_security_delegate.cc` returns `false`
+  from `CanAccessRemoteShell()`, and Crostini's server is created with that
+  delegate. Only servers with a permissive delegate, such as ARC's, advertise
+  remote shell. The bind itself has no further check.
+  `kZcrRemoteShellV2Version` is 6.
+- **Conclusion.** The backend is implemented as requested, but it is
+  unit-tested only and cannot be host-validated here. That matches old PR #8's
+  runtime observation.
+
+### Design
+
+- **Opt-in.** `SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2=1` is off by
+  default. `WindowPlacementState` now selects at most one
+  `WindowPlacementBackend`: `ArcBounds` or `RemoteShellV2`. If both
+  environment flags are set, placement is disabled. Shortcuts are parsed
+  whenever a backend is selected.
+- **Registry.** Only when the backend is on, `zcr_remote_shell_v2` v4+ is
+  bound host-side, capped at v6, and hidden from guests. Otherwise the global
+  is dropped exactly as before. v4 is required because the backend relies on
+  `set_scale_factor`. After `global_remove`, the manager stays bound for
+  existing surfaces, like `zaura_shell` children.
+- **Role exclusivity.** Exo assigns the shell role at `get_xdg_surface` and
+  rejects a second role. Popups require a non-null XDG parent. With a bound
+  manager, the guest's `xdg_surface`, `xdg_toplevel`, and `xdg_popup` objects
+  are therefore proxy-local facades:
+  - `get_toplevel` creates `zcr_remote_surface_v2` (default container), sets
+    scale factor 1.0 so coordinates are DIPs like the Aura work area, and
+    synthesizes the initial 0x0 configure.
+  - `set_title` and `set_app_id` (Guest OS namespace) are forwarded.
+  - Remote `close` becomes `xdg_toplevel.close`.
+  - `bounds_changed_in_output` is a compositor request in Exo's
+    client-controlled model. It is accepted by echoing
+    `set_bounds_in_output` and configuring the guest.
+  - Popups get `popup_done` immediately.
+  - Other requests are consumed. Facade destructors send a local `delete_id`.
+  - `wl_surface.destroy` releases the remote role before the surface.
+- **Local-only facades.** Facades have no host mapping, via
+  `ShadowTable::track_local_only_guest_object`. Reserving a host ID that never
+  reaches the wire would leave a gap in the client's ID sequence, and
+  libwayland-server's `wl_map_insert_at` rejects the next real `new_id` with
+  "invalid new id". Old PR #8 mapped facades to synthetic host IDs and would
+  have hit this as soon as a host advertised the global.
+- **Placement seam.** `KeyboardHandler::apply_window_layout` resolves the
+  focused toplevel, output, and work-area bounds once, then dispatches on the
+  backend. `ArcBounds` runs the unchanged `apply_arc_window_bounds`.
+  `RemoteShellV2` calls `remote_shell::queue_window_bounds`, which sends
+  `set_bounds_in_output` (output-relative) and the guest configure, and rolls
+  both queues back on failure. Exo applies the bounds on the guest's
+  following commit. No sync barrier or held configures are needed, because
+  the proxy synthesizes every guest configure itself.
+- **Shared requirement.** Every backend now binds `zaura_output`, including
+  the late-`zaura_shell` repair, because both need the Aura work area. The
+  ARC-only steps (ARC identity, `zaura_toplevel`) stay ARC-only.
+- **xdg-decoration.** It is hidden while the backend is on, because its
+  `get_toplevel_decoration` would reference a facade.
+- **Fail closed.** Without a usable manager, `get_xdg_surface` takes the
+  normal path and a warning is logged once. Placement then finds no remote
+  surface and leaves the shortcut key with the client.
+
+### Ported from PR #8, and what was dropped
+
+**Ported:**
+
+- The trimmed XML, re-checked against Chromium main.
+- The `get_remote_surface`, `set_title`, `set_app_id`, and `destroy`
+  encoding.
+- `close` becoming `xdg_toplevel.close`.
+- The idea of an XDG facade.
+
+**Dropped:**
+
+- The `--window-placement-backend`, `--window-geometry-method`, and
+  `--window-host-policy` CLI axes.
+- `WindowPlacementMode` and the self-parent paths.
+- The generation and transaction machinery.
+- Translating `window_geometry_changed` into guest resizes, which could
+  feed back on the guest's own commits.
+- Synthetic facade host IDs (the ID-gap bug above).
+- PR #8's fatal rejection when the global is absent. This PR falls back to
+  the normal XDG path instead.
+- `xdg_surface.ack_configure` protocol errors for every ack.
+- The `wl_surface.commit` that PR #8 injected after `set_bounds_in_output`.
+  It could split the client's own attach/damage/commit sequence. This PR
+  relies on the guest's commit after the configure instead.
+
+### Limits and open questions
+
+- Nothing here is host-validated. The following are unverified:
+  - shelf icon matching for remote surfaces;
+  - where Exo maps a remote surface before its first `set_bounds`;
+  - whether a frame or decoration is drawn;
+  - how buffer scale interacts with the 1.0 scale factor;
+  - whether echoing `bounds_changed_in_output` can loop on some hosts.
+- Window states are not bridged: maximize, minimize, fullscreen, and Ash's
+  `state_type_changed` requests. Configures carry no XDG states, not even
+  `activated`. Interactive move/resize, min/max size, and window geometry are
+  not bridged either.
+- A position-only placement takes effect only when the guest commits after
+  the configure. Clients that ignore a same-size configure will not move.
+- If the manager binds after a client has already created XDG surfaces,
+  facade and host XDG roles can mix on one connection. The registry is
+  normally processed before any client creates a surface, so this was not
+  handled further.
+
+### Validation
+
+Validation used the monorepo dev shell, locked and serial:
+
+- Sommelier: 641 passed, 1 ignored. That is 609 before plus 32 new tests:
+  - 16 in `handler::remote_shell`, including the opcode pin;
+  - 5 for `RemoteShellState` and 4 for backend selection in
+    `WindowPlacementState`;
+  - 4 for the registry;
+  - 2 for the keyboard placement seam;
+  - 1 for `ShadowTable`.
+- Sample GUI: 12 passed. Codegen: 7 passed. `gui_smoke`: 0 run, 1 ignored.
+- Strict Clippy on all targets, `cargo fmt --check`, and `git diff --check`
+  pass.
+
+No Sommelier process was started or restarted.

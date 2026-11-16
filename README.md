@@ -211,7 +211,8 @@ test uses `/dev/wl0`.
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated host-handled accelerator keysyms. |
 | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window bounds placement (`1`, `true`, `yes`, or `on`). |
-| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional comma-separated `CHORD=ACTION` bindings, enabled only with the ARC policy gate. |
+| `SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2` | Experimental and off by default. Selects the `zcr_remote_shell_v2` placement backend instead of the ARC policy (`1`, `true`, `yes`, or `on`). Unit-tested only, because stock Crostini does not advertise the global. Setting it together with `SOMMELIER_WINDOW_BOUNDS_AS_ARC` disables placement. |
+| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional comma-separated `CHORD=ACTION` bindings. They are enabled only when a placement backend is selected (`SOMMELIER_WINDOW_BOUNDS_AS_ARC` or `SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2`). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
@@ -284,6 +285,37 @@ state only through its methods, and surface/toplevel teardown releases it in
 one place. [`sommelier/docs/ARC_TASK_AND_SESSION_IDS.md`](sommelier/docs/ARC_TASK_AND_SESSION_IDS.md)
 explains the ARC application-ID namespaces, the identity allocator, and why
 `.session.*` restore identities are never fabricated.
+
+### Experimental remote-shell-v2 backend
+
+`SOMMELIER_WINDOW_PLACEMENT_REMOTE_SHELL_V2=1` swaps the ARC policy for the
+host's `zcr_remote_shell_v2` (v4 or newer), using the same shortcuts and work
+area. It cannot be validated on stock Crostini. Chromium's
+`GuestOsSecurityDelegate::CanAccessRemoteShell()` returns `false`, so the
+guest-OS Wayland server never advertises the global. A 2026-11-16 registry
+probe of this host confirmed that. It needs a host whose security delegate
+grants remote shell access.
+
+When the backend is enabled and the global is bound, the guest's XDG objects
+are implemented inside the proxy, because Exo allows only one shell role per
+surface. Each toplevel gets a host remote-surface role with scale factor 1.0.
+Placement sends `set_bounds_in_output`, relative to the output, together with
+a matching guest configure. Exo applies it on the client's next commit.
+Window title, app ID, and close are bridged. The compositor's
+`bounds_changed_in_output` requests are accepted as-is.
+
+The backend has these limits:
+
+- XDG popups (menus, tooltips) are dismissed immediately with `popup_done`.
+- `xdg-decoration` is hidden.
+- Window states, interactive move/resize, size limits, and window geometry
+  are not bridged.
+
+Without a usable global, windows stay on the normal XDG path, a warning is
+logged once, and shortcut keys go to the client. The protocol code is in
+`sommelier/src/handler/remote_shell.rs`. Its state is in
+`sommelier/src/state/window_placement/remote_shell.rs`, owned by
+`WindowPlacementState`.
 
 ## CI and release workflow
 
