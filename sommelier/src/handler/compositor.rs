@@ -268,11 +268,6 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
 /// `zaura_output` is host-only, so none of its events reach the guest. Its
 /// events for an unknown or no longer live output are stale and dropped
 /// (see [`crate::state::OutputRegistry::aura_event_target`]).
-///
-/// `logical_transform` is deliberately not handled: Exo's `wl_output.mode` is
-/// the panel's native pixel size, and only the `wl_output.geometry` (panel)
-/// transform rotates it into the logical screen (see
-/// [`crate::state::OutputState::panel_transform`]). The default handler drops it.
 impl ZauraOutputHandler for CompositorHandler {
     fn on_insets(
         &mut self,
@@ -337,6 +332,11 @@ impl ZauraOutputHandler for CompositorHandler {
         ctx.outputs.update(wl_output_id, |output| {
             output.aura_device_scale_factor = Some(scale);
         });
+        Action::Drop
+    }
+
+    /// Not used: see [`crate::state::OutputState::panel_transform`].
+    fn on_logical_transform(&mut self, _ctx: &mut Context, _transform: i32) -> Action {
         Action::Drop
     }
 }
