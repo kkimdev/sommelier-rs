@@ -2007,6 +2007,37 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
     }
 }
 
+/// Return the `xdg_toplevel` version that introduced `state`, per the
+/// vendored xdg-shell.xml, or `None` for values xdg-shell does not define.
+fn xdg_toplevel_state_since(state: u32) -> Option<u32> {
+    match state {
+        1..=4 => Some(1),   // maximized, fullscreen, resizing, activated
+        5..=8 => Some(2),   // tiled_left/right/top/bottom
+        9 => Some(6),       // suspended
+        10..=13 => Some(7), // constrained_left/right/top/bottom
+        _ => None,
+    }
+}
+
+/// Keep only the XDG states the guest's `xdg_toplevel` version can receive.
+///
+/// `zaura_toplevel.configure` carries XDG states plus Aura-only supplements
+/// (`immersive` = 100, `minimized` = 101) that are not part of xdg-shell, and
+/// it is not filtered by the guest's negotiated `xdg_toplevel` version. The
+/// array is a sequence of native-endian u32 values; a trailing partial entry
+/// is malformed and dropped.
+fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
+    states
+        .chunks_exact(4)
+        .filter(|entry| {
+            let state = u32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            xdg_toplevel_state_since(state).is_some_and(|since| since <= guest_version)
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn queue_guest_xdg_configure(
     ctx: &mut Context,
     guest_xdg_toplevel_id: u32,
@@ -2014,10 +2045,17 @@ fn queue_guest_xdg_configure(
     height: i32,
     states: &[u8],
 ) -> bool {
+    // Without a recorded version, assume the baseline so only states every
+    // xdg_toplevel client understands are delivered.
+    let guest_version = ctx
+        .shadow_table
+        .guest_object_version(guest_xdg_toplevel_id)
+        .unwrap_or(1);
+    let states = guest_xdg_toplevel_states(states, guest_version);
     let mut builder = crate::wire::MessageBuilder::new();
     builder.write_i32(width);
     builder.write_i32(height);
-    builder.write_array(states);
+    builder.write_array(&states);
     let Ok(message) = builder.try_build_message(
         guest_xdg_toplevel_id,
         crate::protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE,
@@ -4937,9 +4975,14 @@ mod tests {
             .insert(xdg_toplevel_id, 77);
         ctx.shadow_table
             .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
+        ctx.shadow_table.track_interface_with_version(
+            xdg_toplevel_id,
+            "xdg_toplevel".to_string(),
+            6,
+        );
         ctx.last_sender_id = 77;
 
-        let states = [1u8, 2, 3, 4];
+        let states = encode_states(&[1, 2, 3, 4]);
         let action =
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
                 &mut CompositorHandler,
@@ -4961,9 +5004,114 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&1920i32.to_ne_bytes());
         expected.extend_from_slice(&1080i32.to_ne_bytes());
-        expected.extend_from_slice(&4u32.to_ne_bytes());
+        expected.extend_from_slice(&16u32.to_ne_bytes());
         expected.extend_from_slice(&states);
         assert_eq!(&message[8..], expected.as_slice());
+    }
+
+    fn encode_states(states: &[u32]) -> Vec<u8> {
+        states
+            .iter()
+            .flat_map(|state| state.to_ne_bytes())
+            .collect()
+    }
+
+    /// Decode the states array of a guest `xdg_toplevel.configure`.
+    fn configure_states(message: &[u8]) -> Vec<u32> {
+        let length = u32::from_ne_bytes(message[16..20].try_into().unwrap()) as usize;
+        message[20..20 + length]
+            .chunks_exact(4)
+            .map(|entry| u32::from_ne_bytes(entry.try_into().unwrap()))
+            .collect()
+    }
+
+    fn translate_aura_configure(guest_version: u32, states: &[u32]) -> Vec<u32> {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.shadow_table.track_interface_with_version(
+            xdg_toplevel_id,
+            "xdg_toplevel".to_string(),
+            guest_version,
+        );
+        ctx.xdg_toplevel_to_zaura_toplevel
+            .insert(xdg_toplevel_id, 77);
+        ctx.shadow_table
+            .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
+        ctx.last_sender_id = 77;
+        let action =
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+                800,
+                600,
+                &encode_states(states),
+            );
+        assert_eq!(action, Action::Drop);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        let message = &ctx.host_to_client_queue[0].0;
+        assert_eq!(msg_sender(message), xdg_toplevel_id);
+        assert_eq!(
+            msg_opcode(message),
+            crate::protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE
+        );
+        configure_states(message)
+    }
+
+    #[test]
+    fn aura_configure_drops_aura_only_states() {
+        // fullscreen + Aura immersive (100) + Aura minimized (101) + activated.
+        assert_eq!(translate_aura_configure(6, &[2, 100, 101, 4]), vec![2, 4]);
+    }
+
+    #[test]
+    fn aura_configure_filters_states_by_guest_xdg_toplevel_version() {
+        let host_states = [1, 5, 8, 9, 10, 13, 14];
+        assert_eq!(translate_aura_configure(1, &host_states), vec![1]);
+        assert_eq!(translate_aura_configure(2, &host_states), vec![1, 5, 8]);
+        assert_eq!(translate_aura_configure(6, &host_states), vec![1, 5, 8, 9]);
+        assert_eq!(
+            translate_aura_configure(7, &host_states),
+            vec![1, 5, 8, 9, 10, 13]
+        );
+    }
+
+    #[test]
+    fn aura_configure_drops_truncated_state_entry() {
+        assert_eq!(guest_xdg_toplevel_states(&[2, 0, 0, 0, 4, 0], 6).len(), 4);
+    }
+
+    #[test]
+    fn held_aura_configure_is_filtered_when_barrier_completes() {
+        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        ctx.shadow_table.track_interface_with_version(
+            xdg_toplevel_id,
+            "xdg_toplevel".to_string(),
+            1,
+        );
+        let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
+        assert!(queue_window_bounds_barrier(&mut ctx, aura_id));
+        let callback_id = *ctx
+            .active_window_bounds_barriers
+            .get(&aura_id)
+            .expect("active barrier");
+        ctx.last_sender_id = aura_id;
+        let action =
+            crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
+                &mut CompositorHandler,
+                &mut ctx,
+                0,
+                0,
+                800,
+                600,
+                &encode_states(&[2, 5, 100, 101]),
+            );
+        assert_eq!(action, Action::Drop);
+        assert!(ctx.host_to_client_queue.is_empty());
+
+        complete_window_bounds_barrier(&mut ctx, callback_id);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(configure_states(&ctx.host_to_client_queue[0].0), vec![2]);
     }
 
     #[test]
