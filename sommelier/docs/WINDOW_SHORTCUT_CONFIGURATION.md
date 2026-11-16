@@ -179,9 +179,10 @@ is used. It is rejected for:
 | Target | Exactly one of `action` / `rect`; `action` must be a known name. |
 | Rect | All four values finite (no `nan`/`inf`); `0 <= x < 1`, `0 <= y < 1`; `0 < width <= 1`, `0 < height <= 1`; `x + width <= 1`, `y + height <= 1`. |
 
-An edge within `1e-9` of `0` or `1` *is* that border: it snaps onto it, so
-`x + width` and `y + height` may exceed `1` by at most `1e-9`. This absorbs
-decimal-to-binary error (for example `0.1 + 0.9000000000000001`).
+The edge tolerance is `1e-9`: an edge within it of `0` or `1` *is* that
+border and snaps onto it, so `x + width` and `y + height` may exceed `1` by
+at most the tolerance. This absorbs decimal-to-binary error (for example
+`0.1 + 0.9000000000000001`).
 
 Error messages name the offending binding as `bindings[N]`, counted from
 zero; in the environment list, empty entries are not counted.
@@ -231,7 +232,7 @@ At key time the focused surface's [work area](#output-and-work-area)
 fraction `f` becomes a pixel offset:
 
 ```text
-offset(f, W) = clamp(floor(f * W + 1e-6), 0, W)
+offset(f, W) = clamp(floor(f * W + bias), 0, W)
 
 left   = offset(x, W)          right  = offset(x + width,  W)
 top    = offset(y, H)          bottom = offset(y + height, H)
@@ -241,9 +242,9 @@ bounds = (X + left, Y + top, right - left, bottom - top)
 - Both edges are floored from their own fraction, so two rectangles that share
   an edge fraction share the same pixel boundary, and a set of rectangles that
   tiles the unit square tiles the work area without gaps or overlap.
-- The `1e-6` pixel bias only corrects floating-point error (see
-  [Precision](#precision)); it never moves an edge that was meant to fall
-  between pixels.
+- The pixel bias is `1e-6`. It only corrects floating-point error (see
+  [Precision](#precision)): it moves an edge by at most the bias, so only an
+  edge less than the bias below a pixel boundary lands on the next pixel.
 - For the halves used by the named actions, `floor(0.5 * W)` equals `W / 2`,
   so their bounds are exactly what the dedicated half-split code produced
   before (a unit test compares both across small, odd, and extreme sizes).
