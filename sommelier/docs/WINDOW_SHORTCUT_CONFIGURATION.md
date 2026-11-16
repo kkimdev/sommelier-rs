@@ -1,42 +1,78 @@
-# Window shortcut configuration file
+# Window placement shortcut configuration
 
-Compositor-owned window placement shortcuts can be configured in two ways:
+Compositor-owned window placement shortcuts move the focused XDG toplevel
+with one `zaura_toplevel.set_window_bounds` request when a configured chord is
+pressed. This document is the single owner of their configuration contract:
+the settings, which source wins, what happens when a setting is invalid,
+reloading, and the precision a rectangle needs. The README links here.
 
-- `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, a comma-separated `CHORD=ACTION`
-  list that is read once per client connection. Use it for short, fixed
-  bindings.
-- `--window-shortcuts-config PATH`, a versioned TOML file that accepts
-  arbitrary rectangles as well as the named actions, and that can be reloaded
-  with `SIGHUP` without restarting the proxy.
+## Settings
 
-Both feed the same keyboard path: a matched chord on the focused XDG toplevel
-becomes one `zaura_toplevel.set_window_bounds` request, which is gated by the
-opt-in ARC policy (`SOMMELIER_WINDOW_BOUNDS_AS_ARC`). This document describes
-the file.
+| Setting | Meaning |
+| --- | --- |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | The gate for the opt-in ARC bounds policy that placement needs. On for `1`, `true`, `yes` or `on` (case-insensitive, surrounding whitespace ignored); off for anything else, including a value that is not UTF-8. |
+| `SOMMELIER_ACCELERATORS` | Chords the host compositor keeps. A binding may not use one of them. |
+| `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Binding source: a `CHORD=ACTION` list with named actions only. It never reloads. |
+| `--window-shortcuts-config PATH` | Binding source: a versioned TOML file with named actions or arbitrary rectangles. `SIGHUP` reloads it. |
 
-## When the file is used
+`PlacementConfig::from_environment` reads every setting once, at startup, so
+a change to the environment needs a restart. A variable that is empty or only
+whitespace counts as unset. A value that is not UTF-8 counts as set and
+invalid.
 
-| `--window-shortcuts-config` | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Result |
-| --- | --- | --- | --- |
-| absent | any | any | No file is read. Existing environment behavior. |
-| given | any | set (not blank) | Startup error (exit 2). Pick one source. |
-| given | off | unset or blank | Warning; the file is not opened. No shortcuts. |
-| given | on | unset or blank | The file is loaded strictly; an invalid file is a startup error (exit 2). |
+## Resolution at startup
 
-Notes:
+At startup the settings resolve to one process-wide configuration that every
+client connection shares. The rules apply in this order, and any warning is
+logged once per process:
 
-- The gate is read only at startup. A reload never turns the ARC policy on or
-  off, and never re-reads any environment variable.
-- If the gate is requested but the proxy cannot reserve an ARC identity
-  block, the ARC policy is disabled for the whole process and no connection
-  consumes chords; the file still loads and reloads normally. See
-  [Sommelier's task-ID allocator](ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator).
-- `SOMMELIER_ACCELERATORS` is parsed at startup and every binding is checked
-  against it. If that variable is malformed, the conflict check cannot run,
-  so the file option is a startup error. (Without the file option, a malformed
-  list still degrades to "no filtering" as before.)
+1. **One binding source.** Giving `--window-shortcuts-config` while
+   `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` is set is a startup error (exit
+   status 2), even with the gate off.
+2. **The policy needs the gate and an ARC block.** With the gate off nothing
+   is reserved. With the gate on, the proxy reserves its block of ARC task
+   IDs (see
+   [Sommelier's task-ID allocator](ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator));
+   if that fails, the policy is off for the whole process. While the policy
+   is off, a binding source is ignored with one warning and is not read or
+   validated, and no chord is consumed.
+3. **Invalid configuration fails startup.** While the policy is active, a
+   requested binding source must be completely valid, and so must
+   `SOMMELIER_ACCELERATORS`, because every binding is checked against it.
+   Otherwise startup fails with exit status 2. The same rule covers both
+   sources, so a mistake is noticed instead of the proxy quietly running
+   without shortcuts.
+4. **Host accelerators alone never fail startup.** Without a binding source,
+   a malformed `SOMMELIER_ACCELERATORS` logs one warning and disables key
+   filtering, so every key goes to the guest. The variable predates
+   placement, and stopping the proxy would break every app in the
+   container.
 
-## Format
+| Policy (gate and ARC block) | Binding source | Result |
+| --- | --- | --- |
+| any | both | Startup error (exit 2). |
+| off | none | No placement. |
+| off | one | One warning; the source is not read. No placement. |
+| active | none | The ARC metadata path only; no chord is consumed. |
+| active | one, valid | The bindings are active. |
+| active | one, invalid, or `SOMMELIER_ACCELERATORS` invalid | Startup error (exit 2). |
+
+While the policy is active, a chord that matches a binding is always
+consumed, even when the placement is skipped (for example, with no focused
+toplevel). A chord listed in `SOMMELIER_ACCELERATORS` stays with the host.
+
+## Environment list format
+
+```text
+SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
+```
+
+A comma-separated list of `CHORD=ACTION` entries. Whitespace around each
+chord and action is ignored, and so are empty entries. Only the named actions
+(see below) are available; use the file for rectangles. A list can move to
+the file unchanged.
+
+## File format
 
 ```toml
 version = 1
@@ -46,10 +82,10 @@ version = 1
 chord = "<Alt>q"
 rect = [0.0, 0.0, 0.5, 0.5]
 
-# A centered column, two thirds wide.
+# A centered column, two thirds wide (see "Precision").
 [[bindings]]
 chord = "<Alt>w"
-rect = [0.1666667, 0.0, 0.6666667, 1.0]
+rect = [0.1666666666666667, 0.0, 0.6666666666666666, 1.0]
 
 # One of the named actions.
 [[bindings]]
@@ -76,9 +112,9 @@ action = "fullscreen"
 - Unknown keys anywhere are rejected, so a misspelt field cannot be silently
   ignored.
 
-Named actions were kept as an alternative to `rect` because they cost one
-match arm (the name parser is shared with the environment variable) and they
-make the common layouts readable. Each named action is defined as a rectangle:
+Named actions are shared with the environment list
+(`WindowLayoutAction::from_name` is the one name parser) and keep the common
+layouts readable. Each named action is defined as a rectangle:
 
 | Action | Rectangle |
 | --- | --- |
@@ -94,22 +130,36 @@ make the common layouts readable. Each named action is defined as a rectangle:
 
 ## Validation
 
-The whole document is validated before anything is used; nothing is applied
-partially. It is rejected for:
+Both sources go through one validator, `validate_bindings`. Nothing is
+applied partially: the whole list or document is validated before anything
+is used. It is rejected for:
 
 | Check | Rule |
 | --- | --- |
-| File | Must be a regular file (checked on the opened descriptor, so a FIFO or device cannot block the proxy); at most 64 KiB; UTF-8. Symbolic links are followed. |
-| TOML | Must parse; no unknown keys; `version = 1`; at most 256 bindings. |
+| File (file only) | Must be a regular file (checked on the opened descriptor, so a FIFO or device cannot block the proxy); at most 64 KiB; UTF-8. Symbolic links are followed. |
+| TOML (file only) | Must parse; no unknown keys; `version = 1`. |
+| Syntax (list only) | Every non-empty entry has the form `CHORD=ACTION`. |
+| Size | At most 256 bindings. |
 | Chord | Must parse; must not duplicate an earlier binding's chord (compared after parsing, so `<Alt>q` and `<Meta>Q` are duplicates); must not be listed in `SOMMELIER_ACCELERATORS`. |
 | Target | Exactly one of `action` / `rect`; `action` must be a known name. |
 | Rect | All four values finite (no `nan`/`inf`); `0 <= x < 1`, `0 <= y < 1`; `0 < width <= 1`, `0 < height <= 1`; `x + width <= 1`, `y + height <= 1`. |
 
-`x + width` and `y + height` may exceed `1` by at most `1e-9` to absorb
-decimal-to-binary error (for example `0.1 + 0.9000000000000001`); an edge
-within `1e-9` of `0` or `1` is snapped onto the border.
+An edge within `1e-9` of `0` or `1` *is* that border: it snaps onto it, so
+`x + width` and `y + height` may exceed `1` by at most `1e-9`. This absorbs
+decimal-to-binary error (for example `0.1 + 0.9000000000000001`).
 
-Error messages name the offending binding as `bindings[N]` (zero-based).
+Error messages name the offending binding as `bindings[N]`, counted from
+zero; in the environment list, empty entries are not counted.
+
+## Precision
+
+Write rectangle values with 16 significant digits, which is what most
+languages print for a double (`1/3` prints as `0.3333333333333333`). Then
+every edge lands on the pixel its exact fraction names, for every work-area
+extent up to 1,000,000 pixels. Exact binary fractions such as `0.5` or
+`0.25` need no extra digits. A shorter decimal that was rounded down can land
+one pixel short: `0.3333333 * 1920 = 639.99994` floors to `639`, not `640`.
+Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
 ## From rectangle to window bounds
 
@@ -129,15 +179,15 @@ bounds = (X + left, Y + top, right - left, bottom - top)
 - Both edges are floored from their own fraction, so two rectangles that share
   an edge fraction share the same pixel boundary, and a set of rectangles that
   tiles the unit square tiles the work area without gaps or overlap.
-- The `1e-6` pixel bias only corrects floating-point error (so `1/3` written
-  as `0.3333333333333333` lands on the intended pixel); it never moves an
-  edge that was meant to fall between pixels.
+- The `1e-6` pixel bias only corrects floating-point error (see
+  [Precision](#precision)); it never moves an edge that was meant to fall
+  between pixels.
 - For the halves used by the named actions, `floor(0.5 * W)` equals `W / 2`,
   so their bounds are exactly what the dedicated half-split code produced
   before (a unit test compares both across small, odd, and extreme sizes).
   For an odd width the left half gets the smaller share.
-- The placement is skipped (logged at debug level; the chord is still
-  consumed) when the work area is unavailable, when an edge strictly inside
+- The placement is skipped (the chord is still consumed) when the work area
+  is unavailable, when an edge strictly inside
   `(0, 1)` rounds onto the work-area border (the output is too small to
   represent the rectangle), when a rounded extent is empty, or when
   `X + left` / `Y + top` overflows.
@@ -146,6 +196,8 @@ The owner of this rule is `NormalizedRect::to_work_area_bounds` in
 `sommelier/src/window_layout.rs`.
 
 ## Reloading
+
+Only the file reloads; the environment list never does.
 
 ```sh
 # Write the new file atomically, then ask the proxy to reload it.
@@ -163,17 +215,18 @@ kill -HUP "$SOMMELIER_PID"
 - If the file is missing, unreadable, or invalid, the error is logged and the
   last known-good bindings stay active. Deleting the file does not disable
   shortcuts; install a file with no bindings instead.
-- Every connected client adopts the new generation the next time it matches
-  a key press. A key already captured as a shortcut stays captured until it
-  is released, even if its binding was removed, so the guest never sees an
-  unpaired release. Key repeat never repeats a placement.
-- The ARC policy, ARC identities, Aura objects, and pending bounds barriers
-  are untouched by a reload.
-- The `SIGHUP` handler is installed only when a configuration file is in use.
-  Without `--window-shortcuts-config` (or with the gate off) `SIGHUP` keeps
-  its default action and terminates the proxy, as before. With the file in
-  use, closing a controlling terminal no longer terminates a proxy started
-  from it.
+- Every connection sees the new generation from its next key press. A key
+  already captured as a shortcut stays captured until it is released, even
+  if its binding was removed, so the guest never sees an unpaired release.
+  Key repeat never repeats a placement.
+- A reload never changes the gate, the ARC policy, ARC identities, Aura
+  objects, or pending bounds barriers, and it never re-reads an environment
+  variable.
+- With `--window-shortcuts-config`, the `SIGHUP` handler is installed before
+  the file is first read, so a `SIGHUP` never terminates the proxy. If the
+  file is not in use (the policy is off), `SIGHUP` is logged and ignored.
+  Without the option, `SIGHUP` keeps its default action and terminates the
+  proxy.
 
 Signal delivery goes through Tokio's signal driver (an internal self-pipe), and
 the reload runs on the proxy's single-threaded event loop between client
@@ -184,13 +237,14 @@ the 64 KiB bound and the regular-file check keep that read short.
 
 | File | Role |
 | --- | --- |
-| `sommelier/src/window_shortcuts.rs` | Schema, strict parser, hardened file read, `ShortcutConfigSource` (path + last good bindings + reload), `ShortcutSubscription`, and the startup gate. |
-| `sommelier/src/window_layout.rs` | `NormalizedRect` validation and the work-area rounding rule; the named actions' rectangles. |
-| `sommelier/src/accelerator.rs` | Chord parsing, `WindowLayoutAction` (named presets plus `Rect`), the shared action-name parser, and `SOMMELIER_ACCELERATORS` reading. |
-| `sommelier/src/state.rs` | `Context::follow_window_placement_shortcuts` / `refresh_window_placement_shortcuts`. |
-| `sommelier/src/handler/keyboard.rs` | Refreshes before matching a press; `bounds_for_action` delegates to the rounding rule. |
-| `sommelier/src/proxy.rs` | Installs the `SIGHUP` stream when a file is in use and runs reloads in the accept loop. |
-| `sommelier/src/main.rs` | The `--window-shortcuts-config` option; startup errors exit with status 2. |
+| `sommelier/src/placement_config.rs` | `PlacementConfig`: startup resolution of every setting, both binding parsers, the one validator, the hardened file read, the current binding generation, and reload. |
+| `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus `Rect`) and its name parser; `NormalizedRect` validation and the work-area rounding rule. |
+| `sommelier/src/accelerator.rs` | Chord types and parsing only. |
+| `sommelier/src/state.rs` | `Context::placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
+| `sommelier/src/state/window_placement.rs` | Per-connection policy state; it gets the ARC block from `PlacementConfig`. |
+| `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; `bounds_for_action` delegates to the rounding rule. |
+| `sommelier/src/main.rs` | The `--window-shortcuts-config` option, the `SIGHUP` handler, and startup errors (exit 2). |
+| `sommelier/src/proxy.rs` | Shares the configuration with every connection and runs reloads in the accept loop. |
 
 ## Not carried over from the earlier draft
 
@@ -205,8 +259,8 @@ These parts were intentionally not reintroduced:
   `rect` or a named `action`.
 - Rounding each edge to the nearest pixel. Flooring is required to keep the
   named actions' bounds identical on odd work-area sizes.
-- Failing startup on a malformed `SOMMELIER_ACCELERATORS` and rejecting empty
-  list elements in it. That would change existing environment-only
-  deployments; the file option alone fails closed on it.
+- Failing startup on a malformed `SOMMELIER_ACCELERATORS` alone, and
+  rejecting empty list elements in it. That would change deployments without
+  placement shortcuts; only a binding source fails closed on it.
 - A per-instance control socket for selecting a different path at runtime.
   `SIGHUP` reloads the startup path; a socket remains a possible follow-up.

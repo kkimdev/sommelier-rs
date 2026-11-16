@@ -1001,3 +1001,78 @@ ARC allocator: Sommelier 650 passed / 1 ignored (640 on that base),
 sample GUI 12, codegen 7, `gui_smoke` 0 run / 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. These fixes have not been validated on a host: no
 Sommelier process was started.
+
+## 2026-11-16 — Placement configuration has one owner
+
+Cleanup PR C for review findings S1, S7, A2, A5, A6, A7, H7 and the
+configuration and test-seam part of H5. The contract itself lives in
+`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`; this section records what
+changed and why.
+
+**Before.** The environment bindings were parsed in `Context::new` on every
+connection, warn-only, with their own duplicate and conflict checks. The file
+was parsed once in `main`, fail-closed, with a second copy of those checks.
+`SOMMELIER_ACCELERATORS` and `SOMMELIER_WINDOW_BOUNDS_AS_ARC` were read in
+four places. Each `Context` copied the bindings into a `Vec` and had to call
+`refresh_*` before matching a key. `accelerator.rs` and `window_layout.rs`
+imported each other, and so did `window_shortcuts.rs` and `state.rs`.
+
+**After.**
+
+- `placement_config.rs` (was `window_shortcuts.rs`) owns `PlacementConfig`.
+  `main` resolves it once from the gate, the ARC block,
+  `SOMMELIER_ACCELERATORS` and exactly one binding source, then shares it
+  with every `Context` as an `Arc`. Nothing else reads these variables.
+  Bindings live inside the active ARC policy, so "policy off" and "chord
+  consumed" cannot coexist. The environment source is a policy without a
+  reload path.
+- Both sources produce raw bindings for one validator: size, chord syntax,
+  duplicates after parsing, host-accelerator conflicts, actions and rects.
+  `configured_text` is the only "blank means unset" rule.
+- `Context` asks the shared config through `placement_action_for` and
+  `is_host_accelerator`. A reload swaps the generation's `Arc`, and the
+  next lookup sees it, so `classify_key` takes `&Context`.
+- `WindowPlacementState::new` takes the ARC block from the config, and
+  "policy active" means a block is present. The environment constructor,
+  the gate helper and the `set_*_for_test` seams are gone.
+  `Context::new_for_test` / `with_placement_for_test` read no environment
+  and reserve no real block; tests build configs through the production
+  resolver.
+- Module graph: `accelerator` (chords only) and `window_layout` (actions and
+  geometry) depend on nothing. `placement_config` depends on both and on
+  `arc_task_ids`. `state` depends on `placement_config`. `keyboard`, `proxy`
+  and `main` sit on top. There are no cycles.
+- A7: `main` installs the `SIGHUP` handler before the file is first read.
+- A5: `GuestKeyOwner::admits_compositor_shortcut` is the only statement of
+  the shortcut arbitration contract. The key reducer routes every event to
+  the channel that owns its generation and rejects a shortcut event the
+  contract does not admit, instead of acking it.
+- A6: both model-based key tests now produce the `CompositorShortcut`
+  owner. The extended trace test found that a physical press of a
+  shortcut-owned key tripped an assertion; the A5 routing fixes that.
+- H7: the precision a rect needs is documented and tested (16 significant
+  digits land on the intended pixel up to 1,000,000 pixels; `0.3333333`
+  can land one pixel short). A test pins every preset to
+  `NormalizedRect::new` of an independent table. `EDGE_TOLERANCE` now has a
+  single role, a border band, with unchanged results.
+
+**Behavior changes.**
+
+- An explicitly requested but invalid `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`
+  now stops startup with exit status 2 while the policy is active, as an
+  invalid file already did. Before, it logged a warning on every connection
+  and ran without shortcuts.
+- Shortcuts requested while the gate is off, or while no ARC block can be
+  reserved, log one warning per process, and neither source is read.
+- The ARC block is reserved at startup instead of on the first connection.
+- With `--window-shortcuts-config`, `SIGHUP` is caught even when the file
+  ends up unused; it is then logged and ignored.
+
+Deliberately not done: `Context::new` still reads `SOMMELIER_VM_IDENTIFIER`
+(the test constructors do not), and the GBM allocator it creates reads
+`SOMMELIER_DRM_DEVICE`. Neither is placement configuration.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 663 passed /
+1 ignored (650 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
+1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. Not host-validated: no Sommelier process was started.

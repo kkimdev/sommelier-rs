@@ -115,10 +115,10 @@ only.
   produced.
 - **Blocks.** The pool is split into 148 blocks of 1,000,000 IDs; the last
   block is partial.
-- **Reservation on first use.** Nothing is reserved at startup. The first
-  client connection that starts while `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set
-  reserves one block for the whole process. The search starts at a random
-  block and walks every block once.
+- **Reservation at startup.** When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set,
+  the proxy reserves one block for the whole process while it resolves its
+  placement configuration at startup, before it accepts a client. The search
+  starts at a random block and walks every block once.
 - **Lock.** A block is reserved by an exclusive, non-blocking `flock` on
   `$XDG_RUNTIME_DIR/sommelier/arc-task-blocks/<first>-<last>.lock`. Missing
   directories are created with mode `0700` and missing lock files with `0600`,
@@ -146,8 +146,8 @@ only.
 - **Failure.** If `XDG_RUNTIME_DIR` is unset or not private, the lock directory
   cannot be created, `getrandom` fails, or no block can be locked, the ARC
   bounds policy is disabled for the whole process instead of using an
-  identity that could collide. The failure is logged once and cached; later
-  connections do not retry.
+  identity that could collide. The failure is logged once, and the
+  reservation is never retried.
 
 ## Restore-session threshold
 
