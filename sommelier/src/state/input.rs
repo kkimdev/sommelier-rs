@@ -1457,9 +1457,16 @@ impl KeyGenerationRegistry {
             }
             GuestKeyEvent::RecoverIme => {
                 let owner = self.guest_owner(keyboard, key);
+                // A compositor shortcut consumed this physical generation;
+                // recovering it would deliver the chord's key to the guest
+                // after Sommelier already acted on it.
                 if matches!(
                     owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                    Some(
+                        GuestKeyOwner::Physical
+                            | GuestKeyOwner::TextInputKeysym
+                            | GuestKeyOwner::CompositorShortcut
+                    )
                 ) {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
@@ -2773,6 +2780,39 @@ mod tests {
                 assert_eq!(ctx.guest_key_owner(keyboard, key), model);
             }
         }
+    }
+
+    #[test]
+    fn ime_recovery_does_not_replay_a_compositor_shortcut_key() {
+        let keyboard = HostId(10);
+        let key = 16;
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(keyboard, key, 1);
+        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: None,
+                ends_repeat: false,
+            },
+            "a consumed shortcut key must not reach the guest as a recovered pair"
+        );
+        assert_eq!(
+            registry.guest_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut),
+            "recovery must leave shortcut ownership intact for the release"
+        );
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(true),
+                ends_repeat: true,
+            }
+        );
+        assert_eq!(registry.guest_owner(keyboard, key), None);
     }
 
     #[test]

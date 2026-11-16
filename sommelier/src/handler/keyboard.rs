@@ -1338,7 +1338,16 @@ impl crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1:
                     let already_dropped_as_accelerator = ctx
                         .key_generations
                         .host_accelerator_suppressed(host_keyboard_id, key);
+                    // peek_key may trail the wl_keyboard press it describes.
+                    // A generation already consumed by a compositor shortcut
+                    // must not become an IME recovery candidate.
+                    // Only a still-held generation is the one this peek
+                    // describes; a released one is retired by the new press.
+                    let consumed_by_shortcut = pressed_before
+                        && ctx.guest_key_owner(host_keyboard_id, key)
+                            == Some(GuestKeyOwner::CompositorShortcut);
                     let eligible = !already_dropped_as_accelerator
+                        && !consumed_by_shortcut
                         && !self.is_host_accelerator(host_keyboard_id, &ctx.accelerators, key);
                     let sequence = ctx.key_generations.observe_peek_press(
                         host_keyboard_id,
@@ -2178,6 +2187,48 @@ mod tests {
 
         assert_eq!(
             handler.on_key(&mut ctx, 3, 160, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+    }
+
+    #[test]
+    fn peek_after_consumed_shortcut_press_is_not_an_ime_recovery_candidate() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert_eq!(queued_window_bounds(&ctx), 1);
+
+        // The extension's peek for the same generation trails the
+        // wl_keyboard press.
+        ctx.last_sender_id = 50;
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 2, 100, key, WL_KEY_PRESSED),
+            Action::Drop
+        );
+        assert!(
+            ctx.key_generations
+                .peek(keyboard, key)
+                .is_some_and(|press| !press.eligible),
+            "a consumed shortcut generation must not be recoverable"
+        );
+        assert_eq!(
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme)
+                .delivery,
+            GuestKeyDelivery::Drop,
+            "an empty IME confirmation must not replay the consumed key"
+        );
+
+        assert_eq!(
+            handler.on_peek_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        ctx.last_sender_id = 5;
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 101, key, WL_KEY_RELEASED),
             Action::Drop
         );
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
