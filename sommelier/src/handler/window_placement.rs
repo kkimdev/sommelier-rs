@@ -279,12 +279,12 @@ pub(crate) fn set_aura_application_id(
     let Some(zaura_surface_host_id) = ensure_host_zaura_surface(ctx, wl_surface_guest_id) else {
         return;
     };
-    log::debug!(
-        "Set application ID to {} on zaura_surface (host_id={})",
-        native_application_id,
-        zaura_surface_host_id
-    );
     if ctx.window_placement.uses_arc_bounds() {
+        log::debug!(
+            "Not sending application ID {} to zaura_surface (host_id={}): the ARC bounds policy replaces it",
+            native_application_id,
+            zaura_surface_host_id
+        );
         if !apply_arc_identity(ctx, wl_surface_guest_id, zaura_surface_host_id) {
             log::warn!(
                 "Unable to apply ARC policy identity for wl_surface {}",
@@ -296,7 +296,14 @@ pub(crate) fn set_aura_application_id(
     let mut builder = MessageBuilder::new();
     builder.write_string(native_application_id);
     match builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID) {
-        Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
+        Ok(message) => {
+            log::debug!(
+                "Set application ID to {} on zaura_surface (host_id={})",
+                native_application_id,
+                zaura_surface_host_id
+            );
+            ctx.client_to_host_queue.push((message, Vec::new()));
+        }
         Err(error) => log::warn!(
             "Dropping the application ID of zaura_surface {}: {}",
             zaura_surface_host_id,
@@ -337,6 +344,11 @@ fn apply_arc_identity(
     let mut builder = MessageBuilder::new();
     builder.write_string(&application_id);
     let message = builder.build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID);
+    log::debug!(
+        "Set ARC policy application ID {} on zaura_surface (host_id={})",
+        application_id,
+        zaura_surface_host_id
+    );
     ctx.client_to_host_queue.push((message, Vec::new()));
     ctx.window_placement
         .mark_arc_application_id_applied(wl_surface_guest_id);
