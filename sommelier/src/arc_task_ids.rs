@@ -222,8 +222,9 @@ fn lock_exclusive(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        // Never create or lock a file through a symlink.
-        .custom_flags(libc::O_NOFOLLOW)
+        // Never create or lock a file through a symlink, and never block
+        // opening a FIFO or device; `flock` is unaffected by `O_NONBLOCK`.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     // `File::try_lock` is `flock(LOCK_EX | LOCK_NB)` on Linux.
     file.try_lock()?;
@@ -252,6 +253,7 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::fs::{self, Permissions};
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
     /// A temporary stand-in for `$XDG_RUNTIME_DIR`.
@@ -341,9 +343,17 @@ mod tests {
         fs::create_dir_all(runtime.path().join(LOCK_DIRECTORY)).expect("lock directory");
         std::os::unix::fs::symlink(&target, lock_path(&runtime, 0)).expect("plant symlink");
         fs::create_dir(lock_path(&runtime, 1)).expect("plant directory");
+        let fifo = std::ffi::CString::new(lock_path(&runtime, 2).into_os_string().into_vec())
+            .expect("path without NUL");
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
+            0,
+            "plant FIFO"
+        );
 
         let block = reserve_block(runtime.path(), seeds(0, 0)).expect("a later block");
-        assert_eq!(block.ids.first_id, block_bounds(2).0);
+        assert_eq!(block.ids.first_id, block_bounds(3).0);
         assert_eq!(fs::read(&target).expect("read target"), b"keep");
         assert_eq!(mode_of(&target), 0o644);
     }
