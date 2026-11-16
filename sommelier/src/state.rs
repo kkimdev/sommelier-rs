@@ -710,8 +710,10 @@ pub struct GtkSurfaceState {
 /// Host output geometry used for compositor-owned window layout requests.
 ///
 /// `wl_output.mode` reports pixel dimensions while Aura window bounds use
-/// logical screen coordinates. `scale` converts the former into the latter;
-/// output insets remove shelf/non-work-area margins when they are known.
+/// logical screen coordinates. Aura's device and current output scales
+/// convert the former into the latter; `wl_output.scale` rounds fractional
+/// scales upward and cannot describe those coordinates. Output insets remove
+/// shelf/non-work-area margins when they are known.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutputState {
     /// Logical screen-space origin from `wl_output.geometry`.
@@ -720,6 +722,12 @@ pub struct OutputState {
     pub mode_width: i32,
     pub mode_height: i32,
     pub scale: i32,
+    /// Current `zaura_output.scale`, in thousandths. Preferred-only scale
+    /// entries do not affect the current output geometry.
+    pub aura_current_scale: Option<u32>,
+    /// `zaura_output.device_scale_factor`, in thousandths. Both Aura factors
+    /// must arrive before this output can authorize placement.
+    pub aura_device_scale_factor: Option<u32>,
     /// Effective logical output transform. This starts with the
     /// `wl_output.geometry` transform and is replaced by Aura's
     /// `logical_transform` event when available.
@@ -735,14 +743,25 @@ impl OutputState {
         if !(0..=7).contains(&self.transform) {
             return None;
         }
-        let scale = self.scale.max(1);
+        let scale = u64::from(self.aura_current_scale?)
+            .checked_mul(u64::from(self.aura_device_scale_factor?))?;
         let (mode_width, mode_height) = if matches!(self.transform, 1 | 3 | 5 | 7) {
             (self.mode_height, self.mode_width)
         } else {
             (self.mode_width, self.mode_height)
         };
-        let width = mode_width.checked_div(scale)?;
-        let height = mode_height.checked_div(scale)?;
+        // Legacy Aura factors are quantized to thousandths, so retain their
+        // precision until the final division and conservatively floor DP
+        // extents. Checked conversion rejects malformed or overflowing modes.
+        let logical_extent = |pixels: i32| {
+            let extent = u64::try_from(pixels)
+                .ok()?
+                .checked_mul(1_000_000)?
+                .checked_div(scale)?;
+            i32::try_from(extent).ok()
+        };
+        let width = logical_extent(mode_width)?;
+        let height = logical_extent(mode_height)?;
         let x = self.origin_x.checked_add(self.insets_left)?;
         let y = self.origin_y.checked_add(self.insets_top)?;
         let width = width
@@ -1774,6 +1793,8 @@ mod tests {
             mode_width: 3840,
             mode_height: 2160,
             scale: 2,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(2000),
             insets_top: 24,
             insets_left: 8,
             insets_bottom: 48,
@@ -1784,11 +1805,72 @@ mod tests {
     }
 
     #[test]
+    fn output_work_area_combines_aura_scales_before_rounding() {
+        let output = OutputState {
+            mode_width: 3840,
+            mode_height: 2160,
+            // Exo rounds its effective 2.5 factor upward on wl_output.
+            scale: 3,
+            aura_current_scale: Some(1250),
+            aura_device_scale_factor: Some(2000),
+            ..Default::default()
+        };
+        assert_eq!(output.work_area(), Some((0, 0, 1536, 864)));
+    }
+
+    #[test]
+    fn fractional_output_work_area_rotates_before_applying_dp_insets() {
+        let output = OutputState {
+            origin_x: 1920,
+            origin_y: 16,
+            mode_width: 3840,
+            mode_height: 2160,
+            scale: 2,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1250),
+            transform: 1,
+            insets_top: 24,
+            insets_left: 8,
+            insets_bottom: 48,
+            insets_right: 16,
+        };
+        assert_eq!(output.work_area(), Some((1928, 40, 1704, 3000)));
+    }
+
+    #[test]
+    fn output_work_area_requires_valid_aura_factors() {
+        let mut output = OutputState {
+            mode_width: 3840,
+            mode_height: 2160,
+            scale: 2,
+            ..Default::default()
+        };
+        for (current, device) in [
+            (None, None),
+            (Some(1000), None),
+            (None, Some(1250)),
+            (Some(0), Some(1250)),
+            (Some(1000), Some(0)),
+            (Some(u32::MAX), Some(u32::MAX)),
+        ] {
+            output.aura_current_scale = current;
+            output.aura_device_scale_factor = device;
+            assert_eq!(output.work_area(), None, "factors: {current:?}, {device:?}");
+        }
+        output.mode_width = i32::MAX;
+        output.aura_current_scale = Some(1);
+        output.aura_device_scale_factor = Some(1);
+        assert_eq!(output.work_area(), None, "DP dimensions must fit i32");
+    }
+
+    #[test]
     fn output_work_area_rejects_invalid_dimensions() {
         let output = OutputState {
             mode_width: 100,
             mode_height: 100,
             scale: 2,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(2000),
             insets_top: 60,
             ..Default::default()
         };
@@ -1801,6 +1883,8 @@ mod tests {
             mode_width: 1920,
             mode_height: 1080,
             scale: 1,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1000),
             transform: 1,
             ..Default::default()
         };
@@ -1818,6 +1902,8 @@ mod tests {
                     mode_width: 1920,
                     mode_height: 1080,
                     scale: 1,
+                    aura_current_scale: Some(1000),
+                    aura_device_scale_factor: Some(1000),
                     ..Default::default()
                 },
             );

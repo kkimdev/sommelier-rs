@@ -339,14 +339,50 @@ impl ZauraOutputHandler for CompositorHandler {
         Action::Drop
     }
 
-    fn on_scale(&mut self, ctx: &mut Context, _flags: u32, scale: u32) -> Action {
-        // wl_output.scale is the authoritative integer buffer-to-logical
-        // conversion used by work_area(). Keep this event consumed so the
-        // host-only Aura object never leaks an unmapped event to the guest.
+    fn on_scale(&mut self, ctx: &mut Context, flags: u32, scale: u32) -> Action {
+        // zaura_output.scale_property.current from the vendored protocol.
+        // Preferred scales describe choices, not the active DP geometry.
+        const CURRENT: u32 = 1;
+        if flags & CURRENT == 0 {
+            return Action::Drop;
+        }
+        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id) else {
+            return Action::Drop;
+        };
+        if ctx.inactive_output_host_ids.contains(&wl_output_id)
+            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
+        {
+            return Action::Drop;
+        }
         if scale == 0 {
             log::warn!("Ignoring invalid zaura_output.scale=0");
+            return Action::Drop;
         }
-        let _ = ctx.last_sender_id;
+        ctx.pending_output_state(wl_output_id).aura_current_scale = Some(scale);
+        if !ctx.output_uses_done(wl_output_id) {
+            ctx.commit_output_state(wl_output_id);
+        }
+        Action::Drop
+    }
+
+    fn on_device_scale_factor(&mut self, ctx: &mut Context, scale: u32) -> Action {
+        let Some(&wl_output_id) = ctx.zaura_output_to_wl_output.get(&ctx.last_sender_id) else {
+            return Action::Drop;
+        };
+        if ctx.inactive_output_host_ids.contains(&wl_output_id)
+            || ctx.shadow_table.is_pending_destroy_host(wl_output_id)
+        {
+            return Action::Drop;
+        }
+        if scale == 0 {
+            log::warn!("Ignoring invalid zaura_output.device_scale_factor=0");
+            return Action::Drop;
+        }
+        ctx.pending_output_state(wl_output_id)
+            .aura_device_scale_factor = Some(scale);
+        if !ctx.output_uses_done(wl_output_id) {
+            ctx.commit_output_state(wl_output_id);
+        }
         Action::Drop
     }
 
@@ -2262,6 +2298,148 @@ mod tests {
     }
 
     #[test]
+    fn fractional_aura_scale_defines_logical_work_area() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.output_host_ids.push(output_host);
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        let mut handler = CompositorHandler;
+
+        ctx.last_sender_id = output_host;
+        handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
+        WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
+        ctx.last_sender_id = aura_output_host;
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
+        handler.on_device_scale_factor(&mut ctx, 1250);
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut handler, &mut ctx);
+
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 3072, 1728)),
+            "Aura bounds use fractional DP scale, not rounded wl_output.scale"
+        );
+    }
+
+    #[test]
+    fn aura_scale_updates_wait_for_done_and_ignore_preferred_or_zero_factors() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.output_states.insert(
+            output_host,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 2,
+                ..Default::default()
+            },
+        );
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        let mut handler = CompositorHandler;
+
+        ctx.last_sender_id = aura_output_host;
+        assert_eq!(handler.on_device_scale_factor(&mut ctx, 0), Action::Drop);
+        assert_eq!(
+            ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0),
+            Action::Drop
+        );
+        assert!(ctx.pending_output_states.is_empty());
+        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+
+        handler.on_device_scale_factor(&mut ctx, 1250);
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut handler, &mut ctx);
+        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+
+        ctx.last_sender_id = aura_output_host;
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
+        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut handler, &mut ctx);
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 3072, 1728))
+        );
+
+        ctx.last_sender_id = aura_output_host;
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 2, 1200);
+        handler.on_device_scale_factor(&mut ctx, 0);
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0);
+        assert!(ctx.pending_output_states.is_empty());
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 3072, 1728))
+        );
+
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 3, 1200);
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 3072, 1728))
+        );
+        ctx.last_sender_id = output_host;
+        WlOutputHandler::on_done(&mut handler, &mut ctx);
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 2560, 1440))
+        );
+    }
+
+    #[test]
+    fn aura_scale_events_ignore_unknown_inactive_and_released_outputs() {
+        let output_host = 20;
+        let aura_output_host = 21;
+        for retired in 0..3 {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            if retired != 0 {
+                ctx.zaura_output_to_wl_output
+                    .insert(aura_output_host, output_host);
+                if retired == 1 {
+                    ctx.inactive_output_host_ids.insert(output_host);
+                } else {
+                    ctx.shadow_table.map_id(10, output_host);
+                    ctx.shadow_table.mark_pending_destroy(10);
+                }
+            }
+            ctx.last_sender_id = aura_output_host;
+            let mut handler = CompositorHandler;
+            assert_eq!(handler.on_device_scale_factor(&mut ctx, 1250), Action::Drop);
+            assert_eq!(
+                ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000),
+                Action::Drop
+            );
+            assert!(ctx.pending_output_states.is_empty());
+            assert!(ctx.output_states.is_empty());
+        }
+    }
+
+    #[test]
+    fn aura_scale_events_publish_immediately_for_version_one_output() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_host = 20;
+        let aura_output_host = 21;
+        ctx.shadow_table
+            .track_host_interface_with_version(output_host, "wl_output".into(), 1);
+        ctx.zaura_output_to_wl_output
+            .insert(aura_output_host, output_host);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = output_host;
+        handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
+        assert_eq!(ctx.output_states[&output_host].work_area(), None);
+        ctx.last_sender_id = aura_output_host;
+        handler.on_device_scale_factor(&mut ctx, 1250);
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
+        assert_eq!(
+            ctx.output_states[&output_host].work_area(),
+            Some((0, 0, 3072, 1728))
+        );
+        assert!(ctx.pending_output_states.is_empty());
+    }
+
+    #[test]
     fn output_geometry_and_aura_insets_define_logical_work_area() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_host = 20;
@@ -2296,6 +2474,8 @@ mod tests {
         WlOutputHandler::on_scale(&mut handler, &mut ctx, 2);
         ctx.last_sender_id = aura_output_host;
         assert_eq!(handler.on_insets(&mut ctx, 24, 8, 48, 16), Action::Drop);
+        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
+        handler.on_device_scale_factor(&mut ctx, 2000);
         assert_eq!(ctx.output_states[&output_host].mode_width, 0);
         ctx.last_sender_id = output_host;
         assert_eq!(
@@ -2386,6 +2566,8 @@ mod tests {
                 mode_width: 3840,
                 mode_height: 2160,
                 scale: 2,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(2000),
                 insets_top: 24,
                 insets_left: 8,
                 insets_bottom: 48,
@@ -2495,6 +2677,8 @@ mod tests {
                 mode_width: 1920,
                 mode_height: 1080,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );

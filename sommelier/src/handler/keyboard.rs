@@ -1689,6 +1689,8 @@ mod tests {
             mode_width: 3840,
             mode_height: 2160,
             scale: 1,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1000),
             ..Default::default()
         };
         assert_eq!(
@@ -1736,6 +1738,8 @@ mod tests {
             mode_width: 4,
             mode_height: 4,
             scale: 1,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1000),
             ..Default::default()
         };
 
@@ -1756,6 +1760,8 @@ mod tests {
             mode_width: 1,
             mode_height: 1,
             scale: 1,
+            aura_current_scale: Some(1000),
+            aura_device_scale_factor: Some(1000),
             ..Default::default()
         };
         assert_eq!(
@@ -1817,6 +1823,8 @@ mod tests {
                 mode_width: 3840,
                 mode_height: 2160,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );
@@ -1896,6 +1904,8 @@ mod tests {
                 mode_width: 1920,
                 mode_height: 1080,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );
@@ -1906,6 +1916,8 @@ mod tests {
                 mode_width: 1920,
                 mode_height: 1080,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );
@@ -1944,6 +1956,74 @@ mod tests {
         assert_eq!(
             u32::from_ne_bytes(bounds.0[24..28].try_into().unwrap()),
             secondary_output
+        );
+    }
+
+    #[test]
+    fn placement_key_is_forwarded_while_aura_scale_metadata_is_incomplete() {
+        let keyboard = 10;
+        let host_keyboard = 5;
+        let seat = 11;
+        let surface = 12;
+        let host_surface = 22;
+        let xdg_toplevel = 13;
+        let output = 25;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_bounds_as_arc = true;
+        ctx.window_placement_shortcuts =
+            crate::accelerator::parse_window_placement_shortcuts("<Alt>q=top-left").unwrap();
+        map_keyboard(&mut ctx, keyboard, host_keyboard, 50, seat);
+        ctx.shadow_table.map_id(surface, host_surface);
+        ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.xdg_toplevel_to_wl_surface.insert(xdg_toplevel, surface);
+        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
+        ctx.host_zaura_shell_id = Some(24);
+        ctx.host_zaura_shell_version = 38;
+        ctx.output_host_ids.push(output);
+        ctx.output_states.insert(
+            output,
+            crate::state::OutputState {
+                mode_width: 3840,
+                mode_height: 2160,
+                scale: 2,
+                aura_current_scale: Some(1000),
+                // The device scale event has not arrived yet.
+                ..Default::default()
+            },
+        );
+        ctx.last_sender_id = host_keyboard;
+        let mut handler = KeyboardHandler::new();
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        handler
+            .modifiers
+            .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
+        assert_eq!(
+            handler.window_layout_action(&ctx, HostId(host_keyboard), key),
+            Some(WindowLayoutAction::TopLeft)
+        );
+
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
+            Action::Forward
+        );
+        assert_eq!(
+            ctx.guest_key_owner(HostId(host_keyboard), key),
+            Some(GuestKeyOwner::Physical)
+        );
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
+            Action::Forward
+        );
+        assert_eq!(ctx.guest_key_owner(HostId(host_keyboard), key), None);
+        assert!(ctx.xdg_toplevel_to_zaura_toplevel.is_empty());
+        assert!(ctx.wl_surface_to_zaura_surface.is_empty());
+        assert!(ctx.window_bounds_barriers.is_empty());
+        assert!(
+            ctx.client_to_host_queue
+                .iter()
+                .all(|message| message_sender(message) == 50),
+            "only keyboard acknowledgments may be queued when placement lacks geometry"
         );
     }
 
@@ -1991,6 +2071,8 @@ mod tests {
                 mode_width: 3840,
                 mode_height: 2160,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );

@@ -1777,6 +1777,8 @@ mod tests {
                 mode_width: 1920,
                 mode_height: 1080,
                 scale: 1,
+                aura_current_scale: Some(1000),
+                aura_device_scale_factor: Some(1000),
                 ..Default::default()
             },
         );

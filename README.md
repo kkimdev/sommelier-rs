@@ -229,6 +229,13 @@ SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
 SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
 ```
 
+Work areas use Aura's current output scale and device scale factor, then apply
+the logical rotation and insets. Placement waits for both scale factors to be
+available in the committed output metadata; the rounded integer
+`wl_output.scale` is insufficient for fractional display scaling. Aura reports
+these factors in thousandths, so unusual scale settings may still differ
+slightly from the host's exact logical dimensions.
+
 No placement shortcut is active by default. The policy gate remains opt-in
 because it changes the ChromeOS window-policy namespace; malformed bindings or
 bindings that conflict with `SOMMELIER_ACCELERATORS` disable shortcut
