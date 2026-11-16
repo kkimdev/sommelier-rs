@@ -501,7 +501,8 @@ pub(crate) fn ensure_host_zaura_surface(
     Some(zaura_surface_host_id)
 }
 
-/// Create or reuse the host-only `zaura_output` of a live output.
+/// Return the host-only `zaura_output` of a bound output, creating it if
+/// the output is still live (see [`crate::state::OutputRegistry::ensure_aura_output`]).
 ///
 /// It carries the Aura scale factors and work-area insets that placement
 /// needs (see [`ZauraOutputHandler`]). The guest only sees the plain
@@ -509,37 +510,35 @@ pub(crate) fn ensure_host_zaura_surface(
 ///
 /// # Returns
 ///
-/// The `zaura_output` host ID, or `None` when the output is not live or no
-/// `zaura_shell` that supports Aura outputs is bound yet.
+/// The `zaura_output` host ID, or `None` when the output has none and is not
+/// live, or no `zaura_shell` that supports Aura outputs is bound yet.
 pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> Option<u32> {
-    if let Some(existing_id) = ctx.outputs.aura_output(wl_output_host_id) {
-        return Some(existing_id);
-    }
-    if !ctx.outputs.is_live(wl_output_host_id) {
-        return None;
-    }
-    let zaura_shell_host_id = ctx.host_zaura_shell_id?;
-    if ctx.host_zaura_shell_version < ZAURA_SHELL_GET_AURA_OUTPUT_SINCE {
-        return None;
-    }
-
-    let zaura_output_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        zaura_output_host_id,
-        "zaura_output".to_string(),
-        ctx.host_zaura_shell_version,
-    );
-    let mut builder = crate::wire::MessageBuilder::new();
-    builder.write_u32(zaura_output_host_id);
-    builder.write_u32(wl_output_host_id);
-    let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_OUTPUT) else {
-        ctx.shadow_table.remove_host_interface(zaura_output_host_id);
-        return None;
-    };
-    ctx.client_to_host_queue.push((message, Vec::new()));
-    ctx.outputs
-        .attach_aura_output(wl_output_host_id, zaura_output_host_id);
-    Some(zaura_output_host_id)
+    let zaura_shell_host_id = ctx.host_zaura_shell_id;
+    let zaura_shell_version = ctx.host_zaura_shell_version;
+    let shadow_table = &mut ctx.shadow_table;
+    let client_to_host_queue = &mut ctx.client_to_host_queue;
+    ctx.outputs.ensure_aura_output(wl_output_host_id, || {
+        let zaura_shell_host_id = zaura_shell_host_id?;
+        if zaura_shell_version < ZAURA_SHELL_GET_AURA_OUTPUT_SINCE {
+            return None;
+        }
+        let zaura_output_host_id = shadow_table.allocate_host_id();
+        shadow_table.track_host_interface_with_version(
+            zaura_output_host_id,
+            "zaura_output".to_string(),
+            zaura_shell_version,
+        );
+        let mut builder = crate::wire::MessageBuilder::new();
+        builder.write_u32(zaura_output_host_id);
+        builder.write_u32(wl_output_host_id);
+        let Ok(message) = builder.try_build_message(zaura_shell_host_id, REQ_GET_AURA_OUTPUT)
+        else {
+            shadow_table.remove_host_interface(zaura_output_host_id);
+            return None;
+        };
+        client_to_host_queue.push((message, Vec::new()));
+        Some(zaura_output_host_id)
+    })
 }
 
 /// Create or reuse the internal Aura toplevel associated with a guest
@@ -2283,7 +2282,7 @@ mod tests {
         ctx.outputs.update(OUTPUT_HOST, |state| *state = committed);
         ctx.outputs.commit(OUTPUT_HOST);
         ctx.outputs
-            .attach_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
+            .ensure_aura_output(OUTPUT_HOST, || Some(AURA_OUTPUT_HOST));
         ctx.shadow_table.track_host_interface_with_version(
             AURA_OUTPUT_HOST,
             "zaura_output".into(),

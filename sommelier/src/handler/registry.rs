@@ -1866,7 +1866,7 @@ mod tests {
         );
         let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
         assert_eq!(
-            ctx.outputs.aura_output(output_host),
+            ctx.outputs.aura_output_for_test(output_host),
             None,
             "Aura output must wait for the shell binding"
         );
@@ -1874,7 +1874,7 @@ mod tests {
         let shell = "zaura_shell".to_string();
         assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
         assert!(
-            ctx.outputs.aura_output(output_host).is_some(),
+            ctx.outputs.aura_output_for_test(output_host).is_some(),
             "late shell binding must attach every already-bound output"
         );
     }
