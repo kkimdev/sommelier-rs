@@ -33,7 +33,7 @@ use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
-use crate::window_layout::WindowLayoutAction;
+use crate::window_layout::{Rect, WindowLayoutAction};
 use crate::wire::{Action, MessageBuilder};
 use xkbcommon::xkb;
 
@@ -425,8 +425,10 @@ impl KeyboardHandler {
     fn bounds_for_action(
         action: WindowLayoutAction,
         output: crate::state::OutputState,
-    ) -> Option<(i32, i32, i32, i32)> {
-        action.rect().to_work_area_bounds(output.work_area()?)
+    ) -> Option<Rect> {
+        action
+            .rect()
+            .to_work_area_bounds(Rect::from(output.work_area()?))
     }
 
     /// Place the focused toplevel for one consumed placement chord.
@@ -456,7 +458,7 @@ impl KeyboardHandler {
             .get_host_id(guest_wl_surface_id)
             .and_then(|host_surface_id| ctx.outputs.for_surface(host_surface_id))
             .ok_or(PlacementSkip::NoUsableOutput)?;
-        let (x, y, width, height) =
+        let bounds =
             Self::bounds_for_action(action, output).ok_or(PlacementSkip::RectNotRepresentable)?;
         let zaura_toplevel_id = crate::handler::compositor::attach_placement_toplevel(
             ctx,
@@ -489,10 +491,10 @@ impl KeyboardHandler {
         // must be captured immediately before the placement-owned batch.
         Self::clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
         let mut builder = MessageBuilder::new();
-        builder.write_i32(x);
-        builder.write_i32(y);
-        builder.write_i32(width);
-        builder.write_i32(height);
+        builder.write_i32(bounds.x);
+        builder.write_i32(bounds.y);
+        builder.write_i32(bounds.width);
+        builder.write_i32(bounds.height);
         builder.write_u32(output_host_id);
         let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
         ctx.client_to_host_queue.push((message, Vec::new()));
@@ -517,10 +519,10 @@ impl KeyboardHandler {
             action,
             guest_xdg_toplevel_id,
             zaura_toplevel_id,
-            x,
-            y,
-            width,
-            height,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
             output_host_id
         );
         Ok(())
@@ -1718,39 +1720,39 @@ mod tests {
         };
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::TopLeft, output),
-            Some((0, 0, 1920, 1080))
+            Some(Rect::new(0, 0, 1920, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Top, output),
-            Some((0, 0, 3840, 1080))
+            Some(Rect::new(0, 0, 3840, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::TopRight, output),
-            Some((1920, 0, 1920, 1080))
+            Some(Rect::new(1920, 0, 1920, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Left, output),
-            Some((0, 0, 1920, 2160))
+            Some(Rect::new(0, 0, 1920, 2160))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, output),
-            Some((0, 0, 3840, 2160))
+            Some(Rect::new(0, 0, 3840, 2160))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomLeft, output),
-            Some((0, 1080, 1920, 1080))
+            Some(Rect::new(0, 1080, 1920, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Bottom, output),
-            Some((0, 1080, 3840, 1080))
+            Some(Rect::new(0, 1080, 3840, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::BottomRight, output),
-            Some((1920, 1080, 1920, 1080))
+            Some(Rect::new(1920, 1080, 1920, 1080))
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Right, output),
-            Some((1920, 0, 1920, 2160))
+            Some(Rect::new(1920, 0, 1920, 2160))
         );
     }
 
@@ -1792,7 +1794,7 @@ mod tests {
         );
         assert_eq!(
             KeyboardHandler::bounds_for_action(WindowLayoutAction::Fullscreen, tiny_output),
-            Some((0, 0, 1, 1))
+            Some(Rect::new(0, 0, 1, 1))
         );
     }
 
