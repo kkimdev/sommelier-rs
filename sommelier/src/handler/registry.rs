@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::handler::callback::queue_internal_sync;
 use crate::handler::display::queue_protocol_error;
+use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
@@ -36,21 +37,20 @@ use crate::state::{
 use crate::wire::{Action, MessageBuilder};
 use log::error;
 
-// The guest-facing proxy only implements the pre-feedback dmabuf requests
-// plus the v4 feedback objects. Do not advertise v5: v5 adds tranche events
-// and semantics that are not translated by this proxy.
-const LINUX_DMABUF_VERSION: u32 = 4;
-// Legacy format/modifier events are needed to synthesize the v4 feedback
-// object exposed to the guest.  `create_immed` is available since v2 and
-// explicit modifier events since v3, so bind at v3 when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 = 3;
+/// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
+/// different fact from the guest version: the legacy format and modifier
+/// events, which are deprecated from the feedback version on, are what the
+/// proxy synthesizes the guest's feedback object from. `create_immed` is
+/// available since v2 and explicit modifier events since v3, so bind at v3
+/// when the host supports it.
+const LINUX_DMABUF_CAPABILITY_VERSION: u32 =
+    crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 const TEXT_INPUT_MANAGER_VERSION: u32 = 1;
 const TEXT_INPUT_EXTENSION_VERSION: u32 = 11;
 const WL_COMPOSITOR_VERSION: u32 = 4;
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
-const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
 /// The `wl_output` ceiling; [`advertised_global_version`] says why. The
 /// vendored XML is newer: v4 adds the `name` and `description` events.
 const WL_OUTPUT_VERSION: u32 = 3;
@@ -116,7 +116,7 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
         "wl_seat" => WL_SEAT_VERSION,
         "wl_data_device_manager" => WL_DATA_DEVICE_MANAGER_VERSION,
         "xdg_wm_base" => XDG_SHELL_VERSION,
-        "zwp_linux_dmabuf_v1" => LINUX_DMABUF_CLIENT_VERSION,
+        "zwp_linux_dmabuf_v1" => GUEST_DMABUF_VERSION,
         _ => host_version,
     };
     host_version.min(cap)
@@ -633,7 +633,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // guest while clamping only the internal host bind to v3.
             let can_synthesize_feedback = can_synthesize_dmabuf_feedback(ctx, version);
             let client_version = if can_synthesize_feedback {
-                LINUX_DMABUF_VERSION
+                GUEST_DMABUF_VERSION
             } else {
                 if version >= LINUX_DMABUF_CAPABILITY_VERSION && ctx.allocator.is_none() {
                     log::warn!(
