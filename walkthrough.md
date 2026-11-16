@@ -597,3 +597,184 @@ the same 10 unrelated baseline failures: nested Biome roots, a missing Slidev
 path, root hygiene/prohibited-file/absolute-path findings, and pre-existing
 shebang or executable-bit findings. None points to the Sommelier or Nix
 changes.
+
+## 2026-08-21 — GTK ARC metadata and direct left/right placement
+
+The window-placement path now keeps one per-surface ARC policy identity when a GTK
+client sends `gtk_surface1.set_dbus_properties`. That request can arrive after
+`xdg_toplevel.set_app_id`; previously it overwrote the ARC metadata with the normal
+Crostini namespace, so ChromeOS rejected arbitrary Aura bounds and the window
+returned to its old `800x600` geometry. The GTK and XDG paths share the generated
+identity, while the host XDG role keeps its native guest namespace. The workaround
+and its compositor-owned shortcuts are disabled unless the ARC policy is enabled;
+the explicit shortcut configuration remains empty by default, so no chord is
+consumed until a deployment opts into one.
+
+Alt+A and Alt+D now use the same direct
+`unset fullscreen/maximized/snap → zaura_toplevel.set_window_bounds → sync`
+sequence as the other seven layouts. They no longer invoke ChromeOS snap
+animations. A regression test asserts that neither snap opcode is queued.
+
+Verification:
+
+- `cargo fmt --all -- --check`, `cargo check -p sommelier`, and
+  `cargo clippy -p sommelier --all-targets -- -D warnings` pass.
+- `cargo test -p sommelier -- --test-threads=1`: 540 passed, 1 ignored.
+- `cargo build --release -p sommelier` produced the tested binary at
+  `target/release/sommelier`.
+- The isolated release proxy was restarted on
+  `/run/user/1000/wayland-codex-ghostty-rewrite`; its startup log records distinct
+  per-surface ARC task-form policy identities for GTK and Ghostty while their
+  host XDG roles retain the native guest namespace.
+- A parallel test run also exposed two pre-existing linux-dmabuf descriptor tests
+  as flaky; each passed alone and in the serialized full suite.
+
+## 2026-09-12 — PR #9 review hardening
+
+The review pass now allocates ARC task-form identities from a process-shared,
+file-locked block. The allocator validates private runtime directories, keeps a
+stable generation guard across lock-directory replacement, and opens range locks
+relative to the validated directory descriptor. If the allocator cannot reserve
+an unambiguous block, the ARC bounds policy fails closed. The `.session.*`
+restore namespace is never fabricated.
+
+Late `zaura_shell` binding now repairs already-bound outputs and XDG toplevels,
+and XDG role metadata is recorded only after a valid `get_toplevel` dispatch.
+`wl_output.release`, negative Aura insets, and delayed output/surface events are
+also covered by lifecycle regressions.
+
+Verification from the final review snapshot:
+
+- Nix source derivation: release build and `cargo test -p sommelier --all-targets`
+  passed 572 tests, with 1 live-device test ignored.
+- Nix development shell: workspace check and strict Clippy passed; formatting
+  and `git diff --check` are clean.
+- Host-level Aura/Wayland compositor validation remains intentionally unrun.
+
+## 2026-11-12 — PR #9 final-path review and fractional display scaling
+
+Continued the saved review through surface commit, placement request ordering,
+paired Aura/XDG configures, callback completion, and teardown. No additional
+confirmed defect was found in the surface-commit or configure-barrier paths.
+
+The output review reproduced a fractional-scaling defect: a native 3840x2160
+output with device factor 1250, current Aura scale 1000, and rounded
+`wl_output.scale = 2` produced 1920x1080 placement bounds instead of 3072x1728.
+The handler-level regression failed before the fix and passed afterward.
+
+`OutputState` now requires both Aura scale factors and combines their
+thousandths with checked integer arithmetic before applying logical insets.
+Only current scale entries update geometry; preferred-only and malformed zero
+entries are ignored. Output changes retain the existing `wl_output.done`
+publication boundary. Eight new regressions cover fractional and combined
+scales, rotation/insets, incomplete metadata, stale output events, version-one
+outputs, and forwarding both edges of a placement chord while metadata is
+incomplete. Existing placement fixtures now supply complete scale metadata.
+
+The eight existing PR commits were rebased without conflicts onto current
+`personal/virtwl` at `df23d4a1686b18c5be65a615df7d73ae902ec53f` (v0.2.6).
+`git range-diff` reports all eight patches unchanged. The rebased local head is
+`a9e5ac0e7f2300240766045cdef5e06e879d59d5`; the previous head is retained at
+`backup/pr9-core-before-2026-11-12-rebase`. The scaling fix and this review
+record were committed and published on 2026-11-16 (see below).
+
+Fresh validation on the rebased code and scaling fix:
+
+- Locked workspace check and strict Clippy across all targets passed.
+- Locked serial workspace tests: Sommelier 582 passed / 1 ignored, sample GUI
+  12 passed, codegen 7 passed; the separate GUI smoke test remains ignored.
+- Formatting and `git diff --check` passed.
+- Nix source derivation: release build and package checks passed, including
+  582 Sommelier tests. Explicit `?shallow=1` was required for this Git checkout.
+- The normally ignored live VirtWL nonblocking-receive/sync test passed using
+  the freshly built test executable.
+- A separate direct-host registry probe created no surfaces and reported one
+  3840x2160 output, integer scale 1, Aura current/device scales 1000/1000,
+  bottom inset 48, and advertised Aura version 65 (bound at supported v38).
+
+Validation logs, host metadata, and the saved pre-rebase patch were moved out
+of `/tmp` to the untracked local evidence directory
+`_local/evidence/pr9-review-2026-11-12/` in the primary checkout.
+
+The live transport and metadata checks do not establish host placement
+acceptance. Actual Aura window placement and multi-monitor behavior remain
+unverified; this host currently exposes only one output. Legacy Aura scale
+factors are quantized to thousandths, so reconstruction can differ slightly
+from exact host logical dimensions at unusual scale settings. The running
+primary Sommelier service was not replaced or restarted.
+
+## 2026-11-16 — Publishing the rebased PR #9
+
+- Committed the fractional-scaling fix as its own change, then extracted the
+  stale-output guard and the `wl_output.done`-aware publish step shared by the
+  four `zaura_output` handlers into `live_aura_output_host_id` and
+  `publish_aura_output_update` (no behavior change).
+- Re-ran validation on the final head in the monorepo development shell
+  (`nix develop <monorepo> -c ...`): locked serial workspace tests report
+  Sommelier 582 passed / 1 ignored, sample GUI 12, codegen 7; strict Clippy
+  across all targets, `cargo fmt --check`, and `git diff --check` pass. The
+  repository's own development shell lacks `libxkbcommon` at test runtime, so
+  the test binary cannot start there.
+- Force-pushed the rebased branch to `feature/window-placement-shortcuts-core`
+  with a lease on the previous head `c2b5208`; PR #9 remains Draft pending
+  host-level Aura placement and multi-monitor acceptance.
+
+## 2026-11-16 — Independent review of PR #9
+
+Three read-only reviewers covered the ARC task-ID allocator, compositor
+placement/output state, and shortcut key handling. Confirmed findings were
+fixed with regression tests (Sommelier 582 → 600 tests):
+
+- ARC allocator: random start offset inside the locked block (IDs no longer
+  coincide across separate `XDG_RUNTIME_DIR`s on the same block), corrupt
+  guard markers are rewritten under the exclusive lock, owner/mode checks use
+  the opened descriptor, and directory creation cannot chmod through a
+  symlink. The dead post-lock identity check was removed. Exclusivity is
+  documented as holding only within one runtime directory; blocks are never
+  refilled and exhaustion fails safe.
+- Shortcuts: ownership is arbitrated before placement, so a key already
+  delivered through text input or IME recovery, or a duplicate press of a
+  consumed chord, no longer triggers placement; IME recovery never replays a
+  consumed shortcut key.
+- Compositor: synthesized `xdg_toplevel.configure` states are filtered to the
+  guest's negotiated xdg-shell version (Aura-only 100/101 no longer leak), and
+  `zaura_toplevel.release` is queued before `xdg_toplevel.destroy`.
+
+Open for host validation before Ready: popup and subsurface positions while
+`set_supports_screen_coordinates` is enabled for every opted-in toplevel
+(including the late zaura_shell repair path), and work-area orientation on a
+rotated or portrait-native panel. Two keyboards on one seat may still issue
+a redundant placement batch for one chord (no key is lost).
+
+Validation on the final head: serial and parallel workspace tests (Sommelier
+600 passed / 1 ignored, sample GUI 12, codegen 7), strict Clippy,
+`cargo fmt --check`, and `git diff --check` pass.
+
+## 2026-11-16 — Host placement acceptance
+
+CI on the review-fix head failed only on a new Rust 1.100 Clippy lint
+(`chunks_exact_to_as_chunks`) in the Aura configure-state helpers; both sites
+now use `as_chunks::<4>()`, which still drops a malformed trailing partial
+entry. CI passes on x86_64 and aarch64.
+
+The release build of that head ran as an isolated proxy on `wayland-9` with
+`SOMMELIER_WINDOW_BOUNDS_AS_ARC=1` and the nine `<Alt>` shortcuts, serving
+`gtk3-widget-factory` on the single 3840x2160 output. The primary Sommelier
+service on `wayland-2` was not touched. An earlier attempt recorded no
+placements because the test window never received keyboard focus; it was not
+a placement failure.
+
+- All nine shortcuts placed the window. At 100% display size the work area was
+  3840x2112 (48 px shelf inset), e.g. Left `(0, 0, 1920, 2112)` and
+  BottomRight `(1920, 1056, 1920, 1056)`. At the 125% display-size setting it
+was 3200x1752 (combined Aura scale 1.2 on this panel), e.g.
+  Fullscreen `(0, 0, 3200, 1752)` and Right `(1600, 0, 1600, 1752)`.
+- The user confirmed the window landed in each half and quadrant, Fullscreen
+  worked, and context menus, menubar submenus, combo popups, and tooltips
+  opened next to the moved window at both display sizes.
+- No placement was skipped and no errors were logged.
+
+Still unverified: multi-monitor placement (this host exposes one output),
+rotated or portrait-native panels, and popups on a toplevel repaired through
+the late zaura_shell path. Logs are kept in the untracked local evidence
+directory `_local/evidence/pr9-hostval-2026-11-16/` in the primary checkout.

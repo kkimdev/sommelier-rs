@@ -517,6 +517,10 @@ struct PeekWatermark {
 pub enum GuestKeyOwner {
     Physical,
     TextInputKeysym,
+    /// Sommelier consumed an application window-layout shortcut. The
+    /// matching release is acknowledged as handled and never reaches the
+    /// guest client.
+    CompositorShortcut,
     /// A balanced synthetic pair was delivered. This completed-generation
     /// tombstone suppresses delayed duplicate channels and permits repeat
     /// recovery without leaving an open guest press.
@@ -537,6 +541,8 @@ pub enum GuestKeyEvent {
         ime_repeat_active: bool,
     },
     PhysicalRelease,
+    CompositorShortcutPress,
+    CompositorShortcutRelease,
     TextInputPress {
         serial: u32,
     },
@@ -940,7 +946,7 @@ impl KeyGenerationRegistry {
                         next_press_serial,
                     })
             }
-            Some(GuestKeyOwner::ImeRecovery) | None => None,
+            Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) | None => None,
         };
         if let Some(retired_release) = retired_release {
             self.retired_guest_releases
@@ -1150,7 +1156,7 @@ impl KeyGenerationRegistry {
                     .is_some_and(|release_serial| serial_is_after(serial, release_serial));
                 let owner_can_start_next = match generation.guest_owner {
                     Some(GuestKeyOwner::TextInputKeysym) => released,
-                    Some(GuestKeyOwner::ImeRecovery) => {
+                    Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) => {
                         generation.physical_state == PhysicalKeyState::Unseen || released
                     }
                     Some(GuestKeyOwner::Physical) | None => false,
@@ -1363,12 +1369,38 @@ impl KeyGenerationRegistry {
                     ends_repeat: true,
                 }
             }
+            GuestKeyEvent::CompositorShortcutPress => {
+                let owner = self.guest_owner(keyboard, key);
+                if owner.is_none() {
+                    let claimed =
+                        self.claim_guest_owner(keyboard, key, GuestKeyOwner::CompositorShortcut);
+                    debug_assert!(claimed, "shortcut press had no guest owner");
+                }
+                GuestKeyDecision {
+                    delivery: GuestKeyDelivery::Drop,
+                    ack_handled: Some(true),
+                    ends_repeat: false,
+                }
+            }
+            GuestKeyEvent::CompositorShortcutRelease => {
+                let owned =
+                    self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
+                if owned {
+                    self.take_guest_owner(keyboard, key);
+                }
+                GuestKeyDecision {
+                    delivery: GuestKeyDelivery::Drop,
+                    ack_handled: Some(true),
+                    ends_repeat: owned,
+                }
+            }
             GuestKeyEvent::TextInputPress { serial } => {
                 let accelerator_generation = self.host_accelerator_suppressed(keyboard, key)
                     || (self.physically_held(keyboard, key)
                         && self
                             .peek(keyboard, key)
-                            .is_some_and(|press| !press.eligible));
+                            .is_some_and(|press| !press.eligible))
+                    || self.guest_owner(keyboard, key) == Some(GuestKeyOwner::CompositorShortcut);
                 if accelerator_generation
                     || self.guest_owner(keyboard, key) == Some(GuestKeyOwner::Physical)
                     || !self.claim_text_input_owner(keyboard, key, serial)
@@ -1425,9 +1457,16 @@ impl KeyGenerationRegistry {
             }
             GuestKeyEvent::RecoverIme => {
                 let owner = self.guest_owner(keyboard, key);
+                // A compositor shortcut consumed this physical generation;
+                // recovering it would deliver the chord's key to the guest
+                // after Sommelier already acted on it.
                 if matches!(
                     owner,
-                    Some(GuestKeyOwner::Physical | GuestKeyOwner::TextInputKeysym)
+                    Some(
+                        GuestKeyOwner::Physical
+                            | GuestKeyOwner::TextInputKeysym
+                            | GuestKeyOwner::CompositorShortcut
+                    )
                 ) {
                     return GuestKeyDecision {
                         delivery: GuestKeyDelivery::Drop,
@@ -2744,6 +2783,39 @@ mod tests {
     }
 
     #[test]
+    fn ime_recovery_does_not_replay_a_compositor_shortcut_key() {
+        let keyboard = HostId(10);
+        let key = 16;
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(keyboard, key, 1);
+        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: None,
+                ends_repeat: false,
+            },
+            "a consumed shortcut key must not reach the guest as a recovered pair"
+        );
+        assert_eq!(
+            registry.guest_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut),
+            "recovery must leave shortcut ownership intact for the release"
+        );
+        assert_eq!(
+            registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease),
+            GuestKeyDecision {
+                delivery: GuestKeyDelivery::Drop,
+                ack_handled: Some(true),
+                ends_repeat: true,
+            }
+        );
+        assert_eq!(registry.guest_owner(keyboard, key), None);
+    }
+
+    #[test]
     fn guest_key_reducer_couples_delivery_ack_and_generation_ownership() {
         let keyboard = HostId(10);
         let physical_key = 30;
@@ -3193,7 +3265,9 @@ mod tests {
                                 next_press_serial,
                             })
                     }
-                    Some(GuestKeyOwner::ImeRecovery) | None => None,
+                    Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) | None => {
+                        None
+                    }
                 };
                 if let Some(retired_release) = retired_release {
                     self.retired_guest_releases
@@ -3443,7 +3517,10 @@ mod tests {
                                     );
                                 let owner_can_start_next = match generation.guest_owner {
                                     Some(GuestKeyOwner::TextInputKeysym) => released,
-                                    Some(GuestKeyOwner::ImeRecovery) => {
+                                    Some(
+                                        GuestKeyOwner::ImeRecovery
+                                        | GuestKeyOwner::CompositorShortcut,
+                                    ) => {
                                         generation.physical_state == PhysicalKeyState::Unseen
                                             || released
                                     }
