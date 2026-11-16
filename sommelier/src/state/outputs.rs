@@ -55,6 +55,10 @@ pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i3
     }
 }
 
+/// Units per 1.0 of an Aura scale factor: `zaura_output` sends both scale
+/// factors in thousandths.
+const AURA_SCALE_UNITS: u64 = 1000;
+
 /// Host output geometry used for compositor-owned window layout requests.
 ///
 /// `wl_output.mode` reports pixel dimensions while Aura window bounds use
@@ -71,8 +75,8 @@ pub struct OutputState {
     /// orientation (Exo sends `bounds_in_native`).
     pub mode_width: i32,
     pub mode_height: i32,
-    /// Current `zaura_output.scale`, in thousandths. Preferred-only scale
-    /// entries do not affect the current output geometry.
+    /// Current `zaura_output.scale`, in thousandths (`AURA_SCALE_UNITS`).
+    /// Preferred-only scale entries do not affect the current output geometry.
     pub aura_current_scale: Option<u32>,
     /// `zaura_output.device_scale_factor`, in thousandths. Both Aura factors
     /// must arrive before this output can authorize placement.
@@ -110,11 +114,12 @@ impl OutputState {
             transformed_extent(self.panel_transform, self.mode_width, self.mode_height);
         // Legacy Aura factors are quantized to thousandths, so retain their
         // precision until the final division and conservatively floor DP
-        // extents. Checked conversion rejects malformed or overflowing modes.
+        // extents. `scale` is the product of two factors, so its unit is
+        // squared. Checked conversion rejects malformed or overflowing modes.
         let logical_extent = |pixels: i32| {
             let extent = u64::try_from(pixels)
                 .ok()?
-                .checked_mul(1_000_000)?
+                .checked_mul(AURA_SCALE_UNITS * AURA_SCALE_UNITS)?
                 .checked_div(scale)?;
             i32::try_from(extent).ok()
         };
