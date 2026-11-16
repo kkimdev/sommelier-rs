@@ -1156,17 +1156,20 @@ and rotation and multi-monitor selection have never been checked on a host.
 
 ## 2026-11-16 — Placement module
 
-Cleanup PR D for review findings A1, H2, H3 (placement objects) and A4.
-Behavior is unchanged; this section records the new structure and why.
+Cleanup PR D for review findings A1, H2, H3 (placement objects) and A4,
+rebased onto the output registry (#23), plus one protocol fix found in
+review. Apart from that fix, behavior is unchanged; this section records the
+new structure and why.
 
 **Before.** Placement was spread over five modules. The keyboard handler
 resolved the focused toplevel, computed bounds, and built the request batch
 with its own rollback. `compositor.rs` created the Aura toplevel, queued the
 ARC identity and the barrier, and held configures inline in three event
-handlers. `callback.rs`, `registry.rs` and `proxy.rs` each called helpers
-and dropped their results with `let _`. Fixed-size requests went through
-`try_build_message` with rollback branches that could never run, version
-thresholds were copied literals, and bounds were bare tuples.
+handlers. `callback.rs` completed barriers through a compositor helper, and
+`registry.rs` and `proxy.rs` attached Aura toplevels and dropped the result
+with `let _`. Fixed-size requests went through `try_build_message` with
+rollback branches that could never run, version thresholds were copied
+literals, and bounds were bare tuples.
 
 **After.**
 
@@ -1181,37 +1184,52 @@ thresholds were copied literals, and bounds were bare tuples.
   surface; `record_xdg_toplevel` stays there because the XDG role links also
   route application IDs. Both are candidates for the Aura-objects and
   XDG-roles owners.
-- H2: placement's fixed-size messages (0–8 byte payloads, or the
-  proxy-generated ARC identity of at most 27 bytes) use `build_message`.
-  This removes `BarrierUnavailable`, the batch rollback,
+- H2: placement's fixed-size messages (u32/i32 payloads of at most
+  20 bytes, or the proxy-generated ARC identity of at most 27 bytes) use
+  `build_message`. This removes `BarrierUnavailable`, the batch rollback,
   `unmark_arc_application_id_applied` and their two tests. Host data (the
   configure states array) keeps the fallible builder, as the sommelier-rs
   rule requires. `ArcIdentityUnavailable` is reachable (an Aura surface
-  created under an older `zaura_shell` generation), and a new test pins
-  that it queues no part of the batch.
+  created under an older `zaura_shell` generation), and a test pins that it
+  queues no part of the batch. `UnmappedToplevel` was unreachable (only
+  mapped toplevels are recorded, and every unmapping path removes the
+  record first) and is gone; focus resolution asserts the invariant.
 - H3: `wayland_codegen` emits `REQ_*_SINCE` / `EVT_*_SINCE` for every
-  message, so the vendored XML owns each threshold. The zaura_surface and
-  zaura_toplevel checks use them; `PLACEMENT_TOPLEVEL_SINCE` is the
+  message, so the vendored XML owns each threshold. The zaura_surface,
+  zaura_toplevel and zaura_output checks use them, replacing the output
+  registry's hand-written `ZAURA_SHELL_GET_AURA_OUTPUT_SINCE` and
+  `ZAURA_OUTPUT_RELEASE_SINCE`. `PLACEMENT_TOPLEVEL_SINCE` is the
   set_window_bounds version, checked at compile time against the other
-  requests placement sends. `compositor::aura_object_version` replaces the
-  repeated version lookup with its fallback.
-- A4: `window_layout::Rect` carries work areas and bounds.
-  `OutputState::work_area` still returns a tuple and is converted with
-  `Rect::from` at one boundary.
+  requests placement sends. `compositor::aura_object_version` is the one
+  version rule for every Aura child, including the zaura_output release; it
+  asserts in debug builds that the child has a recorded version.
+- A4: `window_layout::Rect` carries work areas and bounds, and
+  `OutputState::work_area` returns it.
 
-Line counts (total / production before `#[cfg(test)]`): `keyboard.rs`
-6404/1405 → 5858/1207, `compositor.rs` 6172/2165 → 5385/1822,
-`callback.rs` 257/124 → 248/115, `window_placement.rs` 1559/686 (new).
+**Behavior change.** `clear_window_state` sent `zaura_surface.unset_snap`
+(since 16) without a version check. An Aura surface keeps the version of the
+shell generation that created it, so after a re-advertised newer shell a
+placement could send it to a v5-v15 surface, which Exo rejects by
+disconnecting the client. It is now sent only to surfaces that have it
+(`unset_snap_is_sent_only_to_an_aura_surface_that_has_it`, which failed
+before the fix).
 
-Deliberately not done: the zaura_output version literals, `ensure_zaura_output`
-and the output maps belong to the OutputRegistry work; the `zaura_shell`
-bind cap (38) is not a since-version; the `xdg_toplevel` state table already
-mirrors the XML in one place. Other handlers' fixed-size
+Line counts against the rebased base (total / production before
+`#[cfg(test)]`): `keyboard.rs` 6388/1405 → 5854/1209, `compositor.rs`
+6147/2098 → 5405/1756, `callback.rs` 257/124 → 248/115,
+`window_placement.rs` 1689/729 (new).
+
+Deliberately not done: `ensure_zaura_output` still builds its fixed-size
+request with `try_build_message`, which belongs with the output registry; the
+`zaura_shell` bind cap (38) is not a since-version; the `xdg_toplevel` state
+table already mirrors the XML in one place. Other handlers' fixed-size
 `try_build_message` calls (`wl_surface.destroy`, `xdg_toplevel.destroy`,
 callback events) are outside placement.
 
-Validation (monorepo dev shell, locked, serial): Sommelier 663 passed /
-1 ignored (664 before: two rollback tests deleted, one skip test added),
-sample GUI 12, codegen 8 (7 before), `gui_smoke` 0 run / 1 ignored. Strict
-Clippy on all targets, `cargo fmt --check`, and `git diff --check` pass.
-Not host-validated: no Sommelier process was started.
+Validation (monorepo dev shell, locked, serial): Sommelier 678 passed /
+1 ignored (675 before: two rollback tests deleted; skip, `unset_snap`,
+zaura_output retire and two version-boundary tests added), sample GUI 12,
+codegen 8 (7 before), `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
+targets, `cargo fmt --check`, and `git diff --check` pass, and every commit
+builds with strict Clippy. Not host-validated: no Sommelier process was
+started.
