@@ -832,3 +832,48 @@ Validation (monorepo dev shell, locked, serial): Sommelier 609 passed /
 codegen 7, `gui_smoke` 0 run / 1 ignored; strict Clippy on all targets,
 `cargo fmt --check`, and `git diff --check` pass. No Sommelier process was
 started or restarted.
+
+## 2026-11-16 — Shortcut configuration file
+
+Ported the still-useful parts of the old shortcut-configuration PR #4
+(`090126e`, `d6f0d24`, `252605b`) onto the merged placement design, without
+its self-parent backend, placement-mode flags, or `window.place` action.
+
+Interface:
+
+- `--window-shortcuts-config PATH` names a TOML file: `version = 1`, then
+  `[[bindings]]` with `chord` and exactly one of `action` (the nine existing
+  names) or `rect = [x, y, width, height]` in work-area fractions.
+- The file is read only when the option is given and
+  `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is requested; with the gate off it is
+  ignored with a warning. Supplying it together with a non-blank
+  `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` is a startup error.
+- Startup validation fails closed (exit 2): regular file only, 64 KiB bound,
+  UTF-8, TOML syntax, unknown keys, version, at most 256 bindings, chord
+  syntax, duplicate chords, `SOMMELIER_ACCELERATORS` conflicts (an invalid
+  accelerator list is itself an error here), unknown actions, and rect bounds
+  (NaN/inf, zero size, `x + width > 1`).
+- `SIGHUP` re-reads the same absolute path. A valid document replaces the
+  bindings atomically through a Tokio `watch` channel; an invalid one is
+  logged and the last known-good bindings stay. Connections adopt a new
+  generation on their next unowned key press. The handler is installed only
+  when a file is in use, and a reload never re-reads the ARC gate.
+
+Geometry: every placement, named or configured, now goes through
+`NormalizedRect::to_work_area_bounds` (`sommelier/src/window_layout.rs`), with
+edges at `floor(f * extent + 1e-6)`. That equals the previous `W / 2` half
+split, which a unit test keeps as an oracle across small, odd, and extreme
+work areas, so the named actions' bounds and the existing keyboard tests are
+unchanged.
+
+Commits: the preset-to-rect refactor, a shared
+`SOMMELIER_ACCELERATORS`/ARC-gate environment refactor, the feature itself
+(new dependencies `serde`, `toml` with only `parse`/`serde`/`std`, and
+`thiserror`), and this documentation. See
+`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 640 passed /
+1 ignored (609 before), sample GUI 12, codegen 7, `gui_smoke` 0 run /
+1 ignored; strict Clippy on all targets, `cargo fmt --check`, and
+`git diff --check` pass. Not host-validated: no Sommelier process was started
+or signalled.
