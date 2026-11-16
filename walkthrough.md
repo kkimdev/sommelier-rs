@@ -718,3 +718,34 @@ primary Sommelier service was not replaced or restarted.
 - Force-pushed the rebased branch to `feature/window-placement-shortcuts-core`
   with a lease on the previous head `c2b5208`; PR #9 remains Draft pending
   host-level Aura placement and multi-monitor acceptance.
+
+## 2026-11-16 — Independent review of PR #9
+
+Three read-only reviewers covered the ARC task-ID allocator, compositor
+placement/output state, and shortcut key handling. Confirmed findings were
+fixed with regression tests (Sommelier 582 → 600 tests):
+
+- ARC allocator: random start offset inside the locked block (IDs no longer
+  coincide across separate `XDG_RUNTIME_DIR`s on the same block), corrupt
+  guard markers are rewritten under the exclusive lock, owner/mode checks use
+  the opened descriptor, and directory creation cannot chmod through a
+  symlink. The dead post-lock identity check was removed. Exclusivity is
+  documented as holding only within one runtime directory; blocks are never
+  refilled and exhaustion fails safe.
+- Shortcuts: ownership is arbitrated before placement, so a key already
+  delivered through text input or IME recovery, or a duplicate press of a
+  consumed chord, no longer triggers placement; IME recovery never replays a
+  consumed shortcut key.
+- Compositor: synthesized `xdg_toplevel.configure` states are filtered to the
+  guest's negotiated xdg-shell version (Aura-only 100/101 no longer leak), and
+  `zaura_toplevel.release` is queued before `xdg_toplevel.destroy`.
+
+Open for host validation before Ready: popup and subsurface positions while
+`set_supports_screen_coordinates` is enabled for every opted-in toplevel
+(including the late zaura_shell repair path), and work-area orientation on a
+rotated or portrait-native panel. Two keyboards on one seat may still issue
+a redundant placement batch for one chord (no key is lost).
+
+Validation on the final head: serial and parallel workspace tests (Sommelier
+600 passed / 1 ignored, sample GUI 12, codegen 7), strict Clippy,
+`cargo fmt --check`, and `git diff --check` pass.
