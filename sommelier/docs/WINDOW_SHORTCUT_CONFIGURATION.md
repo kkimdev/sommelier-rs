@@ -53,9 +53,9 @@ problem is logged once per process instead. The rules apply in this order:
 3. **A file can recover by reload.** If the file was given alone and its path
    resolved, `SIGHUP` re-reads it, so a fixed file activates its bindings
    without a restart (see [Reloading](#reloading)). The other unusable cases
-   have nothing to reload: the conflict and the environment list need a
-   restart, and so does an invalid `SOMMELIER_ACCELERATORS`, because it is
-   read only at startup.
+   have nothing to reload and need a restart: both sources given, an invalid
+   environment list, a file path that cannot be resolved, and an invalid
+   `SOMMELIER_ACCELERATORS`, which is read only at startup.
 4. **Host accelerators alone only lose filtering.** Without a binding source,
    a malformed `SOMMELIER_ACCELERATORS` logs one warning and disables key
    filtering, so every key goes to the guest.

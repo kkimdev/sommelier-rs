@@ -101,7 +101,7 @@ struct Args {
     /// SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An unusable file is logged and
     /// leaves placement shortcuts disabled; SIGHUP reloads it and keeps the
     /// previous bindings if the new file is invalid. See
-    /// docs/WINDOW_SHORTCUT_CONFIGURATION.md.
+    /// sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md.
     #[arg(long, value_name = "PATH")]
     window_shortcuts_config: Option<std::path::PathBuf>,
 
