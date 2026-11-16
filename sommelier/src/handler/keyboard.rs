@@ -368,67 +368,17 @@ impl KeyboardHandler {
         ctx.client_to_host_queue.truncate(queue_start);
     }
 
+    /// Resolve the screen bounds for a placement action on an output.
+    ///
+    /// The action's normalized rectangle is mapped into the output work area
+    /// by [`crate::window_layout::NormalizedRect::to_work_area_bounds`], which
+    /// owns the rounding rule. Returns `None` when the output has no usable
+    /// work area or the rectangle cannot be represented in it.
     fn bounds_for_action(
         action: WindowLayoutAction,
         output: crate::state::OutputState,
     ) -> Option<(i32, i32, i32, i32)> {
-        let (x, y, width, height) = output.work_area()?;
-        let half_width = width / 2;
-        let half_height = height / 2;
-        if matches!(
-            action,
-            WindowLayoutAction::TopLeft
-                | WindowLayoutAction::TopRight
-                | WindowLayoutAction::BottomLeft
-                | WindowLayoutAction::BottomRight
-                | WindowLayoutAction::Left
-                | WindowLayoutAction::Right
-        ) && half_width <= 0
-        {
-            return None;
-        }
-        if matches!(
-            action,
-            WindowLayoutAction::TopLeft
-                | WindowLayoutAction::Top
-                | WindowLayoutAction::TopRight
-                | WindowLayoutAction::BottomLeft
-                | WindowLayoutAction::Bottom
-                | WindowLayoutAction::BottomRight
-        ) && half_height <= 0
-        {
-            return None;
-        }
-        match action {
-            WindowLayoutAction::TopLeft => Some((x, y, half_width, half_height)),
-            WindowLayoutAction::Top => Some((x, y, width, half_height)),
-            WindowLayoutAction::TopRight => Some((
-                x.checked_add(half_width)?,
-                y,
-                width - half_width,
-                half_height,
-            )),
-            WindowLayoutAction::BottomLeft => Some((
-                x,
-                y.checked_add(half_height)?,
-                half_width,
-                height - half_height,
-            )),
-            WindowLayoutAction::Bottom => {
-                Some((x, y.checked_add(half_height)?, width, height - half_height))
-            }
-            WindowLayoutAction::BottomRight => Some((
-                x.checked_add(half_width)?,
-                y.checked_add(half_height)?,
-                width - half_width,
-                height - half_height,
-            )),
-            WindowLayoutAction::Left => Some((x, y, half_width, height)),
-            WindowLayoutAction::Fullscreen => Some((x, y, width, height)),
-            WindowLayoutAction::Right => {
-                Some((x.checked_add(half_width)?, y, width - half_width, height))
-            }
-        }
+        action.rect().to_work_area_bounds(output.work_area()?)
     }
 
     fn apply_window_layout(

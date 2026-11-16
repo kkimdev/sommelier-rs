@@ -29,6 +29,7 @@ mod state;
 mod test_support;
 mod virtwl;
 mod virtwl_channel;
+mod window_layout;
 mod wire;
 
 mod protocols {

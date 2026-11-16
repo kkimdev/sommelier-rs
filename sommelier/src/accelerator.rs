@@ -74,6 +74,10 @@ pub struct Accelerator {
 /// from a fixed set of keysyms in the keyboard event path.  This keeps keyboard
 /// ownership policy at the process boundary and lets deployments choose a
 /// layout without changing the proxy binary.
+///
+/// Every action resolves to a normalized work-area rectangle through
+/// [`WindowLayoutAction::rect`] (see `crate::window_layout`), so every
+/// placement shares one rounding rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowLayoutAction {
     TopLeft,
@@ -85,6 +89,31 @@ pub(crate) enum WindowLayoutAction {
     BottomLeft,
     Bottom,
     BottomRight,
+}
+
+/// Resolve a named placement action, case-insensitively.
+///
+/// # Arguments
+///
+/// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
+///   `right`, `bottom-left`, `bottom`, or `bottom-right`.
+///
+/// # Returns
+///
+/// The matching preset, or `None` for any other spelling.
+pub(crate) fn parse_window_layout_action(name: &str) -> Option<WindowLayoutAction> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "top-left" => Some(WindowLayoutAction::TopLeft),
+        "top" => Some(WindowLayoutAction::Top),
+        "top-right" => Some(WindowLayoutAction::TopRight),
+        "left" => Some(WindowLayoutAction::Left),
+        "fullscreen" => Some(WindowLayoutAction::Fullscreen),
+        "right" => Some(WindowLayoutAction::Right),
+        "bottom-left" => Some(WindowLayoutAction::BottomLeft),
+        "bottom" => Some(WindowLayoutAction::Bottom),
+        "bottom-right" => Some(WindowLayoutAction::BottomRight),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,25 +226,13 @@ pub(crate) fn parse_window_placement_shortcuts(
         })?;
         let accelerator = parse_accelerator(chord.trim())
             .map_err(|error| format!("binding {} has invalid chord: {}", index, error))?;
-        let action_name = action.trim().to_ascii_lowercase();
-        let action = match action_name.as_str() {
-            "top-left" => WindowLayoutAction::TopLeft,
-            "top" => WindowLayoutAction::Top,
-            "top-right" => WindowLayoutAction::TopRight,
-            "left" => WindowLayoutAction::Left,
-            "fullscreen" => WindowLayoutAction::Fullscreen,
-            "right" => WindowLayoutAction::Right,
-            "bottom-left" => WindowLayoutAction::BottomLeft,
-            "bottom" => WindowLayoutAction::Bottom,
-            "bottom-right" => WindowLayoutAction::BottomRight,
-            _ => {
-                return Err(format!(
-                    "binding {} has unsupported action {:?}",
-                    index,
-                    action.trim()
-                ));
-            }
-        };
+        let action = parse_window_layout_action(action).ok_or_else(|| {
+            format!(
+                "binding {} has unsupported action {:?}",
+                index,
+                action.trim()
+            )
+        })?;
         if bindings
             .iter()
             .any(|binding: &WindowPlacementShortcut| binding.accelerator == accelerator)
