@@ -26,7 +26,7 @@ limitations under the License.
 //! A chord bound to a placement action is consumed here and placed by
 //! [`crate::handler::window_placement::place_focused`].
 //!
-//! See `docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
+//! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
 use crate::protocols::wayland::wl_keyboard;
 use crate::state::{
