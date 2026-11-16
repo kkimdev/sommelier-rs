@@ -650,3 +650,71 @@ Verification from the final review snapshot:
 - Nix development shell: workspace check and strict Clippy passed; formatting
   and `git diff --check` are clean.
 - Host-level Aura/Wayland compositor validation remains intentionally unrun.
+
+## 2026-11-12 — PR #9 final-path review and fractional display scaling
+
+Continued the saved review through surface commit, placement request ordering,
+paired Aura/XDG configures, callback completion, and teardown. No additional
+confirmed defect was found in the surface-commit or configure-barrier paths.
+
+The output review reproduced a fractional-scaling defect: a native 3840x2160
+output with device factor 1250, current Aura scale 1000, and rounded
+`wl_output.scale = 2` produced 1920x1080 placement bounds instead of 3072x1728.
+The handler-level regression failed before the fix and passed afterward.
+
+`OutputState` now requires both Aura scale factors and combines their
+thousandths with checked integer arithmetic before applying logical insets.
+Only current scale entries update geometry; preferred-only and malformed zero
+entries are ignored. Output changes retain the existing `wl_output.done`
+publication boundary. Eight new regressions cover fractional and combined
+scales, rotation/insets, incomplete metadata, stale output events, version-one
+outputs, and forwarding both edges of a placement chord while metadata is
+incomplete. Existing placement fixtures now supply complete scale metadata.
+
+The eight existing PR commits were rebased without conflicts onto current
+`personal/virtwl` at `df23d4a1686b18c5be65a615df7d73ae902ec53f` (v0.2.6).
+`git range-diff` reports all eight patches unchanged. The rebased local head is
+`a9e5ac0e7f2300240766045cdef5e06e879d59d5`; the previous head is retained at
+`backup/pr9-core-before-2026-11-12-rebase`. The scaling fix and this review
+record were committed and published on 2026-11-16 (see below).
+
+Fresh validation on the rebased code and scaling fix:
+
+- Locked workspace check and strict Clippy across all targets passed.
+- Locked serial workspace tests: Sommelier 582 passed / 1 ignored, sample GUI
+  12 passed, codegen 7 passed; the separate GUI smoke test remains ignored.
+- Formatting and `git diff --check` passed.
+- Nix source derivation: release build and package checks passed, including
+  582 Sommelier tests. Explicit `?shallow=1` was required for this Git checkout.
+- The normally ignored live VirtWL nonblocking-receive/sync test passed using
+  the freshly built test executable.
+- A separate direct-host registry probe created no surfaces and reported one
+  3840x2160 output, integer scale 1, Aura current/device scales 1000/1000,
+  bottom inset 48, and advertised Aura version 65 (bound at supported v38).
+
+Validation logs, host metadata, and the saved pre-rebase patch were moved out
+of `/tmp` to the untracked local evidence directory
+`_local/evidence/pr9-review-2026-11-12/` in the primary checkout.
+
+The live transport and metadata checks do not establish host placement
+acceptance. Actual Aura window placement and multi-monitor behavior remain
+unverified; this host currently exposes only one output. Legacy Aura scale
+factors are quantized to thousandths, so reconstruction can differ slightly
+from exact host logical dimensions at unusual scale settings. The running
+primary Sommelier service was not replaced or restarted.
+
+## 2026-11-16 — Publishing the rebased PR #9
+
+- Committed the fractional-scaling fix as its own change, then extracted the
+  stale-output guard and the `wl_output.done`-aware publish step shared by the
+  four `zaura_output` handlers into `live_aura_output_host_id` and
+  `publish_aura_output_update` (no behavior change).
+- Re-ran validation on the final head in the monorepo development shell
+  (`nix develop <monorepo> -c ...`): locked serial workspace tests report
+  Sommelier 582 passed / 1 ignored, sample GUI 12, codegen 7; strict Clippy
+  across all targets, `cargo fmt --check`, and `git diff --check` pass. The
+  repository's own development shell lacks `libxkbcommon` at test runtime, so
+  the test binary cannot start there.
+- Force-pushed the rebased branch to `feature/window-placement-shortcuts-core`
+  with a lease on the previous head `c2b5208`; PR #9 remains Draft pending
+  host-level Aura placement and multi-monitor acceptance.
