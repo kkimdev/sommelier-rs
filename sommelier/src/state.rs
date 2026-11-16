@@ -173,6 +173,8 @@ pub struct ShadowTable {
 
 impl ShadowTable {
     const GUEST_SERVER_ID_START: u32 = 0xff00_0000;
+    /// The version of an object registered without a negotiated version.
+    ///
     /// Test fixtures and legacy internal registrations that do not carry a
     /// negotiated version remain permissive. Production-created objects are
     /// registered with their actual version by the generated dispatcher.
@@ -495,6 +497,26 @@ impl ShadowTable {
                 .get(&host_id)
                 .and_then(|guest_id| self.guest_versions.get(guest_id).copied())
         })
+    }
+
+    /// The guest object's version, or the unknown version when none is
+    /// recorded. A child object created from it takes this version.
+    pub(crate) fn guest_object_version_or_unknown(&self, guest_id: u32) -> u32 {
+        self.guest_object_version(guest_id)
+            .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
+    }
+
+    /// The host object's version, or the unknown version when none is
+    /// recorded. A child object created from it takes this version.
+    pub(crate) fn host_object_version_or_unknown(&self, host_id: u32) -> u32 {
+        self.host_object_version(host_id)
+            .unwrap_or(Self::UNKNOWN_OBJECT_VERSION)
+    }
+
+    /// Whether `version` is the unknown version: the object was registered
+    /// without a negotiated one.
+    pub(crate) fn is_unknown_version(version: u32) -> bool {
+        version == Self::UNKNOWN_OBJECT_VERSION
     }
 
     /// Remove a host-side interface registration.

@@ -27,6 +27,7 @@ limitations under the License.
 //! the only statements of the `wl_output.transform` enum rules; surfaces'
 //! buffer transforms use them too.
 
+use crate::protocols::wayland::wl_output;
 use crate::window_layout::Rect;
 use std::collections::{HashMap, HashSet};
 
@@ -134,10 +135,6 @@ impl OutputState {
     }
 }
 
-/// `wl_output.done` exists since this version. Older outputs have no event
-/// group barrier, so each event applies as it arrives.
-const WL_OUTPUT_DONE_SINCE: u32 = 2;
-
 /// The registry advertisement that an output object was bound from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlobalBinding {
@@ -167,7 +164,8 @@ enum Liveness {
 #[derive(Debug)]
 struct OutputRecord {
     global: GlobalBinding,
-    /// Version 2+ outputs batch events until `wl_output.done`.
+    /// Outputs with `wl_output.done` batch events until it arrives. Older
+    /// outputs have no event group barrier, so each event applies at once.
     batches_until_done: bool,
     /// Host-only `zaura_output` extending this output, once created.
     aura_output: Option<u32>,
@@ -216,7 +214,7 @@ impl OutputRegistry {
             output,
             OutputRecord {
                 global,
-                batches_until_done: version >= WL_OUTPUT_DONE_SINCE,
+                batches_until_done: version >= wl_output::EVT_DONE_SINCE,
                 aura_output: None,
                 liveness: Liveness::Live {
                     committed: OutputState::default(),

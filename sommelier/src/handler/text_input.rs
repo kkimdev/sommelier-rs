@@ -26,7 +26,7 @@ use crate::protocols::wayland::wl_keyboard;
 use crate::state::GuestKeyOwner;
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
-    InternalCallback, SeatFocusChange,
+    InternalCallback, SeatFocusChange, ShadowTable,
 };
 use crate::wire::{Action, MessageBuilder};
 use std::os::unix::io::RawFd;
@@ -182,9 +182,9 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
 
 fn extension_version_allows(version: u32, required: u32) -> bool {
     // Test fixtures and older callers that predate version tracking use
-    // UNKNOWN_OBJECT_VERSION. Keep those permissive while production objects
+    // the unknown version. Keep those permissive while production objects
     // are guarded by the negotiated protocol version.
-    version == u32::MAX || version >= required
+    ShadowTable::is_unknown_version(version) || version >= required
 }
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -1262,7 +1262,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
         builder.write_u32(host_v1_id);
         push_msg(&mut ctx.client_to_host_queue, host_manager_id, 0, builder);
 
-        let host_ext_id = ctx
+        let host_ext = ctx
             .host_text_input_extension_v1_id
             .map(|host_ext_manager_id| {
                 let host_ext_id = ctx.shadow_table.allocate_host_id();
@@ -1275,7 +1275,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                     0,
                     builder,
                 );
-                host_ext_id
+                (host_ext_id, host_ext_manager_id)
             });
 
         ctx.shadow_table.map_id(id, host_v1_id);
@@ -1286,11 +1286,10 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             "zwp_text_input_v1".to_string(),
             1,
         );
-        if let Some(host_ext_id) = host_ext_id {
-            let host_ext_manager_id = ctx.host_text_input_extension_v1_id;
-            let host_ext_version = host_ext_manager_id
-                .and_then(|manager_id| ctx.shadow_table.host_object_version(manager_id))
-                .unwrap_or(u32::MAX);
+        if let Some((host_ext_id, host_ext_manager_id)) = host_ext {
+            let host_ext_version = ctx
+                .shadow_table
+                .host_object_version_or_unknown(host_ext_manager_id);
             ctx.shadow_table.track_host_interface_with_version(
                 host_ext_id,
                 "zcr_extended_text_input_v1".to_string(),
@@ -1302,7 +1301,12 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
 
         ctx.text_inputs.insert(
             id,
-            crate::state::TextInputState::new(host_v1_id, host_ext_id, seat, active_surface),
+            crate::state::TextInputState::new(
+                host_v1_id,
+                host_ext.map(|(host_ext_id, _)| host_ext_id),
+                seat,
+                active_surface,
+            ),
         );
 
         // A text-input object created after keyboard focus was established
@@ -1860,11 +1864,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 map_v3_content_type(hint, purpose);
 
             if let Some(host_ext_id) = plan.host_ext_id {
-                let host_ext_version = ctx
-                    .shadow_table
-                    .host_object_version(host_ext_id)
-                    .unwrap_or(u32::MAX);
-                if extension_version_allows(host_ext_version, 9) {
+                let host_ext_version = ctx.shadow_table.host_object_version_or_unknown(host_ext_id);
+                if extension_version_allows(
+                    host_ext_version,
+                    zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
+                ) {
                     // This request applies to the following content-type
                     // request, so keep both in the same transaction.
                     let mut builder = MessageBuilder::new();
@@ -1894,19 +1898,21 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 // carries inline-composition support. Older hosts must
                 // receive opcode 1 instead; sending opcode 6 to v1-v7 is a
                 // protocol error.
-                let host_ext_version = ctx
-                    .shadow_table
-                    .host_object_version(host_ext_id)
-                    .unwrap_or(u32::MAX);
-                if extension_version_allows(host_ext_version, 8) {
+                let host_ext_version = ctx.shadow_table.host_object_version_or_unknown(host_ext_id);
+                if extension_version_allows(
+                    host_ext_version,
+                    zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
+                ) {
                     // A text-input-v3 client supports inline preedit by
                     // definition.
                     builder.write_u32(1);
                     if !push_msg(&mut transaction, host_ext_id, 6, builder) {
                         return Action::Drop;
                     }
-                } else if extension_version_allows(host_ext_version, 2)
-                    && !push_msg(&mut transaction, host_ext_id, 1, builder)
+                } else if extension_version_allows(
+                    host_ext_version,
+                    zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
+                ) && !push_msg(&mut transaction, host_ext_id, 1, builder)
                 {
                     return Action::Drop;
                 }

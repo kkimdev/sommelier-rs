@@ -1237,8 +1237,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             }
             let version = ctx
                 .shadow_table
-                .host_object_version(host_params_id)
-                .unwrap_or(u32::MAX);
+                .host_object_version_or_unknown(host_params_id);
             ctx.shadow_table.track_host_interface_with_version(
                 buffer,
                 "wl_buffer".to_string(),
@@ -1278,8 +1277,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 }
                 let version = ctx
                     .shadow_table
-                    .host_object_version(host_params_id)
-                    .unwrap_or(u32::MAX);
+                    .host_object_version_or_unknown(host_params_id);
                 ctx.shadow_table.track_host_interface_with_version(
                     buffer,
                     "wl_buffer".to_string(),
@@ -1400,10 +1398,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // Codegen would map it if we forwarded.
         // buffer_id is new_id wl_buffer.
         let host_buffer_id = ctx.shadow_table.allocate_host_id();
-        let buffer_version = ctx
-            .shadow_table
-            .guest_object_version(params_id)
-            .unwrap_or(u32::MAX);
+        let buffer_version = ctx.shadow_table.guest_object_version_or_unknown(params_id);
         ctx.shadow_table.map_id(buffer_id, host_buffer_id);
         ctx.shadow_table.track_interface_with_version(
             buffer_id,

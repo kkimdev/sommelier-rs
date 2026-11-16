@@ -24,14 +24,14 @@ use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{
-    WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY,
+    WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY, REQ_OFFSET_SINCE,
 };
 use crate::protocols::xdg_shell::xdg_toplevel::{
     REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
 };
 use crate::state::{
-    is_valid_transform, transformed_extent, Context, DamageRect, PostDispatch, SurfaceAttachment,
-    SurfaceCommit, SurfaceState, ViewportState,
+    is_valid_transform, transformed_extent, Context, DamageRect, PostDispatch, ShadowTable,
+    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 use crate::wire::Action;
 use log::trace;
@@ -954,10 +954,11 @@ impl WlSurfaceHandler for CompositorHandler {
 
     fn on_attach(&mut self, ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
         let surface_id = ctx.last_sender_id;
-        let object_version = ctx.shadow_table.guest_object_version(surface_id);
-        if object_version.is_some_and(|version| version != u32::MAX && version >= 5)
-            && (x != 0 || y != 0)
-        {
+        // Objects of unknown version keep the permissive pre-offset rules.
+        let version = ctx.shadow_table.guest_object_version_or_unknown(surface_id);
+        let has_offset_request =
+            !ShadowTable::is_unknown_version(version) && version >= REQ_OFFSET_SINCE;
+        if has_offset_request && (x != 0 || y != 0) {
             // wl_surface v5 made non-zero attach offsets a protocol error;
             // clients must use wl_surface.offset instead. Do not let an
             // invalid request reach the host compositor.
@@ -986,9 +987,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // (and non-zero values were rejected above). Keep them out of the
         // legacy pending-offset slot so a legal attach(buffer, 0, 0) cannot
         // reset a previously committed wl_surface.offset.
-        let legacy_attach_offset =
-            object_version.is_none_or(|version| version < 5 || version == u32::MAX);
-        if buffer != 0 && legacy_attach_offset {
+        if buffer != 0 && !has_offset_request {
             surface_state.pending_attach_offset = Some((x, y));
         }
         // A pending native buffer can be destroyed before the commit that
