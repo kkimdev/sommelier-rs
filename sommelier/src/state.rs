@@ -29,7 +29,7 @@ use self::render::RenderBufferRegistry;
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
-use log::warn;
+use log::{debug, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -883,6 +883,10 @@ pub struct Context {
     /// Explicitly configured compositor-owned placement shortcuts. An empty
     /// list means the feature consumes no keyboard chords.
     pub window_placement_shortcuts: Vec<crate::accelerator::WindowPlacementShortcut>,
+    /// Shared `--window-shortcuts-config` bindings followed by this
+    /// connection. A reloaded generation replaces
+    /// `window_placement_shortcuts` before the next key press is matched.
+    window_placement_shortcut_updates: Option<crate::window_shortcuts::ShortcutSubscription>,
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
@@ -1277,38 +1281,20 @@ impl Context {
             }
         };
 
-        let (accelerators, accelerators_valid) = match utf8_env("SOMMELIER_ACCELERATORS") {
-            Ok(Some(accelerators_env)) => {
-                match crate::accelerator::parse_accelerators(&accelerators_env) {
-                    Ok(list) => (list, true),
-                    Err(e) => {
-                        // A malformed accelerator config should not crash the proxy —
-                        // that would break every app in the container. Degrade to no
-                        // filtering (all keys forwarded to the guest), but retain the
-                        // invalid state so placement shortcuts cannot accidentally
-                        // bypass a conflict check against an empty list.
-                        warn!(
-                            "Invalid SOMMELIER_ACCELERATORS '{}': {}. \
-                         Accelerator filtering disabled.",
-                            accelerators_env, e
-                        );
-                        (Vec::new(), false)
-                    }
+        let (accelerators, accelerators_valid) =
+            match crate::accelerator::host_accelerators_from_environment() {
+                Ok(list) => (list, true),
+                Err(error) => {
+                    // A malformed accelerator config should not crash the proxy —
+                    // that would break every app in the container. Degrade to no
+                    // filtering (all keys forwarded to the guest), but retain the
+                    // invalid state so placement shortcuts cannot accidentally
+                    // bypass a conflict check against an empty list. A non-UTF-8
+                    // value is malformed rather than unset for the same reason.
+                    warn!("{}. Accelerator filtering disabled.", error);
+                    (Vec::new(), false)
                 }
-            }
-            Ok(None) => (Vec::new(), true),
-            Err(()) => {
-                // Environment values are bytes on Unix. Treat a non-UTF-8
-                // value as malformed rather than as an unset variable: the
-                // placement conflict gate must fail closed even when the
-                // accelerator list cannot be rendered in a warning.
-                warn!(
-                    "Invalid SOMMELIER_ACCELERATORS (value is not UTF-8). \
-                 Accelerator filtering disabled."
-                );
-                (Vec::new(), false)
-            }
-        };
+            };
         let window_placement = WindowPlacementState::from_environment();
         let window_placement_env = match utf8_env("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS") {
             Ok(Some(value)) => value,
@@ -1404,6 +1390,7 @@ impl Context {
             keyboard_keysym_to_keycode: HashMap::new(),
             accelerators,
             window_placement_shortcuts,
+            window_placement_shortcut_updates: None,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1487,6 +1474,41 @@ impl Context {
         // the runtime-only ARC bounds workaround for an isolated proxy.
         ctx.window_placement = WindowPlacementState::for_test();
         ctx
+    }
+
+    /// Follow the shared shortcut configuration file for this connection.
+    ///
+    /// The bindings are adopted only when this connection's ARC bounds policy
+    /// is active (the process gate is on and an identity block was reserved);
+    /// otherwise placement could never be applied and no chord is consumed.
+    /// Startup guarantees `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` is unset when
+    /// a configuration file is in use, so the file is the only source.
+    pub(crate) fn follow_window_placement_shortcuts(
+        &mut self,
+        mut subscription: crate::window_shortcuts::ShortcutSubscription,
+    ) {
+        if !self.window_placement.uses_arc_bounds() {
+            debug!("window shortcut config ignored: ARC bounds policy is inactive");
+            return;
+        }
+        self.window_placement_shortcuts = subscription.current().to_vec();
+        self.window_placement_shortcut_updates = Some(subscription);
+    }
+
+    /// Adopt a shortcut generation published by a reload, if one is pending.
+    ///
+    /// Called on the key-press path before a chord is matched, so every press
+    /// sees one complete generation. Keys already captured as compositor
+    /// shortcuts are tracked by key ownership, not by binding, so dropping a
+    /// binding cannot strand a held key.
+    pub(crate) fn refresh_window_placement_shortcuts(&mut self) {
+        if let Some(bindings) = self
+            .window_placement_shortcut_updates
+            .as_mut()
+            .and_then(crate::window_shortcuts::ShortcutSubscription::take_update)
+        {
+            self.window_placement_shortcuts = bindings.to_vec();
+        }
     }
 
     /// Return the first output with a usable mode.
@@ -1675,6 +1697,76 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::fd::{FromRawFd, OwnedFd};
+
+    fn shortcut_source(
+        dir: &crate::test_support::TempDir,
+        text: &str,
+    ) -> crate::window_shortcuts::ShortcutConfigSource {
+        let path = dir.write("shortcuts.toml", text.as_bytes());
+        crate::window_shortcuts::ShortcutConfigSource::load(path, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn followed_shortcut_config_refreshes_only_after_a_valid_reload() {
+        let dir = crate::test_support::TempDir::new("context-shortcut-follow");
+        let source = shortcut_source(
+            &dir,
+            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
+        );
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.window_placement.set_arc_bounds_for_test(true);
+        ctx.follow_window_placement_shortcuts(source.subscribe());
+        assert_eq!(ctx.window_placement_shortcuts.len(), 1);
+        assert_eq!(
+            ctx.window_placement_shortcuts[0].action,
+            crate::accelerator::WindowLayoutAction::Left
+        );
+
+        dir.write("shortcuts.toml", b"version = 1\nbindings = 3\n");
+        assert!(source.reload().is_err());
+        ctx.refresh_window_placement_shortcuts();
+        assert_eq!(
+            ctx.window_placement_shortcuts[0].action,
+            crate::accelerator::WindowLayoutAction::Left,
+            "an invalid reload keeps the last known-good bindings"
+        );
+
+        dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
+        );
+        source.reload().unwrap();
+        assert_eq!(
+            ctx.window_placement_shortcuts[0].action,
+            crate::accelerator::WindowLayoutAction::Left,
+            "a connection adopts a reload only when it next matches a key"
+        );
+        ctx.refresh_window_placement_shortcuts();
+        assert_eq!(
+            ctx.window_placement_shortcuts[0].action,
+            crate::accelerator::WindowLayoutAction::Right
+        );
+        assert!(
+            ctx.window_placement.uses_arc_bounds(),
+            "reload never changes the gate"
+        );
+    }
+
+    #[test]
+    fn shortcut_config_is_ignored_without_an_active_arc_policy() {
+        let dir = crate::test_support::TempDir::new("context-shortcut-gate");
+        let source = shortcut_source(
+            &dir,
+            "version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
+        );
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.follow_window_placement_shortcuts(source.subscribe());
+        assert!(ctx.window_placement_shortcuts.is_empty());
+        source.reload().unwrap();
+        ctx.refresh_window_placement_shortcuts();
+        assert!(ctx.window_placement_shortcuts.is_empty());
+        assert!(!ctx.window_placement.uses_arc_bounds());
+    }
 
     fn awaiting_release(has_detached_use: bool) -> RenderBufferUse {
         RenderBufferUse::AwaitingRelease { has_detached_use }

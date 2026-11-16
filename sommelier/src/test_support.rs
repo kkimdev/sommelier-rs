@@ -17,6 +17,7 @@ limitations under the License.
 //! Shared helpers for unit tests.
 
 use std::os::fd::RawFd;
+use std::path::{Path, PathBuf};
 
 /// The `(device, inode)` pair of an open file description.
 ///
@@ -53,4 +54,44 @@ pub fn any_fd_has_identity(identity: TestFdIdentity) -> bool {
         .filter_map(|entry| entry.file_name().to_str()?.parse::<RawFd>().ok())
         .filter_map(try_fd_identity)
         .any(|current| current == identity)
+}
+
+/// A uniquely named scratch directory removed when dropped.
+///
+/// Tests run in parallel inside one process, so the name combines the process
+/// ID, a caller label, and a per-process counter.
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// Create a fresh directory under the system temporary directory.
+    pub fn new(label: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sommelier-test-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create test directory");
+        Self { path }
+    }
+
+    /// Return the directory path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Replace the file `name` with `contents` and return its path.
+    pub fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.path.join(name);
+        std::fs::write(&path, contents).expect("write test file");
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }

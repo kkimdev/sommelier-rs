@@ -74,7 +74,11 @@ pub struct Accelerator {
 /// from a fixed set of keysyms in the keyboard event path.  This keeps keyboard
 /// ownership policy at the process boundary and lets deployments choose a
 /// layout without changing the proxy binary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every action resolves to a normalized work-area rectangle through
+/// [`WindowLayoutAction::rect`] (see `crate::window_layout`), so named presets
+/// and configured rectangles share one rounding rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WindowLayoutAction {
     TopLeft,
     Top,
@@ -85,9 +89,36 @@ pub(crate) enum WindowLayoutAction {
     BottomLeft,
     Bottom,
     BottomRight,
+    /// An arbitrary validated rectangle from the shortcut configuration file.
+    Rect(crate::window_layout::NormalizedRect),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Resolve a named placement action, case-insensitively.
+///
+/// # Arguments
+///
+/// * `name` - one of `top-left`, `top`, `top-right`, `left`, `fullscreen`,
+///   `right`, `bottom-left`, `bottom`, or `bottom-right`.
+///
+/// # Returns
+///
+/// The matching preset, or `None` for any other spelling.
+pub(crate) fn parse_window_layout_action(name: &str) -> Option<WindowLayoutAction> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "top-left" => Some(WindowLayoutAction::TopLeft),
+        "top" => Some(WindowLayoutAction::Top),
+        "top-right" => Some(WindowLayoutAction::TopRight),
+        "left" => Some(WindowLayoutAction::Left),
+        "fullscreen" => Some(WindowLayoutAction::Fullscreen),
+        "right" => Some(WindowLayoutAction::Right),
+        "bottom-left" => Some(WindowLayoutAction::BottomLeft),
+        "bottom" => Some(WindowLayoutAction::Bottom),
+        "bottom-right" => Some(WindowLayoutAction::BottomRight),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowPlacementShortcut {
     pub(crate) accelerator: Accelerator,
     pub(crate) action: WindowLayoutAction,
@@ -170,6 +201,33 @@ pub fn parse_accelerators(s: &str) -> Result<Vec<Accelerator>, ParseError> {
     Ok(result)
 }
 
+/// Read and parse `SOMMELIER_ACCELERATORS` from the process environment.
+///
+/// # Returns
+///
+/// The host accelerator list; an unset variable means an empty list.
+///
+/// # Errors
+///
+/// Returns a diagnostic when the value is not UTF-8 or does not parse. Callers
+/// decide whether that degrades filtering or fails closed.
+pub(crate) fn host_accelerators_from_environment() -> Result<Vec<Accelerator>, String> {
+    host_accelerators_from_value(std::env::var("SOMMELIER_ACCELERATORS"))
+}
+
+fn host_accelerators_from_value(
+    value: Result<String, std::env::VarError>,
+) -> Result<Vec<Accelerator>, String> {
+    match value {
+        Ok(value) => parse_accelerators(&value)
+            .map_err(|error| format!("Invalid SOMMELIER_ACCELERATORS '{}': {}", value, error)),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("Invalid SOMMELIER_ACCELERATORS (value is not UTF-8)".to_string())
+        }
+    }
+}
+
 /// Parse compositor-owned window placement bindings.
 ///
 /// The format is a comma-separated list of `CHORD=ACTION` pairs, for example:
@@ -197,25 +255,13 @@ pub(crate) fn parse_window_placement_shortcuts(
         })?;
         let accelerator = parse_accelerator(chord.trim())
             .map_err(|error| format!("binding {} has invalid chord: {}", index, error))?;
-        let action_name = action.trim().to_ascii_lowercase();
-        let action = match action_name.as_str() {
-            "top-left" => WindowLayoutAction::TopLeft,
-            "top" => WindowLayoutAction::Top,
-            "top-right" => WindowLayoutAction::TopRight,
-            "left" => WindowLayoutAction::Left,
-            "fullscreen" => WindowLayoutAction::Fullscreen,
-            "right" => WindowLayoutAction::Right,
-            "bottom-left" => WindowLayoutAction::BottomLeft,
-            "bottom" => WindowLayoutAction::Bottom,
-            "bottom-right" => WindowLayoutAction::BottomRight,
-            _ => {
-                return Err(format!(
-                    "binding {} has unsupported action {:?}",
-                    index,
-                    action.trim()
-                ));
-            }
-        };
+        let action = parse_window_layout_action(action).ok_or_else(|| {
+            format!(
+                "binding {} has unsupported action {:?}",
+                index,
+                action.trim()
+            )
+        })?;
         if bindings
             .iter()
             .any(|binding: &WindowPlacementShortcut| binding.accelerator == accelerator)
@@ -329,6 +375,27 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].modifiers, SUPER_MASK);
         assert_eq!(list[0].symbol, xkb::keysyms::KEY_space);
+    }
+
+    #[test]
+    fn host_accelerator_environment_value_is_unset_valid_or_invalid() {
+        use std::env::VarError;
+        assert_eq!(
+            host_accelerators_from_value(Err(VarError::NotPresent)),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            host_accelerators_from_value(Ok("<Alt>a".to_string())),
+            Ok(vec![parse_accelerator("<Alt>a").unwrap()])
+        );
+        assert!(host_accelerators_from_value(Ok("<Hyper>a".to_string()))
+            .unwrap_err()
+            .starts_with("Invalid SOMMELIER_ACCELERATORS '<Hyper>a'"));
+        assert!(
+            host_accelerators_from_value(Err(VarError::NotUnicode(std::ffi::OsString::from("x"))))
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
     }
 
     #[test]

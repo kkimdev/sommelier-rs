@@ -3797,7 +3797,25 @@ pub async fn run(
     gpu_accel: bool,
     xdg_decoration: bool,
     virtio_wayland: Option<String>,
+    window_shortcuts: Option<crate::window_shortcuts::ShortcutConfigSource>,
 ) {
+    // SIGHUP reloads the shortcut configuration file. The handler is
+    // installed only when a file is in use, so otherwise SIGHUP keeps its
+    // default disposition (terminate). Tokio delivers the signal through its
+    // own self-pipe, and the reload runs on this event loop between accepts.
+    let mut reload_signal = window_shortcuts.as_ref().map(|_| {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(signal) => signal,
+            Err(e) => {
+                log::error!(
+                    "Failed to install the SIGHUP shortcut reload handler: {}",
+                    e
+                );
+                std::process::exit(1);
+            }
+        }
+    });
+
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
             .read(true)
@@ -3831,7 +3849,16 @@ pub async fn run(
     local
         .run_until(async move {
             loop {
-                match listener.accept().await {
+                let accepted = tokio::select! {
+                    Some(()) = next_reload_signal(&mut reload_signal) => {
+                        if let Some(source) = &window_shortcuts {
+                            source.reload_and_log();
+                        }
+                        continue;
+                    }
+                    accepted = listener.accept() => accepted,
+                };
+                match accepted {
                     Ok((stream, _)) => {
                         log::info!("New client connected");
 
@@ -3901,6 +3928,11 @@ pub async fn run(
                             if let Some(channel) = virtwayland_channel_ref {
                                 client.ctx.virtwayland_channel = Some(channel);
                             }
+                            if let Some(source) = &window_shortcuts {
+                                client
+                                    .ctx
+                                    .follow_window_placement_shortcuts(source.subscribe());
+                            }
 
                             tokio::task::spawn_local(async move {
                                 client.run().await;
@@ -3917,4 +3949,12 @@ pub async fn run(
             }
         })
         .await;
+}
+
+/// Wait for the next shortcut reload signal; never resolves without one.
+async fn next_reload_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+    match signal {
+        Some(signal) => signal.recv().await,
+        None => std::future::pending().await,
+    }
 }

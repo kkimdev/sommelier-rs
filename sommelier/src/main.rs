@@ -29,6 +29,8 @@ mod state;
 mod test_support;
 mod virtwl;
 mod virtwl_channel;
+mod window_layout;
+mod window_shortcuts;
 mod wire;
 
 mod protocols {
@@ -90,6 +92,15 @@ struct Args {
     #[arg(long)]
     virtio_wl: Option<String>,
 
+    /// Read window placement shortcut bindings from a versioned TOML file.
+    ///
+    /// Used only when SOMMELIER_WINDOW_BOUNDS_AS_ARC is set, and mutually
+    /// exclusive with SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS. An invalid file is
+    /// a startup error; SIGHUP reloads it and keeps the previous bindings if
+    /// the new file is invalid.
+    #[arg(long, value_name = "PATH")]
+    window_shortcuts_config: Option<std::path::PathBuf>,
+
     /// The display name (e.g. wayland-proxy-0)
     #[arg(default_value = "wayland-proxy-0")]
     display: String,
@@ -106,6 +117,15 @@ async fn main() {
     let gpu_accel = args.gpu_accel;
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
+    let window_shortcuts = match window_shortcuts::startup_source_from_environment(
+        args.window_shortcuts_config.as_deref(),
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            log::error!("{}", error);
+            std::process::exit(2);
+        }
+    };
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
@@ -124,6 +144,7 @@ async fn main() {
         gpu_accel,
         xdg_decoration,
         virtio_wl,
+        window_shortcuts,
     )
     .await;
 }

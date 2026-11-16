@@ -217,6 +217,7 @@ test uses `/dev/wl0`.
 | `--virtio-wl PATH` | VirtWL device path; Crostini normally uses `/dev/wl0`. |
 | `--xdg-decoration` | Enable XDG decoration forwarding. |
 | `--local-compositor PATH` | Use a local compositor for debugging instead of VirtWL. |
+| `--window-shortcuts-config PATH` | Optional versioned TOML file of placement bindings (named actions or work-area rects), read only with the ARC policy gate; mutually exclusive with `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`; `SIGHUP` reloads it. |
 
 When both `SOMMELIER_WINDOW_BOUNDS_AS_ARC` and
 `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` are set, Sommelier handles the
@@ -228,6 +229,32 @@ on multi-monitor setups, with a deterministic usable-output fallback. For exampl
 SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
 SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
 ```
+
+The same bindings, plus arbitrary rectangles given as `[x, y, width, height]`
+fractions of the work area, can instead live in a TOML file:
+
+```toml
+# ~/.config/sommelier/shortcuts.toml
+version = 1
+
+[[bindings]]
+chord = "<Alt>q"
+action = "top-left"
+
+[[bindings]]
+chord = "<Alt>w"
+rect = [0.25, 0.0, 0.5, 1.0] # centered half-width column
+```
+
+```text
+SOMMELIER_WINDOW_BOUNDS_AS_ARC=1 sommelier-rs --window-shortcuts-config ~/.config/sommelier/shortcuts.toml ...
+kill -HUP <pid>   # reload; an invalid file keeps the previous bindings
+```
+
+An invalid file, or setting both the file and
+`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, stops startup with exit status 2.
+[`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md)
+describes the schema, validation, rounding rule, and reload semantics.
 
 Work areas use Aura's current output scale and device scale factor, then apply
 the logical rotation and insets. Placement waits for both scale factors to be

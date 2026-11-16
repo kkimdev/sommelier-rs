@@ -368,67 +368,17 @@ impl KeyboardHandler {
         ctx.client_to_host_queue.truncate(queue_start);
     }
 
+    /// Resolve the screen bounds for a placement action on an output.
+    ///
+    /// The action's normalized rectangle is mapped into the output work area
+    /// by [`crate::window_layout::NormalizedRect::to_work_area_bounds`], which
+    /// owns the rounding rule. Returns `None` when the output has no usable
+    /// work area or the rectangle cannot be represented in it.
     fn bounds_for_action(
         action: WindowLayoutAction,
         output: crate::state::OutputState,
     ) -> Option<(i32, i32, i32, i32)> {
-        let (x, y, width, height) = output.work_area()?;
-        let half_width = width / 2;
-        let half_height = height / 2;
-        if matches!(
-            action,
-            WindowLayoutAction::TopLeft
-                | WindowLayoutAction::TopRight
-                | WindowLayoutAction::BottomLeft
-                | WindowLayoutAction::BottomRight
-                | WindowLayoutAction::Left
-                | WindowLayoutAction::Right
-        ) && half_width <= 0
-        {
-            return None;
-        }
-        if matches!(
-            action,
-            WindowLayoutAction::TopLeft
-                | WindowLayoutAction::Top
-                | WindowLayoutAction::TopRight
-                | WindowLayoutAction::BottomLeft
-                | WindowLayoutAction::Bottom
-                | WindowLayoutAction::BottomRight
-        ) && half_height <= 0
-        {
-            return None;
-        }
-        match action {
-            WindowLayoutAction::TopLeft => Some((x, y, half_width, half_height)),
-            WindowLayoutAction::Top => Some((x, y, width, half_height)),
-            WindowLayoutAction::TopRight => Some((
-                x.checked_add(half_width)?,
-                y,
-                width - half_width,
-                half_height,
-            )),
-            WindowLayoutAction::BottomLeft => Some((
-                x,
-                y.checked_add(half_height)?,
-                half_width,
-                height - half_height,
-            )),
-            WindowLayoutAction::Bottom => {
-                Some((x, y.checked_add(half_height)?, width, height - half_height))
-            }
-            WindowLayoutAction::BottomRight => Some((
-                x.checked_add(half_width)?,
-                y.checked_add(half_height)?,
-                width - half_width,
-                height - half_height,
-            )),
-            WindowLayoutAction::Left => Some((x, y, half_width, height)),
-            WindowLayoutAction::Fullscreen => Some((x, y, width, height)),
-            WindowLayoutAction::Right => {
-                Some((x.checked_add(half_width)?, y, width - half_width, height))
-            }
-        }
+        action.rect().to_work_area_bounds(output.work_area()?)
     }
 
     fn apply_window_layout(
@@ -1082,9 +1032,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             WL_KEY_PRESSED => match guest_owner {
                 Some(GuestKeyOwner::CompositorShortcut) => true,
                 Some(_) => false,
-                None => self
-                    .window_layout_action(ctx, host_keyboard_id, key)
-                    .is_some_and(|action| Self::apply_window_layout(ctx, host_keyboard_id, action)),
+                None => {
+                    // Adopt a reloaded shortcut generation before matching.
+                    ctx.refresh_window_placement_shortcuts();
+                    self.window_layout_action(ctx, host_keyboard_id, key)
+                        .is_some_and(|action| {
+                            Self::apply_window_layout(ctx, host_keyboard_id, action)
+                        })
+                }
             },
             WL_KEY_REPEATED | WL_KEY_RELEASED => {
                 guest_owner == Some(GuestKeyOwner::CompositorShortcut)
@@ -2093,6 +2048,72 @@ mod tests {
                     && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
             })
             .count()
+    }
+
+    /// The `[x, y, width, height]` of the single queued bounds request.
+    fn queued_bounds_payload(ctx: &Context) -> [i32; 4] {
+        let aura_toplevel = ctx
+            .window_placement
+            .aura_toplevel_for_xdg_toplevel(13)
+            .expect("Aura toplevel mapping");
+        let bounds = ctx
+            .client_to_host_queue
+            .iter()
+            .find(|message| {
+                message_sender(message) == aura_toplevel
+                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+            })
+            .expect("window bounds request");
+        let field =
+            |offset: usize| i32::from_ne_bytes(bounds.0[offset..offset + 4].try_into().unwrap());
+        [field(8), field(12), field(16), field(20)]
+    }
+
+    #[test]
+    fn shortcut_config_reload_takes_effect_on_the_next_press() {
+        let (mut handler, mut ctx, key) = placeable_shortcut_fixture();
+        let keyboard = HostId(5);
+        let dir = crate::test_support::TempDir::new("keyboard-shortcut-reload");
+        let path = dir.write("shortcuts.toml", b"version = 1\n");
+        let source = crate::window_shortcuts::ShortcutConfigSource::load(path, Vec::new()).unwrap();
+        ctx.follow_window_placement_shortcuts(source.subscribe());
+        assert!(
+            ctx.window_placement_shortcuts.is_empty(),
+            "the followed file is the only binding source"
+        );
+
+        dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\nrect = [0.25, 0.0, 0.5, 1.0]\n",
+        );
+        source.reload().unwrap();
+        assert_eq!(
+            handler.on_key(&mut ctx, 1, 100, key, WL_KEY_PRESSED),
+            Action::Drop,
+            "the reloaded chord is consumed by the compositor"
+        );
+        assert_eq!(queued_bounds_payload(&ctx), [960, 0, 1920, 2160]);
+        assert_eq!(
+            ctx.guest_key_owner(keyboard, key),
+            Some(GuestKeyOwner::CompositorShortcut)
+        );
+
+        // Removing the binding while the key is held still suppresses the
+        // matching release: ownership, not the binding, owns the release.
+        dir.write("shortcuts.toml", b"version = 1\n");
+        source.reload().unwrap();
+        assert_eq!(
+            handler.on_key(&mut ctx, 2, 101, key, WL_KEY_RELEASED),
+            Action::Drop
+        );
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
+        ctx.client_to_host_queue.clear();
+        assert_eq!(
+            handler.on_key(&mut ctx, 3, 102, key, WL_KEY_PRESSED),
+            Action::Forward,
+            "a removed binding is delivered to the guest"
+        );
+        assert_eq!(queued_window_bounds(&ctx), 0);
     }
 
     #[test]
