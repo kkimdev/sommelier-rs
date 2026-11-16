@@ -921,7 +921,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // that the shell object and its version are available; the
                 // output bind path cannot do this retroactively on its own.
                 for output_host_id in ctx.outputs.live_outputs() {
-                    // The output registry records the new Aura output.
                     crate::handler::aura_objects::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
@@ -1227,9 +1226,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             );
             if ctx.window_placement.uses_arc_bounds() {
                 // Host-only Aura output metadata (scale factors and insets).
-                // A missing shell is retried when zaura_shell binds, so a
-                // failure here is not an error.
-                let _ = crate::handler::aura_objects::ensure_zaura_output(ctx, host_new_id);
+                // A missing shell is retried when zaura_shell binds.
+                crate::handler::aura_objects::ensure_zaura_output(ctx, host_new_id);
             }
         }
         if interface == "zwp_linux_dmabuf_v1" {
@@ -1802,7 +1800,7 @@ mod tests {
         );
         let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
         assert_eq!(
-            ctx.outputs.aura_output_for_test(output_host),
+            ctx.outputs.aura_output(output_host),
             None,
             "Aura output must wait for the shell binding"
         );
@@ -1810,7 +1808,7 @@ mod tests {
         let shell = "zaura_shell".to_string();
         assert_eq!(handler.on_global(&mut ctx, 11, &shell, 38), Action::Drop);
         assert!(
-            ctx.outputs.aura_output_for_test(output_host).is_some(),
+            ctx.outputs.aura_output(output_host).is_some(),
             "late shell binding must attach every already-bound output"
         );
     }

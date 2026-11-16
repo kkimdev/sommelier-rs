@@ -29,9 +29,8 @@ limitations under the License.
 //! | `zaura_output` | [`crate::state::OutputRegistry`] | placement metadata |
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
-use crate::state::{Context, ShadowTable};
+use crate::state::Context;
 use crate::wire::MessageBuilder;
-use std::os::fd::RawFd;
 
 /// What the proxy needs to know about one kind of host Aura child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,38 +97,18 @@ pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u3
 ///
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
-    create_from_parts(
-        &mut ctx.shadow_table,
-        &mut ctx.client_to_host_queue,
-        ctx.host_zaura_shell_id,
-        ctx.host_zaura_shell_version,
-        child,
-        parent_host_id,
-    )
-}
-
-/// [`create`] on borrowed `Context` fields, for a caller that already
-/// borrows another field (the output registry).
-fn create_from_parts(
-    shadow_table: &mut ShadowTable,
-    client_to_host_queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    shell_host_id: Option<u32>,
-    shell_version: u32,
-    child: AuraChild,
-    parent_host_id: u32,
-) -> Option<u32> {
-    let shell_host_id = shell_host_id?;
-    let child_host_id = shadow_table.allocate_host_id();
-    shadow_table.track_host_interface_with_version(
+    let shell_host_id = ctx.host_zaura_shell_id?;
+    let child_host_id = ctx.shadow_table.allocate_host_id();
+    ctx.shadow_table.track_host_interface_with_version(
         child_host_id,
         child.interface.to_string(),
-        shell_version,
+        ctx.host_zaura_shell_version,
     );
     let mut builder = MessageBuilder::new();
     builder.write_u32(child_host_id);
     builder.write_u32(parent_host_id);
     let message = builder.build_message(shell_host_id, child.get_opcode);
-    client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue.push((message, Vec::new()));
     Some(child_host_id)
 }
 
@@ -186,31 +165,21 @@ pub(crate) fn release_host_zaura_surface(ctx: &mut Context, wl_surface_host_id: 
     }
 }
 
-/// Return the host-only `zaura_output` of a bound output, creating it if
-/// the output is still live (see [`crate::state::OutputRegistry::ensure_aura_output`]).
+/// Give a live output its host-only `zaura_output` if it has none yet.
 ///
 /// It carries the Aura scale factors, logical transform and work-area insets
-/// that placement needs. The guest only sees the plain `wl_output`;
-/// `wl_output.release` releases this child first.
-///
-/// # Returns
-///
-/// The `zaura_output` host ID, or `None` when the output has none and is not
-/// live, or no `zaura_shell` is bound yet.
-pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> Option<u32> {
-    let shadow_table = &mut ctx.shadow_table;
-    let client_to_host_queue = &mut ctx.client_to_host_queue;
-    let (shell_host_id, shell_version) = (ctx.host_zaura_shell_id, ctx.host_zaura_shell_version);
-    ctx.outputs.ensure_aura_output(wl_output_host_id, || {
-        create_from_parts(
-            shadow_table,
-            client_to_host_queue,
-            shell_host_id,
-            shell_version,
-            AuraChild::OUTPUT,
-            wl_output_host_id,
-        )
-    })
+/// that placement needs; the guest only sees the plain `wl_output`. Without a
+/// bound `zaura_shell` nothing is created, and binding one retries.
+pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) {
+    if ctx.outputs.aura_output(wl_output_host_id).is_some()
+        || !ctx.outputs.is_live(wl_output_host_id)
+    {
+        return;
+    }
+    if let Some(zaura_output_host_id) = create(ctx, AuraChild::OUTPUT, wl_output_host_id) {
+        ctx.outputs
+            .remember_aura_output(wl_output_host_id, zaura_output_host_id);
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +257,29 @@ mod tests {
             assert!(!ctx.shadow_table.is_pending_destroy_host_only(id));
             assert!(!ctx.shadow_table.is_host_id_available(id));
         }
+    }
+
+    #[test]
+    fn only_a_live_output_without_one_gets_an_aura_output() {
+        let mut ctx = ctx_with_shell(crate::protocols::aura_shell::zaura_shell::VERSION);
+        ctx.outputs
+            .bind_for_test(PARENT_HOST, crate::state::OutputState::default());
+        ensure_zaura_output(&mut ctx, PARENT_HOST);
+        let aura_output = ctx.outputs.aura_output(PARENT_HOST).expect("Aura output");
+        ensure_zaura_output(&mut ctx, PARENT_HOST);
+        assert_eq!(ctx.client_to_host_queue.len(), 1, "an output gets one");
+        assert_eq!(ctx.outputs.aura_output(PARENT_HOST), Some(aura_output));
+
+        let inactive = PARENT_HOST + 1;
+        ctx.outputs
+            .bind_for_test(inactive, crate::state::OutputState::default());
+        ctx.outputs.deactivate(crate::state::GlobalBinding {
+            name: inactive,
+            generation: 1,
+        });
+        ctx.client_to_host_queue.clear();
+        ensure_zaura_output(&mut ctx, inactive);
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(ctx.outputs.aura_output(inactive), None);
     }
 }

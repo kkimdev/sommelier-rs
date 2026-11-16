@@ -1687,7 +1687,7 @@ mod tests {
         ctx.outputs.update(OUTPUT_HOST, |state| *state = committed);
         ctx.outputs.commit(OUTPUT_HOST);
         ctx.outputs
-            .ensure_aura_output(OUTPUT_HOST, || Some(AURA_OUTPUT_HOST));
+            .remember_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
         ctx.shadow_table.track_host_interface_with_version(
             AURA_OUTPUT_HOST,
             "zaura_output".into(),
