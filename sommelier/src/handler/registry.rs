@@ -18,7 +18,9 @@ use crate::handler::display::queue_protocol_error;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
-use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
+use crate::protocols::aura_shell::zaura_shell::{
+    REQ_RELEASE as ZAURA_SHELL_RELEASE, REQ_RELEASE_SINCE as ZAURA_SHELL_RELEASE_SINCE,
+};
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
@@ -445,7 +447,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // registry remover. New children cannot be created until a replacement
         // shell global is advertised and rebound.
         if let Some(host_id) = shell_id {
-            if shell_version >= 38 {
+            if shell_version >= ZAURA_SHELL_RELEASE_SINCE {
                 let message = MessageBuilder::new().build_message(host_id, ZAURA_SHELL_RELEASE);
                 ctx.client_to_host_queue.push((message, Vec::new()));
                 ctx.shadow_table.mark_pending_destroy_host(host_id);
