@@ -18,8 +18,11 @@ use crate::handler::display::queue_protocol_error;
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::{
     ZauraOutputHandler, REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT,
+    REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
 };
-use crate::protocols::aura_shell::zaura_shell::{REQ_GET_AURA_OUTPUT, REQ_GET_AURA_SURFACE};
+use crate::protocols::aura_shell::zaura_shell::{
+    REQ_GET_AURA_OUTPUT, REQ_GET_AURA_OUTPUT_SINCE, REQ_GET_AURA_SURFACE,
+};
 use crate::protocols::aura_shell::zaura_surface::{
     REQ_RELEASE, REQ_RELEASE_SINCE, REQ_SET_APPLICATION_ID, REQ_SET_APPLICATION_ID_SINCE,
 };
@@ -154,12 +157,6 @@ const WL_OUTPUT_MODE_CURRENT: u32 = 1;
 /// `zaura_output.scale_property.current` from the vendored protocol.
 const ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT: u32 = 1;
 
-/// `zaura_shell.get_aura_output` exists since this version.
-const ZAURA_SHELL_GET_AURA_OUTPUT_SINCE: u32 = 2;
-/// `zaura_output.release` exists since this version. Older `zaura_output`
-/// objects have no destructor request.
-const ZAURA_OUTPUT_RELEASE_SINCE: u32 = 38;
-
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
 /// forwarded unchanged. Events from a released output never get here: the
 /// proxy suppresses host events for objects awaiting `delete_id`. Events
@@ -237,11 +234,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for CompositorHandler
             return Action::Drop;
         };
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
-            let version = ctx
-                .shadow_table
-                .host_object_version(zaura_output_host_id)
-                .unwrap_or(ctx.host_zaura_shell_version);
-            if version >= ZAURA_OUTPUT_RELEASE_SINCE {
+            // Before zaura_output.release the object has no destructor
+            // request; its ID is retired instead.
+            if aura_object_version(ctx, zaura_output_host_id) >= REQ_RELEASE_AURA_OUTPUT_SINCE {
                 let message = crate::wire::MessageBuilder::new()
                     .build_message(zaura_output_host_id, REQ_RELEASE_AURA_OUTPUT);
                 ctx.client_to_host_queue.push((message, Vec::new()));
@@ -473,7 +468,7 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) -> 
     let client_to_host_queue = &mut ctx.client_to_host_queue;
     ctx.outputs.ensure_aura_output(wl_output_host_id, || {
         let zaura_shell_host_id = zaura_shell_host_id?;
-        if zaura_shell_version < ZAURA_SHELL_GET_AURA_OUTPUT_SINCE {
+        if zaura_shell_version < REQ_GET_AURA_OUTPUT_SINCE {
             return None;
         }
         let zaura_output_host_id = shadow_table.allocate_host_id();
@@ -2257,6 +2252,39 @@ mod tests {
         assert!(ctx
             .shadow_table
             .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
+    }
+
+    /// Before `zaura_output.release` the Aura output has no destructor: it is
+    /// retired without a request, and only the wl_output is released.
+    #[test]
+    fn aura_output_without_release_is_retired_silently() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let output_guest = 10;
+        ctx.shadow_table.map_id(output_guest, OUTPUT_HOST);
+        ctx.shadow_table
+            .track_interface_with_version(output_guest, "wl_output".into(), 3);
+        bind_output_with_aura(&mut ctx, 3, Default::default());
+        ctx.shadow_table.track_host_interface_with_version(
+            AURA_OUTPUT_HOST,
+            "zaura_output".into(),
+            REQ_RELEASE_AURA_OUTPUT_SINCE - 1,
+        );
+        ctx.last_sender_id = output_guest;
+        assert_eq!(
+            WlOutputHandler::on_release(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+        let queued = ctx
+            .client_to_host_queue
+            .iter()
+            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
+            .collect::<Vec<_>>();
+        assert_eq!(queued, vec![(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]);
+        assert!(!ctx
+            .shadow_table
+            .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
+        assert_eq!(ctx.shadow_table.get_host_interface(AURA_OUTPUT_HOST), None);
+        assert!(!ctx.shadow_table.is_host_id_available(AURA_OUTPUT_HOST));
     }
 
     #[test]
