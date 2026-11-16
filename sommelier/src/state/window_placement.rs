@@ -154,7 +154,7 @@ impl WindowPlacementState {
         Self {
             arc_id_allocator: Some(ArcIdAllocator::for_test(
                 crate::arc_task_ids::ARC_ID_POOL_START,
-                crate::arc_task_ids::ARC_ID_POOL_START + 1_000_000 - 1,
+                crate::arc_task_ids::ARC_ID_POOL_START + crate::arc_task_ids::ARC_ID_BLOCK_SIZE - 1,
             )),
             ..Self::default()
         }
