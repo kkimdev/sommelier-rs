@@ -1222,83 +1222,26 @@ mod tests {
         drop(client);
     }
 
-    #[tokio::test]
-    async fn failed_get_toplevel_does_not_create_internal_aura_object() {
+    const XDG_SURFACE: u32 = 10;
+    const XDG_SURFACE_HOST: u32 = 20;
+    const XDG_TOPLEVEL: u32 = 11;
+    const WL_SURFACE: u32 = 12;
+    const ZAURA_SHELL_HOST: u32 = 40;
+
+    /// A client with the ARC bounds policy on, a bound `zaura_shell`, and the
+    /// v6 xdg_surface `XDG_SURFACE` on wl_surface `WL_SURFACE`, with the
+    /// peers of its guest and host connections.
+    fn client_with_xdg_surface() -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
         use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::arc_bounds_for_test("")),
-        );
-        client.ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 40,
-            version: 38,
-        });
-        client.ctx.shadow_table.map_id(10, 20);
-        client
-            .ctx
-            .shadow_table
-            .track_interface_with_version(10, "xdg_surface".to_string(), 6);
-        client.ctx.shadow_table.set_host_version(20, 6);
-        client.ctx.shadow_table.mark_pending_destroy(10);
-
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(30);
-        let request =
-            builder.build_message(10, protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(
-            !client.handle_msgs(Direction::ClientToHost).await,
-            "a request from a pending xdg_surface must terminate the session"
-        );
-        assert!(
-            client.ctx.window_placement.aura_toplevel_count() == 0,
-            "failed get_toplevel requests must not leave an internal Aura child"
-        );
-    }
-
-    /// The (sender, opcode) of every message written to `peer` until EOF.
-    fn sent_messages(peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u16)> {
-        use std::io::Read;
-
-        let mut stream = Vec::new();
-        peer.read_to_end(&mut stream)
-            .expect("the peer stream should be readable");
-        let mut sent = Vec::new();
-        let mut rest = stream.as_slice();
-        while let Some((header, _)) = rest.split_first_chunk::<8>() {
-            let sender = u32::from_ne_bytes(header[0..4].try_into().unwrap());
-            let word = u32::from_ne_bytes(header[4..8].try_into().unwrap());
-            sent.push((sender, (word & 0xffff) as u16));
-            rest = &rest[(word >> 16) as usize..];
-        }
-        sent
-    }
-
-    /// A forwarded `xdg_surface.get_toplevel` records the XDG role and
-    /// attaches the placement Aura toplevel, whose requests follow the
-    /// forwarded request on the host stream.
-    #[tokio::test]
-    async fn forwarded_get_toplevel_records_the_role_after_the_request() {
-        use std::os::fd::IntoRawFd;
-        use std::os::unix::net::UnixStream;
-
-        const XDG_SURFACE: u32 = 10;
-        const XDG_SURFACE_HOST: u32 = 20;
-        const XDG_TOPLEVEL: u32 = 11;
-        const WL_SURFACE: u32 = 12;
-        const ZAURA_SHELL_HOST: u32 = 40;
-
-        let (guest_proxy, _guest_peer) =
+        let (guest_proxy, guest_peer) =
             UnixStream::pair().expect("guest socket pair should be created");
-        let (host_proxy, mut host_peer) =
+        let (host_proxy, host_peer) =
             UnixStream::pair().expect("host socket pair should be created");
         let mut client = Client::new(
             WaylandConnection::new(guest_proxy.into_raw_fd()),
@@ -1318,13 +1261,57 @@ mod tests {
         ctx.shadow_table.set_host_version(XDG_SURFACE_HOST, 6);
         ctx.shadow_table.map_id(WL_SURFACE, 22);
         ctx.xdg_roles.add_xdg_surface(XDG_SURFACE, WL_SURFACE);
+        (client, guest_peer, host_peer)
+    }
 
+    /// `xdg_surface.get_toplevel` creating `XDG_TOPLEVEL`, followed by the
+    /// extra payload words `trailing`.
+    fn get_toplevel_request(trailing: &[u32]) -> Vec<u8> {
         let mut builder = MessageBuilder::new();
         builder.write_u32(XDG_TOPLEVEL);
-        let request = builder.build_message(
+        for &word in trailing {
+            builder.write_u32(word);
+        }
+        builder.build_message(
             XDG_SURFACE,
             protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_get_toplevel_does_not_create_internal_aura_object() {
+        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
+        client.ctx.shadow_table.mark_pending_destroy(XDG_SURFACE);
+        let request = get_toplevel_request(&[]);
+        client.client_conn.read_buf.extend_from_slice(&request);
+
+        assert!(
+            !client.handle_msgs(Direction::ClientToHost).await,
+            "a request from a pending xdg_surface must terminate the session"
         );
+        assert!(
+            client.ctx.window_placement.aura_toplevel_count() == 0,
+            "failed get_toplevel requests must not leave an internal Aura child"
+        );
+    }
+
+    /// The (sender, opcode) of every message written to `peer` until EOF.
+    fn sent_messages(peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u16)> {
+        use std::io::Read;
+
+        let mut stream = Vec::new();
+        peer.read_to_end(&mut stream)
+            .expect("the peer stream should be readable");
+        crate::test_support::stream_headers(&stream)
+    }
+
+    /// A forwarded `xdg_surface.get_toplevel` records the XDG role and
+    /// attaches the placement Aura toplevel, whose requests follow the
+    /// forwarded request on the host stream.
+    #[tokio::test]
+    async fn forwarded_get_toplevel_records_the_role_after_the_request() {
+        let (mut client, _guest_peer, mut host_peer) = client_with_xdg_surface();
+        let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
         assert_eq!(
@@ -1363,39 +1350,15 @@ mod tests {
     /// Aura toplevel: the deferred work is discarded with the message.
     #[tokio::test]
     async fn rejected_get_toplevel_discards_its_deferred_work() {
-        use std::os::fd::IntoRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
-            false,
-            false,
-            Arc::new(PlacementConfig::arc_bounds_for_test("")),
-        );
-        let ctx = &mut client.ctx;
-        ctx.host_zaura_shell = Some(crate::state::HostAuraShell {
-            id: 40,
-            version: 38,
-        });
-        ctx.shadow_table.map_id(10, 20);
-        ctx.shadow_table
-            .track_interface_with_version(10, "xdg_surface".to_string(), 6);
-        ctx.shadow_table.set_host_version(20, 6);
-        ctx.shadow_table.map_id(12, 22);
-        ctx.xdg_roles.add_xdg_surface(10, 12);
-
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(30);
-        builder.write_u32(0);
-        let request =
-            builder.build_message(10, protocols::xdg_shell::xdg_surface::REQ_GET_TOPLEVEL);
+        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
+        let request = get_toplevel_request(&[0]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
         assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        assert_eq!(client.ctx.xdg_roles.toplevel_of_xdg_surface(10), None);
+        assert_eq!(
+            client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
+            None
+        );
         assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
         assert!(!client.ctx.has_post_dispatch());
     }

@@ -178,6 +178,7 @@ pub(crate) fn ensure_zaura_output(ctx: &mut Context, wl_output_host_id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::queued_headers;
 
     const SHELL_HOST: u32 = 0xff00_0001;
     const PARENT_HOST: u32 = 0xff00_0002;
@@ -192,24 +193,16 @@ mod tests {
         ctx
     }
 
-    fn queued(ctx: &Context) -> Vec<(u32, u16)> {
-        ctx.client_to_host_queue
-            .iter()
-            .map(|(message, _)| {
-                let sender = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-                let opcode = u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff;
-                (sender, opcode as u16)
-            })
-            .collect()
-    }
-
     #[test]
     fn create_queues_the_shell_request_with_the_shell_version() {
         let version = 17;
         for child in ALL {
             let mut ctx = ctx_with_shell(version);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
-            assert_eq!(queued(&ctx), vec![(SHELL_HOST, child.get_opcode)]);
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue),
+                vec![(SHELL_HOST, child.get_opcode)]
+            );
             assert_eq!(
                 ctx.client_to_host_queue[0].0[8..16],
                 [id.to_ne_bytes(), PARENT_HOST.to_ne_bytes()].concat()
@@ -237,7 +230,10 @@ mod tests {
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
             ctx.client_to_host_queue.clear();
             release(&mut ctx, child, id);
-            assert_eq!(queued(&ctx), vec![(id, child.release_opcode)]);
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue),
+                vec![(id, child.release_opcode)]
+            );
             assert!(ctx.shadow_table.is_pending_destroy_host_only(id));
 
             let mut ctx = ctx_with_shell(since - 1);

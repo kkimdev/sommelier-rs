@@ -1576,18 +1576,10 @@ mod tests {
     use crate::state::{
         BufferState, Context, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
     };
+    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::window_layout::Rect;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::{Arc, RwLock};
-
-    fn msg_sender(msg: &[u8]) -> u32 {
-        u32::from_ne_bytes(msg[0..4].try_into().unwrap())
-    }
-
-    fn msg_opcode(msg: &[u8]) -> u16 {
-        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
-        (word2 & 0xffff) as u16
-    }
 
     fn protocol_error_code(ctx: &Context) -> u32 {
         let message = &ctx.host_to_client_queue[0].0;
@@ -2085,11 +2077,7 @@ mod tests {
             WlOutputHandler::on_release(&mut CompositorHandler, &mut ctx),
             Action::Drop
         );
-        let queued = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
-            .collect::<Vec<_>>();
+        let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(queued, vec![(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]);
         assert!(!ctx
             .shadow_table

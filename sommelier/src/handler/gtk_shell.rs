@@ -180,6 +180,7 @@ mod tests {
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::state::GtkShellState;
+    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::WireMessage;
 
     const GTK_SHELL: u32 = 10;
@@ -218,16 +219,9 @@ mod tests {
         ctx
     }
 
-    fn sender(message: &[u8]) -> u32 {
-        u32::from_ne_bytes(message[0..4].try_into().unwrap())
-    }
-
-    fn opcode(message: &[u8]) -> u16 {
-        u32::from_ne_bytes(message[4..8].try_into().unwrap()) as u16
-    }
-
     fn nullable_string(message: &[u8]) -> Option<String> {
-        let mut wire = WireMessage::new(sender(message), opcode(message), &message[8..], &[]);
+        let mut wire =
+            WireMessage::new(msg_sender(message), msg_opcode(message), &message[8..], &[]);
         wire.read_nullable_string().unwrap()
     }
 
@@ -247,10 +241,10 @@ mod tests {
 
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         let get_aura_surface = &ctx.client_to_host_queue[0].0;
-        assert_eq!(sender(get_aura_surface), ZAURA_SHELL_HOST);
-        assert_eq!(opcode(get_aura_surface), REQ_GET_AURA_SURFACE);
+        assert_eq!(msg_sender(get_aura_surface), ZAURA_SHELL_HOST);
+        assert_eq!(msg_opcode(get_aura_surface), REQ_GET_AURA_SURFACE);
         let startup_id = &ctx.client_to_host_queue[1].0;
-        assert_eq!(opcode(startup_id), REQ_SET_STARTUP_ID);
+        assert_eq!(msg_opcode(startup_id), REQ_SET_STARTUP_ID);
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
         assert!(ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE));
         assert_eq!(
@@ -308,7 +302,7 @@ mod tests {
         );
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
+        assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID);
         assert_eq!(
             nullable_string(message).as_deref(),
             Some(
@@ -373,11 +367,7 @@ mod tests {
             .aura_surfaces
             .get(WL_SURFACE_HOST)
             .expect("set_startup_id creates the Aura surface");
-        let queued = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| (sender(message), opcode(message)))
-            .collect::<Vec<_>>();
+        let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(
             queued,
             vec![
@@ -424,7 +414,7 @@ mod tests {
         );
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(opcode(message), REQ_SET_APPLICATION_ID);
+        assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID);
         let application_id = nullable_string(message).expect("ARC application identity");
         assert!(application_id.starts_with(crate::state::ARC_APPLICATION_ID_PREFIX));
         assert!(!application_id.starts_with("org.chromium.arc.session."));

@@ -750,16 +750,8 @@ mod tests {
         XdgToplevelHandler, REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL,
     };
     use crate::state::ARC_APPLICATION_ID_PREFIX;
+    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::Action;
-
-    fn msg_sender(msg: &[u8]) -> u32 {
-        u32::from_ne_bytes(msg[0..4].try_into().unwrap())
-    }
-
-    fn msg_opcode(msg: &[u8]) -> u16 {
-        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
-        (word2 & 0xffff) as u16
-    }
 
     fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
         msg_sender(&message.0)
@@ -1445,14 +1437,6 @@ mod tests {
         );
     }
 
-    /// The (sender, opcode) of every queued host request.
-    fn queued_requests(ctx: &Context) -> Vec<(u32, u16)> {
-        ctx.client_to_host_queue
-            .iter()
-            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
-            .collect()
-    }
-
     /// A malformed client that gives one wl_surface two xdg_surfaces ends
     /// only the destroyed xdg_surface's toplevel role.
     #[test]
@@ -1474,7 +1458,7 @@ mod tests {
             Action::Forward
         );
         assert_eq!(
-            queued_requests(&ctx),
+            queued_headers(&ctx.client_to_host_queue),
             vec![(first_aura, REQ_RELEASE_AURA_TOPLEVEL)]
         );
         assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(first_toplevel), None);
@@ -1509,11 +1493,7 @@ mod tests {
             WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
             Action::Drop
         );
-        let queued = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
-            .collect::<Vec<_>>();
+        let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(
             queued,
             vec![
@@ -1541,11 +1521,7 @@ mod tests {
             None
         );
         // Child-first: the Aura extension is released before its xdg role.
-        let queued = ctx
-            .client_to_host_queue
-            .iter()
-            .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
-            .collect::<Vec<_>>();
+        let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(
             queued,
             vec![
