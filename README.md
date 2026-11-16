@@ -43,9 +43,9 @@ The current published binary is the
 | x86_64 | `sommelier_rs_virtwl-v0.2.6-x86_64` |
 | aarch64/arm64 | `sommelier_rs_virtwl-v0.2.6-aarch64` |
 
-Every release also includes `SHA256SUMS`. The release workflow builds on
-GitHub-hosted Ubuntu 24.04 runners, runs the x86_64 regression suite, and
-publishes the release only after both architecture builds succeed.
+Every release also includes `SHA256SUMS`. See
+[CI and release workflow](#ci-and-release-workflow) for how releases are
+built.
 
 ## Install and run in Crostini
 
@@ -253,8 +253,10 @@ git tag -a virtwl-v0.2.6 personal/virtwl -m "Release virtwl-v0.2.6"
 git push personal refs/tags/virtwl-v0.2.6
 ```
 
-The release workflow builds both architectures, creates `SHA256SUMS`, uploads
-all assets while the release is a draft, and then publishes the prerelease.
+The release workflow builds both architectures on GitHub-hosted Ubuntu
+24.04 runners, runs the x86_64 regression suite, creates `SHA256SUMS`, and
+uploads all assets while the release is a draft. It publishes the
+prerelease only after both architecture builds succeed.
 The fork currently keeps `virtwl` as its only development branch.
 
 ## Repository layout
