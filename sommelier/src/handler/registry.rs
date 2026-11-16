@@ -91,6 +91,33 @@ fn next_global_generation(ctx: &mut Context) -> u64 {
     generation
 }
 
+/// Return the advertisement generation that a bind of global `name` through
+/// `registry_host_id` refers to: that registry's own view, else the
+/// connection-wide current generation.
+///
+/// Bound objects record it so a delayed `global_remove` of an older
+/// advertisement cannot retire a binding of its replacement.
+fn bound_global_generation(ctx: &Context, registry_host_id: u32, name: u32) -> u64 {
+    let generation = ctx
+        .registry_global_generations
+        .get(&registry_host_id)
+        .and_then(|generations| generations.get(&name))
+        .copied()
+        .or_else(|| ctx.global_generations.get(&name).copied());
+    // A missing generation is unreachable: `guest_bind_is_allowed` admits
+    // only names in `host_globals`, which are added only after
+    // `note_registry_global` has recorded a generation for the name, and
+    // generations are never removed. Generation 0 is a safe fallback anyway:
+    // `next_global_generation` starts at 1, so 0 never matches a removal, and
+    // the only effect would be that `global_remove` cannot retire the
+    // binding; it stays valid until the guest destroys it.
+    debug_assert!(
+        generation.is_some(),
+        "bound global {name} has no advertisement generation"
+    );
+    generation.unwrap_or_default()
+}
+
 fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
     let registry_id = ctx.last_sender_id;
     let current_generation = ctx.global_generations.get(&name).copied();
@@ -1243,32 +1270,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // failure paths above have no output state to undo.
             ctx.output_host_ids.push(host_new_id);
             ctx.output_states.entry(host_new_id).or_default();
-            let generation = ctx
-                .registry_global_generations
-                .get(&registry_host_id)
-                .and_then(|generations| generations.get(&name))
-                .copied()
-                .or_else(|| ctx.global_generations.get(&name).copied())
-                .unwrap_or_default();
+            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.output_host_global_bindings
                 .insert(host_new_id, (name, generation));
             ctx.inactive_output_host_ids.remove(&host_new_id);
             if ctx.window_placement.uses_arc_bounds() {
-                // The Aura output extension carries the logical work-area
-                // insets that wl_output itself does not expose. It is
-                // host-only; the guest continues to receive the ordinary
-                // wl_output events.
+                // Host-only Aura output metadata (insets, scale, transform).
+                // A missing shell is retried when zaura_shell binds, so a
+                // failure here is not an error.
                 let _ = crate::handler::compositor::ensure_zaura_output(ctx, host_new_id);
             }
         }
         if interface == "zwp_linux_dmabuf_v1" {
-            let generation = ctx
-                .registry_global_generations
-                .get(&registry_host_id)
-                .and_then(|generations| generations.get(&name))
-                .copied()
-                .or_else(|| ctx.global_generations.get(&name).copied())
-                .unwrap_or_default();
+            let generation = bound_global_generation(ctx, registry_host_id, name);
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
