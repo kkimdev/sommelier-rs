@@ -26,9 +26,9 @@ limitations under the License.
 //! cannot update one side of an association, or retire a toplevel, without
 //! the matching cleanup.
 //!
-//! Wire encoding stays in the protocol handlers; this type only answers
-//! ownership questions and returns the IDs whose host teardown the caller must
-//! perform.
+//! Wire encoding stays in `crate::handler::window_placement`; this type only
+//! answers ownership questions and returns the IDs whose host teardown the
+//! caller must perform.
 
 use std::collections::{HashMap, HashSet};
 
@@ -209,13 +209,6 @@ impl WindowPlacementState {
     pub(crate) fn mark_arc_application_id_applied(&mut self, wl_surface_guest_id: u32) {
         self.arc_application_ids_applied.insert(wl_surface_guest_id);
         self.debug_assert_consistent();
-    }
-
-    /// Allow the ARC identity to be queued again after the request that
-    /// carried it was rolled back before reaching the host.
-    pub(crate) fn unmark_arc_application_id_applied(&mut self, wl_surface_guest_id: u32) {
-        self.arc_application_ids_applied
-            .remove(&wl_surface_guest_id);
     }
 
     #[cfg(test)]
@@ -511,17 +504,6 @@ mod tests {
         // Identities are never recycled: a reused guest ID gets a new one.
         let second = state.arc_application_id(10).expect("ARC identity");
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn applied_flag_can_be_rolled_back_without_losing_identity() {
-        let mut state = active();
-        let identity = state.arc_application_id(10).expect("ARC identity");
-        state.mark_arc_application_id_applied(10);
-        assert!(state.arc_application_id_applied(10));
-        state.unmark_arc_application_id_applied(10);
-        assert!(!state.arc_application_id_applied(10));
-        assert_eq!(state.arc_application_id(10), Some(identity));
     }
 
     #[test]

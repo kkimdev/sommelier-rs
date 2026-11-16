@@ -18,7 +18,9 @@ use crate::handler::display::queue_protocol_error;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
-use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
+use crate::protocols::aura_shell::zaura_shell::{
+    REQ_RELEASE as ZAURA_SHELL_RELEASE, REQ_RELEASE_SINCE as ZAURA_SHELL_RELEASE_SINCE,
+};
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::ALLOWED_INTERFACES as GTK_ALLOWED;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
@@ -50,6 +52,15 @@ const WL_COMPOSITOR_VERSION: u32 = 4;
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
 const LINUX_DMABUF_CLIENT_VERSION: u32 = 4;
+/// The oldest `zaura_shell` this proxy binds, the v6+ contract ChromiumOS
+/// Sommelier uses. Every Aura child takes its shell's version, so this
+/// floor is what lets the Aura metadata paths send `set_application_id`
+/// without a per-object version check.
+const ZAURA_SHELL_MIN_VERSION: u32 = 6;
+const _: () = assert!(
+    crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID_SINCE
+        <= ZAURA_SHELL_MIN_VERSION
+);
 
 /// Version ceilings used by ChromiumOS Sommelier's client-facing globals.
 ///
@@ -436,7 +447,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // registry remover. New children cannot be created until a replacement
         // shell global is advertised and rebound.
         if let Some(host_id) = shell_id {
-            if shell_version >= 38 {
+            if shell_version >= ZAURA_SHELL_RELEASE_SINCE {
                 let message = MessageBuilder::new().build_message(host_id, ZAURA_SHELL_RELEASE);
                 ctx.client_to_host_queue.push((message, Vec::new()));
                 ctx.shadow_table.mark_pending_destroy_host(host_id);
@@ -619,13 +630,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // advertisement.
         ctx.removed_host_globals.remove(&name);
 
-        if interface == "zaura_shell" && version < 6 {
-            // Sommelier's aura integration requires set_application_id (v5)
-            // and only binds the shell when the host provides the v6+
-            // contract used by ChromiumOS.
+        if interface == "zaura_shell" && version < ZAURA_SHELL_MIN_VERSION {
             log::debug!(
-                "Ignoring zaura_shell v{}; minimum supported version is 6",
-                version
+                "Ignoring zaura_shell v{}; minimum supported version is {}",
+                version,
+                ZAURA_SHELL_MIN_VERSION
             );
             record_registry_global_visibility(ctx, name, false);
             return Action::Drop;
@@ -952,23 +961,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     let _ = crate::handler::compositor::ensure_zaura_output(ctx, output_host_id);
                 }
                 // Apply the same retry to XDG roles created before the shell
-                // global arrived. Their guest-side associations are recorded
-                // after a successful get_toplevel dispatch, so a late shell
-                // can safely attach the missing Aura child here as well,
-                // through the same identity gate as get_toplevel. A role
-                // that still cannot attach is retried lazily by placement.
-                for (xdg_toplevel_guest_id, wl_surface_guest_id) in ctx
-                    .xdg_toplevel_to_wl_surface
-                    .iter()
-                    .map(|(&toplevel, &surface)| (toplevel, surface))
-                    .collect::<Vec<_>>()
-                {
-                    let _ = crate::handler::compositor::attach_placement_toplevel(
-                        ctx,
-                        xdg_toplevel_guest_id,
-                        wl_surface_guest_id,
-                    );
-                }
+                // global arrived.
+                crate::handler::window_placement::attach_recorded_toplevels(ctx);
             }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 

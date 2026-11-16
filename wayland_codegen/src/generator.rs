@@ -370,6 +370,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
             InterfaceItem::Request(req) => {
                 let opcode_name = format_ident!("REQ_{}", req.name.to_uppercase());
                 request_opcodes.push(quote! { pub const #opcode_name: u16 = #req_idx; });
+                request_opcodes.push(generate_since_constant(&opcode_name, req.since));
 
                 let var_name = format_ident!("{}", snake_to_camel(&req.name));
                 let fields = generate_fields(&req.items);
@@ -567,6 +568,7 @@ fn generate_interface(interface: &Interface) -> TokenStream {
             InterfaceItem::Event(evt) => {
                 let opcode_name = format_ident!("EVT_{}", evt.name.to_uppercase());
                 event_opcodes.push(quote! { pub const #opcode_name: u16 = #evt_idx; });
+                event_opcodes.push(generate_since_constant(&opcode_name, evt.since));
 
                 let var_name = format_ident!("{}", snake_to_camel(&evt.name));
                 let fields = generate_fields(&evt.items);
@@ -896,6 +898,18 @@ fn generate_reads(items: &[MessageItem]) -> TokenStream {
         }
     }
     quote! { #(#statements)* }
+}
+
+/// Generate `<OPCODE>_SINCE`, the object version that introduced a message.
+///
+/// The protocol XML is the single owner of these thresholds; hand-written
+/// handlers compare negotiated versions against the generated constant
+/// instead of copying the number. A message without a `since` attribute
+/// exists from version 1.
+fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStream {
+    let since_name = format_ident!("{}_SINCE", opcode_name);
+    let since = since.unwrap_or(1);
+    quote! { pub const #since_name: u32 = #since; }
 }
 
 /// Generate the object-version guard required by Wayland's `since`

@@ -262,6 +262,8 @@ but no compositor-owned chords.
 
 `PlacementConfig` in `sommelier/src/placement_config.rs` owns the
 process-wide configuration, and every connection shares it.
+`sommelier/src/handler/window_placement.rs` performs placement: protocol
+handlers delegate to it, and it sends the Aura requests and orders them.
 `WindowPlacementState` in `sommelier/src/state/window_placement.rs` is the
 single owner of this policy's per-connection state: the per-surface ARC
 identities, the host Aura surface/toplevel associations, the host-sync bounds

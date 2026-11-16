@@ -25,9 +25,14 @@ limitations under the License.
 //!   work area. Every action resolves to one ([`WindowLayoutAction::rect`]),
 //!   and every placement goes through [`NormalizedRect::to_work_area_bounds`],
 //!   so there is exactly one rounding rule.
+//! * [`Rect`] - an integer rectangle in logical screen coordinates: the work
+//!   area a placement maps into and the window bounds it produces.
 //!
-//! The module depends on nothing else in the crate; the configuration
-//! parsers and the keyboard handler depend on it.
+//! The module depends on nothing else in the crate. The configuration
+//! parser (`placement_config`) builds actions; `Context` and the keyboard
+//! handler pass them on; the output registry (`state::outputs`) returns
+//! work areas as [`Rect`]; and the placement handler
+//! (`handler::window_placement`) maps one into the other.
 //!
 //! # Rules
 //!
@@ -49,6 +54,32 @@ const EDGE_TOLERANCE: f64 = 1e-9;
 /// so the bias corrects representation error without moving any edge that
 /// was meant to fall between pixels.
 const PIXEL_BIAS: f64 = 1e-6;
+
+/// An integer rectangle in logical screen coordinates.
+///
+/// It is the output work area a placement maps into and the window bounds
+/// the mapping produces. It is plain data: a value with a non-positive
+/// extent is representable, and [`NormalizedRect::to_work_area_bounds`]
+/// rejects it as a work area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Rect {
+    /// Build a rectangle from its origin and extent.
+    pub(crate) const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
 
 /// Actions that may be bound to compositor-owned window placement shortcuts.
 ///
@@ -143,25 +174,20 @@ impl NormalizedRect {
     ///
     /// # Arguments
     ///
-    /// * `work_area` - `(x, y, width, height)` in logical screen coordinates,
-    ///   as returned by [`crate::state::OutputState::work_area`].
+    /// * `work_area` - the output work area in logical screen coordinates.
     ///
     /// # Returns
     ///
-    /// `(x, y, width, height)` screen bounds using the rounding rule (see the
-    /// module rules), or `None` when the work area is empty, too small to represent the
+    /// The screen bounds using the rounding rule (see the module rules), or
+    /// `None` when the work area is empty, too small to represent the
     /// rectangle without collapsing an interior edge, or the absolute
     /// coordinates overflow `i32`.
-    pub(crate) fn to_work_area_bounds(
-        self,
-        work_area: (i32, i32, i32, i32),
-    ) -> Option<(i32, i32, i32, i32)> {
-        let (origin_x, origin_y, work_width, work_height) = work_area;
-        let (left, right) = span(self.left, self.right, work_width)?;
-        let (top, bottom) = span(self.top, self.bottom, work_height)?;
-        Some((
-            origin_x.checked_add(left)?,
-            origin_y.checked_add(top)?,
+    pub(crate) fn to_work_area_bounds(self, work_area: Rect) -> Option<Rect> {
+        let (left, right) = span(self.left, self.right, work_area.width)?;
+        let (top, bottom) = span(self.top, self.bottom, work_area.height)?;
+        Some(Rect::new(
+            work_area.x.checked_add(left)?,
+            work_area.y.checked_add(top)?,
             right - left,
             bottom - top,
         ))
@@ -301,11 +327,16 @@ mod tests {
     /// The integer half-split formula the presets used before they were
     /// expressed as normalized rectangles. It is the reference oracle that
     /// proves the generalized mapping did not move any named placement.
-    fn legacy_preset_bounds(
-        action: WindowLayoutAction,
-        (x, y, width, height): (i32, i32, i32, i32),
-    ) -> Option<(i32, i32, i32, i32)> {
-        use WindowLayoutAction::*;
+    fn legacy_preset_bounds(action: WindowLayoutAction, work_area: Rect) -> Option<Rect> {
+        let Rect {
+            x,
+            y,
+            width,
+            height,
+        } = work_area;
+        use WindowLayoutAction::{
+            Bottom, BottomLeft, BottomRight, Fullscreen, Left, Right, Top, TopLeft, TopRight,
+        };
         if width <= 0 || height <= 0 {
             return None;
         }
@@ -326,31 +357,43 @@ mod tests {
             return None;
         }
         match action {
-            TopLeft => Some((x, y, half_width, half_height)),
-            Top => Some((x, y, width, half_height)),
-            TopRight => Some((
+            TopLeft => Some(Rect::new(x, y, half_width, half_height)),
+            Top => Some(Rect::new(x, y, width, half_height)),
+            TopRight => Some(Rect::new(
                 x.checked_add(half_width)?,
                 y,
                 width - half_width,
                 half_height,
             )),
-            BottomLeft => Some((
+            BottomLeft => Some(Rect::new(
                 x,
                 y.checked_add(half_height)?,
                 half_width,
                 height - half_height,
             )),
-            Bottom => Some((x, y.checked_add(half_height)?, width, height - half_height)),
-            BottomRight => Some((
+            Bottom => Some(Rect::new(
+                x,
+                y.checked_add(half_height)?,
+                width,
+                height - half_height,
+            )),
+            BottomRight => Some(Rect::new(
                 x.checked_add(half_width)?,
                 y.checked_add(half_height)?,
                 width - half_width,
                 height - half_height,
             )),
-            Left => Some((x, y, half_width, height)),
-            Fullscreen => Some((x, y, width, height)),
-            Right => Some((x.checked_add(half_width)?, y, width - half_width, height)),
-            Rect(_) => unreachable!("only named presets have a legacy formula"),
+            Left => Some(Rect::new(x, y, half_width, height)),
+            Fullscreen => Some(Rect::new(x, y, width, height)),
+            Right => Some(Rect::new(
+                x.checked_add(half_width)?,
+                y,
+                width - half_width,
+                height,
+            )),
+            WindowLayoutAction::Rect(_) => {
+                unreachable!("only named presets have a legacy formula")
+            }
         }
     }
 
@@ -360,7 +403,7 @@ mod tests {
             for width in 0..=257 {
                 for height in [0, 1, 2, 3, 99, 100, 101, 1079, 1080, 2160] {
                     for origin in [(0, 0), (37, -12)] {
-                        let work_area = (origin.0, origin.1, width, height);
+                        let work_area = Rect::new(origin.0, origin.1, width, height);
                         assert_eq!(
                             action.rect().to_work_area_bounds(work_area),
                             legacy_preset_bounds(action, work_area),
@@ -381,7 +424,7 @@ mod tests {
                 for &height in &extents {
                     for &ox in &origins {
                         for &oy in &origins {
-                            let work_area = (ox, oy, width, height);
+                            let work_area = Rect::new(ox, oy, width, height);
                             assert_eq!(
                                 action.rect().to_work_area_bounds(work_area),
                                 legacy_preset_bounds(action, work_area),
@@ -400,8 +443,8 @@ mod tests {
         // Edges: x 0.25*1366=341.5→341, 0.75*1366=1024.5→1024;
         //        y 0.1*720=72, 0.9*720=648.
         assert_eq!(
-            rect.to_work_area_bounds((10, 48, 1366, 720)),
-            Some((351, 120, 683, 576))
+            rect.to_work_area_bounds(Rect::new(10, 48, 1366, 720)),
+            Some(Rect::new(351, 120, 683, 576))
         );
     }
 
@@ -416,12 +459,15 @@ mod tests {
         for width in [3, 100, 1366, 1920, 2559] {
             let bounds: Vec<_> = rects
                 .iter()
-                .map(|rect| rect.to_work_area_bounds((0, 0, width, 10)).unwrap())
+                .map(|rect| {
+                    rect.to_work_area_bounds(Rect::new(0, 0, width, 10))
+                        .unwrap()
+                })
                 .collect();
-            assert_eq!(bounds[0].0, 0);
-            assert_eq!(bounds[0].0 + bounds[0].2, bounds[1].0, "width {width}");
-            assert_eq!(bounds[1].0 + bounds[1].2, bounds[2].0, "width {width}");
-            assert_eq!(bounds[2].0 + bounds[2].2, width, "width {width}");
+            assert_eq!(bounds[0].x, 0);
+            assert_eq!(bounds[0].x + bounds[0].width, bounds[1].x, "width {width}");
+            assert_eq!(bounds[1].x + bounds[1].width, bounds[2].x, "width {width}");
+            assert_eq!(bounds[2].x + bounds[2].width, width, "width {width}");
         }
     }
 
@@ -436,8 +482,8 @@ mod tests {
         let [left, _, snapped_width, _] = rect.components();
         assert_eq!(left + snapped_width, 1.0);
         assert_eq!(
-            rect.to_work_area_bounds((0, 0, 1000, 1000)),
-            Some((100, 700, 900, 300))
+            rect.to_work_area_bounds(Rect::new(0, 0, 1000, 1000)),
+            Some(Rect::new(100, 700, 900, 300))
         );
     }
 
@@ -445,30 +491,45 @@ mod tests {
     fn mapping_refuses_degenerate_or_overflowing_bounds() {
         let sliver = NormalizedRect::new(0.3, 0.0, 0.05, 1.0).unwrap();
         // 0.3*5 = 1.5 → 1 and 0.35*5 = 1.75 → 1: empty after rounding.
-        assert_eq!(sliver.to_work_area_bounds((0, 0, 5, 5)), None);
+        assert_eq!(sliver.to_work_area_bounds(Rect::new(0, 0, 5, 5)), None);
         // An interior edge collapsing onto the border is refused:
         // 0.1 * 5 = 0.5 floors onto the left border.
         let right_nine_tenths = NormalizedRect::new(0.1, 0.0, 0.9, 1.0).unwrap();
-        assert_eq!(right_nine_tenths.to_work_area_bounds((0, 0, 5, 5)), None);
         assert_eq!(
-            right_nine_tenths.to_work_area_bounds((0, 0, 10, 5)),
-            Some((1, 0, 9, 5))
+            right_nine_tenths.to_work_area_bounds(Rect::new(0, 0, 5, 5)),
+            None
+        );
+        assert_eq!(
+            right_nine_tenths.to_work_area_bounds(Rect::new(0, 0, 10, 5)),
+            Some(Rect::new(1, 0, 9, 5))
         );
         let full = WindowLayoutAction::Fullscreen.rect();
-        assert_eq!(full.to_work_area_bounds((0, 0, 0, 10)), None);
-        assert_eq!(full.to_work_area_bounds((0, 0, 10, -1)), None);
-        assert_eq!(full.to_work_area_bounds((0, 0, 1, 1)), Some((0, 0, 1, 1)));
+        assert_eq!(full.to_work_area_bounds(Rect::new(0, 0, 0, 10)), None);
+        assert_eq!(full.to_work_area_bounds(Rect::new(0, 0, 10, -1)), None);
+        assert_eq!(
+            full.to_work_area_bounds(Rect::new(0, 0, 1, 1)),
+            Some(Rect::new(0, 0, 1, 1))
+        );
         let right = WindowLayoutAction::Right.rect();
-        assert_eq!(right.to_work_area_bounds((i32::MAX, 0, 4, 4)), None);
-        assert_eq!(right.to_work_area_bounds((0, 0, 1, 4)), None);
-        assert_eq!(right.to_work_area_bounds((0, 0, 3, 4)), Some((1, 0, 2, 4)));
+        assert_eq!(
+            right.to_work_area_bounds(Rect::new(i32::MAX, 0, 4, 4)),
+            None
+        );
+        assert_eq!(right.to_work_area_bounds(Rect::new(0, 0, 1, 4)), None);
+        assert_eq!(
+            right.to_work_area_bounds(Rect::new(0, 0, 3, 4)),
+            Some(Rect::new(1, 0, 2, 4))
+        );
     }
 
     #[test]
     fn edges_near_a_border_snap_onto_it() {
         let rect = NormalizedRect::new(1e-12, 0.0, 1.0 - 1e-12, 1.0 - 2e-12).unwrap();
         assert_eq!(rect.components(), [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(rect.to_work_area_bounds((0, 0, 7, 9)), Some((0, 0, 7, 9)));
+        assert_eq!(
+            rect.to_work_area_bounds(Rect::new(0, 0, 7, 9)),
+            Some(Rect::new(0, 0, 7, 9))
+        );
     }
 
     #[test]
@@ -602,8 +663,8 @@ mod tests {
                 let width = sixteen_digits(f64::from(right - left) / f64::from(extent));
                 let rect = NormalizedRect::new(x, 0.0, width, 1.0).unwrap();
                 assert_eq!(
-                    rect.to_work_area_bounds((0, 0, extent, 1)),
-                    Some((left, 0, right - left, 1)),
+                    rect.to_work_area_bounds(Rect::new(0, 0, extent, 1)),
+                    Some(Rect::new(left, 0, right - left, 1)),
                     "edges {left}..{right} of {extent} written as x={x:e} width={width:e}"
                 );
             }
@@ -615,8 +676,8 @@ mod tests {
         // The counterexample quoted in the configuration doc.
         let third = NormalizedRect::new(0.3333333, 0.0, 0.6666667, 1.0).unwrap();
         assert_eq!(
-            third.to_work_area_bounds((0, 0, 1920, 1)),
-            Some((639, 0, 1281, 1))
+            third.to_work_area_bounds(Rect::new(0, 0, 1920, 1)),
+            Some(Rect::new(639, 0, 1281, 1))
         );
     }
 }

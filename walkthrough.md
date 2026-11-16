@@ -1153,3 +1153,92 @@ Validation (monorepo dev shell, locked, serial): Sommelier 675 passed /
 1 ignored. Strict Clippy on all targets, `cargo fmt --check`, and
 `git diff --check` pass. Not host-validated: no Sommelier process was started,
 and rotation and multi-monitor selection have never been checked on a host.
+
+## 2026-11-16 — Placement module
+
+Cleanup PR D for review findings A1, H2, H3 (placement objects) and A4,
+rebased onto the output registry (#23), plus one protocol fix found in
+review. Apart from that fix, behavior is unchanged; this section records the
+new structure and why.
+
+**Before.** Placement was spread over five modules. The keyboard handler
+resolved the focused toplevel, computed bounds, and built the request batch
+with its own rollback. `compositor.rs` created the Aura toplevel, queued the
+ARC identity and the barrier, and held configures inline in three event
+handlers. `callback.rs` completed barriers through a compositor helper, and
+`registry.rs` and `proxy.rs` attached Aura toplevels and dropped the result
+with `let _`. Fixed-size requests went through `try_build_message` with
+rollback branches that could never run, version thresholds were copied
+literals, and bounds were bare tuples.
+
+**After.**
+
+- A1: `sommelier/src/handler/window_placement.rs` owns placement mechanics.
+  Each protocol handler translates its event and makes one call:
+  `place_focused`, `attach_toplevel`, `attach_recorded_toplevels`,
+  `release_toplevel`, `apply_arc_identity`, `complete_barrier`,
+  `hold_surface_configure`, `hold_toplevel_configure` and
+  `translate_aura_configure` (the module docs map events to entry points).
+  `PlacementSkip` is its only other export. `ensure_host_zaura_surface`
+  stays in `compositor.rs` because XDG and GTK metadata share the Aura
+  surface; `record_xdg_toplevel` stays there because the XDG role links also
+  route application IDs. Both are candidates for the Aura-objects and
+  XDG-roles owners.
+- H2: placement's fixed-size messages (u32/i32 payloads of at most
+  20 bytes, or the proxy-generated ARC identity of at most 27 bytes) use
+  `build_message`. This removes `BarrierUnavailable`, the batch rollback,
+  `unmark_arc_application_id_applied` and their two tests. Host data (the
+  configure states array) keeps the fallible builder, as the sommelier-rs
+  rule requires. Two placement skips were unreachable and are gone.
+  `ArcIdentityUnavailable`: the registry binds no `zaura_shell` older than
+  `ZAURA_SHELL_MIN_VERSION` (6), so every Aura surface supports
+  `set_application_id` (since 5, asserted at compile time next to the
+  floor), and placement has already allocated the identity when it attaches
+  the Aura toplevel; `place_focused` asserts this in debug builds.
+  `UnmappedToplevel`: only mapped toplevels are recorded, and every
+  unmapping path removes the record first; focus resolution asserts it.
+- H3: `wayland_codegen` emits `REQ_*_SINCE` / `EVT_*_SINCE` for every
+  message, so the vendored XML owns each threshold. The zaura_surface,
+  zaura_toplevel and zaura_output checks use them, replacing the output
+  registry's hand-written `ZAURA_SHELL_GET_AURA_OUTPUT_SINCE` and
+  `ZAURA_OUTPUT_RELEASE_SINCE`, and the registry's literal 38 for
+  `zaura_shell.release`. `PLACEMENT_TOPLEVEL_SINCE` is the
+  set_window_bounds version, checked at compile time against the other
+  requests placement sends. `compositor::aura_object_version` is the one
+  version rule for every Aura child, including the zaura_output release; it
+  asserts in debug builds that the child has a recorded version.
+- A4: `window_layout::Rect` carries work areas and bounds, and
+  `OutputState::work_area` returns it.
+
+**Behavior change.** `clear_window_state` sent `zaura_surface.unset_snap`
+(since 16) without a version check. An Aura surface keeps the version of the
+shell generation that created it, so after a re-advertised newer shell a
+placement could send it to a v6-v15 surface, which Exo rejects by
+disconnecting the client. It is now sent only to surfaces that have it
+(`unset_snap_is_sent_only_to_an_aura_surface_that_has_it`, which failed
+before the fix). On such a surface, placement therefore cannot unsnap a
+window the user snapped through the Ash UI; the request does not exist at
+that version, so skipping it is still the correct choice.
+
+Line counts against the rebased base (total / production before
+`#[cfg(test)]`): `keyboard.rs` 6388/1405 → 5854/1209, `compositor.rs`
+6147/2098 → 5405/1756, `callback.rs` 257/124 → 248/115,
+`window_placement.rs` 1643/723 (new).
+
+Deliberately not done: `ensure_zaura_output` still builds its fixed-size
+request with `try_build_message`, which belongs with the output registry; the
+`zaura_shell` bind cap (38) is not a since-version; the `xdg_toplevel` state
+table already mirrors the XML in one place. The XDG and GTK metadata paths
+still check `set_application_id` and `set_startup_id` versions that the
+shell floor now guarantees; they are outside placement. Other handlers'
+fixed-size
+`try_build_message` calls (`wl_surface.destroy`, `xdg_toplevel.destroy`,
+callback events) are outside placement.
+
+Validation (monorepo dev shell, locked, serial): Sommelier 677 passed /
+1 ignored (675 before: two rollback tests deleted; `unset_snap`,
+zaura_output retire and two version-boundary tests added), sample GUI 12,
+codegen 8 (7 before), `gui_smoke` 0 run / 1 ignored. Strict Clippy on all
+targets, `cargo fmt --check`, and `git diff --check` pass, and every commit
+builds with strict Clippy. Not host-validated: no Sommelier process was
+started.
