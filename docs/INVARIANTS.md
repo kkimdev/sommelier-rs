@@ -393,6 +393,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   nothing.
   Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
   `a_removal_outlives_the_registry_that_saw_it`,
+  `the_removal_of_a_dropped_global_waits_for_every_registry`,
   `destroying_a_registry_keeps_a_global_no_registry_saw_removed`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the

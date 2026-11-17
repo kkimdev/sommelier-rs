@@ -381,5 +381,19 @@ impl Context {
         for &registry in registries {
             host("registry globals", registry, "wl_registry");
         }
+        // A removal on record is of the global's current generation, and
+        // waits for a registry that still lists it; a global the proxy
+        // drops is in neither `host_globals` nor `hidden_host_globals`.
+        for (&name, &generation) in &self.removed_global_generations {
+            assert_eq!(
+                self.global_generations.get(&name),
+                Some(&generation),
+                "removal of global {name} outlived its generation {generation}"
+            );
+            assert!(
+                registry::global_still_seen(self, name, Some(generation)),
+                "removal of global {name} outlived every registry that lists it"
+            );
+        }
     }
 }
