@@ -1037,14 +1037,6 @@ pub(crate) fn copy_shm_planes(src_ptr: *const u8, dst_ptr: *mut u8, layout: ShmC
     copy_shm_damage(src_ptr, dst_ptr, layout, std::slice::from_ref(&rect))
 }
 
-fn unmap_destination(ptr: *mut u8, size: usize) {
-    if !ptr.is_null() && ptr as *mut libc::c_void != libc::MAP_FAILED {
-        unsafe {
-            libc::munmap(ptr as *mut libc::c_void, size);
-        }
-    }
-}
-
 /// Report a resource failure while creating a `wl_buffer`.
 ///
 /// `create_buffer` carries a client supplied `new_id`; silently dropping the
@@ -1081,16 +1073,6 @@ fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
     // acknowledgement arrives. The destroy request is ordered after all
     // already-queued params requests.
     ctx.shadow_table.mark_pending_destroy_host(params_id);
-}
-
-fn cleanup_direct_dmabuf_failure(
-    ctx: &mut Context,
-    params_id: u32,
-    dest_ptr: *mut u8,
-    dest_size: usize,
-) {
-    unmap_destination(dest_ptr, dest_size);
-    queue_host_params_destroy(ctx, params_id);
 }
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
@@ -1680,6 +1662,41 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
             return Action::Drop;
         }
+        // Duplicate the descriptors the ADDs hand to the host before mapping
+        // or queueing anything, so a failure has nothing to undo.
+        let fd_to_send = match dmabuf_fd_owned.try_clone() {
+            Ok(fd) => fd,
+            Err(error) => {
+                error!("Failed to duplicate VirtWL dma-buf fd: {}", error);
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to duplicate wl_shm dma-buf backing",
+                );
+                return Action::Drop;
+            }
+        };
+        let plane1_fd_to_send = if format == WL_SHM_FORMAT_NV12 {
+            match plane1_fd_owned
+                .as_ref()
+                .unwrap_or(&dmabuf_fd_owned)
+                .try_clone()
+            {
+                Ok(fd) => Some(fd),
+                Err(error) => {
+                    error!("Failed to duplicate NV12 dma-buf fd: {}", error);
+                    queue_buffer_creation_error(
+                        ctx,
+                        pool_id,
+                        "unable to duplicate wl_shm dma-buf plane",
+                    );
+                    return Action::Drop;
+                }
+            }
+        } else {
+            None
+        };
+
         let layout = DmabufLayout {
             stride0: bo_stride as usize,
             stride1: plane1_stride,
@@ -1725,19 +1742,6 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             builder.build_message(host_dmabuf_id, zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS);
         ctx.client_to_host_queue.push((create_params, Vec::new()));
 
-        let fd_to_send = match dmabuf_fd_owned.try_clone() {
-            Ok(fd) => fd.into_raw_fd(),
-            Err(error) => {
-                error!("Failed to duplicate VirtWL dma-buf fd: {}", error);
-                cleanup_direct_dmabuf_failure(ctx, params_id, dest_ptr, dest_size);
-                queue_buffer_creation_error(
-                    ctx,
-                    pool_id,
-                    "unable to duplicate wl_shm dma-buf backing",
-                );
-                return Action::Drop;
-            }
-        };
         let mut add = MessageBuilder::new();
         add.write_u32(0); // plane index
         add.write_u32(blob_offset);
@@ -1745,34 +1749,19 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         add.write_u32((modifier >> 32) as u32);
         add.write_u32(modifier as u32);
         let add = add.build_message(params_id, zwp_linux_buffer_params_v1::REQ_ADD);
-        ctx.client_to_host_queue.push((add, vec![fd_to_send]));
-        if format == WL_SHM_FORMAT_NV12 {
+        ctx.client_to_host_queue
+            .push((add, vec![fd_to_send.into_raw_fd()]));
+        if let Some(plane1_fd) = plane1_fd_to_send {
             let mut add_plane1 = MessageBuilder::new();
             add_plane1.write_u32(1);
             add_plane1.write_u32(host_plane1_offset_u32);
             add_plane1.write_u32(plane1_stride_u32);
             add_plane1.write_u32((modifier >> 32) as u32);
             add_plane1.write_u32(modifier as u32);
-            let plane1_fd = match plane1_fd_owned
-                .as_ref()
-                .unwrap_or(&dmabuf_fd_owned)
-                .try_clone()
-            {
-                Ok(fd) => fd.into_raw_fd(),
-                Err(error) => {
-                    error!("Failed to duplicate NV12 dma-buf fd: {}", error);
-                    cleanup_direct_dmabuf_failure(ctx, params_id, dest_ptr, dest_size);
-                    queue_buffer_creation_error(
-                        ctx,
-                        pool_id,
-                        "unable to duplicate wl_shm dma-buf plane",
-                    );
-                    return Action::Drop;
-                }
-            };
             let add_plane1 =
                 add_plane1.build_message(params_id, zwp_linux_buffer_params_v1::REQ_ADD);
-            ctx.client_to_host_queue.push((add_plane1, vec![plane1_fd]));
+            ctx.client_to_host_queue
+                .push((add_plane1, vec![plane1_fd.into_raw_fd()]));
         }
 
         let host_buffer_id = ctx.shadow_table.allocate_host_id();
