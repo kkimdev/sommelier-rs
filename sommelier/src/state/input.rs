@@ -86,18 +86,31 @@ pub struct HostContentType {
 ///   text as the input method commits, so neither is modelled: each guest
 ///   commit forwards the ones it states.
 ///
-/// Exo also attaches and detaches the input method on its own, as its
-/// seat's focus moves (`OnSurfaceFocused`) and as the surface is destroyed
-/// (`OnSurfaceDestroying`). The model holds because each of those reaches
-/// the proxy as a `wl_keyboard.leave` or `enter`, which ends the guest
-/// focus and so the text input's target, or as the surface's own end, and
-/// every such end makes the proxy `deactivate`: what the proxy believes
-/// attached and what Exo attached change together. Suppressing, delaying
-/// past a later request or coalescing a host `leave`/`enter` pair would let
-/// them part, and the proxy would send content types to an input method
-/// Exo had detached, or none to one it had reattached. The one detach the
-/// proxy cannot see is `OnInputMethodDestroyed`, when the input method
-/// itself goes away.
+/// Exo reports every attach as `zwp_text_input_v1.enter` and every detach
+/// as `leave` (`Activated` and `Deactivated` of its text-input delegate),
+/// and it also attaches and detaches on its own:
+///
+/// - It detaches when its seat's focus leaves the surface
+///   (`OnSurfaceFocused`), when the surface is destroyed
+///   (`OnSurfaceDestroying`) and when the input method is destroyed
+///   (`OnInputMethodDestroyed`). Each goes through `Deactivate`, so Exo
+///   then has no surface and attaches again only on a new `activate`. A
+///   `leave` while active is such a detach, since the proxy's own
+///   `deactivate` starts draining first: the generation ends there, with
+///   no barrier, as the `leave` follows its every event, and reconciling
+///   activates again if the target still wants it.
+/// - It attaches on its own only when its focus reaches a surface an
+///   `activate` found unfocused. Exo sent `wl_keyboard.leave` before it
+///   handled that `activate`, so the proxy is draining by the time the
+///   `enter` arrives. An `enter` while active therefore answers the proxy's
+///   own `activate`, and the content type the proxy sent after it reached
+///   the attached input method.
+///
+/// The model holds only while every host `zwp_text_input_v1.leave` and
+/// `wl_keyboard.leave` and `enter` reaches the proxy's state in order:
+/// dropping, delaying past a later event or coalescing one would let the
+/// model believe an input method attached that Exo detached, or the
+/// reverse.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HostApplied {
     /// No input method is attached and no events are in flight.
@@ -143,11 +156,13 @@ impl HostApplied {
         true
     }
 
-    /// End an active generation that no live host seat can deactivate.
+    /// End an active generation without a drain barrier: no live host seat
+    /// can deactivate it, or Exo detached its input method itself, whose
+    /// `leave` follows every event of that generation.
     ///
     /// A draining generation cannot be forced inactive because its callback
     /// remains the ownership proof for events already queued by the host.
-    pub fn deactivate_without_barrier(&mut self) -> bool {
+    pub fn end_without_barrier(&mut self) -> bool {
         if !matches!(self, Self::Active { .. }) {
             return false;
         }
@@ -528,6 +543,23 @@ impl TextInputState {
         self.current_preedit.clear();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
+    }
+
+    /// Exo detached the input method on its own: end the host generation
+    /// without a barrier ([`HostApplied::end_without_barrier`]) and drop the
+    /// composition it was building.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no generation was active; otherwise whether the guest was
+    /// shown a preedit, which it must now be told to clear.
+    pub(crate) fn end_on_host_detach(&mut self) -> Option<bool> {
+        if !self.host.end_without_barrier() {
+            return None;
+        }
+        let had_preedit = !self.current_preedit.is_empty();
+        self.clear_host_composition();
+        Some(had_preedit)
     }
 
     fn clear_host_composition(&mut self) {
@@ -1895,7 +1927,7 @@ mod tests {
             BeginDrainingB,
             CompleteDrainingA,
             CompleteDrainingB,
-            DeactivateWithoutBarrier,
+            EndWithoutBarrier,
         }
 
         const CALLBACK_A: HostId = HostId(100);
@@ -1906,7 +1938,7 @@ mod tests {
             Operation::BeginDrainingB,
             Operation::CompleteDrainingA,
             Operation::CompleteDrainingB,
-            Operation::DeactivateWithoutBarrier,
+            Operation::EndWithoutBarrier,
         ];
         const INITIAL_STATES: [HostApplied; 4] = [
             HostApplied::Inactive,
@@ -1946,7 +1978,7 @@ mod tests {
                     },
                     Operation::CompleteDrainingB,
                 ) => (HostApplied::Inactive, true),
-                (ACTIVE, Operation::DeactivateWithoutBarrier) => (HostApplied::Inactive, true),
+                (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
                 _ => (state, false),
             }
         }
@@ -1977,7 +2009,7 @@ mod tests {
                     Operation::BeginDrainingB => next.host.begin_draining(CALLBACK_B),
                     Operation::CompleteDrainingA => next.host.complete_draining(CALLBACK_A),
                     Operation::CompleteDrainingB => next.host.complete_draining(CALLBACK_B),
-                    Operation::DeactivateWithoutBarrier => next.host.deactivate_without_barrier(),
+                    Operation::EndWithoutBarrier => next.host.end_without_barrier(),
                 };
                 let (next_expected, expected_changed) = model_transition(expected, operation);
                 assert_eq!(actual_changed, expected_changed);
@@ -2013,7 +2045,7 @@ mod tests {
         let changed = match steps.activation {
             Some(ActivationStep::Activate) => next.activate(),
             Some(ActivationStep::Deactivate) => next.begin_draining(HostId(101)),
-            Some(ActivationStep::Abandon) => next.deactivate_without_barrier(),
+            Some(ActivationStep::Abandon) => next.end_without_barrier(),
             None => true,
         };
         assert!(changed, "{steps:?} must be a transition from {applied:?}");

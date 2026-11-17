@@ -621,23 +621,43 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   change can reset the input method's composition. Exo keeps surrounding
   text and the cursor rectangle without an input method, so they are
   forwarded as committed and never replayed.
-  `HostApplied` is sound only because Exo attaches or detaches the input
-  method on its own only as its seat's focus moves or the surface goes,
-  and each of those reaches the proxy as a `wl_keyboard.leave` or `enter`
-  or as the surface's destruction, which ends the text input's focus and
-  makes the proxy `deactivate`. A host `leave` or `enter` MUST therefore
-  reach the text-input focus in order with the requests around it, never
-  suppressed or coalesced with its pair: otherwise the proxy would believe
-  an input method attached that Exo detached, or the reverse, and send
-  content types Exo drops or withhold the one it needs.
+  Exo reports every attach of its input method as
+  `zwp_text_input_v1.enter` and every detach as `leave`, including those
+  it makes on its own. It detaches on its own when its seat's focus
+  leaves the surface, the surface is destroyed or the input method is
+  destroyed, each time through `Deactivate`, so it attaches again only on
+  a new `activate`. A `leave` while the proxy's host generation is active
+  is such a detach, since the proxy's own `deactivate` starts draining
+  first: the generation ends there without a barrier, its composition is
+  dropped, a preedit the guest shows is cleared with an empty
+  `preedit_string` and `done`, and reconciling activates again if the
+  guest still wants input. If that `leave` beats the `wl_keyboard.leave`
+  of the same focus change, the activation finds Exo unfocused and the
+  keyboard leave drains it. Exo attaches on its own only when focus
+  reaches a surface an `activate` found unfocused, after a
+  `wl_keyboard.leave` that set the proxy draining, so an `enter` while
+  active answers the proxy's own `activate` and resends nothing.
+  `HostApplied` is therefore sound only while every host
+  `zwp_text_input_v1.leave`, `wl_keyboard.leave` and `wl_keyboard.enter`
+  reaches the text-input state in order with the events around it, never
+  dropped, delayed or coalesced with its pair: otherwise the proxy would
+  believe an input method attached that Exo detached, or the reverse, and
+  send content types Exo drops or withhold the one it needs.
   Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
   `a_host_without_surrounding_text_support_gets_no_resend`,
   `a_deferred_activation_replays_the_committed_content_type`,
   `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
-  `a_content_type_waits_for_the_host_to_attach`, and the fuzzer's end
-  state against its model of Exo (`guest_streams_cannot_crash_hang_or_leak`;
-  see [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
+  `a_content_type_waits_for_the_host_to_attach`,
+  `the_enter_answering_an_activate_resends_nothing`,
+  `an_exo_detach_activates_again_with_the_content_type`,
+  `a_content_type_waits_for_exo_to_attach_again`,
+  `the_leave_answering_a_deactivate_is_ignored`,
+  `an_exo_detach_clears_the_guest_preedit`,
+  `an_exo_detach_before_the_keyboard_leave_activates_then_drains`, and
+  the fuzzer's end state against its model of Exo
+  (`guest_streams_cannot_crash_hang_or_leak`; see
+  [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
 - **One text input on a connection is enabled at a time.** Exo has one
   seat, and its `Activate` gives the input method to the text input that
   activated last without telling the one it replaced. That one keeps its

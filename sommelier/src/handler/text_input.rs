@@ -859,15 +859,51 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         Action::Drop
     }
 
+    /// Exo attached the input method. While active this answers the
+    /// proxy's own `activate` ([`HostApplied`]), and otherwise belongs to a
+    /// generation being drained, so it changes nothing.
     fn on_enter(&mut self, ctx: &mut Context, surface: u32) -> Action {
-        let _host_v1_id = ctx.last_sender_id;
-        log::info!(">>> on_enter: surface={}", surface);
+        log::debug!(
+            ">>> on_enter: host_v1_id={}, surface={surface}",
+            ctx.last_sender_id
+        );
         Action::Drop
     }
 
+    /// Exo detached the input method. While active Exo did so on its own
+    /// and is now deactivated ([`HostApplied`]): the generation ends, its
+    /// composition goes, a preedit the guest shows is cleared, and
+    /// reconciling activates again if the guest still wants input. A
+    /// `leave` that answers the proxy's `deactivate` arrives while draining
+    /// and is ignored.
     fn on_leave(&mut self, ctx: &mut Context) -> Action {
         let host_v1_id = ctx.last_sender_id;
-        log::info!(">>> on_leave: host_v1_id={}", host_v1_id);
+        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_v1_id) else {
+            return Action::Drop;
+        };
+        let Some(state) = ctx
+            .text_inputs
+            .get_mut(&guest_id)
+            .filter(|state| state.host_v1_id == host_v1_id)
+        else {
+            return Action::Drop;
+        };
+        let Some(had_preedit) = state.end_on_host_detach() else {
+            log::debug!(">>> on_leave: host_v1_id={host_v1_id} while not active");
+            return Action::Drop;
+        };
+        log::info!("Exo detached the input method of text input {guest_id} (host {host_v1_id})");
+        // The composition went with the input method, as when its process
+        // restarts: the guest would otherwise keep showing it.
+        if had_preedit {
+            let serial = state.guest_commit_serial();
+            let mut transaction = Vec::new();
+            if push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
+                transaction.push(zwp_text_input_v3::evt::done(guest_id, serial));
+                ctx.host_to_client_queue.extend(transaction);
+            }
+        }
+        reconcile_host(ctx, guest_id, None);
         Action::Drop
     }
 
@@ -1490,7 +1526,7 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
         Some(ActivationStep::Abandon) => {
             log::debug!("Text input {guest_id} lost its host seat while active");
             if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                state.host.deactivate_without_barrier();
+                state.host.end_without_barrier();
             }
         }
         // An activation the target needs and the host cannot take yet.
@@ -1715,7 +1751,7 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     if !host_deleted {
         reconcile_host(ctx, guest_id, None);
     } else if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-        state.host.deactivate_without_barrier();
+        state.host.end_without_barrier();
     }
 
     // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
@@ -3365,6 +3401,197 @@ mod tests {
                 (host_v1_id, REQ_COMMIT_STATE),
             ]
         );
+    }
+
+    /// The requests that set the password content type on the fixture's
+    /// host after `activate`, ending with its `commit_state`.
+    const PASSWORD_AFTER_ACTIVATE: [(u32, u16); 4] = [
+        (10, zwp_text_input_v1::REQ_ACTIVATE),
+        (
+            30,
+            zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT,
+        ),
+        (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
+        (10, zwp_text_input_v1::REQ_COMMIT_STATE),
+    ];
+
+    /// A fixture whose guest enabled a password field the host attached,
+    /// with every request so far taken.
+    fn attached_password_field() -> (Context, u32, u32) {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        {
+            let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+            state.committed.enabled = false;
+            state.host = HostApplied::Inactive;
+        }
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        v3.on_enable(&mut ctx);
+        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+        v3.on_commit(&mut ctx);
+        let mut sent = take_requests(&mut ctx);
+        // Leave out the reset surrounding text and cursor rectangle.
+        sent.retain(|&(sender, opcode)| {
+            sender != host_v1_id
+                || ![
+                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
+                    zwp_text_input_v1::REQ_SET_CURSOR_RECTANGLE,
+                ]
+                .contains(&opcode)
+        });
+        assert_eq!(sent, PASSWORD_AFTER_ACTIVATE);
+        (ctx, host_v1_id, guest_id)
+    }
+
+    #[test]
+    fn the_enter_answering_an_activate_resends_nothing() {
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+        assert_eq!(take_requests(&mut ctx), []);
+
+        // The content type sent after the activate is the one Exo applied.
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+        v3.on_commit(&mut ctx);
+        assert_eq!(
+            take_requests(&mut ctx),
+            [(host_v1_id, zwp_text_input_v1::REQ_COMMIT_STATE)]
+        );
+    }
+
+    #[test]
+    fn an_exo_detach_activates_again_with_the_content_type() {
+        // Exo detached on its own, as when its input method is destroyed,
+        // and has no surface left to attach to: the proxy activates again
+        // and resends the content type the new attachment reset.
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+
+        TextInputV1Handler.on_leave(&mut ctx);
+        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
+        assert!(ctx.text_inputs[&guest_id].host_is_active());
+
+        // The enter answering that activate resends nothing.
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+        assert_eq!(take_requests(&mut ctx), []);
+    }
+
+    #[test]
+    fn an_exo_detach_clears_the_guest_preedit() {
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+
+        // Without a preedit the guest is told nothing.
+        ctx.host_to_client_queue.clear();
+        TextInputV1Handler.on_leave(&mut ctx);
+        assert!(ctx.host_to_client_queue.is_empty());
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+
+        // The input method's process restarts mid-composition.
+        TextInputV1Handler.on_preedit_string(&mut ctx, 1, &"가".to_string(), &"가".to_string());
+        ctx.host_to_client_queue.clear();
+        take_requests(&mut ctx);
+        TextInputV1Handler.on_leave(&mut ctx);
+
+        let events = std::mem::take(&mut ctx.host_to_client_queue);
+        assert_eq!(
+            (0..events.len())
+                .map(|index| (msg_sender(&events, index), msg_opcode(&events, index)))
+                .collect::<Vec<_>>(),
+            [
+                (guest_id, zwp_text_input_v3::EVT_PREEDIT_STRING),
+                (guest_id, zwp_text_input_v3::EVT_DONE),
+            ]
+        );
+        assert_eq!(
+            msg_done_serial(&events, 1),
+            ctx.text_inputs[&guest_id].guest_commit_serial()
+        );
+        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
+        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
+    }
+
+    #[test]
+    fn an_exo_detach_before_the_keyboard_leave_activates_then_drains() {
+        // Exo's text input hears of a focus change before the keyboard:
+        // its `leave` arrives first, and the proxy activates again on the
+        // surface Exo has just left, which Exo keeps without attaching.
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_enter(&mut ctx, 901);
+        TextInputV1Handler.on_leave(&mut ctx);
+        assert_eq!(take_requests(&mut ctx), PASSWORD_AFTER_ACTIVATE);
+
+        // The keyboard leave then deactivates it behind a barrier.
+        apply_keyboard_focus_changes(
+            &mut ctx,
+            &[SeatFocusChange {
+                guest_seat: 0,
+                previous_surface: Some(900),
+                current_surface: None,
+            }],
+        );
+        assert_eq!(
+            take_requests(&mut ctx),
+            [
+                (host_v1_id, zwp_text_input_v1::REQ_DEACTIVATE),
+                (1, wl_display::REQ_SYNC),
+            ]
+        );
+        let callback = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("the keyboard leave drains the activation");
+
+        // Exo never attached, so it sends no leave, and the drain ends
+        // with nothing more to send.
+        ctx.last_sender_id = callback.0;
+        CallbackHandler.on_done(&mut ctx, 0);
+        assert_eq!(ctx.text_inputs[&guest_id].host, HostApplied::Inactive);
+        assert_eq!(take_requests(&mut ctx), []);
+    }
+
+    #[test]
+    fn a_content_type_waits_for_exo_to_attach_again() {
+        // Exo detached while the guest's seat cannot carry an activate:
+        // nothing is sent, not even a changed content type, until it can.
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+        // A seat with no host object.
+        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_leave(&mut ctx);
+        assert!(!ctx.text_inputs[&guest_id].host_is_active());
+
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_NORMAL);
+        v3.on_commit(&mut ctx);
+        assert!(!take_requests(&mut ctx).iter().any(|&(sender, opcode)| {
+            opcode == zwp_text_input_v1::REQ_ACTIVATE
+                || sender == 30
+                || opcode == zwp_text_input_v1::REQ_SET_CONTENT_TYPE
+        }));
+    }
+
+    #[test]
+    fn the_leave_answering_a_deactivate_is_ignored() {
+        let (mut ctx, host_v1_id, guest_id) = attached_password_field();
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        v3.on_disable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        let callback = ctx.text_inputs[&guest_id].draining_callback();
+        assert!(callback.is_some());
+        take_requests(&mut ctx);
+
+        ctx.last_sender_id = host_v1_id;
+        TextInputV1Handler.on_leave(&mut ctx);
+        assert_eq!(take_requests(&mut ctx), []);
+        assert_eq!(ctx.text_inputs[&guest_id].draining_callback(), callback);
     }
 
     #[test]
