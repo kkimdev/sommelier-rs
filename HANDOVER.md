@@ -43,6 +43,10 @@
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.
+- Text input's double-buffered state still lives in separate `pending_*`
+  fields and dirty flags of `TextInputState`; moving it to the
+  [double-buffered state](docs/DESIGN.md#double-buffered-state) convention
+  is the next cleanup.
 - Placement's unverified cases are listed under
   [Output and work area](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#output-and-work-area);
   popups on a toplevel repaired through a late `zaura_shell` bind were also

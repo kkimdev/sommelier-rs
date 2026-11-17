@@ -700,19 +700,19 @@ impl WlSurfaceHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        let surface_state = ctx.surfaces.entry(surface_id).or_default();
-        surface_state.pending_attachment = if buffer == 0 {
+        let pending = &mut ctx.surface_mut(surface_id).pending;
+        pending.attachment = if buffer == 0 {
             SurfaceAttachment::Detach
         } else {
             SurfaceAttachment::Attach(buffer)
         };
-        surface_state.pending_attach_offset = None;
+        pending.attach_offset = None;
         // Since wl_surface version 5, attach's x/y arguments are ignored
         // (and non-zero values were rejected above). Keep them out of the
         // legacy pending-offset slot so a legal attach(buffer, 0, 0) cannot
         // reset a previously committed wl_surface.offset.
         if buffer != 0 && !has_offset_request {
-            surface_state.pending_attach_offset = Some((x, y));
+            pending.attach_offset = Some((x, y));
         }
         // A pending native buffer can be destroyed before the commit that
         // attached it. Replacing that pending attach (including attach(NULL))
@@ -724,10 +724,9 @@ impl WlSurfaceHandler for CompositorHandler {
     }
 
     fn on_damage(&mut self, ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
-        ctx.surfaces
-            .entry(ctx.last_sender_id)
-            .or_default()
-            .pending_surface_damage
+        ctx.surface_mut(ctx.last_sender_id)
+            .pending
+            .surface_damage
             .push(DamageRect::new(x, y, width, height));
         // The host compositor only understands surface-coordinate damage. Keep
         // this request local so the commit path can preserve ordering and
@@ -743,10 +742,9 @@ impl WlSurfaceHandler for CompositorHandler {
         width: i32,
         height: i32,
     ) -> Action {
-        ctx.surfaces
-            .entry(ctx.last_sender_id)
-            .or_default()
-            .pending_buffer_damage
+        ctx.surface_mut(ctx.last_sender_id)
+            .pending
+            .buffer_damage
             .push(DamageRect::new(x, y, width, height));
         // ChromiumOS Sommelier implements damage_buffer by translating it to
         // wl_surface.damage because the host compositor may only expose v3.
@@ -764,10 +762,7 @@ impl WlSurfaceHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        ctx.surfaces
-            .entry(ctx.last_sender_id)
-            .or_default()
-            .pending_buffer_scale = Some(scale);
+        ctx.surface_mut(ctx.last_sender_id).pending.buffer_scale = Some(scale);
         Action::Forward
     }
 
@@ -785,19 +780,12 @@ impl WlSurfaceHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        ctx.surfaces
-            .entry(ctx.last_sender_id)
-            .or_default()
-            .pending_buffer_transform = Some(transform);
+        ctx.surface_mut(ctx.last_sender_id).pending.buffer_transform = Some(transform);
         Action::Forward
     }
 
-    fn on_offset(&mut self, _ctx: &mut Context, _x: i32, _y: i32) -> Action {
-        let ctx = _ctx;
-        ctx.surfaces
-            .entry(ctx.last_sender_id)
-            .or_default()
-            .pending_offset = Some((_x, _y));
+    fn on_offset(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
+        ctx.surface_mut(ctx.last_sender_id).pending.offset = Some((x, y));
         Action::Forward
     }
 
@@ -1001,8 +989,7 @@ impl wp_viewporter::WpViewporterHandler for CompositorHandler {
             return Action::Drop;
         }
         ctx.viewport_to_wl_surface.insert(id, surface);
-        ctx.surfaces.entry(surface).or_default().pending_viewport =
-            Some(Some(ViewportState::new()));
+        ctx.surface_mut(surface).pending.viewport = Some(Some(ViewportState::new()));
         Action::Forward
     }
 }
@@ -1036,14 +1023,8 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        let surface = ctx.surfaces.entry(surface_id).or_default();
-        let mut viewport = surface
-            .pending_viewport
-            .and_then(|pending| pending)
-            .or(surface.viewport)
-            .unwrap_or_default();
-        viewport.source = (!unset).then_some((x, y, width, height));
-        surface.pending_viewport = Some(Some(viewport));
+        ctx.surface_mut(surface_id).pending_viewport_mut().source =
+            (!unset).then_some((x, y, width, height));
         Action::Forward
     }
 
@@ -1072,14 +1053,9 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
             );
             return Action::Drop;
         }
-        let surface = ctx.surfaces.entry(surface_id).or_default();
-        let mut viewport = surface
-            .pending_viewport
-            .and_then(|pending| pending)
-            .or(surface.viewport)
-            .unwrap_or_default();
-        viewport.destination = (!unset).then_some((width, height));
-        surface.pending_viewport = Some(Some(viewport));
+        ctx.surface_mut(surface_id)
+            .pending_viewport_mut()
+            .destination = (!unset).then_some((width, height));
         Action::Forward
     }
 
@@ -1087,7 +1063,7 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
         let viewport_id = ctx.last_sender_id;
         if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
             if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                surface.pending_viewport = Some(None);
+                surface.pending.viewport = Some(None);
             }
         }
         Action::Forward
@@ -1445,7 +1421,6 @@ mod tests {
         state.content_type_dirty = true;
         state.cursor_rect = Some((1, 2, 3, 4));
         state.cursor_rect_dirty = true;
-        state.text_change_cause = 1;
         state.current_preedit = "한".to_string();
         state.set_guest_commits(1);
         state.pending_preedit_cursor = Some(1);
@@ -1558,9 +1533,7 @@ mod tests {
         buffer_id: Option<u32>,
         dimensions: Option<(i32, i32)>,
     ) {
-        ctx.surfaces
-            .entry(surface_id)
-            .or_default()
+        ctx.surface_mut(surface_id)
             .set_current_buffer_for_test(buffer_id, dimensions);
     }
 
@@ -1626,7 +1599,7 @@ mod tests {
             "a commit whose synchronization failed must not reach the host"
         );
         assert_eq!(
-            ctx.surfaces.get(&surface).unwrap().pending_attachment,
+            ctx.surfaces.get(&surface).unwrap().pending.attachment,
             SurfaceAttachment::Attach(buffer),
             "fatal teardown still rolls back the prepared surface transaction"
         );
@@ -2979,7 +2952,7 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .map(|surface| surface.pending_attachment),
+                .map(|surface| surface.pending.attachment),
             Some(SurfaceAttachment::Attach(buffer_id))
         );
 
@@ -3025,7 +2998,7 @@ mod tests {
         rejected(&|handler, ctx| handler.on_set_buffer_transform(ctx, 8), 1);
         assert!(
             ctx.surfaces.get(&surface_id).is_none_or(|surface| {
-                surface.pending_buffer_scale.is_none() && surface.pending_buffer_transform.is_none()
+                surface.pending.buffer_scale.is_none() && surface.pending.buffer_transform.is_none()
             }),
             "invalid requests must not create or mutate pending surface state"
         );
@@ -3043,7 +3016,7 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .map(|surface| surface.pending_attachment)
+                .map(|surface| surface.pending.attachment)
                 .filter(|attachment| *attachment != SurfaceAttachment::Unchanged),
             None
         );
@@ -3057,7 +3030,7 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .and_then(|surface| surface.pending_attach_offset),
+                .and_then(|surface| surface.pending.attach_offset),
             Some((3, 4))
         );
     }
@@ -3075,7 +3048,7 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .and_then(|surface| surface.pending_offset),
+                .and_then(|surface| surface.pending.offset),
             None,
             "commit must consume the one-shot offset"
         );
@@ -3086,7 +3059,7 @@ mod tests {
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
-                .and_then(|surface| surface.pending_attach_offset),
+                .and_then(|surface| surface.pending.attach_offset),
             None
         );
     }
@@ -3105,7 +3078,8 @@ mod tests {
         ctx.surfaces
             .get_mut(&surface_id)
             .expect("surface state")
-            .pending_offset = Some((8, 9));
+            .pending
+            .offset = Some((8, 9));
         let commit = ctx
             .surfaces
             .get_mut(&surface_id)
@@ -3130,7 +3104,8 @@ mod tests {
         ctx.surfaces
             .get_mut(&surface_id)
             .expect("surface state")
-            .pending_offset = Some((8, 9));
+            .pending
+            .offset = Some((8, 9));
         let surface = ctx.surfaces.get_mut(&surface_id).expect("surface state");
         assert_eq!(surface.prepare_commit().buffer_offset, (8, 9));
         assert_eq!(
@@ -3299,8 +3274,8 @@ mod tests {
             );
         }
         let surface = ctx.surfaces.get(&surface_id).unwrap();
-        assert!(surface.pending_surface_damage.is_empty());
-        assert!(surface.pending_buffer_damage.is_empty());
+        assert!(surface.pending.surface_damage.is_empty());
+        assert!(surface.pending.buffer_damage.is_empty());
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert_eq!(ctx.client_to_host_queue.len(), 1);
@@ -3402,7 +3377,7 @@ mod tests {
     #[test]
     fn damage_buffer_mapping_does_not_include_surface_offset() {
         let mut surface = SurfaceState::default();
-        surface.pending_offset = Some((80, 90));
+        surface.pending.offset = Some((80, 90));
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_offset, (80, 90));
 
@@ -3426,7 +3401,7 @@ mod tests {
             mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
-        surface.pending_offset = Some((3, 0));
+        surface.pending.offset = Some((3, 0));
         ctx.surfaces.insert(surface_id, surface);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
@@ -3453,7 +3428,7 @@ mod tests {
             mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
-        surface.pending_offset = Some((3, 0));
+        surface.pending.offset = Some((3, 0));
         ctx.surfaces.insert(surface_id, surface);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), Some((8, 6)));
         ctx.last_sender_id = surface_id;
@@ -3880,10 +3855,8 @@ mod tests {
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         assert!(ctx.mark_buffer_submitted(guest_buffer));
         set_test_surface_content(&mut ctx, first_surface, Some(guest_buffer), None);
-        ctx.surfaces
-            .entry(second_surface)
-            .or_default()
-            .pending_attachment = SurfaceAttachment::Attach(guest_buffer);
+        ctx.surface_mut(second_surface).pending.attachment =
+            SurfaceAttachment::Attach(guest_buffer);
 
         let mut handler = CompositorHandler;
         ctx.last_sender_id = first_surface;

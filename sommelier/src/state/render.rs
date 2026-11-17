@@ -280,10 +280,6 @@ impl DamageRegion {
             Self::Empty | Self::Full => &[],
         }
     }
-
-    fn take(&mut self) -> Self {
-        std::mem::take(self)
-    }
 }
 
 impl From<Vec<DamageRect>> for DamageRegion {
@@ -356,35 +352,43 @@ pub struct SurfaceState {
     /// live wl_buffer object reference. The reference may disappear after
     /// wl_buffer.destroy while the dimensions remain valid for damage mapping.
     pub(super) current_content: Option<SurfaceContentSnapshot>,
-    pub pending_attachment: SurfaceAttachment,
-    /// Damage expressed in surface-local coordinates. It can only be copied
-    /// directly when the current buffer has the default transform and no
-    /// viewport; otherwise the compositor falls back to a complete copy.
-    pub pending_surface_damage: DamageRegion,
-    /// Damage expressed in buffer pixel coordinates.
-    pub pending_buffer_damage: DamageRegion,
     /// Buffer scale/transform are double-buffered by wl_surface. Keeping the
     /// state here lets the commit path decide whether a damage rectangle can
     /// be mapped safely.
-    pub pending_buffer_scale: Option<i32>,
     pub current_buffer_scale: i32,
-    pub pending_buffer_transform: Option<i32>,
     pub current_buffer_transform: i32,
-    /// `wl_surface.offset` is also double-buffered. The SHM bridge does not
-    /// currently transform surface damage through a non-zero offset, so the
-    /// commit path conservatively performs a complete copy in that case.
-    pub pending_offset: Option<(i32, i32)>,
+    /// A viewport object exists for this surface. The object's state is
+    /// tracked separately because an unset viewport is an identity mapping.
+    pub viewport: Option<ViewportState>,
+    /// State the next commit applies.
+    pub pending: SurfacePending,
+}
+
+/// Everything a `wl_surface` request sets for the next commit, which
+/// [`SurfaceState::prepare_commit`] applies at once.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SurfacePending {
+    pub attachment: SurfaceAttachment,
+    /// Damage expressed in surface-local coordinates. It can only be copied
+    /// directly when the current buffer has the default transform and no
+    /// viewport; otherwise the compositor falls back to a complete copy.
+    pub surface_damage: DamageRegion,
+    /// Damage expressed in buffer pixel coordinates.
+    pub buffer_damage: DamageRegion,
+    pub buffer_scale: Option<i32>,
+    pub buffer_transform: Option<i32>,
+    /// `wl_surface.offset`. The SHM bridge does not currently transform
+    /// surface damage through a non-zero offset, so the commit path
+    /// conservatively performs a complete copy in that case.
+    pub offset: Option<(i32, i32)>,
     /// For wl_surface versions before 5, attach(x, y) carries the pending
     /// buffer offset. Keep it separate from the v5+ offset request so a
     /// zero-valued attach does not overwrite a real `wl_surface.offset`
     /// request that appeared earlier in the same state batch.
-    pub pending_attach_offset: Option<(i32, i32)>,
-    /// A viewport object exists for this surface. The object's state is
-    /// tracked separately because an unset viewport is an identity mapping.
-    pub viewport: Option<ViewportState>,
-    /// Pending viewport state applied by the next surface commit. `Some(None)`
-    /// represents destruction of the viewport object; `None` means unchanged.
-    pub pending_viewport: Option<Option<ViewportState>>,
+    pub attach_offset: Option<(i32, i32)>,
+    /// `Some(None)` represents destruction of the viewport object; `None`
+    /// means unchanged.
+    pub viewport: Option<Option<ViewportState>>,
 }
 
 /// One atomically prepared `wl_surface.commit`.
@@ -516,7 +520,13 @@ impl SurfaceState {
         false
     }
 
-    pub(crate) fn clear_current_buffer_reference(&mut self, buffer_id: u32) {
+    /// Drop the surface's references to the destroyed `buffer_id`: its
+    /// current contents keep only their dimensions, and a pending attach of
+    /// it becomes a detach.
+    pub(crate) fn clear_buffer_references(&mut self, buffer_id: u32) {
+        if self.pending.attachment == SurfaceAttachment::Attach(buffer_id) {
+            self.pending.attachment = SurfaceAttachment::Detach;
+        }
         let remove_content = self.current_content.as_mut().is_some_and(|content| {
             if content.buffer_id != Some(buffer_id) {
                 return false;
@@ -548,10 +558,31 @@ impl SurfaceState {
             });
     }
 
+    /// The viewport the next commit applies, for a `wp_viewport` request to
+    /// change: the pending one, or else a copy of the current one.
+    pub fn pending_viewport_mut(&mut self) -> &mut ViewportState {
+        let current = self.viewport.unwrap_or_default();
+        self.pending
+            .viewport
+            .get_or_insert(None)
+            .get_or_insert(current)
+    }
+
     /// Apply and consume all state pending for the next surface commit.
     pub fn prepare_commit(&mut self) -> SurfaceCommit {
         let previous = self.clone();
-        let attachment = std::mem::take(&mut self.pending_attachment);
+        // Name every field: one the commit never applies is then an unused
+        // variable (see docs/DESIGN.md, "Double-buffered state").
+        let SurfacePending {
+            attachment,
+            surface_damage,
+            buffer_damage,
+            buffer_scale,
+            buffer_transform,
+            offset,
+            attach_offset,
+            viewport,
+        } = std::mem::take(&mut self.pending);
         match attachment {
             SurfaceAttachment::Unchanged => {}
             SurfaceAttachment::Detach => self.current_content = None,
@@ -559,24 +590,15 @@ impl SurfaceState {
                 self.current_content = Some(SurfaceContentSnapshot::from_buffer(buffer_id));
             }
         }
-        if let Some(scale) = self.pending_buffer_scale.take() {
+        if let Some(scale) = buffer_scale {
             self.current_buffer_scale = scale;
         }
-        if let Some(transform) = self.pending_buffer_transform.take() {
+        if let Some(transform) = buffer_transform {
             self.current_buffer_transform = transform;
         }
-        let buffer_offset = self
-            .pending_offset
-            .take()
-            .or_else(|| self.pending_attach_offset.take())
-            .unwrap_or((0, 0));
-        // Consume a legacy attach offset even when an explicit offset wins.
-        self.pending_attach_offset = None;
-        if let Some(viewport) = self.pending_viewport.take() {
+        if let Some(viewport) = viewport {
             self.viewport = viewport;
         }
-        let surface_damage = self.pending_surface_damage.take();
-        let buffer_damage = self.pending_buffer_damage.take();
 
         SurfaceCommit {
             previous,
@@ -584,7 +606,8 @@ impl SurfaceState {
             attachment,
             surface_damage,
             buffer_damage,
-            buffer_offset,
+            // An explicit offset wins over a legacy attach offset.
+            buffer_offset: offset.or(attach_offset).unwrap_or((0, 0)),
         }
     }
 }
@@ -593,17 +616,10 @@ impl Default for SurfaceState {
     fn default() -> Self {
         Self {
             current_content: None,
-            pending_attachment: SurfaceAttachment::Unchanged,
-            pending_surface_damage: DamageRegion::default(),
-            pending_buffer_damage: DamageRegion::default(),
-            pending_buffer_scale: None,
             current_buffer_scale: 1,
-            pending_buffer_transform: None,
             current_buffer_transform: 0,
-            pending_offset: None,
-            pending_attach_offset: None,
             viewport: None,
-            pending_viewport: None,
+            pending: SurfacePending::default(),
         }
     }
 }

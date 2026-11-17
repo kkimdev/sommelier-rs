@@ -55,7 +55,6 @@ pub struct TextInputState {
     pub content_type_dirty: bool,
     pub cursor_rect: Option<(i32, i32, i32, i32)>,
     pub cursor_rect_dirty: bool,
-    pub text_change_cause: u32,
     pub current_preedit: String,
     /// Number of v3 commit requests received from this guest object.
     ///
@@ -152,7 +151,6 @@ impl TextInputState {
             content_type_dirty: false,
             cursor_rect: None,
             cursor_rect_dirty: false,
-            text_change_cause: 0,
             current_preedit: String::new(),
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
@@ -241,7 +239,6 @@ impl TextInputState {
         self.content_type_dirty = false;
         self.cursor_rect = None;
         self.cursor_rect_dirty = false;
-        self.text_change_cause = 0;
         self.clear_host_composition();
         self.active_surface = active_surface;
         previous_surface
@@ -268,16 +265,11 @@ impl TextInputState {
         self.content_type_dirty = true;
         self.cursor_rect = None;
         self.cursor_rect_dirty = true;
-        self.text_change_cause = 0;
     }
 
     pub fn set_surrounding_text(&mut self, text: String, cursor: i32, anchor: i32) {
         self.pending_surrounding_text = Some((text, cursor, anchor));
         self.surrounding_text_dirty = true;
-    }
-
-    pub fn set_text_change_cause(&mut self, cause: u32) {
-        self.text_change_cause = cause;
     }
 
     pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
@@ -385,7 +377,6 @@ impl TextInputState {
         if plan.cursor_rect.is_some() {
             self.cursor_rect_dirty = false;
         }
-        self.text_change_cause = 0;
     }
 
     pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
@@ -1993,7 +1984,6 @@ mod tests {
         state.content_type_dirty = true;
         state.cursor_rect = Some((1, 2, 3, 4));
         state.cursor_rect_dirty = true;
-        state.text_change_cause = 1;
         state.current_preedit = "조합".to_string();
         state.set_guest_commits(17);
         state.pending_preedit_cursor = Some(3);
@@ -2018,7 +2008,6 @@ mod tests {
         state.set_surrounding_text("가나다".to_string(), 9, 9);
         state.set_content_type(3, 4);
         state.set_cursor_rect((1, 2, 3, 4));
-        state.set_text_change_cause(1);
         assert_eq!(state.count_guest_commit(), 1);
         let before = state.clone();
 
@@ -2045,7 +2034,6 @@ mod tests {
         state.set_surrounding_text("가나다".to_string(), 9, 9);
         state.set_content_type(3, 4);
         state.set_cursor_rect((1, 2, 3, 4));
-        state.set_text_change_cause(1);
 
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
@@ -2063,7 +2051,6 @@ mod tests {
         assert_eq!(state.committed_content_type, Some((3, 4)));
         assert!(!state.content_type_dirty);
         assert!(!state.cursor_rect_dirty);
-        assert_eq!(state.text_change_cause, 0);
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_preedit_cursor.is_none());
         assert!(state.pending_deletes.is_empty());

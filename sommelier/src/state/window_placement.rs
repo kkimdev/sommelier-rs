@@ -32,7 +32,7 @@ limitations under the License.
 //! answers ownership questions and returns the IDs whose host teardown the
 //! caller must perform.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::arc_task_ids::ArcIdAllocator;
 
@@ -77,6 +77,15 @@ pub(crate) struct HeldWindowBoundsConfigures {
     pub surface_configure: Option<PendingWindowBoundsSurfaceConfigure>,
 }
 
+/// The barrier callback that gates an Aura toplevel's configures, with the
+/// latest configures held behind it. Configures are held only while a
+/// barrier is active, so they live inside it.
+#[derive(Debug)]
+struct ActiveBarrier {
+    callback_host_id: u32,
+    held: HeldWindowBoundsConfigures,
+}
+
 /// All mutable state owned by the window-placement feature for one client
 /// connection.
 #[derive(Debug)]
@@ -98,15 +107,10 @@ pub(crate) struct WindowPlacementState {
     /// Reverse of `aura_toplevel_by_xdg_toplevel`, used to route host Aura
     /// toplevel events back to the guest role.
     xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
-    /// The newest barrier callback for each live Aura toplevel; only it gates
+    /// The newest barrier of each live Aura toplevel; only it gates
     /// configure delivery. Every barrier, including superseded ones, stays
     /// pending in `crate::state::InternalCallbacks` until its `done`.
-    active_barriers: HashMap<u32, u32>,
-    /// Latest toplevel configure held while the active barrier is live.
-    held_configures: HashMap<u32, PendingWindowBoundsConfigure>,
-    /// Latest serial-bearing surface configure held while the active barrier
-    /// is live.
-    held_surface_configures: HashMap<u32, PendingWindowBoundsSurfaceConfigure>,
+    active_barriers: HashMap<u32, ActiveBarrier>,
 }
 
 impl WindowPlacementState {
@@ -125,8 +129,6 @@ impl WindowPlacementState {
             aura_toplevel_by_xdg_toplevel: HashMap::new(),
             xdg_toplevel_by_aura_toplevel: HashMap::new(),
             active_barriers: HashMap::new(),
-            held_configures: HashMap::new(),
-            held_surface_configures: HashMap::new(),
         }
     }
 
@@ -150,13 +152,6 @@ impl WindowPlacementState {
             self.aura_toplevel_by_xdg_toplevel.len(),
             self.xdg_toplevel_by_aura_toplevel.len()
         );
-        debug_assert!(self
-            .held_configures
-            .keys()
-            .chain(self.held_surface_configures.keys())
-            .all(|zaura_toplevel_host_id| self
-                .active_barriers
-                .contains_key(zaura_toplevel_host_id)));
         debug_assert!(self
             .arc_application_ids_applied
             .iter()
@@ -273,8 +268,6 @@ impl WindowPlacementState {
         self.xdg_toplevel_by_aura_toplevel
             .remove(&zaura_toplevel_host_id);
         self.active_barriers.remove(&zaura_toplevel_host_id);
-        self.held_configures.remove(&zaura_toplevel_host_id);
-        self.held_surface_configures.remove(&zaura_toplevel_host_id);
         self.debug_assert_consistent();
         Some(zaura_toplevel_host_id)
     }
@@ -287,10 +280,16 @@ impl WindowPlacementState {
     // ── Bounds barriers and held configures ───────────────────────────────
 
     /// Make a newly queued barrier callback the one that gates an Aura
-    /// toplevel's configures. A previous barrier no longer gates them.
+    /// toplevel's configures. A previous barrier no longer gates them, and
+    /// the configures it held wait for the new one.
     pub(crate) fn register_barrier(&mut self, callback_host_id: u32, zaura_toplevel_host_id: u32) {
         self.active_barriers
-            .insert(zaura_toplevel_host_id, callback_host_id);
+            .entry(zaura_toplevel_host_id)
+            .or_insert_with(|| ActiveBarrier {
+                callback_host_id,
+                held: HeldWindowBoundsConfigures::default(),
+            })
+            .callback_host_id = callback_host_id;
         self.debug_assert_consistent();
     }
 
@@ -307,12 +306,12 @@ impl WindowPlacementState {
         callback_host_id: u32,
         zaura_toplevel_host_id: u32,
     ) -> HeldWindowBoundsConfigures {
-        let mut held = HeldWindowBoundsConfigures::default();
-        if self.active_barriers.get(&zaura_toplevel_host_id) == Some(&callback_host_id) {
-            self.active_barriers.remove(&zaura_toplevel_host_id);
-            held.configure = self.held_configures.remove(&zaura_toplevel_host_id);
-            held.surface_configure = self.held_surface_configures.remove(&zaura_toplevel_host_id);
-        }
+        let held = match self.active_barriers.entry(zaura_toplevel_host_id) {
+            Entry::Occupied(barrier) if barrier.get().callback_host_id == callback_host_id => {
+                barrier.remove().held
+            }
+            _ => HeldWindowBoundsConfigures::default(),
+        };
         self.debug_assert_consistent();
         held
     }
@@ -334,11 +333,10 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         configure: PendingWindowBoundsConfigure,
     ) -> bool {
-        if !self.has_active_barrier(zaura_toplevel_host_id) {
+        let Some(barrier) = self.active_barriers.get_mut(&zaura_toplevel_host_id) else {
             return false;
-        }
-        self.held_configures
-            .insert(zaura_toplevel_host_id, configure);
+        };
+        barrier.held.configure = Some(configure);
         true
     }
 
@@ -350,22 +348,25 @@ impl WindowPlacementState {
         zaura_toplevel_host_id: u32,
         configure: PendingWindowBoundsSurfaceConfigure,
     ) -> bool {
-        if !self.has_active_barrier(zaura_toplevel_host_id) {
+        let Some(barrier) = self.active_barriers.get_mut(&zaura_toplevel_host_id) else {
             return false;
-        }
-        self.held_surface_configures
-            .insert(zaura_toplevel_host_id, configure);
+        };
+        barrier.held.surface_configure = Some(configure);
         true
     }
 
     #[cfg(test)]
     pub(crate) fn active_barrier_for_toplevel(&self, zaura_toplevel_host_id: u32) -> Option<u32> {
-        self.active_barriers.get(&zaura_toplevel_host_id).copied()
+        self.active_barriers
+            .get(&zaura_toplevel_host_id)
+            .map(|barrier| barrier.callback_host_id)
     }
 
     #[cfg(test)]
     pub(crate) fn has_held_configure(&self, zaura_toplevel_host_id: u32) -> bool {
-        self.held_configures.contains_key(&zaura_toplevel_host_id)
+        self.active_barriers
+            .get(&zaura_toplevel_host_id)
+            .is_some_and(|barrier| barrier.held.configure.is_some())
     }
 }
 
@@ -494,8 +495,9 @@ mod tests {
         let mut state = inactive();
         state.remember_aura_toplevel(10, 77);
         state.register_barrier(40, 77);
-        state.register_barrier(41, 77);
         assert!(state.hold_configure(77, configure(10)));
+        state.register_barrier(41, 77);
+        assert!(state.hold_surface_configure(77, surface_configure(2)));
 
         assert_eq!(
             state.complete_barrier(40, 77),
@@ -504,8 +506,14 @@ mod tests {
         assert_eq!(state.active_barrier_for_toplevel(77), Some(41));
         assert!(state.has_held_configure(77));
 
-        let held = state.complete_barrier(41, 77);
-        assert_eq!(held.configure, Some(configure(10)));
+        assert_eq!(
+            state.complete_barrier(41, 77),
+            HeldWindowBoundsConfigures {
+                configure: Some(configure(10)),
+                surface_configure: Some(surface_configure(2)),
+            },
+            "configures held before and after a newer barrier wait for it"
+        );
         assert!(!state.has_active_barrier(77));
     }
 }

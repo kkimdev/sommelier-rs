@@ -50,6 +50,8 @@ pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
 };
+#[cfg(test)]
+pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
     BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
     StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
@@ -580,6 +582,12 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn render_buffer_count(&self) -> usize {
         self.render_buffers.len()
+    }
+
+    /// The state of the guest `wl_surface` `surface`, created by the first
+    /// request that sets any.
+    pub(crate) fn surface_mut(&mut self, surface: u32) -> &mut SurfaceState {
+        self.surfaces.entry(surface).or_default()
     }
 
     /// Stale what `commit` of `surface` changed in the host copies of the
@@ -1206,20 +1214,22 @@ mod tests {
     fn surface_commit_applies_every_pending_field_atomically() {
         let mut surface = SurfaceState {
             current_content: None,
-            pending_attachment: SurfaceAttachment::Attach(2),
-            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
-            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
-            pending_buffer_scale: Some(2),
             current_buffer_scale: 1,
-            pending_buffer_transform: Some(3),
             current_buffer_transform: 0,
-            pending_offset: Some((9, 10)),
-            pending_attach_offset: Some((11, 12)),
             viewport: None,
-            pending_viewport: Some(Some(ViewportState {
-                source: Some((0, 0, 256, 256)),
-                destination: Some((20, 30)),
-            })),
+            pending: SurfacePending {
+                attachment: SurfaceAttachment::Attach(2),
+                surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
+                buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
+                buffer_scale: Some(2),
+                buffer_transform: Some(3),
+                offset: Some((9, 10)),
+                attach_offset: Some((11, 12)),
+                viewport: Some(Some(ViewportState {
+                    source: Some((0, 0, 256, 256)),
+                    destination: Some((20, 30)),
+                })),
+            },
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
 
@@ -1254,14 +1264,7 @@ mod tests {
             })
         );
         assert_eq!(surface, commit.state);
-        assert_eq!(surface.pending_attachment, SurfaceAttachment::Unchanged);
-        assert!(surface.pending_surface_damage.is_empty());
-        assert!(surface.pending_buffer_damage.is_empty());
-        assert!(surface.pending_buffer_scale.is_none());
-        assert!(surface.pending_buffer_transform.is_none());
-        assert!(surface.pending_offset.is_none());
-        assert!(surface.pending_attach_offset.is_none());
-        assert!(surface.pending_viewport.is_none());
+        assert_eq!(surface.pending, SurfacePending::default());
 
         let next = surface.prepare_commit();
         assert_eq!(next.attachment, SurfaceAttachment::Unchanged);
@@ -1276,17 +1279,19 @@ mod tests {
     fn surface_commit_rollback_restores_the_complete_snapshot() {
         let mut surface = SurfaceState {
             current_content: None,
-            pending_attachment: SurfaceAttachment::Detach,
-            pending_surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
-            pending_buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
-            pending_buffer_scale: Some(2),
             current_buffer_scale: 1,
-            pending_buffer_transform: Some(3),
             current_buffer_transform: 0,
-            pending_offset: Some((4, 5)),
-            pending_attach_offset: Some((11, 12)),
             viewport: Some(ViewportState::new()),
-            pending_viewport: Some(None),
+            pending: SurfacePending {
+                attachment: SurfaceAttachment::Detach,
+                surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
+                buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
+                buffer_scale: Some(2),
+                buffer_transform: Some(3),
+                offset: Some((4, 5)),
+                attach_offset: Some((11, 12)),
+                viewport: Some(None),
+            },
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
         let before = surface.clone();
@@ -1301,10 +1306,8 @@ mod tests {
 
     #[test]
     fn surface_commit_detach_clears_committed_content_dimensions() {
-        let mut surface = SurfaceState {
-            pending_attachment: SurfaceAttachment::Detach,
-            ..SurfaceState::default()
-        };
+        let mut surface = SurfaceState::default();
+        surface.pending.attachment = SurfaceAttachment::Detach;
         surface.set_current_buffer_for_test(Some(1), Some((100, 50)));
 
         let commit = surface.prepare_commit();
@@ -1319,11 +1322,11 @@ mod tests {
         let mut surface = SurfaceState::default();
         surface.set_current_buffer_for_test(Some(7), Some((100, 50)));
 
-        surface.clear_current_buffer_reference(8);
+        surface.clear_buffer_references(8);
         assert_eq!(surface.current_buffer_id(), Some(7));
         assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
 
-        surface.clear_current_buffer_reference(7);
+        surface.clear_buffer_references(7);
         assert_eq!(surface.current_buffer_id(), None);
         assert_eq!(surface.current_buffer_dimensions(), Some((100, 50)));
         assert!(
@@ -1340,23 +1343,25 @@ mod tests {
             .map(|index| DamageRect::new(index as i32, 0, 1, 1))
             .collect();
         for rect in &exact {
-            surface.pending_buffer_damage.push(*rect);
+            surface.pending.buffer_damage.push(*rect);
         }
 
-        assert_eq!(surface.pending_buffer_damage, DamageRegion::Rects(exact));
+        assert_eq!(surface.pending.buffer_damage, DamageRegion::Rects(exact));
 
         surface
-            .pending_buffer_damage
+            .pending
+            .buffer_damage
             .push(DamageRect::new(-10, -20, 30, 40));
-        assert_eq!(surface.pending_buffer_damage, DamageRegion::Full);
+        assert_eq!(surface.pending.buffer_damage, DamageRegion::Full);
 
         for _ in 0..MAX_PENDING_DAMAGE_RECTS {
             surface
-                .pending_buffer_damage
+                .pending
+                .buffer_damage
                 .push(DamageRect::new(1, 1, 1, 1));
         }
         assert_eq!(
-            surface.pending_buffer_damage,
+            surface.pending.buffer_damage,
             DamageRegion::Full,
             "a collapsed region must remain bounded"
         );
@@ -1364,7 +1369,7 @@ mod tests {
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_damage, DamageRegion::Full);
         assert!(commit.has_full_damage());
-        assert!(surface.pending_buffer_damage.is_empty());
+        assert!(surface.pending.buffer_damage.is_empty());
     }
 
     #[test]
@@ -1372,7 +1377,8 @@ mod tests {
         let mut surface = SurfaceState::default();
         for index in 0..=MAX_PENDING_DAMAGE_RECTS {
             surface
-                .pending_surface_damage
+                .pending
+                .surface_damage
                 .push(DamageRect::new(index as i32, 0, 1, 1));
         }
         let pending = surface.clone();
@@ -1388,20 +1394,60 @@ mod tests {
 
     #[test]
     fn surface_commit_validates_fractional_viewport_as_one_state() {
-        let mut surface = SurfaceState {
-            pending_viewport: Some(Some(ViewportState {
-                source: Some((0, 0, 257, 256)),
-                destination: None,
-            })),
-            ..SurfaceState::default()
-        };
+        let mut surface = SurfaceState::default();
+        surface.pending.viewport = Some(Some(ViewportState {
+            source: Some((0, 0, 257, 256)),
+            destination: None,
+        }));
         assert!(surface.prepare_commit().has_invalid_fractional_viewport());
 
-        surface.pending_viewport = Some(Some(ViewportState {
+        surface.pending.viewport = Some(Some(ViewportState {
             source: Some((0, 0, 257, 256)),
             destination: Some((10, 10)),
         }));
         assert!(!surface.prepare_commit().has_invalid_fractional_viewport());
+    }
+
+    #[test]
+    fn pending_viewport_starts_from_the_pending_else_the_committed_one() {
+        let source = Some((0, 0, 256, 256));
+        let mut surface = SurfaceState::default();
+        surface.pending_viewport_mut().source = source;
+        surface.prepare_commit();
+        let committed = surface.viewport;
+
+        // Nothing pending: the request edits a copy of the committed viewport.
+        surface.pending_viewport_mut().destination = Some((10, 20));
+        assert_eq!(surface.viewport, committed);
+        assert_eq!(
+            surface.pending.viewport,
+            Some(Some(ViewportState {
+                source,
+                destination: Some((10, 20)),
+            }))
+        );
+
+        // A viewport pending: the request edits it.
+        surface.pending_viewport_mut().destination = Some((30, 40));
+        assert_eq!(
+            surface.prepare_commit().state.viewport,
+            Some(ViewportState {
+                source,
+                destination: Some((30, 40)),
+            })
+        );
+
+        // A destroyed viewport pending: the request edits a copy of the
+        // committed viewport.
+        surface.pending.viewport = Some(None);
+        surface.pending_viewport_mut().source = None;
+        assert_eq!(
+            surface.pending.viewport,
+            Some(Some(ViewportState {
+                source: None,
+                destination: Some((30, 40)),
+            }))
+        );
     }
 
     #[test]
