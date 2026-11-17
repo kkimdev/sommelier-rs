@@ -1286,7 +1286,6 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             WaylandConnection::new(host.into()).expect("register the host socket"),
             context,
         );
-        client.check_orphans = true;
         let (get_registry, _) = wl_display::req::get_registry(WL_DISPLAY_ID, REGISTRY);
         client.client_conn.read_buf.extend(get_registry);
         assert!(client.handle_msgs(Direction::ClientToHost).await);

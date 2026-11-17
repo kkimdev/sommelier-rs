@@ -257,10 +257,6 @@ struct Client {
     /// failed. No later batch dispatches anything, so the guest gets at most
     /// one error. A failed receive or a closed peer stops `run` without it.
     ended: bool,
-    /// Whether every batch that keeps the session checks that it left no
-    /// state behind an ended object (`Context::assert_no_orphans`).
-    #[cfg(test)]
-    check_orphans: bool,
     /// The guest request waiting for a fence, if one is.
     parked: Option<ParkedRequest>,
 }
@@ -274,8 +270,6 @@ impl Client {
             ctx,
             handler: SommelierHandler::new(),
             ended: false,
-            #[cfg(test)]
-            check_orphans: false,
             parked: None,
         }
     }
@@ -736,10 +730,10 @@ impl Client {
         // refreshes within this dispatch batch; allow the next batch to
         // publish a newer table after more capabilities have arrived.
         self.ctx.synthetic_feedback_refresh_pending.clear();
-        // A session that ends rolls nothing back, so only a batch that
-        // keeps it must leave no state behind an ended object.
+        // A session that ends rolls nothing back, so in tests every batch
+        // that keeps it must leave no state behind an ended object.
         #[cfg(test)]
-        if self.check_orphans && end.is_none() {
+        if end.is_none() {
             self.ctx.assert_no_orphans();
         }
 
@@ -1433,36 +1427,43 @@ mod tests {
             );
         }
         client.ctx.guest_destroyed(STALE_GUEST_KEYBOARD);
-        client.ctx.keyboard_repeatable_keys.insert(
-            crate::state::HostId(STALE_HOST_KEYBOARD),
-            std::collections::HashSet::from([57]),
-        );
 
         (client, guest_peer, _host_peer)
     }
 
-    fn duplicate_pipe_read_fd() -> (RawFd, std::path::PathBuf) {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let keymap_fd = unsafe { libc::fcntl(pipe_fds[0], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(keymap_fd >= 1000, "fd duplication should succeed");
-        let keymap_target =
-            fs::read_link(format!("/proc/self/fd/{keymap_fd}")).expect("keymap fd target");
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-        (keymap_fd, keymap_target)
-    }
-
-    /// A keymap event; its descriptor travels apart from its bytes.
-    fn stale_keymap_event() -> Vec<u8> {
+    /// A valid keymap event from the destroyed keyboard, and the identity
+    /// of its descriptor, which travels apart from its bytes. Were its
+    /// handler to run, it would load the keymap for the destroyed keyboard,
+    /// state the orphan check after the batch reports.
+    fn stale_keymap_event() -> (Vec<u8>, OwnedFd, crate::test_support::TestFdIdentity) {
         use crate::protocols::wayland::wl_keyboard;
+        use xkbcommon::xkb;
 
-        let mut keymap = MessageBuilder::new();
-        keymap.write_u32(1);
-        keymap.write_u32(0);
-        keymap.build_message(STALE_HOST_KEYBOARD, wl_keyboard::EVT_KEYMAP)
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the default keymap");
+        // The size counts the NUL that ends the keymap text.
+        let mut text = keymap
+            .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+            .into_bytes();
+        text.push(0);
+        let file = OwnedFd::from(shm_pool_file(&text));
+        let identity = fd_identity(file.as_raw_fd());
+        let (event, mut fds) = wl_keyboard::evt::keymap(
+            STALE_HOST_KEYBOARD,
+            wl_keyboard::KEYMAP_FORMAT_XKB_V1,
+            file,
+            text.len() as u32,
+        );
+        (event, fds.pop().expect("the keymap's descriptor"), identity)
     }
 
     fn repeat_info_event(keyboard: u32) -> Vec<u8> {
@@ -1490,8 +1491,7 @@ mod tests {
     #[tokio::test]
     async fn pending_destroy_event_consumes_known_fd_before_live_event_in_same_batch() {
         let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
-        let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
-        let keymap = stale_keymap_event();
+        let (keymap, keymap_fd, keymap_identity) = stale_keymap_event();
         let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
         let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
 
@@ -1500,10 +1500,7 @@ mod tests {
             .host_conn
             .read_buf
             .extend_from_slice(&live_repeat_info);
-        client
-            .host_conn
-            .read_fds
-            .push_back(unsafe { OwnedFd::from_raw_fd(keymap_fd) });
+        client.host_conn.read_fds.push_back(keymap_fd);
 
         assert!(
             client.handle_msgs(Direction::HostToClient).await,
@@ -1522,13 +1519,11 @@ mod tests {
                 .is_pending_destroy_guest(STALE_GUEST_KEYBOARD),
             "dropping a stale event must not complete object teardown"
         );
-        assert_eq!(
-            client.ctx.keyboard_repeatable_keys[&crate::state::HostId(STALE_HOST_KEYBOARD)],
-            std::collections::HashSet::from([57]),
-            "schema consumption must not invoke the keymap handler"
-        );
         assert_live_repeat_info_forwarded(&mut guest_peer, &expected_repeat_info);
-        assert_fd_released(keymap_fd, &keymap_target);
+        assert!(
+            !any_fd_has_identity(keymap_identity),
+            "the stale keymap's descriptor is closed"
+        );
     }
 
     #[tokio::test]
@@ -1536,8 +1531,7 @@ mod tests {
         use std::io::Read;
 
         let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
-        let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
-        let keymap = stale_keymap_event();
+        let (keymap, keymap_fd, keymap_identity) = stale_keymap_event();
         let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
         let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
 
@@ -1546,10 +1540,7 @@ mod tests {
             .host_conn
             .read_buf
             .extend_from_slice(&live_repeat_info[..4]);
-        client
-            .host_conn
-            .read_fds
-            .push_back(unsafe { OwnedFd::from_raw_fd(keymap_fd) });
+        client.host_conn.read_fds.push_back(keymap_fd);
 
         assert!(client.handle_msgs(Direction::HostToClient).await);
         assert_eq!(
@@ -1559,17 +1550,15 @@ mod tests {
         );
         assert!(client.host_conn.read_fds.is_empty());
         assert!(!client.host_conn.ambiguous_untracked_fd);
-        assert_eq!(
-            client.ctx.keyboard_repeatable_keys[&crate::state::HostId(STALE_HOST_KEYBOARD)],
-            std::collections::HashSet::from([57]),
-            "schema consumption must not invoke the keymap handler"
-        );
         let mut premature = [0u8; 1];
         let read_error = guest_peer
             .read(&mut premature)
             .expect_err("an incomplete live event must not be forwarded");
         assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
-        assert_fd_released(keymap_fd, &keymap_target);
+        assert!(
+            !any_fd_has_identity(keymap_identity),
+            "the stale keymap's descriptor is closed"
+        );
 
         client
             .host_conn
