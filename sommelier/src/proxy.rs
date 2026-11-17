@@ -17,7 +17,7 @@ limitations under the License.
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
-use crate::state::{Context, PostDispatch, SessionEnd, ShadowTable};
+use crate::state::{Context, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
@@ -53,17 +53,6 @@ const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis
 enum Direction {
     ClientToHost,
     HostToClient,
-}
-
-fn translated_sender_id(
-    shadow_table: &ShadowTable,
-    direction: Direction,
-    sender_id: u32,
-) -> Option<u32> {
-    match direction {
-        Direction::ClientToHost => shadow_table.get_host_id(sender_id),
-        Direction::HostToClient => shadow_table.get_guest_id(sender_id),
-    }
 }
 
 fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bool {
@@ -414,17 +403,6 @@ impl Client {
 
             let packet = &conn.read_buf[offset..message_end];
 
-            let guest_id = match direction {
-                Direction::ClientToHost => Some(sender_id),
-                Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
-            };
-            // Destructors retain their numeric mapping until host
-            // wl_display.delete_id, but the translated sender is still
-            // captured before dispatch so custom handlers may retire state
-            // without changing the forwarded request's sender.
-            let target_sender_id =
-                translated_sender_id(&self.ctx.shadow_table, direction, sender_id);
-
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
@@ -487,7 +465,7 @@ impl Client {
                 // request was accepted and can desynchronize protocol state.
                 Err(ProtocolError::InvalidSender(sender_id))
             } else {
-                if guest_id.is_some() {
+                if self.ctx.shadow_table.get_guest_id(sender_id).is_some() {
                     log::warn!(
                         "[{:?}] unknown id {} opcode {} (len={})",
                         direction,
@@ -553,22 +531,16 @@ impl Client {
                 end = Some(session_end);
                 break;
             }
-            if let Some((mut data, fds)) = forward {
-                log::debug!("  -> translated ({} bytes, {} fds)", data.len(), fds.len());
-
-                // Patch ID in the forwarded message
-                if let Some(gid) = guest_id {
-                    if let Some(tid) = target_sender_id {
-                        MessageHeader::set_sender(&mut data, tid);
-                    } else {
-                        // If we can't map the ID, it might be a new object or error.
-                        // For ClientToHost, it's usually sender which should be mapped.
-                        // We log a warning but send anyway (might fail on host).
-                        log::warn!("Could not map sender ID {} to host ID", gid);
-                    }
-                }
-
-                out.push((data, fds));
+            // The generated dispatcher encoded the forward under the sender
+            // it translated before the handler ran, so a handler that retires
+            // the sender's mapping cannot change it.
+            if let Some(message) = forward {
+                log::debug!(
+                    "  -> translated ({} bytes, {} fds)",
+                    message.0.len(),
+                    message.1.len()
+                );
+                out.push(message);
             }
             let (onward, back) = match direction {
                 Direction::ClientToHost => (effects.to_host, effects.to_guest),
@@ -4414,21 +4386,6 @@ mod tests {
             ],
             "the valid event reaches the guest ahead of the session's error"
         );
-    }
-
-    #[test]
-    fn translated_sender_survives_destructor_mapping_removal() {
-        let mut shadow_table = ShadowTable::new();
-        shadow_table.insert_paired_for_test(47, 68, "wl_surface");
-
-        let client_to_host = translated_sender_id(&shadow_table, Direction::ClientToHost, 47);
-        let host_to_client = translated_sender_id(&shadow_table, Direction::HostToClient, 68);
-        shadow_table.release_deleted_host_id(68);
-
-        assert_eq!(client_to_host, Some(68));
-        assert_eq!(host_to_client, Some(47));
-        assert_eq!(shadow_table.get_host_id(47), None);
-        assert_eq!(shadow_table.get_guest_id(68), None);
     }
 
     #[test]
