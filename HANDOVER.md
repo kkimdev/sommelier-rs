@@ -17,7 +17,9 @@
 ## Architecture
 
 - The README's [repository layout](README.md#repository-layout) lists the
-  top-level directories.
+  top-level directories, [`docs/DESIGN.md`](docs/DESIGN.md) explains the
+  proxy's structure, and [`docs/INVARIANTS.md`](docs/INVARIANTS.md) holds
+  the rules every change must keep.
 - The opt-in window placement feature is described, with its code map, in
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
 
@@ -30,6 +32,17 @@
   `--gpu-accel` and the fork do not cover.
 - Upstream review and eventual rebase/cherry-pick coordination remain
   separate from this fork's `virtwl` branch.
+- The damage-only commit rule and the code disagree; see
+  [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).
+- ChromiumOS parity reviews left these differences unconfirmed, with no
+  reproducer: commits on a surface with no role or window, cleanup of a
+  keyboard leave for a pending surface, and two keyboards on one seat (the
+  IME Backspace fallback picks a seat-level keyboard while keysyms prefer
+  the focused one, and one chord can issue a redundant placement batch).
+- Placement's unverified cases are listed under
+  [Output and work area](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#output-and-work-area);
+  popups on a toplevel repaired through a late `zaura_shell` bind were also
+  never checked on a host.
 
 ## Next steps
 

@@ -268,6 +268,8 @@ The fork currently keeps `virtwl` as its only development branch.
 - `sommelier_test_app/` — standalone GUI/IME test client.
 - `third_party/protocols/` — vendored Wayland and ChromeOS protocol XML.
 - `packaging/systemd/` — user service template for VirtWL instances.
+- `docs/` — [design](docs/DESIGN.md) and the binding
+  [runtime invariants](docs/INVARIANTS.md).
 - `sommelier/docs/` — focused protocol and keyboard design notes.
 
 ## Scope and limitations
