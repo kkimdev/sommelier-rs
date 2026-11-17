@@ -176,8 +176,8 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // can trigger a secondary protocol error in its display parser.
             // The session still ends with an `implementation` error.
             error!(
-                "Dropping host display error for unmapped object_id={} (code={})",
-                object_id, code
+                "Dropping host display error for unmapped object_id={} (code={}): {}",
+                object_id, code, message
             );
             return Action::Drop;
         };
