@@ -436,8 +436,11 @@ impl ShadowTable {
     /// Retire a host-only object after its destructor request has been queued.
     ///
     /// The dispatch metadata is removed immediately so stale events cannot
-    /// reach a handler, but the numeric ID remains reserved until the host
-    /// acknowledges the destructor with `wl_display.delete_id`.
+    /// reach a handler. An ID this proxy allocated remains reserved until the
+    /// host acknowledges the destructor with `wl_display.delete_id`. An ID
+    /// the host allocated gets no `delete_id` (libwayland frees server IDs
+    /// as soon as the destructor is processed and may hand them to the next
+    /// server-created object at once), so nothing is kept for it.
     ///
     /// Handlers go through [`Context::retire_destroyed_host_object`], which
     /// owns what a refusal means.
@@ -449,7 +452,7 @@ impl ShadowTable {
         self.host_interfaces.remove(&host_id);
         self.host_versions.remove(&host_id);
         self.retired_host_ids.remove(&host_id);
-        self.pending_destroy_host_ids.insert(host_id)
+        !self.host_ids.contains(host_id) || self.pending_destroy_host_ids.insert(host_id)
     }
 
     #[allow(dead_code)]
@@ -1887,6 +1890,22 @@ mod tests {
         assert_eq!(table.release_deleted_host_id(40), DeletedHostId::HostOnly);
         assert!(!table.is_pending_destroy_host_only(40));
         assert!(table.is_host_id_available(40));
+    }
+
+    #[test]
+    fn destroyed_host_allocated_object_frees_its_id_at_once() {
+        // The host allocates IDs from the server range and sends no
+        // delete_id for them; it may reuse one for its next new object.
+        let host_buffer = ShadowTable::GUEST_SERVER_ID_START + 5;
+        let mut table = ShadowTable::new();
+        table.track_host_interface(host_buffer, "wl_buffer".to_string());
+
+        assert!(table.mark_pending_destroy_host(host_buffer));
+        assert!(!table.is_event_sender_known(host_buffer));
+        assert!(
+            table.is_host_id_available(host_buffer),
+            "the host's next server-created object may reuse the ID"
+        );
     }
 
     #[test]
