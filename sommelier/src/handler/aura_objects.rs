@@ -252,7 +252,7 @@ mod tests {
                 [id.to_ne_bytes(), PARENT_HOST.to_ne_bytes()].concat()
             );
             assert_eq!(
-                ctx.shadow_table.get_host_interface(id).map(String::as_str),
+                ctx.shadow_table.get_host_interface(id),
                 Some(child.interface)
             );
             assert_eq!(aura_object_version(&ctx, id), version);

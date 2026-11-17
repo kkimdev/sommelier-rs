@@ -1477,7 +1477,7 @@ mod tests {
         assert_eq!(handler.on_bind(&mut ctx, 8, &bind), Action::Drop);
         assert_eq!(
             ctx.shadow_table.get_interface(20),
-            Some(&"wl_shm".to_string()),
+            Some("wl_shm"),
             "the second registry's synthetic global must accept a bind"
         );
     }
@@ -1877,10 +1877,7 @@ mod tests {
             (4, "zcr_keyboard_extension_v1"),
             (5, "wl_shm"),
         ] {
-            assert_eq!(
-                ctx.shadow_table.get_host_interface(id),
-                Some(&interface.to_string())
-            );
+            assert_eq!(ctx.shadow_table.get_host_interface(id), Some(interface));
         }
     }
 
@@ -1906,10 +1903,7 @@ mod tests {
         assert_eq!(handler.on_bind(&mut ctx, 7, &id), crate::wire::Action::Drop);
 
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert_eq!(
-            ctx.shadow_table.get_interface(20),
-            Some(&"wl_shm".to_string())
-        );
+        assert_eq!(ctx.shadow_table.get_interface(20), Some("wl_shm"));
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "synthetic wl_shm bind must not issue a second host bind"
@@ -1952,7 +1946,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(2),
-            Some(&"zwp_text_input_manager_v1".to_string())
+            Some("zwp_text_input_manager_v1")
         );
         assert!(ctx.shadow_table.get_interface(21).is_some());
     }
@@ -2124,7 +2118,7 @@ mod tests {
             .expect("extended keyboard child");
         assert_eq!(
             ctx.shadow_table.get_host_interface(child_id.0),
-            Some(&"zcr_extended_keyboard_v1".to_string())
+            Some("zcr_extended_keyboard_v1")
         );
 
         assert_eq!(handler.on_global_remove(&mut ctx, 20), Action::Drop);
@@ -2146,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(child_id.0),
-            Some(&"zcr_extended_keyboard_v1".to_string()),
+            Some("zcr_extended_keyboard_v1"),
             "child dispatch metadata must survive global removal"
         );
     }
@@ -2237,7 +2231,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(surface_id),
-            Some(&"zaura_surface".to_string()),
+            Some("zaura_surface"),
             "legacy child dispatch metadata remains live until surface destroy"
         );
         assert!(
@@ -2275,7 +2269,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(surface_id),
-            Some(&"zaura_surface".to_string())
+            Some("zaura_surface")
         );
         assert_eq!(
             ctx.client_to_host_queue.len(),
@@ -2555,7 +2549,7 @@ mod tests {
         assert_ne!(replacement_id, old_id);
         assert_eq!(
             ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(&keyboard_extension)
+            Some(keyboard_extension.as_str())
         );
 
         // Registry B's queued remove belongs to generation 1. It must not
@@ -2565,7 +2559,7 @@ mod tests {
         assert_eq!(ctx.host_keyboard_extension_id, Some(replacement_id));
         assert_eq!(
             ctx.shadow_table.get_host_interface(replacement_id.0),
-            Some(&keyboard_extension)
+            Some(keyboard_extension.as_str())
         );
     }
 

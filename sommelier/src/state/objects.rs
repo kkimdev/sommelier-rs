@@ -450,13 +450,13 @@ impl ShadowTable {
     }
 
     /// The guest object's interface.
-    pub fn get_interface(&self, guest_id: u32) -> Option<&String> {
+    pub fn get_interface(&self, guest_id: u32) -> Option<&str> {
         Some(&self.guests.get(&GuestId(guest_id))?.interface().name)
     }
 
     /// The interface of a live host object, which events from it are
     /// dispatched by.
-    pub fn get_host_interface(&self, host_id: u32) -> Option<&String> {
+    pub fn get_host_interface(&self, host_id: u32) -> Option<&str> {
         Some(&self.hosts.get(&HostId(host_id))?.interface()?.name)
     }
 
@@ -1069,10 +1069,7 @@ mod tests {
 
         assert!(table.guest_ended_host_kept(20));
         assert_eq!(table.get_host_id(20), None);
-        assert_eq!(
-            table.get_host_interface(host),
-            Some(&"wl_callback".to_string())
-        );
+        assert_eq!(table.get_host_interface(host), Some("wl_callback"));
         assert_ne!(
             table.allocate_host_id(),
             HostId(host),
@@ -1103,7 +1100,7 @@ mod tests {
 
         assert_eq!(
             table.get_host_interface(host),
-            Some(&"wl_buffer".to_string()),
+            Some("wl_buffer"),
             "a delayed wl_buffer.release must still be dispatchable after guest destroy"
         );
         assert!(table.is_event_sender_known(host));
@@ -1230,10 +1227,7 @@ mod tests {
         table.insert_paired_for_test(10, 3, "wl_surface");
         table.insert_paired_for_test(server_guest, 4, "wl_data_offer");
         assert_eq!(table.get_host_id(10), Some(3));
-        assert_eq!(
-            table.get_interface(server_guest),
-            Some(&"wl_data_offer".to_string())
-        );
+        assert_eq!(table.get_interface(server_guest), Some("wl_data_offer"));
 
         // The allocators skip the fixture IDs themselves.
         assert_eq!(table.host_ids.next_candidate(), Some(2));
@@ -1252,24 +1246,15 @@ mod tests {
         let mut table = ShadowTable::new();
         let host = table.create_bridged(20, "zwp_text_input_v3", 1, "zwp_text_input_v1", 1);
 
-        assert_eq!(
-            table.get_interface(20),
-            Some(&"zwp_text_input_v3".to_string())
-        );
-        assert_eq!(
-            table.get_host_interface(host),
-            Some(&"zwp_text_input_v1".to_string())
-        );
+        assert_eq!(table.get_interface(20), Some("zwp_text_input_v3"));
+        assert_eq!(table.get_host_interface(host), Some("zwp_text_input_v1"));
         assert_eq!(table.event_object(host, "zwp_text_input_v1"), Some(20));
         assert_eq!(table.event_object(host, "zwp_text_input_v3"), None);
 
         // Once the guest object goes, the host object keeps its own
         // interface, routes its events and stays reserved.
         assert!(table.guest_ended_host_kept(20));
-        assert_eq!(
-            table.get_host_interface(host),
-            Some(&"zwp_text_input_v1".to_string())
-        );
+        assert_eq!(table.get_host_interface(host), Some("zwp_text_input_v1"));
         assert!(table.is_event_sender_known(host));
         assert!(!table.is_host_id_available(host));
     }

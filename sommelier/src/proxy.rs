@@ -408,10 +408,16 @@ impl Client {
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
-                Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id).cloned(),
-                Direction::HostToClient => {
-                    self.ctx.shadow_table.get_host_interface(sender_id).cloned()
-                }
+                Direction::ClientToHost => self
+                    .ctx
+                    .shadow_table
+                    .get_interface(sender_id)
+                    .map(str::to_string),
+                Direction::HostToClient => self
+                    .ctx
+                    .shadow_table
+                    .get_host_interface(sender_id)
+                    .map(str::to_string),
             };
 
             let result = if let Some(interface) = interface {
@@ -526,7 +532,9 @@ impl Client {
                         Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
                     };
                     let interface = guest_id_for_log
-                        .and_then(|gid| self.ctx.shadow_table.get_interface(gid).cloned())
+                        .and_then(|gid| {
+                            self.ctx.shadow_table.get_interface(gid).map(str::to_string)
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
                     if matches!(direction, Direction::ClientToHost) {

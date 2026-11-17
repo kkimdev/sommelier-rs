@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(ctx.internal_callbacks.get(callback), Some(waits_for));
         assert_eq!(
             ctx.shadow_table.get_host_interface(callback.0),
-            Some(&"wl_callback".to_string())
+            Some("wl_callback")
         );
     }
 

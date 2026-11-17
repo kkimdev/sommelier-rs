@@ -177,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_interface(guest_offer_id),
-            Some(&"wl_data_offer".to_string())
+            Some("wl_data_offer")
         );
     }
 

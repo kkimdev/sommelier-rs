@@ -1560,7 +1560,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(callback_id),
-            Some(&"wl_callback".to_string())
+            Some("wl_callback")
         );
     }
 
