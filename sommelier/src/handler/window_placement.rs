@@ -110,7 +110,8 @@ pub(crate) enum PlacementSkip {
     /// The keyboard focus is not on an xdg_toplevel.
     NoFocusedToplevel,
     /// No output with complete metadata can host the surface (see
-    /// `OutputRegistry::for_surface`).
+    /// `OutputRegistry::for_surface`), including when the client never
+    /// bound a `wl_output`.
     NoUsableOutput,
     /// The rectangle has an empty extent, an edge that rounds onto the work
     /// area border, or overflowing coordinates on this output.

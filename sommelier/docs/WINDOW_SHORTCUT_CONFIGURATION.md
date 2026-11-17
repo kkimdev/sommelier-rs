@@ -204,7 +204,9 @@ window never jumps to another monitor; only a surface currently on no output
 (before its first enter, or after its output went away) uses the first
 usable output. `OutputRegistry::for_surface` in
 `sommelier/src/state/outputs.rs` owns the exact rule, including when an
-output counts as usable.
+output counts as usable. The proxy learns an output only from the guest's
+own `wl_output` bind, so a client that never binds one cannot be placed:
+each chord is skipped as having no usable output.
 
 The work area is the output's logical screen area minus Aura's insets (the
 shelf and other reserved margins), in the coordinates that
