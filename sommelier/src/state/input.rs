@@ -289,6 +289,9 @@ pub struct TextInputState {
     pub pending_cursor_position: Option<(i32, i32)>,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
+    /// Whether the proxy warned that the guest seat cannot carry an
+    /// activation, which every later reconcile would repeat.
+    pub(crate) warned_seat_missing: bool,
 }
 
 /// What a v3 commit asks of the host beyond its committed state.
@@ -355,6 +358,7 @@ impl TextInputState {
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
             host: HostApplied::default(),
+            warned_seat_missing: false,
         }
     }
 

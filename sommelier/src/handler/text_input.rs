@@ -1549,7 +1549,19 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
                     "Deferring text input {guest_id} activation until the previous generation drains"
                 );
             } else {
-                log::warn!(
+                // Warn once per text input: every reconcile until the guest
+                // binds a seat under the ID would repeat it.
+                let first = ctx
+                    .text_inputs
+                    .get_mut(&guest_id)
+                    .is_some_and(|state| !std::mem::replace(&mut state.warned_seat_missing, true));
+                let level = if first {
+                    log::Level::Warn
+                } else {
+                    log::Level::Debug
+                };
+                log::log!(
+                    level,
                     "Cannot activate text input {guest_id}: guest seat {guest_seat} has no live host seat"
                 );
             }
@@ -3623,11 +3635,13 @@ mod tests {
             ctx.last_sender_id = guest_id;
             let mut v3 = TextInputV3Handler;
 
-            // The seat has no host object yet: nothing can activate.
+            // The seat has no host object yet: nothing can activate, which
+            // the proxy warns of once.
             v3.on_enable(&mut ctx);
             v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
             v3.on_commit(&mut ctx);
             assert!(!ctx.text_inputs[&guest_id].host_is_active());
+            assert!(ctx.text_inputs[&guest_id].warned_seat_missing);
             assert!(!take_requests(&mut ctx)
                 .iter()
                 .any(|&(_, opcode)| opcode == REQ_ACTIVATE));
