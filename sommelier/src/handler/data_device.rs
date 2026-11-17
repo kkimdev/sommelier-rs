@@ -21,7 +21,14 @@ use crate::protocols::wayland::wl_data_source;
 use crate::state::Context;
 use crate::wire::{queue_or_drop, Action};
 use log::{debug, error};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::sys::socket::{send, MsgFlags};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 
 pub struct DataDeviceHandler;
 
@@ -109,18 +116,12 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
                 return Action::Drop;
             }
 
-            // Spawn pump task
-            let pump_task = async move {
-                let mut input = tokio::fs::File::from_std(std::fs::File::from(virtwl_pipe));
-                let mut output = tokio::fs::File::from_std(std::fs::File::from(client_fd));
-
-                if let Err(e) = tokio::io::copy(&mut input, &mut output).await {
-                    error!("Clipboard pump error: {}", e);
+            ctx.clipboard_pumps.start(async move {
+                match pump(virtwl_pipe, client_fd).await {
+                    Ok(()) => debug!("Clipboard pump finished"),
+                    Err(e) => error!("Clipboard pump error: {}", e),
                 }
-                debug!("Clipboard pump finished");
-            };
-
-            ctx.clipboard_pumps.start(pump_task);
+            });
 
             // Drop original action (we handled it)
             return Action::Drop;
@@ -132,13 +133,426 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
 
 impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {}
 
+/// How many bytes a clipboard pump reads at a time.
+const PUMP_BUFFER_LEN: usize = 64 * 1024;
+
+/// Copy `src`, the proxy's VirtWL pipe, into `dst`, the guest's
+/// descriptor, until `src` ends or `dst`'s reader goes away.
+///
+/// Every client shares one thread, so the pump waits on the event loop: a
+/// peer that stalls parks only this pump, and aborting the pump closes
+/// both descriptors without waiting on either peer. Tokio's pipe types
+/// would take only a FIFO, and a VirtWL pipe is not one, but `virtio_wl.c`
+/// implements `poll` for it and returns `EAGAIN` under `O_NONBLOCK`.
+pub(crate) async fn pump(src: OwnedFd, dst: OwnedFd) -> io::Result<()> {
+    match copy(src, dst).await {
+        // The guest closed its end and wants no more. Rust ignores SIGPIPE,
+        // so a pipe write fails instead of ending the process.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+async fn copy(src: OwnedFd, dst: OwnedFd) -> io::Result<()> {
+    let mut dst = Destination::new(dst)?;
+    // The duplicate of the VirtWL pipe sent to the host is closed once
+    // sent, so this description is the proxy's alone to make non-blocking.
+    let flags = OFlag::from_bits_truncate(fcntl(&src, FcntlArg::F_GETFL)?);
+    fcntl(&src, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    // A VirtWL pipe's `poll` also waits on the device's shared send queue,
+    // so watching it for writing too would only wake the pump for nothing.
+    let src = AsyncFd::with_interest(File::from(src), Interest::READABLE)?;
+    let mut buf = vec![0; PUMP_BUFFER_LEN];
+    loop {
+        let len = wait_io(&src, Interest::READABLE, |mut src| src.read(&mut buf)).await?;
+        if len == 0 {
+            return Ok(());
+        }
+        let mut unwritten = &buf[..len];
+        while !unwritten.is_empty() {
+            match dst.write(unwritten).await? {
+                // A write that makes no progress would spin on the loop.
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                written => unwritten = &unwritten[written..],
+            }
+        }
+    }
+}
+
+/// Where a pump writes.
+///
+/// The pump never changes the flags of the guest's open file description:
+/// it is shared with the client, and with any other pump into the same
+/// pipe, so a shared `O_NONBLOCK` could be cleared under a pump and leave
+/// its next write blocking the loop.
+enum Destination {
+    /// A pipe or a named FIFO.
+    Pipe(GuestPipe),
+    /// A socket, written with `MSG_DONTWAIT`.
+    Socket(AsyncFd<File>),
+}
+
+impl Destination {
+    fn new(fd: OwnedFd) -> io::Result<Self> {
+        let file = File::from(fd);
+        let kind = file.metadata()?.file_type();
+        if kind.is_fifo() {
+            Ok(Self::Pipe(GuestPipe {
+                fd: AsyncFd::with_interest(file, Interest::WRITABLE)?,
+                reopened: false,
+            }))
+        } else if kind.is_socket() {
+            Ok(Self::Socket(AsyncFd::with_interest(
+                file,
+                Interest::WRITABLE,
+            )?))
+        } else {
+            // epoll cannot watch a regular file or a device.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the guest's descriptor is not a pipe or a socket",
+            ))
+        }
+    }
+
+    /// Write some of `data`, once the destination takes it.
+    async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Pipe(pipe) => pipe.write(data).await,
+            Self::Socket(socket) => {
+                let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
+                let send = |socket: &File| Ok(send(socket.as_raw_fd(), data, flags)?);
+                wait_io(socket, Interest::WRITABLE, send).await
+            }
+        }
+    }
+}
+
+/// The guest's pipe.
+///
+/// An anonymous pipe on Linux 6.5 or later is written with `RWF_NOWAIT`,
+/// which makes each write non-blocking whatever the flags of the pipe's
+/// description. A named FIFO, or any pipe on an older kernel, refuses that
+/// flag, so it is reopened instead through `/proc/self/fd` as a private
+/// non-blocking description. Opening needs write permission on the pipe,
+/// which a client running as another user (started through `sudo -E`, say)
+/// may not give the proxy; its transfer is then refused.
+struct GuestPipe {
+    fd: AsyncFd<File>,
+    reopened: bool,
+}
+
+impl GuestPipe {
+    async fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if !self.reopened {
+            let write = |pipe: &File| write_nowait(pipe, data);
+            match wait_io(&self.fd, Interest::WRITABLE, write).await {
+                Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                    let pipe = reopen(self.fd.get_ref())?;
+                    self.fd = AsyncFd::with_interest(pipe, Interest::WRITABLE)?;
+                    self.reopened = true;
+                }
+                result => return result,
+            }
+        }
+        wait_io(&self.fd, Interest::WRITABLE, |mut pipe| pipe.write(data)).await
+    }
+}
+
+/// Write some of `data` into `pipe` without waiting for room: `EAGAIN`
+/// when it is full, whatever the flags of its description.
+fn write_nowait(pipe: &File, data: &[u8]) -> io::Result<usize> {
+    let iov = libc::iovec {
+        iov_base: data.as_ptr().cast_mut().cast(),
+        iov_len: data.len(),
+    };
+    // SAFETY: `iov` describes `data`, which outlives the call, and the
+    // kernel only reads it. Offset -1 writes at the current position, which
+    // is all a pipe has.
+    let written = unsafe { libc::pwritev2(pipe.as_raw_fd(), &iov, 1, -1, libc::RWF_NOWAIT) };
+    usize::try_from(written).map_err(|_| io::Error::last_os_error())
+}
+
+/// Open the pipe behind `pipe` again as a private non-blocking description.
+fn reopen(pipe: &File) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(format!("/proc/self/fd/{}", pipe.as_raw_fd()))
+        .map_err(|e| match e.raw_os_error() {
+            // A named FIFO whose reader is gone cannot be opened again. An
+            // anonymous pipe can, and its first write then fails with EPIPE.
+            Some(libc::ENXIO) => io::ErrorKind::BrokenPipe.into(),
+            _ => io::Error::new(e.kind(), format!("cannot reopen the guest's pipe: {e}")),
+        })
+}
+
+/// Run `op` on `fd` once it is ready for `interest`, and again whenever it
+/// would block or a signal interrupts it.
+async fn wait_io<R>(
+    fd: &AsyncFd<File>,
+    interest: Interest,
+    mut op: impl FnMut(&File) -> io::Result<R>,
+) -> io::Result<R> {
+    fd.async_io(interest, |file| retry_interrupted(|| op(file)))
+        .await
+}
+
+/// Run `op` until a signal does not interrupt it.
+fn retry_interrupted<R>(mut op: impl FnMut() -> io::Result<R>) -> io::Result<R> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DataDeviceHandler;
+    use super::{pump, reopen, write_nowait, DataDeviceHandler};
     use crate::protocols::wayland::wl_data_device;
     use crate::state::Context;
-    use crate::test_support::raw_dispatch;
+    use crate::test_support::{raw_dispatch, Rng};
     use crate::wire::WireMessage;
+    use std::io::{self, Read, Write};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Write `data` into `writer` on a thread of its own, then close it.
+    fn write_on_a_thread(mut writer: io::PipeWriter, data: &[u8]) -> thread::JoinHandle<()> {
+        let data = data.to_vec();
+        thread::spawn(move || writer.write_all(&data).expect("write the transfer"))
+    }
+
+    /// Read `reader` to its end on a thread of its own, `chunk` bytes at a
+    /// time.
+    fn read_on_a_thread(
+        mut reader: impl Read + Send + 'static,
+        chunk: usize,
+    ) -> thread::JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let mut received = Vec::new();
+            let mut buf = vec![0; chunk];
+            loop {
+                match reader.read(&mut buf).expect("read the transfer") {
+                    0 => return received,
+                    len => received.extend_from_slice(&buf[..len]),
+                }
+            }
+        })
+    }
+
+    /// A transfer many times the size of a pipe and of the pump's buffer
+    /// arrives whole and in order, and the pump ends at the source's EOF.
+    #[tokio::test]
+    async fn pump_copies_a_large_transfer_whole() {
+        let data = Rng::new(1).bytes(8 << 20);
+        let (src, src_writer) = io::pipe().unwrap();
+        let (dst_reader, dst) = io::pipe().unwrap();
+        let writer = write_on_a_thread(src_writer, &data);
+        let reader = read_on_a_thread(dst_reader, 1 << 20);
+
+        pump(src.into(), dst.into()).await.unwrap();
+
+        writer.join().unwrap();
+        assert!(
+            reader.join().unwrap() == data,
+            "the transfer must arrive intact"
+        );
+    }
+
+    /// A guest that reads slowly parks the pump while the event loop goes
+    /// on, and still receives every byte.
+    #[tokio::test]
+    async fn a_slow_reader_parks_the_pump_without_blocking_the_loop() {
+        let data = Rng::new(2).bytes(1 << 20);
+        let (src, src_writer) = io::pipe().unwrap();
+        let (dst_reader, dst) = io::pipe().unwrap();
+        let writer = write_on_a_thread(src_writer, &data);
+        let pump = tokio::spawn(pump(src.into(), dst.into()));
+
+        // Nobody reads yet, so the pump fills the guest's pipe and waits for
+        // it to drain. This timer fires on the same thread meanwhile.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!pump.is_finished());
+
+        let reader = read_on_a_thread(dst_reader, 4096);
+        pump.await.unwrap().unwrap();
+
+        writer.join().unwrap();
+        assert!(
+            reader.join().unwrap() == data,
+            "the transfer must arrive intact"
+        );
+    }
+
+    /// Two pumps may write into one pipe, as when a client passes the same
+    /// pipe to two receives. Neither changes the flags of the client's open
+    /// file description, so neither can leave the other's writes blocking.
+    #[tokio::test]
+    async fn pumps_into_one_pipe_never_change_its_flags() {
+        use nix::fcntl::{fcntl, FcntlArg};
+        let flags = |pipe: &io::PipeWriter| fcntl(pipe, FcntlArg::F_GETFL).unwrap();
+        let (dst_reader, guest_pipe) = io::pipe().unwrap();
+        let original = flags(&guest_pipe);
+        let (first_src, first_writer) = io::pipe().unwrap();
+        let (second_src, second_writer) = io::pipe().unwrap();
+        let first_dst = guest_pipe.try_clone().unwrap();
+        let second_dst = guest_pipe.try_clone().unwrap();
+        let first = tokio::spawn(pump(first_src.into(), first_dst.into()));
+        let second = tokio::spawn(pump(second_src.into(), second_dst.into()));
+        let writers = [
+            write_on_a_thread(first_writer, b"first"),
+            write_on_a_thread(second_writer, &[0; 1 << 20]),
+        ];
+
+        // Nobody reads yet, so the second pump fills the pipe and waits.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!second.is_finished());
+        assert_eq!(flags(&guest_pipe), original);
+
+        let reader = read_on_a_thread(dst_reader, 4096);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(flags(&guest_pipe), original);
+        drop(guest_pipe);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(reader.join().unwrap().len(), b"first".len() + (1 << 20));
+    }
+
+    /// A pipe the proxy may not open again, such as one from a client running
+    /// as another user, still receives the transfer: it is written with
+    /// `RWF_NOWAIT`, through the descriptor the client sent. A kernel whose
+    /// pipes refuse that flag reopens them, which this pipe forbids, so the
+    /// test is skipped there.
+    #[tokio::test]
+    async fn pump_writes_into_a_pipe_it_cannot_reopen() {
+        use nix::sys::stat::{fchmod, Mode};
+        let (_probe_reader, probe) = io::pipe().unwrap();
+        let probe = std::fs::File::from(std::os::fd::OwnedFd::from(probe));
+        if write_nowait(&probe, b"?").is_err_and(|e| e.raw_os_error() == Some(libc::EOPNOTSUPP)) {
+            eprintln!("skipped: this kernel's pipes refuse RWF_NOWAIT, so it reopens them");
+            return;
+        }
+        let data = Rng::new(4).bytes(1 << 20);
+        let (src, src_writer) = io::pipe().unwrap();
+        let (dst_reader, dst) = io::pipe().unwrap();
+        fchmod(&dst, Mode::S_IRUSR).unwrap();
+        let writer = write_on_a_thread(src_writer, &data);
+        let reader = read_on_a_thread(dst_reader, 4096);
+
+        pump(src.into(), dst.into()).await.unwrap();
+
+        writer.join().unwrap();
+        assert!(
+            reader.join().unwrap() == data,
+            "the transfer must arrive intact"
+        );
+    }
+
+    /// A named FIFO refuses `RWF_NOWAIT`, so the pump reopens it and writes
+    /// that private description.
+    #[tokio::test]
+    async fn pump_writes_into_a_named_fifo() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = crate::test_support::TempDir::new("clipboard-fifo");
+        let path = dir.path().join("fifo");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        // Opening the read end first lets the write end open at once.
+        let fifo_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        fcntl(&fifo_reader, FcntlArg::F_SETFL(OFlag::empty())).unwrap();
+        let fifo = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let (src, src_writer) = io::pipe().unwrap();
+        let writer = write_on_a_thread(src_writer, b"through a named FIFO");
+        let reader = read_on_a_thread(fifo_reader, 4096);
+
+        pump(src.into(), fifo.into()).await.unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(reader.join().unwrap(), b"through a named FIFO");
+    }
+
+    /// The fallback for kernels whose pipes refuse `RWF_NOWAIT` writes a
+    /// private non-blocking description and leaves the guest's alone.
+    #[test]
+    fn a_reopened_pipe_is_private_and_non_blocking() {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        let flags = |file: &std::fs::File| {
+            OFlag::from_bits_truncate(fcntl(file, FcntlArg::F_GETFL).unwrap())
+        };
+        let (mut reader, writer) = io::pipe().unwrap();
+        let guest_pipe = std::fs::File::from(std::os::fd::OwnedFd::from(writer));
+        let original = flags(&guest_pipe);
+
+        let mut reopened = reopen(&guest_pipe).unwrap();
+
+        assert!(flags(&reopened).contains(OFlag::O_NONBLOCK));
+        assert_eq!(flags(&guest_pipe), original);
+        reopened.write_all(b"private").unwrap();
+        let mut received = [0; 7];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"private");
+    }
+
+    /// A guest that closes its pipe ends the transfer, whether before the
+    /// pump starts or mid-transfer: the pump closes the host's pipe instead
+    /// of waiting for the host to finish writing.
+    #[tokio::test]
+    async fn a_closed_reader_ends_the_pump() {
+        use tokio::io::AsyncReadExt;
+        for mid_transfer in [false, true] {
+            let (src, mut src_writer) = io::pipe().unwrap();
+            let (dst_reader, dst) = io::pipe().unwrap();
+            let mut dst_reader =
+                tokio::net::unix::pipe::Receiver::from_owned_fd(dst_reader.into()).unwrap();
+            let pump = tokio::spawn(pump(src.into(), dst.into()));
+            if mid_transfer {
+                src_writer.write_all(b"wanted").unwrap();
+                let mut wanted = [0; 6];
+                dst_reader.read_exact(&mut wanted).await.unwrap();
+            }
+            drop(dst_reader);
+            src_writer.write_all(b"unwanted").unwrap();
+
+            pump.await.unwrap().unwrap();
+
+            assert_eq!(
+                src_writer.write(b"more").unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe,
+                "mid_transfer={mid_transfer}: the pump must have closed the host's pipe"
+            );
+        }
+    }
+
+    /// A destination that is not a pipe or a socket, such as a device, is
+    /// refused, and dropping it lets the guest read EOF.
+    #[tokio::test]
+    async fn pump_refuses_a_character_device() {
+        let (src, _src_writer) = io::pipe().unwrap();
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+
+        let error = pump(src.into(), null.into()).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
 
     #[test]
     fn host_data_offer_gets_a_guest_server_id_mapping() {

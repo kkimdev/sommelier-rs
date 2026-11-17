@@ -1047,11 +1047,9 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
 }
 
 #[cfg(test)]
-// Tests build and close raw descriptors to check who owns them.
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
 
     fn alt_q() -> crate::accelerator::Accelerator {
         crate::accelerator::parse_accelerator("<Alt>q").unwrap()
@@ -1144,27 +1142,43 @@ mod tests {
         RenderBufferUse::AwaitingRelease { has_detached_use }
     }
 
+    /// Stopping the pumps closes their descriptors at once, even while a
+    /// pump waits in the middle of a transfer for its peer to write.
     #[tokio::test]
     async fn stop_clipboard_pumps_aborts_and_closes_owned_fds() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0
-        );
-        // Both ends of a pipe share its identity, and a parallel test can
-        // reuse either number once the pump closes it.
-        let pipe = crate::test_support::fd_identity(pipe_fds[0]);
-        let read_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
-        let write_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        use crate::test_support::{any_fd_has_identity, fd_identity};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use tokio::io::AsyncReadExt;
+
+        // Each end of a socket pair is a socket of its own, so the pump's
+        // ends have identities that the test's ends do not share.
+        let (src, mut host) = UnixStream::pair().unwrap();
+        let (dst, guest) = UnixStream::pair().unwrap();
+        let pump_ends = [src.as_raw_fd(), dst.as_raw_fd()].map(fd_identity);
+        guest.set_nonblocking(true).unwrap();
+        let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.clipboard_pumps.start(async move {
-            let mut input = tokio::fs::File::from_std(std::fs::File::from(read_owned));
-            let mut output = tokio::fs::File::from_std(std::fs::File::from(write_owned));
-            let _ = tokio::io::copy(&mut input, &mut output).await;
+            let pump = crate::handler::data_device::pump(src.into(), dst.into());
+            pump.await.expect("the pump runs until it is stopped");
         });
+        // One chunk crosses, so the pump is running, then it waits for the
+        // next one, which the host never writes.
+        std::io::Write::write_all(&mut host, b"first").unwrap();
+        let mut first = [0; 5];
+        guest.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"first");
+
         ctx.clipboard_pumps.stop().await;
 
-        assert!(!crate::test_support::any_fd_has_identity(pipe));
+        assert!(!pump_ends.into_iter().any(any_fd_has_identity));
+        assert_eq!(
+            guest.read(&mut first).await.unwrap(),
+            0,
+            "the guest reads EOF"
+        );
     }
 
     #[test]
