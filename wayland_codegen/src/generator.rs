@@ -384,9 +384,13 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
     let mut req_idx = 0u16;
     let mut evt_idx = 0u16;
 
+    let mut requests = Vec::new();
+    let mut events = Vec::new();
+
     for item in &interface.items {
         match item {
             InterfaceItem::Request(req) => {
+                requests.push(req);
                 let opcode_name = format_ident!("REQ_{}", req.name.to_uppercase());
                 constant_names.claim_opcode(&opcode_name);
                 request_opcodes.push(quote! { pub const #opcode_name: u16 = #req_idx; });
@@ -546,6 +550,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 req_idx += 1;
             }
             InterfaceItem::Event(evt) => {
+                events.push(evt);
                 let opcode_name = format_ident!("EVT_{}", evt.name.to_uppercase());
                 constant_names.claim_opcode(&opcode_name);
                 event_opcodes.push(quote! { pub const #opcode_name: u16 = #evt_idx; });
@@ -711,6 +716,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
     // The XML owns the newest version of each interface, as it owns each
     // message's since-version; nothing newer can be decoded.
     let interface_version = interface.version;
+    let request_test_impls = generate_test_impls(&format_ident!("Request"), &requests);
+    let event_test_impls = generate_test_impls(&format_ident!("Event"), &events);
     quote! {
         pub mod #mod_name {
             use super::*;
@@ -737,6 +744,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 #(#request_variants),*
             }
 
+            #request_test_impls
+
             impl Request {
                 pub fn from_wire(msg: &mut WireMessage) -> Result<Self, ProtocolError> {
                     match msg.opcode {
@@ -759,7 +768,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 #(#event_variants),*
             }
 
-             impl Event {
+            #event_test_impls
+
+            impl Event {
                 pub fn from_wire(msg: &mut WireMessage) -> Result<Self, ProtocolError> {
                     match msg.opcode {
                         #(#event_decoders)*
@@ -820,6 +831,82 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
             pub fn consume_event(msg: &mut WireMessage) -> Result<(), ProtocolError> {
                 let _ = Event::from_wire(msg)?;
                 Ok(())
+            }
+        }
+    }
+}
+
+/// Generate what tests need of a decoded message type, `Request` or
+/// `Event`: equality, which compares a descriptor by the file it refers
+/// to (`test_support::same_file`), since descriptors have no equality of
+/// their own, and `new_object`, the ID and interface of the object a
+/// message creates, which lets a test peer follow the objects it is told
+/// about as a Wayland client library does. No vendored message creates
+/// more than one object (`test_no_message_creates_two_objects`).
+fn generate_test_impls(enum_name: &Ident, messages: &[&Message]) -> TokenStream {
+    let mut eq_arms = Vec::new();
+    let mut new_object_arms = Vec::new();
+    for message in messages {
+        let variant = format_ident!("{}", snake_to_camel(&message.name));
+        let mut fields = Vec::new();
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut comparisons = Vec::new();
+        for arg in args(&message.items) {
+            let field = sanitize_ident(&arg.name);
+            let l = format_ident!("l_{}", arg.name);
+            let r = format_ident!("r_{}", arg.name);
+            comparisons.push(if arg.typ == "fd" {
+                quote! { crate::test_support::same_file(#l, #r) }
+            } else {
+                quote! { #l == #r }
+            });
+            fields.push(field);
+            left.push(l);
+            right.push(r);
+        }
+        eq_arms.push(quote! {
+            (Self::#variant { #(#fields: #left),* }, Self::#variant { #(#fields: #right),* }) => {
+                true #(&& #comparisons)*
+            }
+        });
+        if let Some(arg) = args(&message.items).find(|arg| arg.typ == "new_id") {
+            let field = sanitize_ident(&arg.name);
+            new_object_arms.push(match &arg.interface {
+                Some(interface) => quote! {
+                    Self::#variant { #field, .. } => Some((*#field, #interface)),
+                },
+                // `wl_registry.bind` names the interface it creates.
+                None => quote! {
+                    Self::#variant { #field, .. } => Some((#field.2, #field.0.as_str())),
+                },
+            });
+        }
+    }
+    quote! {
+        #[cfg(test)]
+        impl PartialEq for #enum_name {
+            // A message type with one argument-less message compares by
+            // literals alone.
+            #[allow(clippy::match_like_matches_macro)]
+            fn eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    #(#eq_arms)*
+                    #[allow(unreachable_patterns)]
+                    _ => false,
+                }
+            }
+        }
+
+        #[cfg(test)]
+        impl #enum_name {
+            /// The ID and interface of the object this message creates.
+            pub fn new_object(&self) -> Option<(u32, &str)> {
+                match self {
+                    #(#new_object_arms)*
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                }
             }
         }
     }
