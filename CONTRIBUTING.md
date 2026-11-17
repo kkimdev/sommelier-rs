@@ -45,6 +45,47 @@ numbers or global state another test leaves alone; see
 - Never commit transient files; `*.local.*` and `_local/` are ignored for
   them.
 
+## Writing tests
+
+Pin what the proxy sends, not how it stores it. `proxy::harness::Session`
+plays both peers of a whole `Client`: send it messages built with the
+generated `req::` and `evt::` encoders, set objects up through real
+protocol flows, and assert what each peer received, decoded into typed
+messages that compare with `==`:
+
+```rust
+let mut s = Session::new();
+let callback = s.new_id();
+let sync = wl_display::req::sync(WL_DISPLAY_ID, callback);
+let host_callback = s.create(sync).await;
+s.host([wl_callback::evt::done(host_callback, 0)]).await;
+assert_eq!(
+    s.guest_received(),
+    [
+        (callback, wl_callback::Event::Done { callback_data: 0 }.into()),
+        (WL_DISPLAY_ID, wl_display::Event::DeleteId { id: callback }.into()),
+    ]
+);
+```
+
+- `guest`, `host` and their `_fatal` forms send messages and say whether
+  the session must survive them; `guest_received_and_error` checks that a
+  session ended with one `wl_display.error`, its last event. A guest
+  request that waits for a fence holds the guest's stream until
+  `resume`.
+- Read everything each peer received: a `Session` dropped with output
+  the test never read fails.
+- Learn host IDs from what the proxy forwards (`create`, `surface`), not
+  from the object table, and reach into the `Context` (`Session::ctx`)
+  only for a fault no peer can cause. Every batch that keeps the session
+  checks that no state outlives its object.
+- A handler test decodes a queue with `test_support::decoded`.
+- Use `MessageBuilder` only for frames no encoder builds, such as
+  malformed ones.
+- [INVARIANTS.md](docs/INVARIANTS.md) and [DESIGN.md](docs/DESIGN.md)
+  cite tests by name in "Test:" and "Tests:" clauses;
+  `scripts/check-cited-tests.py` checks that each names a test.
+
 ## Randomized tests
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
