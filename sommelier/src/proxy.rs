@@ -425,6 +425,7 @@ impl Client {
                     .map(str::to_string),
             };
 
+            let output_mark = self.ctx.output_mark();
             let result = if let Some(interface) = interface {
                 // The message takes its descriptors from the front of the
                 // queue; dropping it unforwarded closes them.
@@ -542,6 +543,9 @@ impl Client {
                         })
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
+                    // A rejected message sends nothing, even what its
+                    // handler queued before the rejection.
+                    self.ctx.discard_output_since(output_mark);
                     if matches!(direction, Direction::ClientToHost) {
                         // Tell the guest why before closing, as
                         // libwayland-server does. The requests before this
@@ -1674,6 +1678,73 @@ mod tests {
         assert_eq!(
             display_errors_in(&events),
             [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A rejected host event sends nothing its handler queued: a
+    /// `wl_callback.done` with trailing bytes must not reach the guest as a
+    /// done and a delete_id ahead of the error.
+    #[tokio::test]
+    async fn a_rejected_host_event_sends_nothing_of_its_own() {
+        use protocols::wayland::wl_display;
+        const CALLBACK: u32 = 3;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        let host_callback = guest_sync(&mut client, CALLBACK).await;
+        let mut done = MessageBuilder::new();
+        done.write_u32(0);
+        done.write_u32(0xdead);
+        client
+            .host_conn
+            .read_buf
+            .extend(done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A rejected guest request sends nothing its handler queued: a local
+    /// `wl_shm_pool.destroy` with trailing bytes must not reach the guest as
+    /// a delete_id ahead of the error.
+    #[tokio::test]
+    async fn a_rejected_request_sends_nothing_of_its_own() {
+        use protocols::wayland::{wl_display, wl_shm_pool};
+        const POOL: u32 = 21;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
+        let mut destroy = MessageBuilder::new();
+        destroy.write_u32(0xdead);
+        client
+            .client_conn
+            .read_buf
+            .extend(destroy.build_message(POOL, wl_shm_pool::REQ_DESTROY));
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)]
         );
     }
 

@@ -98,6 +98,24 @@ impl HostId {
     }
 }
 
+/// Whether `message` is a `wl_display.error` event.
+fn is_display_error(message: &[u8]) -> bool {
+    crate::wire::MessageHeader::parse(message).is_some_and(|header| {
+        (header.sender_id, header.opcode)
+            == (
+                crate::wire::WL_DISPLAY_ID,
+                crate::protocols::wayland::wl_display::EVT_ERROR,
+            )
+    })
+}
+
+/// Where the output queues stood before a message was dispatched
+/// ([`Context::output_mark`]).
+pub(crate) struct OutputMark {
+    to_client: usize,
+    to_host: usize,
+}
+
 /// Metadata for one global advertised by the host compositor.
 ///
 /// Global names are unique, but interface names are not: a compositor may
@@ -439,6 +457,29 @@ impl Context {
     /// only the first is sent.
     pub(crate) fn note_protocol_error(&mut self) -> bool {
         !std::mem::replace(&mut self.protocol_error_queued, true)
+    }
+
+    /// Mark where the output queues stand before a message is dispatched
+    /// (see [`Self::discard_output_since`]).
+    pub(crate) fn output_mark(&self) -> OutputMark {
+        OutputMark {
+            to_client: self.host_to_client_queue.len(),
+            to_host: self.client_to_host_queue.len(),
+        }
+    }
+
+    /// Discard the messages queued since `mark`, which a message that is
+    /// then rejected must not send: only the messages before it are valid.
+    /// A protocol error its handler queued stays, as the session's one
+    /// error. Dropping the messages closes their descriptors.
+    pub(crate) fn discard_output_since(&mut self, mark: OutputMark) {
+        self.client_to_host_queue.truncate(mark.to_host);
+        let rejected = self.host_to_client_queue.split_off(mark.to_client);
+        self.host_to_client_queue.extend(
+            rejected
+                .into_iter()
+                .filter(|(message, _)| is_display_error(message)),
+        );
     }
 
     /// Forget a fatal error, so a test can go on with the same context.

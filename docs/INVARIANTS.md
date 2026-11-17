@@ -142,7 +142,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   a host event the proxy rejects or whose descriptors are ambiguous) gets
   `implementation` on `wl_display` when its batch ends. The messages
   before the rejected one in the same batch were valid and are forwarded
-  first.
+  first; nothing the rejected message's handler queued is sent, except
+  an error of its own.
   Tests: `unknown_client_sender_is_a_protocol_error`,
   `undecodable_request_is_reported_after_forwarding_earlier_requests`,
   `rejected_requests_report_invalid_method_on_the_display`,
@@ -154,6 +155,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `a_host_error_on_a_host_only_object_ends_the_session`,
   `an_invalid_host_event_is_reported_after_the_valid_ones`,
   `descriptor_ambiguity_is_reported_after_the_valid_events`,
+  `a_rejected_host_event_sends_nothing_of_its_own`,
+  `a_rejected_request_sends_nothing_of_its_own`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors
