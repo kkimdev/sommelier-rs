@@ -32,9 +32,7 @@ use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
-use crate::protocols::xdg_output_unstable_v1::{
-    zxdg_output_manager_v1, ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED,
-};
+use crate::protocols::xdg_output_unstable_v1::ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED;
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
 use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
@@ -63,17 +61,13 @@ const WL_COMPOSITOR_VERSION: u32 = 4;
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
-/// The `wl_output` ceiling; [`advertised_global_version`] says why. The
+/// The `wl_output` ceiling; [`forwarded_global_version`] says why. The
 /// vendored XML is newer: v4 adds the `name` and `description` events.
 const WL_OUTPUT_VERSION: u32 = 3;
-/// The `wl_seat` ceiling; [`advertised_global_version`] says why. The
+/// The `wl_seat` ceiling; [`forwarded_global_version`] says why. The
 /// vendored XML is newer: v6 to v10 add touch shape and orientation,
 /// high-resolution scroll and scroll-direction events.
 const WL_SEAT_VERSION: u32 = 5;
-/// The newest `wl_data_device_manager` the proxy advertises: the vendored
-/// XML's, which the generated code forwards in full.
-const WL_DATA_DEVICE_MANAGER_VERSION: u32 =
-    crate::protocols::wayland::wl_data_device_manager::VERSION;
 /// The newest `zcr_keyboard_extension_v1` the proxy binds: the vendored
 /// XML's. The proxy handles all of it, including the v2 `peek_key` event
 /// that reports keys the IME consumed.
@@ -106,47 +100,67 @@ const _: () = assert!(
 /// let Exo send Aura events whose unknown opcodes end the client's session.
 const ZAURA_SHELL_MAX_VERSION: u32 = crate::protocols::aura_shell::zaura_shell::VERSION;
 
-/// Version ceilings used by ChromiumOS Sommelier's client-facing globals.
+/// The protocols whose host globals the proxy forwards, apart from
+/// `zxdg_decoration_manager_v1`, which only `--xdg-decoration` forwards.
+/// The globals it binds internally or replaces are handled before this.
+const FORWARDED_PROTOCOLS: [&[&str]; 7] = [
+    WL_ALLOWED,
+    XDG_ALLOWED,
+    DMABUF_ALLOWED,
+    VIEWPORTER_ALLOWED,
+    TEXT_INPUT_ALLOWED,
+    FRACTIONAL_SCALE_ALLOWED,
+    XDG_OUTPUT_ALLOWED,
+];
+
+/// Whether the proxy forwards a host global of `interface` to the guest.
+fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
+    FORWARDED_PROTOCOLS
+        .iter()
+        .any(|interfaces| interfaces.contains(&interface))
+        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
+}
+
+/// The version the guest is offered of a host global of `interface` that
+/// the host advertises at `host_version`, or `None` if the proxy does not
+/// forward it.
 ///
-/// The generated protocol code can decode newer XML messages, but that does
-/// not mean the proxy implements the semantics of every newer version. In
-/// particular, the C++ proxy caps `wl_seat` at v5 and `wl_output` at v3; it
-/// also exposes the compositor only up to the version for which its surface
-/// damage handling is implemented. Keep the guest advertisement aligned with
-/// those ceilings so clients do not start using requests/events that this
-/// proxy merely forwards without the required coordinate/focus handling.
-fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
-    if interface == "wl_compositor" && host_version >= WL_COMPOSITOR_HOST_VERSION {
-        return WL_COMPOSITOR_VERSION;
+/// The offer is never newer than the vendored XML: the generated code knows
+/// no message added after it, so a newer global would let the guest send
+/// requests whose unknown opcodes end its session.
+///
+/// Some interfaces have a lower ceiling, as in ChromiumOS Sommelier's
+/// client-facing globals. The generated code can decode newer XML
+/// messages, but that does not mean the proxy implements the semantics of
+/// every newer version. In particular, the C++ proxy caps `wl_seat` at v5
+/// and `wl_output` at v3; it also exposes the compositor only up to the
+/// version for which its surface damage handling is implemented. Keep the
+/// guest advertisement aligned with those ceilings so clients do not start
+/// using requests/events that this proxy merely forwards without the
+/// required coordinate/focus handling.
+fn forwarded_global_version(ctx: &Context, interface: &str, host_version: u32) -> Option<u32> {
+    if !forwards_host_global(ctx, interface) {
+        return None;
     }
-    let cap = match interface {
-        // ChromiumOS implements wl_surface.damage_buffer in terms of the
-        // legacy damage request. Hosts below v3 retain their original version;
-        // the proxy does not expose v5/v6 surface semantics.
+    let xml_version = crate::protocols::interface_version(interface)?;
+    // ChromiumOS implements wl_surface.damage_buffer in terms of the legacy
+    // damage request, so a v3 host compositor is offered as v4. Hosts below
+    // v3 retain their original version; the proxy does not expose v5/v6
+    // surface semantics.
+    let host_version = if interface == "wl_compositor" && host_version >= WL_COMPOSITOR_HOST_VERSION
+    {
+        WL_COMPOSITOR_VERSION
+    } else {
+        host_version
+    };
+    let ceiling = match interface {
         "wl_compositor" => WL_COMPOSITOR_VERSION,
         "wl_output" => WL_OUTPUT_VERSION,
         "wl_seat" => WL_SEAT_VERSION,
-        "wl_data_device_manager" => WL_DATA_DEVICE_MANAGER_VERSION,
         "xdg_wm_base" => XDG_SHELL_VERSION,
-        "zwp_linux_dmabuf_v1" => GUEST_DMABUF_VERSION,
-        "zxdg_output_manager_v1" => zxdg_output_manager_v1::VERSION,
-        _ => host_version,
+        _ => xml_version,
     };
-    host_version.min(cap)
-}
-
-/// Whether the proxy forwards a host global of `interface` to the guest.
-/// The globals it binds internally or replaces are handled before this.
-fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
-    WL_ALLOWED.contains(&interface)
-        || XDG_ALLOWED.contains(&interface)
-        || DMABUF_ALLOWED.contains(&interface)
-        || VIEWPORTER_ALLOWED.contains(&interface)
-        || TEXT_INPUT_ALLOWED.contains(&interface)
-        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
-        || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
-        || XDG_OUTPUT_ALLOWED.contains(&interface)
-        || interface == "wl_data_device_manager"
+    Some(host_version.min(ceiling).min(xml_version))
 }
 
 fn keyboard_extension_version(host_version: u32) -> u32 {
@@ -964,11 +978,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             return Action::Drop;
         }
 
-        if !forwards_host_global(ctx, interface) {
+        let Some(advertised_version) = forwarded_global_version(ctx, interface, version) else {
             record_registry_global_visibility(ctx, name, false);
             return Action::Drop;
-        }
-        let advertised_version = advertised_global_version(interface, version);
+        };
         ctx.host_globals.insert(
             name,
             HostGlobal {
@@ -1275,8 +1288,8 @@ impl wl_fixes::WlFixesHandler for RegistryHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        advertised_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
-        RegistryHandler, TEXT_INPUT_EXTENSION_VERSION,
+        forwarded_global_version, keyboard_extension_version, should_bind_internal_dmabuf,
+        RegistryHandler, FORWARDED_PROTOCOLS, TEXT_INPUT_EXTENSION_VERSION, XDG_DECORATION_ALLOWED,
     };
     use crate::handler::callback::CallbackHandler;
     use crate::handler::linux_dmabuf::LinuxDmabufHandler;
@@ -2628,16 +2641,46 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_globals_are_capped_to_supported_versions() {
-        assert_eq!(advertised_global_version("wl_compositor", 6), 4);
-        assert_eq!(advertised_global_version("wl_output", 4), 3);
-        assert_eq!(advertised_global_version("wl_seat", 10), 5);
-        assert_eq!(advertised_global_version("wl_data_device_manager", 99), 3);
-        assert_eq!(advertised_global_version("xdg_wm_base", 7), 3);
-        assert_eq!(advertised_global_version("zwp_linux_dmabuf_v1", 5), 4);
-        assert_eq!(advertised_global_version("zxdg_output_manager_v1", 4), 3);
-
+    fn every_forwarded_global_is_capped_at_its_xml_version() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.xdg_decoration = true;
+        let forwarded = FORWARDED_PROTOCOLS
+            .into_iter()
+            .chain([XDG_DECORATION_ALLOWED])
+            .flatten();
+        for &interface in forwarded {
+            let xml_version = crate::protocols::interface_version(interface)
+                .expect("a forwarded interface comes from the vendored XML");
+            let offered = forwarded_global_version(&ctx, interface, u32::MAX)
+                .expect("the interface is forwarded");
+            assert!(
+                offered <= xml_version,
+                "{interface} is offered at v{offered}, newer than its XML's v{xml_version}"
+            );
+        }
+        assert_eq!(forwarded_global_version(&ctx, "unknown_interface", 1), None);
+    }
+
+    #[test]
+    fn ordinary_globals_are_capped_to_supported_versions() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        for (interface, host_version, offered) in [
+            ("wl_compositor", 6, 4),
+            ("wl_compositor", 3, 4),
+            ("wl_compositor", 2, 2),
+            ("wl_output", 4, 3),
+            ("wl_seat", 10, 5),
+            ("wl_data_device_manager", 99, 3),
+            ("xdg_wm_base", 7, 3),
+            ("zxdg_output_manager_v1", 4, 3),
+        ] {
+            assert_eq!(
+                forwarded_global_version(&ctx, interface, host_version),
+                Some(offered),
+                "{interface} v{host_version}"
+            );
+        }
+
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;

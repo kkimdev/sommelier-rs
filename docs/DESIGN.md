@@ -117,9 +117,13 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   differs: `wl_seat` v5 and `wl_output` v3 match ChromiumOS Sommelier's
   caps, `wl_compositor` and `xdg_wm_base` are capped at the versions whose
   semantics the proxy implements, and `zaura_shell` has a v6 floor.
+  `forwarded_global_version` never offers a forwarded global above its
+  generated `VERSION`.
 
-`generate_routing` derives the interface-to-protocol routing table from the
-same list, so the proxy never restates which protocol owns an interface.
+`generate_routing` derives the interface-to-protocol routing table, and
+`interface_version`, each interface's `VERSION` by name, from the same
+list, so the proxy never restates which protocol owns an interface or how
+new it is.
 
 ## Object translation
 

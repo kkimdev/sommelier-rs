@@ -326,12 +326,19 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   global's version bound is the generated `VERSION` unless a named
   constant in `registry.rs` documents a deliberate difference and its
   reason (such as the ChromiumOS caps `wl_seat` v5 and `wl_output` v3, or
-  the `zaura_shell` v6 floor). A child object takes its parent's version,
-  and a request is sent to a host object only if that object's version
-  has it: an Aura surface keeps the version of the shell generation that
-  created it.
+  the `zaura_shell` v6 floor). Every forwarded host global but
+  `zwp_linux_dmabuf_v1` is offered through `forwarded_global_version`;
+  the proxy advertises that one itself, at `GUEST_DMABUF_VERSION` when it
+  can synthesize feedback and otherwise at the host's version capped at
+  v3. `forwarded_global_version` never exceeds the generated `VERSION`
+  (`protocols::interface_version`), so a host newer than the vendored XML
+  cannot make the guest send requests the proxy cannot decode. A child
+  object takes its parent's version, and a request is sent to a host
+  object only if that object's version has it: an Aura surface keeps the
+  version of the shell generation that created it.
   Tests: `child_objects_inherit_their_manager_versions`,
-  `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`.
+  `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`,
+  `every_forwarded_global_is_capped_at_its_xml_version`.
 
 ## Surfaces, damage and SHM
 
