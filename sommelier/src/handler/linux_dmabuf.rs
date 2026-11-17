@@ -316,6 +316,17 @@ fn valid_dmabuf_plane(param: &PendingParam, format: u32, width: i32, height: i32
         .is_some()
 }
 
+/// Report synthetic feedback the proxy could not allocate, as libwayland's
+/// `wl_client_post_no_memory` does: the display's `no_memory` error.
+fn queue_feedback_allocation_error(ctx: &mut Context) {
+    queue_protocol_error(
+        ctx,
+        WL_DISPLAY_ID,
+        wl_display::ERROR_NO_MEMORY,
+        "unable to allocate linux-dmabuf feedback",
+    );
+}
+
 impl LinuxDmabufHandler {
     fn queue_synthetic_feedback(
         ctx: &mut Context,
@@ -364,12 +375,7 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_protocol_error(
-                    ctx,
-                    WL_DISPLAY_ID,
-                    wl_display::ERROR_INVALID_METHOD,
-                    "unable to allocate linux-dmabuf feedback",
-                );
+                queue_feedback_allocation_error(ctx);
             }
         }
         Action::Drop
@@ -404,12 +410,7 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_protocol_error(
-                    ctx,
-                    WL_DISPLAY_ID,
-                    wl_display::ERROR_INVALID_METHOD,
-                    "unable to allocate linux-dmabuf feedback",
-                );
+                queue_feedback_allocation_error(ctx);
                 break;
             }
         }
@@ -449,12 +450,7 @@ impl LinuxDmabufHandler {
                     error
                 );
                 ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
-                queue_protocol_error(
-                    ctx,
-                    WL_DISPLAY_ID,
-                    wl_display::ERROR_INVALID_METHOD,
-                    "unable to allocate linux-dmabuf feedback",
-                );
+                queue_feedback_allocation_error(ctx);
                 break;
             }
         }
@@ -1272,11 +1268,12 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
+    use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::wayland::wl_shm;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-    use crate::test_support::{any_fd_has_identity, fd_identity};
-    use crate::wire::{Action, WireMessage};
+    use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
+    use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::os::fd::{AsRawFd, FromRawFd};
 
     use crate::test_support::msg_opcode as message_opcode;
@@ -1404,6 +1401,30 @@ mod tests {
                 let _ = nix::unistd::close(fd);
             }
         }
+    }
+
+    /// Feedback the proxy cannot allocate (here, without a GBM device to
+    /// name) is the compositor running out of resources, not a client
+    /// error: libwayland reports that as `wl_display.no_memory`.
+    #[test]
+    fn unallocatable_feedback_is_a_no_memory_error() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.dmabuf_guest_generations.insert(7, 42);
+        ctx.dmabuf_capabilities.entry(42).or_default().ready = true;
+        ctx.last_sender_id = 7;
+
+        assert_eq!(
+            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        let error = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
+            WL_DISPLAY_ID,
+            "the error names the display"
+        );
+        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_NO_MEMORY);
     }
 
     #[test]
