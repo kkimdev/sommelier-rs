@@ -209,22 +209,6 @@ fn held_backspace_keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<Ho
 }
 
 #[cfg(test)]
-fn ime_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
-    ctx.keyboard_to_seat
-        .iter()
-        .filter(|(_, seat)| **seat == guest_seat)
-        .filter_map(|(&guest_keyboard_id, _)| {
-            ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
-        })
-        .any(|host_keyboard_id| {
-            ctx.key_generations.ime_repeat_active(
-                host_keyboard_id,
-                crate::handler::keyboard::EVDEV_KEY_BACKSPACE,
-            )
-        })
-}
-
-#[cfg(test)]
 pub(crate) fn backspace_pressed_for_seat(ctx: &Context, guest_seat: u32) -> bool {
     held_backspace_keyboard_for_seat(ctx, guest_seat).is_some()
 }
@@ -2015,7 +1999,7 @@ mod tests {
     use crate::proxy::harness::{Object, Session};
     use crate::wire::WireMessage;
     use crate::wire::WL_DISPLAY_ID;
-    use zcr_extended_text_input_v1::Request as Ext;
+    use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
     use zcr_text_input_extension_v1::Request as ExtManager;
     use zwp_text_input_manager_v1::Request as V1Manager;
     use zwp_text_input_v1::{evt as v1, Request as V1};
@@ -2186,77 +2170,6 @@ mod tests {
     }
 
     #[test]
-    fn on_preedit_string_sends_v3_preedit_and_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = TextInputV1Handler;
-        let text = "こんにちは".to_string();
-        let action = handler.on_preedit_string(&mut ctx, 42, &text, &String::new());
-        assert_eq!(action, Action::Drop);
-
-        // Should produce exactly 2 messages: preedit_string (opcode 2) + done (opcode 5)
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2); // preedit_string
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 1), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 5); // done
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 42); // serial
-    }
-
-    #[test]
-    fn empty_preedit_applies_v1_reset_fallback() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("test text input")
-            .current_preedit = "미완성".to_string();
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_preedit_string(&mut ctx, 42, &"".to_string(), &"확정".to_string());
-        assert_eq!(action, Action::Drop);
-
-        // v3 commit_string removes the old composition; the empty preedit
-        // event then records the replacement state, followed by done.
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        let commit_payload = &ctx.host_to_client_queue[0].0[8..];
-        let commit_len =
-            u32::from_ne_bytes(commit_payload[0..4].try_into().expect("commit length")) as usize;
-        assert_eq!(&commit_payload[4..4 + commit_len - 1], "확정".as_bytes());
-        assert!(!ime_repeat_active_for_seat(&ctx, 0));
-    }
-
-    #[test]
-    fn live_preedit_does_not_commit_v1_reset_fallback() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_preedit_string(
-            &mut ctx,
-            42,
-            &"간".to_string(),
-            &"reset fallback".to_string(),
-        );
-        assert_eq!(action, Action::Drop);
-
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 5);
-        assert_eq!(ctx.text_inputs[&guest_id].current_preedit, "간");
-    }
-
-    #[test]
     fn oversized_preedit_does_not_partially_advance_state() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = host_v1_id;
@@ -2313,87 +2226,6 @@ mod tests {
     }
 
     #[test]
-    fn korean_trace_commits_each_completed_syllable_once() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        for text in ["ㄱ", "가", "간"] {
-            handler.on_preedit_string(&mut ctx, 1, &text.to_string(), &text.to_string());
-        }
-        handler.on_commit_string(&mut ctx, 2, &"가".to_string());
-        handler.on_preedit_string(&mut ctx, 3, &"나".to_string(), &"나".to_string());
-        handler.on_preedit_string(&mut ctx, 4, &"낟".to_string(), &"낟".to_string());
-        handler.on_commit_string(&mut ctx, 5, &"나".to_string());
-        handler.on_preedit_string(&mut ctx, 6, &"다".to_string(), &"다".to_string());
-
-        let commits = ctx
-            .host_to_client_queue
-            .iter()
-            .filter(|message| msg_opcode(std::slice::from_ref(message), 0) == 3)
-            .map(|message| {
-                wire_message(std::slice::from_ref(message), 0)
-                    .read_string()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(commits, ["가", "나"]);
-        assert_eq!(ctx.text_inputs[&guest_id].current_preedit, "다");
-    }
-
-    #[test]
-    fn reset_fallback_without_previous_preedit_is_not_inserted() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let action = TextInputV1Handler.on_preedit_string(
-            &mut ctx,
-            42,
-            &String::new(),
-            &"stale fallback".to_string(),
-        );
-
-        assert_eq!(action, Action::Drop);
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![2, 5]
-        );
-        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
-    }
-
-    #[test]
-    fn on_commit_string_sends_preedit_clear_then_commit_then_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-            state.current_preedit = "미완성".to_string();
-        }
-
-        let mut handler = TextInputV1Handler;
-        let text = "確定".to_string();
-        let action = handler.on_commit_string(&mut ctx, 42, &text);
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: preedit_string("") + commit_string + done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2); // preedit_string (clear)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3); // commit_string
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5); // done
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // All messages should target the guest_id
-        for i in 0..3 {
-            assert_eq!(msg_sender(&ctx.host_to_client_queue, i), guest_id);
-        }
-    }
-
-    #[test]
     fn empty_commit_clears_stale_backspace_repeat_state() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = host_v1_id;
@@ -2405,152 +2237,6 @@ mod tests {
             Action::Drop
         );
         assert!(!backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn on_delete_surrounding_text_negative_index_spanning_cursor() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_delete_surrounding_text(&mut ctx, -3, 5);
-        assert_eq!(action, Action::Drop);
-
-        // v1 deletion is buffered until the following commit_string.
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        let action = handler.on_commit_string(&mut ctx, 42, &String::new());
-        assert_eq!(action, Action::Drop);
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        assert_eq!(msg_sender(&ctx.host_to_client_queue, 0), guest_id);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        let before_length = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
-        let after_length = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        assert_eq!(before_length, 3);
-        assert_eq!(after_length, 2);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42);
-    }
-
-    #[test]
-    fn non_adjacent_delete_is_ignored_instead_of_deleting_intervening_text() {
-        let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-
-        let mut handler = TextInputV1Handler;
-        let action = handler.on_delete_surrounding_text(&mut ctx, -5, 3);
-        assert_eq!(action, Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-        handler.on_commit_string(&mut ctx, 1, &String::new());
-
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![3, 5]
-        );
-    }
-
-    #[test]
-    fn multiple_v1_deletes_are_preserved_until_commit_string() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_delete_surrounding_text(&mut ctx, -3, 3);
-        handler.on_delete_surrounding_text(&mut ctx, 0, 2);
-        assert!(ctx.host_to_client_queue.is_empty());
-        handler.on_commit_string(&mut ctx, 0, &"한".to_string());
-
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![4, 4, 3, 5]
-        );
-        let mut first_delete = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(first_delete.read_u32().unwrap(), 3);
-        assert_eq!(first_delete.read_u32().unwrap(), 0);
-        let mut second_delete = wire_message(&ctx.host_to_client_queue, 1);
-        assert_eq!(second_delete.read_u32().unwrap(), 0);
-        assert_eq!(second_delete.read_u32().unwrap(), 2);
-    }
-
-    #[test]
-    fn on_set_preedit_region_translates_correctly() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        let host_ext_id = 30u32;
-        ctx.last_sender_id = host_ext_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.committed.surrounding_text = Some(("가나다".to_string(), 6, 6));
-            state.set_guest_commits(42);
-        }
-
-        let mut handler = ExtendedTextInputV1Handler;
-        let action = handler.on_set_preedit_region(&mut ctx, -3, 3); // "나" (3 bytes)
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: delete_surrounding_text, preedit_string, done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        // 1. delete_surrounding_text (opcode 4)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        let payload = &ctx.host_to_client_queue[0].0[8..];
-        let before_length = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
-        let after_length = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        assert_eq!(before_length, 3);
-        assert_eq!(after_length, 0);
-
-        // 2. preedit_string (opcode 2)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 2);
-        let payload = &ctx.host_to_client_queue[1].0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let preedit_str = String::from_utf8(payload[4..4 + str_len - 1].to_vec()).unwrap();
-        assert_eq!(preedit_str, "나");
-        let cursor_offset = 4 + ((str_len + 3) & !3);
-        let cursor_begin = i32::from_ne_bytes(
-            payload[cursor_offset..cursor_offset + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let cursor_end = i32::from_ne_bytes(
-            payload[cursor_offset + 4..cursor_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!((cursor_begin, cursor_end), (3, 3));
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 1);
-        assert_eq!(
-            preedit.read_nullable_string().unwrap(),
-            Some("나".to_string())
-        );
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert!(
-            preedit.is_payload_consumed(),
-            "translated preedit must contain only its declared fields"
-        );
-
-        // 3. done (opcode 5)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // Cached preedit should be updated
-        if let Some(state) = ctx.text_inputs.get(&guest_id) {
-            assert_eq!(state.current_preedit, "나");
-        } else {
-            panic!("state not found");
-        }
     }
 
     #[test]
@@ -2596,81 +2282,6 @@ mod tests {
     }
 
     #[test]
-    fn non_adjacent_preedit_region_is_ignored_instead_of_deleting_text_gap() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .committed
-            .surrounding_text = Some(("가나다".to_string(), 9, 9));
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_set_preedit_region(&mut ctx, -9, 3), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.text_inputs[&guest_id].current_preedit.is_empty());
-    }
-
-    #[test]
-    fn on_confirm_preedit_commits_cached_preedit() {
-        let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
-        let host_ext_id = 30u32;
-        ctx.last_sender_id = host_ext_id;
-
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.current_preedit = "나".to_string();
-            state.set_guest_commits(42);
-            state.record_preedit_selection(0, 3);
-            state.record_preedit_cursor(3);
-            assert!(state.record_delete(3, 0));
-            state.record_cursor_position(1, 1);
-        }
-
-        let mut handler = ExtendedTextInputV1Handler;
-        let action = handler.on_confirm_preedit(&mut ctx, 0);
-        assert_eq!(action, Action::Drop);
-
-        // Should produce 3 messages: preedit_string(""), commit_string, done
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-
-        // 0. preedit_string("") (opcode 2)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 2);
-
-        // 1. commit_string (opcode 3)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 1), 3);
-        let payload = &ctx.host_to_client_queue[1].0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let commit_str = String::from_utf8(payload[4..4 + str_len - 1].to_vec()).unwrap();
-        assert_eq!(commit_str, "나");
-
-        // 2. done (opcode 5)
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 2), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 2), 42); // serial
-
-        // Confirming commits only the preedit. v1 delete/cursor metadata
-        // belongs to the following commit_string transaction.
-        if let Some(state) = ctx.text_inputs.get(&guest_id) {
-            assert_eq!(state.current_preedit, "");
-            assert!(state.pending_preedit_selection.is_none());
-            assert!(state.pending_preedit_cursor.is_none());
-            assert_eq!(state.pending_deletes, vec![(3, 0)]);
-            assert_eq!(state.pending_cursor_position, Some((1, 1)));
-        } else {
-            panic!("state not found");
-        }
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 10;
-        assert_eq!(
-            TextInputV1Handler.on_commit_string(&mut ctx, 42, &"다".to_string()),
-            Action::Drop
-        );
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, 0), 4);
-        assert!(ctx.text_inputs[&guest_id].pending_deletes.is_empty());
-        assert!(ctx.text_inputs[&guest_id].pending_cursor_position.is_none());
-    }
-
-    #[test]
     fn oversized_confirm_preedit_does_not_partially_advance_state() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = 30;
@@ -2689,59 +2300,6 @@ mod tests {
         let state = &ctx.text_inputs[&guest_id];
         assert_eq!(state.current_preedit.len(), 4_084);
         assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
-    }
-
-    #[test]
-    fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3_handler = TextInputV3Handler;
-        v3_handler.on_commit(&mut ctx);
-        v3_handler.on_commit(&mut ctx);
-
-        let commit_serials: Vec<u32> = ctx
-            .client_to_host_queue
-            .iter()
-            .filter_map(|(msg, _)| {
-                let opcode = u32::from(crate::test_support::msg_opcode(msg));
-                (opcode == 9).then(|| u32::from_ne_bytes(msg[8..12].try_into().unwrap()))
-            })
-            .collect();
-        assert_eq!(commit_serials, vec![1, 2]);
-
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
-            HostApplied::Active { content_type: None };
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = host_v1_id;
-        let mut v1_handler = TextInputV1Handler;
-        v1_handler.on_preedit_string(&mut ctx, 2942, &"한".to_string(), &String::new());
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 2);
-
-        // Multiple host events based on the same guest state must not advance
-        // the v3 serial, regardless of Exo's independent v1 event serials.
-        ctx.host_to_client_queue.clear();
-        v1_handler.on_preedit_string(&mut ctx, 2944, &"한글".to_string(), &String::new());
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, 1), 2);
-
-        ctx.host_to_client_queue.clear();
-        v1_handler.on_commit_string(&mut ctx, 2945, &"한글".to_string());
-        let done_index = ctx.host_to_client_queue.len() - 1;
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue, done_index), 5);
-        assert_eq!(msg_done_serial(&ctx.host_to_client_queue, done_index), 2);
-    }
-
-    #[test]
-    fn confirm_preedit_without_preedit_has_no_effect() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .unwrap()
-            .set_guest_commits(2);
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
     }
 
     #[test]
@@ -3072,88 +2630,6 @@ mod tests {
     }
 
     #[test]
-    fn held_backspace_fallback_requires_guest_keyboard_for_seat() {
-        let (mut ctx, _, _) = setup_v1_ctx();
-        ctx.last_sender_id = 30;
-        let mut handler = ExtendedTextInputV1Handler;
-
-        assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-    }
-
-    #[test]
-    fn preedit_cursor_and_selection_are_forwarded_as_byte_ranges() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_preedit_cursor(&mut ctx, 3);
-        handler.on_preedit_string(&mut ctx, 0, &"가나".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가나");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-
-        ctx.host_to_client_queue.clear();
-        handler.on_preedit_styling(&mut ctx, 0, 3, 6);
-        handler.on_preedit_cursor(&mut ctx, 6);
-        handler.on_preedit_string(&mut ctx, 0, &"가나".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가나");
-        assert_eq!(preedit.read_i32().unwrap(), 0);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-    }
-
-    #[test]
-    fn invalid_preedit_utf8_ranges_fall_back_to_string_end() {
-        let (mut ctx, host_v1_id, _) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_preedit_cursor(&mut ctx, 1);
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-
-        ctx.host_to_client_queue.clear();
-        handler.on_preedit_styling(&mut ctx, 1, 1, 6);
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        let mut preedit = wire_message(&ctx.host_to_client_queue, 0);
-        assert_eq!(preedit.read_string().unwrap(), "가");
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-        assert_eq!(preedit.read_i32().unwrap(), 3);
-    }
-
-    #[test]
-    fn uncommitted_surrounding_text_is_hidden_from_host_extension() {
-        let (mut ctx, _, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = guest_id;
-        let mut v3_handler = TextInputV3Handler;
-        v3_handler.on_set_surrounding_text(&mut ctx, &"가나다".to_string(), 6, 6);
-
-        ctx.last_sender_id = 30;
-        let mut ext_handler = ExtendedTextInputV1Handler;
-        ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
-        assert!(ctx.host_to_client_queue.is_empty());
-
-        ctx.last_sender_id = guest_id;
-        v3_handler.on_commit(&mut ctx);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
-            HostApplied::Active { content_type: None };
-        ctx.last_sender_id = 30;
-        ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
-        assert_eq!(
-            ctx.host_to_client_queue
-                .iter()
-                .map(|message| msg_opcode(std::slice::from_ref(message), 0))
-                .collect::<Vec<_>>(),
-            vec![4, 2, 5]
-        );
-    }
-
-    #[test]
     fn child_objects_inherit_their_manager_versions() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.host_text_input_manager_v1_id = Some(2);
@@ -3182,22 +2658,6 @@ mod tests {
             Some(4)
         );
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(5));
-    }
-
-    #[test]
-    fn inactive_host_ime_events_are_ignored() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host = HostApplied::Inactive;
-        ctx.last_sender_id = host_v1_id;
-        let mut handler = TextInputV1Handler;
-
-        handler.on_preedit_string(&mut ctx, 0, &"가".to_string(), &String::new());
-        handler.on_delete_surrounding_text(&mut ctx, -3, 3);
-        handler.on_commit_string(&mut ctx, 0, &"가".to_string());
-        handler.on_keysym(&mut ctx, 0, 0, u32::from(b'a'), 1, 0);
-
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.text_inputs[&guest_id].pending_deletes.is_empty());
     }
 
     #[test]
@@ -4252,34 +3712,6 @@ mod tests {
             ctx.guest_key_owner(HostId(888), crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
                 == Some(GuestKeyOwner::ImeRecovery),
             "keysym release must retain a completed-generation tombstone"
-        );
-    }
-
-    #[test]
-    fn empty_preedit_confirmation_requires_a_held_backspace() {
-        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.last_sender_id = host_v1_id;
-        ctx.text_inputs
-            .get_mut(&guest_id)
-            .expect("text input")
-            .current_preedit = "가".to_string();
-
-        let mut v1_handler = TextInputV1Handler;
-        assert_eq!(
-            v1_handler.on_preedit_string(&mut ctx, 1, &String::new(), &String::new()),
-            Action::Drop
-        );
-        assert!(!ime_repeat_active_for_seat(&ctx, 0));
-
-        ctx.host_to_client_queue.clear();
-        ctx.last_sender_id = 30;
-        assert_eq!(
-            ExtendedTextInputV1Handler.on_confirm_preedit(&mut ctx, 0),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "confirm_preedit must not synthesize Backspace without a held key"
         );
     }
 
@@ -5718,5 +5150,294 @@ mod tests {
                 "destroy: {destroy}"
             );
         }
+    }
+
+    /// The `done` of the guest's first commit.
+    const DONE: V3 = V3::Done { serial: 1 };
+
+    fn delete(before_length: u32, after_length: u32) -> V3 {
+        V3::DeleteSurroundingText {
+            before_length,
+            after_length,
+        }
+    }
+
+    /// The host input method's events reach the guest as text-input-v3
+    /// transactions, each closed by a `done` that numbers the guest's
+    /// commits, whatever serial the host sent.
+    #[tokio::test]
+    async fn host_ime_events_become_v3_transactions() {
+        type Events = fn(&Field) -> Vec<Outgoing>;
+        let korean: Events = |f| {
+            vec![
+                f.preedit("ㄱ", "ㄱ"),
+                f.preedit("가", "가"),
+                f.preedit("간", "간"),
+                f.commit("가"),
+                f.preedit("나", "나"),
+                f.preedit("낟", "낟"),
+                f.commit("나"),
+                f.preedit("다", "다"),
+            ]
+        };
+        let cases: Vec<(&str, Events, Vec<V3>)> = vec![
+            (
+                "a preedit",
+                |f| vec![v1::preedit_string(f.host, 42, "こんにちは", "").unwrap()],
+                vec![preedit("こんにちは"), DONE],
+            ),
+            (
+                "a live preedit keeps its fallback",
+                |f| vec![f.preedit("가", ""), f.preedit("간", "reset fallback")],
+                vec![preedit("가"), DONE, preedit("간"), DONE],
+            ),
+            (
+                "a preedit reset commits its fallback",
+                |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
+                vec![preedit("미완성"), DONE, commit("확정"), no_preedit(), DONE],
+            ),
+            (
+                "a reset without a preedit commits nothing",
+                |f| vec![f.preedit("", "stale fallback")],
+                vec![no_preedit(), DONE],
+            ),
+            (
+                "a commit clears the preedit",
+                |f| vec![f.preedit("미완성", ""), f.commit("確定")],
+                vec![preedit("미완성"), DONE, no_preedit(), commit("確定"), DONE],
+            ),
+            (
+                "Korean composition commits each syllable once",
+                korean,
+                vec![
+                    preedit("ㄱ"),
+                    DONE,
+                    preedit("가"),
+                    DONE,
+                    preedit("간"),
+                    DONE,
+                    no_preedit(),
+                    commit("가"),
+                    DONE,
+                    preedit("나"),
+                    DONE,
+                    preedit("낟"),
+                    DONE,
+                    no_preedit(),
+                    commit("나"),
+                    DONE,
+                    preedit("다"),
+                    DONE,
+                ],
+            ),
+            (
+                "a delete waits for its commit",
+                |f| vec![v1::delete_surrounding_text(f.host, -3, 5)],
+                vec![],
+            ),
+            (
+                "a delete spans the cursor",
+                |f| vec![v1::delete_surrounding_text(f.host, -3, 5), f.commit("")],
+                vec![delete(3, 2), commit(""), DONE],
+            ),
+            (
+                "a delete apart from the cursor would delete the text between",
+                |f| vec![v1::delete_surrounding_text(f.host, -5, 3), f.commit("")],
+                vec![commit(""), DONE],
+            ),
+            (
+                "deletes accumulate until the commit",
+                |f| {
+                    vec![
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        v1::delete_surrounding_text(f.host, 0, 2),
+                        f.commit("한"),
+                    ]
+                },
+                vec![delete(3, 0), delete(0, 2), commit("한"), DONE],
+            ),
+            (
+                "a preedit cursor is a byte offset",
+                |f| vec![v1::preedit_cursor(f.host, 3), f.preedit("가나", "")],
+                vec![preedit_at("가나", 3, 3), DONE],
+            ),
+            (
+                "a selection is a byte range, which the cursor does not move",
+                |f| {
+                    vec![
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 6),
+                        f.preedit("가나", ""),
+                    ]
+                },
+                vec![preedit_at("가나", 0, 3), DONE],
+            ),
+            (
+                "a cursor inside a character falls back to the end",
+                |f| vec![v1::preedit_cursor(f.host, 1), f.preedit("가", "")],
+                vec![preedit("가"), DONE],
+            ),
+            (
+                "a selection inside a character falls back to the end",
+                |f| vec![v1::preedit_styling(f.host, 1, 1, 6), f.preedit("가", "")],
+                vec![preedit("가"), DONE],
+            ),
+            (
+                "a confirm without a preedit or a held key",
+                |f| vec![ext::confirm_preedit(f.host_ext, 1)],
+                vec![],
+            ),
+            (
+                "a confirm of an emptied preedit without a held key",
+                |f| {
+                    vec![
+                        f.preedit("가", ""),
+                        f.preedit("", ""),
+                        ext::confirm_preedit(f.host_ext, 0),
+                    ]
+                },
+                vec![preedit("가"), DONE, no_preedit(), DONE],
+            ),
+            (
+                // Its selection and cursor go with it, while the edits stay
+                // for the next commit.
+                "a confirm commits the preedit",
+                |f| {
+                    vec![
+                        f.preedit("나", ""),
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 3),
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        ext::confirm_preedit(f.host_ext, 0),
+                        f.preedit("다라", ""),
+                        f.commit("다"),
+                        f.commit("라"),
+                    ]
+                },
+                vec![
+                    preedit("나"),
+                    DONE,
+                    no_preedit(),
+                    commit("나"),
+                    DONE,
+                    preedit_at("다라", 6, 6),
+                    DONE,
+                    no_preedit(),
+                    delete(3, 0),
+                    commit("다"),
+                    DONE,
+                    commit("라"),
+                    DONE,
+                ],
+            ),
+        ];
+        for (case, events, expected) in cases {
+            let mut f = Field::enabled().await;
+            let events = events(&f);
+            f.s.host(events).await;
+            assert_eq!(f.s.guest_received(), f.events(expected), "{case}");
+        }
+    }
+
+    /// A preedit region makes committed surrounding text around the cursor
+    /// the preedit; text the guest has not committed, or a region apart
+    /// from the cursor, cannot be.
+    #[tokio::test]
+    async fn on_set_preedit_region_translates_correctly() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::set_surrounding_text(f.ti, "가나다", 6, 6).unwrap()])
+            .await;
+        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.guest([v3::commit(f.ti)]).await;
+        let mut expected = vec![f.surrounding_text("가나다", 6, 6)];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([ext::set_preedit_region(f.host_ext, -6, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = [delete(3, 0), preedit_at("나", 3, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // The region is the preedit now.
+        f.s.host([f.commit("나")]).await;
+        let expected = [no_preedit(), commit("나"), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // A pending preedit cursor, or selection, places the region's.
+        f.s.host([
+            v1::preedit_cursor(f.host, 0),
+            ext::set_preedit_region(f.host_ext, -3, 3),
+        ])
+        .await;
+        let expected = [delete(3, 0), preedit_at("나", 0, 0), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([
+            v1::preedit_styling(f.host, 0, 3, 6),
+            ext::set_preedit_region(f.host_ext, -6, 6),
+        ])
+        .await;
+        let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Each commit_state carries the guest's commit count, which numbers
+    /// every `done` until the next commit, however many host events with
+    /// whatever serials it answers.
+    #[tokio::test]
+    async fn guest_commit_count_is_sent_to_v1_and_used_by_v3_done() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+
+        f.s.host([
+            v1::preedit_string(f.host, 2942, "한", "").unwrap(),
+            v1::preedit_string(f.host, 2944, "한글", "").unwrap(),
+            v1::commit_string(f.host, 2945, "한글").unwrap(),
+        ])
+        .await;
+        let done = || V3::Done { serial: 2 };
+        assert_eq!(
+            f.s.guest_received(),
+            f.events([
+                preedit("한"),
+                done(),
+                preedit("한글"),
+                done(),
+                no_preedit(),
+                commit("한글"),
+                done(),
+            ])
+        );
+    }
+
+    /// Events of a host text input that is not active belong to no guest
+    /// generation: none reaches the guest or edits its next transaction.
+    #[tokio::test]
+    async fn inactive_host_ime_events_are_ignored() {
+        let mut f = Field::disabled().await;
+        f.s.host([
+            f.preedit("가", ""),
+            v1::delete_surrounding_text(f.host, -3, 3),
+            f.commit("가"),
+            v1::keysym(
+                f.host,
+                0,
+                0,
+                u32::from(b'a'),
+                wl_keyboard::KEY_STATE_PRESSED,
+                0,
+            ),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.s.host([f.commit("나")]).await;
+        assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
     }
 }
