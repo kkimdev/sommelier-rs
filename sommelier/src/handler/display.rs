@@ -163,7 +163,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         // and the ID may go to the next new object: drop all state keyed by
         // the host ID along with the ID itself.
         let paired_guest = match ctx.shadow_table.release_deleted_host_id(id) {
-            DeletedHostId::Untracked => return Action::Drop,
+            DeletedHostId::Ignored => return Action::Drop,
             DeletedHostId::HostOnly => None,
             DeletedHostId::Paired(guest_id) => Some(guest_id),
         };

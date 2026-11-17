@@ -1782,6 +1782,44 @@ mod tests {
         ctx.shadow_table.retire_guest_object(guest_id);
     }
 
+    /// An object that never reached the host is usable only if the proxy
+    /// implements its interface; see `local_only_guest_objects_are_explicitly_allowlisted`.
+    #[test]
+    fn an_unmapped_object_that_is_not_local_is_rejected() {
+        use crate::protocols::wayland::wl_surface;
+        use crate::wire::ProtocolError;
+        let dispatch = |ctx: &mut Context, (request, _): crate::wire::Outgoing| {
+            let (header, payload) = crate::test_support::frames(&request)
+                .next()
+                .expect("a whole request");
+            let mut request =
+                crate::wire::WireMessage::new(header.sender_id, header.opcode, payload);
+            crate::test_support::raw_dispatch(wl_surface::dispatch_request(
+                &mut request,
+                &mut CompositorHandler,
+                ctx,
+            ))
+        };
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table
+            .track_interface(20, "wl_surface".to_string());
+        ctx.shadow_table
+            .track_interface(21, "wl_buffer".to_string());
+        ctx.shadow_table.map_id(22, 32);
+        ctx.shadow_table
+            .track_interface(22, "wl_surface".to_string());
+
+        assert_eq!(
+            dispatch(&mut ctx, wl_surface::req::commit(20)),
+            Err(ProtocolError::InvalidSender(20))
+        );
+        assert_eq!(
+            dispatch(&mut ctx, wl_surface::req::attach(22, Some(21), 0, 0)),
+            Err(ProtocolError::InvalidObjectId(21))
+        );
+        assert!(ctx.client_to_host_queue.is_empty());
+    }
+
     #[test]
     fn set_app_id_creates_zaura_surface_and_sets_app_id() {
         let (mut ctx, xdg_toplevel_id, zaura_shell_host, _wl_surface_host) = setup_ctx();

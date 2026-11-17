@@ -122,13 +122,24 @@ same list, so the proxy never restates which protocol owns an interface.
 
 ## Object translation
 
-`state::ShadowTable` maps every guest object ID to its host ID and records
-each side's interface and negotiated version. Guest and host ID spaces are
-independent: the proxy allocates host IDs itself, and host-created objects
-get guest IDs in the server range (`0xff000000` and above). Both come from
-a `state::IdAllocator`, which, like libwayland's object map, reuses the
-last freed ID before a fresh one, so a long session never outgrows the
-peer's map.
+`state::ShadowTable` (`state/objects.rs`) holds one entry per object on
+each side of a connection, with the interface and negotiated version that
+side knows it by:
+
+- A guest object is local (implemented in the proxy; see
+  [Synthetic objects](#synthetic-objects)) or paired with a host object,
+  live or destroyed by the guest and awaiting its host's `delete_id`.
+- A host ID is in use exactly while it has an entry: a paired object, a
+  host-only object the proxy uses itself, or a reservation that outlived
+  its object, until its `delete_id` or for the rest of the connection.
+- A pairing is recorded in both entries: every change updates both, and
+  debug builds check that they match.
+
+Guest and host ID spaces are independent: the proxy allocates host IDs
+itself, and host-created objects get guest IDs in the server range
+(`0xff000000` and above). Both come from a `state::IdAllocator`, which,
+like libwayland's object map, reuses the last freed ID before a fresh one,
+so a long session never outgrows the peer's map.
 
 Destruction is asymmetric. A guest destructor request is forwarded, but the
 mapping survives until the host's `wl_display.delete_id` arrives, so late

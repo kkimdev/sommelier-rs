@@ -76,6 +76,38 @@ impl IdAllocator {
             self.free.push(id);
         }
     }
+
+    /// Mark `id`, which a test fixture chose instead of taking it from
+    /// here, as in use, so it is not handed out until it is released.
+    ///
+    /// The fresh IDs below `id` become free, so they are still handed out
+    /// in order, after the IDs released before; allocation then runs as if
+    /// `id` alone were skipped. An ID outside the range is not this
+    /// allocator's and is left alone.
+    ///
+    /// This pushes every fresh ID below `id` onto the free list, so it costs
+    /// time and memory in `id`'s distance from the next fresh ID: fine for
+    /// the small IDs fixtures choose, not for production.
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, when `id` is already in use.
+    #[cfg(test)]
+    pub(super) fn reserve(&mut self, id: u32) -> bool {
+        if !self.contains(id) {
+            return true;
+        }
+        if id < self.next {
+            let Some(index) = self.free.iter().position(|&free| free == id) else {
+                return false;
+            };
+            self.free.remove(index);
+        } else {
+            self.free.splice(0..0, (self.next..id).rev());
+            self.next = id + 1;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +136,33 @@ mod tests {
         ids.release(10);
         assert_eq!(ids.next_candidate(), Some(3));
         assert_eq!(ids.next_candidate(), Some(4));
+    }
+
+    #[test]
+    fn reserved_ids_are_skipped_and_the_rest_keep_their_order() {
+        let mut ids = IdAllocator::new(2..10);
+        assert_eq!(ids.next_candidate(), Some(2));
+        ids.release(2);
+        assert!(ids.reserve(5));
+        assert!(ids.reserve(20), "an ID outside the range is not ours");
+        assert_eq!(ids.next_candidate(), Some(2), "released IDs still go first");
+        assert_eq!(ids.next_candidate(), Some(3));
+        assert_eq!(ids.next_candidate(), Some(4));
+        assert_eq!(ids.next_candidate(), Some(6));
+
+        ids.release(5);
+        assert_eq!(ids.next_candidate(), Some(5), "once released, reused first");
+    }
+
+    #[test]
+    fn an_id_in_use_cannot_be_reserved() {
+        let mut ids = IdAllocator::new(2..10);
+        assert!(ids.reserve(4));
+        assert!(!ids.reserve(4));
+        assert_eq!(ids.next_candidate(), Some(2));
+        assert!(!ids.reserve(2));
+        assert!(ids.reserve(3), "a fresh ID below a reserved one is free");
+        assert_eq!(ids.next_candidate(), Some(5));
     }
 
     #[test]
