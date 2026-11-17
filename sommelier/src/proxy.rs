@@ -3448,9 +3448,8 @@ mod tests {
                 GUEST_SEAT,
                 Some(GUEST_SURFACE),
             );
-            state.pending_enabled = true;
-            state.committed_enabled = true;
-            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.committed.enabled = true;
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
             state.set_guest_commits(1);
             state.host_activation = crate::state::HostActivationState::Active;
             state
@@ -4172,7 +4171,7 @@ mod tests {
         let (mut ctx, mut handler) = setup_raw_ime_dispatch();
         {
             let state = ctx.text_inputs.get_mut(&GUEST_TEXT_INPUT).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
@@ -4408,7 +4407,7 @@ mod tests {
         let (mut ctx, mut handler) = setup_raw_ime_dispatch();
         {
             let state = ctx.text_inputs.get_mut(&GUEST_TEXT_INPUT).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
@@ -4506,8 +4505,11 @@ mod tests {
             raw_text_input_request(zwp_text_input_v3::REQ_DISABLE),
         )
         .is_none());
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
-        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].committed_enabled);
+        assert_eq!(
+            ctx.text_inputs[&GUEST_TEXT_INPUT].pending.enabled,
+            Some(false)
+        );
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].committed.enabled);
 
         assert!(dispatch_raw_event_result(
             &mut handler,
@@ -4561,8 +4563,11 @@ mod tests {
             raw_text_input_request(zwp_text_input_v3::REQ_ENABLE),
         )
         .is_none());
-        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].committed_enabled);
+        assert_eq!(
+            ctx.text_inputs[&GUEST_TEXT_INPUT].pending.enabled,
+            Some(true)
+        );
+        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].committed.enabled);
         assert!(dispatch_raw_event_result(
             &mut handler,
             &mut ctx,
@@ -4577,7 +4582,7 @@ mod tests {
             raw_keyboard_enter(803, THIRD_HOST_SURFACE),
         )
         .is_some());
-        assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].pending_enabled);
+        assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].pending.enabled.is_none());
 
         ctx.client_to_host_queue.clear();
         assert!(dispatch_raw_request_result(

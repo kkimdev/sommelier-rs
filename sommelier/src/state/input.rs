@@ -31,35 +31,64 @@ pub enum HostActivationState {
     Draining { callback: HostId },
 }
 
+/// A text-input-v3 content type: `(hint, purpose)`.
+pub type ContentType = (u32, u32);
+/// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
+pub type SurroundingText = (String, i32, i32);
+/// A text-input-v3 cursor rectangle: `(x, y, width, height)`.
+pub type CursorRect = (i32, i32, i32, i32);
+
+/// The text-input-v3 requests a guest made since its most recent commit,
+/// each `None` until made.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct V3Pending {
+    pub enabled: Option<bool>,
+    pub surrounding_text: Option<Option<SurroundingText>>,
+    pub content_type: Option<ContentType>,
+    pub cursor_rect: Option<CursorRect>,
+}
+
+impl V3Pending {
+    /// The pending state after `enable` or `disable`, which reset every
+    /// other piece of state. The host's v1 has no unset cursor rectangle,
+    /// so an empty one stands for it.
+    pub fn reset(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            surrounding_text: Some(None),
+            content_type: Some(ContentType::default()),
+            cursor_rect: Some(CursorRect::default()),
+        }
+    }
+}
+
+/// The text-input-v3 state a guest has committed. The cursor rectangle is
+/// not kept: only the host needs it, in the commit that states it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct V3Committed {
+    pub enabled: bool,
+    pub surrounding_text: Option<SurroundingText>,
+    pub content_type: ContentType,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
     pub host_ext_id: Option<u32>,
     pub guest_seat: u32,
     pub active_surface: Option<u32>,
-    /// State requested by the guest since its most recent v3 commit.
-    pub pending_enabled: bool,
-    /// State applied by the most recent v3 commit.
-    pub committed_enabled: bool,
-    /// Whether an enable/disable request is waiting for the next commit.
-    pub enabled_dirty: bool,
-    /// Double-buffered v3 surrounding-text state.
-    pub pending_surrounding_text: Option<(String, i32, i32)>,
-    pub committed_surrounding_text: Option<(String, i32, i32)>,
-    pub surrounding_text_dirty: bool,
-    pub content_hint: u32,
-    pub content_purpose: u32,
-    /// Content type last committed to the host. `None` forces the next v3
-    /// transaction to replay the pending type after an enable/disable reset.
-    pub committed_content_type: Option<(u32, u32)>,
-    pub content_type_dirty: bool,
+    /// Requests since the most recent v3 commit, which the next applies.
+    pub pending: V3Pending,
+    /// State the v3 commits applied.
+    pub committed: V3Committed,
+    /// The content type last sent to the host, or `None` if none was sent
+    /// since the focus changed.
+    pub(crate) host_content_type: Option<ContentType>,
     /// Whether the host was last told, with the committed content type,
     /// that the field has surrounding text, or `None` if it was not told.
     /// Exo applies `set_surrounding_text_support` only with a content type,
     /// so a change resends the content type.
-    committed_surrounding_text_support: Option<bool>,
-    pub cursor_rect: Option<(i32, i32, i32, i32)>,
-    pub cursor_rect_dirty: bool,
+    host_surrounding_text_support: Option<bool>,
     pub current_preedit: String,
     /// Number of v3 commit requests received from this guest object.
     ///
@@ -91,10 +120,10 @@ pub(crate) struct GuestCommitPlan {
     pub enabled: bool,
     pub enable_conflict: bool,
     pub resets_composition: bool,
-    pub surrounding_text: Option<Option<(String, i32, i32)>>,
+    pub surrounding_text: Option<Option<SurroundingText>>,
     pub has_surrounding_text: bool,
-    pub content_type: Option<(u32, u32)>,
-    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+    pub content_type: Option<ContentType>,
+    pub cursor_rect: Option<CursorRect>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,19 +173,10 @@ impl TextInputState {
             host_ext_id,
             guest_seat,
             active_surface,
-            pending_enabled: false,
-            committed_enabled: false,
-            enabled_dirty: false,
-            pending_surrounding_text: None,
-            committed_surrounding_text: None,
-            surrounding_text_dirty: false,
-            content_hint: 0,
-            content_purpose: 0,
-            committed_content_type: None,
-            content_type_dirty: false,
-            committed_surrounding_text_support: None,
-            cursor_rect: None,
-            cursor_rect_dirty: false,
+            pending: V3Pending::default(),
+            committed: V3Committed::default(),
+            host_content_type: None,
+            host_surrounding_text_support: None,
             current_preedit: String::new(),
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
@@ -232,63 +252,18 @@ impl TextInputState {
     /// deliberately survive so the bridge can deactivate the previous host
     /// generation with the correct transaction ordering.
     pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
-        let previous_surface = self.active_surface;
-        self.pending_enabled = false;
-        self.committed_enabled = false;
-        self.enabled_dirty = false;
-        self.pending_surrounding_text = None;
-        self.committed_surrounding_text = None;
-        self.surrounding_text_dirty = false;
-        self.content_hint = 0;
-        self.content_purpose = 0;
-        self.committed_content_type = None;
-        self.content_type_dirty = false;
-        self.committed_surrounding_text_support = None;
-        self.cursor_rect = None;
-        self.cursor_rect_dirty = false;
+        self.pending = V3Pending::default();
+        self.committed = V3Committed::default();
+        self.host_content_type = None;
+        self.host_surrounding_text_support = None;
         self.clear_host_composition();
-        self.active_surface = active_surface;
-        previous_surface
+        std::mem::replace(&mut self.active_surface, active_surface)
     }
 
     /// Move the object to its final disabled target before host reconciliation.
     pub fn begin_destroy(&mut self) {
-        self.committed_enabled = false;
+        self.committed.enabled = false;
         self.active_surface = None;
-    }
-
-    /// Start a new text-input-v3 enable or disable transaction.
-    ///
-    /// Both requests reset the pending editor state. Committed state remains
-    /// untouched until [`Self::finish_guest_commit`] publishes a fully encoded
-    /// host transaction.
-    pub fn begin_enabled_transaction(&mut self, enabled: bool) {
-        self.pending_enabled = enabled;
-        self.enabled_dirty = true;
-        self.pending_surrounding_text = None;
-        self.surrounding_text_dirty = true;
-        self.content_hint = 0;
-        self.content_purpose = 0;
-        self.content_type_dirty = true;
-        self.cursor_rect = None;
-        self.cursor_rect_dirty = true;
-    }
-
-    pub fn set_surrounding_text(&mut self, text: String, cursor: i32, anchor: i32) {
-        self.pending_surrounding_text = Some((text, cursor, anchor));
-        self.surrounding_text_dirty = true;
-    }
-
-    pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
-        self.content_hint = hint;
-        self.content_purpose = purpose;
-        self.content_type_dirty =
-            self.enabled_dirty || self.committed_content_type != Some((hint, purpose));
-    }
-
-    pub fn set_cursor_rect(&mut self, rect: (i32, i32, i32, i32)) {
-        self.cursor_rect = Some(rect);
-        self.cursor_rect_dirty = true;
     }
 
     /// Count one v3 `commit` request and return its serial.
@@ -320,23 +295,24 @@ impl TextInputState {
     /// the plan on an encoding failure leaves the state byte-for-byte
     /// unchanged; only [`Self::finish_guest_commit`] advances the transaction.
     pub(crate) fn prepare_guest_commit(&self, enable_conflict: bool) -> GuestCommitPlan {
-        let resets_composition = self.enabled_dirty;
-        let enabled = if resets_composition && !enable_conflict {
-            self.pending_enabled
-        } else {
-            self.committed_enabled
+        let pending = &self.pending;
+        let resets_composition = pending.enabled.is_some();
+        let enabled = match pending.enabled {
+            Some(enabled) if !enable_conflict => enabled,
+            _ => self.committed.enabled,
         };
-        let effective_surrounding_text = if self.surrounding_text_dirty {
-            &self.pending_surrounding_text
-        } else {
-            &self.committed_surrounding_text
+        let has_surrounding_text = match &pending.surrounding_text {
+            Some(surrounding_text) => surrounding_text.is_some(),
+            None => self.committed.surrounding_text.is_some(),
         };
-        let has_surrounding_text = effective_surrounding_text.is_some();
+        let content_type = pending.content_type.unwrap_or(self.committed.content_type);
         // Resend an unchanged content type only when the support the host
         // was told no longer holds: a resend can reset Exo's composition.
         let support_changed = self
-            .committed_surrounding_text_support
+            .host_surrounding_text_support
             .is_some_and(|supported| supported != has_surrounding_text);
+        let content_type_changed = pending.content_type.is_some()
+            && (resets_composition || self.host_content_type != Some(content_type));
         GuestCommitPlan {
             host_v1_id: self.host_v1_id,
             host_ext_id: self.host_ext_id,
@@ -345,15 +321,10 @@ impl TextInputState {
             enabled,
             enable_conflict,
             resets_composition,
-            surrounding_text: self
-                .surrounding_text_dirty
-                .then(|| self.pending_surrounding_text.clone()),
+            surrounding_text: pending.surrounding_text.clone(),
             has_surrounding_text,
-            content_type: (self.content_type_dirty || support_changed)
-                .then_some((self.content_hint, self.content_purpose)),
-            cursor_rect: self
-                .cursor_rect_dirty
-                .then_some(self.cursor_rect.unwrap_or((0, 0, 0, 0))),
+            content_type: (content_type_changed || support_changed).then_some(content_type),
+            cursor_rect: pending.cursor_rect,
         }
     }
 
@@ -374,35 +345,32 @@ impl TextInputState {
             plan.serial, self.guest_commit_serial,
             "a guest commit plan is finished for the commit that prepared it"
         );
-
-        if plan.resets_composition {
-            if plan.enable_conflict {
-                self.pending_enabled = self.committed_enabled;
-            } else {
-                self.pending_enabled = plan.enabled;
-                self.committed_enabled = plan.enabled;
-            }
-            self.enabled_dirty = false;
+        let V3Pending {
+            enabled,
+            surrounding_text,
+            content_type,
+            cursor_rect: _,
+        } = std::mem::take(&mut self.pending);
+        if enabled.is_some() {
+            self.committed.enabled = plan.enabled;
             self.clear_host_composition();
         }
-        if let Some(surrounding_text) = plan.surrounding_text {
-            self.surrounding_text_dirty = false;
-            self.committed_surrounding_text = surrounding_text;
+        if let Some(surrounding_text) = surrounding_text {
+            self.committed.surrounding_text = surrounding_text;
+        }
+        if let Some(content_type) = content_type {
+            self.committed.content_type = content_type;
         }
         if let Some(content_type) = plan.content_type {
-            self.content_type_dirty = false;
-            self.committed_content_type = Some(content_type);
+            self.host_content_type = Some(content_type);
             self.record_surrounding_text_support(surrounding_text_support);
-        }
-        if plan.cursor_rect.is_some() {
-            self.cursor_rect_dirty = false;
         }
     }
 
     /// Record the surrounding-text support the host was told with the
     /// committed content type, or `None` if it was told none.
     pub(crate) fn record_surrounding_text_support(&mut self, support: Option<bool>) {
-        self.committed_surrounding_text_support = support;
+        self.host_surrounding_text_support = support;
     }
 
     pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
@@ -477,7 +445,7 @@ impl TextInputState {
         if !self.host_is_active() {
             return None;
         }
-        let (surrounding_text, surrounding_cursor, _) = self.committed_surrounding_text.as_ref()?;
+        let (surrounding_text, surrounding_cursor, _) = self.committed.surrounding_text.as_ref()?;
         Some(PreeditRegionPlan {
             guest_seat: self.guest_seat,
             surrounding_text: surrounding_text.clone(),
@@ -1995,7 +1963,7 @@ mod tests {
         ] {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
             state.host_activation = activation;
-            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
 
             assert_eq!(
                 state.prepare_host_preedit().is_some(),
@@ -2038,18 +2006,18 @@ mod tests {
     #[test]
     fn text_input_focus_boundary_resets_editor_state_only() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.pending_enabled = true;
-        state.committed_enabled = true;
-        state.enabled_dirty = true;
-        state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
-        state.committed_surrounding_text = Some(("committed".to_string(), 9, 9));
-        state.surrounding_text_dirty = true;
-        state.content_hint = 5;
-        state.content_purpose = 6;
-        state.committed_content_type = Some((5, 6));
-        state.content_type_dirty = true;
-        state.cursor_rect = Some((1, 2, 3, 4));
-        state.cursor_rect_dirty = true;
+        state.pending = V3Pending {
+            enabled: Some(true),
+            surrounding_text: Some(Some(("pending".to_string(), 7, 7))),
+            content_type: Some((5, 6)),
+            cursor_rect: Some((1, 2, 3, 4)),
+        };
+        state.committed = V3Committed {
+            enabled: true,
+            surrounding_text: Some(("committed".to_string(), 9, 9)),
+            content_type: (5, 6),
+        };
+        state.host_content_type = Some((5, 6));
         state.current_preedit = "조합".to_string();
         state.set_guest_commits(17);
         state.pending_preedit_cursor = Some(3);
@@ -2069,11 +2037,13 @@ mod tests {
     #[test]
     fn preparing_guest_commit_is_non_mutating_until_finish() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.committed_content_type = Some((1, 2));
-        state.begin_enabled_transaction(true);
-        state.set_surrounding_text("가나다".to_string(), 9, 9);
-        state.set_content_type(3, 4);
-        state.set_cursor_rect((1, 2, 3, 4));
+        state.host_content_type = Some((1, 2));
+        state.pending = V3Pending {
+            surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
+            content_type: Some((3, 4)),
+            cursor_rect: Some((1, 2, 3, 4)),
+            ..V3Pending::reset(true)
+        };
         assert_eq!(state.count_guest_commit(), 1);
         let before = state.clone();
 
@@ -2096,27 +2066,28 @@ mod tests {
         state.current_preedit = "이전".to_string();
         state.pending_preedit_cursor = Some(3);
         state.pending_deletes.push((3, 0));
-        state.begin_enabled_transaction(true);
-        state.set_surrounding_text("가나다".to_string(), 9, 9);
-        state.set_content_type(3, 4);
-        state.set_cursor_rect((1, 2, 3, 4));
+        state.pending = V3Pending {
+            surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
+            content_type: Some((3, 4)),
+            cursor_rect: Some((1, 2, 3, 4)),
+            ..V3Pending::reset(true)
+        };
 
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
         state.finish_guest_commit(plan, None);
 
         assert_eq!(state.guest_commit_serial(), 1);
-        assert!(state.pending_enabled);
-        assert!(state.committed_enabled);
-        assert!(!state.enabled_dirty);
+        assert_eq!(state.pending, V3Pending::default());
         assert_eq!(
-            state.committed_surrounding_text,
-            Some(("가나다".to_string(), 9, 9))
+            state.committed,
+            V3Committed {
+                enabled: true,
+                surrounding_text: Some(("가나다".to_string(), 9, 9)),
+                content_type: (3, 4),
+            }
         );
-        assert!(!state.surrounding_text_dirty);
-        assert_eq!(state.committed_content_type, Some((3, 4)));
-        assert!(!state.content_type_dirty);
-        assert!(!state.cursor_rect_dirty);
+        assert_eq!(state.host_content_type, Some((3, 4)));
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_preedit_cursor.is_none());
         assert!(state.pending_deletes.is_empty());
@@ -2125,20 +2096,22 @@ mod tests {
     #[test]
     fn a_change_of_the_told_surrounding_text_support_resends_the_content_type() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.begin_enabled_transaction(true);
-        state.set_content_type(3, 4);
+        state.pending = V3Pending {
+            content_type: Some((3, 4)),
+            ..V3Pending::reset(true)
+        };
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
         assert!(!plan.has_surrounding_text);
         state.finish_guest_commit(plan, Some(false));
 
         // Unchanged support: nothing to resend.
-        state.set_content_type(3, 4);
+        state.pending.content_type = Some((3, 4));
         state.count_guest_commit();
         assert_eq!(state.prepare_guest_commit(false).content_type, None);
 
         // The field gains surrounding text: the host was told otherwise.
-        state.set_surrounding_text("abc".to_string(), 3, 3);
+        state.pending.surrounding_text = Some(Some(("abc".to_string(), 3, 3)));
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
         assert!(plan.has_surrounding_text);
@@ -2164,13 +2137,13 @@ mod tests {
     #[test]
     fn enable_replays_same_content_type_but_ordinary_repeat_is_clean() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.committed_content_type = Some((3, 4));
+        state.host_content_type = Some((3, 4));
 
-        state.set_content_type(3, 4);
+        state.pending.content_type = Some((3, 4));
         assert_eq!(state.prepare_guest_commit(false).content_type, None);
 
-        state.begin_enabled_transaction(true);
-        state.set_content_type(3, 4);
+        state.pending = V3Pending::reset(true);
+        state.pending.content_type = Some((3, 4));
         assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
     }
 
@@ -2179,7 +2152,7 @@ mod tests {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
         state.current_preedit = "가".to_string();
         state.pending_deletes.push((3, 0));
-        state.begin_enabled_transaction(true);
+        state.pending = V3Pending::reset(true);
 
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(true);
@@ -2187,9 +2160,8 @@ mod tests {
         state.finish_guest_commit(plan, None);
 
         assert_eq!(state.guest_commit_serial(), 1);
-        assert!(!state.pending_enabled);
-        assert!(!state.committed_enabled);
-        assert!(!state.enabled_dirty);
+        assert_eq!(state.pending, V3Pending::default());
+        assert!(!state.committed.enabled);
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
     }
@@ -2375,46 +2347,28 @@ mod tests {
                         assert_eq!(next, expected);
                     }
                     Step::Enable | Step::Disable if next.active_surface.is_some() => {
-                        next.begin_enabled_transaction(matches!(step, Step::Enable));
-                        assert!(next.enabled_dirty);
-                        assert!(next.surrounding_text_dirty);
-                        assert!(next.content_type_dirty);
-                        assert!(next.cursor_rect_dirty);
+                        next.pending = V3Pending::reset(matches!(step, Step::Enable));
                     }
                     Step::Surrounding if next.active_surface.is_some() => {
-                        next.set_surrounding_text("가".to_string(), 3, 3);
-                        assert!(next.surrounding_text_dirty);
+                        next.pending.surrounding_text = Some(Some(("가".to_string(), 3, 3)));
                     }
                     Step::ContentType if next.active_surface.is_some() => {
-                        next.set_content_type(3, 4);
+                        next.pending.content_type = Some((3, 4));
                     }
                     Step::CursorRect if next.active_surface.is_some() => {
-                        next.set_cursor_rect((1, 2, 3, 4));
-                        assert!(next.cursor_rect_dirty);
+                        next.pending.cursor_rect = Some((1, 2, 3, 4));
                     }
                     Step::Commit if next.active_surface.is_some() => {
                         let previous_serial = next.guest_commit_serial();
                         next.count_guest_commit();
                         let plan = next.prepare_guest_commit(false);
                         let resets_composition = plan.resets_composition;
-                        let commits_surrounding = plan.surrounding_text.is_some();
-                        let commits_content_type = plan.content_type.is_some();
-                        let commits_cursor_rect = plan.cursor_rect.is_some();
                         next.finish_guest_commit(plan, None);
                         assert_eq!(next.guest_commit_serial(), previous_serial.wrapping_add(1));
+                        assert_eq!(next.pending, V3Pending::default());
                         if resets_composition {
-                            assert!(!next.enabled_dirty);
                             assert!(next.current_preedit.is_empty());
                             assert!(next.pending_deletes.is_empty());
-                        }
-                        if commits_surrounding {
-                            assert!(!next.surrounding_text_dirty);
-                        }
-                        if commits_content_type {
-                            assert!(!next.content_type_dirty);
-                        }
-                        if commits_cursor_rect {
-                            assert!(!next.cursor_rect_dirty);
                         }
                     }
                     Step::FailedCommit if next.active_surface.is_some() => {
@@ -2440,7 +2394,7 @@ mod tests {
                         next.begin_destroy();
                         assert_eq!(next.guest_commit_serial(), serial);
                         assert_eq!(next.host_activation(), host_activation);
-                        assert!(!next.committed_enabled);
+                        assert!(!next.committed.enabled);
                         assert!(next.active_surface.is_none());
                     }
                     _ => {}

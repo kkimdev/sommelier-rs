@@ -1437,12 +1437,12 @@ fn replay_committed_content_type(ctx: &mut Context, guest_id: u32) {
     let Some(state) = ctx.text_inputs.get(&guest_id) else {
         return;
     };
-    let Some(content_type) = state.committed_content_type else {
+    let Some(content_type) = state.host_content_type else {
         return;
     };
     let host_ids = (state.host_v1_id, state.host_ext_id);
     let serial = state.guest_commit_serial();
-    let has_surrounding_text = state.committed_surrounding_text.is_some();
+    let has_surrounding_text = state.committed.surrounding_text.is_some();
     let mut transaction = Vec::new();
     let support = push_content_type(
         &mut transaction,
@@ -1495,7 +1495,7 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
     let host_surface = state
         .active_surface
         .and_then(|surface| ctx.shadow_table.get_host_id(surface));
-    let target_activated = state.committed_enabled && host_surface.is_some();
+    let target_activated = state.committed.enabled && host_surface.is_some();
 
     match (target_activated, state.host_activation()) {
         (true, HostActivationState::Inactive) | (false, HostActivationState::Active) => {}
@@ -1774,7 +1774,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         }
         log::info!(">>> v3 on_enable: guest_id={}", guest_id);
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.begin_enabled_transaction(true);
+            state.pending = crate::state::V3Pending::reset(true);
         }
         Action::Drop
     }
@@ -1786,7 +1786,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         }
         log::info!(">>> v3 on_disable: guest_id={}", guest_id);
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.begin_enabled_transaction(false);
+            state.pending = crate::state::V3Pending::reset(false);
         }
         Action::Drop
     }
@@ -1825,7 +1825,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             return Action::Drop;
         }
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_surrounding_text(text.clone(), cursor, anchor);
+            state.pending.surrounding_text = Some(Some((text.clone(), cursor, anchor)));
         }
         Action::Drop
     }
@@ -1847,7 +1847,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             purpose
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_content_type(hint, purpose);
+            state.pending.content_type = Some((hint, purpose));
         }
         Action::Drop
     }
@@ -1873,7 +1873,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             height
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_cursor_rect((x, y, width, height));
+            state.pending.cursor_rect = Some((x, y, width, height));
         }
         Action::Drop
     }
@@ -1888,12 +1888,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             return Action::Drop;
         }
         let enable_conflict = ctx.text_inputs.get(&guest_id).is_some_and(|state| {
-            state.enabled_dirty
-                && state.pending_enabled
+            state.pending.enabled == Some(true)
                 && ctx.text_inputs.iter().any(|(&other_id, other)| {
                     other_id != guest_id
                         && other.guest_seat == state.guest_seat
-                        && other.committed_enabled
+                        && other.committed.enabled
                 })
         });
         let Some(plan) = ctx
@@ -2077,10 +2076,10 @@ mod tests {
         // The protocol counts the commit even though nothing reached the host.
         expected.set_guest_commits(1);
         assert_eq!(state, &expected);
-        assert!(state.committed_surrounding_text.is_none());
-        assert!(state.surrounding_text_dirty);
-        assert!(state.committed_content_type.is_none());
-        assert!(state.content_type_dirty);
+        assert!(state.committed.surrounding_text.is_none());
+        assert!(state.pending.surrounding_text.is_some());
+        assert_eq!(state.committed.content_type, (0, 0));
+        assert_eq!(state.pending.content_type, Some((0, 13)));
     }
 
     /// Helper: set up a context with a host→guest mapping for text input testing.
@@ -2105,8 +2104,7 @@ mod tests {
             // leave behavior explicitly clear this field.
             let mut state =
                 crate::state::TextInputState::new(host_v1_id, Some(host_ext_id), 0, Some(900));
-            state.pending_enabled = true;
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.host_activation = HostActivationState::Active;
             state
         });
@@ -2522,7 +2520,7 @@ mod tests {
         ctx.last_sender_id = host_ext_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.committed_surrounding_text = Some(("가나다".to_string(), 6, 6));
+            state.committed.surrounding_text = Some(("가나다".to_string(), 6, 6));
             state.set_guest_commits(42);
         }
 
@@ -2589,7 +2587,7 @@ mod tests {
         ctx.last_sender_id = 30;
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_surrounding_text = Some(("가나다".to_string(), 9, 9));
+            state.committed.surrounding_text = Some(("가나다".to_string(), 9, 9));
         }
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
@@ -2605,7 +2603,7 @@ mod tests {
         let oversized = "x".repeat(4_084);
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_surrounding_text = Some((oversized, 4_084, 4_084));
+            state.committed.surrounding_text = Some((oversized, 4_084, 4_084));
             state.pending_preedit_cursor = Some(7);
             state.pending_preedit_selection = Some((1, 2));
             state.current_preedit = "old".to_string();
@@ -2632,7 +2630,8 @@ mod tests {
         ctx.text_inputs
             .get_mut(&guest_id)
             .unwrap()
-            .committed_surrounding_text = Some(("가나다".to_string(), 9, 9));
+            .committed
+            .surrounding_text = Some(("가나다".to_string(), 9, 9));
         let mut handler = ExtendedTextInputV1Handler;
 
         assert_eq!(handler.on_set_preedit_region(&mut ctx, -9, 3), Action::Drop);
@@ -2778,8 +2777,7 @@ mod tests {
         ctx.keyboard_to_seat.insert(40, 0);
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_surrounding_text = Some(("english".to_string(), 7, 7));
-            state.pending_surrounding_text = state.committed_surrounding_text.clone();
+            state.committed.surrounding_text = Some(("english".to_string(), 7, 7));
         }
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
         end_backspace_repeat_for_seat(&mut ctx, 0);
@@ -2792,7 +2790,7 @@ mod tests {
             "a routine empty confirmation must not become a synthetic Backspace"
         );
         assert_eq!(
-            ctx.text_inputs[&guest_id].committed_surrounding_text,
+            ctx.text_inputs[&guest_id].committed.surrounding_text,
             Some(("english".to_string(), 7, 7))
         );
     }
@@ -2814,7 +2812,8 @@ mod tests {
         ctx.text_inputs
             .get_mut(&guest_id)
             .unwrap()
-            .committed_surrounding_text = Some(("가나다라".to_string(), 12, 12));
+            .committed
+            .surrounding_text = Some(("가나다라".to_string(), 12, 12));
         ctx.last_sender_id = 30;
         let mut handler = ExtendedTextInputV1Handler;
 
@@ -2996,8 +2995,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.set_guest_commits(2);
-            state.committed_surrounding_text = Some(("A가".to_string(), 4, 4));
-            state.pending_surrounding_text = state.committed_surrounding_text.clone();
+            state.committed.surrounding_text = Some(("A가".to_string(), 4, 4));
         }
         ctx.last_sender_id = host_v1_id;
         let mut v1_handler = TextInputV1Handler;
@@ -3034,7 +3032,7 @@ mod tests {
         assert_eq!(release.read_u32().unwrap(), 14);
         assert_eq!(release.read_u32().unwrap(), 0);
         assert_eq!(
-            ctx.text_inputs[&guest_id].committed_surrounding_text,
+            ctx.text_inputs[&guest_id].committed.surrounding_text,
             Some(("A가".to_string(), 4, 4))
         );
 
@@ -3071,7 +3069,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.current_preedit = "가".to_string();
-            state.committed_surrounding_text = Some(("A가".to_string(), 4, 4));
+            state.committed.surrounding_text = Some(("A가".to_string(), 4, 4));
         }
 
         // Model a normal physical press that was already forwarded, followed
@@ -3164,8 +3162,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.active_surface = Some(guest_surface);
-            state.pending_enabled = false;
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.host_activation = HostActivationState::Inactive;
         }
         ctx.last_sender_id = guest_id;
@@ -3190,7 +3187,7 @@ mod tests {
 
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         update_host_activation(&mut ctx, guest_id);
@@ -3224,7 +3221,7 @@ mod tests {
 
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.active_surface = Some(next_surface);
         }
         update_host_activation(&mut ctx, guest_id);
@@ -3261,7 +3258,7 @@ mod tests {
 
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         update_host_activation(&mut ctx, guest_id);
@@ -3392,7 +3389,7 @@ mod tests {
         }
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         update_host_activation(&mut ctx, guest_id);
@@ -3400,7 +3397,7 @@ mod tests {
 
         for (enabled, surface) in [(true, Some(901)), (true, Some(903)), (false, Some(903))] {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = enabled;
+            state.committed.enabled = enabled;
             state.active_surface = surface;
             update_host_activation(&mut ctx, guest_id);
         }
@@ -3425,7 +3422,7 @@ mod tests {
         let (mut ctx, _old_host_v1_id, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.active_surface = None;
         }
         update_host_activation(&mut ctx, guest_id);
@@ -3433,7 +3430,7 @@ mod tests {
 
         let mut replacement = ctx.text_inputs.remove(&guest_id).unwrap();
         replacement.host_v1_id = 11;
-        replacement.committed_enabled = true;
+        replacement.committed.enabled = true;
         replacement.active_surface = Some(901);
         replacement.host_activation = HostActivationState::Inactive;
         ctx.shadow_table
@@ -3459,8 +3456,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&first_id).unwrap();
             state.active_surface = Some(surface);
-            state.pending_enabled = false;
-            state.committed_enabled = false;
+            state.committed.enabled = false;
             state.host_activation = HostActivationState::Inactive;
         }
         let second_id = 21;
@@ -3480,9 +3476,9 @@ mod tests {
         handler.on_enable(&mut ctx);
         handler.on_commit(&mut ctx);
 
-        assert!(ctx.text_inputs[&first_id].committed_enabled);
+        assert!(ctx.text_inputs[&first_id].committed.enabled);
         assert!(ctx.text_inputs[&first_id].host_is_active());
-        assert!(!ctx.text_inputs[&second_id].committed_enabled);
+        assert!(!ctx.text_inputs[&second_id].committed.enabled);
         assert!(!ctx.text_inputs[&second_id].host_is_active());
         assert_eq!(
             ctx.key_generations
@@ -3527,21 +3523,21 @@ mod tests {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.pending_surrounding_text = Some(("가".to_string(), 3, 3));
-            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
         handler.on_disable(&mut ctx);
 
         assert!(ctx.text_inputs[&guest_id]
-            .committed_surrounding_text
+            .committed
+            .surrounding_text
             .is_some());
         handler.on_commit(&mut ctx);
 
         let state = &ctx.text_inputs[&guest_id];
-        assert!(!state.committed_enabled);
-        assert!(state.committed_surrounding_text.is_none());
+        assert!(!state.committed.enabled);
+        assert!(state.committed.surrounding_text.is_none());
         assert!(!state.host_is_active());
         let clear_message = ctx.client_to_host_queue.iter().find(|message| {
             msg_sender(std::slice::from_ref(message), 0) == 10
@@ -3586,13 +3582,10 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.set_guest_commits(17);
-            state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
-            state.committed_surrounding_text = Some(("current".to_string(), 7, 7));
-            state.surrounding_text_dirty = true;
-            state.content_hint = 0x200;
-            state.content_type_dirty = true;
-            state.cursor_rect = Some((1, 2, 3, 4));
-            state.cursor_rect_dirty = true;
+            state.pending.surrounding_text = Some(Some(("pending".to_string(), 7, 7)));
+            state.committed.surrounding_text = Some(("current".to_string(), 7, 7));
+            state.pending.content_type = Some((0x200, 0));
+            state.pending.cursor_rect = Some((1, 2, 3, 4));
             state.current_preedit = "한".to_string();
             state.pending_deletes.push((3, 0));
         }
@@ -3603,15 +3596,9 @@ mod tests {
 
         assert_eq!(state.guest_commit_serial(), 17);
         assert!(state.host_is_active());
-        assert!(!state.pending_enabled);
-        assert!(!state.committed_enabled);
-        assert!(state.pending_surrounding_text.is_none());
-        assert!(state.committed_surrounding_text.is_none());
-        assert!(!state.surrounding_text_dirty);
-        assert_eq!(state.content_hint, 0);
-        assert!(!state.content_type_dirty);
-        assert!(state.cursor_rect.is_none());
-        assert!(!state.cursor_rect_dirty);
+        assert_eq!(state.pending, crate::state::V3Pending::default());
+        assert!(!state.committed.enabled);
+        assert!(state.committed.surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
     }
@@ -3624,8 +3611,7 @@ mod tests {
         handler.on_set_surrounding_text(&mut ctx, &"가".to_string(), 1, 1);
 
         let state = &ctx.text_inputs[&guest_id];
-        assert!(state.pending_surrounding_text.is_none());
-        assert!(!state.surrounding_text_dirty);
+        assert!(state.pending.surrounding_text.is_none());
     }
 
     #[test]
@@ -3696,8 +3682,8 @@ mod tests {
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 10);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 9);
         let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.committed_content_type, Some((0, 13)));
-        assert!(!state.content_type_dirty);
+        assert_eq!(state.committed.content_type, (0, 13));
+        assert!(state.pending.content_type.is_none());
     }
 
     /// Take every queued host request; return the extension's, as
@@ -5333,17 +5319,7 @@ mod tests {
             .get_mut(&guest_id)
             .expect("text input fixture")
             .active_surface = None;
-        let before = {
-            let state = &ctx.text_inputs[&guest_id];
-            (
-                state.pending_enabled,
-                state.enabled_dirty,
-                state.pending_surrounding_text.clone(),
-                state.content_hint,
-                state.content_purpose,
-                state.cursor_rect,
-            )
-        };
+        let before = ctx.text_inputs[&guest_id].pending.clone();
         let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial();
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -5368,15 +5344,7 @@ mod tests {
         );
         let state = &ctx.text_inputs[&guest_id];
         assert_eq!(
-            (
-                state.pending_enabled,
-                state.enabled_dirty,
-                state.pending_surrounding_text.clone(),
-                state.content_hint,
-                state.content_purpose,
-                state.cursor_rect,
-            ),
-            before,
+            state.pending, before,
             "inactive v3 requests must not mutate double-buffered state"
         );
         assert_eq!(

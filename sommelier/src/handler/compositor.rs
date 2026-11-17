@@ -1213,18 +1213,15 @@ mod tests {
     ) -> crate::state::TextInputState {
         let mut state =
             crate::state::TextInputState::new(host_v1_id, None, guest_seat, Some(active_surface));
-        state.pending_enabled = true;
-        state.committed_enabled = true;
-        state.enabled_dirty = true;
-        state.pending_surrounding_text = Some(("한".to_string(), 3, 3));
-        state.committed_surrounding_text = Some(("한".to_string(), 3, 3));
-        state.surrounding_text_dirty = true;
-        state.content_hint = 1;
-        state.content_purpose = 1;
-        state.committed_content_type = Some((1, 1));
-        state.content_type_dirty = true;
-        state.cursor_rect = Some((1, 2, 3, 4));
-        state.cursor_rect_dirty = true;
+        state.pending = crate::state::V3Pending {
+            enabled: Some(true),
+            surrounding_text: Some(Some(("한".to_string(), 3, 3))),
+            content_type: Some((1, 1)),
+            cursor_rect: Some((1, 2, 3, 4)),
+        };
+        state.committed.enabled = true;
+        state.committed.surrounding_text = Some(("한".to_string(), 3, 3));
+        state.committed.content_type = (1, 1);
         state.current_preedit = "한".to_string();
         state.set_guest_commits(1);
         state.pending_preedit_cursor = Some(1);
@@ -4493,12 +4490,12 @@ mod tests {
         for guest_text_input in [700, 710] {
             let state = &ctx.text_inputs[&guest_text_input];
             assert_eq!(state.active_surface, None);
-            assert!(!state.committed_enabled);
+            assert!(!state.committed.enabled);
             assert!(!state.host_is_active());
         }
         let unaffected = &ctx.text_inputs[&720];
         assert_eq!(unaffected.active_surface, Some(live_surface));
-        assert!(unaffected.committed_enabled);
+        assert!(unaffected.committed.enabled);
         assert!(unaffected.host_is_active());
         assert_eq!(unaffected.current_preedit, "한");
 
@@ -4634,18 +4631,18 @@ mod tests {
 
         let repaired = &ctx.text_inputs[&stale_with_replacement];
         assert_eq!(repaired.active_surface, Some(replacement_surface));
-        assert!(!repaired.committed_enabled);
+        assert!(!repaired.committed.enabled);
         assert!(!repaired.host_is_active());
         assert!(repaired.current_preedit.is_empty());
 
         let repaired_without_owner = &ctx.text_inputs[&stale_without_owner];
         assert_eq!(repaired_without_owner.active_surface, None);
-        assert!(!repaired_without_owner.committed_enabled);
+        assert!(!repaired_without_owner.committed.enabled);
         assert!(!repaired_without_owner.host_is_active());
 
         let healthy = &ctx.text_inputs[&healthy_on_replacement];
         assert_eq!(healthy.active_surface, Some(replacement_surface));
-        assert!(healthy.committed_enabled);
+        assert!(healthy.committed.enabled);
         assert!(healthy.host_is_active());
         assert_eq!(healthy.current_preedit, "한");
 

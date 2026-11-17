@@ -358,7 +358,7 @@ mod tests {
             .shadow_table
             .create_host_only("zcr_extended_text_input_v1", 1);
         let mut state = crate::state::TextInputState::new(host, Some(extension), SEAT, None);
-        state.committed_enabled = true;
+        state.committed.enabled = true;
         assert!(state.activate_host());
         ctx.text_inputs.insert(TEXT_INPUT, state);
 
