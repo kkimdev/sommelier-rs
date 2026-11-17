@@ -601,6 +601,27 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
         let surface_id = ctx.last_sender_id;
 
+        // A native dma-buf's fence belongs to the contents an attach
+        // submits, so an attach(NULL) or damage-only commit waits for
+        // nothing, as in ChromiumOS Sommelier, whose sync point is set at
+        // attach. The wait comes before the commit changes anything.
+        let attached = ctx
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.pending.attachment.buffer_id());
+        if let Some(buffer_id) = attached {
+            // Wait for guest GPU writes before the host compositor samples
+            // the buffer, matching ChromiumOS Sommelier's sync_point path.
+            if let Err(error) = wait_for_native_buffer(ctx, buffer_id) {
+                // wl_surface.commit has no recoverable failure response.
+                // Disconnect rather than silently dropping a request the
+                // guest reasonably believes was accepted.
+                return ctx.fail(format_args!(
+                    "Native dma-buf synchronization failed for surface {surface_id}: {error}"
+                ));
+            }
+        }
+
         let mut default_surface = SurfaceState::default();
         let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
             || default_surface.prepare_commit(),
@@ -608,13 +629,6 @@ impl WlSurfaceHandler for CompositorHandler {
         );
         let attached_buffer_id = commit.attached_buffer_id();
         let copied_buffer_id = buffer_to_copy(ctx, &commit);
-        // A native dma-buf acquire fence belongs to the new contents submitted
-        // by an attach.  Re-running the dma-buf wait for a damage-only commit
-        // blocks this single-threaded proxy even though the host compositor
-        // is already using the same buffer.  ChromiumOS Sommelier waits at
-        // attach time as well; keep explicit attach(NULL) and damage-only
-        // commits non-blocking.
-        let wait_for_native_sync = attached_buffer_id.is_some();
 
         let mapping = commit.state.mapping(shown_buffer_size(ctx, &commit.state));
         // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
@@ -682,22 +696,6 @@ impl WlSurfaceHandler for CompositorHandler {
                 }
                 crate::handler::shm::retire_eligible_buffers(ctx);
                 return Action::Drop;
-            }
-        }
-
-        if wait_for_native_sync {
-            if let Some(buffer_id) = attached_buffer_id {
-                // Native linux-dmabuf buffers bypass the local SHM copy path.
-                // Wait for guest GPU writes before the host compositor samples
-                // the buffer, matching ChromiumOS Sommelier's sync_point path.
-                if let Err(error) = wait_for_native_buffer(ctx, buffer_id) {
-                    // wl_surface.commit has no recoverable failure response.
-                    // Disconnect rather than silently rolling back a request
-                    // the guest reasonably believes was accepted.
-                    return ctx.fail(format_args!(
-                        "Native dma-buf synchronization failed for surface {surface_id}: {error}"
-                    ));
-                }
             }
         }
 
