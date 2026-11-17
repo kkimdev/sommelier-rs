@@ -1935,6 +1935,48 @@ mod tests {
     /// An attached input method with no known content type.
     const ACTIVE: HostApplied = HostApplied::Active { content_type: None };
 
+    /// A deactivated input method whose events a barrier drains.
+    const DRAINING: HostApplied = HostApplied::Draining {
+        callback: HostId(100),
+    };
+
+    /// One host state of each activation.
+    const ACTIVATIONS: [HostApplied; 3] = [HostApplied::Inactive, ACTIVE, DRAINING];
+
+    /// A text input of guest seat 12, focused on surface 13, whose host has
+    /// applied `host`.
+    fn text_input(host: HostApplied) -> TextInputState {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.host = host;
+        state
+    }
+
+    /// A text input after 7 commits whose host is `ACTIVE` (attached, no
+    /// known content type), composing the preedit "가" with every kind of
+    /// IME metadata pending: preedit selection (0, 3), preedit cursor 3, one
+    /// delete of (3, 0) and cursor position (1, 1). Offsets count bytes, as
+    /// in `zwp_text_input_v1`, and "가" is three.
+    fn composing() -> TextInputState {
+        let mut state = text_input(ACTIVE);
+        state.set_guest_commits(7);
+        state.current_preedit = "가".to_string();
+        state.record_preedit_selection(0, 3);
+        state.record_preedit_cursor(3);
+        assert!(state.record_delete(3, 0));
+        state.record_cursor_position(1, 1);
+        assert_eq!(
+            (
+                state.pending_preedit_selection,
+                state.pending_preedit_cursor,
+                &state.pending_deletes[..],
+                state.pending_cursor_position,
+            ),
+            (Some((0, 3)), Some(3), &[(3, 0)][..], Some((1, 1))),
+            "the recorders store what they are given"
+        );
+        state
+    }
+
     #[test]
     fn host_activation_transitions_match_the_model_for_all_short_sequences() {
         #[derive(Clone, Copy)]
@@ -1957,50 +1999,26 @@ mod tests {
             Operation::CompleteDrainingB,
             Operation::EndWithoutBarrier,
         ];
-        const INITIAL_STATES: [HostApplied; 4] = [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: CALLBACK_A,
-            },
-            HostApplied::Draining {
-                callback: CALLBACK_B,
-            },
-        ];
+        const DRAINING_A: HostApplied = HostApplied::Draining {
+            callback: CALLBACK_A,
+        };
+        const DRAINING_B: HostApplied = HostApplied::Draining {
+            callback: CALLBACK_B,
+        };
 
         fn model_transition(state: HostApplied, operation: Operation) -> (HostApplied, bool) {
             match (state, operation) {
                 (HostApplied::Inactive, Operation::Activate) => (ACTIVE, true),
-                (ACTIVE, Operation::BeginDrainingA) => (
-                    HostApplied::Draining {
-                        callback: CALLBACK_A,
-                    },
-                    true,
-                ),
-                (ACTIVE, Operation::BeginDrainingB) => (
-                    HostApplied::Draining {
-                        callback: CALLBACK_B,
-                    },
-                    true,
-                ),
-                (
-                    HostApplied::Draining {
-                        callback: CALLBACK_A,
-                    },
-                    Operation::CompleteDrainingA,
-                )
-                | (
-                    HostApplied::Draining {
-                        callback: CALLBACK_B,
-                    },
-                    Operation::CompleteDrainingB,
-                ) => (HostApplied::Inactive, true),
-                (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
+                (ACTIVE, Operation::BeginDrainingA) => (DRAINING_A, true),
+                (ACTIVE, Operation::BeginDrainingB) => (DRAINING_B, true),
+                (DRAINING_A, Operation::CompleteDrainingA)
+                | (DRAINING_B, Operation::CompleteDrainingB)
+                | (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
                 _ => (state, false),
             }
         }
 
-        fn assert_invariants(state: &TextInputState, expected: HostApplied) {
+        fn walk(state: TextInputState, expected: HostApplied, remaining: usize) {
             assert_eq!(state.host, expected);
             assert_eq!(state.host_is_active(), expected == ACTIVE);
             assert_eq!(
@@ -2010,10 +2028,6 @@ mod tests {
                     HostApplied::Inactive | HostApplied::Active { .. } => None,
                 }
             );
-        }
-
-        fn walk(state: TextInputState, expected: HostApplied, remaining: usize) {
-            assert_invariants(&state, expected);
             if remaining == 0 {
                 return;
             }
@@ -2034,26 +2048,20 @@ mod tests {
             }
         }
 
-        for initial in INITIAL_STATES {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = initial;
-            walk(state, initial, 5);
+        for initial in [HostApplied::Inactive, ACTIVE, DRAINING_A, DRAINING_B] {
+            walk(text_input(initial), initial, 5);
         }
     }
 
     /// Every host state a test of [`reconcile`] starts from: each
     /// activation, with each content type the host could have.
     fn host_states(content_types: &[HostContentType]) -> Vec<HostApplied> {
-        let mut states = vec![
-            HostApplied::Inactive,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ];
-        for content_type in std::iter::once(None).chain(content_types.iter().copied().map(Some)) {
-            states.push(HostApplied::Active { content_type });
-        }
-        states
+        let known = content_types
+            .iter()
+            .map(|&content_type| HostApplied::Active {
+                content_type: Some(content_type),
+            });
+        ACTIVATIONS.into_iter().chain(known).collect()
     }
 
     /// Apply `steps` to `applied` as the host does.
@@ -2077,9 +2085,10 @@ mod tests {
         next
     }
 
-    #[test]
-    fn reconcile_reaches_every_target_with_only_needed_requests() {
-        let content_types = [(1, 2), (3, 4)]
+    /// Two content types, each with unknown, absent and present
+    /// surrounding-text support.
+    fn content_types() -> Vec<HostContentType> {
+        [(1, 2), (3, 4)]
             .into_iter()
             .flat_map(|content_type| {
                 [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
@@ -2087,29 +2096,29 @@ mod tests {
                     surrounding_text_support,
                 })
             })
-            .collect::<Vec<_>>();
-        for applied in host_states(&content_types) {
-            for (active, seat_live, &content_type) in [false, true]
-                .into_iter()
-                .flat_map(|active| [false, true].map(|seat_live| (active, seat_live)))
-                .flat_map(|(active, seat_live)| {
-                    content_types
-                        .iter()
-                        .map(move |content_type| (active, seat_live, content_type))
-                })
-            {
-                let target = HostTarget {
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_reaches_every_target_with_only_needed_requests() {
+        let content_types = content_types();
+        let targets = [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .flat_map(|(active, seat_live)| {
+                content_types.iter().map(move |&content_type| HostTarget {
                     active,
                     seat_live,
                     content_type,
-                };
-                let steps = reconcile(&target, &applied);
-                let reached = apply_steps(&applied, steps);
-                let expected = match (applied, active, seat_live) {
+                })
+            });
+        for target in targets {
+            for applied in host_states(&content_types) {
+                let reached = apply_steps(&applied, reconcile(&target, &applied));
+                let expected = match (applied, target.active, target.seat_live) {
                     // The barrier's completion reconciles again.
                     (HostApplied::Draining { .. }, ..) => applied,
                     (_, true, true) => HostApplied::Active {
-                        content_type: Some(content_type),
+                        content_type: Some(target.content_type),
                     },
                     (HostApplied::Active { .. }, false, true) => HostApplied::Draining {
                         callback: HostId(101),
@@ -2119,7 +2128,7 @@ mod tests {
                     // as it is, with the content type it can still take.
                     (HostApplied::Inactive, true, false) => applied,
                     (HostApplied::Active { .. }, true, false) => HostApplied::Active {
-                        content_type: Some(content_type),
+                        content_type: Some(target.content_type),
                     },
                 };
                 assert_eq!(reached, expected, "{target:?} from {applied:?}");
@@ -2133,84 +2142,42 @@ mod tests {
     }
 
     #[test]
-    fn a_reached_content_type_is_resent_only_after_the_host_forgets_it() {
-        let content_type = HostContentType {
-            content_type: (1, 2),
-            surrounding_text_support: Some(false),
-        };
-        let target = HostTarget {
-            active: true,
-            seat_live: true,
-            content_type,
-        };
-        let mut applied = HostApplied::default();
-        assert_eq!(
-            reconcile(&target, &applied),
-            HostSteps {
-                activation: Some(ActivationStep::Activate),
-                content_type: Some(content_type),
-            }
-        );
-        assert!(applied.activate());
-        applied.apply_content_type(content_type);
-        assert_eq!(reconcile(&target, &applied), HostSteps::default());
-
-        // A new field is told its content type even if it is unchanged.
-        applied.new_field();
-        assert_eq!(
-            reconcile(&target, &applied).content_type,
-            Some(content_type)
-        );
-    }
-
-    #[test]
-    fn only_active_host_generation_accepts_ime_events() {
-        for activation in [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ] {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = activation;
-            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
-
-            assert_eq!(state.prepare_host_preedit().is_some(), activation == ACTIVE);
-            assert_eq!(state.prepare_host_commit().is_some(), activation == ACTIVE);
-            assert_eq!(
-                state.prepare_preedit_region().is_some(),
-                activation == ACTIVE
-            );
-            assert_eq!(
-                state.prepare_confirm_preedit().is_some(),
-                activation == ACTIVE
-            );
+    fn a_new_field_forgets_only_the_applied_content_type() {
+        for applied in host_states(&content_types()) {
+            let mut next = applied;
+            next.new_field();
+            let expected = match applied {
+                HostApplied::Active { .. } => ACTIVE,
+                HostApplied::Inactive | HostApplied::Draining { .. } => applied,
+            };
+            assert_eq!(next, expected, "{applied:?}");
         }
     }
 
     #[test]
-    fn editor_lifecycle_boundaries_preserve_host_activation_generation() {
-        for activation in [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ] {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = activation;
+    fn only_active_host_generation_accepts_ime_events() {
+        for activation in ACTIVATIONS {
+            let mut state = text_input(activation);
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
 
-            state.apply_focus(Some(14));
-            assert_eq!(state.host, activation);
-            state.begin_destroy();
-            assert_eq!(state.host, activation);
+            let active = activation == ACTIVE;
+            assert_eq!(state.prepare_host_preedit().is_some(), active);
+            assert_eq!(state.prepare_host_commit().is_some(), active);
+            assert_eq!(state.prepare_preedit_region().is_some(), active);
+            assert_eq!(state.prepare_confirm_preedit().is_some(), active);
         }
     }
 
     #[test]
     fn text_input_focus_boundary_resets_editor_state_only() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        let applied = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (5, 6),
+                surrounding_text_support: Some(true),
+            }),
+        };
+        let mut state = composing();
+        state.host = applied;
         state.pending = V3Pending {
             enabled: Some(true),
             surrounding_text: Some(Some(("pending".to_string(), 7, 7))),
@@ -2222,27 +2189,14 @@ mod tests {
             surrounding_text: Some(("committed".to_string(), 9, 9)),
             content_type: (5, 6),
         };
-        state.current_preedit = "조합".to_string();
-        state.set_guest_commits(17);
-        state.pending_preedit_cursor = Some(3);
-        state.pending_preedit_selection = Some((0, 3));
-        state.pending_deletes.push((3, 0));
-        state.pending_cursor_position = Some((1, 1));
-        let applied = HostApplied::Active {
-            content_type: Some(HostContentType {
-                content_type: (5, 6),
-                surrounding_text_support: Some(true),
-            }),
-        };
-        state.host = applied;
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
         // What the host applied is the host's, so it survives: reconciling
         // the reset target deactivates it and forgets the content type.
-        let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
-        expected.set_guest_commits(17);
-        expected.host = applied;
+        let mut expected = text_input(applied);
+        expected.active_surface = Some(14);
+        expected.set_guest_commits(7);
         assert_eq!(state, expected);
         let target = HostTarget {
             active: state.committed.enabled,
@@ -2263,16 +2217,17 @@ mod tests {
 
     #[test]
     fn commit_applies_every_pending_field_and_starts_a_new_field() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(state.host.activate());
         let content_type = HostContentType {
             content_type: (3, 4),
             surrounding_text_support: Some(true),
         };
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
+        };
+        let mut state = composing();
         state.host.apply_content_type(content_type);
-        state.current_preedit = "이전".to_string();
-        state.pending_preedit_cursor = Some(3);
-        state.pending_deletes.push((3, 0));
         state.pending = V3Pending {
             surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
             content_type: Some((3, 4)),
@@ -2288,26 +2243,16 @@ mod tests {
                 cursor_rect: Some((1, 2, 3, 4)),
             }
         );
-        assert_eq!(state.guest_commit_serial(), 1);
-        assert_eq!(state.pending, V3Pending::default());
-        assert_eq!(
-            state.committed,
-            V3Committed {
-                enabled: true,
-                surrounding_text: Some(("가나다".to_string(), 9, 9)),
-                content_type: (3, 4),
-            }
-        );
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_preedit_cursor.is_none());
-        assert!(state.pending_deletes.is_empty());
-        // The new field is told its content type even though it is the old
-        // field's.
-        let target = HostTarget {
-            active: true,
-            seat_live: true,
-            content_type,
+        // The commit closes the composition, and the new field is told its
+        // content type even though it is the old field's.
+        let mut expected = text_input(ACTIVE);
+        expected.set_guest_commits(8);
+        expected.committed = V3Committed {
+            enabled: true,
+            surrounding_text: Some(("가나다".to_string(), 9, 9)),
+            content_type: (3, 4),
         };
+        assert_eq!(state, expected);
         assert_eq!(
             reconcile(&target, &state.host).content_type,
             Some(content_type)
@@ -2322,21 +2267,34 @@ mod tests {
 
     #[test]
     fn rejected_enable_closes_composition_but_stays_disabled() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.current_preedit = "가".to_string();
-        state.pending_deletes.push((3, 0));
-        state.pending = V3Pending::reset(true);
+        let known = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (3, 4),
+                surrounding_text_support: Some(false),
+            }),
+        };
+        // Another text input holds the activation, so the host is usually
+        // inactive, but the commit starts a new field whatever it applied.
+        for (applied, expected_host) in [
+            (HostApplied::Inactive, HostApplied::Inactive),
+            (ACTIVE, ACTIVE),
+            (DRAINING, DRAINING),
+            (known, ACTIVE),
+        ] {
+            let mut state = composing();
+            state.host = applied;
+            state.pending = V3Pending::reset(true);
 
-        assert!(state.commit(true).new_field);
-        assert_eq!(state.pending, V3Pending::default());
-        assert!(!state.committed.enabled);
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_deletes.is_empty());
+            assert!(state.commit(true).new_field, "{applied:?}");
+            let mut expected = text_input(expected_host);
+            expected.set_guest_commits(7);
+            assert_eq!(state, expected, "{applied:?}");
+        }
     }
 
     #[test]
     fn guest_commit_serial_wraps_to_zero() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
+        let mut state = text_input(HostApplied::Inactive);
         state.set_guest_commits(u32::MAX);
 
         assert_eq!(state.count_guest_commit(), 0);
@@ -2344,89 +2302,87 @@ mod tests {
         assert_eq!(state.guest_commit_serial(), 0);
     }
 
+    // Each host IME event is planned without changing the state, and
+    // finishing the plan consumes exactly the metadata the event used.
+
     #[test]
     fn host_preedit_metadata_is_consumed_only_after_finish() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.prepare_host_preedit().is_none());
-        assert!(state.host.activate());
-        state.set_guest_commits(7);
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
+        let mut state = composing();
         let before = state.clone();
-
         let plan = state.prepare_host_preedit().expect("active host input");
         assert_eq!(state, before);
-        assert_eq!(plan.done_serial, 7);
-        assert!(plan.had_preedit);
-        assert_eq!(plan.selection, Some((0, 3)));
-        assert_eq!(plan.cursor, Some(3));
+        assert_eq!(
+            plan,
+            HostPreeditPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: true,
+                selection: Some((0, 3)),
+                cursor: Some(3),
+            }
+        );
 
         state.finish_host_preedit(plan, "각".to_string(), true, true);
-        assert_eq!(state.current_preedit, "각");
-        assert!(state.pending_preedit_selection.is_none());
-        assert!(state.pending_preedit_cursor.is_none());
+        let mut expected = before;
+        expected.current_preedit = "각".to_string();
+        expected.pending_preedit_selection = None;
+        expected.pending_preedit_cursor = None;
+        assert_eq!(state, expected);
     }
 
     #[test]
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
-        state.set_guest_commits(7);
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
-        assert!(state.record_delete(3, 0));
-        state.record_cursor_position(1, 1);
+        let mut state = composing();
         let before = state.clone();
-
         let plan = state.prepare_host_commit().expect("active host input");
+        assert_eq!(state, before);
         assert_eq!(
-            state, before,
-            "preparing an event must not consume metadata"
+            plan,
+            HostCommitPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: true,
+                deletes: vec![(3, 0)],
+                cursor_position: Some((1, 1)),
+            }
         );
-        assert_eq!(plan.deletes, vec![(3, 0)]);
-        assert_eq!(plan.cursor_position, Some((1, 1)));
 
         state.finish_host_commit(plan);
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_preedit_selection.is_none());
-        assert!(state.pending_preedit_cursor.is_none());
-        assert!(state.pending_deletes.is_empty());
-        assert!(state.pending_cursor_position.is_none());
-
-        let next = state.prepare_host_commit().expect("still active");
-        assert!(!next.had_preedit);
-        assert!(next.deletes.is_empty());
-        assert!(next.cursor_position.is_none());
+        let mut expected = text_input(ACTIVE);
+        expected.set_guest_commits(7);
+        assert_eq!(state, expected);
+        assert_eq!(
+            state.prepare_host_commit(),
+            Some(HostCommitPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: false,
+                deletes: Vec::new(),
+                cursor_position: None,
+            }),
+            "the next commit string finds nothing of the last"
+        );
     }
 
     #[test]
     fn confirming_preedit_closes_only_preedit_metadata() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
-        assert!(state.record_delete(3, 0));
-        state.record_cursor_position(1, 1);
-
+        let mut state = composing();
+        let before = state.clone();
         let plan = state.prepare_confirm_preedit().expect("active host input");
-        state.finish_confirm_preedit(plan);
+        assert_eq!(state, before);
 
-        let next_preedit = state.prepare_host_preedit().expect("still active");
-        assert!(!next_preedit.had_preedit);
-        assert!(next_preedit.selection.is_none());
-        assert!(next_preedit.cursor.is_none());
-        let next_commit = state.prepare_host_commit().expect("still active");
-        assert_eq!(next_commit.deletes, vec![(3, 0)]);
-        assert_eq!(next_commit.cursor_position, Some((1, 1)));
+        state.finish_confirm_preedit(plan);
+        // The edits stay for the next commit string.
+        let mut expected = before;
+        expected.current_preedit.clear();
+        expected.pending_preedit_selection = None;
+        expected.pending_preedit_cursor = None;
+        assert_eq!(state, expected);
     }
 
     #[test]
     fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
+        let mut state = text_input(ACTIVE);
         for index in 0..MAX_PENDING_IME_DELETES {
             assert!(state.record_delete(index as u32, 0));
         }
@@ -2471,6 +2427,7 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Step {
             Focus,
+            Refocus,
             Leave,
             Enable,
             Disable,
@@ -2482,8 +2439,9 @@ mod tests {
             Destroy,
         }
 
-        const STEPS: [Step; 10] = [
+        const STEPS: [Step; 11] = [
             Step::Focus,
+            Step::Refocus,
             Step::Leave,
             Step::Enable,
             Step::Disable,
@@ -2502,10 +2460,14 @@ mod tests {
             for step in STEPS {
                 let mut next = state.clone();
                 match step {
-                    Step::Focus | Step::Leave => {
+                    Step::Focus | Step::Refocus | Step::Leave => {
                         let serial = next.guest_commit_serial;
                         let host_activation = next.host;
-                        let surface = matches!(step, Step::Focus).then_some(13);
+                        let surface = match step {
+                            Step::Focus => Some(13),
+                            Step::Refocus => Some(14),
+                            _ => None,
+                        };
                         next.apply_focus(surface);
                         let mut expected = TextInputState::new(10, Some(11), 12, surface);
                         expected.guest_commit_serial = serial;
@@ -2558,9 +2520,11 @@ mod tests {
             }
         }
 
-        let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(initial.host.activate());
-        walk(initial, 4);
+        // Neither focus, onto either surface or none, nor destroy changes
+        // what the host applied.
+        for activation in ACTIVATIONS {
+            walk(text_input(activation), 4);
+        }
     }
 
     #[test]
