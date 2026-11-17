@@ -219,7 +219,8 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   connection, but `ShadowTable::retire_host_interface` retires its dispatch
   metadata as soon as its guest object or global is gone.
   Tests: `host_only_destructor_reservation_survives_until_delete_id`,
-  `retiring_a_destroyed_host_object_requires_a_live_host_only_object`.
+  `retiring_a_destroyed_host_object_requires_a_live_host_only_object`,
+  `retiring_a_host_object_awaiting_delete_id_keeps_its_id_reserved`.
 - **Synthetic objects complete their own lifecycle.** A guest object
   implemented entirely in the proxy (such as `wl_shm_pool` or
   `zwp_text_input_manager_v3`) MUST, on its destructor, retire its dispatch
