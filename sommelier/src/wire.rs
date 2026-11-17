@@ -32,7 +32,7 @@ pub type Outgoing = (Vec<u8>, Vec<OwnedFd>);
 /// Queue an encoded message, or log and drop one that could not be encoded.
 ///
 /// Only the encoder of a message with a string or array fails, when the
-/// data does not fit the wire's 16-bit length. That data can come from the
+/// data does not fit [`MessageHeader::MAX_LEN`]. That data can come from the
 /// host or a guest, so dropping the one message keeps the session alive
 /// instead of ending it.
 ///
@@ -94,8 +94,12 @@ pub enum Framing {
 impl MessageHeader {
     /// The size of the header in bytes.
     pub const LEN: usize = 8;
-    /// The largest length the 16-bit length field can carry.
-    const MAX_LEN: usize = u16::MAX as usize;
+    /// The longest message, header included: libwayland's
+    /// `WL_MAX_MESSAGE_SIZE`. Both of its peers refuse a longer one, a
+    /// client by closing the connection and a compositor with
+    /// `invalid_method`, although the 16-bit length field could describe
+    /// more. The proxy therefore neither accepts nor builds one.
+    pub const MAX_LEN: usize = 4096;
 
     /// Decode the header at the start of `bytes`, or `None` while fewer than
     /// [`Self::LEN`] bytes are available.
@@ -110,7 +114,7 @@ impl MessageHeader {
     }
 
     /// Whether the length field describes a message the wire can carry: at
-    /// least a header, 4-byte aligned, and within the 16-bit field.
+    /// least a header, 4-byte aligned, and at most [`Self::MAX_LEN`].
     pub fn has_valid_len(&self) -> bool {
         (Self::LEN..=Self::MAX_LEN).contains(&self.len) && self.len.is_multiple_of(4)
     }
@@ -452,7 +456,7 @@ impl MessageBuilder {
 
 impl MessageBuilder {
     /// Assemble a complete Wayland wire message, returning an error instead
-    /// of truncating the 16-bit length field when the payload is too large.
+    /// of building one longer than [`MessageHeader::MAX_LEN`].
     pub fn try_build_message(&self, sender_id: u32, opcode: u16) -> Result<Vec<u8>, ProtocolError> {
         let len = self
             .payload
@@ -504,11 +508,11 @@ impl MessageBuilder {
     /// bytes accumulated via `write_*` calls.
     ///
     /// # Panics
-    /// Panics if the total message does not fit within Wayland's 16-bit
-    /// length field. Silently truncating the length in release builds would
-    /// desynchronise the stream, so this invariant is enforced in all builds.
-    /// The generated encoders call it only for messages without strings or
-    /// arrays, which always fit.
+    /// Panics if the total message is longer than
+    /// [`MessageHeader::MAX_LEN`]. Silently truncating the length in release
+    /// builds would desynchronise the stream, so this invariant is enforced
+    /// in all builds. The generated encoders call it only for messages
+    /// without strings or arrays, which always fit.
     pub fn build_message(self, sender_id: u32, opcode: u16) -> Vec<u8> {
         debug_assert!(
             self.fds.is_empty(),
@@ -822,7 +826,7 @@ mod tests {
     fn an_encoder_that_cannot_build_its_message_closes_its_descriptors() {
         let pipe_end = descriptor();
         let identity = fd_identity(pipe_end.as_raw_fd());
-        let mime_type = "x".repeat(u16::MAX.into());
+        let mime_type = "x".repeat(4_084);
         assert!(matches!(
             wl_data_offer::req::receive(10, &mime_type, pipe_end),
             Err(ProtocolError::MessageTooLarge(_))
@@ -896,10 +900,12 @@ mod tests {
             opcode: 0,
             len,
         };
-        for valid in [8, 12, 65_532] {
+        for valid in [8, 12, 4_096] {
             assert!(header(valid).has_valid_len(), "{valid}");
         }
-        for invalid in [0, 4, 7, 10, 65_536] {
+        // libwayland refuses a message over 4096 bytes, although the 16-bit
+        // length field can describe up to 65532.
+        for invalid in [0, 4, 7, 10, 4_100, 65_532, 65_536] {
             assert!(!header(invalid).has_valid_len(), "{invalid}");
         }
     }
@@ -1010,17 +1016,20 @@ mod tests {
     #[should_panic(expected = "Wayland message is too large")]
     fn builder_rejects_oversized_wire_message() {
         let mut builder = MessageBuilder::new();
-        builder.payload.resize(65_528, 0);
+        builder.payload.resize(4_092, 0);
         let _ = builder.build_message(1, 0);
     }
 
     #[test]
     fn try_builder_reports_oversized_wire_message() {
         let mut builder = MessageBuilder::new();
-        builder.payload.resize(65_528, 0);
+        builder.payload.resize(4_088, 0);
+        assert_eq!(builder.try_build_message(1, 0).map(|m| m.len()), Ok(4_096));
+        builder.payload.resize(4_092, 0);
         assert_eq!(
             builder.try_build_message(1, 0),
-            Err(ProtocolError::MessageTooLarge(65_536))
+            Err(ProtocolError::MessageTooLarge(4_100)),
+            "libwayland refuses a message over 4096 bytes"
         );
     }
 

@@ -2082,6 +2082,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_request_over_4096_bytes_is_an_invalid_method() {
+        use protocols::wayland::wl_data_source::REQ_OFFER;
+        use std::io::Read;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+        client
+            .ctx
+            .shadow_table
+            .insert_paired_for_test(5, 6, "wl_data_source");
+        // `wl_data_source.offer` of `bytes` in all, header included. The
+        // header is written by hand: no encoder builds a message this long.
+        let offer = |bytes: usize| {
+            let mut mime_type = MessageBuilder::new();
+            // The string's length word, then its bytes and NUL.
+            mime_type.write_string(&"x".repeat(bytes - MessageHeader::LEN - 4 - 1));
+            let word = ((bytes as u32) << 16) | u32::from(REQ_OFFER);
+            let message = [5u32.to_ne_bytes(), word.to_ne_bytes()].concat();
+            let message = [message, mime_type.into_payload()].concat();
+            assert_eq!(message.len(), bytes);
+            message
+        };
+        // libwayland-server's limit is the message's length, not its
+        // arguments': one of 4096 bytes is valid, one word more is not.
+        client.client_conn.read_buf.extend(offer(4096));
+        client.client_conn.read_buf.extend(offer(4100));
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                protocols::wayland::wl_display::ERROR_INVALID_METHOD
+            )]
+        );
+        let mut forwarded = Vec::new();
+        host_peer
+            .read_to_end(&mut forwarded)
+            .expect("read the forwarded requests");
+        assert_eq!(stream_headers(&forwarded), [(6, REQ_OFFER)]);
+    }
+
     const XDG_SURFACE: u32 = 10;
     const XDG_SURFACE_HOST: u32 = 20;
     const XDG_TOPLEVEL: u32 = 11;
@@ -4555,7 +4597,7 @@ mod tests {
             .insert_paired_with_version_for_test(10, 20, "wl_data_source", 1);
 
         let mut builder = MessageBuilder::new();
-        builder.write_string(&"x".repeat(65_520));
+        builder.write_string(&"x".repeat(4_084));
         let payload = builder.into_payload();
         let mut msg = WireMessage::new(10, protocols::wayland::wl_data_source::REQ_OFFER, &payload);
         let mut handler = SommelierHandler::new();
@@ -4566,7 +4608,7 @@ mod tests {
                 &mut handler,
                 &mut ctx,
             )),
-            Err(ProtocolError::MessageTooLarge(65_536)),
+            Err(ProtocolError::MessageTooLarge(4_100)),
             "generated forwarding must not truncate the Wayland length field"
         );
     }

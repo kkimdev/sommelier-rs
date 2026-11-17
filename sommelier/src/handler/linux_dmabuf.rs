@@ -21,7 +21,7 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-use crate::wire::{queue_or_drop, Action, Outgoing, WL_DISPLAY_ID};
+use crate::wire::{queue_or_drop, Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
 use nix::sys::memfd::MFdFlags;
 use std::fs::File;
@@ -39,9 +39,9 @@ const DRM_FORMAT_MOD_INVALID: u64 = (1u64 << 56) - 1;
 /// one too.
 pub(crate) const GUEST_DMABUF_VERSION: u32 = zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE;
 const MAX_FEEDBACK_FORMATS: usize = u16::MAX as usize + 1;
-// A Wayland message has a 16-bit byte length. Account for the 8-byte header
-// and 4-byte array length, then keep the uint16 index payload 4-byte aligned.
-const MAX_TRANCHE_INDICES_PER_EVENT: usize = (65_532 - 8 - 4) / 2;
+/// The most uint16 indices one `tranche_formats` event carries: the longest
+/// message less its header and array length word, in whole 4-byte words.
+const MAX_TRANCHE_INDICES_PER_EVENT: usize = (MessageHeader::MAX_LEN - MessageHeader::LEN - 4) / 2;
 
 pub struct LinuxDmabufHandler;
 
@@ -1181,7 +1181,6 @@ mod tests {
         build_synthetic_feedback_messages, feedback_pairs, format_table_fd_can_map,
         guest_device_bytes, is_supported_drm_format, maybe_reclaim_capability_generation,
         LinuxDmabufHandler, DRM_FORMAT_MOD_INVALID, MAX_FEEDBACK_FORMATS,
-        MAX_TRANCHE_INDICES_PER_EVENT,
     };
     use crate::handler::display::DisplayHandler;
     use crate::handler::shm::ShmHandler;
@@ -1300,18 +1299,29 @@ mod tests {
             .collect::<Vec<_>>();
         let messages = build_synthetic_feedback_messages(77, &pairs, &[0; 8])
             .expect("maximum-size feedback should be representable");
-        let tranche_messages = messages
+        assert!(messages
+            .iter()
+            .all(|(message, _)| message.len() <= crate::wire::MessageHeader::MAX_LEN));
+        // The tranche_formats events together list every table index once,
+        // in order.
+        let indices = messages
             .iter()
             .filter(|(message, _)| {
                 message_opcode(message)
                     == crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS
             })
+            .flat_map(|(message, _)| {
+                let mut event = WireMessage::new(77, 0, &message[8..]);
+                let array = event.read_array().expect("a tranche_formats array");
+                let (indices, rest) = array.as_chunks::<2>();
+                assert!(rest.is_empty(), "uint16 indices");
+                indices
+                    .iter()
+                    .map(|index| usize::from(u16::from_ne_bytes(*index)))
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
-        assert_eq!(
-            tranche_messages.len(),
-            MAX_FEEDBACK_FORMATS.div_ceil(MAX_TRANCHE_INDICES_PER_EVENT)
-        );
-        assert!(messages.iter().all(|(message, _)| message.len() <= 65_532));
+        assert!(indices.iter().copied().eq(0..MAX_FEEDBACK_FORMATS));
 
         drop(messages);
     }

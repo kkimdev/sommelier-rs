@@ -70,10 +70,11 @@ pub(crate) fn queue_protocol_error(
     if !ctx.note_protocol_error() {
         return;
     }
-    // The error event itself is subject to Wayland's 16-bit message-length
-    // limit. A client-controlled interface name or diagnostic can otherwise
-    // make the proxy drop the diagnostic while still tearing down the
-    // connection. Keep a useful bounded prefix and preserve UTF-8 validity.
+    // The error event itself is subject to the wire's message-length limit
+    // (`MessageHeader::MAX_LEN`). A client-controlled interface name or
+    // diagnostic can otherwise make the proxy drop the diagnostic while
+    // still tearing down the connection. Keep a useful bounded prefix and
+    // preserve UTF-8 validity.
     const MAX_DIAGNOSTIC_BYTES: usize = 1024;
     let message = message.as_ref();
     let diagnostic = if message.len() <= MAX_DIAGNOSTIC_BYTES {
@@ -278,12 +279,12 @@ mod tests {
         let mut handler = DisplayHandler;
 
         assert_eq!(
-            handler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520)),
+            handler.on_error(&mut ctx, 77, 3, &"x".repeat(4_084)),
             Action::Drop
         );
         assert!(
             ctx.host_to_client_queue.is_empty(),
-            "a host-supplied error string must not wrap the 16-bit wire length"
+            "a host-supplied error string must not exceed the wire length"
         );
     }
 
@@ -294,7 +295,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
-        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520));
+        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(4_084));
         queue_error_if_none_queued(&mut ctx);
 
         assert_eq!(ctx.host_to_client_queue.len(), 1, "exactly one error");
@@ -310,7 +311,7 @@ mod tests {
     #[test]
     fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        queue_protocol_error(&mut ctx, 7, 3, "x".repeat(65_520));
+        queue_protocol_error(&mut ctx, 7, 3, "x".repeat(4_084));
 
         assert!(ctx.is_fatal());
         assert_eq!(
@@ -319,8 +320,8 @@ mod tests {
             "fatal validation must still deliver a display.error event"
         );
         assert!(
-            ctx.host_to_client_queue[0].0.len() <= 0xffff,
-            "the bounded diagnostic must fit Wayland's message length field"
+            ctx.host_to_client_queue[0].0.len() <= crate::wire::MessageHeader::MAX_LEN,
+            "the bounded diagnostic must fit in a Wayland message"
         );
     }
 }

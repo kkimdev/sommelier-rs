@@ -91,8 +91,15 @@ always consumed; a configuration problem never stops the proxy) is owned by
   opcode in its lower 16 bits. `MessageHeader::frame` alone decides whether
   a buffered message is complete: one whose bytes have not all arrived
   waits for the next receive, and an invalid length ends the connection.
+  A message is at most `MessageHeader::MAX_LEN` (4096) bytes in both
+  directions, libwayland's `WL_MAX_MESSAGE_SIZE`: libwayland refuses a
+  longer one from either peer, even though the length field could describe
+  up to 65532. A longer message received is an invalid length, and the
+  proxy builds none.
   Tests: `run_receives_the_rest_of_a_partially_buffered_message`,
-  `buffered_message_readiness_distinguishes_partial_and_complete_frames`.
+  `buffered_message_readiness_distinguishes_partial_and_complete_frames`,
+  `header_length_validity_matches_the_wire_limits`,
+  `a_request_over_4096_bytes_is_an_invalid_method`.
 - **Messages come from the XML.** Production code builds every message it
   sends itself with a generated encoder, `<interface>::req::<request>` or
   `<interface>::evt::<event>`, which takes the arguments in XML order and
@@ -105,7 +112,7 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `encoded_messages_decode_to_the_same_arguments`.
 - **Host data is untrusted.** The encoder of a message with a string or an
   array returns a `Result`, because host or guest data can exceed the
-  wire's 16-bit length; every other encoder cannot fail. A message the
+  wire's length limit; every other encoder cannot fail. A message the
   proxy builds itself that does not fit is dropped without panicking,
   usually through `wire::queue_or_drop`, and the session goes on. A
   forwarded message that does not fit is a `MessageTooLarge` protocol

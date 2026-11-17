@@ -1970,7 +1970,7 @@ mod tests {
     #[test]
     fn oversized_host_text_is_dropped_without_panicking() {
         let mut queue = Vec::new();
-        assert!(!push_commit_string_to(&mut queue, 7, &"x".repeat(65_528)));
+        assert!(!push_commit_string_to(&mut queue, 7, &"x".repeat(4_084)));
         assert!(queue.is_empty());
     }
 
@@ -1978,7 +1978,7 @@ mod tests {
     fn oversized_surrounding_commit_does_not_partially_advance_state() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = guest_id;
-        let oversized = "x".repeat(65_528);
+        let oversized = "x".repeat(4_084);
         let mut handler = TextInputV3Handler;
 
         assert_eq!(
@@ -2209,7 +2209,7 @@ mod tests {
         }
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
-        let oversized = "x".repeat(65_528);
+        let oversized = "x".repeat(4_084);
         assert_eq!(
             TextInputV1Handler.on_preedit_string(&mut ctx, 0, &oversized, &String::new()),
             Action::Drop
@@ -2237,7 +2237,7 @@ mod tests {
         }
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
-        let oversized = "x".repeat(65_528);
+        let oversized = "x".repeat(4_084);
         assert_eq!(
             TextInputV1Handler.on_commit_string(&mut ctx, 0, &oversized),
             Action::Drop
@@ -2513,10 +2513,10 @@ mod tests {
     fn oversized_preedit_region_does_not_partially_advance_state() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.last_sender_id = 30;
-        let oversized = "x".repeat(65_528);
+        let oversized = "x".repeat(4_084);
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.committed_surrounding_text = Some((oversized, 65_528, 65_528));
+            state.committed_surrounding_text = Some((oversized, 4_084, 4_084));
             state.pending_preedit_cursor = Some(7);
             state.pending_preedit_selection = Some((1, 2));
             state.current_preedit = "old".to_string();
@@ -2524,7 +2524,7 @@ mod tests {
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
         assert_eq!(
-            ExtendedTextInputV1Handler.on_set_preedit_region(&mut ctx, -65_528, 65_528),
+            ExtendedTextInputV1Handler.on_set_preedit_region(&mut ctx, -4_084, 4_084),
             Action::Drop
         );
 
@@ -2616,7 +2616,7 @@ mod tests {
         ctx.last_sender_id = 30;
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.current_preedit = "x".repeat(65_528);
+            state.current_preedit = "x".repeat(4_084);
         }
         arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), guest_id);
 
@@ -2627,7 +2627,7 @@ mod tests {
 
         assert!(ctx.host_to_client_queue.is_empty());
         let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state.current_preedit.len(), 65_528);
+        assert_eq!(state.current_preedit.len(), 4_084);
         assert!(backspace_repeat_active_for_keyboard(&ctx, HostId(41)));
     }
 

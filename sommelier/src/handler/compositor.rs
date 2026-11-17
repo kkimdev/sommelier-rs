@@ -1934,7 +1934,7 @@ mod tests {
     fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         ctx.last_sender_id = xdg_toplevel_id;
-        let oversized = "x".repeat(65_520);
+        let oversized = "x".repeat(4_084);
 
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_set_app_id(&mut ctx, &oversized), Action::Drop);
@@ -1946,10 +1946,10 @@ mod tests {
 
     #[test]
     fn namespaced_app_id_wire_size_boundary_is_checked() {
-        // Exercise the exact 16-bit boundary independently of the namespace
-        // prefix used by the production path.
-        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_519)).is_ok());
-        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_520)).is_err());
+        // Exercise the exact 4096-byte message boundary independently of the
+        // namespace prefix used by the production path.
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(4_083)).is_ok());
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(4_084)).is_err());
     }
 
     #[test]
