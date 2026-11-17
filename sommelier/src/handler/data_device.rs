@@ -239,6 +239,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_from_an_unmapped_sender_maps_no_new_id() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        // The data device object exists, but this host ID was never mapped.
+        ctx.shadow_table
+            .track_host_interface(81, "wl_data_device".to_string());
+        let host_offer: u32 = 0xff00_0001;
+        let payload = host_offer.to_ne_bytes();
+        let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+
+        assert_eq!(
+            wl_data_device::dispatch_event(&mut offer, &mut DataDeviceHandler, &mut ctx),
+            Ok(None)
+        );
+        assert_eq!(ctx.shadow_table.get_guest_id(host_offer), None);
+        assert_eq!(
+            ctx.shadow_table.allocate_guest_server_id(),
+            0xff00_0000,
+            "a dropped event must not consume a guest server ID"
+        );
+    }
+
     /// Every clipboard or drag-and-drop selection brings a new host data
     /// offer. The guest IDs must be recycled, or a long session would run
     /// out of server IDs.
