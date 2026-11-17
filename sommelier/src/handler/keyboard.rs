@@ -1312,7 +1312,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5073,7 +5073,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5166,7 +5166,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5254,7 +5254,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5319,7 +5319,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5400,7 +5400,7 @@ mod tests {
                     cursor_rect_dirty: false,
                     text_change_cause: 0,
                     current_preedit: String::new(),
-                    guest_commit_serial: 1,
+                    guest_commit_serial: crate::state::CommitCount::at(1),
                     pending_preedit_cursor: None,
                     pending_preedit_selection: None,
                     pending_deletes: Vec::new(),
@@ -5483,7 +5483,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 9,
+                guest_commit_serial: crate::state::CommitCount::at(9),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: vec![(3, 0)],
@@ -5503,7 +5503,7 @@ mod tests {
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
-        assert_eq!(state.guest_commit_serial, 9);
+        assert_eq!(state.guest_commit_serial.get(), 9);
 
         let deactivate = ctx.client_to_host_queue.iter().find(|(message, _)| {
             crate::test_support::msg_sender(message) == 50

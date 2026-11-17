@@ -38,10 +38,10 @@ use log::{error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
-    GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
-    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
-    PreeditRegionPlan, SeatFocusChange, TextInputState,
+    CommitCount, ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery,
+    GuestKeyEvent, GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan,
+    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate,
+    PeekKeyProvenance, PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;

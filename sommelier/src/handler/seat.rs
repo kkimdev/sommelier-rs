@@ -138,7 +138,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 0,
+                guest_commit_serial: crate::state::CommitCount::at(0),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),

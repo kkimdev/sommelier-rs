@@ -2044,7 +2044,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
