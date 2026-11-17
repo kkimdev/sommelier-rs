@@ -2010,7 +2010,8 @@ mod tests {
     use crate::state::{BufferRect, DamageRegion};
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::test_support::{
-        msg_sender, protocol_error_code, queued_headers, raw_dispatch, shm_pool_file,
+        msg_sender, protocol_error, protocol_error_code, queued_headers, raw_dispatch,
+        shm_pool_file,
     };
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
@@ -2114,6 +2115,27 @@ mod tests {
             0,
             "unsupported format must use wl_shm.invalid_format"
         );
+    }
+
+    #[test]
+    fn create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd() {
+        let (pipe_read, _pipe_write) = nix::unistd::pipe().expect("pipe");
+        let short_file = shm_pool_file(&[0; 4095]);
+        for fd in [pipe_read.as_fd(), short_file.as_fd()] {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            ctx.last_sender_id = 10;
+            assert_eq!(
+                ShmHandler.on_create_pool(&mut ctx, 20, fd, 4096),
+                Action::Drop
+            );
+            assert!(ctx.is_fatal());
+            assert_eq!(
+                protocol_error(&ctx),
+                (10, wl_shm::ERROR_INVALID_FD),
+                "a pool must be a regular file of at least its size"
+            );
+            assert!(ctx.pools.is_empty());
+        }
     }
 
     #[test]
