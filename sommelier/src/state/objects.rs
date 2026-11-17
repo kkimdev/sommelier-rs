@@ -149,8 +149,7 @@ impl HostObject {
 pub struct ShadowTable {
     /// Every object the guest has.
     guests: HashMap<GuestId, GuestObject>,
-    /// Every host ID in use: [`Self::allocate_host_id`] skips these, and a
-    /// host `new_id` may not name one.
+    /// Every host ID in use. A host `new_id` may not name one.
     hosts: HashMap<HostId, HostObject>,
     /// The IDs this proxy allocates for its objects on the host connection.
     /// An ID returns here only through [`Self::release_deleted_host_id`] or
@@ -189,7 +188,9 @@ impl ShadowTable {
     /// Allocate an ID for a new proxy object on the host connection.
     ///
     /// The ID is free on the host: either never used, or released by the
-    /// host's `wl_display.delete_id`, and no table entry names it.
+    /// host's `wl_display.delete_id`. No entry holds it: the allocator hands
+    /// out each ID once until it is released, and the host creates objects
+    /// only with server IDs ([`Self::accepts_host_new_id`]).
     ///
     /// # Panics
     ///
@@ -198,20 +199,15 @@ impl ShadowTable {
     /// task, and Tokio confines a task's panic to it, so this ends that
     /// client alone; unwinding drops its connections and descriptors.
     fn allocate_host_id(&mut self) -> HostId {
-        loop {
-            let Some(id) = self.host_ids.next_candidate() else {
-                log::error!("Ending the client: its host object IDs are exhausted");
-                panic!("host Wayland object IDs exhausted");
-            };
-            if !self.hosts.contains_key(&HostId(id)) {
-                return HostId(id);
-            }
-            // Only an object registered under an ID this allocator did not
-            // hand out gets here: a host `new_id` from the client range, or
-            // a test fixture. Skipping keeps two objects off one ID; the
-            // warning keeps the cause visible.
-            warn!("Skipping host ID {id}, which is registered but was never allocated");
-        }
+        let Some(id) = self.host_ids.next_candidate() else {
+            log::error!("Ending the client: its host object IDs are exhausted");
+            panic!("host Wayland object IDs exhausted");
+        };
+        debug_assert!(
+            !self.hosts.contains_key(&HostId(id)),
+            "host ID {id} is in use"
+        );
+        HostId(id)
     }
 
     /// Allocate an ID in Wayland's server-generated ID range for a guest
@@ -222,18 +218,15 @@ impl ShadowTable {
     /// Like [`Self::allocate_host_id`], when the range is exhausted; that
     /// ends only the client whose task allocates.
     fn allocate_guest_server_id(&mut self) -> GuestId {
-        loop {
-            let Some(id) = self.guest_server_ids.next_candidate() else {
-                log::error!("Ending the client: its guest server IDs are exhausted");
-                panic!("guest Wayland server IDs exhausted");
-            };
-            if !self.guests.contains_key(&GuestId(id)) {
-                return GuestId(id);
-            }
-            // As in `allocate_host_id`: only an ID registered without being
-            // allocated (a test fixture) gets here.
-            warn!("Skipping guest server ID {id}, which is registered but was never allocated");
-        }
+        let Some(id) = self.guest_server_ids.next_candidate() else {
+            log::error!("Ending the client: its guest server IDs are exhausted");
+            panic!("guest Wayland server IDs exhausted");
+        };
+        debug_assert!(
+            !self.guests.contains_key(&GuestId(id)),
+            "guest server ID {id} is in use"
+        );
+        GuestId(id)
     }
 
     // Creation. Each constructor creates an object with every fact the
