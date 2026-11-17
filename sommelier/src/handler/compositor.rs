@@ -656,7 +656,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // The host destructor is queued above. Retain the numeric mapping
         // until the host acknowledges it with wl_display.delete_id so the
         // guest can safely reuse the ID only after that acknowledgement.
-        ctx.shadow_table.mark_pending_destroy(wl_surface_guest_id);
+        ctx.shadow_table.guest_destroyed(wl_surface_guest_id);
         Action::Drop
     }
 
@@ -1163,7 +1163,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         ctx.client_to_host_queue
             .push(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
         ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
-        ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
+        ctx.shadow_table.guest_destroyed(xdg_toplevel_id);
         Action::Drop
     }
 
@@ -1779,7 +1779,7 @@ mod tests {
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.retire_guest_object(guest_id);
+        ctx.shadow_table.guest_destroyed_in_use(guest_id);
     }
 
     /// An object that never reached the host is usable only if the proxy

@@ -56,7 +56,7 @@ enum GuestObject {
     Paired {
         host: HostId,
         /// `None` until the interface is tracked, and once
-        /// [`ShadowTable::retire_guest_object`] has moved it to the host
+        /// [`ShadowTable::guest_destroyed_in_use`] has moved it to the host
         /// object.
         interface: Option<Interface>,
         state: GuestState,
@@ -94,7 +94,7 @@ enum HostObject {
     /// An object paired with a guest object, which records the pairing too.
     /// `interface` and `version` are the host object's own, when recorded:
     /// an interface that differs from the guest's (a v3 text input backed
-    /// by v1), or the guest's once [`ShadowTable::retire_guest_object`] has
+    /// by v1), or the guest's once [`ShadowTable::guest_destroyed_in_use`] has
     /// moved it here. A missing version falls back to the guest object's,
     /// and an event may name the object by either interface.
     Paired {
@@ -552,6 +552,67 @@ impl ShadowTable {
         }
     }
 
+    /// The guest destroyed paired guest object `guest_id`, and its
+    /// destructor went to the host object.
+    ///
+    /// An object the guest created stays paired until the host's
+    /// `delete_id`, rejecting requests, so late events still resolve and the
+    /// `delete_id` reaches the guest. An object the server created gets no
+    /// `delete_id`: libwayland frees its ID on both sides as soon as either
+    /// side destroys it, so both entries end now.
+    pub fn guest_destroyed(&mut self, guest_id: u32) {
+        if self.is_guest_server_id(guest_id) {
+            self.remove_id(guest_id);
+        } else {
+            self.mark_pending_destroy(guest_id);
+        }
+    }
+
+    /// Guest object `guest_id` ended without its destructor reaching its
+    /// host object, which has none (a v3 text input backed by a host v1
+    /// one): the host object stays in use as a host-only object, so its ID
+    /// is not reused while its events are in flight.
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `guest_id` is paired.
+    pub fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
+        if self.get_host_id(guest_id).is_none() {
+            return false;
+        }
+        self.remove_guest_mapping(guest_id);
+        true
+    }
+
+    /// Paired guest object `guest_id` ended, and so did its host object:
+    /// by a terminal event (`wl_callback.done`) or a destructor the proxy
+    /// queued. The host ID stays reserved until the host's `delete_id`,
+    /// which then reaches no guest object.
+    pub fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
+        let host = self.get_host_id(guest_id);
+        debug_assert!(host.is_some(), "guest {guest_id} is not paired");
+        if let Some(host) = host {
+            self.remove_guest_mapping(guest_id);
+            let queued = self.host_destroy_queued(host);
+            debug_assert!(queued, "host {host} did not outlive guest {guest_id}");
+        }
+    }
+
+    /// Local guest object `guest_id` ended: its destructor completed in the
+    /// proxy.
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `guest_id` is a local object.
+    pub fn local_destroyed(&mut self, guest_id: u32) -> bool {
+        let guest = GuestId(guest_id);
+        if !matches!(self.guests.get(&guest), Some(GuestObject::Local(_))) {
+            return false;
+        }
+        self.forget_guest_object(guest);
+        true
+    }
+
     /// Retire a host-only object after its destructor request has been queued.
     ///
     /// The dispatch metadata is removed immediately so stale events cannot
@@ -569,7 +630,7 @@ impl ShadowTable {
     ///
     /// `false`, changing nothing, unless `host_id` is a live host-only
     /// object.
-    pub(super) fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
+    pub(super) fn host_destroy_queued(&mut self, host_id: u32) -> bool {
         let host = HostId(host_id);
         if !matches!(self.hosts.get(&host), Some(HostObject::HostOnly { .. })) {
             return false;
@@ -743,7 +804,7 @@ impl ShadowTable {
     /// A paired object is not a binding of the proxy's own, so it is left
     /// alone; the host's `delete_id` cannot give a binding's ID to one (see
     /// [`Self::release_deleted_host_id`]).
-    pub fn retire_host_interface(&mut self, host_id: u32) {
+    pub fn retire_host(&mut self, host_id: u32) {
         let host = HostId(host_id);
         if let Some(guest) = self.guest_id_of(host) {
             warn!(
@@ -821,17 +882,14 @@ impl ShadowTable {
         }
     }
 
-    /// Mark a guest object as destroyed while retaining both sides of its
-    /// mapping for a delayed host event (for example wl_buffer.release).
+    /// The guest destroyed paired guest object `guest_id` while its host
+    /// object is still in use, as a buffer the host still shows: the proxy
+    /// destroys the host object later, through [`Self::guest_destroyed`].
     ///
-    /// Requests carrying this guest ID will fail the interface validation,
-    /// while events from the still-live host object can continue to resolve
-    /// back to the retired guest ID until [`Self::remove_id`] is called.
-    /// Preserve the interface metadata on the host side as well: proxy
-    /// dispatch needs an interface name before it can invoke the event
-    /// handler, and the guest metadata is intentionally removed so a
-    /// destroyed object cannot accept another request.
-    pub fn retire_guest_object(&mut self, guest_id: u32) {
+    /// Until then the guest object rejects requests, but stays paired so
+    /// the host object's events still reach its handler. The interface
+    /// moves to the host object, which dispatches those events by it.
+    pub fn guest_destroyed_in_use(&mut self, guest_id: u32) {
         let guest = GuestId(guest_id);
         let Some(object) = self.guests.get_mut(&guest) else {
             return;
@@ -971,7 +1029,7 @@ mod tests {
     #[test]
     fn allocate_host_id_skips_retired_host_interfaces() {
         let mut table = ShadowTable::new();
-        table.retire_host_interface(2);
+        table.retire_host(2);
         assert_eq!(
             table.allocate_host_id(),
             3,
@@ -982,7 +1040,7 @@ mod tests {
     #[test]
     fn host_generated_ids_reject_retired_host_interfaces() {
         let mut table = ShadowTable::new();
-        table.retire_host_interface(2);
+        table.retire_host(2);
         assert!(
             !table.is_host_id_available(2),
             "host-generated objects must not reuse retired proxy IDs"
@@ -1056,7 +1114,7 @@ mod tests {
         // Retiring keeps the ID until the mapping is removed, and frees it
         // once.
         table.track_interface(replacement, "wl_buffer".to_string());
-        table.retire_guest_object(replacement);
+        table.guest_destroyed_in_use(replacement);
         let next = table.allocate_guest_server_id();
         assert_ne!(next, replacement, "a retired object still owns its ID");
         table.remove_id(replacement);
@@ -1182,7 +1240,7 @@ mod tests {
         table.track_interface_with_version(20, "wl_buffer".to_string(), 1);
         table.set_host_version(40, 1);
 
-        table.retire_guest_object(20);
+        table.guest_destroyed_in_use(20);
 
         assert_eq!(table.get_interface(20), None);
         assert_eq!(
@@ -1203,7 +1261,7 @@ mod tests {
         // The destroy request has been queued, but the host has not processed
         // it yet. The dispatch metadata is retired immediately while the
         // numeric ID remains unavailable for reuse.
-        table.mark_pending_destroy_host(40);
+        table.host_destroy_queued(40);
         assert!(table.is_pending_destroy_host_only(40));
         assert!(!table.is_event_sender_known(40));
         assert!(!table.is_host_id_available(40));
@@ -1223,7 +1281,7 @@ mod tests {
         let mut table = ShadowTable::new();
         table.track_host_interface(host_buffer, "wl_buffer".to_string());
 
-        assert!(table.mark_pending_destroy_host(host_buffer));
+        assert!(table.host_destroy_queued(host_buffer));
         assert!(!table.is_event_sender_known(host_buffer));
         assert!(
             table.is_host_id_available(host_buffer),
@@ -1283,12 +1341,12 @@ mod tests {
         let next = table.allocate_host_id();
         assert_ne!(next, binding);
         table.map_id(11, next);
-        table.retire_host_interface(binding);
+        table.retire_host(binding);
         assert!(!table.is_event_sender_known(binding));
         assert_eq!(table.get_host_id(11), Some(next));
 
         // Retiring a paired object is refused, not fatal.
-        table.retire_host_interface(next);
+        table.retire_host(next);
         assert_eq!(table.get_host_id(11), Some(next));
         assert!(table.is_event_sender_known(next));
     }
@@ -1358,9 +1416,9 @@ mod tests {
         let mut table = ShadowTable::new();
         let host_id = table.allocate_host_id();
         table.track_host_interface(host_id, "zaura_output".to_string());
-        assert!(table.mark_pending_destroy_host(host_id));
+        assert!(table.host_destroy_queued(host_id));
 
-        table.retire_host_interface(host_id);
+        table.retire_host(host_id);
         assert!(!table.is_pending_destroy_host_only(host_id));
         assert!(!table.is_event_sender_known(host_id));
         assert!(!table.is_host_id_available(host_id));

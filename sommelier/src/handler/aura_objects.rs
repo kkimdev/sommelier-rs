@@ -149,7 +149,7 @@ fn release_host_only(
         ctx.client_to_host_queue.push(release(host_id));
         ctx.retire_destroyed_host_object(host_id);
     } else {
-        ctx.shadow_table.retire_host_interface(host_id);
+        ctx.shadow_table.retire_host(host_id);
     }
 }
 

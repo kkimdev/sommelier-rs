@@ -224,7 +224,7 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `Context::retire_destroyed_host_object` is the one way to retire such
   an object after its destructor is queued, and a refused retirement is
   fatal. An object with no wire destructor stays reserved for the
-  connection, but `ShadowTable::retire_host_interface` retires its dispatch
+  connection, but `ShadowTable::retire_host` retires its dispatch
   metadata as soon as its guest object or global is gone.
   Tests: `host_only_destructor_reservation_survives_until_delete_id`,
   `retiring_a_destroyed_host_object_requires_a_live_host_only_object`,

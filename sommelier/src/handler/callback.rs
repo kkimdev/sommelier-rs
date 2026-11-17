@@ -94,11 +94,8 @@ impl WlCallbackHandler for CallbackHandler {
             ]);
 
             // The terminal event destroys the callback on both sides, but the
-            // host numeric ID cannot be reused until its later delete_id. The
-            // guest mapping goes now; removing it keeps the host ID reserved
-            // as a host-only object, which is then retired.
-            ctx.shadow_table.remove_guest_mapping(guest_id);
-            ctx.retire_destroyed_host_object(host_id);
+            // host numeric ID cannot be reused until its later delete_id.
+            ctx.shadow_table.guest_ended_host_destroyed(guest_id);
         }
         Action::Drop
     }

@@ -1603,8 +1603,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         let Some(state) = ctx.text_inputs.remove(&guest_id) else {
             // Keep the guest lifecycle well-formed even if local text-input
             // state was already cleaned by a focus/seat teardown path.
-            if crate::handler::display::queue_guest_delete_id(ctx, guest_id) {
-                ctx.shadow_table.remove_guest_mapping(guest_id);
+            if ctx.shadow_table.guest_ended_host_kept(guest_id) {
+                crate::handler::display::queue_delete_id(ctx, guest_id);
             }
             return Action::Drop;
         };
@@ -1617,19 +1617,16 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             ctx.retire_destroyed_host_object(host_ext_id);
         }
         // The v3 object is guest-facing but backed by a v1 host object whose
-        // protocol has no destructor. Complete the guest-only lifecycle
-        // locally before removing the paired mapping.
-        if !crate::handler::display::queue_guest_delete_id(ctx, guest_id) {
+        // protocol has no destructor, so the host object stays for the
+        // connection and the guest lifecycle completes locally.
+        if !ctx.shadow_table.guest_ended_host_kept(guest_id) {
             log::debug!(
                 "Text input {} had already been retired before its destroy handler ran",
                 guest_id
             );
             return Action::Drop;
         }
-        // The host v1 object has no destructor request. Keep its host-side
-        // interface reservation until connection teardown so a new text input
-        // cannot reuse the ID while stale host events are still in flight.
-        ctx.shadow_table.remove_guest_mapping(guest_id);
+        crate::handler::display::queue_delete_id(ctx, guest_id);
         Action::Drop
     }
 

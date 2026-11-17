@@ -111,7 +111,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         // The Aura child goes first (see `aura_objects::release`). Returning
         // Forward would put wl_output.release ahead of the queued Aura
         // release, so queue the translated destructor explicitly.
-        ctx.shadow_table.mark_pending_destroy(guest_output_id);
+        ctx.shadow_table.guest_destroyed(guest_output_id);
         ctx.client_to_host_queue
             .push(wl_output::req::release(host_output_id));
         Action::Drop

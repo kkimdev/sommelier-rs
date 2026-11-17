@@ -374,7 +374,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     }
     if ctx.host_shm_global_name == Some(name) {
         if let Some(host_id) = ctx.host_shm_id.take() {
-            ctx.shadow_table.retire_host_interface(host_id);
+            ctx.shadow_table.retire_host(host_id);
         }
         // A synthetic wl_shm object is bound locally, but its capability
         // source is the internal host binding above. Once that binding's
@@ -401,7 +401,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
     }
     if ctx.host_keyboard_extension_global_name == Some(name) {
         if let Some(host_id) = ctx.host_keyboard_extension_id.take() {
-            ctx.shadow_table.retire_host_interface(host_id.0);
+            ctx.shadow_table.retire_host(host_id.0);
         }
         ctx.host_keyboard_extension_global_name = None;
         // `global_remove` invalidates only the manager global name. It does
@@ -1271,7 +1271,7 @@ impl wl_fixes::WlFixesHandler for RegistryHandler {
         // wl_fixes destroys the registry passed as an object argument rather
         // than its own request sender. Reserve that guest/host mapping until
         // wl_display.delete_id acknowledges the host-side destruction.
-        ctx.shadow_table.mark_pending_destroy(registry);
+        ctx.shadow_table.guest_destroyed(registry);
         Action::Forward
     }
 }

@@ -673,13 +673,13 @@ impl Context {
 
     /// Retire a host-only object that is being destroyed, by a destructor
     /// just queued or by the host's terminal event, until its
-    /// `wl_display.delete_id` (see [`ShadowTable::mark_pending_destroy_host`]).
+    /// `wl_display.delete_id` (see [`ShadowTable::host_destroy_queued`]).
     ///
     /// Every caller tracked the object as host-only and has not retired it,
     /// so a refusal means the proxy's ID bookkeeping diverged, which ends the
     /// session.
     pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
-        if !self.shadow_table.mark_pending_destroy_host(host_id) {
+        if !self.shadow_table.host_destroy_queued(host_id) {
             error!(
                 "Host object {} was not a live host-only object when it was retired",
                 host_id
@@ -708,20 +708,16 @@ impl Context {
             return false;
         }
 
-        if self.shadow_table.is_guest_server_id(guest_buffer_id) {
-            if !self.render_buffers.remove(host_buffer_id) {
-                return false;
-            }
-            self.shadow_table.remove_id(guest_buffer_id);
+        let render_buffer_ended = if self.shadow_table.is_guest_server_id(guest_buffer_id) {
+            self.render_buffers.remove(host_buffer_id)
         } else {
-            if self.render_buffers.contains(host_buffer_id)
-                && !self.render_buffers.mark_host_destroy_queued(host_buffer_id)
-            {
-                return false;
-            }
-            self.shadow_table.mark_pending_destroy(guest_buffer_id);
+            !self.render_buffers.contains(host_buffer_id)
+                || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
+        };
+        if render_buffer_ended {
+            self.shadow_table.guest_destroyed(guest_buffer_id);
         }
-        true
+        render_buffer_ended
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {

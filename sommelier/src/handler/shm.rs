@@ -1090,8 +1090,7 @@ fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
         return;
     }
     queue_host_buffer_destroy(ctx, host_id);
-    ctx.shadow_table.remove_guest_mapping(guest_id);
-    ctx.retire_destroyed_host_object(host_id);
+    ctx.shadow_table.guest_ended_host_destroyed(guest_id);
 }
 
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
@@ -1960,7 +1959,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 );
                 ctx.fail_session();
             }
-            ctx.shadow_table.retire_guest_object(guest_id);
+            ctx.shadow_table.guest_destroyed_in_use(guest_id);
             return Action::Drop;
         }
 
@@ -2063,7 +2062,7 @@ mod tests {
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.retire_guest_object(guest_id);
+        ctx.shadow_table.guest_destroyed_in_use(guest_id);
     }
 
     fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {

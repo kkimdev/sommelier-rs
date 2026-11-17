@@ -4153,7 +4153,7 @@ mod tests {
             .track_interface_with_version(11, "wl_buffer".to_string(), 1);
         assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
         assert!(ctx.mark_buffer_guest_destroyed(11));
-        ctx.shadow_table.retire_guest_object(11);
+        ctx.shadow_table.guest_destroyed_in_use(11);
         assert!(!pending_host_event_is_stale(
             &ctx,
             21,
@@ -4169,7 +4169,7 @@ mod tests {
         // interface is retired while the host-side interface remains
         // available long enough to dispatch wl_buffer.release.
         assert!(ctx.mark_buffer_guest_destroyed(12));
-        ctx.shadow_table.retire_guest_object(12);
+        ctx.shadow_table.guest_destroyed_in_use(12);
         assert!(!pending_host_event_is_stale(
             &ctx,
             22,
