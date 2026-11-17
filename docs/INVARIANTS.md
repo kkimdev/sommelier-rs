@@ -71,9 +71,12 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `WaylandConnection::send_messages` is the only way to send, and splits a
   batch only between messages, so each message's descriptors travel with
   its bytes and the receiver never meets a message whose descriptors have
-  not arrived. No single message carries more than 28.
+  not arrived. No Wayland message has more than 28 descriptor arguments;
+  `send_messages` refuses one that carries more, in every build, and the
+  session ends.
   Tests: `batches_send_at_most_the_transport_descriptor_limit_at_once`,
-  `send_messages_splits_only_between_messages`.
+  `send_messages_splits_only_between_messages`,
+  `a_message_with_more_descriptors_than_a_submission_is_not_sent`.
 - **VirtWL ioctl errors still own their descriptors.** Every descriptor
   returned in a transaction buffer belongs to the proxy, even when the
   ioctl reports an error after partially writing the buffer. Error paths
@@ -91,8 +94,15 @@ always consumed; a configuration problem never stops the proxy) is owned by
   opcode in its lower 16 bits. `MessageHeader::frame` alone decides whether
   a buffered message is complete: one whose bytes have not all arrived
   waits for the next receive, and an invalid length ends the connection.
+  A message is at most `MessageHeader::MAX_LEN` (4096) bytes in both
+  directions, libwayland's `WL_MAX_MESSAGE_SIZE`: libwayland refuses a
+  longer one from either peer, even though the length field could describe
+  up to 65532. A longer message received is an invalid length, and the
+  proxy builds none.
   Tests: `run_receives_the_rest_of_a_partially_buffered_message`,
-  `buffered_message_readiness_distinguishes_partial_and_complete_frames`.
+  `buffered_message_readiness_distinguishes_partial_and_complete_frames`,
+  `header_length_validity_matches_the_wire_limits`,
+  `a_request_over_4096_bytes_is_an_invalid_method`.
 - **Messages come from the XML.** Production code builds every message it
   sends itself with a generated encoder, `<interface>::req::<request>` or
   `<interface>::evt::<event>`, which takes the arguments in XML order and
@@ -105,7 +115,7 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `encoded_messages_decode_to_the_same_arguments`.
 - **Host data is untrusted.** The encoder of a message with a string or an
   array returns a `Result`, because host or guest data can exceed the
-  wire's 16-bit length; every other encoder cannot fail. A message the
+  wire's length limit; every other encoder cannot fail. A message the
   proxy builds itself that does not fit is dropped without panicking,
   usually through `wire::queue_or_drop`, and the session goes on. A
   forwarded message that does not fit is a `MessageTooLarge` protocol
@@ -319,12 +329,19 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   global's version bound is the generated `VERSION` unless a named
   constant in `registry.rs` documents a deliberate difference and its
   reason (such as the ChromiumOS caps `wl_seat` v5 and `wl_output` v3, or
-  the `zaura_shell` v6 floor). A child object takes its parent's version,
-  and a request is sent to a host object only if that object's version
-  has it: an Aura surface keeps the version of the shell generation that
-  created it.
+  the `zaura_shell` v6 floor). Every forwarded host global but
+  `zwp_linux_dmabuf_v1` is offered through `forwarded_global_version`;
+  the proxy advertises that one itself, at `GUEST_DMABUF_VERSION` when it
+  can synthesize feedback and otherwise at the host's version capped at
+  v3. `forwarded_global_version` never exceeds the generated `VERSION`
+  (`protocols::interface_version`), so a host newer than the vendored XML
+  cannot make the guest send requests the proxy cannot decode. A child
+  object takes its parent's version, and a request is sent to a host
+  object only if that object's version has it: an Aura surface keeps the
+  version of the shell generation that created it.
   Tests: `child_objects_inherit_their_manager_versions`,
-  `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`.
+  `unset_snap_is_sent_only_to_an_aura_surface_that_has_it`,
+  `every_forwarded_global_is_capped_at_its_xml_version`.
 
 ## Surfaces, damage and SHM
 
@@ -452,6 +469,36 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   Chrome's `spellcheck_on` (`1 << 4`); Chrome's `autocorrect_on` (`1 << 2`)
   is a separate flag and is never inferred from it.
   Test: `content_type_mapping_preserves_pin_privacy_and_inline_composition`.
+- **`set_input_type` replaces v1 `set_content_type`.** When the host's
+  `zcr_extended_text_input_v1` has `set_input_type` (v8), a content type
+  reaches Exo through it alone, as the extension XML says ("used in place
+  of"), right after `set_surrounding_text_support` (v9). Exo applies that
+  support to the next of the two requests and resets it, so a v1
+  `set_content_type` in between would report every field without
+  surrounding text as supporting it. Older extensions get
+  `set_content_type`, then `deprecated_set_input_type` (v2). The mapping
+  to `set_input_type` is lossy: the `latin` hint, `multiline` outside the
+  normal, alpha and name purposes, and the `terminal` purpose have no
+  equivalent. They had no effect before either, because `set_input_type`
+  replaced what Exo derived from `set_content_type`. Because Exo learns
+  the support only with a content type, a commit that changes whether the
+  field has surrounding text resends the content type with the new
+  support; nothing else resends an unchanged content type, which can
+  reset Exo's composition.
+  Tests: `content_type_takes_one_host_request_per_extension_version`,
+  `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
+  `a_host_without_surrounding_text_support_gets_no_resend`.
+- **A deferred activation replays the content type.** A commit that
+  enables a text input while its previous host generation still drains
+  reaches Exo before the deferred `activate`, while no input method is
+  attached. Exo drops a content type then, and attaching resets the type
+  and mode but keeps the previous field's flags, learning mode and
+  surrounding-text support, so a password field would be treated as text
+  the IME may learn. The `activate` that ends the barrier is therefore
+  followed by the committed content type, with its support, and a
+  `commit_state`. Exo keeps surrounding text and the cursor rectangle
+  without an input method, so they are not replayed.
+  Test: `a_deferred_activation_replays_the_committed_content_type`.
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A

@@ -2268,11 +2268,13 @@ mod tests {
 
         // The IME barrier reactivates text input without retiring the
         // placement barrier, which still gates configures.
+        let queued_before = ctx.client_to_host_queue.len();
         complete_callback(&mut ctx, ime_barrier.0);
         assert!(ctx.text_inputs[&guest_text_input].host_is_active());
+        // The activation, then the committed content type it replays.
         let activate = ctx
             .client_to_host_queue
-            .last()
+            .get(queued_before)
             .expect("IME barrier completion must queue activation");
         assert_eq!(
             (message_sender(activate), message_opcode(activate)),

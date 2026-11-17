@@ -418,8 +418,18 @@ struct Message {
 }
 
 impl Message {
+    /// The message's bytes. The header is written by hand, because a guest
+    /// that does not use libwayland can send a message longer than any
+    /// encoder builds.
     fn encode(&self) -> Vec<u8> {
-        MessageBuilder::from_payload(self.payload.clone()).build_message(self.sender, self.opcode)
+        let len = MessageHeader::LEN + self.payload.len();
+        let word = (len as u32) << 16 | u32::from(self.opcode);
+        [
+            &self.sender.to_ne_bytes()[..],
+            &word.to_ne_bytes(),
+            &self.payload,
+        ]
+        .concat()
     }
 }
 
@@ -717,6 +727,9 @@ impl<'a> Guest<'a> {
         match self.rng.below(4) {
             0 => String::new(),
             1 => self.rng.pick(self.globals).interface.clone(),
+            // Rarely, about as long as a whole message can be, so that a
+            // request lands on either side of the limit.
+            2 if self.rng.one_in(8) => "x".repeat(MessageHeader::MAX_LEN - 24 + self.rng.below(24)),
             2 => "x".repeat(self.rng.below(300)),
             _ => (0..self.rng.below(16))
                 .map(|_| char::from(b'a' + self.rng.below(26) as u8))

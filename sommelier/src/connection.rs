@@ -68,13 +68,6 @@ pub(crate) struct OutgoingMessages {
 
 impl OutgoingMessages {
     pub(crate) fn push(&mut self, (message, fds): Outgoing) {
-        // No Wayland message has that many descriptor arguments; one that
-        // did could not be sent in a single submission.
-        debug_assert!(
-            fds.len() <= MAX_FDS_PER_SEND,
-            "a message carries {} descriptors",
-            fds.len()
-        );
         self.bytes.extend_from_slice(&message);
         self.fds.extend(fds);
         self.ends.push((self.bytes.len(), self.fds.len()));
@@ -426,17 +419,33 @@ impl WaylandConnection {
     /// A submission ends only between messages, so every message's
     /// descriptors travel with its bytes: a receiver must never meet a
     /// message whose descriptors have not arrived yet.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for a message with more descriptors than one
+    /// submission carries, which is not sent; the messages before it are.
+    /// No Wayland message has that many descriptor arguments.
     pub(crate) async fn send_messages(&mut self, messages: &OutgoingMessages) -> io::Result<()> {
         let mut start = (0, 0);
         let mut end = start;
         for &message_end in &messages.ends {
             if message_end.1 - start.1 > MAX_FDS_PER_SEND {
-                self.send(
-                    &messages.bytes[start.0..end.0],
-                    &messages.fds[start.1..end.1],
-                )
-                .await?;
+                // This message starts the next submission.
+                if start != end {
+                    self.send(
+                        &messages.bytes[start.0..end.0],
+                        &messages.fds[start.1..end.1],
+                    )
+                    .await?;
+                }
                 start = end;
+                let message_fds = message_end.1 - start.1;
+                if message_fds > MAX_FDS_PER_SEND {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("a message carries {message_fds} descriptors"),
+                    ));
+                }
             }
             end = message_end;
         }
@@ -522,7 +531,7 @@ impl AsRawFd for WaylandConnection {
 mod tests {
     use super::{
         decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
-        WaylandConnection,
+        WaylandConnection, MAX_FDS_PER_SEND,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
@@ -620,6 +629,46 @@ mod tests {
             submissions.push((bytes, fds.len()));
         }
         assert_eq!(submissions, vec![(8, 20), (48, 15)]);
+    }
+
+    #[tokio::test]
+    async fn a_message_with_more_descriptors_than_a_submission_is_not_sent() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let name = CString::new("sommelier-oversized-message").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let identity = fd_identity(memfd.as_raw_fd());
+
+        // A valid message, then one whose descriptors cannot travel with it.
+        let mut messages = OutgoingMessages::default();
+        for (len, fds) in [(8, 1), (12, MAX_FDS_PER_SEND + 1)] {
+            let fds = (0..fds)
+                .map(|_| memfd.try_clone().expect("dup the memfd"))
+                .collect();
+            messages.push((vec![0; len], fds));
+        }
+        drop(memfd);
+        let error = connection
+            .send_messages(&messages)
+            .await
+            .expect_err("the second message cannot be sent");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        drop(messages);
+        drop(connection);
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 64];
+            let mut control = vec![0u8; 4096];
+            let (bytes, fds) =
+                recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
+            if bytes == 0 {
+                break;
+            }
+            submissions.push((bytes, fds.len()));
+        }
+        assert_eq!(submissions, [(8, 1)], "only the message before it is sent");
+        assert!(!any_fd_has_identity(identity));
     }
 
     #[tokio::test]

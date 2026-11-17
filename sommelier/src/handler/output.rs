@@ -101,9 +101,9 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         let guest_output_id = ctx.last_sender_id;
         let Some(host_output_id) = ctx.shadow_table.get_host_id(guest_output_id) else {
             // Only an inert output, whose bind crossed its global's removal,
-            // gets here without a host object. The generated dispatcher
-            // completes its destructor locally.
-            return Action::Forward;
+            // gets here without a host object. Nothing reaches the host; the
+            // generated dispatcher completes the destructor locally.
+            return Action::Drop;
         };
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
             aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);

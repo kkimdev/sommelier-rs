@@ -145,6 +145,9 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     let mut special_request_arms = Vec::new();
     let mut special_event_arms = Vec::new();
     let mut consume_event_arms = Vec::new();
+    let mut version_arms = Vec::new();
+    // The proxy routes and versions an object by its interface name alone.
+    let mut routed_interfaces = HashSet::new();
 
     for protocol in protocols {
         let protocol_name = format_ident!("{}", protocol.name);
@@ -193,6 +196,16 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
                 #(#interface_names)|* => Some(ProtocolFamily::#family_name),
             });
         }
+        for name in &interface_names {
+            assert!(
+                routed_interfaces.insert(name.clone()),
+                "interface `{name}` is defined by more than one protocol"
+            );
+            let interface = format_ident!("{}", name);
+            version_arms.push(quote! {
+                #name => Some(#protocol_name::#interface::VERSION),
+            });
+        }
     }
 
     let expanded = quote! {
@@ -216,6 +229,16 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
         pub fn classify_interface(interface: &str) -> Option<ProtocolFamily> {
             match interface {
                 #(#classify_arms)*
+                _ => None,
+            }
+        }
+
+        /// The newest version of `interface` in the vendored XML, the
+        /// newest the generated code can decode, or `None` for an interface
+        /// no vendored protocol defines.
+        pub fn interface_version(interface: &str) -> Option<u32> {
+            match interface {
+                #(#version_arms)*
                 _ => None,
             }
         }

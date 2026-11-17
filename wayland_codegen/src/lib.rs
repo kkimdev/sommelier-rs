@@ -392,6 +392,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "interface `wl_display` is defined by more than one protocol")]
+    fn routing_rejects_an_interface_defined_twice() {
+        let wayland =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../third_party/protocols/wayland.xml");
+        let protocol = parse(&wayland).expect("Failed to parse wayland.xml");
+        generator::generate_routing(&[protocol.clone(), protocol]);
+    }
+
+    #[test]
     fn test_generate_routing() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let protocols = ["wayland.xml", "xdg-shell.xml"]
@@ -406,6 +415,7 @@ mod tests {
         assert!(code.contains("XdgShell"));
         assert!(code.contains("wl_surface"));
         assert!(code.contains("fn classify_interface"));
+        assert!(code.contains("fn interface_version"));
         assert!(code.contains("fn consume_event"));
     }
 }

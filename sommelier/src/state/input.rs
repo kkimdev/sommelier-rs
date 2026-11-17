@@ -53,6 +53,11 @@ pub struct TextInputState {
     /// transaction to replay the pending type after an enable/disable reset.
     pub committed_content_type: Option<(u32, u32)>,
     pub content_type_dirty: bool,
+    /// Whether the host was last told, with the committed content type,
+    /// that the field has surrounding text, or `None` if it was not told.
+    /// Exo applies `set_surrounding_text_support` only with a content type,
+    /// so a change resends the content type.
+    committed_surrounding_text_support: Option<bool>,
     pub cursor_rect: Option<(i32, i32, i32, i32)>,
     pub cursor_rect_dirty: bool,
     pub current_preedit: String,
@@ -149,6 +154,7 @@ impl TextInputState {
             content_purpose: 0,
             committed_content_type: None,
             content_type_dirty: false,
+            committed_surrounding_text_support: None,
             cursor_rect: None,
             cursor_rect_dirty: false,
             current_preedit: String::new(),
@@ -237,6 +243,7 @@ impl TextInputState {
         self.content_purpose = 0;
         self.committed_content_type = None;
         self.content_type_dirty = false;
+        self.committed_surrounding_text_support = None;
         self.cursor_rect = None;
         self.cursor_rect_dirty = false;
         self.clear_host_composition();
@@ -296,7 +303,6 @@ impl TextInputState {
     }
 
     /// The number of v3 `commit` requests counted so far.
-    #[cfg(test)]
     pub fn guest_commit_serial(&self) -> u32 {
         self.guest_commit_serial
     }
@@ -325,6 +331,12 @@ impl TextInputState {
         } else {
             &self.committed_surrounding_text
         };
+        let has_surrounding_text = effective_surrounding_text.is_some();
+        // Resend an unchanged content type only when the support the host
+        // was told no longer holds: a resend can reset Exo's composition.
+        let support_changed = self
+            .committed_surrounding_text_support
+            .is_some_and(|supported| supported != has_surrounding_text);
         GuestCommitPlan {
             host_v1_id: self.host_v1_id,
             host_ext_id: self.host_ext_id,
@@ -336,9 +348,8 @@ impl TextInputState {
             surrounding_text: self
                 .surrounding_text_dirty
                 .then(|| self.pending_surrounding_text.clone()),
-            has_surrounding_text: effective_surrounding_text.is_some(),
-            content_type: self
-                .content_type_dirty
+            has_surrounding_text,
+            content_type: (self.content_type_dirty || support_changed)
                 .then_some((self.content_hint, self.content_purpose)),
             cursor_rect: self
                 .cursor_rect_dirty
@@ -347,7 +358,15 @@ impl TextInputState {
     }
 
     /// Publish a previously encoded guest commit plan.
-    pub(crate) fn finish_guest_commit(&mut self, plan: GuestCommitPlan) {
+    ///
+    /// `surrounding_text_support` is the support the encoded transaction
+    /// told the host with the plan's content type, if it told any: only a
+    /// host extension with `set_surrounding_text_support` is told.
+    pub(crate) fn finish_guest_commit(
+        &mut self,
+        plan: GuestCommitPlan,
+        surrounding_text_support: Option<bool>,
+    ) {
         debug_assert_eq!(plan.host_v1_id, self.host_v1_id);
         debug_assert_eq!(plan.host_ext_id, self.host_ext_id);
         debug_assert_eq!(plan.guest_seat, self.guest_seat);
@@ -373,10 +392,17 @@ impl TextInputState {
         if let Some(content_type) = plan.content_type {
             self.content_type_dirty = false;
             self.committed_content_type = Some(content_type);
+            self.record_surrounding_text_support(surrounding_text_support);
         }
         if plan.cursor_rect.is_some() {
             self.cursor_rect_dirty = false;
         }
+    }
+
+    /// Record the surrounding-text support the host was told with the
+    /// committed content type, or `None` if it was told none.
+    pub(crate) fn record_surrounding_text_support(&mut self, support: Option<bool>) {
+        self.committed_surrounding_text_support = support;
     }
 
     pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
@@ -2037,7 +2063,7 @@ mod tests {
 
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
-        state.finish_guest_commit(plan);
+        state.finish_guest_commit(plan, None);
 
         assert_eq!(state.guest_commit_serial(), 1);
         assert!(state.pending_enabled);
@@ -2054,6 +2080,45 @@ mod tests {
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_preedit_cursor.is_none());
         assert!(state.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn a_change_of_the_told_surrounding_text_support_resends_the_content_type() {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.begin_enabled_transaction(true);
+        state.set_content_type(3, 4);
+        state.count_guest_commit();
+        let plan = state.prepare_guest_commit(false);
+        assert!(!plan.has_surrounding_text);
+        state.finish_guest_commit(plan, Some(false));
+
+        // Unchanged support: nothing to resend.
+        state.set_content_type(3, 4);
+        state.count_guest_commit();
+        assert_eq!(state.prepare_guest_commit(false).content_type, None);
+
+        // The field gains surrounding text: the host was told otherwise.
+        state.set_surrounding_text("abc".to_string(), 3, 3);
+        state.count_guest_commit();
+        let plan = state.prepare_guest_commit(false);
+        assert!(plan.has_surrounding_text);
+        assert_eq!(plan.content_type, Some((3, 4)));
+        state.finish_guest_commit(plan, Some(true));
+        state.count_guest_commit();
+        assert_eq!(state.prepare_guest_commit(false).content_type, None);
+
+        // Only a host that was told a support can be told wrong.
+        state.record_surrounding_text_support(Some(false));
+        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
+        state.record_surrounding_text_support(None);
+        assert_eq!(state.prepare_guest_commit(false).content_type, None);
+
+        // A focus change forgets what the host was told, with the rest of
+        // the editor state.
+        state.record_surrounding_text_support(Some(true));
+        state.apply_focus(Some(14));
+        assert!(!state.prepare_guest_commit(false).has_surrounding_text);
+        assert_eq!(state.prepare_guest_commit(false).content_type, None);
     }
 
     #[test]
@@ -2079,7 +2144,7 @@ mod tests {
         state.count_guest_commit();
         let plan = state.prepare_guest_commit(true);
         assert!(!plan.enabled);
-        state.finish_guest_commit(plan);
+        state.finish_guest_commit(plan, None);
 
         assert_eq!(state.guest_commit_serial(), 1);
         assert!(!state.pending_enabled);
@@ -2097,7 +2162,7 @@ mod tests {
         assert_eq!(state.count_guest_commit(), 0);
         let plan = state.prepare_guest_commit(false);
         assert_eq!(plan.serial, 0);
-        state.finish_guest_commit(plan);
+        state.finish_guest_commit(plan, None);
         assert_eq!(state.guest_commit_serial(), 0);
     }
 
@@ -2295,7 +2360,7 @@ mod tests {
                         let commits_surrounding = plan.surrounding_text.is_some();
                         let commits_content_type = plan.content_type.is_some();
                         let commits_cursor_rect = plan.cursor_rect.is_some();
-                        next.finish_guest_commit(plan);
+                        next.finish_guest_commit(plan, None);
                         assert_eq!(next.guest_commit_serial(), previous_serial.wrapping_add(1));
                         if resets_composition {
                             assert!(!next.enabled_dirty);
