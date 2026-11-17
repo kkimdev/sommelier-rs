@@ -459,6 +459,24 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   Chrome's `spellcheck_on` (`1 << 4`); Chrome's `autocorrect_on` (`1 << 2`)
   is a separate flag and is never inferred from it.
   Test: `content_type_mapping_preserves_pin_privacy_and_inline_composition`.
+- **`set_input_type` replaces v1 `set_content_type`.** When the host's
+  `zcr_extended_text_input_v1` has `set_input_type` (v8), a content type
+  reaches Exo through it alone, as the extension XML says ("used in place
+  of"), right after `set_surrounding_text_support` (v9). Exo applies that
+  support to the next of the two requests and resets it, so a v1
+  `set_content_type` in between would report every field without
+  surrounding text as supporting it. Older extensions get
+  `set_content_type`, then `deprecated_set_input_type` (v2). The mapping
+  to `set_input_type` is lossy: the `latin` hint, `multiline` outside the
+  normal, alpha and name purposes, and the `terminal` purpose have no
+  equivalent. They had no effect before either, because `set_input_type`
+  replaced what Exo derived from `set_content_type`. Because Exo learns
+  the support only with a content type, a commit that changes whether the
+  field has surrounding text resends the content type with the new
+  support; nothing else resends an unchanged content type, which can
+  reset Exo's composition.
+  Tests: `content_type_takes_one_host_request_per_extension_version`,
+  `surrounding_text_support_follows_the_field_and_resends_only_on_change`.
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A
