@@ -199,20 +199,22 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             );
             return Action::Drop;
         };
-        if !ctx.note_protocol_error() {
-            return Action::Drop;
-        }
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
         );
-
-        queue_or_drop(
-            &mut ctx.host_to_client_queue,
-            wl_display::evt::error(WL_DISPLAY_ID, guest_id, code, message),
-            format_args!("the host error on object {guest_id}"),
-        );
-
+        // Only an error the guest receives takes the session's one error. A
+        // message too long to forward leaves the slot to the
+        // `implementation` error every fatal session ends with
+        // ([`queue_error_if_none_queued`]).
+        match wl_display::evt::error(WL_DISPLAY_ID, guest_id, code, message) {
+            Ok(event) => {
+                if ctx.note_protocol_error() {
+                    ctx.host_to_client_queue.push(event);
+                }
+            }
+            Err(error) => log::warn!("Dropping the host error on object {guest_id}: {error}"),
+        }
         Action::Drop
     }
 }
@@ -222,6 +224,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
+    use crate::test_support::protocol_error_code;
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
@@ -296,6 +299,26 @@ mod tests {
             ctx.host_to_client_queue.is_empty(),
             "a host-supplied error string must not wrap the 16-bit wire length"
         );
+    }
+
+    /// A host error too long to forward does not use up the session's one
+    /// error: the guest still learns why it ends.
+    #[test]
+    fn an_unforwardable_host_error_leaves_the_implementation_error() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(7, 77);
+
+        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520));
+        queue_error_if_none_queued(&mut ctx);
+
+        assert_eq!(ctx.host_to_client_queue.len(), 1, "exactly one error");
+        let error = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
+            WL_DISPLAY_ID,
+            "the error names the display"
+        );
+        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
     }
 
     #[test]
