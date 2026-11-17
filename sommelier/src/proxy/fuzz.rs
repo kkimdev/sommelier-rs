@@ -25,9 +25,10 @@ limitations under the License.
 //! bind of it crosses the removal), answers each `wl_display.sync`, offers
 //! each new data device a selection and answers each asynchronous dma-buf
 //! create with a buffer of its own, deletes each object the proxy
-//! destroys, and, as weston does, destroys a destroyed surface's pending
-//! frame callbacks without `done`. In some cases it also destroys live
-//! objects of one interface on its own ([`HOST_DESTROYED`]).
+//! destroys, as weston does, destroys a destroyed surface's pending frame
+//! callbacks without `done`, and gives the keyboard focus to each surface
+//! the proxy commits, as a click on its window would. In some cases it also
+//! destroys live objects of one interface on its own ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -67,8 +68,8 @@ use super::{Client, Direction};
 use crate::connection::{WaylandConnection, MAX_FDS_PER_SEND};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::wayland::{
-    wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_registry,
-    wl_surface,
+    wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
+    wl_registry, wl_seat, wl_surface,
 };
 use crate::state::Context;
 use crate::test_support::{frames, Rng};
@@ -1256,10 +1257,10 @@ impl ServerIds {
 /// `zwp_linux_buffer_params_v1.create` with a `wl_buffer` it creates, sends
 /// `delete_id` after every destructor of an object the proxy created,
 /// destroys a destroyed surface's frame callbacks (it never sends their
-/// `done`), with `host_destroys` destroys live objects of that interface on
-/// its own as it answers a sync ([`destroy_live_objects`]), and does nothing
-/// else, until
-/// the proxy closes the connection.
+/// `done`), gives the keyboard focus to each surface the proxy commits,
+/// with `host_destroys` destroys live objects of that interface on its own
+/// as it answers a sync ([`destroy_live_objects`]), and does nothing else,
+/// until the proxy closes the connection.
 ///
 /// Panics on what a real compositor would refuse: a header the wire cannot
 /// frame, a request from an object the host does not have (never created,
@@ -1275,6 +1276,10 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
     let mut deleted = BTreeSet::new();
     // Each surface's frame callbacks, which never get `done` here.
     let mut frame_callbacks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    // The seat's keyboard focus: the surface committed last, as if each
+    // commit were a click on its window.
+    let mut focus = None;
+    let mut serial = 0;
     let mut server_ids = ServerIds {
         next: SERVER_ID_START,
         free: Vec::new(),
@@ -1359,6 +1364,29 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                     objects.insert(buffer, "wl_buffer".to_string());
                     reply.push(zwp_linux_buffer_params_v1::evt::created(sender, buffer).0);
                 }
+                ("wl_surface", wl_surface::REQ_COMMIT) if !zombie && focus != Some(sender) => {
+                    let keyboards = objects
+                        .iter()
+                        .filter(|&(_, interface)| interface == "wl_keyboard")
+                        .map(|(&keyboard, _)| keyboard);
+                    for keyboard in keyboards {
+                        if let Some(surface) = focus {
+                            serial += 1;
+                            reply.push(wl_keyboard::evt::leave(keyboard, serial, surface).0);
+                        }
+                        serial += 1;
+                        reply.push(keyboard_enter(keyboard, serial, sender));
+                    }
+                    focus = Some(sender);
+                }
+                // A new keyboard learns the seat's focus at once.
+                ("wl_seat", wl_seat::REQ_GET_KEYBOARD) => {
+                    if let Some(surface) = focus {
+                        serial += 1;
+                        let keyboard = first_created.expect("a keyboard");
+                        reply.push(keyboard_enter(keyboard, serial, surface));
+                    }
+                }
                 _ => {}
             }
             if (interface.as_str(), opcode) == ("wl_surface", wl_surface::REQ_FRAME) {
@@ -1412,6 +1440,8 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                     reply.push(delete_id(id));
                 }
             }
+            // A destroyed surface loses the focus without a `leave`.
+            focus = focus.filter(|surface| objects.contains_key(surface));
             // The proxy may already have closed the connection.
             let _ = (&host).write_all(&reply.concat());
         }
@@ -1501,6 +1531,13 @@ fn destroy_live_objects(
             delete_id(id)
         })
         .collect()
+}
+
+/// `wl_keyboard.enter` of `keyboard` on `surface`, with no keys pressed.
+fn keyboard_enter(keyboard: u32, serial: u32, surface: u32) -> Vec<u8> {
+    wl_keyboard::evt::enter(keyboard, serial, surface, &[])
+        .expect("an enter with no keys fits a message")
+        .0
 }
 
 /// `wl_display.delete_id(id)`.
