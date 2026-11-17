@@ -570,17 +570,16 @@ impl Client {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
                 };
-                if !msg.is_payload_consumed() {
+                let res = msg.check_consumed(res);
+                if res.as_ref().err() == Some(&ProtocolError::TrailingData) {
                     log::error!(
                         "Protocol message left {} trailing payload byte(s): interface={}, opcode={}",
                         msg.payload.len() - msg.offset,
                         interface,
                         opcode
                     );
-                    Err(ProtocolError::TrailingData)
-                } else {
-                    res
                 }
+                res
             } else if matches!(direction, Direction::ClientToHost) {
                 // A guest request is only valid when its sender is a live
                 // object owned by this connection. Unlike a stale host event
@@ -1817,6 +1816,32 @@ mod tests {
         assert_eq!(
             s.guest_received_and_error(),
             (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
+        );
+    }
+
+    /// A request whose decode fails part-way also leaves bytes unread; its
+    /// error names why the decode failed, not the bytes left over.
+    #[tokio::test]
+    async fn a_failed_decode_reports_its_own_error_not_the_bytes_left() {
+        use protocols::wayland::{wl_display, wl_registry};
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        // The interface string has no terminating NUL; the version and new
+        // ID after it stay unread.
+        let interface = u32::from_ne_bytes(*b"abcd");
+        s.guest_fatal([raw(
+            registry.id,
+            wl_registry::REQ_BIND,
+            &[1, 4, interface, 1, 50],
+        )])
+        .await;
+        assert_eq!(
+            s.guest_received_and_diagnosed_error(),
+            (
+                vec![],
+                (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD),
+                ProtocolError::InvalidString.to_string()
+            )
         );
     }
 

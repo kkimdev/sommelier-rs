@@ -369,6 +369,16 @@ impl<'a> WireMessage<'a> {
     pub fn is_payload_consumed(&self) -> bool {
         self.offset == self.payload.len()
     }
+
+    /// `decoded`, the result of decoding this message, unless the decode
+    /// succeeded without reading the whole payload: then `TrailingData`. A
+    /// failed decode keeps its own error, which says why it stopped.
+    pub fn check_consumed<T>(&self, decoded: Result<T, ProtocolError>) -> Result<T, ProtocolError> {
+        match decoded {
+            Ok(_) if !self.is_payload_consumed() => Err(ProtocolError::TrailingData),
+            decoded => decoded,
+        }
+    }
 }
 
 /// The byte-level writer behind the generated encoders.
@@ -944,6 +954,25 @@ mod tests {
             wire.offset, 4,
             "invalid input must not consume the string payload"
         );
+    }
+
+    #[test]
+    fn only_a_successful_decode_can_leave_trailing_data() {
+        let payload = [0; 8];
+        let mut wire = WireMessage::new(1, 0, &payload);
+        assert_eq!(wire.read_u32(), Ok(0));
+
+        assert_eq!(
+            wire.check_consumed(Ok(())),
+            Err(ProtocolError::TrailingData)
+        );
+        assert_eq!(
+            wire.check_consumed::<()>(Err(ProtocolError::InvalidString)),
+            Err(ProtocolError::InvalidString),
+            "a decode that stopped early reports why"
+        );
+        assert_eq!(wire.read_u32(), Ok(0));
+        assert_eq!(wire.check_consumed(Ok(())), Ok(()));
     }
 
     #[test]

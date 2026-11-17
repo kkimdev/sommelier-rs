@@ -153,6 +153,14 @@ impl Session {
     /// and code. The error must be the guest's one error and its last
     /// event, and carry a diagnostic.
     pub(super) fn guest_received_and_error(&mut self) -> (Vec<(u32, AnyEvent)>, (u32, u32)) {
+        let (events, error, _) = self.guest_received_and_diagnosed_error();
+        (events, error)
+    }
+
+    /// [`Self::guest_received_and_error`], with the error's diagnostic.
+    pub(super) fn guest_received_and_diagnosed_error(
+        &mut self,
+    ) -> (Vec<(u32, AnyEvent)>, (u32, u32), String) {
         assert!(self.client.ended, "the session goes on");
         let mut events = self.guest_received();
         let Some((
@@ -174,7 +182,7 @@ impl Session {
             )),
             "the guest got more than one error: {events:?}"
         );
-        (events, (object_id, code))
+        (events, (object_id, code), message)
     }
 
     /// A guest object ID no object has had.
