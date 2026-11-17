@@ -16,7 +16,9 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_output;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
+use std::marker::PhantomData;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -93,7 +95,7 @@ impl Drop for BufferState {
 /// on another surface, or new, copies everything.
 #[derive(Debug)]
 pub struct StalePixels {
-    damage: DamageRegion,
+    damage: DamageRegion<BufferSpace>,
     surface: Option<u32>,
 }
 
@@ -116,7 +118,7 @@ impl StalePixels {
     }
 
     /// The region to copy before the buffer is shown on `surface`.
-    pub fn to_copy_on(&self, surface: u32) -> DamageRegion {
+    pub fn to_copy_on(&self, surface: u32) -> DamageRegion<BufferSpace> {
         if self.surface == Some(surface) {
             self.damage.clone()
         } else {
@@ -138,7 +140,7 @@ impl StalePixels {
     /// A commit on `surface` changed `damage` of the surface's contents, in
     /// this buffer's pixels, or `None` when the contents cannot be related to
     /// this buffer pixel for pixel.
-    fn add_surface_damage(&mut self, surface: u32, damage: Option<&DamageRegion>) {
+    fn add_surface_damage(&mut self, surface: u32, damage: Option<&DamageRegion<BufferSpace>>) {
         if self.surface != Some(surface) {
             return;
         }
@@ -156,12 +158,82 @@ impl StalePixels {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DamageRect {
+/// The coordinate space of buffer pixels: `wl_surface.damage_buffer` and
+/// the SHM copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BufferSpace {}
+
+/// The surface-local coordinate space: `wl_surface.damage` and the damage
+/// the host receives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SurfaceSpace {}
+
+/// A rectangle in the coordinate space `S`, so damage in one space cannot
+/// be used as damage in the other.
+#[derive(PartialEq, Eq)]
+pub struct Rect<S> {
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    space: PhantomData<S>,
+}
+
+pub type BufferRect = Rect<BufferSpace>;
+pub type SurfaceRect = Rect<SurfaceSpace>;
+
+// By hand: a derive would require `S: Copy`, a bound every function generic
+// over the space would then repeat.
+impl<S> Clone for Rect<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S> Copy for Rect<S> {}
+
+// By hand, to leave out the space marker.
+impl<S> fmt::Debug for Rect<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Rect")
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+impl<S> Rect<S> {
+    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            space: PhantomData,
+        }
+    }
+}
+
+impl SurfaceRect {
+    /// This rectangle in the pixels of a buffer of integer scale `factor`,
+    /// clamped to non-negative i32 coordinates. The copy clips damage to the
+    /// buffer, which lies inside that range, so the clamp drops nothing it
+    /// would copy.
+    fn scaled(self, factor: i32) -> BufferRect {
+        let scale = |value: i64| {
+            let scaled = value.saturating_mul(i64::from(factor));
+            scaled.clamp(0, i64::from(i32::MAX)) as i32
+        };
+        let edges = |start: i32, length: i32| {
+            let start = i64::from(start);
+            (scale(start), scale(start + i64::from(length)))
+        };
+        let (x0, x1) = edges(self.x, self.width);
+        let (y0, y1) = edges(self.y, self.height);
+        BufferRect::new(x0, y0, x1 - x0, y1 - y0)
+    }
 }
 
 /// The crop/scale state associated with a `wp_viewport`.
@@ -195,34 +267,6 @@ impl Default for ViewportState {
     }
 }
 
-impl DamageRect {
-    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// This rectangle scaled by `factor`, clamped to non-negative i32
-    /// coordinates. The copy clips damage to the buffer, which lies inside
-    /// that range, so the clamp drops nothing it would copy.
-    fn scaled(self, factor: i32) -> Self {
-        let scale = |value: i64| {
-            let scaled = value.saturating_mul(i64::from(factor));
-            scaled.clamp(0, i64::from(i32::MAX)) as i32
-        };
-        let edges = |start: i32, length: i32| {
-            let start = i64::from(start);
-            (scale(start), scale(start + i64::from(length)))
-        };
-        let (x0, x1) = edges(self.x, self.width);
-        let (y0, y1) = edges(self.y, self.height);
-        Self::new(x0, y0, x1 - x0, y1 - y0)
-    }
-}
-
 pub(super) const MAX_PENDING_DAMAGE_RECTS: usize = 256;
 
 /// Bounded damage accumulated for one surface commit.
@@ -234,15 +278,15 @@ pub(super) const MAX_PENDING_DAMAGE_RECTS: usize = 256;
 /// a magic rectangle: every consumer must handle the same authoritative
 /// variant, so host damage and local copies cannot disagree.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum DamageRegion {
+pub enum DamageRegion<S> {
     #[default]
     Empty,
-    Rects(Vec<DamageRect>),
+    Rects(Vec<Rect<S>>),
     Full,
 }
 
-impl DamageRegion {
-    pub fn push(&mut self, rect: DamageRect) {
+impl<S> DamageRegion<S> {
+    pub fn push(&mut self, rect: Rect<S>) {
         if matches!(self, Self::Full) || rect.width <= 0 || rect.height <= 0 {
             return;
         }
@@ -257,7 +301,7 @@ impl DamageRegion {
     }
 
     /// Add every rectangle of `other` to this region.
-    pub fn extend(&mut self, other: &DamageRegion) {
+    pub fn extend(&mut self, other: &Self) {
         match other {
             Self::Empty => {}
             Self::Full => *self = Self::Full,
@@ -274,7 +318,7 @@ impl DamageRegion {
         matches!(self, Self::Full)
     }
 
-    pub fn rects(&self) -> &[DamageRect] {
+    pub fn rects(&self) -> &[Rect<S>] {
         match self {
             Self::Rects(rects) => rects,
             Self::Empty | Self::Full => &[],
@@ -282,8 +326,8 @@ impl DamageRegion {
     }
 }
 
-impl From<Vec<DamageRect>> for DamageRegion {
-    fn from(rects: Vec<DamageRect>) -> Self {
+impl<S> From<Vec<Rect<S>>> for DamageRegion<S> {
+    fn from(rects: Vec<Rect<S>>) -> Self {
         let mut region = Self::default();
         for rect in rects {
             region.push(rect);
@@ -372,9 +416,9 @@ pub struct SurfacePending {
     /// Damage expressed in surface-local coordinates. It can only be copied
     /// directly when the current buffer has the default transform and no
     /// viewport; otherwise the compositor falls back to a complete copy.
-    pub surface_damage: DamageRegion,
+    pub surface_damage: DamageRegion<SurfaceSpace>,
     /// Damage expressed in buffer pixel coordinates.
-    pub buffer_damage: DamageRegion,
+    pub buffer_damage: DamageRegion<BufferSpace>,
     pub buffer_scale: Option<i32>,
     pub buffer_transform: Option<i32>,
     /// `wl_surface.offset`. The SHM bridge does not currently transform
@@ -403,8 +447,8 @@ pub struct SurfaceCommit {
     previous: SurfaceState,
     pub state: SurfaceState,
     pub attachment: SurfaceAttachment,
-    pub surface_damage: DamageRegion,
-    pub buffer_damage: DamageRegion,
+    pub surface_damage: DamageRegion<SurfaceSpace>,
+    pub buffer_damage: DamageRegion<BufferSpace>,
     /// One-shot placement of the pending attachment relative to the previous
     /// surface contents. wl_surface.offset replaces legacy attach(x, y); it is
     /// consumed by this commit and is not persistent surface state.
@@ -460,7 +504,7 @@ impl SurfaceCommit {
     /// Buffer damage is already in buffer pixels. Surface damage maps to them
     /// exactly under an integer buffer scale (HiDPI clients); any other
     /// mapping falls back to the whole buffer.
-    pub fn buffer_copy_damage(&self) -> DamageRegion {
+    pub fn buffer_copy_damage(&self) -> DamageRegion<BufferSpace> {
         if self.has_full_damage() {
             return DamageRegion::Full;
         }
@@ -835,7 +879,7 @@ impl RenderBufferRegistry {
         &mut self,
         surface: u32,
         shown: Option<HostId>,
-        damage: &DamageRegion,
+        damage: &DamageRegion<BufferSpace>,
         mapping_changed: bool,
     ) {
         let shown_size = shown.and_then(|host_id| self.dimensions(host_id));
@@ -1078,28 +1122,28 @@ impl RenderBufferRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::DamageRect;
+    use super::{BufferRect, SurfaceRect};
 
     #[test]
     fn scaling_damage_clamps_to_non_negative_i32_edges() {
         assert_eq!(
-            DamageRect::new(1, 2, 3, 4).scaled(2),
-            DamageRect::new(2, 4, 6, 8)
+            SurfaceRect::new(1, 2, 3, 4).scaled(2),
+            BufferRect::new(2, 4, 6, 8)
         );
         // A rectangle reaching left of the buffer keeps its visible part.
         assert_eq!(
-            DamageRect::new(-1, -1, 3, 2).scaled(2),
-            DamageRect::new(0, 0, 4, 2)
+            SurfaceRect::new(-1, -1, 3, 2).scaled(2),
+            BufferRect::new(0, 0, 4, 2)
         );
         // Huge edges saturate instead of wrapping, so the copy still covers
         // the whole buffer.
         assert_eq!(
-            DamageRect::new(-(1 << 30), 0, i32::MAX, 1).scaled(2),
-            DamageRect::new(0, 0, i32::MAX - 1, 2)
+            SurfaceRect::new(-(1 << 30), 0, i32::MAX, 1).scaled(2),
+            BufferRect::new(0, 0, i32::MAX - 1, 2)
         );
         assert_eq!(
-            DamageRect::new(0, 0, i32::MAX, i32::MAX).scaled(i32::MAX),
-            DamageRect::new(0, 0, i32::MAX, i32::MAX)
+            SurfaceRect::new(0, 0, i32::MAX, i32::MAX).scaled(i32::MAX),
+            BufferRect::new(0, 0, i32::MAX, i32::MAX)
         );
     }
 }

@@ -55,8 +55,9 @@ pub(crate) use self::outputs::{
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
-    BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
-    StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    BufferRect, BufferSpace, BufferState, DamageRegion, Rect, RenderBufferLifecycle,
+    RenderBufferUse, ShmPool, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceRect,
+    SurfaceState, ViewportState,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
@@ -1301,8 +1302,8 @@ mod tests {
             viewport: None,
             pending: SurfacePending {
                 attachment: SurfaceAttachment::Attach(2),
-                surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
-                buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
+                surface_damage: vec![SurfaceRect::new(1, 2, 3, 4)].into(),
+                buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
                 offset: Some((9, 10)),
@@ -1324,11 +1325,11 @@ mod tests {
         assert!(!commit.has_invalid_fractional_viewport());
         assert_eq!(
             commit.surface_damage,
-            DamageRegion::Rects(vec![DamageRect::new(1, 2, 3, 4)])
+            DamageRegion::Rects(vec![SurfaceRect::new(1, 2, 3, 4)])
         );
         assert_eq!(
             commit.buffer_damage,
-            DamageRegion::Rects(vec![DamageRect::new(5, 6, 7, 8)])
+            DamageRegion::Rects(vec![BufferRect::new(5, 6, 7, 8)])
         );
         assert!(!commit.has_full_damage());
         assert_eq!(
@@ -1366,8 +1367,8 @@ mod tests {
             viewport: Some(ViewportState::new()),
             pending: SurfacePending {
                 attachment: SurfaceAttachment::Detach,
-                surface_damage: vec![DamageRect::new(1, 2, 3, 4)].into(),
-                buffer_damage: vec![DamageRect::new(5, 6, 7, 8)].into(),
+                surface_damage: vec![SurfaceRect::new(1, 2, 3, 4)].into(),
+                buffer_damage: vec![BufferRect::new(5, 6, 7, 8)].into(),
                 buffer_scale: Some(2),
                 buffer_transform: Some(3),
                 offset: Some((4, 5)),
@@ -1422,7 +1423,7 @@ mod tests {
     fn pending_damage_is_exact_until_bounded_then_becomes_full() {
         let mut surface = SurfaceState::default();
         let exact: Vec<_> = (0..MAX_PENDING_DAMAGE_RECTS)
-            .map(|index| DamageRect::new(index as i32, 0, 1, 1))
+            .map(|index| BufferRect::new(index as i32, 0, 1, 1))
             .collect();
         for rect in &exact {
             surface.pending.buffer_damage.push(*rect);
@@ -1433,14 +1434,14 @@ mod tests {
         surface
             .pending
             .buffer_damage
-            .push(DamageRect::new(-10, -20, 30, 40));
+            .push(BufferRect::new(-10, -20, 30, 40));
         assert_eq!(surface.pending.buffer_damage, DamageRegion::Full);
 
         for _ in 0..MAX_PENDING_DAMAGE_RECTS {
             surface
                 .pending
                 .buffer_damage
-                .push(DamageRect::new(1, 1, 1, 1));
+                .push(BufferRect::new(1, 1, 1, 1));
         }
         assert_eq!(
             surface.pending.buffer_damage,
@@ -1461,7 +1462,7 @@ mod tests {
             surface
                 .pending
                 .surface_damage
-                .push(DamageRect::new(index as i32, 0, 1, 1));
+                .push(SurfaceRect::new(index as i32, 0, 1, 1));
         }
         let pending = surface.clone();
 

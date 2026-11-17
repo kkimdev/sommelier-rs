@@ -18,7 +18,9 @@ use crate::allocator::Allocator;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
-use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool, StalePixels};
+use crate::state::{
+    BufferRect, BufferSpace, BufferState, Context, DamageRegion, HostId, Rect, ShmPool, StalePixels,
+};
 use crate::wire::Action;
 use log::{debug, error, warn};
 use std::collections::HashSet;
@@ -724,7 +726,7 @@ fn valid_plane_copy(dest_size: usize, plane: PlaneCopy) -> bool {
 }
 
 fn clipped_damage(
-    rect: DamageRect,
+    rect: BufferRect,
     width: usize,
     height: usize,
 ) -> Option<(usize, usize, usize, usize)> {
@@ -752,7 +754,10 @@ fn clipped_damage(
 
 /// Whether copying `damage` would write any pixel of `buffer`'s host copy:
 /// damage that clips to nothing needs no copy, and no dma-buf sync either.
-pub(crate) fn damage_reaches_buffer(damage: &DamageRegion, buffer: &BufferState) -> bool {
+pub(crate) fn damage_reaches_buffer(
+    damage: &DamageRegion<BufferSpace>,
+    buffer: &BufferState,
+) -> bool {
     let (Ok(width), Ok(height)) = (
         usize::try_from(buffer.width),
         usize::try_from(buffer.height),
@@ -774,7 +779,7 @@ pub(crate) fn damage_reaches_buffer(damage: &DamageRegion, buffer: &BufferState)
 /// Wayland damage coordinates are signed and may extend outside the buffer.
 /// Keeping the intermediate edges in i64 lets the union path remain safe
 /// before the copy path clips them to the actual image dimensions.
-fn damage_edges(rect: DamageRect) -> Option<(i64, i64, i64, i64)> {
+fn damage_edges<S>(rect: Rect<S>) -> Option<(i64, i64, i64, i64)> {
     if rect.width <= 0 || rect.height <= 0 {
         return None;
     }
@@ -797,9 +802,9 @@ fn damage_edges_fit_i32(edges: (i64, i64, i64, i64)) -> bool {
         && y1 - y0 <= i64::from(i32::MAX)
 }
 
-fn damage_from_edges(edges: (i64, i64, i64, i64)) -> DamageRect {
+fn damage_from_edges<S>(edges: (i64, i64, i64, i64)) -> Rect<S> {
     let (x0, y0, x1, y1) = edges;
-    DamageRect::new(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
+    Rect::new(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
 }
 
 fn damage_rects_touch_or_overlap(
@@ -840,7 +845,7 @@ fn damage_union_is_compact(
 /// 4K pixels repeatedly when GTK emits several overlapping rectangles for one
 /// frame.  A merged bounding rectangle can include a small amount of clean
 /// area, which is safe and substantially cheaper than duplicate row copies.
-pub(crate) fn coalesce_damage_rects(damage: &[DamageRect]) -> Vec<DamageRect> {
+pub(crate) fn coalesce_damage_rects<S>(damage: &[Rect<S>]) -> Vec<Rect<S>> {
     let mut merged = Vec::with_capacity(damage.len());
 
     for rect in damage {
@@ -851,7 +856,7 @@ pub(crate) fn coalesce_damage_rects(damage: &[DamageRect]) -> Vec<DamageRect> {
         // Merge until the expanded candidate no longer intersects another
         // rectangle.  The fixed-point loop is needed for A touching B and B
         // touching C while A and C do not touch directly.
-        while let Some(index) = merged.iter().position(|existing: &DamageRect| {
+        while let Some(index) = merged.iter().position(|existing: &Rect<S>| {
             damage_edges(*existing).is_some_and(|existing_edges| {
                 if !damage_rects_touch_or_overlap(candidate, existing_edges) {
                     return false;
@@ -903,7 +908,7 @@ pub(crate) fn copy_shm_damage(
     source: &File,
     dst_ptr: *mut u8,
     layout: ShmCopyLayout,
-    damage: &DamageRegion,
+    damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {
     let ShmCopyLayout {
         dest_size,
@@ -928,7 +933,7 @@ pub(crate) fn copy_shm_damage(
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
     let plane_count = if format == wl_shm::FORMAT_NV12 { 2 } else { 1 };
     let merged_damage = match damage {
-        DamageRegion::Full => vec![DamageRect::new(
+        DamageRegion::Full => vec![BufferRect::new(
             0,
             0,
             i32::try_from(width).unwrap_or(i32::MAX),
@@ -1995,8 +2000,8 @@ mod tests {
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
+    use crate::state::{BufferRect, DamageRegion};
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
-    use crate::state::{DamageRect, DamageRegion};
     use crate::test_support::{
         msg_sender, protocol_error_code, queued_headers, raw_dispatch, shm_pool_file,
     };
@@ -2200,20 +2205,20 @@ mod tests {
     #[test]
     fn coalesces_overlapping_and_compact_adjacent_damage() {
         let damage = [
-            DamageRect::new(0, 0, 8, 4),
-            DamageRect::new(6, 2, 8, 4),
-            DamageRect::new(14, 2, 2, 4),
+            BufferRect::new(0, 0, 8, 4),
+            BufferRect::new(6, 2, 8, 4),
+            BufferRect::new(14, 2, 2, 4),
         ];
 
         assert_eq!(
             coalesce_damage_rects(&damage),
-            vec![DamageRect::new(0, 0, 16, 6)]
+            vec![BufferRect::new(0, 0, 16, 6)]
         );
     }
 
     #[test]
     fn keeps_sparse_corner_damage_separate() {
-        let damage = [DamageRect::new(0, 0, 2, 2), DamageRect::new(2, 2, 2, 2)];
+        let damage = [BufferRect::new(0, 0, 2, 2), BufferRect::new(2, 2, 2, 2)];
 
         assert_eq!(coalesce_damage_rects(&damage), damage);
     }
@@ -2221,16 +2226,16 @@ mod tests {
     #[test]
     fn coalescing_discards_empty_damage_without_overflowing_edges() {
         let damage = [
-            DamageRect::new(0, 0, 0, 8),
-            DamageRect::new(i32::MAX, i32::MAX, 1, 1),
-            DamageRect::new(4, 4, 2, 2),
+            BufferRect::new(0, 0, 0, 8),
+            BufferRect::new(i32::MAX, i32::MAX, 1, 1),
+            BufferRect::new(4, 4, 2, 2),
         ];
 
         assert_eq!(
             coalesce_damage_rects(&damage),
             vec![
-                DamageRect::new(i32::MAX, i32::MAX, 1, 1),
-                DamageRect::new(4, 4, 2, 2)
+                BufferRect::new(i32::MAX, i32::MAX, 1, 1),
+                BufferRect::new(4, 4, 2, 2)
             ]
         );
     }
@@ -2339,7 +2344,7 @@ mod tests {
             dst_plane1_stride: 0,
             height: 1,
         };
-        let damage = DamageRegion::from(vec![DamageRect::new(0, 0, 1, 1)]);
+        let damage = DamageRegion::from(vec![BufferRect::new(0, 0, 1, 1)]);
         for destination in [std::ptr::null_mut(), libc::MAP_FAILED.cast()] {
             assert!(matches!(
                 copy_shm_damage(&source, destination, layout, &damage),
@@ -2456,7 +2461,7 @@ mod tests {
                 dst_plane1_stride: 8,
                 height: 4,
             },
-            &DamageRegion::from(vec![DamageRect::new(0, 2, 4, 2)]),
+            &DamageRegion::from(vec![BufferRect::new(0, 2, 4, 2)]),
         )
         .is_ok());
 
