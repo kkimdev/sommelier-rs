@@ -323,10 +323,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 - **A removed backing global leaves synthetic objects destroyable but
   inert.** When the host global behind a synthetic object is removed, the
   object MUST still accept its destructor and MUST ignore every other
-  request. Children created before the removal (such as a `wl_shm_pool`)
-  still complete their own lifecycle and emit exactly one `delete_id`.
-  Tests: `removed_host_shm_rejects_pool_creation_from_existing_synthetic_object`,
-  `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`.
+  request. A request that creates an object still creates it, because the
+  guest owns its ID, but inert: a `wl_shm_pool` that ignores its requests
+  in turn, or a `wl_buffer` that attaches as no buffer. Children created
+  before the removal (such as a `wl_shm_pool`) still complete their own
+  lifecycle and emit exactly one `delete_id`.
+  Tests: `removed_host_shm_creates_only_inert_pools_and_buffers`,
+  `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`,
+  `attaching_an_inert_buffer_detaches_the_surface`.
 - **Releasing a parent does not end its children.** `wl_seat.release`
   forwards the seat's destructor without tearing down keyboards, key
   routing or IME state that child devices still own. A keyboard or text

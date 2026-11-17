@@ -1245,6 +1245,9 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
                 "Ignoring wl_shm.create_pool from removed host global object {}",
                 ctx.last_sender_id
             );
+            // The guest owns the new ID, so the pool exists, inert.
+            ctx.shadow_table.create_local(id, "wl_shm_pool", 1);
+            ctx.stale_shm_pools.insert(id);
             return Action::Drop;
         }
         let pool_id = id;
@@ -1786,6 +1789,9 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 "Ignoring wl_shm_pool.create_buffer from removed host global object {}",
                 pool_id
             );
+            // The guest owns the new ID, so the buffer exists, inert:
+            // attaching it detaches (`CompositorHandler::on_attach`).
+            ctx.shadow_table.create_local(id, "wl_buffer", 1);
             return Action::Drop;
         }
         let Some(pool) = ctx.pools.get(&pool_id) else {
@@ -2842,7 +2848,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_host_shm_rejects_pool_creation_from_existing_synthetic_object() {
+    fn removed_host_shm_creates_only_inert_pools_and_buffers() {
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::ffi::CString;
 
@@ -2883,11 +2889,32 @@ mod tests {
             ctx.pools.is_empty(),
             "a removed host wl_shm binding must not retain a new local pool"
         );
+        // The guest owns the ID, so the pool exists for it to use and
+        // destroy, inert like a pool created before the removal.
+        assert!(ctx.shadow_table.is_local(30));
+        assert_eq!(ctx.shadow_table.get_interface(30), Some("wl_shm_pool"));
+        assert!(ctx.stale_shm_pools.contains(&30));
+
+        ctx.last_sender_id = 30;
         assert_eq!(
-            ctx.shadow_table.get_interface(30),
-            None,
-            "a rejected pool must not register a synthetic child object"
+            crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_create_buffer(
+                &mut handler,
+                &mut ctx,
+                31,
+                0,
+                1,
+                1,
+                4,
+                0
+            ),
+            Action::Drop
         );
+        assert!(ctx.shadow_table.is_local(31));
+        assert_eq!(ctx.shadow_table.get_interface(31), Some("wl_buffer"));
+        assert!(!ctx.is_fatal());
+
+        assert!(ctx.local_destroyed(30));
+        assert!(!ctx.stale_shm_pools.contains(&30));
     }
 
     #[test]
@@ -3009,6 +3036,7 @@ mod tests {
             ctx.shadow_table.get_host_id(31).is_none(),
             "a stale pool must not allocate a host buffer through replacement SHM"
         );
+        assert_eq!(ctx.shadow_table.get_interface(31), Some("wl_buffer"));
 
         assert!(ctx.local_destroyed(30));
         assert!(!ctx.pools.contains_key(&30));
