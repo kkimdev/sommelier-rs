@@ -119,8 +119,6 @@ const MAX_REQUESTS: usize = 64;
 const REGISTRY: u32 = 2;
 /// The first ID of the range servers allocate from (`WL_SERVER_ID_START`).
 const SERVER_ID_START: u32 = 0xff00_0000;
-/// Set in the child process that runs the cases.
-const CHILD_ENV: &str = "SOMMELIER_FUZZ_CHILD";
 
 #[test]
 fn guest_streams_cannot_crash_hang_or_leak() {
@@ -218,20 +216,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// Run `cases` in a child copy of this test binary that runs only this
 /// test, so the process's descriptors belong to the cases alone.
 fn in_own_process(cases: impl FnOnce()) {
-    if std::env::var_os(CHILD_ENV).is_some() {
-        return cases();
-    }
-    let name = "proxy::fuzz::guest_streams_cannot_crash_hang_or_leak";
-    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args([name, "--exact", "--test-threads=1", "--nocapture"])
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("run the test binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "the fuzz cases failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
+    let stdout = crate::test_support::in_own_process(
+        "proxy::fuzz::guest_streams_cannot_crash_hang_or_leak",
+        cases,
     );
     // The case count and outcomes, shown with `--nocapture`.
     for summary in stdout

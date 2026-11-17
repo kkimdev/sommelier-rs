@@ -712,12 +712,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             );
         }
 
+        // A failure here is the proxy's own, such as EMFILE; dropping the
+        // plane would blame the guest with an incomplete buffer later.
         let duplicate = match fd.try_clone_to_owned() {
             Ok(duplicate) => duplicate,
-            Err(e) => {
-                error!("Failed to dup FD for add: {}", e);
-                return Action::Drop;
-            }
+            Err(e) => return ctx.fail(format_args!("Failed to duplicate dma-buf fd for add: {e}")),
         };
 
         // ChromiumOS fixes up plane-0 metadata for classic virtio-gpu PRIME
@@ -953,12 +952,12 @@ mod tests {
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::wayland::wl_shm;
-    use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
+    use crate::state::{Context, HostId, PendingNativeCreate, PendingParam, SessionEnd};
     use crate::test_support::{
         any_fd_has_identity, fd_identity, protocol_error, protocol_error_code,
     };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
-    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use crate::test_support::msg_opcode as message_opcode;
 
@@ -1324,6 +1323,49 @@ mod tests {
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(protocol_error_code(&ctx), 0);
+    }
+
+    /// A plane the proxy cannot duplicate, here because the process may
+    /// open no more descriptors, ends the session as the proxy's own
+    /// failure. The descriptor limit is the whole process's, so the test
+    /// lowers it only in a child process that runs it alone.
+    #[test]
+    fn a_plane_the_proxy_cannot_duplicate_is_its_own_failure() {
+        crate::test_support::in_own_process(
+            "handler::linux_dmabuf::tests::a_plane_the_proxy_cannot_duplicate_is_its_own_failure",
+            a_plane_the_proxy_cannot_duplicate,
+        );
+    }
+
+    fn a_plane_the_proxy_cannot_duplicate() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.pending_params.insert(7, Vec::new());
+        ctx.last_sender_id = 7;
+        let plane = crate::test_support::shm_pool_file(&[]);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        // A duplicate takes the lowest free number from 3 up, which must be
+        // below the soft limit.
+        let exhausted = libc::rlimit {
+            rlim_cur: limit.rlim_max.min(3),
+            ..limit
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+            0
+        );
+        let action = LinuxDmabufHandler.on_add(&mut ctx, plane.as_fd(), 0, 0, 64, 0, 0);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        assert_eq!(action, Action::Drop);
+        assert_eq!(ctx.session_end(), Some(&SessionEnd::Internal));
+        assert!(ctx.pending_params[&7].is_empty());
     }
 
     #[test]
