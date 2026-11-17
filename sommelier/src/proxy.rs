@@ -4696,9 +4696,8 @@ async fn connect_host(
 ///
 /// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
 /// the signal through its own self-pipe; [`reload_on_signal`] runs the
-/// reload. `main`
-/// installs it before anything else can take long, whatever the
-/// configuration.
+/// reload. `main` installs it before anything else can take long, whatever
+/// the configuration.
 ///
 /// # Returns
 ///
@@ -4714,6 +4713,7 @@ pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
         })
         .ok()
 }
+
 /// Reload the shortcut configuration on each `signal`.
 ///
 /// A task of its own, so a reload never waits behind the accept loop (its

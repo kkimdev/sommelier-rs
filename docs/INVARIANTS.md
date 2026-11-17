@@ -151,11 +151,14 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `delete_id`; it stops being reserved as soon as the proxy destroys the
   object. A guest ID from the server range returns, through
   `ShadowTable::forget_guest_object`, when its guest object ends. Generated
-  dispatchers map a `new_id` only for a message they forward, so a dropped
-  message consumes no ID. Freed IDs are reused first, so the ID spaces stay
-  as dense as the live objects, and each stays within libwayland's map
-  limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`) inclusive, the ID itself
-  on the client side and its offset from `0xff000000` on the server side.
+  dispatchers map a `new_id` only when its message's sender is mapped, so a
+  message dropped for an unmapped sender consumes no ID; one dropped later,
+  for a local-only object in a non-nullable argument, still does (a
+  nullable one is sent as null). Freed IDs are reused first, so the ID
+  spaces stay as dense as the live objects, and each stays within
+  libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
+  inclusive, the ID itself on the client side and its offset from
+  `0xff000000` on the server side.
   A client that exhausts a range ends; allocation runs in its own task, so
   no other client is affected.
   Tests: `host_ids_are_recycled_through_delete_id`,
