@@ -215,6 +215,109 @@ mod tests {
         );
     }
 
+    fn generate_compact(file: &str) -> String {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocol_path = manifest_dir.join("../third_party/protocols").join(file);
+        let protocol = parse(protocol_path).expect("Failed to parse protocol fixture");
+        without_whitespace(&generator::generate(&protocol))
+    }
+
+    #[test]
+    fn test_generate_enum_constants_from_protocol_xml() {
+        let wayland = generate_compact("wayland.xml");
+        assert!(
+            wayland.contains("pubconstERROR_INVALID_FD:u32=2u32;"),
+            "an entry becomes <ENUM>_<ENTRY> in its interface module"
+        );
+        assert!(
+            wayland.contains("pubconstFORMAT_NV12:u32=842094158u32;"),
+            "hexadecimal values are decoded"
+        );
+        assert!(
+            wayland.contains("pubconstTRANSFORM_FLIPPED_270:i32=7i32;"),
+            "an enum that an int argument carries is i32"
+        );
+
+        let extension = generate_compact("text-input-extension-unstable-v1.xml");
+        assert!(
+            extension.contains("pubconstINPUT_FLAGS_SPELLCHECK_ON:u32=16u32;"),
+            "shifted values are decoded"
+        );
+    }
+
+    #[test]
+    fn test_generate_enum_since_from_protocol_xml() {
+        let xdg_shell = generate_compact("xdg-shell.xml");
+        let toplevel = &xdg_shell[xdg_shell
+            .find("pubmodxdg_toplevel{")
+            .expect("xdg_toplevel module")..];
+        assert!(
+            toplevel
+                .contains("pubfnstate_since(value:u32)->Option<u32>{matchvalue{1u32=>Some(1u32),"),
+            "an entry without since exists from version 1"
+        );
+        assert!(
+            toplevel.contains("9u32=>Some(6u32),"),
+            "an entry's since attribute is its version"
+        );
+        assert!(
+            toplevel.contains("_=>None,"),
+            "a value the XML does not define has no version"
+        );
+
+        let extension = generate_compact("text-input-extension-unstable-v1.xml");
+        assert!(
+            extension.contains(
+                "pubfninput_type_since(value:u32)->Option<u32>{matchvalue{0u32=>Some(2u32),"
+            ),
+            "an entry inherits its enum's since attribute"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "thing generates the constant REQ_PING twice")]
+    fn test_generate_rejects_colliding_constant_names() {
+        let xml = r#"
+        <protocol name="collision">
+          <interface name="thing" version="1">
+            <request name="ping"/>
+            <enum name="req">
+              <entry name="ping" value="0"/>
+            </enum>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        generator::generate(&protocol);
+    }
+
+    #[test]
+    fn test_generate_one_since_arm_per_enum_value() {
+        let xml = r#"
+        <protocol name="aliases">
+          <interface name="thing" version="3">
+            <enum name="mode">
+              <entry name="old" value="1"/>
+              <entry name="new_name" value="1" since="3"/>
+              <entry name="other" value="2" since="2"/>
+            </enum>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        let compact = without_whitespace(&generator::generate(&protocol));
+        assert!(
+            compact.contains("pubconstMODE_OLD:u32=1u32;pubconstMODE_NEW_NAME:u32=1u32;"),
+            "every entry keeps its constant"
+        );
+        assert!(
+            compact.contains("matchvalue{1u32=>Some(1u32),2u32=>Some(2u32),_=>None,}"),
+            "a shared value has one arm, with the older version"
+        );
+    }
+
     #[test]
     fn test_request_object_validation_accepts_local_only_objects() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
