@@ -3535,7 +3535,7 @@ mod tests {
     }
 
     fn test_buffer_state() -> crate::state::BufferState {
-        use crate::state::BufferState;
+        use crate::state::{BufferState, StalePixels};
         use std::sync::Arc;
         BufferState {
             pool_file: Arc::new(crate::test_support::shm_pool_file(&[])),
@@ -3552,7 +3552,7 @@ mod tests {
             dmabuf_sync: false,
             dest_ptr: std::ptr::null_mut(),
             dest_size: 0,
-            needs_full_copy: false,
+            stale: StalePixels::all(),
         }
     }
 

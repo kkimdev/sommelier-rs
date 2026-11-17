@@ -62,10 +62,8 @@ pub struct BufferState {
     pub dmabuf_sync: bool,
     pub dest_ptr: *mut u8,
     pub dest_size: usize,
-    /// Newly allocated host storage is uninitialized. The first committed
-    /// frame must therefore copy the complete guest buffer even if the client
-    /// omitted an explicit damage request.
-    pub needs_full_copy: bool,
+    /// The pixels the host copy lacks, which the next copy covers.
+    pub stale: StalePixels,
 }
 
 unsafe impl Send for BufferState {}
@@ -78,6 +76,81 @@ impl Drop for BufferState {
                 libc::munmap(self.dest_ptr as *mut libc::c_void, self.dest_size);
                 self.dest_ptr = std::ptr::null_mut();
             }
+        }
+    }
+}
+
+/// The pixels a local buffer's host copy lacks, relative to the surface it
+/// was last copied for.
+///
+/// Damage is relative to the surface's current contents, not to the frame a
+/// buffer last showed: a client alternating buffers A, B, A damages only what
+/// changed since B. Each buffer has its own host copy, so every commit on a
+/// surface also stales its pixels in the host copies of the surface's other
+/// buffers, and a buffer copies what it lacks the next time it is
+/// committed. That relation holds only on one surface: a buffer committed
+/// on another surface, or new, copies everything.
+#[derive(Debug)]
+pub struct StalePixels {
+    damage: DamageRegion,
+    surface: Option<u32>,
+}
+
+impl StalePixels {
+    /// New host storage holds no pixels yet.
+    pub fn all() -> Self {
+        Self {
+            damage: DamageRegion::Full,
+            surface: None,
+        }
+    }
+
+    /// A host copy that already matches its buffer as shown on `surface`.
+    #[cfg(test)]
+    pub fn in_sync_on(surface: u32) -> Self {
+        Self {
+            damage: DamageRegion::Empty,
+            surface: Some(surface),
+        }
+    }
+
+    /// The region to copy before the buffer is shown on `surface`.
+    pub fn to_copy_on(&self, surface: u32) -> DamageRegion {
+        if self.surface == Some(surface) {
+            self.damage.clone()
+        } else {
+            DamageRegion::Full
+        }
+    }
+
+    /// The host copy now matches the buffer as shown on `surface`.
+    pub fn copied_on(&mut self, surface: u32) {
+        self.damage = DamageRegion::Empty;
+        self.surface = Some(surface);
+    }
+
+    /// Nothing in the host copy can be trusted, as after a failed copy.
+    pub fn invalidate(&mut self) {
+        *self = Self::all();
+    }
+
+    /// A commit on `surface` changed `damage` of the surface's contents, in
+    /// this buffer's pixels, or `None` when the contents cannot be related to
+    /// this buffer pixel for pixel.
+    fn add_surface_damage(&mut self, surface: u32, damage: Option<&DamageRegion>) {
+        if self.surface != Some(surface) {
+            return;
+        }
+        match damage {
+            Some(damage) => self.damage.extend(damage),
+            None => self.damage = DamageRegion::Full,
+        }
+    }
+
+    /// `surface` was destroyed, and its ID may name a new surface.
+    fn forget_surface(&mut self, surface: u32) {
+        if self.surface == Some(surface) {
+            self.invalidate();
         }
     }
 }
@@ -162,6 +235,15 @@ impl DamageRegion {
             }
             Self::Rects(rects) => rects.push(rect),
             Self::Full => unreachable!("full damage returned above"),
+        }
+    }
+
+    /// Add every rectangle of `other` to this region.
+    pub fn extend(&mut self, other: &DamageRegion) {
+        match other {
+            Self::Empty => {}
+            Self::Full => *self = Self::Full,
+            Self::Rects(rects) => rects.iter().for_each(|&rect| self.push(rect)),
         }
     }
 
@@ -319,6 +401,16 @@ impl SurfaceCommit {
     pub fn attachment_transition(&self) -> Option<(Option<u32>, Option<u32>)> {
         self.attachment
             .transition_from(self.previous.current_buffer_id())
+    }
+
+    /// Whether this commit changes how buffer pixels map onto the surface:
+    /// its scale, transform or viewport. Pixel damage in one buffer then no
+    /// longer carries over to the surface's others. (An offset moves the
+    /// surface, not its pixels.)
+    pub fn changes_buffer_mapping(&self) -> bool {
+        self.previous.current_buffer_scale != self.state.current_buffer_scale
+            || self.previous.current_buffer_transform != self.state.current_buffer_transform
+            || self.previous.viewport != self.state.viewport
     }
 
     pub fn has_full_damage(&self) -> bool {
@@ -683,6 +775,50 @@ impl RenderBufferRegistry {
             RenderBufferBacking::LocalCopy(backing) => Some(backing),
             RenderBufferBacking::Native { .. } => None,
         }
+    }
+
+    /// Stale the pixels that a commit of `surface` changed in the host copies
+    /// of the surface's local buffers.
+    ///
+    /// `damage` is in the pixels of `shown`, the buffer the surface shows
+    /// after the commit, or `None` when no host copy relates to the new
+    /// contents (no contents, or a buffer attached with a new mapping).
+    /// Another buffer's host copy relates to it pixel for pixel only at the
+    /// same size and while the commit keeps the buffer-to-surface mapping;
+    /// otherwise all of its pixels become stale. A held buffer shown without
+    /// an attach keeps its pixels when the mapping changes.
+    pub(super) fn stale_surface_pixels(
+        &mut self,
+        surface: u32,
+        shown: Option<HostId>,
+        damage: &DamageRegion,
+        mapping_changed: bool,
+    ) {
+        let shown_size = shown.and_then(|host_id| self.dimensions(host_id));
+        for (host_id, buffer) in self.local_copies_mut() {
+            let same_size = shown_size == Some((buffer.width, buffer.height));
+            let related = same_size && (shown == Some(host_id) || !mapping_changed);
+            buffer
+                .stale
+                .add_surface_damage(surface, related.then_some(damage));
+        }
+    }
+
+    /// `surface` was destroyed, and its ID may name a new surface: no host
+    /// copy is relative to it any more.
+    pub(super) fn forget_surface(&mut self, surface: u32) {
+        for (_, buffer) in self.local_copies_mut() {
+            buffer.stale.forget_surface(surface);
+        }
+    }
+
+    fn local_copies_mut(&mut self) -> impl Iterator<Item = (HostId, &mut BufferState)> {
+        self.entries.iter_mut().filter_map(|(&host_id, buffer)| {
+            match &mut buffer.active_mut()?.backing {
+                RenderBufferBacking::LocalCopy(backing) => Some((host_id, backing)),
+                RenderBufferBacking::Native { .. } => None,
+            }
+        })
     }
 
     pub(super) fn dimensions(&self, host_id: HostId) -> Option<(i32, i32)> {

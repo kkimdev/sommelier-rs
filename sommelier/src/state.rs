@@ -48,7 +48,7 @@ pub(crate) use self::outputs::{
 };
 pub(crate) use self::render::{
     BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
-    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
@@ -1061,6 +1061,31 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn render_buffer_count(&self) -> usize {
         self.render_buffers.len()
+    }
+
+    /// Stale what `commit` of `surface` changed in the host copies of the
+    /// surface's local buffers. See [`StalePixels`].
+    pub(crate) fn stale_surface_pixels(&mut self, surface: u32, commit: &SurfaceCommit) {
+        // A buffer attached together with a new mapping was last copied for
+        // the old one, while the client's damage is relative to the new one:
+        // then no host copy relates to the new contents pixel for pixel.
+        let relatable = !(commit.has_buffer_attach() && commit.changes_buffer_mapping());
+        let shown = commit
+            .state
+            .current_buffer_id()
+            .filter(|_| relatable)
+            .and_then(|buffer| self.render_buffer_host_id(buffer));
+        self.render_buffers.stale_surface_pixels(
+            surface,
+            shown,
+            &commit.buffer_copy_damage(),
+            commit.changes_buffer_mapping(),
+        );
+    }
+
+    /// Drop every host copy's relation to the destroyed `surface`.
+    pub(crate) fn forget_surface_buffer_copies(&mut self, surface: u32) {
+        self.render_buffers.forget_surface(surface);
     }
 
     pub(crate) fn buffer_dimensions(&self, guest_buffer_id: u32) -> Option<(i32, i32)> {

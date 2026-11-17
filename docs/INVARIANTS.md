@@ -184,12 +184,14 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   image stale while its damage is signaled. The one exception is a buffer
   the host has released (`Released`): per `wl_buffer.release` the client
   then owns the storage and may be drawing its next frame into it, so
-  reading it could tear, and the host no longer samples it. Exo releases
-  a buffer only after it is detached, so with Exo every damage-only commit
-  copies. A commit with nothing to copy (no damage, or damage outside the
-  buffer) skips the copy path entirely (no dma-buf sync or BO map), so a
-  damage-free commit, such as one acknowledging a configure, is never
-  dropped by a host storage failure.
+  reading it could tear, and the host no longer samples it. That commit's
+  damage stays stale in the buffer's host copy (see the next rule) and is
+  copied at its next attach. Exo releases a buffer only after it is
+  detached, so with Exo every damage-only commit copies. A commit with
+  nothing to copy (no damage, or damage outside the buffer) skips the copy
+  path entirely (no dma-buf sync or BO map), so a damage-free commit, such
+  as one acknowledging a configure, is never dropped by a host storage
+  failure.
   Known limit: a release carries no serial. If a surface is destroyed while
   buffer A awaits release (`ReleaseOwed`) and A is attached elsewhere before
   the owed release arrives, that release marks A `Released` while the host
@@ -197,6 +199,26 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   Tests: `damage_only_commit_copies_the_mutated_current_shm_buffer`,
   `damage_only_commit_does_not_read_a_released_shm_buffer`,
   `commit_without_damage_on_a_held_buffer_skips_the_copy`.
+- **Each host copy tracks the pixels it lacks.** Damage is relative to the
+  surface's current contents, so a client alternating buffers A, B, A
+  damages only what changed since B, while each guest SHM buffer has its
+  own host copy. Every commit therefore stales its buffer-space damage in
+  the host copies of all the surface's local buffers (`StalePixels`), and a
+  buffer copies everything it lacks before it is shown. A host copy that
+  cannot be related pixel for pixel copies in full: a buffer that is new,
+  new to the surface, of another size than the shown buffer, after a
+  failed copy, or after a commit that changed the scale, transform or
+  viewport (for every buffer but a held one shown without an attach).
+  Destroying a surface drops the relation, because its ID can be reused.
+  Tests: `reattached_buffer_copies_the_damage_of_the_frames_it_missed`,
+  `reattached_buffer_copies_the_damage_of_every_frame_it_missed`,
+  `damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach`,
+  `a_frame_of_another_size_stales_the_whole_host_copy`,
+  `a_buffer_moving_between_surfaces_copies_everything`,
+  `a_failed_copy_stales_the_whole_host_copy`,
+  `a_mapping_change_stales_the_other_host_copies`,
+  `a_buffer_attached_with_a_new_mapping_copies_everything`,
+  `destroying_a_surface_stales_the_host_copies_it_showed`.
 - **`attach` offsets at version 5.** For a `wl_surface` at version 5 or
   newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
   a committed `wl_surface.offset` survives a later zero-coordinate attach.

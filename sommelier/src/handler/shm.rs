@@ -18,7 +18,7 @@ use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool};
+use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool, StalePixels};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
 use std::collections::HashSet;
@@ -1604,7 +1604,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         dmabuf_sync: false,
         dest_ptr,
         dest_size,
-        needs_full_copy: true,
+        stale: StalePixels::all(),
     };
     register_shm_buffer(
         ctx,
@@ -1762,7 +1762,7 @@ fn create_dmabuf_buffer(
         dmabuf_sync,
         dest_ptr,
         dest_size,
-        needs_full_copy: true,
+        stale: StalePixels::all(),
     };
     register_shm_buffer(
         ctx,
@@ -2040,7 +2040,7 @@ mod tests {
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
-    use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool};
+    use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
     use crate::test_support::shm_pool_file;
     use crate::wire::{Action, WireMessage};
@@ -3074,7 +3074,7 @@ mod tests {
                 dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
-                needs_full_copy: false,
+                stale: StalePixels::all(),
             },
         );
         ctx.mark_buffer_submitted(guest_buffer);
@@ -3157,7 +3157,7 @@ mod tests {
                 dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
-                needs_full_copy: false,
+                stale: StalePixels::all(),
             },
         );
         ctx.mark_buffer_submitted(guest_buffer);
@@ -3370,7 +3370,7 @@ mod tests {
                 dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
-                needs_full_copy: false,
+                stale: StalePixels::all(),
             },
         );
         register_test_native(&mut ctx, native_host);
@@ -3439,7 +3439,7 @@ mod tests {
                 dmabuf_sync: false,
                 dest_ptr: std::ptr::null_mut(),
                 dest_size: 0,
-                needs_full_copy: false,
+                stale: StalePixels::all(),
             },
         );
         ctx.mark_buffer_submitted(guest_buffer);
