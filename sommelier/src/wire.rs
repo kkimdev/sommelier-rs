@@ -306,18 +306,16 @@ impl<'a> WireMessage<'a> {
         };
         let bytes = &self.payload[self.offset..bytes_end];
 
-        // Wayland strings include null terminator in the length.
-        // We expect at least one byte for the null terminator if len > 0.
-        if bytes.last() != Some(&0) {
+        // A Wayland string's length includes its terminating NUL, and
+        // libwayland rejects a string with a NUL before it ("string has
+        // embedded nul" in `wl_connection_demarshal`).
+        let Some((&0, text)) = bytes.split_last() else {
+            return Err(ProtocolError::InvalidString);
+        };
+        if text.contains(&0) {
             return Err(ProtocolError::InvalidString);
         }
-
-        // To match C behavior, we truncate at the first null terminator if there are interior nulls
-        let null_pos = bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(len.saturating_sub(1));
-        let s = std::str::from_utf8(&bytes[..null_pos])
+        let s = std::str::from_utf8(text)
             .map_err(|_| ProtocolError::InvalidString)?
             .to_owned();
 
@@ -946,6 +944,15 @@ mod tests {
             wire.offset, 4,
             "invalid input must not consume the string payload"
         );
+    }
+
+    #[test]
+    fn wire_message_rejects_string_with_embedded_nul() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_ne_bytes());
+        payload.extend_from_slice(b"a\0b\0");
+        let mut wire = WireMessage::new(1, 0, &payload);
+        assert_eq!(wire.read_string(), Err(ProtocolError::InvalidString));
     }
 
     #[test]
