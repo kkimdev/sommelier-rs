@@ -20,7 +20,7 @@ use crate::handler::window_placement::set_aura_application_id;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
-use crate::state::{Context, GtkSurfaceState, Link};
+use crate::state::{Context, GtkSurfaceState};
 use crate::wire::{queue_or_drop, Action};
 
 pub struct GtkShellHandler;
@@ -45,9 +45,7 @@ const GTK_SHELL_CAPABILITIES: u32 = 0;
 /// [`crate::state::InternalCallback::GtkShellCapabilities`]). A shell the
 /// guest has destroyed meanwhile gets nothing.
 pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: u32) {
-    if !ctx.gtk_shells.contains_key(&gtk_shell_id)
-        || ctx.shadow_table.request_sender(gtk_shell_id) != Some(Link::Local)
-    {
+    if !ctx.gtk_shells.contains_key(&gtk_shell_id) || !ctx.shadow_table.is_local(gtk_shell_id) {
         return;
     }
     ctx.host_to_client_queue.push(gtk_shell1::evt::capabilities(
@@ -229,7 +227,7 @@ mod tests {
         let startup_id = &ctx.client_to_host_queue[1].0;
         assert_eq!(msg_opcode(startup_id), zaura_surface::REQ_SET_STARTUP_ID);
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
-        assert!(ctx.shadow_table.request_sender(GTK_SURFACE) == Some(crate::state::Link::Local));
+        assert!(ctx.shadow_table.is_local(GTK_SURFACE));
         assert_eq!(
             ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id,
             WL_SURFACE_GUEST
@@ -445,7 +443,7 @@ mod tests {
         assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert!(!ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
         assert!(
-            ctx.shadow_table.request_sender(GTK_SURFACE) == Some(crate::state::Link::Local),
+            ctx.shadow_table.is_local(GTK_SURFACE),
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
         );
         assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));

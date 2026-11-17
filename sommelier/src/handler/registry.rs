@@ -1411,7 +1411,7 @@ mod tests {
             handler.on_bind(&mut ctx, 7, &("gtk_shell1".to_string(), 1, 50)),
             Action::Drop
         );
-        assert!(ctx.shadow_table.request_sender(50) == Some(crate::state::Link::Local));
+        assert!(ctx.shadow_table.is_local(50));
         assert!(ctx.gtk_shells.contains_key(&50));
         assert!(ctx.host_to_client_queue.is_empty());
         let callback_id = ctx

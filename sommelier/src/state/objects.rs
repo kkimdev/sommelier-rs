@@ -392,6 +392,15 @@ impl ShadowTable {
         (own.name == interface && !self.is_pending_destroy_guest(guest.0)).then_some(guest.0)
     }
 
+    /// Return whether guest object `guest_id` is one the proxy implements
+    /// itself ([`Self::create_local`]).
+    pub fn is_local(&self, guest_id: u32) -> bool {
+        matches!(
+            self.guests.get(&GuestId(guest_id)),
+            Some(GuestObject::Local(_))
+        )
+    }
+
     /// Return whether a guest request may allocate `guest_id`.
     ///
     /// Client-created IDs must be non-zero, must not reuse an existing object,
@@ -531,10 +540,7 @@ impl ShadowTable {
             return;
         }
         let guest = GuestId(guest_id);
-        if let Some(host) = self
-            .forget_guest_object(guest)
-            .and_then(|object| object.host())
-        {
+        if let Some(host) = self.end_paired_guest(guest) {
             self.remove_paired_host(host, guest);
         }
     }
@@ -588,11 +594,10 @@ impl ShadowTable {
     ///
     /// `false`, changing nothing, unless `guest_id` is a local object.
     pub fn local_destroyed(&mut self, guest_id: u32) -> bool {
-        let guest = GuestId(guest_id);
-        if !matches!(self.guests.get(&guest), Some(GuestObject::Local(_))) {
+        if !self.is_local(guest_id) {
             return false;
         }
-        self.forget_guest_object(guest);
+        self.forget_guest_object(GuestId(guest_id));
         true
     }
 
