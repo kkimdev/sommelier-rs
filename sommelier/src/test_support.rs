@@ -16,10 +16,11 @@ limitations under the License.
 
 //! Shared helpers for unit tests.
 
-use std::os::fd::{AsRawFd, RawFd};
+use std::collections::VecDeque;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError};
+use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 
 /// A message's bytes and its descriptors' numbers.
 pub type RawMessage = (Vec<u8>, Vec<RawFd>);
@@ -99,6 +100,76 @@ pub fn stream_headers(stream: &[u8]) -> Vec<(u32, u16)> {
     frames(stream)
         .map(|(header, _)| (header.sender_id, header.opcode))
         .collect()
+}
+
+/// The sender of `message` and the message decoded by `decode`, which
+/// takes its descriptors from the front of `fds`. `message` must be one
+/// whole message, and `decode` must read all of its payload.
+pub fn decode<M>(
+    message: &[u8],
+    fds: &mut VecDeque<OwnedFd>,
+    decode: impl FnOnce(&mut WireMessage) -> Result<M, ProtocolError>,
+) -> Result<(u32, M), ProtocolError> {
+    let header = match MessageHeader::frame(message) {
+        Framing::Complete(header) if header.len == message.len() => header,
+        _ => return Err(ProtocolError::InvalidMessageLength(message.len())),
+    };
+    let mut wire = WireMessage::new(
+        header.sender_id,
+        header.opcode,
+        &message[MessageHeader::LEN..],
+    )
+    .with_fds(fds);
+    let decoded = decode(&mut wire)?;
+    if !wire.is_payload_consumed() {
+        return Err(ProtocolError::TrailingData);
+    }
+    Ok((header.sender_id, decoded))
+}
+
+/// Each message of a proxy message queue, with its sender, decoded by
+/// `decode`, such as `wl_keyboard::Event::from_wire`. The decoded
+/// descriptors are duplicates, so the queue keeps its own. Panics if a
+/// message does not decode whole, or leaves a descriptor unread.
+pub fn decoded<M>(
+    queue: &[Outgoing],
+    decode: fn(&mut WireMessage) -> Result<M, ProtocolError>,
+) -> Vec<(u32, M)> {
+    queue
+        .iter()
+        .map(|(message, fds)| {
+            let mut fds: VecDeque<OwnedFd> = fds
+                .iter()
+                .map(|fd| fd.try_clone().expect("duplicate a queued descriptor"))
+                .collect();
+            let decoded = self::decode(message, &mut fds, decode)
+                .unwrap_or_else(|error| panic!("a queued message does not decode: {error}"));
+            assert!(
+                fds.is_empty(),
+                "a queued message carries unread descriptors"
+            );
+            decoded
+        })
+        .collect()
+}
+
+/// Whether `a` and `b` refer to the same file, by device and inode, which
+/// is how decoded messages compare their descriptors in tests. Two open
+/// file descriptions of one file compare equal. Panics for an anonymous
+/// inode, such as an eventfd or a sync_file: all of them share one inode,
+/// so the comparison would prove nothing.
+pub fn same_file(a: &impl AsFd, b: &impl AsFd) -> bool {
+    let identity = |fd: &dyn AsFd| {
+        let fd = fd.as_fd().as_raw_fd();
+        let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .expect("read the descriptor's target");
+        assert!(
+            !target.to_string_lossy().starts_with("anon_inode:"),
+            "descriptor {fd} is an anonymous inode, {target:?}, which compares equal to every other"
+        );
+        fd_identity(fd)
+    };
+    identity(a) == identity(b)
 }
 
 /// The `(device, inode)` pair of an open file description.
@@ -245,8 +316,87 @@ impl Drop for TempDir {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::stream_headers;
-    use crate::wire::MessageBuilder;
+    use super::{decode, decoded, shm_pool_file, stream_headers};
+    use crate::protocols::wayland::{wl_callback, wl_keyboard};
+    use crate::wire::{MessageBuilder, ProtocolError};
+    use std::collections::VecDeque;
+    use std::os::fd::OwnedFd;
+
+    #[test]
+    fn decoded_queues_compare_descriptors_by_the_file_they_refer_to() {
+        const KEYBOARD: u32 = 5;
+        let keymap = shm_pool_file(b"keymap");
+        let keymap_event = |file: &std::fs::File| {
+            wl_keyboard::evt::keymap(
+                KEYBOARD,
+                wl_keyboard::KEYMAP_FORMAT_XKB_V1,
+                file.try_clone().unwrap().into(),
+                6,
+            )
+        };
+        let queue = vec![
+            keymap_event(&keymap),
+            wl_keyboard::evt::leave(KEYBOARD, 7, 8),
+        ];
+        let expected = |file: &std::fs::File| wl_keyboard::Event::Keymap {
+            format: wl_keyboard::KEYMAP_FORMAT_XKB_V1,
+            fd: OwnedFd::from(file.try_clone().unwrap()),
+            size: 6,
+        };
+
+        assert_eq!(
+            decoded(&queue, wl_keyboard::Event::from_wire),
+            [
+                (KEYBOARD, expected(&keymap)),
+                (
+                    KEYBOARD,
+                    wl_keyboard::Event::Leave {
+                        serial: 7,
+                        surface: 8
+                    }
+                ),
+            ]
+        );
+        assert_eq!(queue[0].1.len(), 1, "the queue keeps its descriptors");
+        let other = shm_pool_file(b"keymap");
+        assert_ne!(
+            decoded(&queue[..1], wl_keyboard::Event::from_wire),
+            [(KEYBOARD, expected(&other))],
+            "another file with the same bytes is another descriptor"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is an anonymous inode")]
+    fn same_file_refuses_anonymous_inodes() {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "an eventfd");
+        let event = unsafe { OwnedFd::from_raw_fd(fd) };
+        super::same_file(&event, &event);
+    }
+
+    #[test]
+    fn decode_takes_one_whole_message_and_reads_all_of_it() {
+        let decode_done =
+            |message: &[u8]| decode(message, &mut VecDeque::new(), wl_callback::Event::from_wire);
+        let (done, _) = wl_callback::evt::done(3, 9);
+        assert_eq!(
+            decode_done(&done),
+            Ok((3, wl_callback::Event::Done { callback_data: 9 }))
+        );
+        assert_eq!(
+            decode_done(&done[..done.len() - 1]),
+            Err(ProtocolError::InvalidMessageLength(done.len() - 1))
+        );
+        let mut long = MessageBuilder::new();
+        long.write_u32(9);
+        long.write_u32(0);
+        assert_eq!(
+            decode_done(&long.build_message(3, wl_callback::EVT_DONE)),
+            Err(ProtocolError::TrailingData)
+        );
+    }
 
     #[test]
     fn stream_headers_stop_at_a_partial_or_corrupt_message() {

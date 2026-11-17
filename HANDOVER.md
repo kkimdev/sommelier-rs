@@ -42,8 +42,9 @@
   the focused one, and one chord can issue a redundant placement batch).
 - A text input whose guest `wl_seat` goes away while it is active ends its
   host generation without a `deactivate`, since none can name a live
-  seat. It does so at its next reconcile (a commit, focus change or its
-  destroy), not when the seat ends. Exo keeps its input method attached
+  seat. It does so at its next reconcile (a commit, a focus change, a
+  completed drain barrier, a seat bind or its destroy), not when the seat
+  ends. Exo keeps its input method attached
   until its own focus moves, and if the guest later binds a new seat
   under the seat ID on that surface, Exo's `activate` does nothing and
   the stale attachment stays. Any live host seat would do for the

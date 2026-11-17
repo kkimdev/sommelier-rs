@@ -19,20 +19,20 @@ limitations under the License.
 //! A guest client controls the bytes and descriptors it sends, and the proxy
 //! must survive whatever arrives. Each case builds a request stream from the
 //! vendored protocol XML (requests of live objects, typed arguments, real
-//! descriptors), mutates some requests, and writes the stream in random
-//! pieces over a socket to `Client::run`. Half the cases end like a client
-//! typing into text fields, switching the focus between surfaces and
-//! waiting for each with a roundtrip, and sometimes releasing its seat. The host peer is a compositor
-//! that advertised every global (and one `wl_output` it then removed, so a
-//! bind of it crosses the removal), answers each `wl_display.sync`, offers
-//! each new data device a selection and answers each asynchronous dma-buf
-//! create with a buffer of its own, deletes each object the proxy
-//! destroys, as weston does, destroys a destroyed surface's pending frame
-//! callbacks without `done`, and gives the keyboard focus to each surface
-//! the proxy commits, as a click on its window would, holds its answer to a
-//! text input's drain barrier, as a slow host would, and keeps the
-//! text-input state Exo would ([`exo`]). In some cases it also destroys
-//! live objects of one interface on its own ([`HOST_DESTROYED`]).
+//! descriptors), mutates some requests, and writes the stream in random pieces
+//! over a socket to `Client::run`. Half the cases end like a client typing into
+//! text fields, switching the focus between surfaces and waiting for each with
+//! a roundtrip, and sometimes releasing its seat. The host peer is a compositor
+//! that advertised every global (and one `wl_output` it then removed, so a bind
+//! of it crosses the removal), answers each `wl_display.sync`, offers each new
+//! data device a selection and answers each asynchronous dma-buf create with a
+//! buffer of its own, deletes each object the proxy destroys, as weston does,
+//! destroys a destroyed surface's pending frame callbacks without `done`, and
+//! gives the keyboard focus to each surface the proxy commits, as a click on
+//! its window would, holds its answer to a text input's drain barrier, as a
+//! slow host would, and keeps the text-input state Exo would ([`exo`]). In some
+//! cases it also destroys live objects of one interface on its own
+//! ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -1124,7 +1124,9 @@ static GUEST_SERVER_OBJECTS: AtomicU64 = AtomicU64::new(0);
 /// gets an ID from the server range that no guest object has. The guest
 /// never destroys an object the server created, so each needs an ID of its
 /// own. When the compositor destroys live objects of an interface on its
-/// own (`host_destroys`), a `delete_id` may also name one of those.
+/// own (`host_destroys`), a `delete_id` may also name one of those. A
+/// `delete_id` hands its ID on: the next object the guest or the server
+/// creates under it is a new object.
 fn check_guest_events(
     protocols: &Protocols,
     guest: &GuestView,
@@ -1286,7 +1288,6 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             WaylandConnection::new(host.into()).expect("register the host socket"),
             context,
         );
-        client.check_orphans = true;
         let (get_registry, _) = wl_display::req::get_registry(WL_DISPLAY_ID, REGISTRY);
         client.client_conn.read_buf.extend(get_registry);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
@@ -1676,9 +1677,8 @@ fn compositor(
                     reply.push(delete_id(id));
                 }
             }
-            // An activation whose seat ended, released by the proxy or
-            // destroyed here, can never be deactivated: the proxy must end
-            // it on its own.
+            // An activation whose seat ended while active, released by the
+            // guest or destroyed here, ends with its seat.
             activations.retain(|text_input, seat| {
                 let live = objects.contains_key(text_input);
                 let seat_live = objects.get(seat).is_some_and(|seat| seat == "wl_seat");
@@ -1789,8 +1789,8 @@ fn destroy_live_objects(
         .collect()
 }
 
-/// Host text-input activations whose seat ended before a `deactivate`, so
-/// that the proxy had to end them on its own, across all cases.
+/// Host text-input activations whose seat ended while active, across all
+/// cases.
 static SEATLESS_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// `zwp_text_input_v1.deactivate` requests naming a seat the compositor

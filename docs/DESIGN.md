@@ -33,8 +33,8 @@ handler intercepts the ones whose meaning changes across the boundary.
   configuration (`PlacementConfig::from_environment`). Connections receive
   the results.
   `Context::from_parts` and the test constructors read no environment
-  (`test_contexts_read_no_environment`), with two exceptions below `main`:
-  `Context::new` creates the GBM allocator, which reads
+  (test: `test_contexts_read_no_environment`), with two exceptions below
+  `main`: `Context::new` creates the GBM allocator, which reads
   `SOMMELIER_DRM_DEVICE` (`allocator.rs`) on every connection, and the ARC
   task-ID reservation reads `XDG_RUNTIME_DIR` (`arc_task_ids.rs`).
 - `proxy::run` claims the socket through its lock file, then `serve`
@@ -229,10 +229,11 @@ is the handler's: a destructor handler that must order its own destructor
 against that output queues the part that goes first before it calls the
 wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
 In tests, `Context::assert_no_orphans` checks every per-object key, and
-every object such state names, against the table; `proxy::fuzz` runs it
-after every batch. A seat reference is the exception: it outlives its
-seat ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its
-copies are checked, against their keyboard's.
+every object such state names, against the table; a test's `Client`,
+the fuzzer's included, runs it after every batch that keeps the session.
+A seat reference is the exception: it outlives its seat
+([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its copies
+are checked, against their keyboard's.
 
 ### Message effects
 
@@ -435,7 +436,10 @@ moment it is closed, so a test that checks a descriptor was closed checks
 that no descriptor still refers to its object
 (`test_support::any_fd_has_identity`), never its number; the randomized
 `proxy::fuzz` test, which counts every open descriptor, runs its cases in
-a child process of its own. Beyond unit tests, `proxy::fuzz` feeds whole
+a child process of its own. `proxy::harness::Session` drives a whole
+`Client` as its guest and host, decoding what the proxy sends each into
+the generated message types; CONTRIBUTING says how to write a test with
+it. Beyond unit tests, `proxy::fuzz` feeds whole
 clients random guest streams, and `sommelier/tests/weston_e2e.rs` runs
 real clients through the proxy against a headless weston; CONTRIBUTING
 says how to run them. `sommelier_test_app` is a standalone GUI for manual

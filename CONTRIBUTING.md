@@ -25,6 +25,7 @@ run the checks CI runs, plus `git diff --check`, from the repository root:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+python3 -I scripts/check-cited-tests.py
 git diff --check
 ```
 
@@ -44,6 +45,47 @@ numbers or global state another test leaves alone; see
 - Never commit transient files; `*.local.*` and `_local/` are ignored for
   them.
 
+## Writing tests
+
+Pin what the proxy sends, not how it stores it. `proxy::harness::Session`
+plays both peers of a whole `Client`: send it messages built with the
+generated `req::` and `evt::` encoders, set objects up through real
+protocol flows, and assert what each peer received, decoded into typed
+messages that compare with `==`:
+
+```rust
+let mut s = Session::new();
+let callback = s.new_id();
+let sync = wl_display::req::sync(WL_DISPLAY_ID, callback);
+let host_callback = s.create(sync).await;
+s.host([wl_callback::evt::done(host_callback, 0)]).await;
+assert_eq!(
+    s.guest_received(),
+    [
+        (callback, wl_callback::Event::Done { callback_data: 0 }.into()),
+        (WL_DISPLAY_ID, wl_display::Event::DeleteId { id: callback }.into()),
+    ]
+);
+```
+
+- `guest`, `host` and their `_fatal` forms send messages and say whether
+  the session must survive them; `guest_received_and_error` checks that a
+  session ended with one `wl_display.error`, its last event. A guest
+  request that waits for a fence holds the guest's stream until
+  `resume`.
+- Read everything each peer received: a `Session` dropped with output
+  the test never read fails.
+- Learn host IDs from what the proxy forwards (`create`, `surface`), not
+  from the object table, and reach into the `Context` (`Session::ctx`)
+  only for a fault no peer can cause. Every batch that keeps the session
+  checks that no state outlives its object.
+- A handler test decodes a queue with `test_support::decoded`.
+- Use `MessageBuilder` only for frames no encoder builds, such as
+  malformed ones.
+- [INVARIANTS.md](docs/INVARIANTS.md) and [DESIGN.md](docs/DESIGN.md)
+  cite tests by name in "Test:" and "Tests:" clauses;
+  `scripts/check-cited-tests.py` checks that each names a test.
+
 ## Randomized tests
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
@@ -53,10 +95,11 @@ real sockets. Half the cases end like a client typing into text fields
 for each move with a roundtrip, and enables, edits and disables the
 field; now and then it releases its seat while the field is enabled,
 reuses the seat's ID for a surface once it is deleted, and disables the
-field, which the proxy can then no longer deactivate. Each case must end without a panic or hang, close every
-descriptor, and either answer the stream's closing `wl_display.sync` or
-send one `wl_display.error`, its last event. The fake compositor behind the proxy also checks
-that every request it receives comes from a live host object, creates
+field, which the proxy can then no longer deactivate. Each case must end
+without a panic or hang, close every descriptor, and either answer the
+stream's closing `wl_display.sync` or send one `wl_display.error`, its
+last event. The fake compositor behind the proxy also checks that every
+request it receives comes from a live host object, creates
 only fresh IDs and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,
 creates objects of its own (a data offer for each data device, a buffer
@@ -99,7 +142,8 @@ The expected content type comes from the proxy's own mapping, so this
 check finds ordering and state bugs, not mapping bugs; unit tests pin
 the mapping. The run reports how many fields it checked, how many
 activations the guest's plan deferred, how many input methods
-restarted, and how many host activations outlived their seat.
+restarted, how many host activations had their seat end while active,
+and how many deactivates named a destroyed seat.
 
 The suite runs 5000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:

@@ -1549,8 +1549,9 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
                     "Deferring text input {guest_id} activation until the previous generation drains"
                 );
             } else {
-                // Warn once per text input: every reconcile until the guest
-                // binds a seat under the ID would repeat it.
+                // Warn once per text input, however many seats it loses:
+                // every reconcile until the guest binds a seat under the ID
+                // would repeat it.
                 let first = ctx
                     .text_inputs
                     .get_mut(&guest_id)

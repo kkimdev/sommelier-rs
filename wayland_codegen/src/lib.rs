@@ -417,5 +417,76 @@ mod tests {
         assert!(code.contains("fn classify_interface"));
         assert!(code.contains("fn interface_version"));
         assert!(code.contains("fn consume_event"));
+        let code = without_whitespace(&code);
+        assert!(
+            code.contains(
+                "\"wl_surface\"=>wayland::wl_surface::Event::from_wire(msg).map(Self::WlSurface),"
+            ),
+            "a test decodes an event of any interface by its sender's interface"
+        );
+        assert!(
+            code.contains("implFrom<xdg_shell::xdg_toplevel::Request>forAnyRequest"),
+            "a test names a message of any interface by its own type"
+        );
+    }
+
+    /// `new_object` reports the one object a message creates.
+    #[test]
+    fn test_no_message_creates_two_objects() {
+        use crate::protocol::{InterfaceItem, MessageItem, ProtocolItem};
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocols = manifest_dir.join("../third_party/protocols");
+        for entry in std::fs::read_dir(protocols).expect("read the vendored protocols") {
+            let path = entry.expect("a protocol file").path();
+            if path.extension().is_none_or(|extension| extension != "xml") {
+                continue;
+            }
+            let protocol = parse(&path).expect("parse a vendored protocol");
+            for item in &protocol.items {
+                let ProtocolItem::Interface(interface) = item else {
+                    continue;
+                };
+                for item in &interface.items {
+                    let (InterfaceItem::Request(message) | InterfaceItem::Event(message)) = item
+                    else {
+                        continue;
+                    };
+                    let new_ids = message
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, MessageItem::Arg(arg) if arg.typ == "new_id"))
+                        .count();
+                    assert!(
+                        new_ids <= 1,
+                        "{}.{} creates {new_ids} objects",
+                        interface.name,
+                        message.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_test_equality_and_created_objects() {
+        let wayland = generate_compact("wayland.xml");
+        assert!(
+            wayland.contains(
+                "(Self::CreatePool{id:l_id,fd:l_fd,size:l_size},Self::CreatePool{id:r_id,fd:r_fd,size:r_size})=>{true&&l_id==r_id&&crate::test_support::same_file(l_fd,r_fd)&&l_size==r_size}"
+            ),
+            "a descriptor compares by the file it refers to"
+        );
+        assert!(
+            wayland.contains("Self::CreatePool{id,..}=>Some((*id,\"wl_shm_pool\")),"),
+            "a typed new_id creates an object of its interface"
+        );
+        assert!(
+            wayland.contains("Self::Bind{id,..}=>Some((id.2,id.0.as_str())),"),
+            "a bind creates an object of the interface it names"
+        );
+        assert!(
+            wayland.contains("Self::DataOffer{id,..}=>Some((*id,\"wl_data_offer\")),"),
+            "an event creates objects too"
+        );
     }
 }
