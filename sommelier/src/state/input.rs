@@ -2834,33 +2834,6 @@ mod tests {
     }
 
     #[test]
-    fn guest_key_owner_is_exclusive_and_source_checked() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let keyboard = HostId(10);
-        let key = 57;
-
-        assert!(ctx.claim_guest_key(keyboard, key, GuestKeyOwner::Physical));
-        for competing_owner in [GuestKeyOwner::TextInputKeysym, GuestKeyOwner::ImeRecovery] {
-            assert!(
-                !ctx.claim_guest_key(keyboard, key, competing_owner),
-                "a second source must not overwrite the live owner"
-            );
-        }
-        assert_eq!(
-            ctx.guest_key_owner(keyboard, key),
-            Some(GuestKeyOwner::Physical)
-        );
-        assert!(!ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        assert_eq!(
-            ctx.guest_key_owner(keyboard, key),
-            Some(GuestKeyOwner::Physical),
-            "a mismatched release must not steal another source's key"
-        );
-        assert!(ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::Physical));
-        assert!(ctx.guest_key_owner(keyboard, key).is_none());
-    }
-
-    #[test]
     fn guest_key_owner_matches_the_model_for_all_short_transition_sequences() {
         #[derive(Clone, Copy)]
         enum Operation {
@@ -2914,17 +2887,89 @@ mod tests {
 
     #[test]
     fn compositor_shortcut_arbitration_admits_only_unowned_or_shortcut_keys() {
-        assert!(GuestKeyOwner::admits_compositor_shortcut(None));
-        assert!(GuestKeyOwner::admits_compositor_shortcut(Some(
-            GuestKeyOwner::CompositorShortcut
-        )));
-        for owner in [
-            GuestKeyOwner::Physical,
-            GuestKeyOwner::TextInputKeysym,
-            GuestKeyOwner::ImeRecovery,
+        for (owner, admitted) in [
+            (None, true),
+            (Some(GuestKeyOwner::CompositorShortcut), true),
+            (Some(GuestKeyOwner::Physical), false),
+            (Some(GuestKeyOwner::TextInputKeysym), false),
+            (Some(GuestKeyOwner::ImeRecovery), false),
         ] {
-            assert!(!GuestKeyOwner::admits_compositor_shortcut(Some(owner)));
+            assert_eq!(
+                GuestKeyOwner::admits_compositor_shortcut(owner),
+                admitted,
+                "{owner:?}"
+            );
         }
+    }
+
+    const PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: false,
+        host_accelerator: false,
+        ime_repeat_active: false,
+    };
+    const REPEAT: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: true,
+        host_accelerator: false,
+        ime_repeat_active: false,
+    };
+    const ACCELERATOR_PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: false,
+        host_accelerator: true,
+        ime_repeat_active: false,
+    };
+
+    fn forwarded(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+        GuestKeyDecision {
+            delivery: GuestKeyDelivery::Forward,
+            ack_handled,
+            ends_repeat,
+        }
+    }
+
+    fn dropped(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+        GuestKeyDecision {
+            delivery: GuestKeyDelivery::Drop,
+            ack_handled,
+            ends_repeat,
+        }
+    }
+
+    /// Give `key` of keyboard A `event`, and check the reducer's decision.
+    fn assert_decision(
+        registry: &mut KeyGenerationRegistry,
+        key: u32,
+        event: GuestKeyEvent,
+        expected: GuestKeyDecision,
+    ) {
+        assert_eq!(
+            registry.transition_guest_key(KEYBOARD_A, key, event),
+            expected,
+            "{event:?} of key {key}"
+        );
+    }
+
+    /// [`assert_decision`] for each event of `steps` in turn.
+    fn assert_decisions(
+        registry: &mut KeyGenerationRegistry,
+        key: u32,
+        steps: &[(GuestKeyEvent, GuestKeyDecision)],
+    ) {
+        for &(event, expected) in steps {
+            assert_decision(registry, key, event, expected);
+        }
+    }
+
+    /// A registry whose compositor shortcut consumed the held `key`.
+    fn shortcut_consumed(key: u32) -> KeyGenerationRegistry {
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(KEYBOARD_A, key, 1);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::CompositorShortcutPress,
+            dropped(Some(true), false),
+        );
+        registry
     }
 
     /// The reducer used to ack a shortcut press or release as handled
@@ -2932,357 +2977,218 @@ mod tests {
     /// is now rejected: it is decided as the owner's physical event.
     #[test]
     fn compositor_shortcut_press_is_rejected_for_another_owner() {
-        let keyboard = HostId(10);
         let key = 16;
         for owner in [
             GuestKeyOwner::Physical,
             GuestKeyOwner::TextInputKeysym,
             GuestKeyOwner::ImeRecovery,
         ] {
-            let mut registry = KeyGenerationRegistry::default();
-            registry.observe_physical_state(keyboard, key, 1);
-            assert!(registry.claim_guest_owner(keyboard, key, owner));
-            let mut reference = KeyGenerationRegistry::default();
-            reference.observe_physical_state(keyboard, key, 1);
-            assert!(reference.claim_guest_owner(keyboard, key, owner));
+            // `reference` gets the physical events the shortcut stands for.
+            let owned = || {
+                let mut registry = KeyGenerationRegistry::default();
+                registry.observe_physical_state(KEYBOARD_A, key, 1);
+                assert!(registry.claim_guest_owner(KEYBOARD_A, key, owner));
+                registry
+            };
+            let (mut registry, mut reference) = (owned(), owned());
 
             let decision = registry.transition_guest_key(
-                keyboard,
+                KEYBOARD_A,
                 key,
                 GuestKeyEvent::CompositorShortcutPress,
             );
-            let duplicate = reference.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            );
-            assert_eq!(decision, duplicate, "{owner:?}");
-            assert_eq!(decision.delivery, GuestKeyDelivery::Drop, "{owner:?}");
             assert_eq!(
-                decision.ack_handled,
-                Some(owner != GuestKeyOwner::ImeRecovery),
+                decision,
+                reference.transition_guest_key(KEYBOARD_A, key, PRESS),
                 "{owner:?}"
             );
-            assert_eq!(registry.guest_owner(keyboard, key), Some(owner));
+            assert_eq!(
+                decision,
+                dropped(Some(owner != GuestKeyOwner::ImeRecovery), false),
+                "{owner:?}"
+            );
+            assert_eq!(registry.guest_owner(KEYBOARD_A, key), Some(owner));
 
             // A shortcut release of that generation is a physical release.
-            let release = registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::CompositorShortcutRelease,
-            );
             assert_eq!(
-                release,
-                reference.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
+                registry.transition_guest_key(
+                    KEYBOARD_A,
+                    key,
+                    GuestKeyEvent::CompositorShortcutRelease
+                ),
+                reference.transition_guest_key(KEYBOARD_A, key, GuestKeyEvent::PhysicalRelease),
                 "{owner:?}"
             );
             assert_eq!(
-                registry.guest_owner(keyboard, key),
-                reference.guest_owner(keyboard, key)
+                registry.guest_owner(KEYBOARD_A, key),
+                reference.guest_owner(KEYBOARD_A, key)
             );
         }
     }
 
     #[test]
     fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
-        let keyboard = HostId(10);
         let key = 16;
-        let mut registry = KeyGenerationRegistry::default();
-        registry.observe_physical_state(keyboard, key, 1);
-        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
-        let consumed = GuestKeyDecision {
-            delivery: GuestKeyDelivery::Drop,
-            ack_handled: Some(true),
-            ends_repeat: false,
-        };
-        for repeated in [false, true] {
+        let mut registry = shortcut_consumed(key);
+        for event in [PRESS, REPEAT] {
+            assert_decision(&mut registry, key, event, dropped(Some(true), false));
             assert_eq!(
-                registry.transition_guest_key(
-                    keyboard,
-                    key,
-                    GuestKeyEvent::PhysicalPress {
-                        repeated,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
-                ),
-                consumed,
-                "repeated: {repeated}"
-            );
-            assert_eq!(
-                registry.guest_owner(keyboard, key),
+                registry.guest_owner(KEYBOARD_A, key),
                 Some(GuestKeyOwner::CompositorShortcut)
             );
         }
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
-            GuestKeyDecision {
-                ends_repeat: true,
-                ..consumed
-            }
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::PhysicalRelease,
+            dropped(Some(true), true),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
 
     #[test]
     fn ime_recovery_does_not_replay_a_compositor_shortcut_key() {
-        let keyboard = HostId(10);
         let key = 16;
-        let mut registry = KeyGenerationRegistry::default();
-        registry.observe_physical_state(keyboard, key, 1);
-        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+        let mut registry = shortcut_consumed(key);
 
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "a consumed shortcut key must not reach the guest as a recovered pair"
+        // A consumed shortcut key must not reach the guest as a recovered
+        // pair, and recovery must leave its ownership for the release.
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::RecoverIme,
+            dropped(None, false),
         );
         assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::CompositorShortcut),
-            "recovery must leave shortcut ownership intact for the release"
+            registry.guest_owner(KEYBOARD_A, key),
+            Some(GuestKeyOwner::CompositorShortcut)
         );
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(true),
-                ends_repeat: true,
-            }
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::CompositorShortcutRelease,
+            dropped(Some(true), true),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
 
     #[test]
     fn guest_key_reducer_couples_delivery_ack_and_generation_ownership() {
-        let keyboard = HostId(10);
-        let physical_key = 30;
-        let accelerator_key = 31;
-        let keysym_key = 32;
         let mut registry = KeyGenerationRegistry::default();
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::TextInputPress { serial: 1 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "a second protocol channel cannot duplicate the physical press"
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: true,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::PhysicalRelease,),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: true,
-            }
+        let physical_key = 30;
+        assert_decisions(
+            &mut registry,
+            physical_key,
+            &[
+                (PRESS, forwarded(Some(true), false)),
+                // A second protocol channel cannot duplicate the press.
+                (
+                    GuestKeyEvent::TextInputPress { serial: 1 },
+                    dropped(None, false),
+                ),
+                (REPEAT, forwarded(Some(true), false)),
+                (GuestKeyEvent::PhysicalRelease, forwarded(Some(true), true)),
+                (
+                    GuestKeyEvent::RecoverIme,
+                    GuestKeyDecision {
+                        delivery: GuestKeyDelivery::EmitBalancedPair,
+                        ack_handled: None,
+                        ends_repeat: false,
+                    },
+                ),
+                // A delayed physical press cannot duplicate the recovered
+                // pair.
+                (
+                    GuestKeyEvent::PhysicalPress {
+                        repeated: false,
+                        host_accelerator: false,
+                        ime_repeat_active: true,
+                    },
+                    dropped(Some(false), false),
+                ),
+            ],
         );
 
-        assert_eq!(
-            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::RecoverIme,),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::EmitBalancedPair,
-                ack_handled: None,
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: true,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            },
-            "delayed physical delivery cannot duplicate a recovered pair"
+        // An accelerator release cannot escape without a guest press.
+        let accelerator_key = 31;
+        assert_decisions(
+            &mut registry,
+            accelerator_key,
+            &[
+                (ACCELERATOR_PRESS, dropped(Some(false), false)),
+                (GuestKeyEvent::PhysicalRelease, dropped(Some(false), true)),
+            ],
         );
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                accelerator_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: true,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                accelerator_key,
-                GuestKeyEvent::PhysicalRelease,
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: true,
-            },
-            "an accelerator release cannot escape without a guest press"
-        );
-
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                keysym_key,
-                GuestKeyEvent::TextInputPress { serial: 10 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: None,
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, keysym_key, GuestKeyEvent::TextInputRepeat,)
-                .delivery,
-            GuestKeyDelivery::Forward
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                keysym_key,
-                GuestKeyEvent::TextInputRelease { serial: 11 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: None,
-                ends_repeat: true,
-            }
-        );
-        assert_eq!(
-            registry
-                .transition_guest_key(
-                    keyboard,
-                    keysym_key,
+        // Each synthetic press has exactly one releasable owner.
+        let keysym_key = 32;
+        assert_decisions(
+            &mut registry,
+            keysym_key,
+            &[
+                (
+                    GuestKeyEvent::TextInputPress { serial: 10 },
+                    forwarded(None, false),
+                ),
+                (GuestKeyEvent::TextInputRepeat, forwarded(None, false)),
+                (
+                    GuestKeyEvent::TextInputRelease { serial: 11 },
+                    forwarded(None, true),
+                ),
+                (
                     GuestKeyEvent::TextInputRelease { serial: 12 },
-                )
-                .delivery,
-            GuestKeyDelivery::Drop,
-            "each synthetic press has exactly one releasable owner"
+                    dropped(None, false),
+                ),
+            ],
         );
     }
 
     #[test]
     fn guest_key_reducer_prevents_keysym_from_bypassing_accelerator_generation() {
-        let keyboard = HostId(10);
         let key = 57;
         let mut registry = KeyGenerationRegistry::default();
 
-        registry.observe_peek_press(keyboard, key, 10, 100, false);
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::TextInputPress { serial: 10 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "an ineligible held peek generation is already known to be a host accelerator"
+        // An ineligible held peek generation is already known to be a host
+        // accelerator.
+        registry.observe_peek_press(KEYBOARD_A, key, 10, 100, false);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::TextInputPress { serial: 10 },
+            dropped(None, false),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: true,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            }
+        // The text-input channel must also honor explicit accelerator
+        // suppression.
+        assert_decisions(
+            &mut registry,
+            key,
+            &[
+                (ACCELERATOR_PRESS, dropped(Some(false), false)),
+                (
+                    GuestKeyEvent::TextInputPress { serial: 11 },
+                    dropped(None, false),
+                ),
+            ],
         );
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 11 },)
-                .delivery,
-            GuestKeyDelivery::Drop,
-            "the text-input channel must also honor explicit accelerator suppression"
+        registry.observe_peek_release(KEYBOARD_A, key, 12);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::PhysicalRelease,
+            dropped(Some(false), true),
         );
-        registry.observe_peek_release(keyboard, key, 12);
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: true,
-            }
-        );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 13 },)
-                .delivery,
-            GuestKeyDelivery::Forward,
-            "accelerator suppression must not leak into the next released generation"
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
+
+        // Accelerator suppression must not leak into the next released
+        // generation.
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::TextInputPress { serial: 13 },
+            forwarded(None, false),
         );
     }
 
@@ -3327,16 +3233,8 @@ mod tests {
                 encoded /= operations.len();
                 serial = serial.wrapping_add(1);
                 let event = match operation {
-                    Operation::PhysicalPress => GuestKeyEvent::PhysicalPress {
-                        repeated: false,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
-                    Operation::PhysicalRepeat => GuestKeyEvent::PhysicalPress {
-                        repeated: true,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
+                    Operation::PhysicalPress => PRESS,
+                    Operation::PhysicalRepeat => REPEAT,
                     Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
                     Operation::TextPress => GuestKeyEvent::TextInputPress { serial },
                     Operation::TextRepeat => GuestKeyEvent::TextInputRepeat,
@@ -3982,38 +3880,32 @@ mod tests {
         assert!(peek.eligible);
     }
 
+    /// A physical press that reaches the proxy after the IME's keysym press
+    /// of the same key joins that press's generation.
     #[test]
-    fn delayed_keyboard_press_preserves_keysym_release_owner() {
-        let keyboard = HostId(10);
+    fn delayed_physical_press_preserves_keysym_release_owner() {
+        type ObservePress = fn(&mut KeyGenerationRegistry, u32);
+        let channels: [(&str, ObservePress); 2] = [
+            ("wl_keyboard", |registry, key| {
+                registry.observe_physical_state(KEYBOARD_A, key, 1)
+            }),
+            ("peek", |registry, key| {
+                registry.observe_peek_press(KEYBOARD_A, key, 1, 10, true);
+            }),
+        ];
         let key = 30;
-        let mut registry = KeyGenerationRegistry::default();
+        for (channel, observe_press) in channels {
+            let mut registry = KeyGenerationRegistry::default();
+            assert!(registry.claim_guest_owner(KEYBOARD_A, key, GuestKeyOwner::TextInputKeysym));
+            observe_press(&mut registry, key);
 
-        assert!(registry.claim_guest_owner(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        registry.observe_physical_state(keyboard, key, 1);
-
-        assert!(registry.physically_held(keyboard, key));
-        assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::TextInputKeysym),
-            "the duplicate keyboard channel must not orphan the synthetic press"
-        );
-    }
-
-    #[test]
-    fn delayed_peek_press_preserves_keysym_release_owner() {
-        let keyboard = HostId(10);
-        let key = 30;
-        let mut registry = KeyGenerationRegistry::default();
-
-        assert!(registry.claim_guest_owner(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        registry.observe_peek_press(keyboard, key, 1, 10, true);
-
-        assert!(registry.physically_held(keyboard, key));
-        assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::TextInputKeysym),
-            "a delayed peek must not orphan the synthetic press"
-        );
+            assert!(registry.physically_held(KEYBOARD_A, key), "{channel}");
+            assert_eq!(
+                registry.guest_owner(KEYBOARD_A, key),
+                Some(GuestKeyOwner::TextInputKeysym),
+                "a delayed {channel} press must not orphan the synthetic press"
+            );
+        }
     }
 
     #[test]
