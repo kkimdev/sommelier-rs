@@ -838,7 +838,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // the sender for get_extended_keyboard requests.
             let bound_version = keyboard_extension_version(version);
             let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
-            ctx.host_keyboard_extension_id = Some(HostId::from_allocated(host_id));
+            ctx.host_keyboard_extension_id = Some(HostId(host_id));
             ctx.host_keyboard_extension_global_name = Some(name);
 
             let registry_host_id = ctx.last_sender_id;

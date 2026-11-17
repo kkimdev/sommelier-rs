@@ -386,7 +386,7 @@ impl KeyboardHandler {
                 let extended_version = ctx
                     .shadow_table
                     .host_object_version_or_unknown(extension_host_id.0);
-                let host_extended_id = HostId::from_allocated(
+                let host_extended_id = HostId(
                     ctx.shadow_table
                         .create_host_only("zcr_extended_keyboard_v1", extended_version),
                 );

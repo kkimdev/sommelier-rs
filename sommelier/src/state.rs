@@ -96,16 +96,6 @@ impl HostId {
     pub(crate) fn from_event_sender(ctx: &Context) -> Self {
         Self(ctx.last_sender_id)
     }
-
-    /// Wrap the ID of a host object a [`ShadowTable`] constructor just
-    /// created, such as [`ShadowTable::create_host_only`].
-    ///
-    /// Using this constructor rather than the bare `HostId(raw)` tuple syntax
-    /// states where the ID came from.
-    #[inline]
-    pub(crate) fn from_allocated(id: u32) -> Self {
-        Self(id)
-    }
 }
 
 /// Metadata for one global advertised by the host compositor.
