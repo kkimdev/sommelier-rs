@@ -39,6 +39,10 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = { version = "1.1", default-features = false, features = ["parse", "serde", "std"] }
 
+[dev-dependencies]
+# `test-util` pauses the Tokio clock, for tests that order timers.
+tokio = { version = "1.49", features = ["test-util"] }
+
 [build-dependencies]
 wayland_codegen = { path = "../wayland_codegen" }
 

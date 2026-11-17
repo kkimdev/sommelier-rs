@@ -999,23 +999,80 @@ mod tests {
         let listener = UnixListener::bind(dir.path().join("socket")).expect("bind listener");
         let config = test_client_config();
         assert!(config.placement.reload().is_none(), "no file to reload");
-        let serving = serve(listener, config, install_reload_signal());
-        tokio::pin!(serving);
-        // Poll once: serve starts waiting for clients and signals.
-        tokio::select! {
-            biased;
-            () = &mut serving => unreachable!("serve runs until the process ends"),
-            () = std::future::ready(()) => {}
-        }
-
-        // Without a handler this would terminate the test process.
-        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        let local = tokio::task::LocalSet::new();
+        let serving = local.spawn_local(serve(listener, config, install_reload_signal()));
+        local
+            .run_until(async {
+                // Let serve start its reload task and wait for clients.
+                tokio::task::yield_now().await;
+                // Without a handler this would terminate the test process.
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            })
+            .await;
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut serving)
-                .await
-                .is_err(),
+            !serving.is_finished(),
             "the proxy keeps serving after the logged no-op reload"
         );
+    }
+
+    /// A reload must not wait for the accept loop's retry pause.
+    #[tokio::test(start_paused = true)]
+    async fn reload_does_not_wait_for_the_accept_retry_pause() {
+        use crate::window_layout::WindowLayoutAction;
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+
+        let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
+        let dir = crate::test_support::TempDir::new("reload-during-retry");
+        let shortcuts = dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
+        );
+        let placement = Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&shortcuts),
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
+        assert_eq!(placement.action_for(&alt_q), Some(WindowLayoutAction::Left));
+        let config = ClientConfig {
+            placement: Arc::clone(&placement),
+            ..test_client_config()
+        };
+        // Every accept on a socket that never listened fails at once, so the
+        // accept loop is in its retry pause from the first step on.
+        let not_listening = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("create a socket");
+        let listener =
+            UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
+                .expect("register the socket");
+
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(listener, config, install_reload_signal()));
+        local
+            .run_until(async {
+                tokio::task::yield_now().await;
+                let started = tokio::time::Instant::now();
+                dir.write(
+                    "shortcuts.toml",
+                    b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
+                );
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                // The clock is paused, so it moves only while every task waits.
+                while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    started.elapsed() < ACCEPT_RETRY_DELAY,
+                    "the reload waited {:?} for the accept loop",
+                    started.elapsed()
+                );
+            })
+            .await;
     }
 
     /// A VirtWL transaction carries at most 28 descriptors, so a batch that
@@ -4301,26 +4358,28 @@ fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flo
 /// shortcut configuration on each `reload_signal`.
 ///
 /// A failure concerning one client is logged and ends only that client.
-/// `reload_and_log` owns what a reload means, including a logged no-op
-/// when there is no file.
+/// Must run inside a `LocalSet`, like the clients it spawns.
 async fn serve(
     listener: UnixListener,
     config: ClientConfig,
-    mut reload_signal: Option<tokio::signal::unix::Signal>,
+    reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
+    if let Some(signal) = reload_signal {
+        let reloads =
+            tokio::task::spawn_local(reload_on_signal(signal, Arc::clone(&config.placement)));
+        // SIGHUP stays handled after the task ends (its signal stream
+        // closed, or a reload panicked), so say that reloads have stopped.
+        tokio::task::spawn_local(async move {
+            match reloads.await {
+                Ok(()) => log::error!("SIGHUP reloads have stopped: the signal stream ended"),
+                Err(error) => log::error!("SIGHUP reloads have stopped: {error}"),
+            }
+        });
+    }
     // Log a run of failed accepts once, not every retry.
     let mut accept_failing = false;
     loop {
-        let accepted = tokio::select! {
-            // The reload runs on this event loop between accepts, so
-            // it never races a key event.
-            Some(()) = next_reload_signal(&mut reload_signal) => {
-                config.placement.reload_and_log();
-                continue;
-            }
-            accepted = listener.accept() => accepted,
-        };
-        match accepted {
+        match listener.accept().await {
             Ok((stream, _)) => {
                 if std::mem::take(&mut accept_failing) {
                     log::info!("Accepting clients again");
@@ -4394,7 +4453,8 @@ async fn connect_host(
 /// Install the `SIGHUP` handler that reloads the shortcut configuration file.
 ///
 /// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
-/// the signal through its own self-pipe; [`serve`] runs the reload. `main`
+/// the signal through its own self-pipe; [`reload_on_signal`] runs the
+/// reload. `main`
 /// installs it before anything else can take long, whatever the
 /// configuration.
 ///
@@ -4412,10 +4472,18 @@ pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
         })
         .ok()
 }
-/// Wait for the next shortcut reload signal; never resolves without one.
-async fn next_reload_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
-    match signal {
-        Some(signal) => signal.recv().await,
-        None => std::future::pending().await,
+/// Reload the shortcut configuration on each `signal`.
+///
+/// A task of its own, so a reload never waits behind the accept loop (its
+/// retry pause, or a client's host connection). It runs on the proxy's one
+/// thread between other tasks' steps, so it never races a key event.
+/// `PlacementConfig::reload_and_log` owns what a reload means, including
+/// the logged no-op when there is no file.
+async fn reload_on_signal(
+    mut signal: tokio::signal::unix::Signal,
+    placement: Arc<PlacementConfig>,
+) {
+    while signal.recv().await.is_some() {
+        placement.reload_and_log();
     }
 }

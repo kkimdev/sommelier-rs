@@ -295,9 +295,11 @@ kill -HUP "$SOMMELIER_PID"
   without reloads.
 
 Signal delivery goes through Tokio's signal driver (an internal self-pipe), and
-the reload runs on the proxy's single-threaded event loop between client
-accepts, so it never races a key event. The file is read synchronously there;
-the 64 KiB bound and the regular-file check keep that read short.
+the reload runs in `reload_on_signal`, a task of its own on the proxy's one
+thread: it runs between other tasks' steps, so it never races a key event,
+and it never waits for the accept loop. The file is read synchronously
+there; the 64 KiB bound and the regular-file check keep that read short. If
+that task ends, an error says reloads have stopped.
 
 ## Code map
 
@@ -317,7 +319,7 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
 | `sommelier/src/main.rs` | The `--window-shortcuts-config` option, and when the `SIGHUP` handler is installed. |
-| `sommelier/src/proxy.rs` | Shares the configuration with every connection; `install_reload_signal` installs the `SIGHUP` handler and the accept loop runs reloads. |
+| `sommelier/src/proxy.rs` | Shares the configuration with every connection; `install_reload_signal` installs the `SIGHUP` handler and `reload_on_signal` runs reloads. |
 
 ## Not carried over from the earlier draft
 
