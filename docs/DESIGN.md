@@ -192,6 +192,24 @@ Two mechanisms let a handler act outside its own message:
   `state::InternalCallbacks` records what it waits for, such as the
   text-input drain or the placement barrier.
 
+### Double-buffered state
+
+The convention for state that a request sets and a later commit applies
+is one `#[derive(Default)]` struct per site, named for it. Requests write
+its fields, and the commit applies them by destructuring
+`std::mem::take(&mut self.pending)`, naming every field. Taking it resets
+the pending state in one step, and a new field the commit never applies
+becomes an unused variable, which CI rejects. There is no generic
+`DoubleBuffered<T>`: each commit applies its fields in its own way.
+
+- `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
+  attachment, damage, scale, transform, offsets and viewport.
+- The `pending_*` fields of `TextInputState` (`input.rs`) predate it and
+  have not moved yet.
+- `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
+  edits a copy-on-write `Option<OutputState>` of the whole state, which
+  `wl_output.done` publishes.
+
 ### Synthetic objects
 
 Some guest objects have no host counterpart and are implemented inside the
