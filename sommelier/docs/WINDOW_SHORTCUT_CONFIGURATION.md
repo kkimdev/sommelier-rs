@@ -287,12 +287,12 @@ kill -HUP "$SOMMELIER_PID"
 - A reload never changes the gate, the ARC policy, ARC identities, Aura
   objects, or pending bounds barriers, and it never re-reads an environment
   variable.
-- With `--window-shortcuts-config`, the `SIGHUP` handler is installed right
-  after argument parsing, before the file is first read. If no file is in use
-  (the policy is off, or startup could not use the file at all), `SIGHUP` is
-  logged and ignored. If the handler cannot be installed, that is logged and
-  the proxy runs without reloads. Without the option, `SIGHUP` keeps its
-  default action and terminates the proxy.
+- The `SIGHUP` handler is installed in every configuration, right after
+  argument parsing and before the file is first read, so `SIGHUP` never
+  terminates the proxy. If no file is in use (no option, the policy is off,
+  or startup could not use the file at all), `SIGHUP` is logged and ignored.
+  If the handler cannot be installed, that is logged and the proxy runs
+  without reloads.
 
 Signal delivery goes through Tokio's signal driver (an internal self-pipe), and
 the reload runs on the proxy's single-threaded event loop between client
@@ -316,8 +316,8 @@ the 64 KiB bound and the regular-file check keep that read short.
 | `sommelier/src/handler/window_placement.rs` | Placement mechanics: the focused toplevel and its output, the ARC identity (`set_aura_application_id` chooses it or the guest's ID for XDG and GTK), `set_window_bounds` and its barrier, and the configures held behind it. Protocol handlers call one entry point per event (listed in its module docs). |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
-| `sommelier/src/main.rs` | The `--window-shortcuts-config` option and the `SIGHUP` handler. |
-| `sommelier/src/proxy.rs` | Shares the configuration with every connection and runs reloads in the accept loop. |
+| `sommelier/src/main.rs` | The `--window-shortcuts-config` option, and when the `SIGHUP` handler is installed. |
+| `sommelier/src/proxy.rs` | Shares the configuration with every connection; `install_reload_signal` installs the `SIGHUP` handler and the accept loop runs reloads. |
 
 ## Not carried over from the earlier draft
 

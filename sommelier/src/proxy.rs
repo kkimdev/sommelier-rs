@@ -1001,6 +1001,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sighup_without_a_shortcuts_file_does_not_end_the_proxy() {
+        let dir = crate::test_support::TempDir::new("sighup");
+        let listener = UnixListener::bind(dir.path().join("socket")).expect("bind listener");
+        let config = test_client_config();
+        assert!(config.placement.reload().is_none(), "no file to reload");
+        let serving = serve(listener, config, install_reload_signal());
+        tokio::pin!(serving);
+        // Poll once: serve starts waiting for clients and signals.
+        tokio::select! {
+            biased;
+            () = &mut serving => unreachable!("serve runs until the process ends"),
+            () = std::future::ready(()) => {}
+        }
+
+        // Without a handler this would terminate the test process.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut serving)
+                .await
+                .is_err(),
+            "the proxy keeps serving after the logged no-op reload"
+        );
+    }
+
+    #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
         use std::os::unix::net::UnixStream;
 
@@ -4119,9 +4144,11 @@ pub async fn run(
 }
 
 /// Accept guest clients for the life of the process, and reload the
-/// shortcut configuration on each reload signal.
+/// shortcut configuration on each `reload_signal`.
 ///
 /// A failure concerning one client is logged and ends only that client.
+/// `reload_and_log` owns what a reload means, including a logged no-op
+/// when there is no file.
 async fn serve(
     listener: UnixListener,
     config: ClientConfig,
@@ -4210,6 +4237,27 @@ async fn connect_host(
     Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
 }
 
+/// Install the `SIGHUP` handler that reloads the shortcut configuration file.
+///
+/// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
+/// the signal through its own self-pipe; [`serve`] runs the reload. `main`
+/// installs it before anything else can take long, whatever the
+/// configuration.
+///
+/// # Returns
+///
+/// `None` when the handler cannot be installed. That is logged and is not
+/// fatal: the proxy runs without reloads.
+pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .inspect_err(|error| {
+            log::error!(
+                "Failed to install the SIGHUP shortcut reload handler; reloads are disabled: {}",
+                error
+            );
+        })
+        .ok()
+}
 /// Wait for the next shortcut reload signal; never resolves without one.
 async fn next_reload_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
     match signal {

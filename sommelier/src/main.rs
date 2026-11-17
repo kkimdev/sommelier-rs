@@ -122,9 +122,8 @@ async fn main() {
     let xdg_decoration = args.xdg_decoration;
     let mut virtio_wl = args.virtio_wl;
     let shortcuts_file = args.window_shortcuts_config.as_deref();
-    // The reload handler is installed right after argument parsing, before
-    // the file is first read, so it is already in place for the first read.
-    let reload_signal = shortcuts_file.and_then(|_| install_reload_signal());
+    // Before the shortcut file is first read (see `prepare_process`).
+    let reload_signal = prepare_process();
     // Never fatal: a configuration problem is logged once and leaves
     // placement shortcuts disabled, because this proxy serves every app.
     let placement = Arc::new(placement_config::PlacementConfig::from_environment(
@@ -156,23 +155,26 @@ async fn main() {
     .await;
 }
 
-/// Install the `SIGHUP` handler that reloads the shortcut configuration file.
+/// Prepare the process to serve, before anything slow happens.
 ///
-/// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
-/// the signal through its own self-pipe; the proxy's accept loop runs the
-/// reload.
-///
-/// # Returns
-///
-/// `None` when the handler cannot be installed. That is logged and is not
-/// fatal: the proxy runs without reloads.
-fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
-    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .inspect_err(|error| {
-            log::error!(
-                "Failed to install the SIGHUP shortcut reload handler; reloads are disabled: {}",
-                error
-            );
-        })
-        .ok()
+/// Installs the `SIGHUP` reload handler in every configuration: from here
+/// on a `SIGHUP` reloads the shortcut configuration (a logged no-op when
+/// there is none) instead of taking the default action, which would end
+/// the proxy and every Linux GUI app with it.
+fn prepare_process() -> Option<tokio::signal::unix::Signal> {
+    proxy::install_reload_signal()
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn sighup_after_process_preparation_reaches_the_reload_handler() {
+        let mut reload_signal = super::prepare_process().expect("install the SIGHUP handler");
+        // Without the handler, this would terminate the test process.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reload_signal.recv())
+            .await
+            .expect("the handler receives the signal")
+            .expect("the signal stream stays open");
+    }
 }
