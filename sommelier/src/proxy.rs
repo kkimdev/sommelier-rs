@@ -3270,7 +3270,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the activation barrier"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert_eq!(
             ctx.host_to_client_queue.len(),
             initial_guest_events + 1,
@@ -3285,7 +3285,7 @@ mod tests {
             "wl_display",
             delete_id.build_message(1, wl_display::EVT_DELETE_ID),
         );
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(!ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(ctx.shadow_table.is_host_id_available(callback_id.0));
         assert_eq!(
             ctx.host_to_client_queue.len(),
@@ -3420,7 +3420,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "the old callback must be consumed even after guest ID reuse"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
         dispatch_raw_event(
             &mut handler,
@@ -3578,7 +3578,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the old focus barrier"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
 
         ctx.client_to_host_queue.clear();

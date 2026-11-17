@@ -1964,9 +1964,7 @@ mod tests {
         assert!(!ctx
             .shadow_table
             .is_pending_destroy_guest(first_guest_buffer));
-        assert!(!ctx
-            .shadow_table
-            .is_pending_destroy_host_only(host_buffer_id));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer_id));
         assert!(ctx.host_to_client_queue.is_empty());
         assert_eq!(
             ctx.client_to_host_queue.len(),

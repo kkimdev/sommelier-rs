@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(handler.on_done(&mut ctx, 0), Action::Drop);
         assert!(ctx.dmabuf_capabilities[&generation].ready);
         assert_eq!(ctx.internal_callbacks.get(HostId(callback_id)), None);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
+        assert!(ctx.shadow_table.is_retired_host(callback_id));
     }
 
     #[test]
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_id), None);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_retired_host(host_id));
         assert!(!ctx.shadow_table.is_host_id_available(host_id));
 
         ctx.last_sender_id = 1;
@@ -184,7 +184,7 @@ mod tests {
             2,
             "the guest already received its callback delete_id"
         );
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(!ctx.shadow_table.is_retired_host(host_id));
         assert!(ctx.shadow_table.is_host_id_available(host_id));
     }
 
@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
         assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id));
+        assert!(ctx.shadow_table.is_retired_host(callback_id));
         assert!(!ctx.shadow_table.is_host_id_available(callback_id));
 
         ctx.last_sender_id = 1;
@@ -234,9 +234,7 @@ mod tests {
                 .active_barrier_for_toplevel(zaura_toplevel_id),
             Some(new_callback_id)
         );
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(old_callback_id));
+        assert!(ctx.shadow_table.is_retired_host(old_callback_id));
         assert_eq!(
             ctx.internal_callbacks.get(HostId(new_callback_id)),
             Some(InternalCallback::WindowBoundsBarrier {
@@ -248,8 +246,6 @@ mod tests {
         assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
         assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
         assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(new_callback_id));
+        assert!(ctx.shadow_table.is_retired_host(new_callback_id));
     }
 }

@@ -1404,7 +1404,7 @@ mod tests {
             None
         );
         assert_eq!(ctx.shadow_table.get_host_interface(aura_id), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(ctx.shadow_table.is_retired_host(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
     }
 
@@ -1524,12 +1524,12 @@ mod tests {
                 (xdg_toplevel_id + 100, REQ_DESTROY_XDG_TOPLEVEL),
             ]
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(ctx.shadow_table.is_retired_host(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
 
         ctx.last_sender_id = 1;
         assert_eq!(DisplayHandler.on_delete_id(&mut ctx, aura_id), Action::Drop);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(!ctx.shadow_table.is_retired_host(aura_id));
         assert!(ctx.shadow_table.is_host_id_available(aura_id));
     }
 

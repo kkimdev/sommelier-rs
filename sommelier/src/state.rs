@@ -1076,7 +1076,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let host_id = ctx.shadow_table.create_host_only("wl_shm_pool", 1);
         ctx.retire_destroyed_host_object(host_id);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_retired_host(host_id));
         assert!(!ctx.is_fatal());
 
         // A second retirement means the bookkeeping diverged.

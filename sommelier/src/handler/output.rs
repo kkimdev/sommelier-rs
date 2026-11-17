@@ -710,9 +710,7 @@ mod tests {
         assert!(ctx.outputs.primary().is_none());
         assert!(ctx.outputs.is_empty_for_test());
         assert!(ctx.shadow_table.is_pending_destroy_guest(output_guest));
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
+        assert!(ctx.shadow_table.is_retired_host(AURA_OUTPUT_HOST));
     }
 
     /// Before `zaura_output.release` the Aura output has no destructor: it is
@@ -740,9 +738,7 @@ mod tests {
         );
         let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(queued, vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)]);
-        assert!(!ctx
-            .shadow_table
-            .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
+        assert!(ctx.shadow_table.is_retired_host(AURA_OUTPUT_HOST));
         assert_eq!(ctx.shadow_table.get_host_interface(AURA_OUTPUT_HOST), None);
         assert!(!ctx.shadow_table.is_host_id_available(AURA_OUTPUT_HOST));
     }

@@ -114,11 +114,11 @@ enum HostObject {
     },
     /// A live object that only the proxy uses.
     HostOnly(Interface),
-    /// An object whose destructor is queued, until the host's `delete_id`.
-    AwaitingDeleteId,
-    /// An object without a destructor that nothing uses any more. Nothing
-    /// frees its ID but a `delete_id` the host sends anyway.
-    ReservedForConnection,
+    /// An object the proxy no longer uses, whose ID stays in use until the
+    /// host's `delete_id`: one whose destructor is queued, or one without a
+    /// destructor, which keeps its ID for the connection unless the host
+    /// sends a `delete_id` anyway.
+    Retired,
 }
 
 impl HostObject {
@@ -133,7 +133,7 @@ impl HostObject {
     fn interface(&self) -> Option<&Interface> {
         match self {
             Self::Paired { interface, .. } | Self::HostOnly(interface) => Some(interface),
-            Self::AwaitingDeleteId | Self::ReservedForConnection => None,
+            Self::Retired => None,
         }
     }
 }
@@ -661,7 +661,7 @@ impl ShadowTable {
             );
             return;
         }
-        self.hosts.insert(host, HostObject::ReservedForConnection);
+        self.hosts.insert(host, HostObject::Retired);
     }
 
     /// Apply the host's `wl_display.delete_id` for `host_id`.
@@ -745,7 +745,7 @@ impl ShadowTable {
     /// is free at once.
     fn retire_destroyed_host(&mut self, host: HostId) {
         if self.host_ids.contains(host.0) {
-            self.hosts.insert(host, HostObject::AwaitingDeleteId);
+            self.hosts.insert(host, HostObject::Retired);
         } else {
             self.hosts.remove(&host);
         }
@@ -851,12 +851,10 @@ impl ShadowTable {
         host_id > 1 && !self.hosts.contains_key(&HostId(host_id))
     }
 
+    /// Return whether host ID `host_id` holds a retired object.
     #[cfg(test)]
-    pub fn is_pending_destroy_host_only(&self, host_id: u32) -> bool {
-        matches!(
-            self.hosts.get(&HostId(host_id)),
-            Some(HostObject::AwaitingDeleteId)
-        )
+    pub fn is_retired_host(&self, host_id: u32) -> bool {
+        matches!(self.hosts.get(&HostId(host_id)), Some(HostObject::Retired))
     }
 }
 
@@ -1097,7 +1095,7 @@ mod tests {
 
         table.guest_ended_host_destroyed(20);
         assert!(table.is_guest_id_available(20));
-        assert!(table.is_pending_destroy_host_only(host));
+        assert!(table.is_retired_host(host));
         assert!(!table.is_event_sender_known(host));
         assert_eq!(table.release_deleted_host_id(host), DeletedHostId::HostOnly);
         assert!(table.is_host_id_available(host));
@@ -1130,7 +1128,7 @@ mod tests {
         // it yet. The dispatch metadata is retired immediately while the
         // numeric ID remains unavailable for reuse.
         assert!(table.host_destroy_queued(40));
-        assert!(table.is_pending_destroy_host_only(40));
+        assert!(table.is_retired_host(40));
         assert!(!table.is_event_sender_known(40));
         assert!(!table.is_host_id_available(40));
         assert!(!table.host_destroy_queued(40), "it is retired once");
@@ -1138,7 +1136,7 @@ mod tests {
         // The host acknowledgement is the only point at which the reservation
         // can be released.
         assert_eq!(table.release_deleted_host_id(40), DeletedHostId::HostOnly);
-        assert!(!table.is_pending_destroy_host_only(40));
+        assert!(!table.is_retired_host(40));
         assert!(table.is_host_id_available(40));
     }
 
@@ -1290,6 +1288,7 @@ mod tests {
         assert!(table.host_destroy_queued(host_id));
 
         table.retire_host(host_id);
+        assert!(table.is_retired_host(host_id));
         assert!(!table.is_event_sender_known(host_id));
         assert!(!table.is_host_id_available(host_id));
         assert_ne!(table.allocate_host_id(), HostId(host_id));

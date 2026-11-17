@@ -2891,7 +2891,7 @@ mod tests {
         assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
         assert!(ctx.shadow_table.is_guest_id_available(guest_id));
         assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_retired_host(host_id));
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(
             crate::test_support::msg_opcode(&ctx.client_to_host_queue[0].0),
@@ -3310,7 +3310,7 @@ mod tests {
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());
@@ -3356,7 +3356,7 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());
@@ -3380,7 +3380,7 @@ mod tests {
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());

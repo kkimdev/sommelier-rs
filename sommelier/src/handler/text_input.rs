@@ -3157,7 +3157,7 @@ mod tests {
         ctx.last_sender_id = callback_id.0;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
         assert!(ctx.text_inputs[&guest_id].host_is_active());
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert_eq!(ctx.client_to_host_queue.len(), 3);
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), host_v1_id);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);

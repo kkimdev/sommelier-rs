@@ -1716,7 +1716,7 @@ mod tests {
                 crate::protocols::aura_shell::zaura_output::REQ_RELEASE
             )]
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_output));
+        assert!(ctx.shadow_table.is_retired_host(aura_output));
         assert!(ctx.outputs.is_empty_for_test());
         assert_eq!(ctx.shadow_table.get_host_id(20), Some(output_host));
     }

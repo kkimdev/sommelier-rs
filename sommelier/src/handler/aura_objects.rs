@@ -278,7 +278,7 @@ mod tests {
                 queued_headers(&ctx.client_to_host_queue),
                 vec![(id, release_opcode)]
             );
-            assert!(ctx.shadow_table.is_pending_destroy_host_only(id));
+            assert!(ctx.shadow_table.is_retired_host(id));
 
             let mut ctx = ctx_with_shell(since - 1);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
@@ -289,7 +289,7 @@ mod tests {
                 "{child:?} has no destructor"
             );
             assert_eq!(ctx.shadow_table.get_host_interface(id), None);
-            assert!(!ctx.shadow_table.is_pending_destroy_host_only(id));
+            assert!(ctx.shadow_table.is_retired_host(id));
             assert!(!ctx.shadow_table.is_host_id_available(id));
         }
     }
