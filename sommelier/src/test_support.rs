@@ -55,15 +55,25 @@ pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
         .collect()
 }
 
+/// Each complete message at the start of a Wayland byte stream, up to a
+/// partial or corrupt one, with its payload.
+pub fn frames(mut stream: &[u8]) -> impl Iterator<Item = (MessageHeader, &[u8])> {
+    std::iter::from_fn(move || {
+        let Framing::Complete(header) = MessageHeader::frame(stream) else {
+            return None;
+        };
+        let (message, rest) = stream.split_at(header.len);
+        stream = rest;
+        Some((header, &message[MessageHeader::LEN..]))
+    })
+}
+
 /// The `(sender, opcode)` of every complete message at the start of a
 /// Wayland byte stream, up to a partial or corrupt one.
-pub fn stream_headers(mut stream: &[u8]) -> Vec<(u32, u16)> {
-    let mut headers = Vec::new();
-    while let Framing::Complete(header) = MessageHeader::frame(stream) {
-        headers.push((header.sender_id, header.opcode));
-        stream = &stream[header.len..];
-    }
-    headers
+pub fn stream_headers(stream: &[u8]) -> Vec<(u32, u16)> {
+    frames(stream)
+        .map(|(header, _)| (header.sender_id, header.opcode))
+        .collect()
 }
 
 /// The `(device, inode)` pair of an open file description.

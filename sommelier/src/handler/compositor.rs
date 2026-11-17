@@ -2977,30 +2977,27 @@ mod tests {
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
-        assert_eq!(
-            handler.on_set_buffer_scale(&mut ctx, 0),
-            Action::Drop,
-            "wl_surface.set_buffer_scale(0) is a protocol error"
-        );
-        assert_eq!(
-            handler.on_set_buffer_scale(&mut ctx, -2),
-            Action::Drop,
-            "negative buffer scales must not enter pending state"
-        );
-        assert_eq!(
-            handler.on_set_buffer_transform(&mut ctx, 8),
-            Action::Drop,
-            "wl_output.transform values are limited to 0..=7"
-        );
+        // A client gets one error, so each rejection starts afresh.
+        let mut rejected = |reject: &dyn Fn(&mut CompositorHandler, &mut Context) -> Action,
+                            code: u32| {
+            ctx.host_to_client_queue.clear();
+            ctx.clear_protocol_error_for_test();
+            assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
+            assert!(ctx.fatal_protocol_error);
+            assert_eq!(ctx.host_to_client_queue.len(), 1);
+            assert_eq!(protocol_error_code(&ctx), code);
+        };
+        // wl_surface.invalid_scale for 0 and negative scales, and
+        // invalid_transform outside wl_output.transform's 0..=7.
+        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, 0), 0);
+        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, -2), 0);
+        rejected(&|handler, ctx| handler.on_set_buffer_transform(ctx, 8), 1);
         assert!(
             ctx.surfaces.get(&surface_id).is_none_or(|surface| {
                 surface.pending_buffer_scale.is_none() && surface.pending_buffer_transform.is_none()
             }),
             "invalid requests must not create or mutate pending surface state"
         );
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-        assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
     }
 
     #[test]
@@ -3024,7 +3021,7 @@ mod tests {
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.shadow_table
             .track_interface_with_version(surface_id, "wl_surface".to_string(), 4);
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
@@ -3611,13 +3608,13 @@ mod tests {
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
@@ -3636,7 +3633,7 @@ mod tests {
             Action::Forward
         );
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.last_sender_id = surface_id;
         assert_eq!(
             handler.on_get_viewport(&mut ctx, 701, surface_id),

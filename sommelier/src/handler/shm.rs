@@ -2127,7 +2127,7 @@ mod tests {
         );
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         let fd = {
             use nix::sys::memfd::{memfd_create, MFdFlags};
             use std::ffi::CString;
@@ -2147,7 +2147,7 @@ mod tests {
             Action::Drop
         );
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.last_sender_id = 20;
         assert_eq!(
             <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(

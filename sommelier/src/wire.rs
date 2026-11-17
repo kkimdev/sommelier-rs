@@ -120,7 +120,11 @@ pub enum ProtocolError {
     InsufficientData,
     InvalidString,
     MissingFd,
+    /// An object argument or `new_id` that cannot be used.
     InvalidObjectId(u32),
+    /// The message's sender is not a usable object: unknown, or destroyed
+    /// and awaiting `delete_id`.
+    InvalidSender(u32),
     UnsupportedVersion {
         object_id: u32,
         required: u32,
@@ -140,6 +144,9 @@ impl fmt::Display for ProtocolError {
             ProtocolError::MissingFd => write!(f, "Missing file descriptor in wire message"),
             ProtocolError::InvalidObjectId(id) => {
                 write!(f, "Invalid or unmapped Wayland object ID: {}", id)
+            }
+            ProtocolError::InvalidSender(id) => {
+                write!(f, "Invalid or unmapped Wayland sender ID: {}", id)
             }
             ProtocolError::UnsupportedVersion {
                 object_id,

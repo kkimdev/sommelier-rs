@@ -531,17 +531,9 @@ fn generate_interface(interface: &Interface) -> TokenStream {
 
                 dispatch_request_arms.push(quote! {
                     Request::#var_name { #(#field_names_list),* } => {
-                        if ctx.shadow_table.is_pending_destroy_guest(msg.sender_id) {
-                            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
-                        }
                         #request_version_validation
                         #(#request_validations)*
                         let host_sender_id = ctx.shadow_table.get_host_id(msg.sender_id);
-                        if host_sender_id.is_none()
-                            && !ctx.shadow_table.is_local_only_guest_object(msg.sender_id)
-                        {
-                            return Err(ProtocolError::InvalidObjectId(msg.sender_id));
-                        }
                         let is_local_only = host_sender_id.is_none()
                             && ctx.shadow_table.is_local_only_guest_object(msg.sender_id);
                         let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
@@ -796,6 +788,15 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                 handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+                // The sender comes first, as in libwayland-server: a request
+                // from an object that is gone is reported as such, whatever
+                // its opcode and arguments.
+                if ctx.shadow_table.is_pending_destroy_guest(msg.sender_id)
+                    || (ctx.shadow_table.get_host_id(msg.sender_id).is_none()
+                        && !ctx.shadow_table.is_local_only_guest_object(msg.sender_id))
+                {
+                    return Err(ProtocolError::InvalidSender(msg.sender_id));
+                }
                 let req = Request::from_wire(msg)?;
                 match req {
                     #(#dispatch_request_arms)*
@@ -937,7 +938,7 @@ fn generate_version_validation(since: Option<u32>, host_to_guest: bool) -> Token
 
     quote! {
         let object_version = #lookup
-            .ok_or(ProtocolError::InvalidObjectId(msg.sender_id))?;
+            .ok_or(ProtocolError::InvalidSender(msg.sender_id))?;
         if object_version < #required {
             return Err(ProtocolError::UnsupportedVersion {
                 object_id: msg.sender_id,

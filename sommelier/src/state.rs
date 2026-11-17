@@ -814,6 +814,9 @@ pub struct Context {
     /// A queued `wl_display.error` must be flushed before the client session
     /// is torn down. This is set by fatal protocol validation paths.
     pub fatal_protocol_error: bool,
+    /// Whether a `wl_display.error` has been queued for the guest; see
+    /// [`Self::note_protocol_error`].
+    protocol_error_queued: bool,
     /// Work deferred by the handler of the message being dispatched; see
     /// [`PostDispatch`].
     post_dispatch: Vec<PostDispatch>,
@@ -1000,6 +1003,21 @@ impl Context {
     /// discarded if the message is dropped or rejected.
     pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
         self.post_dispatch.push(effect);
+    }
+
+    /// Record that a `wl_display.error` is being queued for the guest, and
+    /// return whether it is the first. libwayland-server posts one error per
+    /// client and ignores later ones (`wl_resource_post_error_vargs`), so
+    /// only the first is sent.
+    pub(crate) fn note_protocol_error(&mut self) -> bool {
+        !std::mem::replace(&mut self.protocol_error_queued, true)
+    }
+
+    /// Forget a fatal error, so a test can go on with the same context.
+    #[cfg(test)]
+    pub(crate) fn clear_protocol_error_for_test(&mut self) {
+        self.fatal_protocol_error = false;
+        self.protocol_error_queued = false;
     }
 
     /// Whether work deferred by a dispatched message has not been taken.
@@ -1374,6 +1392,7 @@ impl Context {
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
             fatal_protocol_error: false,
+            protocol_error_queued: false,
             post_dispatch: Vec::new(),
             synthetic_keyboard_serial: 0,
             allocator,

@@ -16,16 +16,56 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, DeletedHostId, HostId};
-use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
+use crate::wire::{Action, MessageBuilder, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
 
+/// `wl_display.error` code: the request names an object that does not
+/// exist.
+pub(crate) const WL_DISPLAY_ERROR_INVALID_OBJECT: u32 = 0;
+/// `wl_display.error` code: the request is not valid for its object.
+pub(crate) const WL_DISPLAY_ERROR_INVALID_METHOD: u32 = 1;
+/// `wl_display.error` code: the compositor (here, the proxy) failed.
+pub(crate) const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
+
+/// End a fatal session with an `implementation` error if nothing has told
+/// the guest why yet: internal failures (a dma-buf sync that fails during
+/// a commit, say) mark the session fatal without an error of their own,
+/// and every session closed for a protocol reason gets exactly one.
+pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
+    if ctx.fatal_protocol_error {
+        // A no-op when an error is already queued.
+        queue_protocol_error(
+            ctx,
+            WL_DISPLAY_ID,
+            WL_DISPLAY_ERROR_IMPLEMENTATION,
+            "the proxy failed to handle a request",
+        );
+    }
+}
+
+/// Report a guest request the proxy cannot decode or dispatch, as
+/// libwayland-server's `wl_client_connection_data` reports one: always on
+/// `wl_display`, as `invalid_object` when the sender is not a usable object
+/// ([`ProtocolError::InvalidSender`]), and as `invalid_method` for anything
+/// else (an unknown opcode, a request too new for its object, arguments
+/// that do not decode, or an object or `new_id` argument that cannot be
+/// used, even one that names the sender).
+pub(crate) fn queue_request_error(ctx: &mut Context, error: &ProtocolError) {
+    let code = match error {
+        ProtocolError::InvalidSender(_) => WL_DISPLAY_ERROR_INVALID_OBJECT,
+        _ => WL_DISPLAY_ERROR_INVALID_METHOD,
+    };
+    queue_protocol_error(ctx, WL_DISPLAY_ID, code, error.to_string());
+}
+
 /// Report a fatal protocol error against a guest object.
 ///
-/// Wayland errors are fatal for the client session. Callers must mark the
-/// context as fatal as well; the proxy flushes this queued event before
-/// closing the session so the client receives the diagnostic.
+/// Wayland errors are fatal for the client session: this marks the context
+/// fatal, and the proxy flushes the queued event before closing the session
+/// so the client receives the diagnostic. Like libwayland-server, which
+/// posts one error per client, only the first call queues an event.
 pub(crate) fn queue_protocol_error(
     ctx: &mut Context,
     object_id: u32,
@@ -35,6 +75,9 @@ pub(crate) fn queue_protocol_error(
     // Whether or not the diagnostic itself fits in the Wayland wire limit,
     // the malformed request is fatal and must terminate the session.
     ctx.fatal_protocol_error = true;
+    if !ctx.note_protocol_error() {
+        return;
+    }
     // The error event itself is subject to Wayland's 16-bit message-length
     // limit. A client-controlled interface name or diagnostic can otherwise
     // make the proxy drop the diagnostic while still tearing down the
@@ -178,17 +221,25 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         code: u32,
         message: &String,
     ) -> Action {
+        // The host ends the connection after its error, so the session is
+        // over, and its error is the guest's one error unless the guest
+        // already has one.
+        ctx.fatal_protocol_error = true;
         let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
             // wl_display.error.object_id is a non-null object argument. An
             // internal host-only object has no valid guest ID; forwarding 0
             // would make the guest receive an invalid Wayland error event and
             // can trigger a secondary protocol error in its display parser.
+            // The session still ends with an `implementation` error.
             error!(
                 "Dropping host display error for unmapped object_id={} (code={})",
                 object_id, code
             );
             return Action::Drop;
         };
+        if !ctx.note_protocol_error() {
+            return Action::Drop;
+        }
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
@@ -252,7 +303,7 @@ mod tests {
 
         assert_eq!(
             wl_display::dispatch_request(&mut msg, &mut handler, &mut ctx),
-            Err(ProtocolError::InvalidObjectId(999))
+            Err(ProtocolError::InvalidSender(999))
         );
         assert!(
             !ctx.fatal_protocol_error,
