@@ -1250,7 +1250,7 @@ mod tests {
             state.committed.enabled = true;
             state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
     }
@@ -4467,7 +4467,7 @@ mod tests {
             state.active_surface = Some(20);
             state.current_preedit = "한".to_string();
             state.committed.enabled = true;
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
         }
         ctx.last_sender_id = 100;
 
@@ -5011,7 +5011,7 @@ mod tests {
             state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
 
@@ -5084,7 +5084,7 @@ mod tests {
             state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
 
@@ -5152,7 +5152,7 @@ mod tests {
             state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
 
@@ -5192,7 +5192,7 @@ mod tests {
                 crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
             state.committed.enabled = true;
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
 
@@ -5252,7 +5252,7 @@ mod tests {
                 );
                 state.committed.enabled = true;
                 state.set_guest_commits(1);
-                state.host_activation = crate::state::HostActivationState::Active;
+                state.host.activation = crate::state::HostActivationState::Active;
                 state
             });
         }
@@ -5319,7 +5319,7 @@ mod tests {
             state.current_preedit = "한".to_string();
             state.set_guest_commits(9);
             state.pending_deletes = vec![(3, 0)];
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
         ctx.last_sender_id = 10;

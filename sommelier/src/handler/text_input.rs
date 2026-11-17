@@ -1334,7 +1334,7 @@ fn queue_host_deactivation_barrier(
     let draining = ctx
         .text_inputs
         .get_mut(&guest_id)
-        .is_some_and(|state| state.begin_host_draining(callback));
+        .is_some_and(|state| state.host.begin_draining(callback));
     debug_assert!(draining, "the host object was checked to be active above");
 }
 
@@ -1468,7 +1468,7 @@ pub(crate) fn complete_host_activation_barrier(
     host_v1_id: u32,
 ) {
     let completed = ctx.text_inputs.get_mut(&guest_id).is_some_and(|state| {
-        state.host_v1_id == host_v1_id && state.complete_host_draining(callback_id)
+        state.host_v1_id == host_v1_id && state.host.complete_draining(callback_id)
     });
     if completed {
         update_host_activation(ctx, guest_id);
@@ -1497,7 +1497,7 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
         .and_then(|surface| ctx.shadow_table.get_host_id(surface));
     let target_activated = state.committed.enabled && host_surface.is_some();
 
-    match (target_activated, state.host_activation()) {
+    match (target_activated, state.host.activation) {
         (true, HostActivationState::Inactive) | (false, HostActivationState::Active) => {}
         (true, HostActivationState::Draining { .. }) => {
             log::debug!(
@@ -1523,7 +1523,7 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
             state.guest_seat
         );
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.deactivate_host_without_barrier();
+            state.host.deactivate_without_barrier();
         }
         return;
     }
@@ -1541,7 +1541,7 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
         );
         if !target_activated {
             if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                state.deactivate_host_without_barrier();
+                state.host.deactivate_without_barrier();
             }
         }
         return;
@@ -1565,7 +1565,7 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
                 host_surface,
             ));
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            let activated = state.activate_host();
+            let activated = state.host.activate();
             debug_assert!(activated, "activation state was checked above");
         }
     } else {
@@ -1732,7 +1732,7 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     if !host_deleted {
         update_host_activation(ctx, guest_id);
     } else if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-        state.deactivate_host_without_barrier();
+        state.host.deactivate_without_barrier();
     }
 
     // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
@@ -2105,7 +2105,7 @@ mod tests {
             let mut state =
                 crate::state::TextInputState::new(host_v1_id, Some(host_ext_id), 0, Some(900));
             state.committed.enabled = true;
-            state.host_activation = HostActivationState::Active;
+            state.host.activation = HostActivationState::Active;
             state
         });
         (ctx, host_v1_id, guest_id)
@@ -2737,7 +2737,7 @@ mod tests {
             .collect();
         assert_eq!(commit_serials, vec![1, 2]);
 
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host_activation = HostActivationState::Active;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Active;
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = host_v1_id;
         let mut v1_handler = TextInputV1Handler;
@@ -3163,7 +3163,7 @@ mod tests {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.active_surface = Some(guest_surface);
             state.committed.enabled = false;
-            state.host_activation = HostActivationState::Inactive;
+            state.host.activation = HostActivationState::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -3432,7 +3432,7 @@ mod tests {
         replacement.host_v1_id = 11;
         replacement.committed.enabled = true;
         replacement.active_surface = Some(901);
-        replacement.host_activation = HostActivationState::Inactive;
+        replacement.host.activation = HostActivationState::Inactive;
         ctx.shadow_table
             .insert_paired_for_test(901, 902, "wl_surface");
         ctx.text_inputs.insert(guest_id, replacement);
@@ -3457,7 +3457,7 @@ mod tests {
             let state = ctx.text_inputs.get_mut(&first_id).unwrap();
             state.active_surface = Some(surface);
             state.committed.enabled = false;
-            state.host_activation = HostActivationState::Inactive;
+            state.host.activation = HostActivationState::Inactive;
         }
         let second_id = 21;
         ctx.shadow_table
@@ -3506,7 +3506,7 @@ mod tests {
 
         ctx.last_sender_id = guest_id;
         v3_handler.on_commit(&mut ctx);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host_activation = HostActivationState::Active;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Active;
         ctx.last_sender_id = 30;
         ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
         assert_eq!(
@@ -3872,7 +3872,7 @@ mod tests {
     #[test]
     fn inactive_host_ime_events_are_ignored() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host_activation = HostActivationState::Inactive;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Inactive;
         ctx.last_sender_id = host_v1_id;
         let mut handler = TextInputV1Handler;
 
@@ -3891,7 +3891,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.set_guest_commits(u32::MAX);
-            state.host_activation = HostActivationState::Inactive;
+            state.host.activation = HostActivationState::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -5242,7 +5242,7 @@ mod tests {
             .get_mut(&guest_id)
             .expect("text input fixture")
             .active_surface = None;
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host_activation = HostActivationState::Inactive;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Inactive;
 
         // Guest calls commit before focus (active_surface is None).
         ctx.last_sender_id = guest_id;

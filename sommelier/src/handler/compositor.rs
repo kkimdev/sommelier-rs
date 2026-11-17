@@ -1228,7 +1228,7 @@ mod tests {
         state.pending_preedit_selection = Some((0, 1));
         state.pending_deletes = vec![(1, 1)];
         state.pending_cursor_position = Some((1, 1));
-        state.host_activation = crate::state::HostActivationState::Active;
+        state.host.activation = crate::state::HostActivationState::Active;
         state
     }
 
@@ -4384,7 +4384,7 @@ mod tests {
         ctx.text_inputs.insert(text_input, {
             let mut state = crate::state::TextInputState::new(702, None, 1, Some(surface));
             state.current_preedit = "한".to_string();
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host.activation = crate::state::HostActivationState::Active;
             state
         });
 

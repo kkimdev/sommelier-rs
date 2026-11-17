@@ -359,7 +359,7 @@ mod tests {
             .create_host_only("zcr_extended_text_input_v1", 1);
         let mut state = crate::state::TextInputState::new(host, Some(extension), SEAT, None);
         state.committed.enabled = true;
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         ctx.text_inputs.insert(TEXT_INPUT, state);
 
         DisplayHandler.on_delete_id(&mut ctx, host);

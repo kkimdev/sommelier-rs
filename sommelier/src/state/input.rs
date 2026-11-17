@@ -71,6 +71,165 @@ pub struct V3Committed {
     pub content_type: ContentType,
 }
 
+/// A content type as the host applies it: the v3 content type, and the
+/// surrounding-text support told with it, or `None` if the host's
+/// extension cannot be told one.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostContentType {
+    pub content_type: ContentType,
+    pub surrounding_text_support: Option<bool>,
+}
+
+/// What a host `zwp_text_input_v1` has effectively applied, by Exo's rules
+/// (Chromium `components/exo/text_input.cc` and
+/// `components/exo/wayland/zwp_text_input_manager.cc`):
+///
+/// - `activate` attaches the input method when the seat's focus is on the
+///   surface, which the proxy's text input follows, and
+///   `AttachInputMethod` resets the type and mode to text: the content
+///   type is unknown until it is sent again.
+/// - `deactivate` detaches it, and `SetTypeModeFlags` drops a content type
+///   while none is attached: the host has a content type only while active.
+/// - `set_surrounding_text_support` applies to the next content type and
+///   then resets to supported, so it is sent right before one and is part
+///   of it.
+/// - Surrounding text and the cursor rectangle are kept with or without an
+///   input method, and Exo edits its copy of the surrounding text as the
+///   input method commits, so they are not modelled: each commit forwards
+///   the ones it states.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostApplied {
+    pub(crate) activation: HostActivationState,
+    /// The content type the attached input method applied, `None` while
+    /// unknown and whenever none is attached.
+    content_type: Option<HostContentType>,
+}
+
+impl HostApplied {
+    /// `activate` reached the host: its input method attached.
+    pub fn activate(&mut self) -> bool {
+        if self.activation != HostActivationState::Inactive {
+            return false;
+        }
+        self.activation = HostActivationState::Active;
+        self.content_type = None;
+        true
+    }
+
+    /// `deactivate` reached the host, and `callback` drains the events it
+    /// sent before.
+    pub fn begin_draining(&mut self, callback: HostId) -> bool {
+        if self.activation != HostActivationState::Active {
+            return false;
+        }
+        self.activation = HostActivationState::Draining { callback };
+        self.content_type = None;
+        true
+    }
+
+    /// The exact matching `callback` drained the deactivated generation.
+    pub fn complete_draining(&mut self, callback: HostId) -> bool {
+        if self.activation != (HostActivationState::Draining { callback }) {
+            return false;
+        }
+        self.activation = HostActivationState::Inactive;
+        true
+    }
+
+    /// End an active generation that no live host seat can deactivate.
+    ///
+    /// A draining generation cannot be forced inactive because its callback
+    /// remains the ownership proof for events already queued by the host.
+    pub fn deactivate_without_barrier(&mut self) -> bool {
+        if self.activation != HostActivationState::Active {
+            return false;
+        }
+        self.activation = HostActivationState::Inactive;
+        self.content_type = None;
+        true
+    }
+
+    /// A content type reached the host, which applies it only while active.
+    #[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+    pub fn apply_content_type(&mut self, content_type: HostContentType) {
+        if self.activation == HostActivationState::Active {
+            self.content_type = Some(content_type);
+        }
+    }
+
+    /// The guest enabled or disabled the field, which resets it: what the
+    #[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+    /// host applied belongs to the old field, so it is told again, which
+    /// also ends Exo's composition in it.
+    pub fn new_field(&mut self) {
+        self.content_type = None;
+    }
+}
+
+/// The host state a text input should have, from its committed v3 state,
+/// its focus and what the host can be told.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostTarget {
+    /// The guest committed an enable, on a focused surface the host knows.
+    pub active: bool,
+    /// The host seat can carry an `activate` or `deactivate`.
+    pub seat_live: bool,
+    pub content_type: HostContentType,
+}
+
+/// How a host text input's activation changes.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationStep {
+    /// `zwp_text_input_v1.activate`.
+    Activate,
+    /// `zwp_text_input_v1.deactivate`, behind a drain barrier.
+    Deactivate,
+    /// No live seat can carry a `deactivate`: the generation ends locally.
+    Abandon,
+}
+
+/// The host requests that bring a text input to its target, in order.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostSteps {
+    pub activation: Option<ActivationStep>,
+    pub content_type: Option<HostContentType>,
+}
+
+/// The requests that make what the host applied equal `target`, and no
+/// others: a content type the host would drop or already has is not sent,
+/// because a resend can reset Exo's composition.
+///
+/// A draining host is not reactivated: its barrier's completion reconciles
+/// again. A content type committed while the host could not apply it is
+/// therefore sent once it can, after the `activate`.
+#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+pub fn reconcile(target: &HostTarget, applied: &HostApplied) -> HostSteps {
+    use HostActivationState::{Active, Inactive};
+    let activation = match (target.active, applied.activation) {
+        (true, Inactive) if target.seat_live => Some(ActivationStep::Activate),
+        (false, Active) if target.seat_live => Some(ActivationStep::Deactivate),
+        (false, Active) => Some(ActivationStep::Abandon),
+        _ => None,
+    };
+    // What the host's input method has after that step, or `None` if no
+    // input method is attached to apply a content type.
+    let attached = match activation {
+        Some(ActivationStep::Activate) => Some(None),
+        Some(ActivationStep::Deactivate | ActivationStep::Abandon) => None,
+        None => (applied.activation == Active).then_some(applied.content_type),
+    };
+    HostSteps {
+        activation,
+        content_type: attached
+            .filter(|&applied| applied != Some(target.content_type))
+            .map(|_| target.content_type),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextInputState {
     pub host_v1_id: u32,
@@ -108,7 +267,8 @@ pub struct TextInputState {
     /// `commit_string` event.
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
-    pub(crate) host_activation: HostActivationState,
+    /// What the host text input has applied.
+    pub(crate) host: HostApplied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,63 +343,19 @@ impl TextInputState {
             pending_preedit_selection: None,
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
-            host_activation: HostActivationState::Inactive,
+            host: HostApplied::default(),
         }
     }
 
     /// Return whether host text-input events belong to this guest generation.
     pub fn host_is_active(&self) -> bool {
-        self.host_activation == HostActivationState::Active
-    }
-
-    /// Return the complete host activation state.
-    pub fn host_activation(&self) -> HostActivationState {
-        self.host_activation
-    }
-
-    /// Start a host activation from an inactive generation.
-    pub fn activate_host(&mut self) -> bool {
-        if self.host_activation != HostActivationState::Inactive {
-            return false;
-        }
-        self.host_activation = HostActivationState::Active;
-        true
-    }
-
-    /// Begin draining the active generation behind `callback`.
-    pub fn begin_host_draining(&mut self, callback: HostId) -> bool {
-        if self.host_activation != HostActivationState::Active {
-            return false;
-        }
-        self.host_activation = HostActivationState::Draining { callback };
-        true
-    }
-
-    /// Complete the generation drained by the exact matching `callback`.
-    pub fn complete_host_draining(&mut self, callback: HostId) -> bool {
-        if self.host_activation != (HostActivationState::Draining { callback }) {
-            return false;
-        }
-        self.host_activation = HostActivationState::Inactive;
-        true
-    }
-
-    /// Drop an active generation when no live host seat can carry a barrier.
-    ///
-    /// A draining generation cannot be forced inactive because its callback
-    /// remains the ownership proof for events already queued by the host.
-    pub fn deactivate_host_without_barrier(&mut self) -> bool {
-        if self.host_activation != HostActivationState::Active {
-            return false;
-        }
-        self.host_activation = HostActivationState::Inactive;
-        true
+        self.host.activation == HostActivationState::Active
     }
 
     /// Return the callback that owns the draining generation, if any.
     #[cfg(test)]
     pub fn draining_callback(&self) -> Option<HostId> {
-        match self.host_activation {
+        match self.host.activation {
             HostActivationState::Draining { callback } => Some(callback),
             HostActivationState::Inactive | HostActivationState::Active => None,
         }
@@ -1909,7 +2025,7 @@ mod tests {
         }
 
         fn assert_invariants(state: &TextInputState, expected: HostActivationState) {
-            assert_eq!(state.host_activation(), expected);
+            assert_eq!(state.host.activation, expected);
             assert_eq!(
                 state.host_is_active(),
                 expected == HostActivationState::Active
@@ -1932,12 +2048,12 @@ mod tests {
             for operation in OPERATIONS {
                 let mut next = state.clone();
                 let actual_changed = match operation {
-                    Operation::Activate => next.activate_host(),
-                    Operation::BeginDrainingA => next.begin_host_draining(CALLBACK_A),
-                    Operation::BeginDrainingB => next.begin_host_draining(CALLBACK_B),
-                    Operation::CompleteDrainingA => next.complete_host_draining(CALLBACK_A),
-                    Operation::CompleteDrainingB => next.complete_host_draining(CALLBACK_B),
-                    Operation::DeactivateWithoutBarrier => next.deactivate_host_without_barrier(),
+                    Operation::Activate => next.host.activate(),
+                    Operation::BeginDrainingA => next.host.begin_draining(CALLBACK_A),
+                    Operation::BeginDrainingB => next.host.begin_draining(CALLBACK_B),
+                    Operation::CompleteDrainingA => next.host.complete_draining(CALLBACK_A),
+                    Operation::CompleteDrainingB => next.host.complete_draining(CALLBACK_B),
+                    Operation::DeactivateWithoutBarrier => next.host.deactivate_without_barrier(),
                 };
                 let (next_expected, expected_changed) = model_transition(expected, operation);
                 assert_eq!(actual_changed, expected_changed);
@@ -1947,9 +2063,142 @@ mod tests {
 
         for initial in INITIAL_STATES {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = initial;
+            state.host.activation = initial;
             walk(state, initial, 5);
         }
+    }
+
+    /// Every host state a test of [`reconcile`] starts from: each
+    /// activation, with each content type the host could have.
+    fn host_states(content_types: &[HostContentType]) -> Vec<HostApplied> {
+        let mut states = vec![
+            HostApplied::default(),
+            HostApplied {
+                activation: HostActivationState::Draining {
+                    callback: HostId(100),
+                },
+                content_type: None,
+            },
+        ];
+        for content_type in std::iter::once(None).chain(content_types.iter().copied().map(Some)) {
+            states.push(HostApplied {
+                activation: HostActivationState::Active,
+                content_type,
+            });
+        }
+        states
+    }
+
+    /// Apply `steps` to `applied` as the host does.
+    fn apply_steps(applied: &HostApplied, steps: HostSteps) -> HostApplied {
+        let mut next = applied.clone();
+        let changed = match steps.activation {
+            Some(ActivationStep::Activate) => next.activate(),
+            Some(ActivationStep::Deactivate) => next.begin_draining(HostId(101)),
+            Some(ActivationStep::Abandon) => next.deactivate_without_barrier(),
+            None => true,
+        };
+        assert!(changed, "{steps:?} must be a transition from {applied:?}");
+        if let Some(content_type) = steps.content_type {
+            let before = next.clone();
+            next.apply_content_type(content_type);
+            assert_ne!(
+                next, before,
+                "{steps:?} sends a content type the host drops or has"
+            );
+        }
+        next
+    }
+
+    #[test]
+    fn reconcile_reaches_every_target_with_only_needed_requests() {
+        let content_types = [(1, 2), (3, 4)]
+            .into_iter()
+            .flat_map(|content_type| {
+                [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
+                    content_type,
+                    surrounding_text_support,
+                })
+            })
+            .collect::<Vec<_>>();
+        for applied in host_states(&content_types) {
+            for (active, seat_live, &content_type) in [false, true]
+                .into_iter()
+                .flat_map(|active| [false, true].map(|seat_live| (active, seat_live)))
+                .flat_map(|(active, seat_live)| {
+                    content_types
+                        .iter()
+                        .map(move |content_type| (active, seat_live, content_type))
+                })
+            {
+                let target = HostTarget {
+                    active,
+                    seat_live,
+                    content_type,
+                };
+                let steps = reconcile(&target, &applied);
+                let reached = apply_steps(&applied, steps);
+                let expected = match (applied.activation, active, seat_live) {
+                    // The barrier's completion reconciles again.
+                    (HostActivationState::Draining { .. }, ..) => applied.clone(),
+                    (_, true, true) => HostApplied {
+                        activation: HostActivationState::Active,
+                        content_type: Some(content_type),
+                    },
+                    (HostActivationState::Active, false, true) => HostApplied {
+                        activation: HostActivationState::Draining {
+                            callback: HostId(101),
+                        },
+                        content_type: None,
+                    },
+                    (_, false, _) => HostApplied::default(),
+                    // A seat that cannot carry an activate keeps the host
+                    // as it is, with the content type it can still take.
+                    (HostActivationState::Inactive, true, false) => applied.clone(),
+                    (HostActivationState::Active, true, false) => HostApplied {
+                        activation: HostActivationState::Active,
+                        content_type: Some(content_type),
+                    },
+                };
+                assert_eq!(reached, expected, "{target:?} from {applied:?}");
+                assert_eq!(
+                    reconcile(&target, &reached),
+                    HostSteps::default(),
+                    "{target:?} is reached from {applied:?} in one reconciliation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reached_content_type_is_resent_only_after_the_host_forgets_it() {
+        let content_type = HostContentType {
+            content_type: (1, 2),
+            surrounding_text_support: Some(false),
+        };
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
+        };
+        let mut applied = HostApplied::default();
+        assert_eq!(
+            reconcile(&target, &applied),
+            HostSteps {
+                activation: Some(ActivationStep::Activate),
+                content_type: Some(content_type),
+            }
+        );
+        assert!(applied.activate());
+        applied.apply_content_type(content_type);
+        assert_eq!(reconcile(&target, &applied), HostSteps::default());
+
+        // A new field is told its content type even if it is unchanged.
+        applied.new_field();
+        assert_eq!(
+            reconcile(&target, &applied).content_type,
+            Some(content_type)
+        );
     }
 
     #[test]
@@ -1962,7 +2211,7 @@ mod tests {
             },
         ] {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = activation;
+            state.host.activation = activation;
             state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
 
             assert_eq!(
@@ -1994,12 +2243,12 @@ mod tests {
             },
         ] {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = activation;
+            state.host.activation = activation;
 
             state.apply_focus(Some(14));
-            assert_eq!(state.host_activation(), activation);
+            assert_eq!(state.host.activation, activation);
             state.begin_destroy();
-            assert_eq!(state.host_activation(), activation);
+            assert_eq!(state.host.activation, activation);
         }
     }
 
@@ -2024,13 +2273,13 @@ mod tests {
         state.pending_preedit_selection = Some((0, 3));
         state.pending_deletes.push((3, 0));
         state.pending_cursor_position = Some((1, 1));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
         let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
         expected.set_guest_commits(17);
-        assert!(expected.activate_host());
+        assert!(expected.host.activate());
         assert_eq!(state, expected);
     }
 
@@ -2182,7 +2431,7 @@ mod tests {
     fn host_preedit_metadata_is_consumed_only_after_finish() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
         assert!(state.prepare_host_preedit().is_none());
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.set_guest_commits(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -2205,7 +2454,7 @@ mod tests {
     #[test]
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.set_guest_commits(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -2238,7 +2487,7 @@ mod tests {
     #[test]
     fn confirming_preedit_closes_only_preedit_metadata() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
@@ -2260,7 +2509,7 @@ mod tests {
     #[test]
     fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         for index in 0..MAX_PENDING_IME_DELETES {
             assert!(state.record_delete(index as u32, 0));
         }
@@ -2338,12 +2587,12 @@ mod tests {
                 match step {
                     Step::Focus | Step::Leave => {
                         let serial = next.guest_commit_serial;
-                        let host_activation = next.host_activation();
+                        let host_activation = next.host.activation;
                         let surface = matches!(step, Step::Focus).then_some(13);
                         next.apply_focus(surface);
                         let mut expected = TextInputState::new(10, Some(11), 12, surface);
                         expected.guest_commit_serial = serial;
-                        expected.host_activation = host_activation;
+                        expected.host.activation = host_activation;
                         assert_eq!(next, expected);
                     }
                     Step::Enable | Step::Disable if next.active_surface.is_some() => {
@@ -2390,10 +2639,10 @@ mod tests {
                     }
                     Step::Destroy => {
                         let serial = next.guest_commit_serial();
-                        let host_activation = next.host_activation();
+                        let host_activation = next.host.activation;
                         next.begin_destroy();
                         assert_eq!(next.guest_commit_serial(), serial);
-                        assert_eq!(next.host_activation(), host_activation);
+                        assert_eq!(next.host.activation, host_activation);
                         assert!(!next.committed.enabled);
                         assert!(next.active_surface.is_none());
                     }
@@ -2404,7 +2653,7 @@ mod tests {
         }
 
         let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(initial.activate_host());
+        assert!(initial.host.activate());
         walk(initial, 4);
     }
 
