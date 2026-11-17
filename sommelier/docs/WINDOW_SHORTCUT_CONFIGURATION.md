@@ -213,7 +213,11 @@ file owns how it is measured from the output's metadata, including why the
 `wl_output.geometry` panel transform is used rather than
 `zaura_output.logical_transform`. Placement waits until Aura has sent both
 its current output scale and its device scale factor; the rounded
-`wl_output.scale` cannot describe fractional display scaling.
+`wl_output.scale` cannot describe fractional display scaling. It also needs
+a `zaura_shell` new enough to send `zaura_output.insets`, without which the
+work area would include the shelf. With an older shell the proxy warns
+once and creates no Aura toplevel, so every chord is skipped
+(`PLACEMENT_SHELL_SINCE` in `sommelier/src/handler/window_placement.rs`).
 
 Known limits:
 

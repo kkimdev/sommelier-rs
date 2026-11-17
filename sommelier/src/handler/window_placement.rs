@@ -47,6 +47,7 @@ use crate::handler::aura_objects::{
     self, aura_object_version, ensure_host_zaura_surface, AuraChild,
 };
 use crate::handler::callback::queue_internal_sync;
+use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
 use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
 use crate::protocols::aura_shell::zaura_surface::{
     REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
@@ -59,18 +60,47 @@ use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_
 use crate::state::{Context, HostId, InternalCallback};
 use crate::window_layout::{Rect, WindowLayoutAction};
 use crate::wire::MessageBuilder;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The `zaura_shell` version a placement Aura toplevel needs.
+/// The `zaura_shell` version placement needs.
 ///
-/// Placement creates the toplevel only to send
-/// `set_supports_screen_coordinates` and `set_window_bounds`, so it requires
-/// the newest of the requests it uses; the assertion below keeps that true
-/// if the vendored protocol changes.
-const PLACEMENT_TOPLEVEL_SINCE: u32 = REQ_SET_WINDOW_BOUNDS_SINCE;
+/// Placement creates an Aura toplevel only to send
+/// `set_supports_screen_coordinates` and `set_window_bounds`, and it
+/// measures the work area with `zaura_output.insets`, without which the
+/// work area would include the shelf. Every Aura child takes its shell's
+/// version, so placement requires the newest of the messages it uses; the
+/// assertion below keeps that true if the vendored protocol changes.
+const PLACEMENT_SHELL_SINCE: u32 = EVT_INSETS_SINCE;
 const _: () = assert!(
-    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE <= PLACEMENT_TOPLEVEL_SINCE
-        && REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE <= PLACEMENT_TOPLEVEL_SINCE
+    REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE <= PLACEMENT_SHELL_SINCE
+        && REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE <= PLACEMENT_SHELL_SINCE
+        && REQ_SET_WINDOW_BOUNDS_SINCE <= PLACEMENT_SHELL_SINCE
 );
+
+/// Whether [`warn_if_shell_cannot_place`] has warned. Every client
+/// connection binds the same host shell, so one warning per process says
+/// it all.
+static OLD_SHELL_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Warn, once per process, that placement is disabled because the host
+/// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`]. The registry calls
+/// this when it binds the shell while the ARC bounds policy is active.
+///
+/// # Returns
+///
+/// Whether this call logged the warning.
+pub(crate) fn warn_if_shell_cannot_place(shell_version: u32) -> bool {
+    if shell_version >= PLACEMENT_SHELL_SINCE || OLD_SHELL_WARNED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    log::warn!(
+        "Window placement is disabled: zaura_shell v{} lacks zaura_output.insets (v{}), \
+         so the work area would include the shelf",
+        shell_version,
+        PLACEMENT_SHELL_SINCE
+    );
+    true
+}
 
 // ── Placing the focused window ────────────────────────────────────────────
 
@@ -370,7 +400,7 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
     let xdg_toplevel_host_id = ctx.shadow_table.get_host_id(xdg_toplevel_guest_id)?;
     if ctx
         .host_zaura_shell
-        .is_none_or(|shell| shell.version < PLACEMENT_TOPLEVEL_SINCE)
+        .is_none_or(|shell| shell.version < PLACEMENT_SHELL_SINCE)
     {
         return None;
     }
@@ -1355,13 +1385,16 @@ mod tests {
         );
     }
 
-    /// A `zaura_shell` older than `set_window_bounds` cannot place, so no
-    /// Aura toplevel is created for it; the first version that can, does.
+    /// A `zaura_shell` without `set_window_bounds` cannot place, and one
+    /// without `zaura_output.insets` would measure a work area that
+    /// includes the shelf, so neither gets an Aura toplevel; the first
+    /// version with both does.
     #[test]
-    fn placement_toplevel_needs_a_shell_with_set_window_bounds() {
+    fn placement_needs_a_shell_with_window_bounds_and_output_insets() {
         for (shell_version, expect_toplevel) in [
-            (PLACEMENT_TOPLEVEL_SINCE - 1, false),
-            (PLACEMENT_TOPLEVEL_SINCE, true),
+            (REQ_SET_WINDOW_BOUNDS_SINCE, false),
+            (EVT_INSETS_SINCE - 1, false),
+            (EVT_INSETS_SINCE, true),
         ] {
             let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
                 setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
@@ -1383,6 +1416,14 @@ mod tests {
                 "zaura_shell v{shell_version}"
             );
         }
+    }
+
+    #[test]
+    fn an_old_shell_is_reported_once_per_process() {
+        OLD_SHELL_WARNED.store(false, Ordering::Relaxed);
+        assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE));
+        assert!(warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE - 1));
+        assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE - 1));
     }
 
     /// Before `zaura_toplevel.release` the Aura toplevel has no destructor:

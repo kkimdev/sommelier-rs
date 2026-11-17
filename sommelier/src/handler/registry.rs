@@ -961,6 +961,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 // Apply the same retry to XDG roles created before the shell
                 // global arrived.
                 crate::handler::window_placement::attach_recorded_toplevels(ctx);
+                crate::handler::window_placement::warn_if_shell_cannot_place(bound_version);
             }
             log::debug!("Bound zaura_shell internally (host_id={})", host_id);
 
