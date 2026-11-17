@@ -18,7 +18,8 @@ env:
   CARGO_TERM_COLOR: always
   # Released binaries need at most this glibc symbol version today, so they
   # run on Debian bookworm (2.36), the Crostini container base. A build that
-  # needs a newer one fails here; raising this is a compatibility decision.
+  # needs a newer one fails here; raising this is a compatibility decision
+  # that also changes the README's install prerequisites.
   MAX_GLIBC_VERSION: "2.34"
 
 jobs:

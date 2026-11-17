@@ -62,6 +62,13 @@ printf '%s\n' "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}"
 `virtio_wl` is not part of the mainline Linux kernel, so ordinary
 distribution kernels generally cannot use this mode.
 
+The prebuilt binary links against libgbm and libxkbcommon and needs glibc
+2.34 or newer. On Debian-compatible guests:
+
+```bash
+sudo apt-get install --yes libgbm1 libxkbcommon0
+```
+
 ### Download the current prerelease
 
 For x86_64:
