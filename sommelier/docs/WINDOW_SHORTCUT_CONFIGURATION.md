@@ -199,12 +199,12 @@ Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
 ## Output and work area
 
-A placement uses an output that the focused surface has entered, so a window
-never jumps to another monitor; only a surface currently on no output (before
-its first enter, or after all its outputs went away) uses the first usable
-output. `OutputRegistry::for_surface` in
-`sommelier/src/state/outputs.rs` owns the exact rule, including which output
-wins when the surface spans several and when an output counts as usable.
+A placement uses the output that the focused surface entered last, so a
+window never jumps to another monitor; only a surface currently on no output
+(before its first enter, or after its output went away) uses the first
+usable output. `OutputRegistry::for_surface` in
+`sommelier/src/state/outputs.rs` owns the exact rule, including when an
+output counts as usable.
 
 The work area is the output's logical screen area minus Aura's insets (the
 shelf and other reserved margins), in the coordinates that

@@ -1346,32 +1346,27 @@ mod tests {
     }
 
     #[test]
-    fn surface_enter_leave_tracks_multiple_outputs() {
+    fn surface_enter_leave_tracks_the_last_entered_output() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = CompositorHandler;
         ctx.outputs.bind_for_test(20, Default::default());
         ctx.outputs.bind_for_test(30, Default::default());
         ctx.last_sender_id = 100;
-        assert_eq!(
-            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, 20),
-            Action::Forward
-        );
-        assert_eq!(
-            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, 30),
-            Action::Forward
-        );
-        assert_eq!(
-            ctx.outputs.entered_for_test(100),
-            Some(&[20, 30].into_iter().collect())
-        );
-        assert_eq!(
-            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, 20),
-            Action::Forward
-        );
-        assert_eq!(
-            ctx.outputs.entered_for_test(100),
-            Some(&[30].into_iter().collect())
-        );
+        let event = |ctx: &mut Context, enter: bool, output: u32| {
+            let action = if enter {
+                WlSurfaceHandler::on_enter(&mut CompositorHandler, ctx, output)
+            } else {
+                WlSurfaceHandler::on_leave(&mut CompositorHandler, ctx, output)
+            };
+            assert_eq!(action, Action::Forward);
+            ctx.outputs.entered_for_test(100)
+        };
+        assert_eq!(event(&mut ctx, true, 20), Some(20));
+        // Exo moves a surface with leave(old) before enter(new).
+        assert_eq!(event(&mut ctx, false, 20), None);
+        assert_eq!(event(&mut ctx, true, 30), Some(30));
+        // A leave of another output, in either order, changes nothing.
+        assert_eq!(event(&mut ctx, true, 20), Some(20));
+        assert_eq!(event(&mut ctx, false, 30), Some(20));
     }
 
     /// The enter and leave handlers rely on generated validation to drop an
