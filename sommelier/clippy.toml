@@ -1,6 +1,25 @@
 # Production code builds every message with a generated encoder; see
 # "Wire messages" in docs/INVARIANTS.md. The generated protocol module
 # allows it, and so does each test module that hand-builds frames.
+#
+# Every descriptor is one OwnedFd from its receive to its send; see
+# "Transport and file descriptors" in docs/INVARIANTS.md. Only the kernel
+# and device boundaries handle raw descriptors (the recvmsg decoder, the
+# VirtWL channel and the GPU allocator), and each allows that itself, as do
+# test modules that build descriptors by hand.
 disallowed-methods = [
     { path = "sommelier::wire::MessageBuilder::new", reason = "build messages with the generated req:: and evt:: encoders" },
+    { path = "libc::close", reason = "an OwnedFd closes its descriptor when it drops" },
+    { path = "nix::unistd::close", reason = "an OwnedFd closes its descriptor when it drops" },
+    { path = "std::os::fd::FromRawFd::from_raw_fd", reason = "only a kernel or device boundary may take over a raw descriptor" },
+    { path = "std::os::fd::IntoRawFd::into_raw_fd", reason = "move the OwnedFd; a raw descriptor has no owner" },
+    { path = "std::os::fd::BorrowedFd::borrow_raw", reason = "borrow an owned descriptor with AsFd::as_fd" },
+    { path = "libc::dup", reason = "duplicate with OwnedFd::try_clone or BorrowedFd::try_clone_to_owned" },
+    { path = "libc::dup2", reason = "a raw duplicate has no owner" },
+    { path = "libc::dup3", reason = "a raw duplicate has no owner" },
+    { path = "nix::unistd::dup2_raw", reason = "a duplicate over a raw number closes whatever owned it" },
+    { path = "nix::unistd::dup3_raw", reason = "a duplicate over a raw number closes whatever owned it" },
+    { path = "nix::unistd::dup2_stdin", reason = "a duplicate over stdin closes whatever owned it" },
+    { path = "nix::unistd::dup2_stdout", reason = "a duplicate over stdout closes whatever owned it" },
+    { path = "nix::unistd::dup2_stderr", reason = "a duplicate over stderr closes whatever owned it" },
 ]

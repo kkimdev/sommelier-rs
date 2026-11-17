@@ -23,10 +23,10 @@ use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
 use crate::wire::{queue_or_drop, Action, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
+use nix::sys::memfd::MFdFlags;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
@@ -99,13 +99,9 @@ fn guest_device_bytes(ctx: &Context, host_device: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn format_table_fd_can_map(fd: RawFd, size: usize) -> bool {
-    if fd < 0 {
-        return false;
-    }
-
+fn format_table_fd_can_map(fd: BorrowedFd<'_>, size: usize) -> bool {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
         return false;
     }
 
@@ -198,18 +194,10 @@ fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u3
         .len()
         .checked_mul(16)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "format table overflow"))?;
-    let name = b"sommelier-dmabuf\0";
-    let fd = unsafe {
-        libc::memfd_create(
-            name.as_ptr().cast::<libc::c_char>(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut file = File::from(nix::sys::memfd::memfd_create(
+        c"sommelier-dmabuf",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )?);
     file.set_len(size as u64)?;
 
     let mut table = Vec::with_capacity(size);
@@ -462,9 +450,6 @@ impl LinuxDmabufHandler {
         let params = ctx.pending_params.remove(&params_id)?;
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
             error!("Unknown host ID for params {}", params_id);
-            for param in params {
-                unsafe { libc::close(param.fd) };
-            }
             // The guest request was valid when it entered the proxy, so a
             // missing host mapping is an internal state corruption rather
             // than a recoverable client error. Do not let callers continue
@@ -483,26 +468,19 @@ impl LinuxDmabufHandler {
         // live with the render-buffer generation through its final destroy.
         let mut sync_fds = Vec::new();
         for param in &params {
-            let sync_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(param.fd) });
-            match sync_fd {
+            match param.fd.try_clone() {
                 Ok(sync_fd) => sync_fds.push(sync_fd),
                 Err(error) => {
                     error!(
                         "Failed to duplicate dma-buf fd for synchronization: {}",
                         error
                     );
-                    for param in params {
-                        unsafe { libc::close(param.fd) };
-                    }
                     ctx.fail_session();
                     return None;
                 }
             }
         }
         if sync_fds.is_empty() {
-            for param in params {
-                unsafe { libc::close(param.fd) };
-            }
             ctx.fail_session();
             return None;
         }
@@ -510,14 +488,11 @@ impl LinuxDmabufHandler {
         // Send the ADDs, each handing its descriptor to the queue. The caller
         // queues its CREATE right after.
         for param in params {
-            // SAFETY: a pending param owns the duplicate `on_add` made, and
-            // its ADD takes the duplicate over.
-            let fd = unsafe { OwnedFd::from_raw_fd(param.fd) };
             // PASS THE GUEST'S EXACT METADATA. NO MINIGBM OVERRIDES.
             ctx.client_to_host_queue
                 .push(zwp_linux_buffer_params_v1::req::add(
                     host_id,
-                    fd,
+                    param.fd,
                     param.plane_idx,
                     param.offset,
                     param.stride,
@@ -527,16 +502,6 @@ impl LinuxDmabufHandler {
         }
         ctx.used_dmabuf_params.insert(params_id);
         Some((HostId(host_id), sync_fds))
-    }
-
-    fn discard_pending_params(ctx: &mut Context, params_id: u32) {
-        if let Some(params) = ctx.pending_params.remove(&params_id) {
-            for param in params {
-                unsafe {
-                    libc::close(param.fd);
-                }
-            }
-        }
     }
 
     fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> bool {
@@ -554,8 +519,7 @@ impl LinuxDmabufHandler {
 
         let mut seen_planes = std::collections::HashSet::new();
         params.iter().all(|param| {
-            param.fd >= 0
-                && param.plane_idx < expected_planes
+            param.plane_idx < expected_planes
                 && seen_planes.insert(param.plane_idx)
                 && valid_dmabuf_plane(param, format, width, height)
         })
@@ -607,16 +571,9 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
 
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
         ctx.used_dmabuf_params.remove(&params_id);
-        if let Some(previous) = ctx.pending_params.insert(params_id, Vec::new()) {
-            // Reusing a params ID is a protocol violation, but closing stale
-            // duplicated plane FDs here keeps the connection from leaking
-            // resources before the compositor reports the error.
-            for param in previous {
-                unsafe {
-                    libc::close(param.fd);
-                }
-            }
-        }
+        // Reusing a params ID is a protocol violation; replacing the stale
+        // planes closes their descriptors before the compositor reports it.
+        ctx.pending_params.insert(params_id, Vec::new());
         Action::Forward
     }
 
@@ -764,7 +721,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         Action::Drop
     }
 
-    fn on_format_table(&mut self, ctx: &mut Context, fd: RawFd, size: u32) -> Action {
+    fn on_format_table(&mut self, ctx: &mut Context, fd: BorrowedFd<'_>, size: u32) -> Action {
         let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
             Some(id) => id,
             None => return Action::Drop,
@@ -773,11 +730,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         // from the new sequence use indices from an older table if rewriting
         // this one fails.
         ctx.feedback_index_maps.remove(&guest_id);
-
-        if fd < 0 {
-            log::warn!("Rejecting dmabuf format table with invalid fd {}", fd);
-            return Action::Drop;
-        }
 
         if size == 0 || !size.is_multiple_of(16) {
             log::warn!("Rejecting malformed dmabuf format table size {}", size);
@@ -798,7 +750,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         if !format_table_fd_can_map(fd, size as usize) {
             log::warn!(
                 "Rejecting dmabuf format table fd {} that cannot provide {} bytes",
-                fd,
+                fd.as_raw_fd(),
                 size
             );
             return Action::Drop;
@@ -815,7 +767,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
                 size as usize,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
@@ -843,12 +795,12 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         unsafe {
             libc::munmap(host_ptr, size as usize);
         }
-        let new_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
+        let new_fd = match fd.try_clone_to_owned() {
             Ok(fd) => fd,
             Err(error) => {
                 log::warn!(
                     "Failed to duplicate dmabuf format table fd {}: {}",
-                    fd,
+                    fd.as_raw_fd(),
                     error
                 );
                 return Action::Drop;
@@ -928,29 +880,20 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             // synchronization descriptor immediately.
             ctx.pending_native_creates.remove(&HostId(host_id));
         }
-        if let Some(params) = ctx.pending_params.remove(&id) {
-            for p in params {
-                unsafe { libc::close(p.fd) };
-            }
-        }
+        ctx.pending_params.remove(&id);
         Action::Forward
     }
 
     fn on_add(
         &mut self,
         ctx: &mut Context,
-        fd: RawFd,
+        fd: BorrowedFd<'_>,
         plane_idx: u32,
         offset: u32,
         stride: u32,
         modifier_hi: u32,
         modifier_lo: u32,
     ) -> Action {
-        if fd < 0 {
-            error!("Ignoring dmabuf add with invalid fd {}", fd);
-            return Action::Drop;
-        }
-
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
             queue_protocol_error(
@@ -984,8 +927,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             return Action::Drop;
         }
 
-        let dup_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
-            Ok(d) => d.into_raw_fd(),
+        let duplicate = match fd.try_clone_to_owned() {
+            Ok(duplicate) => duplicate,
             Err(e) => {
                 error!("Failed to dup FD for add: {}", e);
                 return Action::Drop;
@@ -1016,7 +959,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
         if let Some(list) = ctx.pending_params.get_mut(&params_id) {
             list.push(PendingParam {
-                fd: dup_fd,
+                fd: duplicate,
                 plane_idx,
                 offset,
                 stride,
@@ -1027,7 +970,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             // If create_params wasn't tracked (e.g. before connection), we can't buffer.
             // But we should have tracked it.
             error!("Unknown params ID {} in add", params_id);
-            unsafe { libc::close(dup_fd) };
         }
 
         Action::Drop
@@ -1063,7 +1005,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 code,
                 "invalid linux-dmabuf buffer parameters",
             );
-            Self::discard_pending_params(ctx, params_id);
+            ctx.pending_params.remove(&params_id);
             return Action::Drop;
         }
 
@@ -1218,7 +1160,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 code,
                 "invalid linux-dmabuf buffer parameters",
             );
-            Self::discard_pending_params(ctx, params_id);
+            ctx.pending_params.remove(&params_id);
             return Action::Drop;
         }
 
@@ -1257,6 +1199,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         build_synthetic_feedback_messages, feedback_pairs, format_table_fd_can_map,
@@ -1276,7 +1220,7 @@ mod tests {
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
     use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use crate::test_support::msg_opcode as message_opcode;
 
@@ -1350,7 +1294,7 @@ mod tests {
             .all(|(message, _)| { crate::test_support::msg_sender(message) == 77 }));
         assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
 
-        let table_fd = messages[0].1[0];
+        let table_fd = messages[0].1[0].as_raw_fd();
         let expected_seals =
             libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
         let seals = unsafe { libc::fcntl(table_fd, libc::F_GET_SEALS) };
@@ -1371,11 +1315,7 @@ mod tests {
             pairs[1].1
         );
 
-        for (_, fds) in messages {
-            for fd in fds {
-                let _ = nix::unistd::close(fd);
-            }
-        }
+        drop(messages);
     }
 
     #[test]
@@ -1398,11 +1338,7 @@ mod tests {
         );
         assert!(messages.iter().all(|(message, _)| message.len() <= 65_532));
 
-        for (_, fds) in messages {
-            for fd in fds {
-                let _ = nix::unistd::close(fd);
-            }
-        }
+        drop(messages);
     }
 
     /// A factory without a capability generation is the proxy's own
@@ -1585,7 +1521,7 @@ mod tests {
         ctx.pending_params.insert(
             params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1669,17 +1605,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_dmabuf_fd_is_rejected_before_borrowing() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(7, Vec::new());
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-
-        assert_eq!(handler.on_add(&mut ctx, -1, 0, 0, 4, 0, 0), Action::Drop);
-        assert!(ctx.pending_params[&7].is_empty());
-    }
-
-    #[test]
     fn invalid_plane_requests_queue_declared_protocol_errors() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -1689,7 +1614,15 @@ mod tests {
         let mut handler = LinuxDmabufHandler;
 
         assert_eq!(
-            handler.on_add(&mut ctx, pipe_fds[1], 2, 0, 64, 0, 0),
+            handler.on_add(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(pipe_fds[1]) },
+                2,
+                0,
+                64,
+                0,
+                0
+            ),
             Action::Drop
         );
         assert!(ctx.is_fatal());
@@ -1710,7 +1643,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: first_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1721,7 +1654,15 @@ mod tests {
         ctx.last_sender_id = 7;
         let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_add(&mut ctx, second_pipe[1], 0, 4096, 64, 0, 0),
+            handler.on_add(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(second_pipe[1]) },
+                0,
+                4096,
+                64,
+                0,
+                0
+            ),
             Action::Drop
         );
         assert!(ctx.is_fatal());
@@ -1748,7 +1689,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1784,7 +1725,7 @@ mod tests {
         ctx.pending_params.insert(
             guest_params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1819,7 +1760,6 @@ mod tests {
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
             &mut message,
@@ -1872,7 +1812,7 @@ mod tests {
             guest_params_id,
             vec![
                 PendingParam {
-                    fd: first_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 16,
@@ -1880,7 +1820,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: second_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                     plane_idx: 1,
                     offset: 128,
                     stride: 16,
@@ -1925,7 +1865,7 @@ mod tests {
             guest_params_id,
             vec![
                 PendingParam {
-                    fd: pipe_fds[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 16,
@@ -1933,7 +1873,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: duplicate,
+                    fd: unsafe { OwnedFd::from_raw_fd(duplicate) },
                     plane_idx: 1,
                     offset: 128,
                     stride: 16,
@@ -1988,7 +1928,7 @@ mod tests {
         ctx.pending_params.insert(
             first_guest_params,
             vec![PendingParam {
-                fd: first_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2008,7 +1948,6 @@ mod tests {
             first_host_params,
             zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         assert!(
             zwp_linux_buffer_params_v1::dispatch_event(&mut created, &mut handler, &mut ctx)
@@ -2024,7 +1963,7 @@ mod tests {
 
         let queued_before_destroy = ctx.client_to_host_queue.len();
         ctx.last_sender_id = first_guest_buffer;
-        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[], &[]);
+        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[]);
         assert!(crate::protocols::wayland::wl_buffer::dispatch_request(
             &mut destroy,
             &mut ShmHandler,
@@ -2067,7 +2006,7 @@ mod tests {
         ctx.pending_params.insert(
             second_guest_params,
             vec![PendingParam {
-                fd: second_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2086,7 +2025,6 @@ mod tests {
             second_host_params,
             zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         assert!(
             zwp_linux_buffer_params_v1::dispatch_event(&mut reused, &mut handler, &mut ctx)
@@ -2122,7 +2060,7 @@ mod tests {
         ctx.pending_params.insert(
             guest_params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2144,7 +2082,6 @@ mod tests {
         let mut message = WireMessage::new(
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED,
-            &[],
             &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
@@ -2219,7 +2156,6 @@ mod tests {
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
             &mut message,
@@ -2323,7 +2259,7 @@ mod tests {
             7,
             vec![
                 PendingParam {
-                    fd: first_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 64,
@@ -2331,7 +2267,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: second_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                     plane_idx: 0,
                     offset: 4096,
                     stride: 64,
@@ -2362,7 +2298,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 // XRGB8888 needs four bytes per pixel.
@@ -2404,7 +2340,10 @@ mod tests {
         // must reach mmap rather than being rejected solely because st_size is
         // zero. A pipe cannot actually be mapped, but this helper deliberately
         // leaves that final check to mmap.
-        assert!(format_table_fd_can_map(pipe_fds[0], 4096));
+        assert!(format_table_fd_can_map(
+            unsafe { BorrowedFd::borrow_raw(pipe_fds[0]) },
+            4096
+        ));
 
         unsafe {
             libc::close(pipe_fds[0]);
@@ -2449,7 +2388,11 @@ mod tests {
         let mut handler = LinuxDmabufHandler;
 
         assert_eq!(
-            handler.on_format_table(&mut ctx, input_fd, bytes.len() as u32),
+            handler.on_format_table(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(input_fd) },
+                bytes.len() as u32
+            ),
             Action::Drop
         );
         unsafe {
@@ -2457,7 +2400,7 @@ mod tests {
         }
 
         assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let rewritten_fd = ctx.host_to_client_queue[0].1[0];
+        let rewritten_fd = ctx.host_to_client_queue[0].1[0].as_raw_fd();
         let mut rewritten = [0u8; 48];
         assert_eq!(
             unsafe {

@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The VirtWL device boundary: its ioctls return raw descriptors, which this
+// module takes over or closes, even on error paths.
+#![allow(clippy::disallowed_methods)]
+
 use crate::virtwl::{
     virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send,
     virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,
@@ -22,7 +26,7 @@ use crate::virtwl::{
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use tokio::io::unix::AsyncFd;
@@ -275,13 +279,7 @@ impl VirtWaylandChannel {
     /// `DMA_BUF_IOCTL_SYNC`.  A failed begin or end must be surfaced to the
     /// caller; silently copying after a failed begin can race the host
     /// compositor and produce torn frames.
-    pub fn sync(&self, dmabuf_fd: RawFd, flags: u32) -> io::Result<()> {
-        if dmabuf_fd < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid VirtWL dma-buf descriptor",
-            ));
-        }
+    pub fn sync(&self, dmabuf_fd: BorrowedFd<'_>, flags: u32) -> io::Result<()> {
         let valid_flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END;
         if flags & !valid_flags != 0 || flags & (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE) == 0 {
             return Err(io::Error::new(
@@ -290,7 +288,7 @@ impl VirtWaylandChannel {
             ));
         }
         let mut sync = crate::virtwl::virtwl_ioctl_dmabuf_sync { flags };
-        unsafe { virtwl_ioctl_dmabuf_sync(dmabuf_fd, &mut sync) }
+        unsafe { virtwl_ioctl_dmabuf_sync(dmabuf_fd.as_raw_fd(), &mut sync) }
             .map(|_| ())
             .map_err(io::Error::from)
     }
@@ -318,7 +316,8 @@ impl VirtWaylandChannel {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub async fn send(&self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    /// Send `data` with copies of `fds`, which stay open.
+    pub async fn send(&self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         if fds.len() > VIRTWL_SEND_MAX_ALLOCS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -342,7 +341,7 @@ impl VirtWaylandChannel {
         Ok(())
     }
 
-    async fn send_chunk(&self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    async fn send_chunk(&self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         let header_size = std::mem::size_of::<virtwl_ioctl_txn>();
         let total_bytes = header_size + data.len();
 
@@ -357,7 +356,9 @@ impl VirtWaylandChannel {
             // `send` bounds `fds.len()` by VIRTWL_SEND_MAX_ALLOCS; unused
             // slots are -1.
             let (used, unused) = txn.fds.split_at_mut(fds.len());
-            used.copy_from_slice(fds);
+            for (slot, fd) in used.iter_mut().zip(fds) {
+                *slot = fd.as_raw_fd();
+            }
             unused.fill(-1);
 
             // Copy data after header

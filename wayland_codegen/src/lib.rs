@@ -283,9 +283,7 @@ mod tests {
             "an encoder takes the XML arguments in order, and owns its descriptors"
         );
         assert!(
-            wayland.contains(
-                "#[must_use=\"amessagethatisnotqueuedleaksitsdescriptors\"]pubfncreate_pool("
-            ),
+            wayland.contains("#[must_use=\"amessagethatisnotqueuedisneversent\"]pubfncreate_pool("),
             "an unused encoder result is a warning"
         );
         assert!(
@@ -301,13 +299,47 @@ mod tests {
         );
         assert!(
             wayland.contains(
-                "Ok((builder.try_build_message(sender_id,super::REQ_RECEIVE)?,vec![fd.into_raw_fd()]))"
+                "Ok((builder.try_build_message(sender_id,super::REQ_RECEIVE)?,vec![fd]))"
             ),
-            "a descriptor becomes raw only after its message is built"
+            "the message owns its descriptors"
         );
         let request_encoders = wayland.find("pubmodreq{").expect("request encoders");
         let event_encoders = wayland.find("pubmodevt{").expect("event encoders");
         assert!(request_encoders < event_encoders);
+    }
+
+    #[test]
+    fn test_generate_descriptor_ownership() {
+        let wayland = generate_compact("wayland.xml");
+        assert!(
+            wayland.contains("CreatePool{id:u32,fd:std::os::fd::OwnedFd,size:i32}"),
+            "a decoded message owns its descriptors"
+        );
+        assert!(
+            wayland.contains(
+                "fnon_create_pool(&mutself,_ctx:&mutContext,_id:u32,_fd:std::os::fd::BorrowedFd<'_>,_size:i32)"
+            ),
+            "a handler borrows the message's descriptors"
+        );
+        assert!(
+            wayland.contains("builder.write_fd(fd);"),
+            "forwarding moves the descriptor into the outgoing message"
+        );
+        // The generated module allows clippy::disallowed_methods for
+        // MessageBuilder::new, which also silences the descriptor guard.
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocols = manifest_dir.join("../third_party/protocols");
+        for entry in std::fs::read_dir(protocols).expect("read the vendored protocols") {
+            let path = entry.expect("a protocol file").path();
+            if path.extension().is_none_or(|extension| extension != "xml") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_str().unwrap();
+            let code = generate_compact(file);
+            for raw in ["into_raw_fd", "from_raw_fd", "borrow_raw", "::close("] {
+                assert!(!code.contains(raw), "{file} generates {raw}");
+            }
+        }
     }
 
     #[test]

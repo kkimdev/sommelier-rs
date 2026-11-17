@@ -40,6 +40,7 @@ use crate::state::{
 };
 use crate::window_layout::WindowLayoutAction;
 use crate::wire::Action;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use xkbcommon::xkb;
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
@@ -75,20 +76,12 @@ impl MmapView {
     /// malformed keymap event from producing a mapping that SIGBUSes when read.
     /// virtwl virtual fds intentionally report no regular-file size and are
     /// validated by the virtwl-backed mmap operation itself.
-    fn from_fd(fd: std::os::unix::io::RawFd, len: usize) -> Option<Self> {
+    fn from_fd(borrowed: BorrowedFd<'_>, len: usize) -> Option<Self> {
         use nix::sys::mman::{mmap, MapFlags, ProtFlags};
         use nix::sys::stat::{fstat, SFlag};
-        use std::os::unix::io::BorrowedFd;
 
-        // `BorrowedFd::borrow_raw` requires a valid non-negative descriptor.
-        // Check before constructing it so malformed protocol input cannot
-        // create an invalid borrowed lifetime or reach fstat/mmap with -1.
-        if fd < 0 {
-            log::error!("on_keymap: rejecting negative fd={}", fd);
-            return None;
-        }
+        let fd = borrowed.as_raw_fd();
         let nonzero_len = std::num::NonZeroUsize::new(len)?;
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let (file_size, file_mode) = match fstat(borrowed) {
             Ok(stat) => (stat.st_size, stat.st_mode),
             Err(error) => {
@@ -469,7 +462,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         &mut self,
         ctx: &mut Context,
         format: u32,
-        fd: std::os::unix::io::RawFd,
+        fd: BorrowedFd<'_>,
         size: u32,
     ) -> Action {
         let host_keyboard_id = HostId::from_event_sender(ctx);
@@ -494,7 +487,11 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // size is a u32 from the Wayland wire; the cast to usize is lossless on
         // 64-bit Linux (the only supported target for sommelier).
         let Some(mapping) = MmapView::from_fd(fd, size as usize) else {
-            log::error!("on_keymap: mmap failed for fd={}, size={}", fd, size);
+            log::error!(
+                "on_keymap: mmap failed for fd={}, size={}",
+                fd.as_raw_fd(),
+                size
+            );
             self.clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         };
@@ -1194,7 +1191,7 @@ mod tests {
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsFd;
 
     /// Helper: create an anonymous memfd, write the default keymap into it
     /// (with a trailing NUL byte as required by the Wayland spec), and call
@@ -1228,7 +1225,7 @@ mod tests {
 
         // size = string bytes + 1 NUL terminator, matching what a real host sends.
         let size = keymap_str.len() as u32 + 1;
-        handler.on_keymap(ctx, 1, fd.as_raw_fd(), size);
+        handler.on_keymap(ctx, 1, fd.as_fd(), size);
         assert!(
             handler
                 .keymaps
@@ -1324,21 +1321,19 @@ mod tests {
         );
     }
 
-    fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+    fn message_sender(message: &crate::wire::Outgoing) -> u32 {
         crate::test_support::msg_sender(&message.0)
     }
 
-    fn message_opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+    fn message_opcode(message: &crate::wire::Outgoing) -> u16 {
         crate::test_support::msg_opcode(&message.0)
     }
 
-    fn message_first_u32(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+    fn message_first_u32(message: &crate::wire::Outgoing) -> u32 {
         u32::from_ne_bytes(message.0[8..12].try_into().unwrap())
     }
 
-    fn keyboard_event_payload(
-        message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>),
-    ) -> (u32, u32, u32, u32) {
+    fn keyboard_event_payload(message: &crate::wire::Outgoing) -> (u32, u32, u32, u32) {
         let payload = &message.0[8..];
         (
             u32::from_ne_bytes(payload[0..4].try_into().unwrap()),
@@ -2660,7 +2655,7 @@ mod tests {
         // read()/pread() from here would get 0 bytes or fail.
         // mmap with offset 0 must still work.
 
-        handler.on_keymap(&mut ctx, 1, fd.as_raw_fd(), keymap_bytes.len() as u32 + 1);
+        handler.on_keymap(&mut ctx, 1, fd.as_fd(), keymap_bytes.len() as u32 + 1);
         assert!(
             handler.keymaps.contains_key(&HostId(0)),
             "keymap must load via mmap even when fd cursor is at EOF"
@@ -2683,14 +2678,6 @@ mod tests {
     }
 
     #[test]
-    fn mmap_view_rejects_negative_fd_before_borrowing() {
-        assert!(
-            MmapView::from_fd(-1, 1).is_none(),
-            "negative descriptors must be rejected before BorrowedFd construction"
-        );
-    }
-
-    #[test]
     fn keymap_mmap_is_private_not_shared() {
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::ffi::CString;
@@ -2701,7 +2688,7 @@ mod tests {
         )
         .expect("memfd_create failed");
         nix::unistd::ftruncate(&fd, 4096).expect("ftruncate failed");
-        let view = MmapView::from_fd(fd.as_raw_fd(), 4096).expect("mmap failed");
+        let view = MmapView::from_fd(fd.as_fd(), 4096).expect("mmap failed");
         let address = view.ptr.as_ptr() as usize;
         let smaps = std::fs::read_to_string("/proc/self/smaps").expect("read smaps");
         let mapping_header = smaps
@@ -2879,8 +2866,13 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // A zero-size keymap must be rejected gracefully (mmap(len=0) is UB).
-        // fd=0 (stdin) won't be mmap'd because the size check fires first.
-        let action = handler.on_keymap(&mut ctx, 1 /* XKB_V1 */, 0, 0 /* size=0 */);
+        // The empty file isn't mapped because the size check fires first.
+        let action = handler.on_keymap(
+            &mut ctx,
+            1, /* XKB_V1 */
+            crate::test_support::shm_pool_file(&[]).as_fd(),
+            0, /* size=0 */
+        );
         assert_eq!(
             action,
             Action::Forward,
@@ -2897,7 +2889,12 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // Format 0 = KEYMAP_FORMAT_NO_KEYMAP; forward without loading.
-        let action = handler.on_keymap(&mut ctx, 0 /* format=no_keymap */, 0, 100);
+        let action = handler.on_keymap(
+            &mut ctx,
+            0, /* format=no_keymap */
+            crate::test_support::shm_pool_file(&[]).as_fd(),
+            100,
+        );
         assert_eq!(action, Action::Forward);
         assert!(!handler.keymaps.contains_key(&HostId(0)));
     }
@@ -2908,7 +2905,15 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         load_test_keymap(&mut handler, &mut ctx);
 
-        assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                99,
+                crate::test_support::shm_pool_file(&[]).as_fd(),
+                0
+            ),
+            Action::Forward
+        );
         assert!(!handler.keymaps.contains_key(&HostId(0)));
         assert!(!handler.states.contains_key(&HostId(0)));
     }
@@ -2930,7 +2935,7 @@ mod tests {
             handler.on_keymap(
                 &mut ctx,
                 KEYMAP_FORMAT_XKB_V1,
-                fd.as_raw_fd(),
+                fd.as_fd(),
                 malformed.len() as u32,
             ),
             Action::Forward
@@ -2956,7 +2961,7 @@ mod tests {
             handler.on_keymap(
                 &mut ctx,
                 KEYMAP_FORMAT_XKB_V1,
-                fd.as_raw_fd(),
+                fd.as_fd(),
                 (bytes.len() + 1) as u32,
             ),
             Action::Forward
@@ -2981,7 +2986,15 @@ mod tests {
         handler.on_modifiers(&mut ctx, 1, ctrl_mask, 0, 0, 0);
         ctx.key_generations.suppress_host_accelerator(HostId(5), 30);
 
-        assert_eq!(handler.on_keymap(&mut ctx, 0, 0, 0), Action::Forward);
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                0,
+                crate::test_support::shm_pool_file(&[]).as_fd(),
+                0
+            ),
+            Action::Forward
+        );
         assert!(!handler.keymaps.contains_key(&HostId(5)));
         assert!(!handler.states.contains_key(&HostId(5)));
         assert!(!handler.modifiers.contains_key(&HostId(5)));
@@ -3000,7 +3013,15 @@ mod tests {
         load_test_keymap(&mut handler, &mut ctx);
 
         ctx.last_sender_id = 5;
-        assert_eq!(handler.on_keymap(&mut ctx, 0, 0, 0), Action::Forward);
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                0,
+                crate::test_support::shm_pool_file(&[]).as_fd(),
+                0
+            ),
+            Action::Forward
+        );
         assert!(!handler.keymaps.contains_key(&HostId(5)));
         assert!(!handler.states.contains_key(&HostId(5)));
         assert!(
@@ -3031,11 +3052,10 @@ mod tests {
         let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD, 0x00];
         nix::unistd::write(&fd, bad_bytes).expect("write failed");
 
-        use std::os::unix::io::AsRawFd;
         let action = handler.on_keymap(
             &mut ctx,
             1, /* XKB_V1 */
-            fd.as_raw_fd(),
+            fd.as_fd(),
             bad_bytes.len() as u32,
         );
         assert_eq!(action, Action::Forward, "invalid UTF-8 must still forward");
@@ -3063,11 +3083,10 @@ mod tests {
         let garbage = b"this is not a valid xkb keymap\0";
         nix::unistd::write(&fd, garbage).expect("write failed");
 
-        use std::os::unix::io::AsRawFd;
         let action = handler.on_keymap(
             &mut ctx,
             1, /* XKB_V1 */
-            fd.as_raw_fd(),
+            fd.as_fd(),
             garbage.len() as u32,
         );
         assert_eq!(
@@ -3419,7 +3438,7 @@ mod tests {
                 message_sender(message) == guest_text_input && message_opcode(message) == 3
             })
             .map(|message| {
-                let mut wire = WireMessage::new(guest_text_input, 3, &message.0[8..], &message.1);
+                let mut wire = WireMessage::new(guest_text_input, 3, &message.0[8..]);
                 wire.read_string().unwrap().to_string()
             })
             .collect();
@@ -4630,7 +4649,15 @@ mod tests {
             .cancel_backspace_repeat(HostId(5), EVDEV_KEY_BACKSPACE);
         assert!(ctx.claim_guest_key(HostId(5), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
 
-        assert_eq!(handler.on_keymap(&mut ctx, 99, 0, 0), Action::Forward);
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                99,
+                crate::test_support::shm_pool_file(&[]).as_fd(),
+                0
+            ),
+            Action::Forward
+        );
         assert!(!ctx
             .key_generations
             .physically_held(HostId(5), EVDEV_KEY_BACKSPACE));

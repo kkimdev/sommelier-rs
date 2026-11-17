@@ -16,10 +16,26 @@ limitations under the License.
 
 //! Shared helpers for unit tests.
 
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use crate::wire::{Framing, MessageHeader};
+use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError};
+
+/// A message's bytes and its descriptors' numbers.
+pub type RawMessage = (Vec<u8>, Vec<RawFd>);
+
+/// `message` as a [`RawMessage`], which compares where owned descriptors
+/// do not. The descriptors close, so the returned numbers name nothing.
+pub fn raw_message((message, fds): Outgoing) -> RawMessage {
+    (message, fds.iter().map(AsRawFd::as_raw_fd).collect())
+}
+
+/// A dispatch result whose message compares; see [`raw_message`].
+pub fn raw_dispatch(
+    result: Result<Option<Outgoing>, ProtocolError>,
+) -> Result<Option<RawMessage>, ProtocolError> {
+    result.map(|message| message.map(raw_message))
+}
 
 /// The header of an encoded Wayland message.
 pub fn msg_header(message: &[u8]) -> MessageHeader {
@@ -48,7 +64,7 @@ pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
 }
 
 /// The `(sender, opcode)` of every message in a proxy message queue.
-pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
+pub fn queued_headers(queue: &[crate::wire::Outgoing]) -> Vec<(u32, u16)> {
     queue
         .iter()
         .map(|(message, _)| (msg_sender(message), msg_opcode(message)))

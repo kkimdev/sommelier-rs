@@ -67,7 +67,7 @@ pub fn generate(protocol: &Protocol) -> String {
             #![allow(clippy::single_match)]
             #![allow(clippy::collapsible_match)]
 
-            use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+            use std::os::fd::OwnedFd;
             use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
             use crate::state::Context;
 
@@ -279,17 +279,9 @@ fn map_type(arg: &Arg) -> TokenStream {
             }
         }
         "array" => quote! { Vec<u8> },
-        "fd" => quote! { RawFd },
+        // A decoded message owns its descriptors; dropping it closes them.
+        "fd" => quote! { std::os::fd::OwnedFd },
         _ => quote! { u32 },
-    }
-}
-
-fn map_type_fq(arg: &Arg) -> TokenStream {
-    match arg.typ.as_str() {
-        "fd" => quote! { std::os::unix::io::RawFd },
-        // For other types, map_type returns primitives or standard library types (String, Vec)
-        // or tuples of them, so it's safe to reuse.
-        _ => map_type(arg),
     }
 }
 
@@ -422,6 +414,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             || (arg.typ == "new_id" && arg.interface.is_none())
                         {
                             handler_call_args.push(quote! { &#name });
+                        } else if arg.typ == "fd" {
+                            handler_call_args.push(quote! { std::os::fd::AsFd::as_fd(&#name) });
                         } else {
                             handler_call_args.push(quote! { #name });
                         }
@@ -618,6 +612,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             || (arg.typ == "new_id" && arg.interface.is_none())
                         {
                             handler_call_args.push(quote! { &#name });
+                        } else if arg.typ == "fd" {
+                            handler_call_args.push(quote! { std::os::fd::AsFd::as_fd(&#name) });
                         } else {
                             handler_call_args.push(quote! { #name });
                         }
@@ -885,7 +881,7 @@ fn generate_delegation_macro(protocol: &Protocol) -> TokenStream {
                 };
 
                 let method_name = format_ident!("on_{}", name);
-                let sig_args = generate_handler_args_fq(args_items);
+                let sig_args = generate_handler_args(args_items);
                 let call_args = generate_forwarding_call_args(args_items);
 
                 method_impls.push(quote! {
@@ -953,8 +949,8 @@ fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStre
 /// argument types of every message the proxy builds itself. A message that
 /// carries a string or an array can exceed the wire's 16-bit length and
 /// returns a `Result`; any other cannot and returns the message directly.
-/// Descriptors are `OwnedFd`s that become raw only once the message is
-/// built, so a failed build closes them.
+/// The message owns its descriptors, as `OwnedFd`s, so one that cannot be
+/// built or is never sent closes them.
 fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> TokenStream {
     let name = sanitize_ident(&message.name);
     let mut params = Vec::new();
@@ -1017,7 +1013,7 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
             }
             "fd" => {
                 params.push(quote! { #arg_name: OwnedFd });
-                fds.push(quote! { #arg_name.into_raw_fd() });
+                fds.push(quote! { #arg_name });
             }
             other => panic!(
                 "{}.{}: unknown argument type {}",
@@ -1041,11 +1037,11 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
             quote! { (builder.build_message(sender_id, super::#opcode), #fds) },
         )
     };
-    // A dropped encoder result loses the message without a trace and leaks
-    // its descriptors, which are raw once it is built. The reason keeps
-    // Clippy from calling the attribute redundant on a `Result`.
+    // A dropped encoder result loses the message without a trace. The
+    // reason keeps Clippy from calling the attribute redundant on a
+    // `Result`.
     quote! {
-        #[must_use = "a message that is not queued leaks its descriptors"]
+        #[must_use = "a message that is not queued is never sent"]
         pub fn #name(sender_id: u32, #(#params),*) -> #output {
             #[allow(unused_mut)]
             let mut builder = MessageBuilder::new();
@@ -1387,6 +1383,11 @@ fn generate_fields(items: &[MessageItem]) -> TokenStream {
     quote! { #(#fields),* }
 }
 
+/// The parameters of a handler method. Types are fully qualified, because
+/// the delegation macro expands them in the handler's module.
+///
+/// A handler borrows the message's descriptors: the dispatcher owns them,
+/// forwards them or closes them, and a handler that keeps one clones it.
 fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
     let mut args = Vec::new();
     for item in items {
@@ -1399,26 +1400,8 @@ fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
                 args.push(quote! { #name: &[u8] });
             } else if arg.typ == "new_id" && arg.interface.is_none() {
                 args.push(quote! { #name: &(String, u32, u32) });
-            } else {
-                args.push(quote! { #name: #ty });
-            }
-        }
-    }
-    quote! { #(#args),* }
-}
-
-fn generate_handler_args_fq(items: &[MessageItem]) -> TokenStream {
-    let mut args = Vec::new();
-    for item in items {
-        if let MessageItem::Arg(arg) = item {
-            let name = format_ident!("_{}", sanitize_ident(&arg.name));
-            let ty = map_type_fq(arg);
-            if arg.typ == "string" {
-                args.push(quote! { #name: &#ty });
-            } else if arg.typ == "array" {
-                args.push(quote! { #name: &[u8] });
-            } else if arg.typ == "new_id" && arg.interface.is_none() {
-                args.push(quote! { #name: &(String, u32, u32) });
+            } else if arg.typ == "fd" {
+                args.push(quote! { #name: std::os::fd::BorrowedFd<'_> });
             } else {
                 args.push(quote! { #name: #ty });
             }

@@ -356,7 +356,7 @@ fn discover_globals(protocols: &Arc<Protocols>, config: Config) -> Vec<Global> {
             (header.sender_id, header.opcode) == (REGISTRY, wl_registry::EVT_GLOBAL)
         })
         .map(|(header, payload)| {
-            let mut global = WireMessage::new(header.sender_id, header.opcode, payload, &[]);
+            let mut global = WireMessage::new(header.sender_id, header.opcode, payload);
             Global {
                 name: global.read_u32().expect("global name"),
                 interface: global.read_string().expect("global interface"),
@@ -997,7 +997,7 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
             let request = protocols.requests[&interface]
                 .get(usize::from(opcode))
                 .unwrap_or_else(|| panic!("{interface} has no request {opcode}"));
-            let mut message = WireMessage::new(sender, opcode, payload, &[]);
+            let mut message = WireMessage::new(sender, opcode, payload);
             let word = |message: &mut WireMessage| message.read_u32().expect("a whole request");
             let mut created = Vec::new();
             for arg in &request.args {
@@ -1051,7 +1051,7 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
                 ended.push(sender);
             }
             if (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC) {
-                let callback = WireMessage::new(sender, opcode, payload, &[])
+                let callback = WireMessage::new(sender, opcode, payload)
                     .read_u32()
                     .expect("a callback ID");
                 // `done` destroys the callback.

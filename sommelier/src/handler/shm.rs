@@ -1247,7 +1247,13 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
         Action::Forward
     }
 
-    fn on_create_pool(&mut self, ctx: &mut Context, id: u32, fd: RawFd, size: i32) -> Action {
+    fn on_create_pool(
+        &mut self,
+        ctx: &mut Context,
+        id: u32,
+        fd: BorrowedFd<'_>,
+        size: i32,
+    ) -> Action {
         if ctx.stale_shm_guest_objects.contains(&ctx.last_sender_id) {
             debug!(
                 "Ignoring wl_shm.create_pool from removed host global object {}",
@@ -1267,16 +1273,9 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             );
             return Action::Drop;
         };
-        // proxy.rs closes `fd` after this handler returns, so the pool owns
-        // a duplicate, close-on-exec like every descriptor the proxy keeps.
-        let duplicate = if fd < 0 {
-            Err(io::Error::from_raw_os_error(libc::EBADF))
-        } else {
-            // Safety: the dispatcher keeps `fd` open until this handler
-            // returns, and it is not -1.
-            unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
-        };
-        let file = match duplicate {
+        // The request closes `fd` once handled, so the pool owns a
+        // duplicate, close-on-exec like every descriptor the proxy keeps.
+        let file = match fd.try_clone_to_owned() {
             Ok(duplicate) => File::from(duplicate),
             Err(error) => {
                 error!("Failed to dup FD for SHM pool: {}", error);
@@ -1292,7 +1291,8 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
         if !regular_file_has_size(&file, pool_size) {
             warn!(
                 "Rejecting SHM pool fd {} that is not a regular file of at least {} bytes",
-                fd, pool_size
+                fd.as_raw_fd(),
+                pool_size
             );
             queue_protocol_error(
                 ctx,
@@ -2043,10 +2043,10 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
-    use crate::test_support::{msg_sender, queued_headers, shm_pool_file};
+    use crate::test_support::{msg_sender, queued_headers, raw_dispatch, shm_pool_file};
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::sync::Arc;
 
     fn register_test_local(ctx: &mut Context, guest_id: u32, host_id: u32, backing: BufferState) {
@@ -2097,7 +2097,10 @@ mod tests {
         let mut handler = ShmHandler;
 
         ctx.last_sender_id = 10;
-        assert_eq!(handler.on_create_pool(&mut ctx, 20, -1, 0), Action::Drop);
+        assert_eq!(
+            handler.on_create_pool(&mut ctx, 20, shm_pool_file(&[]).as_fd(), 0),
+            Action::Drop
+        );
         assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
@@ -2123,7 +2126,7 @@ mod tests {
         };
         ctx.last_sender_id = 10;
         assert_eq!(
-            handler.on_create_pool(&mut ctx, 20, fd.as_raw_fd(), 4096),
+            handler.on_create_pool(&mut ctx, 20, fd.as_fd(), 4096),
             Action::Drop
         );
         ctx.host_to_client_queue.clear();
@@ -2656,14 +2659,13 @@ mod tests {
             guest_shm,
             crate::protocols::wayland::wl_shm::REQ_RELEASE,
             &[],
-            &[],
         );
         assert_eq!(
-            crate::protocols::wayland::wl_shm::dispatch_request(
+            raw_dispatch(crate::protocols::wayland::wl_shm::dispatch_request(
                 &mut release,
                 &mut handler,
                 &mut ctx
-            ),
+            )),
             Ok(None)
         );
         assert!(!ctx.shm_guest_formats.contains_key(&guest_shm));
@@ -2823,8 +2825,7 @@ mod tests {
                 (host_pool, wl_shm_pool::REQ_DESTROY),
             ]
         );
-        let pool_fd =
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(ctx.client_to_host_queue[0].1[0]) };
+        let pool_fd = ctx.client_to_host_queue[0].1[0].as_fd();
         let pool_size = nix::sys::stat::fstat(pool_fd)
             .expect("fstat the pool")
             .st_size;
@@ -2954,7 +2955,7 @@ mod tests {
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_shm;
         assert_eq!(
-            handler.on_create_pool(&mut ctx, 30, fd.as_raw_fd(), 4096),
+            handler.on_create_pool(&mut ctx, 30, fd.as_fd(), 4096),
             Action::Drop
         );
         assert!(
@@ -3048,7 +3049,7 @@ mod tests {
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_shm;
         assert_eq!(
-            WlShmHandler::on_create_pool(&mut handler, &mut ctx, 30, fd.as_raw_fd(), 4096),
+            WlShmHandler::on_create_pool(&mut handler, &mut ctx, 30, fd.as_fd(), 4096),
             Action::Drop
         );
         assert!(ctx.pools.contains_key(&30));

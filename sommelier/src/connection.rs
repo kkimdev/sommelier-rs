@@ -15,12 +15,12 @@ limitations under the License.
 */
 
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Framing, MessageHeader};
+use crate::wire::{Framing, MessageHeader, Outgoing};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -55,17 +55,19 @@ pub(crate) const MAX_FDS_PER_SEND: usize = crate::virtwl::VIRTWL_SEND_MAX_ALLOCS
 /// An ordered run of outgoing Wayland messages and their descriptors.
 ///
 /// Sent by [`WaylandConnection::send_messages`], which coalesces messages
-/// into as few submissions as [`MAX_FDS_PER_SEND`] allows.
+/// into as few submissions as [`MAX_FDS_PER_SEND`] allows. It owns the
+/// descriptors: a send passes copies to the peer, and dropping the run
+/// closes them, sent or not.
 #[derive(Debug, Default)]
 pub(crate) struct OutgoingMessages {
     bytes: Vec<u8>,
-    fds: Vec<RawFd>,
+    fds: Vec<OwnedFd>,
     /// Where each message ends in `bytes` and in `fds`.
     ends: Vec<(usize, usize)>,
 }
 
 impl OutgoingMessages {
-    pub(crate) fn push(&mut self, message: &[u8], fds: &[RawFd]) {
+    pub(crate) fn push(&mut self, (message, fds): Outgoing) {
         // No Wayland message has that many descriptor arguments; one that
         // did could not be sent in a single submission.
         debug_assert!(
@@ -73,36 +75,30 @@ impl OutgoingMessages {
             "a message carries {} descriptors",
             fds.len()
         );
-        self.bytes.extend_from_slice(message);
-        self.fds.extend_from_slice(fds);
+        self.bytes.extend_from_slice(&message);
+        self.fds.extend(fds);
         self.ends.push((self.bytes.len(), self.fds.len()));
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ends.is_empty()
     }
-
-    /// The descriptors of every message, which the caller still owns.
-    pub(crate) fn fds(&self) -> &[RawFd] {
-        &self.fds
-    }
-
-    /// Discard the messages, returning their descriptors.
-    pub(crate) fn take_fds(&mut self) -> Vec<RawFd> {
-        self.bytes.clear();
-        self.ends.clear();
-        std::mem::take(&mut self.fds)
-    }
 }
 
 pub struct WaylandConnection {
     transport: ConnectionTransport,
     pub read_buf: Vec<u8>,
-    pub read_fds: Vec<RawFd>,
+    /// Received descriptors no message has taken yet, in stream order. A
+    /// decoded message takes its own from the front; the rest close with
+    /// the connection.
+    pub read_fds: VecDeque<OwnedFd>,
     /// A complete untracked message was dropped while descriptors remained
     /// queued on the ordered stream. This ambiguity must survive separate
     /// recv/parse calls until a complete follow-up can be rejected.
     pub ambiguous_untracked_fd: bool,
+    /// The most received descriptors held unconsumed: [`MAX_PENDING_FDS`],
+    /// which tests lower so they need not hold a thousand descriptors.
+    max_pending_fds: usize,
 }
 
 enum ConnectionTransport {
@@ -117,26 +113,22 @@ fn unix_send_flags() -> MsgFlags {
     MsgFlags::MSG_NOSIGNAL
 }
 
-fn close_received_fds(fds: &[RawFd]) {
-    let mut unique_fds = HashSet::with_capacity(fds.len());
-    for &fd in fds {
-        if fd >= 0 && unique_fds.insert(fd) {
-            let _ = nix::unistd::close(fd);
-        }
-    }
-}
-
 /// Decode SCM_RIGHTS descriptors from a raw `recvmsg` control buffer.
 ///
 /// `nix::RecvMsg::cmsgs()` intentionally refuses to iterate when
 /// `MSG_CTRUNC` is set. That is normally a useful safety check, but it would
 /// leak descriptors that the kernel did install before truncating the
-/// ancillary buffer. This parser validates each kernel-provided length,
-/// collects every descriptor that is present, and closes those descriptors
-/// before returning an error whenever truncation or malformed control data is
-/// observed.
-fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
+/// ancillary buffer. This parser validates each kernel-provided length and
+/// takes ownership of every descriptor that is present as soon as it reads
+/// it, so returning an error whenever truncation or malformed control data
+/// is observed closes them.
+// The kernel boundary: recvmsg installs raw descriptors.
+#[allow(clippy::disallowed_methods)]
+fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
     let mut fds = Vec::new();
+    // The kernel never reports a negative descriptor; owning one would be
+    // unsound. Skip it, but own the rest before failing, so none leaks.
+    let mut negative_fd = false;
     let control_start = msg.msg_control as usize;
     // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl. Keep
     // pointer arithmetic in usize so this parser is portable across targets.
@@ -161,14 +153,12 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     while !current.is_null() {
         let current_addr = current as usize;
         let Some(current_offset) = current_addr.checked_sub(control_start) else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS header lies outside the control buffer",
             ));
         };
         if current_offset > control_len || control_len - current_offset < header_size {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated SCM_RIGHTS control header",
@@ -177,7 +167,6 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
 
         let cmsg_len = unsafe { (*current).cmsg_len as usize };
         if cmsg_len < header_size || cmsg_len > control_end - current_addr {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid SCM_RIGHTS control length",
@@ -189,35 +178,30 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             && unsafe { (*current).cmsg_type } == libc::SCM_RIGHTS
         {
             if !payload_len.is_multiple_of(std::mem::size_of::<RawFd>()) {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload is not fd-aligned",
                 ));
             }
             let Some(data_addr) = current_addr.checked_add(header_size) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload address overflows",
                 ));
             };
             let Some(data_end) = data_addr.checked_add(payload_len) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload end overflows",
                 ));
             };
             let Some(message_end) = current_addr.checked_add(cmsg_len) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS message end overflows",
                 ));
             };
             if data_end > message_end {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload exceeds control message",
@@ -225,7 +209,14 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             }
             for index in 0..(payload_len / std::mem::size_of::<RawFd>()) {
                 let fd_addr = data_addr + index * std::mem::size_of::<RawFd>();
-                fds.push(unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) });
+                let fd = unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) };
+                if fd < 0 {
+                    negative_fd = true;
+                    continue;
+                }
+                // SAFETY: `recvmsg` installed this descriptor for this
+                // receive, once, and nothing else refers to it yet.
+                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }
         }
 
@@ -233,14 +224,12 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             .checked_add(align - 1)
             .map(|len| len & !(align - 1))
         else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS control alignment overflows",
             ));
         };
         let Some(next_addr) = current_addr.checked_add(aligned_len) else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS control chain overflows",
@@ -253,10 +242,15 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     }
 
     if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-        close_received_fds(&fds);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated SCM_RIGHTS ancillary data",
+        ));
+    }
+    if negative_fd {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative SCM_RIGHTS descriptor",
         ));
     }
 
@@ -267,7 +261,7 @@ fn recv_unix_message(
     fd: RawFd,
     data: &mut [u8],
     control: &mut [u8],
-) -> io::Result<(usize, Vec<RawFd>)> {
+) -> io::Result<(usize, Vec<OwnedFd>)> {
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),
@@ -311,8 +305,9 @@ impl WaylandConnection {
         Ok(Self {
             transport: ConnectionTransport::Unix(AsyncFd::new(fd)?),
             read_buf: Vec::new(),
-            read_fds: Vec::new(),
+            read_fds: VecDeque::new(),
             ambiguous_untracked_fd: false,
+            max_pending_fds: MAX_PENDING_FDS,
         })
     }
 
@@ -320,8 +315,9 @@ impl WaylandConnection {
         Self {
             transport: ConnectionTransport::VirtWayland(channel),
             read_buf: Vec::new(),
-            read_fds: Vec::new(),
+            read_fds: VecDeque::new(),
             ambiguous_untracked_fd: false,
+            max_pending_fds: MAX_PENDING_FDS,
         }
     }
 
@@ -329,19 +325,16 @@ impl WaylandConnection {
     ///
     /// Fails once more than [`MAX_PENDING_FDS`] descriptors are pending; the
     /// caller then closes the connection, which closes them.
-    fn append_received(
-        &mut self,
-        data: &[u8],
-        fds: impl IntoIterator<Item = RawFd>,
-    ) -> io::Result<()> {
+    fn append_received(&mut self, data: &[u8], fds: Vec<OwnedFd>) -> io::Result<()> {
         self.read_buf.extend_from_slice(data);
         self.read_fds.extend(fds);
-        if self.read_fds.len() > MAX_PENDING_FDS {
+        if self.read_fds.len() > self.max_pending_fds {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "peer has {} unconsumed file descriptors; the limit is {MAX_PENDING_FDS}",
-                    self.read_fds.len()
+                    "peer has {} unconsumed file descriptors; the limit is {}",
+                    self.read_fds.len(),
+                    self.max_pending_fds
                 ),
             ));
         }
@@ -368,15 +361,16 @@ impl WaylandConnection {
     /// Send one transport submission. Private: everything outgoing goes
     /// through [`Self::send_messages`], which keeps each submission within
     /// [`MAX_FDS_PER_SEND`].
-    async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    async fn send(&mut self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         if data.is_empty() && fds.is_empty() {
             return Ok(());
         }
 
         match &mut self.transport {
             ConnectionTransport::Unix(fd) => {
+                let raw_fds: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
                 let mut data_offset = 0;
-                let mut fds_to_send = fds;
+                let mut fds_to_send = raw_fds.as_slice();
 
                 while data_offset < data.len() || !fds_to_send.is_empty() {
                     let mut guard = fd.writable().await?;
@@ -478,7 +472,7 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => {
                 let (data, fds) = channel.recv().await?;
-                self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                self.append_received(&data, fds)?;
                 Ok(data.len())
             }
         }
@@ -505,7 +499,7 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => match channel.try_recv()? {
                 Some((data, fds)) => {
-                    self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                    self.append_received(&data, fds)?;
                     Ok(Some(data.len()))
                 }
                 None => Ok(None),
@@ -523,25 +517,14 @@ impl AsRawFd for WaylandConnection {
     }
 }
 
-impl Drop for WaylandConnection {
-    fn drop(&mut self) {
-        // FDs received through SCM_RIGHTS are owned by the proxy. Normally
-        // proxy::handle_msgs drains and closes them after forwarding, but a
-        // disconnect or protocol error can drop the connection while a
-        // partial message is still buffered.
-        close_received_fds(&self.read_fds);
-        self.read_fds.clear();
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
-        WaylandConnection, MAX_PENDING_FDS,
+        WaylandConnection,
     };
-    use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
@@ -609,13 +592,15 @@ mod tests {
         let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
         let name = CString::new("sommelier-split-batch").unwrap();
         let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
-        let fd = memfd.as_raw_fd();
 
         // (bytes, descriptors) per message: the second message would take
         // the first submission past the limit, so it starts the next one.
         let mut messages = OutgoingMessages::default();
         for (len, fds) in [(8, 20), (12, 10), (16, 0), (20, 5)] {
-            messages.push(&vec![0; len], &vec![fd; fds]);
+            let fds = (0..fds)
+                .map(|_| memfd.try_clone().expect("dup the memfd"))
+                .collect();
+            messages.push((vec![0; len], fds));
         }
         connection
             .send_messages(&messages)
@@ -632,9 +617,6 @@ mod tests {
             if bytes == 0 {
                 break;
             }
-            for &received in &fds {
-                unsafe { libc::close(received) };
-            }
             submissions.push((bytes, fds.len()));
         }
         assert_eq!(submissions, vec![(8, 20), (48, 15)]);
@@ -644,9 +626,10 @@ mod tests {
     async fn too_many_unconsumed_fds_end_the_connection() {
         let (peer, socket) = UnixStream::pair().expect("unix socket pair");
         let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
-        // Stand-ins for descriptors already pending; negative entries are
-        // never closed, so the test does not need a thousand real ones.
-        connection.read_fds.resize(MAX_PENDING_FDS - 1, -1);
+        // A small limit stands in for MAX_PENDING_FDS, and one descriptor
+        // already pending brings the queue to one below it.
+        connection.max_pending_fds = 2;
+        connection.read_fds.push_back(shm_pool_file(&[]).into());
 
         let name = CString::new("sommelier-pending-fd-limit").unwrap();
         let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
@@ -684,17 +667,16 @@ mod tests {
         // identity is not shared with the connection's pipe peer or another
         // anonymous-inode object. Eventfds all report one inode on Linux.
         let name = CString::new("sommelier-connection-fd-test").unwrap();
-        let pending_fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)
-            .expect("memfd_create")
-            .into_raw_fd();
-        let pending_identity = fd_identity(pending_fd);
+        let pending_fd =
+            memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let pending_identity = fd_identity(pending_fd.as_raw_fd());
         unsafe {
             libc::close(pipe_fds[1]);
         }
         let mut connection =
             WaylandConnection::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) })
                 .expect("register test pipe");
-        connection.read_fds.push(pending_fd);
+        connection.read_fds.push_back(pending_fd);
         drop(connection);
 
         // The numeric descriptor can be reused immediately by another test,
@@ -741,6 +723,37 @@ mod tests {
                 .as_ref()
                 .map_or(true, |current| current != &received_target),
             "truncated control cleanup must release the received fd"
+        );
+    }
+
+    #[test]
+    fn negative_scm_rights_descriptor_is_invalid_data() {
+        // The kernel never reports one; owning it would be unsound. The
+        // descriptor after it must still be owned, and closed.
+        let name = CString::new("sommelier-after-negative-fd").unwrap();
+        let received = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let identity = fd_identity(received.as_raw_fd());
+        let payload_len = 2 * std::mem::size_of::<RawFd>() as u32;
+        let control_len = unsafe { libc::CMSG_SPACE(payload_len) } as usize;
+        let mut control = vec![0u8; control_len];
+        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        unsafe {
+            (*header).cmsg_len = libc::CMSG_LEN(payload_len) as _;
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            let data = libc::CMSG_DATA(header).cast::<RawFd>();
+            data.write_unaligned(-1);
+            data.add(1).write_unaligned(received.into_raw_fd());
+        }
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len() as _;
+
+        let error = decode_unix_control_fds(&msg).expect_err("a negative descriptor");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !any_fd_has_identity(identity),
+            "the descriptors after a negative one must be closed"
         );
     }
 

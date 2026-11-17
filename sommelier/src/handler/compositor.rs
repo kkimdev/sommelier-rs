@@ -34,7 +34,7 @@ use crate::state::{
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::trace;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::Arc;
 
 pub struct CompositorHandler;
@@ -46,14 +46,14 @@ pub struct CompositorHandler;
 /// future early-return path from leaving the host dma-buf permanently locked.
 struct DmabufWriteSync<'a> {
     channel: &'a crate::virtwl_channel::VirtWaylandChannel,
-    fd: RawFd,
+    fd: BorrowedFd<'a>,
     ended: bool,
 }
 
 impl<'a> DmabufWriteSync<'a> {
     fn begin(
         channel: Option<&'a Arc<crate::virtwl_channel::VirtWaylandChannel>>,
-        fd: Option<RawFd>,
+        fd: Option<BorrowedFd<'a>>,
     ) -> Option<Self> {
         let channel = channel?;
         let fd = fd?;
@@ -524,7 +524,7 @@ fn copy_to_host_storage(
         return Err(ShmCopyError::Destination);
     };
     let sync_guard = if buffer.dmabuf_sync {
-        let fd = buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd);
+        let fd = buffer.dmabuf_fd.as_ref().map(AsFd::as_fd);
         let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
             log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
             return Err(ShmCopyError::Destination);
@@ -1267,6 +1267,8 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
@@ -1284,7 +1286,7 @@ mod tests {
     use crate::test_support::{
         msg_opcode, msg_sender, protocol_error_code, queued_headers, shm_pool_file,
     };
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
 
     fn setup_ctx() -> (Context, u32, u32, u32) {
@@ -1332,7 +1334,7 @@ mod tests {
         ctx.last_sender_id = toplevel_guest;
         let payload = inert_output.to_ne_bytes();
         let mut request =
-            crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload, &[]);
+            crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload);
         let (message, _) = dispatch_request(&mut request, &mut CompositorHandler, &mut ctx)
             .expect("valid request")
             .expect("forwarded");
@@ -1384,7 +1386,7 @@ mod tests {
 
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
-            let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload, &[]);
+            let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload);
             let dispatched = dispatch_event(&mut event, &mut CompositorHandler, &mut ctx);
             assert!(matches!(dispatched, Ok(None)), "opcode {opcode}");
             assert_eq!(ctx.outputs.entered_for_test(surface_host), None);
@@ -2544,7 +2546,6 @@ mod tests {
     #[test]
     fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
         use crate::protocols::wayland::wl_shm::WlShmHandler;
-        use std::os::fd::AsRawFd;
 
         const BUFFER_BYTES: usize = 4;
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
@@ -2558,7 +2559,7 @@ mod tests {
             crate::handler::shm::ShmHandler.on_create_pool(
                 &mut ctx,
                 pool_id,
-                client_file.as_raw_fd(),
+                client_file.as_fd(),
                 BUFFER_BYTES as i32,
             ),
             Action::Drop
@@ -3140,7 +3141,7 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         let damage = &ctx.client_to_host_queue[0].0;
         assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 8);
@@ -3273,7 +3274,7 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         let damage = &ctx.client_to_host_queue[0].0;
         assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 8);
@@ -3292,7 +3293,7 @@ mod tests {
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         let damage = &ctx.client_to_host_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
         assert_eq!(wire.read_i32().unwrap(), 9);
         assert_eq!(wire.read_i32().unwrap(), 19);
         assert_eq!(wire.read_i32().unwrap(), 3);
@@ -3334,7 +3335,7 @@ mod tests {
 
         let damage = &ctx.client_to_host_queue[0].0;
         assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 6);
@@ -3409,7 +3410,7 @@ mod tests {
             .iter()
             .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
             .expect("offset plus explicit damage must include complete host damage");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage.0[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage.0[8..]);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 8);
@@ -3433,7 +3434,7 @@ mod tests {
             .iter()
             .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
             .expect("damage request");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..]);
         assert_eq!(wire.read_i32().unwrap(), i32::MIN / 10);
         assert_eq!(wire.read_i32().unwrap(), -1);
         assert_eq!(wire.read_i32().unwrap(), 214_748_364);
@@ -3510,7 +3511,7 @@ mod tests {
             .iter()
             .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
             .expect("translated damage request");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..]);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 0);
         assert_eq!(wire.read_i32().unwrap(), 51);

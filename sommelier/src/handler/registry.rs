@@ -1442,7 +1442,7 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         let global = &ctx.host_to_client_queue[0].0;
         assert_eq!(crate::test_support::msg_sender(global), 10);
-        let mut wire = crate::wire::WireMessage::new(10, 0, &global[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(10, 0, &global[8..]);
         assert_eq!(wire.read_u32().unwrap(), 7);
         assert_eq!(wire.read_string().unwrap(), "gtk_shell1");
         assert_eq!(wire.read_u32().unwrap(), 1);
@@ -1616,7 +1616,7 @@ mod tests {
         );
 
         let bind = &ctx.client_to_host_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..]);
         assert_eq!(wire.read_u32().unwrap(), 10);
         assert_eq!(wire.read_string().unwrap(), dmabuf);
         assert_eq!(
@@ -1655,7 +1655,7 @@ mod tests {
         );
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         let global = &ctx.host_to_client_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..], &[]);
+        let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..]);
         assert_eq!(wire.read_u32().unwrap(), 10);
         assert_eq!(wire.read_string().unwrap(), "zwp_linux_dmabuf_v1");
         assert_eq!(wire.read_u32().unwrap(), 3);
@@ -2701,7 +2701,7 @@ mod tests {
             } else {
                 assert_eq!(action, Action::Drop);
                 let (global, _) = ctx.host_to_client_queue.pop().expect("guest global");
-                let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..], &[]);
+                let mut wire = crate::wire::WireMessage::new(1, 0, &global[8..]);
                 assert_eq!(wire.read_u32().unwrap(), 7);
                 assert_eq!(wire.read_string().unwrap(), compositor);
                 assert_eq!(wire.read_u32().unwrap(), guest_version);
@@ -2723,7 +2723,7 @@ mod tests {
                 Some(guest_version.min(3))
             );
             let (bind, _) = ctx.client_to_host_queue.pop().expect("host bind");
-            let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..], &[]);
+            let mut wire = crate::wire::WireMessage::new(1, 0, &bind[8..]);
             assert_eq!(wire.read_u32().unwrap(), 7);
             assert_eq!(wire.read_string().unwrap(), compositor);
             assert_eq!(wire.read_u32().unwrap(), guest_version.min(3));

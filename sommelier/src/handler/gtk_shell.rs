@@ -211,8 +211,7 @@ mod tests {
     }
 
     fn nullable_string(message: &[u8]) -> Option<String> {
-        let mut wire =
-            WireMessage::new(msg_sender(message), msg_opcode(message), &message[8..], &[]);
+        let mut wire = WireMessage::new(msg_sender(message), msg_opcode(message), &message[8..]);
         wire.read_nullable_string().unwrap()
     }
 

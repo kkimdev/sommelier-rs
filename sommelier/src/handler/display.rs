@@ -224,7 +224,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
-    use crate::test_support::protocol_error_code;
+    use crate::test_support::{protocol_error_code, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
@@ -257,11 +257,15 @@ mod tests {
     fn unmapped_request_is_rejected_before_handler_state_mutation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let payload = 20u32.to_ne_bytes();
-        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload, &[]);
+        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload);
         let mut handler = ProbeHandler;
 
         assert_eq!(
-            wl_display::dispatch_request(&mut msg, &mut handler, &mut ctx),
+            raw_dispatch(wl_display::dispatch_request(
+                &mut msg,
+                &mut handler,
+                &mut ctx
+            )),
             Err(ProtocolError::InvalidSender(999))
         );
         assert!(
