@@ -1313,11 +1313,11 @@ fn queue_host_deactivation_barrier(
         return;
     };
     if !state.host_is_active() {
-        log::error!(
-            "Text-input {} was not active when its drain barrier was installed",
-            guest_id
-        );
-        ctx.fail_session();
+        // Deep in a text-input focus change: the session ends, and the
+        // loop drops this message's effects whatever its handler returns.
+        let _ = ctx.fail(format_args!(
+            "Text-input {guest_id} was not active when its drain barrier was installed"
+        ));
         return;
     }
     ctx.client_to_host_queue

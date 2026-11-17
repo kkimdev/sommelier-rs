@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::display::queue_protocol_error;
 use crate::handler::shm::record_host_shm_drm_format;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
@@ -248,15 +247,16 @@ fn valid_dmabuf_plane(param: &PendingParam, format: u32, width: i32, height: i32
         .is_some()
 }
 
-/// Report synthetic feedback the proxy could not allocate, as libwayland's
-/// `wl_client_post_no_memory` does: the display's `no_memory` error.
-fn queue_feedback_allocation_error(ctx: &mut Context) {
-    queue_protocol_error(
-        ctx,
+/// Reject the message for synthetic feedback the proxy could not allocate,
+/// as libwayland's `wl_client_post_no_memory` does: the display's
+/// `no_memory` error.
+#[must_use = "a handler returns the Action::Drop"]
+fn reject_unallocatable_feedback(ctx: &mut Context) -> Action {
+    ctx.reject(
         WL_DISPLAY_ID,
         wl_display::ERROR_NO_MEMORY,
         "unable to allocate linux-dmabuf feedback",
-    );
+    )
 }
 
 impl LinuxDmabufHandler {
@@ -278,19 +278,11 @@ impl LinuxDmabufHandler {
     fn create_synthetic_feedback(ctx: &mut Context, guest_id: u32) -> Action {
         let factory_id = ctx.last_sender_id;
         let Some(generation) = ctx.dmabuf_guest_generations.get(&factory_id).copied() else {
-            log::error!(
-                "Cannot create synthetic dmabuf feedback for untracked factory {}",
-                factory_id
-            );
             // The factory interface declares no errors, and the client did
             // nothing wrong: the proxy lost its own bookkeeping.
-            queue_protocol_error(
-                ctx,
-                WL_DISPLAY_ID,
-                wl_display::ERROR_IMPLEMENTATION,
-                "linux-dmabuf factory has no capability generation",
-            );
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Cannot create synthetic dmabuf feedback for untracked factory {factory_id}"
+            ));
         };
         ctx.shadow_table.create_local(
             guest_id,
@@ -309,7 +301,7 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_feedback_allocation_error(ctx);
+                return reject_unallocatable_feedback(ctx);
             }
         }
         Action::Drop
@@ -344,7 +336,10 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_feedback_allocation_error(ctx);
+                // Deep in a wl_callback.done: the session ends, and the
+                // loop drops this message's effects whatever its handler
+                // returns.
+                let _ = reject_unallocatable_feedback(ctx);
                 break;
             }
         }
@@ -384,22 +379,30 @@ impl LinuxDmabufHandler {
                     error
                 );
                 ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
-                queue_feedback_allocation_error(ctx);
+                // Deep in a capability event: the session ends, and the
+                // loop drops this message's effects whatever its handler
+                // returns.
+                let _ = reject_unallocatable_feedback(ctx);
                 break;
             }
         }
     }
 
-    fn process_params(&self, ctx: &mut Context, params_id: u32) -> Option<(HostId, Vec<OwnedFd>)> {
-        let params = ctx.pending_params.remove(&params_id)?;
+    /// Queue the ADDs of params `params_id` and mark it used. Returns its
+    /// host ID and the planes' synchronization descriptors, or the action
+    /// a handler returns when it cannot.
+    fn process_params(
+        &self,
+        ctx: &mut Context,
+        params_id: u32,
+    ) -> Result<(HostId, Vec<OwnedFd>), Action> {
+        let params = ctx.pending_params.remove(&params_id).ok_or(Action::Drop)?;
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
-            error!("Unknown host ID for params {}", params_id);
             // The guest request was valid when it entered the proxy, so a
             // missing host mapping is an internal state corruption rather
             // than a recoverable client error. Do not let callers continue
             // with a CREATE that has no corresponding host params object.
-            ctx.fail_session();
-            return None;
+            return Err(ctx.fail(format_args!("Unknown host ID for params {params_id}")));
         };
 
         // Keep one descriptor for every plane. Multi-plane formats may use
@@ -415,18 +418,14 @@ impl LinuxDmabufHandler {
             match param.fd.try_clone() {
                 Ok(sync_fd) => sync_fds.push(sync_fd),
                 Err(error) => {
-                    error!(
-                        "Failed to duplicate dma-buf fd for synchronization: {}",
-                        error
-                    );
-                    ctx.fail_session();
-                    return None;
+                    return Err(ctx.fail(format_args!(
+                        "Failed to duplicate dma-buf fd for synchronization: {error}"
+                    )));
                 }
             }
         }
         if sync_fds.is_empty() {
-            ctx.fail_session();
-            return None;
+            return Err(ctx.fail(format_args!("Params {params_id} have no planes to create")));
         }
 
         // Send the ADDs, each handing its descriptor to the queue. The caller
@@ -445,7 +444,7 @@ impl LinuxDmabufHandler {
                 ));
         }
         ctx.used_dmabuf_params.insert(params_id);
-        Some((HostId(host_id), sync_fds))
+        Ok((HostId(host_id), sync_fds))
     }
 
     fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> bool {
@@ -674,35 +673,29 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     ) -> Action {
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 params_id,
                 zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
                 "linux-dmabuf params already used",
             );
-            return Action::Drop;
         }
         if plane_idx > 1 {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 params_id,
                 zwp_linux_buffer_params_v1::ERROR_PLANE_IDX,
                 "dmabuf plane index out of bounds",
             );
-            return Action::Drop;
         }
         if ctx
             .pending_params
             .get(&params_id)
             .is_some_and(|params| params.iter().any(|param| param.plane_idx == plane_idx))
         {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 params_id,
                 zwp_linux_buffer_params_v1::ERROR_PLANE_SET,
                 "dmabuf plane was already set",
             );
-            return Action::Drop;
         }
 
         let duplicate = match fd.try_clone_to_owned() {
@@ -763,13 +756,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     ) -> Action {
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 params_id,
                 zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
                 "linux-dmabuf params already used",
             );
-            return Action::Drop;
         }
         if !Self::valid_params(ctx, params_id, width, height, format) {
             error!(
@@ -777,48 +768,40 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 params_id, width, height, format
             );
             let code = Self::params_error_code(ctx, params_id, width, height, format);
-            queue_protocol_error(
-                ctx,
-                params_id,
-                code,
-                "invalid linux-dmabuf buffer parameters",
-            );
-            ctx.pending_params.remove(&params_id);
-            return Action::Drop;
+            return ctx.reject(params_id, code, "invalid linux-dmabuf buffer parameters");
         }
 
         // The non-immediate create request reports its wl_buffer through a
         // later `created` event. Keep all resources under the host params ID:
         // unlike the guest numeric ID, it uniquely identifies this async
         // generation even after guest-side delete_id and ID reuse.
-        if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
-            ctx.client_to_host_queue
-                .push(zwp_linux_buffer_params_v1::req::create(
-                    host_params_id.0,
-                    width,
-                    height,
-                    format,
-                    flags,
-                ));
-            let pending = PendingNativeCreate {
-                guest_params_id: params_id,
-                dimensions: (width, height),
-                sync_fds,
-            };
-            match ctx.pending_native_creates.entry(host_params_id) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(pending);
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    error!(
-                        "Duplicate asynchronous dmabuf params host ID {}",
-                        host_params_id.0
-                    );
-                    ctx.fail_session();
-                }
+        let (host_params_id, sync_fds) = match self.process_params(ctx, params_id) {
+            Ok(params) => params,
+            Err(action) => return action,
+        };
+        ctx.client_to_host_queue
+            .push(zwp_linux_buffer_params_v1::req::create(
+                host_params_id.0,
+                width,
+                height,
+                format,
+                flags,
+            ));
+        let pending = PendingNativeCreate {
+            guest_params_id: params_id,
+            dimensions: (width, height),
+            sync_fds,
+        };
+        match ctx.pending_native_creates.entry(host_params_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(pending);
+                Action::Drop
             }
+            std::collections::hash_map::Entry::Occupied(_) => ctx.fail(format_args!(
+                "Duplicate asynchronous dmabuf params host ID {}",
+                host_params_id.0
+            )),
         }
-        Action::Drop
     }
 
     fn on_created(&mut self, ctx: &mut Context, buffer: u32) -> Action {
@@ -838,20 +821,17 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             }
             if let Some(pending) = ctx.pending_native_creates.remove(&HostId(host_params_id)) {
                 if pending.guest_params_id != guest_params_id {
-                    error!(
+                    return ctx.fail(format_args!(
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
                         host_params_id, guest_params_id, pending.guest_params_id
-                    );
-                    ctx.fail_session();
-                    return Action::Drop;
+                    ));
                 }
                 // The generated dispatcher maps this host-created buffer to a
                 // fresh guest server ID immediately after the handler returns.
                 // Register the host generation now; compositor lookup resolves
                 // the guest ID through the shadow table after forwarding.
                 if !ctx.register_native_buffer(buffer, pending.dimensions, pending.sync_fds) {
-                    error!("Duplicate render buffer host ID {}", buffer);
-                    ctx.fail_session();
+                    return ctx.fail(format_args!("Duplicate render buffer host ID {buffer}"));
                 }
             }
         }
@@ -867,12 +847,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             }
             if let Some(pending) = ctx.pending_native_creates.remove(&HostId(host_params_id)) {
                 if pending.guest_params_id != guest_params_id {
-                    error!(
+                    return ctx.fail(format_args!(
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
                         host_params_id, guest_params_id, pending.guest_params_id
-                    );
-                    ctx.fail_session();
-                    return Action::Drop;
+                    ));
                 }
             }
         }
@@ -890,13 +868,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     ) -> Action {
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 params_id,
                 zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
                 "linux-dmabuf params already used",
             );
-            return Action::Drop;
         }
         // A params object is tracked as soon as create_params is decoded. If
         // it is absent here, do not allocate/map a host wl_buffer: doing so
@@ -915,18 +891,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 params_id, width, height, format
             );
             let code = Self::params_error_code(ctx, params_id, width, height, format);
-            queue_protocol_error(
-                ctx,
-                params_id,
-                code,
-                "invalid linux-dmabuf buffer parameters",
-            );
-            ctx.pending_params.remove(&params_id);
-            return Action::Drop;
+            return ctx.reject(params_id, code, "invalid linux-dmabuf buffer parameters");
         }
 
-        let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) else {
-            return Action::Drop;
+        let (host_params_id, sync_fds) = match self.process_params(ctx, params_id) {
+            Ok(params) => params,
+            Err(action) => return action,
         };
         // The request is dropped and rebuilt here, so create the buffer the
         // generated dispatcher would have created for it.
@@ -944,8 +914,9 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 flags,
             ));
         if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
-            error!("Duplicate render buffer host ID {}", host_buffer_id);
-            ctx.fail_session();
+            return ctx.fail(format_args!(
+                "Duplicate render buffer host ID {host_buffer_id}"
+            ));
         }
         Action::Drop
     }
@@ -969,7 +940,9 @@ mod tests {
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::wayland::wl_shm;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-    use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
+    use crate::test_support::{
+        any_fd_has_identity, fd_identity, protocol_error, protocol_error_code,
+    };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
@@ -1115,14 +1088,10 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.is_fatal());
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            WL_DISPLAY_ID,
-            "the error names the display"
+            protocol_error(&ctx),
+            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
         );
-        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
     }
 
     /// Feedback the proxy cannot allocate (here, without a GBM device to
@@ -1139,14 +1108,10 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.is_fatal());
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            WL_DISPLAY_ID,
-            "the error names the display"
+            protocol_error(&ctx),
+            (WL_DISPLAY_ID, wl_display::ERROR_NO_MEMORY)
         );
-        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_NO_MEMORY);
     }
 
     #[test]
@@ -1344,10 +1309,7 @@ mod tests {
         assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            0
-        );
+        assert_eq!(protocol_error_code(&ctx), 0);
     }
 
     #[test]
@@ -1372,10 +1334,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            1
-        );
+        assert_eq!(protocol_error_code(&ctx), 1);
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -1412,10 +1371,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            2
-        );
+        assert_eq!(protocol_error_code(&ctx), 2);
         // The context owns the first plane's descriptor and closes it; a
         // second close here would close whatever a parallel test had just
         // opened under that number.
@@ -1450,10 +1406,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            5
-        );
+        assert_eq!(protocol_error_code(&ctx), 5);
         unsafe {
             libc::close(pipe_fds[0]);
         }

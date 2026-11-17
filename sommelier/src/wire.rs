@@ -70,8 +70,7 @@ pub fn queue_or_drop(
 ///     included, in the upper 16 bits and the opcode in the lower 16 bits.
 ///
 /// This type owns that layout: every header is decoded by [`Self::parse`]
-/// (or [`Self::frame`]) and written by [`Self::encode`] or
-/// [`Self::set_sender`].
+/// (or [`Self::frame`]) and written by [`Self::encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageHeader {
     pub sender_id: u32,
@@ -127,14 +126,6 @@ impl MessageHeader {
             Some(header) if header.len > stream.len() => Framing::Partial,
             Some(header) => Framing::Complete(header),
         }
-    }
-
-    /// Replace the sender ID of the encoded message `message`.
-    pub fn set_sender(message: &mut [u8], sender_id: u32) {
-        let sender = message
-            .first_chunk_mut::<4>()
-            .expect("an encoded message starts with its header");
-        *sender = sender_id.to_ne_bytes();
     }
 
     /// Encode the header, or report why its length cannot be encoded.
@@ -877,20 +868,6 @@ mod tests {
             MessageHeader::frame(&message),
             Framing::Invalid(_)
         ));
-    }
-
-    #[test]
-    fn set_sender_rewrites_only_the_sender() {
-        let mut message = MessageBuilder::new().build_message(7, 3);
-        MessageHeader::set_sender(&mut message, 9);
-        assert_eq!(
-            MessageHeader::parse(&message),
-            Some(MessageHeader {
-                sender_id: 9,
-                opcode: 3,
-                len: 8,
-            })
-        );
     }
 
     #[test]

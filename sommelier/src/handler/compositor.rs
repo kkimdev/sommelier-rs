@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::allocator::Allocator;
 use crate::handler::aura_objects;
-use crate::handler::display::queue_protocol_error;
 use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
 use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
@@ -585,12 +584,9 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let wl_surface_guest_id = ctx.last_sender_id;
         let Some(wl_surface_host_id) = ctx.shadow_table.get_host_id(wl_surface_guest_id) else {
-            log::error!(
-                "Unable to destroy wl_surface {} without its host generation",
-                wl_surface_guest_id
-            );
-            ctx.fail_session();
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Unable to destroy wl_surface {wl_surface_guest_id} without its host generation"
+            ));
         };
         // Keep the references owned by this surface before removing its
         // state. A submitted buffer may have been detached from another
@@ -692,13 +688,11 @@ impl WlSurfaceHandler for CompositorHandler {
                 y,
                 surface_id
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 surface_id,
                 wl_surface::ERROR_INVALID_OFFSET,
                 "wl_surface.attach offset is non-zero for version 5+",
             );
-            return Action::Drop;
         }
         let pending = &mut ctx.surface_mut(surface_id).pending;
         pending.attachment = if buffer == 0 {
@@ -754,13 +748,11 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_set_buffer_scale(&mut self, ctx: &mut Context, scale: i32) -> Action {
         if scale <= 0 {
             log::warn!("Rejecting invalid wl_surface buffer scale {}", scale);
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wl_surface::ERROR_INVALID_SCALE,
                 "invalid wl_surface buffer scale",
             );
-            return Action::Drop;
         }
         ctx.surface_mut(ctx.last_sender_id).pending.buffer_scale = Some(scale);
         Action::Forward
@@ -772,13 +764,11 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Rejecting invalid wl_surface buffer transform {}",
                 transform
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wl_surface::ERROR_INVALID_TRANSFORM,
                 "invalid wl_surface buffer transform",
             );
-            return Action::Drop;
         }
         ctx.surface_mut(ctx.last_sender_id).pending.buffer_transform = Some(transform);
         Action::Forward
@@ -820,8 +810,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 .iter()
                 .find(|(_, &owner)| owner == surface_id)
             {
-                queue_protocol_error(
-                    ctx,
+                return ctx.reject(
                     viewport_id,
                     wp_viewport::ERROR_BAD_SIZE,
                     "fractional wp_viewport source requires a destination",
@@ -853,16 +842,9 @@ impl WlSurfaceHandler for CompositorHandler {
             &commit.state,
             force_full_damage,
         ) else {
-            log::error!(
-                "Cannot commit wl_surface {} without its host object",
-                surface_id
-            );
-            ctx.fail_session();
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                commit.rollback(surface);
-            }
-            crate::handler::shm::retire_eligible_buffers(ctx);
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Cannot commit wl_surface {surface_id} without its host object"
+            ));
         };
 
         // A SHM-backed buffer is copied into host storage before the host
@@ -876,12 +858,13 @@ impl WlSurfaceHandler for CompositorHandler {
                     // The client broke its pool, for example by truncating
                     // the file. Like libwayland's SIGBUS guard, report it on
                     // the buffer and end the session.
-                    ShmCopyError::Source(_) => queue_protocol_error(
-                        ctx,
-                        buffer_id,
-                        wl_shm::ERROR_INVALID_FD,
-                        "error accessing SHM buffer",
-                    ),
+                    ShmCopyError::Source(_) => {
+                        return ctx.reject(
+                            buffer_id,
+                            wl_shm::ERROR_INVALID_FD,
+                            "error accessing SHM buffer",
+                        )
+                    }
                     ShmCopyError::Destination => log::warn!(
                         "Skipping host wl_surface.commit for {} because its SHM copy failed",
                         surface_id
@@ -901,20 +884,12 @@ impl WlSurfaceHandler for CompositorHandler {
                 // Wait for guest GPU writes before the host compositor samples
                 // the buffer, matching ChromiumOS Sommelier's sync_point path.
                 if let Err(error) = wait_for_native_buffer(ctx, buffer_id) {
-                    log::error!(
-                        "Native dma-buf synchronization failed for surface {}: {}",
-                        surface_id,
-                        error
-                    );
                     // wl_surface.commit has no recoverable failure response.
                     // Disconnect rather than silently rolling back a request
                     // the guest reasonably believes was accepted.
-                    ctx.fail_session();
-                    if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                        commit.rollback(surface);
-                    }
-                    crate::handler::shm::retire_eligible_buffers(ctx);
-                    return Action::Drop;
+                    return ctx.fail(format_args!(
+                        "Native dma-buf synchronization failed for surface {surface_id}: {error}"
+                    ));
                 }
             }
         }
@@ -937,7 +912,7 @@ impl WlSurfaceHandler for CompositorHandler {
             let use_updated =
                 snapshot_updated && ctx.finalize_surface_attachment(previous_buffer, next_buffer);
             if !snapshot_updated || !use_updated {
-                log::error!(
+                let why = format!(
                     "Render-buffer replacement could not finalize surface {}: \
                      previous guest={:?} host={:?} use={:?}, \
                      next guest={:?} host={:?} use={:?}, snapshot_updated={}",
@@ -950,12 +925,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
                     snapshot_updated,
                 );
-                ctx.fail_session();
-                if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                    commit.rollback(surface);
-                }
-                crate::handler::shm::retire_eligible_buffers(ctx);
-                return Action::Drop;
+                return ctx.fail(why);
             }
         }
 
@@ -980,13 +950,11 @@ impl wp_viewporter::WpViewporterHandler for CompositorHandler {
             .any(|&owner| owner == surface)
         {
             log::warn!("Rejecting duplicate wp_viewport for wl_surface {}", surface);
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wp_viewporter::ERROR_VIEWPORT_EXISTS,
                 "wl_surface already has a wp_viewport",
             );
-            return Action::Drop;
         }
         ctx.viewport_to_wl_surface.insert(id, surface);
         ctx.surface_mut(surface).pending.viewport = Some(Some(ViewportState::new()));
@@ -1004,24 +972,20 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
         height: i32,
     ) -> Action {
         let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&ctx.last_sender_id) else {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
-            return Action::Drop;
         };
         let unset = (x, y, width, height) == (-256, -256, -256, -256);
         if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
             log::warn!("Rejecting invalid wp_viewport source rectangle");
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wp_viewport::ERROR_BAD_VALUE,
                 "invalid wp_viewport source",
             );
-            return Action::Drop;
         }
         ctx.surface_mut(surface_id).pending_viewport_mut().source =
             (!unset).then_some((x, y, width, height));
@@ -1030,13 +994,11 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
 
     fn on_set_destination(&mut self, ctx: &mut Context, width: i32, height: i32) -> Action {
         let Some(&surface_id) = ctx.viewport_to_wl_surface.get(&ctx.last_sender_id) else {
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
-            return Action::Drop;
         };
         let unset = width == -1 && height == -1;
         if !unset && (width <= 0 || height <= 0) {
@@ -1045,13 +1007,11 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
                 width,
                 height
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wp_viewport::ERROR_BAD_VALUE,
                 "invalid wp_viewport destination",
             );
-            return Action::Drop;
         }
         ctx.surface_mut(surface_id)
             .pending_viewport_mut()
@@ -1126,12 +1086,9 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let xdg_toplevel_id = ctx.last_sender_id;
         let Some(host_xdg_toplevel_id) = ctx.shadow_table.get_host_id(xdg_toplevel_id) else {
-            log::error!(
-                "Unable to destroy xdg_toplevel {} without its host generation",
-                xdg_toplevel_id
-            );
-            ctx.fail_session();
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Unable to destroy xdg_toplevel {xdg_toplevel_id} without its host generation"
+            ));
         };
         // The Aura toplevel goes before the role destructor (see
         // `aura_objects::release`). Retain the guest ID until the host
@@ -1261,7 +1218,7 @@ mod tests {
     use crate::state::ARC_APPLICATION_ID_PREFIX;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::{
-        msg_opcode, msg_sender, protocol_error_code, queued_headers, shm_pool_file,
+        msg_opcode, msg_sender, protocol_error, protocol_error_code, queued_headers, shm_pool_file,
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
@@ -1597,11 +1554,6 @@ mod tests {
                 .iter()
                 .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
             "a commit whose synchronization failed must not reach the host"
-        );
-        assert_eq!(
-            ctx.surfaces.get(&surface).unwrap().pending.attachment,
-            SurfaceAttachment::Attach(buffer),
-            "fatal teardown still rolls back the prepared surface transaction"
         );
     }
 
@@ -2615,12 +2567,9 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.is_fatal());
-        assert_eq!(protocol_error_code(&ctx), wl_shm::ERROR_INVALID_FD);
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            buffer_id,
+            protocol_error(&ctx),
+            (buffer_id, wl_shm::ERROR_INVALID_FD),
             "the error names the buffer whose pool failed, as libwayland does"
         );
         assert!(
@@ -2985,10 +2934,8 @@ mod tests {
         let mut rejected = |reject: &dyn Fn(&mut CompositorHandler, &mut Context) -> Action,
                             code: u32| {
             ctx.host_to_client_queue.clear();
-            ctx.clear_protocol_error_for_test();
+            ctx.clear_session_end_for_test();
             assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
-            assert!(ctx.is_fatal());
-            assert_eq!(ctx.host_to_client_queue.len(), 1);
             assert_eq!(protocol_error_code(&ctx), code);
         };
         // wl_surface.invalid_scale for 0 and negative scales, and
@@ -3024,7 +2971,7 @@ mod tests {
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
         assert_eq!(
@@ -3214,21 +3161,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_host_surface_rolls_back_the_complete_commit() {
+    fn missing_host_surface_ends_the_session_without_a_commit() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
-        let pending = ctx.surfaces.get(&surface_id).unwrap().clone();
         ctx.shadow_table.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
     }
 
     #[test]
@@ -3246,13 +3191,11 @@ mod tests {
             handler.on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
-        let pending = ctx.surfaces.get(&surface_id).unwrap().clone();
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
         assert_eq!(
             ctx.render_buffer_lifecycle_for_host(host_id),
             Some(RenderBufferLifecycle::HostDestroyQueued)
@@ -3609,13 +3552,13 @@ mod tests {
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
@@ -3634,7 +3577,7 @@ mod tests {
             Action::Forward
         );
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.last_sender_id = surface_id;
         assert_eq!(
             handler.on_get_viewport(&mut ctx, 701, surface_id),

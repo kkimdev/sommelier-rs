@@ -50,7 +50,7 @@ numbers or global state another test leaves alone; see
 request streams built from the vendored XML, some of them damaged, over
 real sockets. Each case must end without a panic or hang, close every
 descriptor, and either answer the stream's closing `wl_display.sync` or
-send `wl_display.error`. The fake compositor behind the proxy also checks
+send one `wl_display.error`, its last event. The fake compositor behind the proxy also checks
 that every request it receives comes from a live host object, creates
 only fresh IDs and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,

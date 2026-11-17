@@ -52,15 +52,24 @@ pub fn msg_opcode(message: &[u8]) -> u16 {
     msg_header(message).opcode
 }
 
-/// The error code of the `wl_display.error` that opens the guest queue.
-pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
-    let message = &ctx.host_to_client_queue[0].0;
-    assert_eq!(msg_sender(message), 1);
+/// The object and code of the `wl_display.error` that ends the session
+/// with the message `ctx` is dispatching.
+pub fn protocol_error(ctx: &crate::state::Context) -> (u32, u32) {
+    let end = ctx.session_end().expect("the message ends the session");
+    let (message, _) = crate::handler::display::session_error(end);
+    assert_eq!(msg_sender(&message), 1);
     assert_eq!(
-        msg_opcode(message),
+        msg_opcode(&message),
         crate::protocols::wayland::wl_display::EVT_ERROR
     );
-    u32::from_ne_bytes(message[12..16].try_into().unwrap())
+    let word = |at: usize| u32::from_ne_bytes(message[at..at + 4].try_into().unwrap());
+    (word(8), word(12))
+}
+
+/// The code of the `wl_display.error` that ends the session with the
+/// message `ctx` is dispatching.
+pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
+    protocol_error(ctx).1
 }
 
 /// The `(sender, opcode)` of every message in a proxy message queue.
