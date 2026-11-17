@@ -1559,8 +1559,8 @@ mod tests {
     #[test]
     fn destination_only_viewport_copies_only_the_damaged_pixels() {
         // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
-        // so a surface unit is half a buffer pixel. It has no damage_buffer
-        // (the host offers wl_compositor v3) and damages surface units.
+        // so a surface unit is half a buffer pixel. It damages surface
+        // units, as a client that does not use damage_buffer does.
         let (mut ctx, ..) = setup_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let mut handler = CompositorHandler;

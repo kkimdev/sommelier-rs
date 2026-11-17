@@ -47,8 +47,9 @@ always consumed; a configuration problem never stops the proxy) is owned by
   reports `MSG_CTRUNC`, every descriptor the kernel installed for that
   receive MUST be recovered and closed before the error is returned. A
   wrapper that refuses to iterate truncated control data MUST NOT be the
-  only cleanup path. The receive buffer is sized for the protocol's maximum
-  descriptor batch.
+  only cleanup path. The receive buffer has room for Linux's `SCM_MAX_FD`
+  (253) descriptors, the most one `SCM_RIGHTS` message carries, so a valid
+  peer never causes truncation.
   Tests: `recvmsg_scm_rights_truncation_closes_kernel_installed_descriptors`,
   `truncated_scm_rights_closes_descriptors_recovered_from_control_buffer`.
 - **Received descriptors are bounded.** A connection holds at most
@@ -466,7 +467,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   a regular file, such as a memfd, tmpfs or `shm_open` file, of at least
   the declared size; any other is rejected with `wl_shm.invalid_fd` at
   `create_pool` and `resize`.
-  Test: `pool_backing_must_be_a_long_enough_regular_file`.
+  Tests: `pool_backing_must_be_a_long_enough_regular_file`,
+  `create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd`,
+  `pool_resize_past_the_file_end_queues_invalid_fd_error`.
 - **Damage-only commits copy from a buffer the host holds.** A commit
   without a new `attach` still damages the surface's current buffer, which
   the host samples again, so its damaged pixels MUST be copied before the
@@ -490,13 +493,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `damage_only_commit_does_not_read_a_released_shm_buffer`,
   `commit_without_damage_on_a_held_buffer_skips_the_copy`.
 - **Surface damage copies the pixels it touches.** Guests see
-  `wl_compositor` v3, so most damage arrives in surface units, and the
-  copy maps it back to buffer pixels: exactly under an integer buffer
-  scale, and through a viewport by inverting the buffer damage mapping
-  below, grown by one buffer pixel and rounded outward, so no pixel whose
-  image meets the damage is left out. Only a transformed buffer, or an
-  attach offset, copies in full; copying a 4K buffer in full every frame
-  costs about 2 GB/s.
+  `wl_compositor` v4; the proxy keeps `damage_buffer` local over Exo's v3.
+  Buffer damage is already in buffer pixels. Surface damage is mapped back
+  to buffer pixels: exactly under an integer buffer scale, and through a
+  viewport by inverting the buffer damage mapping below, grown by one
+  buffer pixel and rounded outward, so no pixel whose image meets the
+  damage is left out. Only a transformed buffer, or an attach offset,
+  copies in full; copying a 4K buffer in full every frame costs about
+  2 GB/s.
   Tests: `surface_damage_maps_to_every_buffer_pixel_it_meets`,
   `destination_only_viewport_copies_only_the_damaged_pixels`,
   `surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels`,
@@ -525,7 +529,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
   a committed `wl_surface.offset` survives a later zero-coordinate attach.
   Non-zero coordinates are a protocol error. Objects with an unknown
-  negotiated version keep the permissive pre-v5 behavior.
+  negotiated version keep the permissive pre-v5 behavior. No guest reaches
+  v5 today (the `wl_compositor` ceiling is v4); this keeps the path correct
+  if the ceiling is raised, which would also need `wl_surface.offset`,
+  forwarded today, to stay local.
   Tests: `v5_zero_attach_does_not_create_an_attach_offset`,
   `v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them`.
 - **A non-zero offset forces full damage.** Surface-local damage cannot yet
@@ -719,12 +726,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   activation but gets no input, and `Activate` on the same surface does
   nothing, so it would stay deaf until deactivated. A text-input-v3 enable
   while another text input on the connection is enabled, for any guest
-  `wl_seat`, is therefore ignored: the commit counts, closes the
-  composition and changes nothing else.
+  `wl_seat`, is therefore ignored: the commit still counts, closes the
+  composition and applies the rest of its state, but the text input stays
+  disabled and is not activated.
   Test: `second_text_input_enable_on_the_connection_is_ignored`.
-- **Focus teardown sends `leave` first.** When a focused text-input surface
-  is destroyed or loses focus, the proxy MUST send the guest
-  `zwp_text_input_v3.leave` before clearing the active-surface state. A
+- **Focus teardown sends `leave` itself.** When a focused text-input
+  surface is destroyed or loses focus, the proxy MUST send
+  `zwp_text_input_v3.leave` as part of that teardown, while the surface ID
+  is still valid, rather than waiting for the host's keyboard leave. A
   delayed host keyboard leave cannot be relied on, since it may be rejected
   as stale once the surface mapping is gone. Teardown is explicit and
   idempotent: the later delayed leave does not duplicate the event.
@@ -733,8 +742,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not
   forwarded to the host. The count is a private field of
-  `TextInputState`, so only code in `state/input.rs` can change it, and it
-  does so only in `TextInputState::count_guest_commit`.
+  `TextInputState`, so only code in `state/input.rs` can change it, and
+  outside tests it does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
 

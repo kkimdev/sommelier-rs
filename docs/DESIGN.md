@@ -120,7 +120,8 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   named constant in `registry.rs` that documents why it deliberately
   differs: `wl_seat` v5 and `wl_output` v3 match ChromiumOS Sommelier's
   caps, `wl_compositor` and `xdg_wm_base` are capped at the versions whose
-  semantics the proxy implements, and `zaura_shell` has a v6 floor.
+  semantics the proxy implements, `wl_shm` is offered at v1, which the
+  proxy implements itself, and `zaura_shell` has a v6 floor.
   `forwarded_global_version` never offers a forwarded global above its
   generated `VERSION`.
 
@@ -271,8 +272,9 @@ or host error wins over an internal failure. After dispatch,
   `MAX_FENCE_POLL_INTERVAL` (16 ms), since each ask costs several
   ioctls; it ends at a fixed instant, which host traffic waking the loop
   does not postpone. The deadline is set when the message first waits
-  and kept across those dispatches; one that passes it ends the session
-  as an internal failure.
+  and kept across those dispatches. At the deadline the message is
+  dispatched once more: if its fence has signalled by then, it goes
+  through; if it still waits, the session ends as an internal failure.
 
 A session that ends never handles another message (`Client` remembers
 that it ended), so a fatal branch rolls nothing back: only output could
@@ -303,7 +305,8 @@ becomes an unused variable, which CI rejects. There is no generic
   attachment, damage, scale, transform, offsets and viewport.
 - `V3Pending` (`input.rs`) follows it for a text-input-v3 object's
   enable, surrounding text, content type and cursor rectangle, which
-  `TextInputState::commit` applies to `V3Committed`.
+  `TextInputState::commit` applies to `V3Committed`, except the cursor
+  rectangle, which only the host keeps and the commit forwards.
 - `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
   edits a copy-on-write `Option<OutputState>` of the whole state, which
   `wl_output.done` publishes.
@@ -392,7 +395,8 @@ that make it match the target the guest committed (`HostTarget`): the
 activation step and, when the attached input method lacks it, the content
 type. `text_input::reconcile_host` sends them wherever the target or the
 host's ability to apply it changes: a guest commit, a focus change, a
-drain barrier's completion, a `wl_seat` bind and the object's destroy.
+drain barrier's completion, Exo detaching the input method on its own (a
+host `leave` while active), a `wl_seat` bind and the object's destroy.
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
 commits, so each guest commit forwards the ones it states. The rules are
