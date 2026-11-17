@@ -36,6 +36,17 @@ pub fn msg_opcode(message: &[u8]) -> u16 {
     msg_header(message).opcode
 }
 
+/// The error code of the `wl_display.error` that opens the guest queue.
+pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
+    let message = &ctx.host_to_client_queue[0].0;
+    assert_eq!(msg_sender(message), 1);
+    assert_eq!(
+        msg_opcode(message),
+        crate::protocols::wayland::wl_display::EVT_ERROR
+    );
+    u32::from_ne_bytes(message[12..16].try_into().unwrap())
+}
+
 /// The `(sender, opcode)` of every message in a proxy message queue.
 pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
     queue

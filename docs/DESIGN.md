@@ -121,7 +121,7 @@ encode wire bytes ad hoc.
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` | clipboard pumps in `Context` |
-| Outputs | `registry.rs`, `compositor.rs` | `outputs.rs` (`OutputRegistry`) |
+| Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs`, `window_placement.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, `window_placement.rs` |
 
 Two mechanisms let a handler act outside its own message:
