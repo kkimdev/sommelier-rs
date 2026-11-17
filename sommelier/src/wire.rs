@@ -368,9 +368,17 @@ impl<'a> WireMessage<'a> {
     }
 }
 
+/// The byte-level writer behind the generated encoders.
+///
+/// Production code builds messages only through the generated `req::` and
+/// `evt::` encoders, which check each message against its XML.
+/// `sommelier/clippy.toml` rejects `MessageBuilder::new` everywhere else,
+/// and the private fields leave no other way to make a builder. A test
+/// module that needs frames no encoder makes, such as malformed ones,
+/// allows `clippy::disallowed_methods` itself.
 pub struct MessageBuilder {
-    pub payload: Vec<u8>,
-    pub fds: Vec<RawFd>,
+    payload: Vec<u8>,
+    fds: Vec<RawFd>,
 }
 
 impl MessageBuilder {
@@ -432,12 +440,6 @@ impl MessageBuilder {
     }
 }
 
-impl Default for MessageBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MessageBuilder {
     /// Assemble a complete Wayland wire message, returning an error instead
     /// of truncating the 16-bit length field when the payload is too large.
@@ -459,6 +461,28 @@ impl MessageBuilder {
         Ok(msg)
     }
 
+    /// Assemble the message together with the descriptors written with
+    /// [`Self::write_fd`], as generated forwarding sends it.
+    pub fn try_build(self, sender_id: u32, opcode: u16) -> Result<Outgoing, ProtocolError> {
+        let message = self.try_build_message(sender_id, opcode)?;
+        Ok((message, self.fds))
+    }
+
+    /// A builder that continues `payload`, for tests that edit raw frames.
+    #[cfg(test)]
+    pub fn from_payload(payload: Vec<u8>) -> Self {
+        Self {
+            payload,
+            fds: Vec::new(),
+        }
+    }
+
+    /// The payload written so far, for tests that edit or decode it.
+    #[cfg(test)]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+
     /// Assemble a complete Wayland wire message into a `Vec<u8>`, consuming `self`.
     ///
     /// `build_message` is the **terminal call** on a `MessageBuilder`. After calling
@@ -473,14 +497,8 @@ impl MessageBuilder {
     /// Panics if the total message does not fit within Wayland's 16-bit
     /// length field. Silently truncating the length in release builds would
     /// desynchronise the stream, so this invariant is enforced in all builds.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let mut b = MessageBuilder::new();
-    /// b.write_u32(serial);
-    /// b.write_u32(handled as u32);
-    /// let msg = b.build_message(sender_id, ACK_KEY_OPCODE);
-    /// ```
+    /// The generated encoders call it only for messages without strings or
+    /// arrays, which always fit.
     pub fn build_message(self, sender_id: u32, opcode: u16) -> Vec<u8> {
         self.try_build_message(sender_id, opcode)
             .unwrap_or_else(|error| panic!("{error}"))
@@ -488,6 +506,7 @@ impl MessageBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{Framing, MessageBuilder, MessageHeader, Outgoing, ProtocolError, WireMessage};
     use crate::protocols::aura_shell::zaura_surface;

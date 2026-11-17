@@ -535,6 +535,7 @@ impl Drop for WaylandConnection {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,

@@ -557,10 +557,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
-                            let full_msg =
-                                builder.try_build_message(host_sender_id, #req_idx)?;
+                            let outgoing = builder.try_build(host_sender_id, #req_idx)?;
                             #destructor_cleanup
-                            return Ok(Some((full_msg, builder.fds)));
+                            return Ok(Some(outgoing));
                         }
                         #local_destructor_cleanup
                     }
@@ -718,10 +717,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
-                            let full_msg =
-                                builder.try_build_message(guest_sender_id, #evt_idx)?;
+                            let outgoing = builder.try_build(guest_sender_id, #evt_idx)?;
                             #destructor_cleanup
-                            return Ok(Some((full_msg, builder.fds)));
+                            return Ok(Some(outgoing));
                         }
                     }
                 });

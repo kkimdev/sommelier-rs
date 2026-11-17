@@ -4803,6 +4803,7 @@ mod tests {
     /// This catches any future refactoring that breaks the `[sender][size<<16|opcode][payload]`
     /// encoding, which would silently corrupt all internal protocol messages.
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn build_wayland_msg_encodes_frame_correctly() {
         let payload = [0x01u8, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]; // two u32 words
         let mut builder = crate::wire::MessageBuilder::new();

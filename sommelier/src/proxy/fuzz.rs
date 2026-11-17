@@ -44,6 +44,10 @@ limitations under the License.
 //! a few replays. CONTRIBUTING.md says how to run more cases, from another
 //! seed, and how to replay one.
 
+// Generated requests are written argument by argument and then mutated,
+// which no encoder can do.
+#![allow(clippy::disallowed_methods)]
+
 use super::{Client, Direction};
 use crate::connection::{WaylandConnection, MAX_FDS_PER_SEND};
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
@@ -372,11 +376,7 @@ struct Message {
 
 impl Message {
     fn encode(&self) -> Vec<u8> {
-        MessageBuilder {
-            payload: self.payload.clone(),
-            fds: Vec::new(),
-        }
-        .build_message(self.sender, self.opcode)
+        MessageBuilder::from_payload(self.payload.clone()).build_message(self.sender, self.opcode)
     }
 }
 
@@ -386,7 +386,7 @@ fn sync_request(callback: u32) -> Message {
     Message {
         sender: WL_DISPLAY_ID,
         opcode: wl_display::REQ_SYNC,
-        payload: payload.payload,
+        payload: payload.into_payload(),
         fds: Vec::new(),
     }
 }
@@ -492,7 +492,7 @@ impl<'a> Guest<'a> {
         let message = Message {
             sender: REGISTRY,
             opcode: wl_registry::REQ_BIND,
-            payload: payload.payload,
+            payload: payload.into_payload(),
             fds: Vec::new(),
         };
         (message, id, version)
@@ -532,7 +532,7 @@ impl<'a> Guest<'a> {
             Message {
                 sender,
                 opcode,
-                payload: payload.payload,
+                payload: payload.into_payload(),
                 fds: Vec::new(),
             }
         };
@@ -571,10 +571,7 @@ impl<'a> Guest<'a> {
     /// Write `arg` of a request from an object of `version`, which objects
     /// the request creates share.
     fn write_arg(&mut self, arg: &'a Arg, version: u32, message: &mut Message) {
-        let mut payload = MessageBuilder {
-            payload: std::mem::take(&mut message.payload),
-            fds: Vec::new(),
-        };
+        let mut payload = MessageBuilder::from_payload(std::mem::take(&mut message.payload));
         match arg {
             // Mostly a declared value, as a client would send, and often one
             // of the first few, which the XML lists as the common ones.
@@ -603,7 +600,7 @@ impl<'a> Guest<'a> {
                 self.write_new_object(global, &mut payload);
             }
         }
-        message.payload = payload.payload;
+        message.payload = payload.into_payload();
     }
 
     /// A number, mostly a small power of two (or 0), so that sizes,

@@ -1,0 +1,6 @@
+# Production code builds every message with a generated encoder; see
+# "Wire messages" in docs/INVARIANTS.md. The generated protocol module
+# allows it, and so does each test module that hand-builds frames.
+disallowed-methods = [
+    { path = "sommelier::wire::MessageBuilder::new", reason = "build messages with the generated req:: and evt:: encoders" },
+]

@@ -706,6 +706,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::test_support::{
@@ -4378,7 +4379,7 @@ mod tests {
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(65_520));
-        let payload = builder.payload;
+        let payload = builder.into_payload();
         let mut msg = WireMessage::new(
             10,
             protocols::wayland::wl_data_source::REQ_OFFER,
