@@ -1445,7 +1445,6 @@ mod tests {
         state.content_type_dirty = true;
         state.cursor_rect = Some((1, 2, 3, 4));
         state.cursor_rect_dirty = true;
-        state.text_change_cause = 1;
         state.current_preedit = "한".to_string();
         state.set_guest_commits(1);
         state.pending_preedit_cursor = Some(1);

@@ -1695,19 +1695,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         Action::Drop
     }
 
-    fn on_set_text_change_cause(&mut self, ctx: &mut Context, cause: u32) -> Action {
-        let guest_id = ctx.last_sender_id;
-        if !v3_is_focused(ctx, guest_id) {
-            return Action::Drop;
-        }
-        log::trace!(
-            ">>> v3 on_text_change_cause: guest_id={}, cause={}",
-            guest_id,
-            cause
-        );
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.set_text_change_cause(cause);
-        }
+    /// The host's text-input-v1 has no text-change cause to forward it to.
+    fn on_set_text_change_cause(&mut self, _ctx: &mut Context, _cause: u32) -> Action {
         Action::Drop
     }
 
@@ -5095,7 +5084,6 @@ mod tests {
                 state.content_hint,
                 state.content_purpose,
                 state.cursor_rect,
-                state.text_change_cause,
             )
         };
         let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial();
@@ -5129,7 +5117,6 @@ mod tests {
                 state.content_hint,
                 state.content_purpose,
                 state.cursor_rect,
-                state.text_change_cause,
             ),
             before,
             "inactive v3 requests must not mutate double-buffered state"
