@@ -4722,6 +4722,9 @@ mod tests {
             None,
             "legacy aura objects must retire dispatch metadata after surface destroy"
         );
-        assert_ne!(ctx.shadow_table.allocate_host_id(), zaura_surface_host);
+        assert_ne!(
+            ctx.shadow_table.create_host_only("wl_callback", 1),
+            zaura_surface_host
+        );
     }
 }

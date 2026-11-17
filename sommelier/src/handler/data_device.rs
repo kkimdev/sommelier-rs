@@ -245,7 +245,8 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_guest_id(host_offer), None);
         assert_eq!(
-            ctx.shadow_table.allocate_guest_server_id(),
+            ctx.shadow_table
+                .adopt_host_created(0xff00_0009, "wl_data_offer", 3),
             0xff00_0000,
             "a dropped event must not consume a guest server ID"
         );

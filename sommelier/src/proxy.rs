@@ -66,17 +66,9 @@ fn translated_sender_id(
     }
 }
 
-fn pending_host_event_is_stale(
-    ctx: &Context,
-    sender_id: u32,
-    opcode: u16,
-    guest_id: Option<u32>,
-) -> bool {
-    let host_interface = ctx.shadow_table.get_host_interface(sender_id);
-    let guest_interface = guest_id.and_then(|gid| ctx.shadow_table.get_interface(gid));
-    let allows_deferred_buffer_release = host_interface
-        .or(guest_interface)
-        .is_some_and(|name| name == "wl_buffer")
+fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bool {
+    let interface = ctx.shadow_table.get_host_interface(sender_id);
+    let allows_deferred_buffer_release = interface.is_some_and(|name| name == "wl_buffer")
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
         && ctx.host_buffer_is_guest_destroyed(sender_id);
     // An asynchronous linux-dmabuf create can legally be followed by
@@ -86,8 +78,7 @@ fn pending_host_event_is_stale(
     // and destroys it. Dropping `created` here would leak the host buffer
     // because generated new_id mapping only runs when the event is
     // forwarded.
-    let allows_orphan_dmabuf_result = host_interface
-        .or(guest_interface)
+    let allows_orphan_dmabuf_result = interface
         .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
         && (opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
             || opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED);
@@ -415,14 +406,11 @@ impl Client {
                 "deferred work belongs to the message that deferred it"
             );
             let suppress_host_event = matches!(direction, Direction::HostToClient)
-                && pending_host_event_is_stale(&self.ctx, sender_id, opcode, guest_id);
+                && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
                 Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id).cloned(),
                 Direction::HostToClient => {
-                    let host_interface = self.ctx.shadow_table.get_host_interface(sender_id);
-                    let guest_interface =
-                        guest_id.and_then(|gid| self.ctx.shadow_table.get_interface(gid));
-                    host_interface.or(guest_interface).cloned()
+                    self.ctx.shadow_table.get_host_interface(sender_id).cloned()
                 }
             };
 
@@ -918,7 +906,7 @@ mod tests {
         host_events(&mut client, &[delete_id(host_callback)]).await;
         assert_eq!(client.ctx.shadow_table.get_host_id(CALLBACK), None);
         assert_eq!(
-            client.ctx.shadow_table.allocate_host_id(),
+            client.ctx.shadow_table.create_host_only("wl_callback", 1),
             host_callback,
             "the deleted callback's host ID is reused first"
         );
@@ -938,8 +926,8 @@ mod tests {
     }
 
     /// A guest may destroy a buffer the host still holds. Its guest object
-    /// is gone, but the host's `release` must still reach the handler, which
-    /// then destroys the host buffer.
+    /// takes no more requests, but the host's `release` must still reach the
+    /// handler, which then destroys the host buffer.
     #[tokio::test]
     async fn a_retired_buffer_still_routes_its_release() {
         use crate::protocols::wayland::wl_buffer;
@@ -956,7 +944,7 @@ mod tests {
         let (destroy, _) = wl_buffer::req::destroy(GUEST);
         client.client_conn.read_buf.extend_from_slice(&destroy);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
-        assert_eq!(client.ctx.shadow_table.get_interface(GUEST), None);
+        assert_eq!(client.ctx.shadow_table.request_sender(GUEST), None);
         assert!(client.ctx.shadow_table.is_pending_destroy_guest(GUEST));
 
         let (release, _) = wl_buffer::evt::release(HOST);
@@ -4093,7 +4081,7 @@ mod tests {
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
         ctx.shadow_table.guest_destroyed(10);
-        assert!(pending_host_event_is_stale(&ctx, 20, 0, Some(10)));
+        assert!(pending_host_event_is_stale(&ctx, 20, 0));
 
         ctx.shadow_table
             .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
@@ -4104,22 +4092,19 @@ mod tests {
             &ctx,
             21,
             protocols::wayland::wl_buffer::EVT_RELEASE,
-            Some(11)
         ));
 
         ctx.shadow_table
             .insert_paired_with_version_for_test(12, 22, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(22, (1, 1), Vec::new()));
-        // Match the production native-buffer destroy path: the guest
-        // interface is retired while the host-side interface remains
-        // available long enough to dispatch wl_buffer.release.
+        // Match the production native-buffer destroy path: the host
+        // object still dispatches wl_buffer.release.
         assert!(ctx.mark_buffer_guest_destroyed(12));
         ctx.shadow_table.guest_destroyed_in_use(12);
         assert!(!pending_host_event_is_stale(
             &ctx,
             22,
             protocols::wayland::wl_buffer::EVT_RELEASE,
-            Some(12)
         ));
     }
 
@@ -4137,7 +4122,7 @@ mod tests {
         WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
         for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
             assert!(
-                pending_host_event_is_stale(&ctx, 20, opcode, Some(10)),
+                pending_host_event_is_stale(&ctx, 20, opcode),
                 "opcode {opcode}"
             );
         }

@@ -1870,7 +1870,7 @@ mod tests {
         assert_eq!(ctx.host_text_input_extension_v1_id, Some(3));
         assert_eq!(ctx.host_keyboard_extension_id.map(|id| id.0), Some(4));
         assert_eq!(ctx.host_shm_id, Some(5));
-        assert_eq!(ctx.shadow_table.allocate_host_id(), 6);
+        assert_eq!(ctx.shadow_table.create_host_only("wl_callback", 1), 6);
         for (id, interface) in [
             (2, "zwp_text_input_manager_v1"),
             (3, "zcr_text_input_extension_v1"),
@@ -2199,7 +2199,7 @@ mod tests {
         let old_host_id = ctx.host_shm_id.expect("internal SHM binding");
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
         assert_ne!(
-            ctx.shadow_table.allocate_host_id(),
+            ctx.shadow_table.create_host_only("wl_callback", 1),
             old_host_id,
             "wl_shm has no host-side destructor; its proxy ID must not be recycled"
         );
@@ -2222,8 +2222,14 @@ mod tests {
         ctx.aura_surfaces.remember(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_ne!(ctx.shadow_table.allocate_host_id(), shell_id);
-        assert_ne!(ctx.shadow_table.allocate_host_id(), surface_id);
+        assert_ne!(
+            ctx.shadow_table.create_host_only("wl_callback", 1),
+            shell_id
+        );
+        assert_ne!(
+            ctx.shadow_table.create_host_only("wl_callback", 1),
+            surface_id
+        );
         assert_eq!(
             ctx.aura_surfaces.get(50),
             Some(surface_id),
