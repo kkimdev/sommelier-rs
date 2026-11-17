@@ -28,9 +28,6 @@ limitations under the License.
 //! or `components/exo/wayland/zwp_text_input_manager.cc` (the request
 //! handlers) at Chromium revision 137f56b0d966 (2026-11-17). Exo has one
 //! seat, and so does the model. Not modelled:
-//! - v1 `set_content_type`: the proxy sends it only to an extension older
-//!   than v8, which has no `set_input_type`, and the fake compositor's is
-//!   newer, so the model refuses it;
 //! - Exo's forced `TEXT_INPUT_TYPE_NULL` for a field without surrounding
 //!   text under an xkb input method (`ShouldUseNullInputType`), which
 //!   depends on the user's input method, not on the requests;
@@ -73,6 +70,71 @@ pub(super) struct ContentType {
     pub flags: u32,
     pub learning: bool,
     pub inline_composition: bool,
+}
+
+/// The content type `text_input_set_content_type` makes of a v1 `hint`
+/// and `purpose`, with each `ui::` value written as the extension's value
+/// of the same name.
+pub(super) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
+    use zwp_text_input_v1 as v1;
+    let hint_flags = [
+        (
+            v1::CONTENT_HINT_AUTO_COMPLETION,
+            extended::INPUT_FLAGS_AUTOCOMPLETE_ON,
+        ),
+        (
+            v1::CONTENT_HINT_AUTO_CORRECTION,
+            extended::INPUT_FLAGS_AUTOCORRECT_ON,
+        ),
+        (
+            v1::CONTENT_HINT_AUTO_CAPITALIZATION,
+            extended::INPUT_FLAGS_AUTOCAPITALIZE_SENTENCES,
+        ),
+        (
+            v1::CONTENT_HINT_LOWERCASE,
+            extended::INPUT_FLAGS_AUTOCAPITALIZE_NONE,
+        ),
+        (
+            v1::CONTENT_HINT_UPPERCASE,
+            extended::INPUT_FLAGS_AUTOCAPITALIZE_CHARACTERS,
+        ),
+        (
+            v1::CONTENT_HINT_TITLECASE,
+            extended::INPUT_FLAGS_AUTOCAPITALIZE_WORDS,
+        ),
+        (
+            v1::CONTENT_HINT_HIDDEN_TEXT,
+            extended::INPUT_FLAGS_AUTOCOMPLETE_OFF | extended::INPUT_FLAGS_AUTOCORRECT_OFF,
+        ),
+    ];
+    let flags = hint_flags
+        .iter()
+        .filter(|&&(bit, _)| hint & bit != 0)
+        .fold(extended::INPUT_FLAGS_NONE, |flags, &(_, flag)| flags | flag);
+    let (input_type, input_mode) = match purpose {
+        v1::CONTENT_PURPOSE_DIGITS => (extended::INPUT_TYPE_NUMBER, extended::INPUT_MODE_DECIMAL),
+        v1::CONTENT_PURPOSE_NUMBER => (extended::INPUT_TYPE_NUMBER, extended::INPUT_MODE_NUMERIC),
+        v1::CONTENT_PURPOSE_PHONE => (extended::INPUT_TYPE_TELEPHONE, extended::INPUT_MODE_TEL),
+        v1::CONTENT_PURPOSE_URL => (extended::INPUT_TYPE_URL, extended::INPUT_MODE_URL),
+        v1::CONTENT_PURPOSE_EMAIL => (extended::INPUT_TYPE_EMAIL, extended::INPUT_MODE_EMAIL),
+        v1::CONTENT_PURPOSE_PASSWORD => {
+            (extended::INPUT_TYPE_PASSWORD, extended::INPUT_MODE_DEFAULT)
+        }
+        v1::CONTENT_PURPOSE_DATE => (extended::INPUT_TYPE_DATE, extended::INPUT_MODE_DEFAULT),
+        v1::CONTENT_PURPOSE_TIME => (extended::INPUT_TYPE_TIME, extended::INPUT_MODE_DEFAULT),
+        v1::CONTENT_PURPOSE_DATETIME => {
+            (extended::INPUT_TYPE_DATE_TIME, extended::INPUT_MODE_DEFAULT)
+        }
+        _ => (extended::INPUT_TYPE_TEXT, extended::INPUT_MODE_DEFAULT),
+    };
+    ContentType {
+        input_type,
+        input_mode,
+        flags,
+        learning: hint & v1::CONTENT_HINT_SENSITIVE_DATA == 0
+            && purpose != v1::CONTENT_PURPOSE_PASSWORD,
+        inline_composition: true,
+    }
 }
 
 /// One host `zwp_text_input_v1`.
@@ -144,10 +206,10 @@ impl TextInput {
         }
     }
 
-    /// A content type from `set_input_type` or `deprecated_set_input_type`.
-    /// Their handler takes the pending support and resets it to supported
-    /// before `SetTypeModeFlags`, which returns early, dropping the type,
-    /// while no input method is attached.
+    /// A content type from `set_input_type`, `deprecated_set_input_type`
+    /// or v1 `set_content_type`. Each handler takes the pending support and
+    /// resets it to supported before `SetTypeModeFlags`, which returns
+    /// early, dropping the type, while no input method is attached.
     fn set_type_mode_flags(&mut self, content_type: ContentType) {
         let supported = std::mem::replace(&mut self.pending_support, true);
         if !self.field.attached {
@@ -255,9 +317,9 @@ impl Exo {
                     text_input.set_type_mode_flags(content_type);
                 }
             }
-            // The fake compositor's extension has set_input_type.
             ("zwp_text_input_v1", zwp_text_input_v1::REQ_SET_CONTENT_TYPE) => {
-                panic!("the proxy sent v1 set_content_type, which set_input_type replaces")
+                let content_type = v1_content_type(word(), word());
+                self.text_input(sender).set_type_mode_flags(content_type);
             }
             ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) => {
                 let _seat = word();

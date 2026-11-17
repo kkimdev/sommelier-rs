@@ -253,24 +253,35 @@ pub(super) struct V3Field {
 }
 
 impl V3Field {
-    /// What Exo should hold for this field once the proxy has sent it: the
-    /// proxy's own mapping of the content type, inline composition, which
-    /// every v3 client supports, and surrounding text, supported when the
-    /// field has it, and the cursor rectangle, empty when it has none.
-    pub(super) fn on_host(&self) -> exo::Field {
+    /// What Exo should hold for this field once the proxy has sent it to
+    /// a host whose `zcr_extended_text_input_v1` has `extension_version`:
+    /// the proxy's own mapping of the content type, through the extension
+    /// from v2 on and through v1 `set_content_type` before; inline
+    /// composition, which every v3 client supports; surrounding text,
+    /// supported when the field has it or when the extension cannot say
+    /// otherwise (before v9); and the cursor rectangle, empty when it has
+    /// none.
+    pub(super) fn on_host(&self, extension_version: u32) -> exo::Field {
+        use zcr_extended_text_input_v1 as extended;
         let (hint, purpose) = self.content_type;
-        let (_, _, input_type, input_mode, flags, learning_mode) =
+        let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
             crate::handler::text_input::map_v3_content_type(hint, purpose);
-        exo::Field {
-            attached: true,
-            content_type: exo::ContentType {
+        let content_type = if extension_version >= extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE {
+            exo::ContentType {
                 input_type,
                 input_mode,
                 flags,
-                learning: learning_mode == zcr_extended_text_input_v1::LEARNING_MODE_ENABLED,
+                learning: learning_mode == extended::LEARNING_MODE_ENABLED,
                 inline_composition: true,
-            },
-            surrounding_text_supported: self.surrounding_text.is_some(),
+            }
+        } else {
+            exo::v1_content_type(v1_hint, v1_purpose)
+        };
+        exo::Field {
+            attached: true,
+            content_type,
+            surrounding_text_supported: self.surrounding_text.is_some()
+                || extension_version < extended::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
             surrounding_text: self.surrounding_text.clone().unwrap_or_default(),
             cursor_rectangle: self.cursor_rectangle.unwrap_or_default(),
         }

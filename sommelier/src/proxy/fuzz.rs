@@ -242,6 +242,8 @@ fn open_fds() -> Vec<std::path::PathBuf> {
 struct Config {
     gpu_accel: bool,
     xdg_decoration: bool,
+    /// The version of the host's `zcr_text_input_extension_v1`.
+    text_input_extension: u32,
 }
 
 impl Config {
@@ -249,9 +251,26 @@ impl Config {
         Self {
             gpu_accel: seed & 1 != 0,
             xdg_decoration: seed & 2 != 0,
+            text_input_extension: TEXT_INPUT_EXTENSION_VERSIONS[(seed >> 2) as usize % 4],
         }
     }
 }
+
+/// A host `zcr_text_input_extension_v1` version for each way the proxy
+/// sends Exo a content type: v1 `set_content_type` alone, followed by
+/// `deprecated_set_input_type`, `set_input_type` alone, or
+/// `set_surrounding_text_support` and `set_input_type` (the newest).
+const TEXT_INPUT_EXTENSION_VERSIONS: [u32; 4] = {
+    use crate::protocols::text_input_extension_unstable_v1::{
+        zcr_extended_text_input_v1 as extended, zcr_text_input_extension_v1,
+    };
+    [
+        extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE - 1,
+        extended::REQ_SET_INPUT_TYPE_SINCE - 1,
+        extended::REQ_SET_INPUT_TYPE_SINCE,
+        zcr_text_input_extension_v1::VERSION,
+    ]
+};
 
 /// One argument of a request, as the protocol XML declares it.
 enum Arg {
@@ -1030,7 +1049,11 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
             // answer releases a held drain barrier's, and the deferred
             // activation that follows reaches the host after it. The proxy
             // sends the host nothing on teardown.
-            let expected: Vec<_> = typed.field.iter().map(typing::V3Field::on_host).collect();
+            let expected: Vec<_> = typed
+                .field
+                .iter()
+                .map(|field| field.on_host(config.text_input_extension))
+                .collect();
             assert_eq!(
                 host.focused_fields(),
                 expected,
@@ -1171,7 +1194,14 @@ fn exchange(
     let (guest, proxy_guest) = UnixStream::pair().expect("guest socket pair");
     let (host, proxy_host) = UnixStream::pair().expect("host socket pair");
 
-    let globals = protocols.globals.clone();
+    let globals = protocols
+        .globals
+        .iter()
+        .map(|(interface, version)| match interface.as_str() {
+            "zcr_text_input_extension_v1" => (interface.clone(), config.text_input_extension),
+            _ => (interface.clone(), *version),
+        })
+        .collect::<Vec<_>>();
     let (finished, proxy_finished) = std::sync::mpsc::channel();
     let proxy = std::thread::spawn(move || {
         let context = Context::new_for_test(config.gpu_accel, config.xdg_decoration, Vec::new());
