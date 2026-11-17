@@ -136,11 +136,12 @@ always consumed; a configuration problem never stops the proxy) is owned by
   error, like a libwayland client (`wl_resource_post_error_vargs`):
   `queue_protocol_error` queues only the first, so a handler's error is
   not followed by a decoding one, and a host's forwarded error counts as
-  the one. A session an internal failure ended without an error of its
-  own (a failed dma-buf sync during a commit, say, or a host error too
-  long to forward) gets `implementation` on `wl_display` when its batch
-  ends. The requests before the rejected
-  one in the same batch were valid and are forwarded.
+  the one. A session an internal failure or the host ended without an
+  error of its own (a failed dma-buf sync during a commit, say, a host
+  error too long to forward or naming an object only the proxy uses, or
+  a host event the proxy rejects) gets `implementation` on `wl_display`
+  when its batch ends. The messages before the rejected one in the same
+  batch were valid and are forwarded first.
   Tests: `unknown_client_sender_is_a_protocol_error`,
   `undecodable_request_is_reported_after_forwarding_earlier_requests`,
   `rejected_requests_report_invalid_method_on_the_display`,
@@ -149,6 +150,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `an_internal_failure_ends_the_session_with_an_implementation_error`,
   `a_host_error_is_the_sessions_only_error`,
   `an_unforwardable_host_error_leaves_the_implementation_error`,
+  `a_host_error_on_a_host_only_object_ends_the_session`,
+  `an_invalid_host_event_is_reported_after_the_valid_ones`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors

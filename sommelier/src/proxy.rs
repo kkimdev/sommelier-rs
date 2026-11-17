@@ -372,9 +372,10 @@ impl Client {
                             &mut self.ctx,
                             &ProtocolError::InvalidMessageLength(header.len),
                         );
-                        break;
+                    } else {
+                        self.ctx.fail_session();
                     }
-                    return false;
+                    break;
                 }
                 Framing::Complete(header) => header,
             };
@@ -542,9 +543,13 @@ impl Client {
                         // libwayland-server does. The requests before this
                         // one were valid, so they are forwarded as usual.
                         crate::handler::display::queue_request_error(&mut self.ctx, &e);
-                        break;
+                    } else {
+                        // The host broke the protocol, so the session ends;
+                        // the events before this one were valid and reach
+                        // the guest ahead of its one error.
+                        self.ctx.fail_session();
                     }
-                    return false;
+                    break;
                 }
             }
 
@@ -1629,7 +1634,12 @@ mod tests {
         guest_peer
             .read_to_end(&mut events)
             .expect("read the guest's events");
-        crate::test_support::frames(&events)
+        display_errors_in(&events)
+    }
+
+    /// The object and code of each `wl_display.error` in `events`.
+    fn display_errors_in(events: &[u8]) -> Vec<(u32, u32)> {
+        crate::test_support::frames(events)
             .filter(|(header, _)| {
                 (header.sender_id, header.opcode)
                     == (
@@ -1873,6 +1883,61 @@ mod tests {
                 crate::wire::WL_DISPLAY_ID,
                 protocols::wayland::wl_display::ERROR_IMPLEMENTATION
             )]
+        );
+    }
+
+    /// A host event that breaks the protocol ends the session like a guest
+    /// request does: the events before it still reach the guest, followed
+    /// by one error.
+    #[tokio::test]
+    async fn an_invalid_host_event_is_reported_after_the_valid_ones() {
+        use protocols::wayland::{wl_data_device, wl_display};
+        const DATA_DEVICE: u32 = 10;
+        const HOST_DATA_DEVICE: u32 = 80;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            DATA_DEVICE,
+            HOST_DATA_DEVICE,
+            "wl_data_device",
+            3,
+        );
+        // A server-range offer, then one from the client range, which only
+        // the proxy allocates from.
+        for offer in [0xff00_0001u32, 123] {
+            let mut event = MessageBuilder::new();
+            event.write_u32(offer);
+            client
+                .host_conn
+                .read_buf
+                .extend(event.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER));
+        }
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let received: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, payload)| {
+                let first = WireMessage::new(header.sender_id, header.opcode, payload)
+                    .read_u32()
+                    .unwrap();
+                (header.sender_id, header.opcode, first)
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER, 0xff00_0000),
+                (
+                    crate::wire::WL_DISPLAY_ID,
+                    wl_display::EVT_ERROR,
+                    crate::wire::WL_DISPLAY_ID
+                ),
+            ]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
         );
     }
 
@@ -3978,20 +4043,37 @@ mod tests {
         );
         assert!(
             !any_fd_has_identity(forwarded_identity),
-            "a translated message that is never sent must close its descriptor"
+            "the proxy closes a forwarded descriptor once it is sent"
         );
         assert!(
             any_fd_has_identity(pending_identity),
             "the connection still owns the descriptor no message took"
         );
-        let mut nothing = [0u8; 1];
-        let read_error = std::io::Read::read(&mut guest_peer, &mut nothing)
-            .expect_err("a batch that ends early sends nothing");
-        assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
         drop(client);
         assert!(
             !any_fd_has_identity(pending_identity),
             "closing the connection must close every pending descriptor"
+        );
+        // The fixture's peer is non-blocking; block until the connection's
+        // close reaches it, which a process forked meanwhile may delay.
+        guest_peer
+            .set_nonblocking(false)
+            .expect("guest peer should become blocking");
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                (LIVE_GUEST_KEYBOARD, wl_keyboard::EVT_KEYMAP),
+                (
+                    crate::wire::WL_DISPLAY_ID,
+                    crate::protocols::wayland::wl_display::EVT_ERROR
+                ),
+            ],
+            "the valid event reaches the guest ahead of the session's error"
         );
     }
 
