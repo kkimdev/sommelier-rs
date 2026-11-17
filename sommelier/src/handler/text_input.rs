@@ -2027,15 +2027,14 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
 
-    /// Helper: extract opcode from a wire message at the given index in a queue.
+    /// The opcode of the message at `idx` in a queue.
     fn msg_opcode(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u16 {
-        let word2 = u32::from_ne_bytes(queue[idx].0[4..8].try_into().unwrap());
-        (word2 & 0xffff) as u16
+        crate::test_support::msg_opcode(&queue[idx].0)
     }
 
-    /// Helper: extract sender_id from a wire message.
+    /// The sender of the message at `idx` in a queue.
     fn msg_sender(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
-        u32::from_ne_bytes(queue[idx].0[0..4].try_into().unwrap())
+        crate::test_support::msg_sender(&queue[idx].0)
     }
 
     fn set_test_focus(
@@ -2750,7 +2749,7 @@ mod tests {
             .client_to_host_queue
             .iter()
             .filter_map(|(msg, _)| {
-                let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+                let opcode = u32::from(crate::test_support::msg_opcode(msg));
                 (opcode == 9).then(|| u32::from_ne_bytes(msg[8..12].try_into().unwrap()))
             })
             .collect();
@@ -5217,7 +5216,7 @@ mod tests {
         // Should NOT send activate (opcode 0) to host because active_surface is None.
         let mut found_activate = false;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 0 {
                 found_activate = true;
             }
@@ -5241,7 +5240,7 @@ mod tests {
         let mut found_activate = false;
         let mut activate_surface = 0u32;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 0 {
                 found_activate = true;
                 let payload = &msg[8..];
@@ -5264,7 +5263,7 @@ mod tests {
         // Now it should have sent deactivate (opcode 1).
         let mut found_deactivate = false;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 1 {
                 found_deactivate = true;
             }

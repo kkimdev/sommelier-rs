@@ -1371,9 +1371,7 @@ mod tests {
     use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    fn message_opcode(message: &[u8]) -> u16 {
-        u16::from_ne_bytes(message[4..6].try_into().unwrap())
-    }
+    use crate::test_support::msg_opcode as message_opcode;
 
     fn pending_native_create(guest_params_id: u32, dimensions: (i32, i32)) -> PendingNativeCreate {
         // A descriptor number from `/dev/null` can be reused by another
@@ -1500,7 +1498,7 @@ mod tests {
         );
         assert!(messages
             .iter()
-            .all(|(message, _)| { u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 77 }));
+            .all(|(message, _)| { crate::test_support::msg_sender(message) == 77 }));
         assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
 
         let table_fd = messages[0].1[0];
@@ -1514,10 +1512,7 @@ mod tests {
             unsafe { libc::pread(table_fd, table.as_mut_ptr().cast(), table.len(), 0) },
             table.len() as isize
         );
-        assert_eq!(
-            u32::from_ne_bytes(table[0..4].try_into().unwrap()),
-            pairs[0].0
-        );
+        assert_eq!(crate::test_support::msg_sender(&table), pairs[0].0);
         assert_eq!(
             u64::from_ne_bytes(table[8..16].try_into().unwrap()),
             pairs[0].1
@@ -2157,13 +2152,10 @@ mod tests {
         );
         let (destroy_message, destroy_fds) = ctx.client_to_host_queue.last().unwrap();
         assert_eq!(
-            u32::from_ne_bytes(destroy_message[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(destroy_message),
             host_buffer_id
         );
-        assert_eq!(
-            u16::from_ne_bytes(destroy_message[4..6].try_into().unwrap()),
-            0
-        );
+        assert_eq!(crate::test_support::msg_opcode(destroy_message), 0);
         assert!(destroy_fds.is_empty());
 
         ctx.shadow_table
@@ -2344,13 +2336,13 @@ mod tests {
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
-                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())),
+                .map(|(message, _)| crate::test_support::msg_sender(message)),
             Some(host_buffer_id)
         );
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
-                .map(|(message, _)| u32::from_ne_bytes(message[4..8].try_into().unwrap()) as u16),
+                .map(|(message, _)| crate::test_support::msg_opcode(message)),
             Some(crate::protocols::wayland::wl_buffer::REQ_DESTROY)
         );
         assert!(ctx
@@ -2434,10 +2426,7 @@ mod tests {
         assert!(
             ctx.client_to_host_queue
                 .iter()
-                .any(
-                    |(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                        == host_buffer_id
-                ),
+                .any(|(message, _)| crate::test_support::msg_sender(message) == host_buffer_id),
             "late created must destroy the host-only wl_buffer"
         );
     }

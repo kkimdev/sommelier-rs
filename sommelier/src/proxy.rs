@@ -19,7 +19,7 @@ use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::state::{Context, PostDispatch, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{ProtocolError, WireMessage};
+use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -55,16 +55,6 @@ fn translated_sender_id(
         Direction::ClientToHost => shadow_table.get_host_id(sender_id),
         Direction::HostToClient => shadow_table.get_guest_id(sender_id),
     }
-}
-
-fn checked_message_end(offset: usize, message_len: usize) -> Option<usize> {
-    offset.checked_add(message_len)
-}
-
-fn valid_message_length(length: usize) -> bool {
-    // Wayland stores the total byte length in the upper 16 bits of the
-    // second header word. The largest aligned representable length is 65532.
-    (8..=0xffff).contains(&length) && length.is_multiple_of(4)
 }
 
 fn close_pending_output_fds(out_fds: &mut Vec<RawFd>, still_owned_fds: &[RawFd]) {
@@ -402,35 +392,21 @@ impl Client {
         // may still complete the descriptor-owning message), but once another
         // complete message is available the association is irrecoverably
         // ambiguous and the connection must be torn down.
-        while let Some(header_end) = offset.checked_add(8) {
-            if header_end > conn.read_buf.len() {
-                break;
-            }
-            let sender_end = header_end - 4;
-            let sender_id =
-                u32::from_ne_bytes(conn.read_buf[offset..sender_end].try_into().unwrap());
-            let word2 =
-                u32::from_ne_bytes(conn.read_buf[offset + 4..header_end].try_into().unwrap());
-            let len = (word2 >> 16) as usize;
-            let opcode = (word2 & 0xFFFF) as u16;
-
-            if !valid_message_length(len) {
-                log::error!("Invalid message length: {}", len);
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
-                return false;
-            }
-            let Some(message_end) = checked_message_end(offset, len) else {
-                log::error!(
-                    "Message end overflows usize: offset={}, length={}",
-                    offset,
-                    len
-                );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
-                return false;
+        loop {
+            let MessageHeader {
+                sender_id,
+                opcode,
+                len,
+            } = match MessageHeader::frame(&conn.read_buf[offset..]) {
+                Framing::Partial => break,
+                Framing::Invalid(header) => {
+                    log::error!("Invalid message length: {}", header.len);
+                    close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                    return false;
+                }
+                Framing::Complete(header) => header,
             };
-            if message_end > conn.read_buf.len() {
-                break;
-            }
+            let message_end = offset + len;
 
             if conn.ambiguous_untracked_fd {
                 log::error!(
@@ -472,8 +448,12 @@ impl Client {
 
             let mut consumed_fds = 0;
             let result = if let Some(interface) = interface {
-                let mut msg =
-                    WireMessage::new(sender_id, opcode, &packet[8..], &conn.read_fds[fd_offset..]);
+                let mut msg = WireMessage::new(
+                    sender_id,
+                    opcode,
+                    &packet[MessageHeader::LEN..],
+                    &conn.read_fds[fd_offset..],
+                );
 
                 log::trace!("[{:?}] {}:{} (len={})", direction, interface, opcode, len);
 
@@ -563,9 +543,7 @@ impl Client {
                     // Patch ID in the forwarded message
                     if let Some(gid) = guest_id {
                         if let Some(tid) = target_sender_id {
-                            if data.len() >= 4 {
-                                data[0..4].copy_from_slice(&tid.to_ne_bytes());
-                            }
+                            MessageHeader::set_sender(&mut data, tid);
                         } else {
                             // If we can't map the ID, it might be a new object or error.
                             // For ClientToHost, it's usually sender which should be mapped.
@@ -719,7 +697,9 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::test_support::{
+        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender,
+    };
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use std::ffi::CString;
@@ -783,6 +763,70 @@ mod tests {
             "host bytes queued after a render batch must be received before another batch"
         );
         assert_eq!(client.host_conn.read_buf, host_event);
+    }
+
+    /// A message whose header arrived in one read and whose body arrives in
+    /// a later one must wait for that read, not be redispatched in a loop.
+    #[test]
+    fn run_receives_the_rest_of_a_partially_buffered_message() {
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut guest_peer, client_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (mut host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        host_peer
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound the wait for the forwarded request");
+
+        // wl_display.sync has opcode 0, so the opcode bytes of its header
+        // read as an invalid zero length when decoded as the length field.
+        const GUEST_CALLBACK: u32 = 2;
+        let mut sync = MessageBuilder::new();
+        sync.write_u32(GUEST_CALLBACK);
+        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        let (header, body) = sync.split_at(MessageHeader::LEN);
+        // The body waits in the socket, so the proxy must read again to
+        // complete the message whose header it has already buffered.
+        guest_peer.write_all(body).expect("queue the message body");
+
+        // Run the proxy on its own thread: a loop that spins without
+        // awaiting would starve a runtime shared with this test.
+        let header = header.to_vec();
+        let proxy = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("proxy runtime")
+                .block_on(async move {
+                    let mut client = Client::new(
+                        WaylandConnection::new(client_socket.into_raw_fd()),
+                        WaylandConnection::new(host_socket.into_raw_fd()),
+                        Context::new_for_test(false, false, Vec::new()),
+                    );
+                    client.client_conn.read_buf.extend_from_slice(&header);
+                    client.run().await;
+                });
+        });
+
+        let mut forwarded = [0u8; 12];
+        host_peer
+            .read_exact(&mut forwarded)
+            .expect("the completed request must reach the host");
+        let forwarded_header = msg_header(&forwarded);
+        assert_eq!(
+            (forwarded_header.sender_id, forwarded_header.opcode),
+            (1, protocols::wayland::wl_display::REQ_SYNC)
+        );
+
+        drop(guest_peer);
+        drop(host_peer);
+        proxy
+            .join()
+            .expect("the proxy loop must end when its peers close");
     }
 
     #[tokio::test]
@@ -1405,13 +1449,11 @@ mod tests {
         guest_peer
             .read_exact(&mut header)
             .expect("guest must receive the fatal display error before disconnect");
-        assert_eq!(u32::from_ne_bytes(header[0..4].try_into().unwrap()), 1);
-        assert_eq!(
-            (u32::from_ne_bytes(header[4..8].try_into().unwrap()) & 0xffff) as u16,
-            protocols::wayland::wl_display::EVT_ERROR
-        );
+        let header = msg_header(&header);
+        assert_eq!(header.sender_id, 1);
+        assert_eq!(header.opcode, protocols::wayland::wl_display::EVT_ERROR);
         assert!(
-            (u32::from_ne_bytes(header[4..8].try_into().unwrap()) >> 16) >= 20,
+            header.len >= 20,
             "display.error must include object, code, and a diagnostic string"
         );
     }
@@ -1426,9 +1468,13 @@ mod tests {
             ctx: &mut Context,
             message: Vec<u8>,
         ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-            let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-            let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-            let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+            let header = msg_header(&message);
+            let mut wire = WireMessage::new(
+                header.sender_id,
+                header.opcode,
+                &message[MessageHeader::LEN..],
+                &[],
+            );
             let result = Client::dispatch_event(handler, ctx, "wl_keyboard", &mut wire)
                 .expect("raw keyboard event must dispatch");
             assert!(
@@ -1590,9 +1636,13 @@ mod tests {
         interface: &str,
         message: Vec<u8>,
     ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let header = msg_header(&message);
+        let mut wire = WireMessage::new(
+            header.sender_id,
+            header.opcode,
+            &message[MessageHeader::LEN..],
+            &[],
+        );
         let result = Client::dispatch_event(handler, ctx, interface, &mut wire)
             .expect("raw host event must dispatch");
         assert!(
@@ -1620,9 +1670,13 @@ mod tests {
         interface: &str,
         message: Vec<u8>,
     ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let header = msg_header(&message);
+        let mut wire = WireMessage::new(
+            header.sender_id,
+            header.opcode,
+            &message[MessageHeader::LEN..],
+            &[],
+        );
         let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
             .expect("raw guest request must dispatch");
         assert!(
@@ -1633,11 +1687,11 @@ mod tests {
     }
 
     fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
-        u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+        msg_sender(&message.0)
     }
 
     fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
-        (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+        msg_opcode(&message.0)
     }
 
     #[test]
@@ -1673,7 +1727,7 @@ mod tests {
         assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         assert_eq!(
-            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(&ctx.client_to_host_queue[0].0),
             AURA_SHELL
         );
 
@@ -3289,23 +3343,6 @@ mod tests {
     }
 
     #[test]
-    fn checked_message_end_rejects_offset_overflow() {
-        assert_eq!(checked_message_end(usize::MAX - 8, 8), Some(usize::MAX));
-        assert_eq!(checked_message_end(usize::MAX, 1), None);
-    }
-
-    #[test]
-    fn message_lengths_must_be_aligned_and_include_the_header() {
-        assert!(!valid_message_length(0));
-        assert!(!valid_message_length(7));
-        assert!(valid_message_length(8));
-        assert!(valid_message_length(12));
-        assert!(!valid_message_length(10));
-        assert!(valid_message_length(65_532));
-        assert!(!valid_message_length(65_536));
-    }
-
-    #[test]
     fn early_output_cleanup_preserves_incoming_fd_ownership() {
         // A memfd has a unique inode for this ownership assertion; pipe
         // read/write ends share an inode and eventfds share an anonymous-inode
@@ -3436,9 +3473,9 @@ mod tests {
         .expect("destroy_registry request should dispatch")
         .expect("destroy_registry request should be forwarded");
         assert!(fds.is_empty());
-        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 15);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), 15);
         assert_eq!(
-            u16::from_ne_bytes(forwarded[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(&forwarded),
             protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY
         );
         assert_eq!(
@@ -3620,7 +3657,7 @@ mod tests {
                 .expect("create_surface dispatch")
                 .expect("create_surface forwarded");
         assert!(fds.is_empty());
-        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 20);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), 20);
         let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
         assert_eq!(
             u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),

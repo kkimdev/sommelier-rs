@@ -195,7 +195,7 @@ mod tests {
         let (wire, fds) = result;
         assert!(fds.is_empty());
         assert_eq!(
-            u32::from_ne_bytes(wire[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(&wire),
             10,
             "event sender must be translated to the guest object"
         );
@@ -274,7 +274,7 @@ mod tests {
         .expect("data_offer.destroy should decode")
         .expect("data_offer.destroy should be forwarded");
         assert_eq!(
-            u32::from_ne_bytes(destroy_request[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(&destroy_request),
             host_offer_id
         );
         assert_eq!(ctx.shadow_table.get_host_id(first_guest_id), None);

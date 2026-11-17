@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::wire::{Framing, MessageHeader};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::HashSet;
@@ -277,15 +278,11 @@ impl WaylandConnection {
     /// `read_buf` (which must be dispatched without waiting for new socket
     /// activity).
     pub(crate) fn has_complete_message(&self) -> bool {
-        if self.read_buf.len() < 8 {
-            return false;
-        }
-        let length = u16::from_ne_bytes([self.read_buf[4], self.read_buf[5]]) as usize;
         // An invalid length is "ready" too: dispatching it lets the normal
         // protocol validation report the error instead of spinning on a
         // permanently buffered malformed header. A valid message is ready
         // only once all of its bytes are buffered.
-        length < 8 || !length.is_multiple_of(4) || length <= self.read_buf.len()
+        !matches!(MessageHeader::frame(&self.read_buf), Framing::Partial)
     }
 
     pub async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -439,6 +436,7 @@ impl Drop for WaylandConnection {
 mod tests {
     use super::{decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection};
     use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     use std::ffi::CString;
@@ -603,19 +601,23 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
         let mut connection = WaylandConnection::new(socket.into_raw_fd());
 
-        // A partial header/body must wait for another recvmsg call.
-        connection.read_buf.extend_from_slice(&[0; 7]);
-        assert!(!connection.has_complete_message());
-        connection.read_buf.push(0);
-        // Wayland length is 8 bytes for a header-only message.
-        connection.read_buf[4..6].copy_from_slice(&8_u16.to_ne_bytes());
-        assert!(connection.has_complete_message());
-
+        // Opcode 0 keeps the bytes that hold the opcode zero, so a decoder
+        // that reads the length from the opcode half sees an invalid length
+        // and reports a partial frame as ready.
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(2);
+        let message = builder.build_message(1, 0);
+        for partial in 0..message.len() {
+            connection.read_buf.clear();
+            connection.read_buf.extend_from_slice(&message[..partial]);
+            assert!(
+                !connection.has_complete_message(),
+                "{partial} of {} bytes must wait for the rest",
+                message.len()
+            );
+        }
         connection.read_buf.clear();
-        connection.read_buf.extend_from_slice(&[0; 8]);
-        connection.read_buf[4..6].copy_from_slice(&16_u16.to_ne_bytes());
-        assert!(!connection.has_complete_message());
-        connection.read_buf.extend_from_slice(&[0; 8]);
+        connection.read_buf.extend_from_slice(&message);
         assert!(connection.has_complete_message());
     }
 
@@ -623,8 +625,11 @@ mod tests {
     async fn malformed_buffered_length_is_ready_for_protocol_validation() {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
         let mut connection = WaylandConnection::new(socket.into_raw_fd());
-        connection.read_buf.extend_from_slice(&[0; 8]);
-        connection.read_buf[4..6].copy_from_slice(&6_u16.to_ne_bytes());
+        let mut message = MessageBuilder::new().build_message(1, 0);
+        // Rewrite the length to 6, below the header size.
+        let invalid_word = (6_u32 << 16).to_ne_bytes();
+        message[4..8].copy_from_slice(&invalid_word);
+        connection.read_buf.extend_from_slice(&message);
         assert!(
             connection.has_complete_message(),
             "invalid buffered headers must not make the event loop wait forever"

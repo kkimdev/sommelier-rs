@@ -19,14 +19,21 @@ limitations under the License.
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
+use crate::wire::{Framing, MessageHeader};
+
+/// The header of an encoded Wayland message.
+pub fn msg_header(message: &[u8]) -> MessageHeader {
+    MessageHeader::parse(message).expect("a complete Wayland message header")
+}
+
 /// The sender object ID of an encoded Wayland message.
 pub fn msg_sender(message: &[u8]) -> u32 {
-    u32::from_ne_bytes(message[0..4].try_into().unwrap())
+    msg_header(message).sender_id
 }
 
 /// The opcode of an encoded Wayland message.
 pub fn msg_opcode(message: &[u8]) -> u16 {
-    (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16
+    msg_header(message).opcode
 }
 
 /// The `(sender, opcode)` of every message in a proxy message queue.
@@ -37,13 +44,13 @@ pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
         .collect()
 }
 
-/// The `(sender, opcode)` of every message in a Wayland byte stream.
+/// The `(sender, opcode)` of every complete message at the start of a
+/// Wayland byte stream, up to a partial or corrupt one.
 pub fn stream_headers(mut stream: &[u8]) -> Vec<(u32, u16)> {
     let mut headers = Vec::new();
-    while stream.len() >= 8 {
-        let length = (u32::from_ne_bytes(stream[4..8].try_into().unwrap()) >> 16) as usize;
-        headers.push((msg_sender(stream), msg_opcode(stream)));
-        stream = &stream[length..];
+    while let Framing::Complete(header) = MessageHeader::frame(stream) {
+        headers.push((header.sender_id, header.opcode));
+        stream = &stream[header.len..];
     }
     headers
 }
@@ -135,5 +142,36 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_headers;
+    use crate::wire::MessageBuilder;
+
+    #[test]
+    fn stream_headers_stop_at_a_partial_or_corrupt_message() {
+        let mut stream = MessageBuilder::new().build_message(7, 3);
+        stream.extend(MessageBuilder::new().build_message(8, 4));
+        assert_eq!(stream_headers(&stream), vec![(7, 3), (8, 4)]);
+
+        let complete = stream.len();
+        stream.extend_from_slice(&9_u32.to_ne_bytes());
+        stream.extend_from_slice(&((16_u32 << 16) | 5).to_ne_bytes());
+        assert_eq!(
+            stream_headers(&stream),
+            vec![(7, 3), (8, 4)],
+            "a message longer than the stream is partial"
+        );
+
+        stream.truncate(complete);
+        stream.extend_from_slice(&9_u32.to_ne_bytes());
+        stream.extend_from_slice(&0_u32.to_ne_bytes());
+        assert_eq!(
+            stream_headers(&stream),
+            vec![(7, 3), (8, 4)],
+            "a zero length must not loop forever"
+        );
     }
 }
