@@ -26,7 +26,6 @@ use log::{debug, error};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::io::IntoRawFd;
 
 /// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
@@ -458,9 +457,6 @@ impl LinuxDmabufHandler {
         let params = ctx.pending_params.remove(&params_id)?;
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
             error!("Unknown host ID for params {}", params_id);
-            for param in params {
-                unsafe { libc::close(param.fd) };
-            }
             // The guest request was valid when it entered the proxy, so a
             // missing host mapping is an internal state corruption rather
             // than a recoverable client error. Do not let callers continue
@@ -479,26 +475,19 @@ impl LinuxDmabufHandler {
         // live with the render-buffer generation through its final destroy.
         let mut sync_fds = Vec::new();
         for param in &params {
-            let sync_fd = nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(param.fd) });
-            match sync_fd {
+            match param.fd.try_clone() {
                 Ok(sync_fd) => sync_fds.push(sync_fd),
                 Err(error) => {
                     error!(
                         "Failed to duplicate dma-buf fd for synchronization: {}",
                         error
                     );
-                    for param in params {
-                        unsafe { libc::close(param.fd) };
-                    }
                     ctx.fail_session();
                     return None;
                 }
             }
         }
         if sync_fds.is_empty() {
-            for param in params {
-                unsafe { libc::close(param.fd) };
-            }
             ctx.fail_session();
             return None;
         }
@@ -506,14 +495,11 @@ impl LinuxDmabufHandler {
         // Send the ADDs, each handing its descriptor to the queue. The caller
         // queues its CREATE right after.
         for param in params {
-            // SAFETY: a pending param owns the duplicate `on_add` made, and
-            // its ADD takes the duplicate over.
-            let fd = unsafe { OwnedFd::from_raw_fd(param.fd) };
             // PASS THE GUEST'S EXACT METADATA. NO MINIGBM OVERRIDES.
             ctx.client_to_host_queue
                 .push(zwp_linux_buffer_params_v1::req::add(
                     host_id,
-                    fd,
+                    param.fd,
                     param.plane_idx,
                     param.offset,
                     param.stride,
@@ -523,16 +509,6 @@ impl LinuxDmabufHandler {
         }
         ctx.used_dmabuf_params.insert(params_id);
         Some((HostId(host_id), sync_fds))
-    }
-
-    fn discard_pending_params(ctx: &mut Context, params_id: u32) {
-        if let Some(params) = ctx.pending_params.remove(&params_id) {
-            for param in params {
-                unsafe {
-                    libc::close(param.fd);
-                }
-            }
-        }
     }
 
     fn valid_params(ctx: &Context, params_id: u32, width: i32, height: i32, format: u32) -> bool {
@@ -550,8 +526,7 @@ impl LinuxDmabufHandler {
 
         let mut seen_planes = std::collections::HashSet::new();
         params.iter().all(|param| {
-            param.fd >= 0
-                && param.plane_idx < expected_planes
+            param.plane_idx < expected_planes
                 && seen_planes.insert(param.plane_idx)
                 && valid_dmabuf_plane(param, format, width, height)
         })
@@ -603,16 +578,9 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
 
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
         ctx.used_dmabuf_params.remove(&params_id);
-        if let Some(previous) = ctx.pending_params.insert(params_id, Vec::new()) {
-            // Reusing a params ID is a protocol violation, but closing stale
-            // duplicated plane FDs here keeps the connection from leaking
-            // resources before the compositor reports the error.
-            for param in previous {
-                unsafe {
-                    libc::close(param.fd);
-                }
-            }
-        }
+        // Reusing a params ID is a protocol violation; replacing the stale
+        // planes closes their descriptors before the compositor reports it.
+        ctx.pending_params.insert(params_id, Vec::new());
         Action::Forward
     }
 
@@ -919,11 +887,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             // synchronization descriptor immediately.
             ctx.pending_native_creates.remove(&HostId(host_id));
         }
-        if let Some(params) = ctx.pending_params.remove(&id) {
-            for p in params {
-                unsafe { libc::close(p.fd) };
-            }
-        }
+        ctx.pending_params.remove(&id);
         Action::Forward
     }
 
@@ -970,8 +934,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             return Action::Drop;
         }
 
-        let dup_fd = match fd.try_clone_to_owned() {
-            Ok(d) => d.into_raw_fd(),
+        let duplicate = match fd.try_clone_to_owned() {
+            Ok(duplicate) => duplicate,
             Err(e) => {
                 error!("Failed to dup FD for add: {}", e);
                 return Action::Drop;
@@ -1002,7 +966,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
         if let Some(list) = ctx.pending_params.get_mut(&params_id) {
             list.push(PendingParam {
-                fd: dup_fd,
+                fd: duplicate,
                 plane_idx,
                 offset,
                 stride,
@@ -1013,7 +977,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             // If create_params wasn't tracked (e.g. before connection), we can't buffer.
             // But we should have tracked it.
             error!("Unknown params ID {} in add", params_id);
-            unsafe { libc::close(dup_fd) };
         }
 
         Action::Drop
@@ -1049,7 +1012,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 code,
                 "invalid linux-dmabuf buffer parameters",
             );
-            Self::discard_pending_params(ctx, params_id);
+            ctx.pending_params.remove(&params_id);
             return Action::Drop;
         }
 
@@ -1204,7 +1167,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 code,
                 "invalid linux-dmabuf buffer parameters",
             );
-            Self::discard_pending_params(ctx, params_id);
+            ctx.pending_params.remove(&params_id);
             return Action::Drop;
         }
 
@@ -1262,7 +1225,7 @@ mod tests {
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
     use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
-    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
     use crate::test_support::msg_opcode as message_opcode;
 
@@ -1563,7 +1526,7 @@ mod tests {
         ctx.pending_params.insert(
             params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1685,7 +1648,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: first_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1731,7 +1694,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1767,7 +1730,7 @@ mod tests {
         ctx.pending_params.insert(
             guest_params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -1854,7 +1817,7 @@ mod tests {
             guest_params_id,
             vec![
                 PendingParam {
-                    fd: first_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 16,
@@ -1862,7 +1825,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: second_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                     plane_idx: 1,
                     offset: 128,
                     stride: 16,
@@ -1907,7 +1870,7 @@ mod tests {
             guest_params_id,
             vec![
                 PendingParam {
-                    fd: pipe_fds[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 16,
@@ -1915,7 +1878,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: duplicate,
+                    fd: unsafe { OwnedFd::from_raw_fd(duplicate) },
                     plane_idx: 1,
                     offset: 128,
                     stride: 16,
@@ -1970,7 +1933,7 @@ mod tests {
         ctx.pending_params.insert(
             first_guest_params,
             vec![PendingParam {
-                fd: first_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2048,7 +2011,7 @@ mod tests {
         ctx.pending_params.insert(
             second_guest_params,
             vec![PendingParam {
-                fd: second_pipe[1],
+                fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2102,7 +2065,7 @@ mod tests {
         ctx.pending_params.insert(
             guest_params_id,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 stride: 64,
@@ -2301,7 +2264,7 @@ mod tests {
             7,
             vec![
                 PendingParam {
-                    fd: first_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
                     plane_idx: 0,
                     offset: 0,
                     stride: 64,
@@ -2309,7 +2272,7 @@ mod tests {
                     modifier_lo: 0,
                 },
                 PendingParam {
-                    fd: second_pipe[1],
+                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
                     plane_idx: 0,
                     offset: 4096,
                     stride: 64,
@@ -2340,7 +2303,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pipe_fds[1],
+                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
                 plane_idx: 0,
                 offset: 0,
                 // XRGB8888 needs four bytes per pixel.

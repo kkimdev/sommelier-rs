@@ -24,7 +24,7 @@ mod window_placement;
 mod xdg_roles;
 
 use std::collections::{HashMap, HashSet};
-use std::os::unix::io::{OwnedFd, RawFd};
+use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
@@ -690,22 +690,6 @@ impl Default for ShadowTable {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        // Pending dma-buf planes hold raw descriptors. A protocol error or a
-        // disconnect can drop Context before linux_dmabuf consumes them, so
-        // close every remaining one here. De-duplicate defensively: a
-        // failed/partially handled request must never turn an accidental
-        // duplicate entry into a close of a subsequently reused descriptor.
-        let mut owned_fds = HashSet::new();
-        for params in self.pending_params.drain().map(|(_, params)| params) {
-            owned_fds.extend(params.into_iter().map(|param| param.fd));
-        }
-
-        for fd in owned_fds {
-            if fd >= 0 {
-                let _ = nix::unistd::close(fd);
-            }
-        }
-
         // Context is also dropped on synchronous protocol-error paths. Tokio
         // JoinHandle::drop detaches a task, so explicitly abort every active
         // clipboard pump instead of allowing it to outlive the connection.
@@ -716,7 +700,7 @@ impl Drop for Context {
 }
 
 pub struct PendingParam {
-    pub fd: RawFd,
+    pub fd: OwnedFd,
     pub plane_idx: u32,
     pub offset: u32,
     pub stride: u32,
@@ -2057,7 +2041,7 @@ mod tests {
     #[test]
     fn context_drop_closes_queued_and_pending_fds() {
         use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
-        use std::os::fd::{AsRawFd, IntoRawFd};
+        use std::os::fd::AsRawFd;
 
         // Memfds have identities of their own, which no other test reuses.
         let files: [_; 4] = std::array::from_fn(|_| shm_pool_file(&[]));
@@ -2071,7 +2055,7 @@ mod tests {
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pending.into_raw_fd(),
+                fd: pending,
                 plane_idx: 0,
                 offset: 0,
                 stride: 4,
