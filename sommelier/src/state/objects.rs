@@ -48,9 +48,7 @@ struct Interface {
 #[derive(Debug)]
 enum GuestObject {
     /// An object with no host counterpart, which the proxy implements
-    /// ([`ShadowTable::is_local_only_guest_object`]). A handler that tracks
-    /// a new object before its dispatcher pairs it (`wl_seat.get_keyboard`)
-    /// makes one for the rest of that dispatch.
+    /// ([`ShadowTable::is_local_only_guest_object`]).
     Local(Interface),
     /// An object paired with a host object, which records the pairing too.
     Paired {
