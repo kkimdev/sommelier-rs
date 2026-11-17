@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod aura_surfaces;
+mod id_allocator;
 mod input;
 mod internal_callbacks;
 mod outputs;
@@ -27,6 +28,7 @@ use std::os::unix::io::{OwnedFd, RawFd};
 use std::sync::Arc;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
+use self::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;
@@ -36,10 +38,10 @@ use log::{error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
-    GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
-    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
-    PreeditRegionPlan, SeatFocusChange, TextInputState,
+    CommitCount, ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery,
+    GuestKeyEvent, GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan,
+    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate,
+    PeekKeyProvenance, PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;
@@ -146,6 +148,18 @@ pub struct PendingDmabufGlobal {
 // `ctx.host_*_id` field, and we register it with `track_host_interface`
 // so proxy.rs can dispatch inbound host events without any magic number hackery.
 
+/// What a host `wl_display.delete_id` ended
+/// ([`ShadowTable::release_deleted_host_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedHostId {
+    /// An ID the proxy does not track; nothing changed.
+    Untracked,
+    /// A host-only object; no guest object is owed a `delete_id`.
+    HostOnly,
+    /// An object paired with this guest object, now owed its `delete_id`.
+    Paired(u32),
+}
+
 #[allow(dead_code)]
 pub struct ShadowTable {
     guest_to_host: HashMap<u32, u32>,
@@ -161,16 +175,26 @@ pub struct ShadowTable {
     /// Guest objects whose destructor request has reached the host but whose
     /// host-side `wl_display.delete_id` has not arrived yet.
     pending_destroy_guest_ids: HashSet<u32>,
-    next_host_id: u32,
+    /// The IDs this proxy allocates for its objects on the host connection.
+    /// An ID returns here only through [`Self::release_deleted_host_id`].
+    host_ids: IdAllocator,
     /// Wayland reserves the upper 8-bit ID range for IDs allocated by the
     /// server and sent to the client in an event. Host and guest object
     /// namespaces are independent, so host-generated `new_id` values must be
     /// translated to a fresh ID in this range before they reach the guest.
-    next_guest_server_id: u32,
+    /// An ID returns here when [`Self::remove_id`] forgets its object.
+    guest_server_ids: IdAllocator,
 }
 
 impl ShadowTable {
     const GUEST_SERVER_ID_START: u32 = 0xff00_0000;
+    /// The IDs a Wayland client allocates: 0 is null, 1 is `wl_display`,
+    /// and libwayland-server accepts up to `WL_MAP_MAX_OBJECTS` inclusive.
+    const CLIENT_IDS: std::ops::Range<u32> = 2..WL_MAP_MAX_OBJECTS + 1;
+    /// The server IDs a libwayland client accepts: index (offset from
+    /// [`Self::GUEST_SERVER_ID_START`]) up to `WL_MAP_MAX_OBJECTS` inclusive.
+    const SERVER_IDS: std::ops::Range<u32> =
+        Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
     /// The version of an object registered without a negotiated version.
     ///
     /// Test fixtures and legacy internal registrations that do not carry a
@@ -189,50 +213,66 @@ impl ShadowTable {
             retired_host_ids: HashSet::new(),
             pending_destroy_host_ids: HashSet::new(),
             pending_destroy_guest_ids: HashSet::new(),
-            // Start at 2 to mimic standard Wayland client behavior.
-            // ID 1 is reserved for wl_display.
-            next_host_id: 2,
-            next_guest_server_id: Self::GUEST_SERVER_ID_START,
+            host_ids: IdAllocator::new(Self::CLIENT_IDS),
+            guest_server_ids: IdAllocator::new(Self::SERVER_IDS),
         }
     }
 
+    /// Allocate an ID for a new proxy object on the host connection.
+    ///
+    /// The ID is free on the host: either never used, or released by the
+    /// host's `wl_display.delete_id`, and no table entry names it.
+    ///
+    /// # Panics
+    ///
+    /// When the client holds `WL_MAP_MAX_OBJECTS` live objects, which the
+    /// host would refuse anyway. Allocation runs only in a client's own
+    /// task, and Tokio confines a task's panic to it, so this ends that
+    /// client alone; unwinding drops its connections and descriptors.
     pub fn allocate_host_id(&mut self) -> u32 {
-        // In the common case (next_host_id points to a free slot) this returns
-        // on the first iteration. The u64 loop bound caps worst-case work at
-        // u32::MAX iterations to prevent an infinite spin when the ID space is
-        // nearly full, and triggers a panic instead of looping forever.
-        //
-        // We use u64 for the loop variable to avoid an overflow when constructing
-        // the `RangeInclusive<u32>`: writing `0u32..=u32::MAX` would require
-        // computing `u32::MAX + 1` for the exclusive upper bound, which wraps
-        // to 0 and produces an empty range on platforms where range iteration
-        // checks `start > end`. Casting to u64 sidesteps this entirely.
-        for _ in 0u64..=(u32::MAX as u64) {
-            // `id` is the candidate we are testing this iteration.
-            let id = self.next_host_id;
-            // Advance the counter; .max(2) handles the u32::MAX → 0 → 2 wrap
-            // in one step, keeping 0 (null) and 1 (wl_display) permanently skipped.
-            self.next_host_id = self.next_host_id.wrapping_add(1).max(2);
-            // Accept only IDs ≥ 2 that are not already assigned in either map.
-            // `host_to_guest` tracks guest↔host paired objects; `host_interfaces`
-            // tracks internally-bound objects (keyboard extension, dmabuf, etc.)
-            // that are registered via `track_host_interface` without a guest pair.
-            // Both maps must be checked, otherwise a freshly-allocated ID could
-            // collide with an already-registered internal object.
-            //
-            // (The pre-advance id could be 0 or 1 if next_host_id was initialised
-            // to those values externally, e.g. in tests.)
-            if id >= 2
-                && !self.host_to_guest.contains_key(&id)
-                && !self.host_interfaces.contains_key(&id)
-                && !self.retired_host_ids.contains(&id)
-                && !self.pending_destroy_host_ids.contains(&id)
-            {
+        loop {
+            let Some(id) = self.host_ids.next_candidate() else {
+                log::error!("Ending the client: its host object IDs are exhausted");
+                panic!("host Wayland object IDs exhausted");
+            };
+            if !self.is_host_id_registered(id) {
                 return id;
             }
+            // Only an object registered under an ID this allocator did not
+            // hand out gets here: a host `new_id` from the client range, or
+            // a test fixture. Skipping keeps two objects off one ID; the
+            // warning keeps the cause visible.
+            warn!("Skipping host ID {id}, which is registered but was never allocated");
         }
-        log::error!("sommelier: host Wayland object ID space exhausted");
-        panic!("sommelier: host Wayland object ID space exhausted — this should never happen");
+    }
+
+    /// Apply the host's `wl_display.delete_id` for `host_id`.
+    ///
+    /// The host has destroyed the object and forgotten its ID, so no later
+    /// event can name it. Forget every mapping of the ID and return it to
+    /// the allocator. As in libwayland-client, this is the only way an ID
+    /// this proxy allocated becomes reusable: an ID is never reused while
+    /// its `delete_id` is outstanding, and objects without a destructor keep
+    /// theirs for the connection.
+    ///
+    /// A `delete_id` for an ID this proxy did not allocate, or no longer
+    /// tracks, changes nothing and returns [`DeletedHostId::Untracked`].
+    pub fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
+        if !self.host_ids.contains(host_id) || !self.is_host_id_registered(host_id) {
+            warn!("Ignoring wl_display.delete_id for untracked host ID {host_id}");
+            return DeletedHostId::Untracked;
+        }
+        let guest_id = self.host_to_guest.get(&host_id).copied();
+        if let Some(guest_id) = guest_id {
+            self.remove_id(guest_id);
+        }
+        self.host_to_guest.remove(&host_id);
+        self.host_interfaces.remove(&host_id);
+        self.host_versions.remove(&host_id);
+        self.retired_host_ids.remove(&host_id);
+        self.pending_destroy_host_ids.remove(&host_id);
+        self.host_ids.release(host_id);
+        guest_id.map_or(DeletedHostId::HostOnly, DeletedHostId::Paired)
     }
 
     /// Allocate an ID in Wayland's server-generated ID range.
@@ -240,29 +280,26 @@ impl ShadowTable {
     /// A host compositor is allowed to choose a different raw ID than the
     /// guest-side proxy can expose. Returning the host ID verbatim can collide
     /// with a guest-created object and makes later requests use the wrong
-    /// namespace. Keep a separate wrapping cursor for the server range and
+    /// namespace. Allocate from the guest's own server range instead, and
     /// reserve the chosen ID in the normal guest maps at the call site.
+    ///
+    /// # Panics
+    ///
+    /// Like [`Self::allocate_host_id`], when the range is exhausted; that
+    /// ends only the client whose task allocates.
     pub fn allocate_guest_server_id(&mut self) -> u32 {
-        // The range is exactly 0x0100_0000 IDs
-        // (0xff00_0000..=u32::MAX). Use a u64 loop counter so the inclusive
-        // bound itself cannot overflow.
-        for _ in 0u64..=0x00ff_ffff {
-            let id = self.next_guest_server_id;
-            self.next_guest_server_id = if id == u32::MAX {
-                Self::GUEST_SERVER_ID_START
-            } else {
-                id + 1
+        loop {
+            let Some(id) = self.guest_server_ids.next_candidate() else {
+                log::error!("Ending the client: its guest server IDs are exhausted");
+                panic!("guest Wayland server IDs exhausted");
             };
-
-            if id >= Self::GUEST_SERVER_ID_START
-                && !self.guest_to_host.contains_key(&id)
-                && !self.interfaces.contains_key(&id)
-            {
+            if !self.guest_to_host.contains_key(&id) && !self.interfaces.contains_key(&id) {
                 return id;
             }
+            // As in `allocate_host_id`: only an ID registered without being
+            // allocated (a test fixture) gets here.
+            warn!("Skipping guest server ID {id}, which is registered but was never allocated");
         }
-        log::error!("sommelier: guest Wayland server ID space exhausted");
-        panic!("sommelier: guest Wayland server ID space exhausted — this should never happen");
     }
 
     pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
@@ -275,8 +312,7 @@ impl ShadowTable {
         if let Some(old_guest_id) = self.host_to_guest.insert(host_id, guest_id) {
             if old_guest_id != guest_id && self.guest_to_host.get(&old_guest_id) == Some(&host_id) {
                 self.guest_to_host.remove(&old_guest_id);
-                self.interfaces.remove(&old_guest_id);
-                self.guest_versions.remove(&old_guest_id);
+                self.forget_guest_object(old_guest_id, true);
             }
         }
     }
@@ -359,11 +395,16 @@ impl ShadowTable {
     /// proxy objects. A reused ID would otherwise overwrite the reverse map
     /// and route subsequent host events to the wrong guest object.
     pub fn is_host_id_available(&self, host_id: u32) -> bool {
-        host_id > 1
-            && !self.host_to_guest.contains_key(&host_id)
-            && !self.host_interfaces.contains_key(&host_id)
-            && !self.retired_host_ids.contains(&host_id)
-            && !self.pending_destroy_host_ids.contains(&host_id)
+        host_id > 1 && !self.is_host_id_registered(host_id)
+    }
+
+    /// Whether any table entry names `host_id`: a paired or host-only
+    /// object, or a reservation awaiting `delete_id` or teardown.
+    fn is_host_id_registered(&self, host_id: u32) -> bool {
+        self.host_to_guest.contains_key(&host_id)
+            || self.host_interfaces.contains_key(&host_id)
+            || self.retired_host_ids.contains(&host_id)
+            || self.pending_destroy_host_ids.contains(&host_id)
     }
 
     pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
@@ -396,8 +437,11 @@ impl ShadowTable {
     /// Retire a host-only object after its destructor request has been queued.
     ///
     /// The dispatch metadata is removed immediately so stale events cannot
-    /// reach a handler, but the numeric ID remains reserved until the host
-    /// acknowledges the destructor with `wl_display.delete_id`.
+    /// reach a handler. An ID this proxy allocated remains reserved until the
+    /// host acknowledges the destructor with `wl_display.delete_id`. An ID
+    /// the host allocated gets no `delete_id` (libwayland frees server IDs
+    /// as soon as the destructor is processed and may hand them to the next
+    /// server-created object at once), so nothing is kept for it.
     ///
     /// Handlers go through [`Context::retire_destroyed_host_object`], which
     /// owns what a refusal means.
@@ -409,7 +453,7 @@ impl ShadowTable {
         self.host_interfaces.remove(&host_id);
         self.host_versions.remove(&host_id);
         self.retired_host_ids.remove(&host_id);
-        self.pending_destroy_host_ids.insert(host_id)
+        !self.host_ids.contains(host_id) || self.pending_destroy_host_ids.insert(host_id)
     }
 
     #[allow(dead_code)]
@@ -417,26 +461,14 @@ impl ShadowTable {
         self.pending_destroy_host_ids.contains(&host_id)
     }
 
-    /// Consume a `wl_display.delete_id` for a host-only object.
-    ///
-    /// Host-only resources have no guest object ID to expose, so the display
-    /// handler uses this result to consume the acknowledgement without
-    /// forwarding an invalid `delete_id(0)` event to the guest.
-    pub fn consume_host_delete_id(&mut self, host_id: u32) -> bool {
-        self.pending_destroy_host_ids.remove(&host_id)
-    }
-
     pub fn is_pending_destroy_guest(&self, guest_id: u32) -> bool {
         self.pending_destroy_guest_ids.contains(&guest_id)
     }
 
-    /// Clear a guest destructor marker after the guest-side mapping has been
-    /// removed while a host-only reservation remains for a delayed event.
-    ///
-    /// This is narrower than [`remove_id`]: orphaned asynchronous
-    /// linux-dmabuf params can acknowledge their guest `delete_id` before
-    /// emitting `created`/`failed`, so their host interface metadata must stay
-    /// registered until that final event is consumed.
+    /// Undo [`Self::mark_pending_destroy`], for tests that stage one object's
+    /// destructor after another's. Production clears the marker only through
+    /// the host's `delete_id`.
+    #[cfg(test)]
     pub fn clear_pending_destroy_guest(&mut self, guest_id: u32) {
         self.pending_destroy_guest_ids.remove(&guest_id);
     }
@@ -520,25 +552,6 @@ impl ShadowTable {
         version == Self::UNKNOWN_OBJECT_VERSION
     }
 
-    /// Remove a host-side interface registration.
-    ///
-    /// Call this when a host object is destroyed (e.g. `zcr_extended_keyboard_v1.destroy`)
-    /// to prevent stale events for the recycled ID from being dispatched.
-    ///
-    /// # Pipelining note
-    /// The `destroy` request and this registration removal are applied immediately
-    /// on the client side, but the host compositor processes them asynchronously.
-    /// Events for `host_id` that were already queued by the host (e.g. `peek_key`
-    /// in protocol v2+) may arrive after the destroy is sent. Those events will
-    /// be silently dropped by the dispatcher once the registration is gone, which
-    /// is the correct behavior. Exo does not send events after processing `destroy`.
-    pub fn remove_host_interface(&mut self, host_id: u32) {
-        self.host_interfaces.remove(&host_id);
-        self.host_versions.remove(&host_id);
-        self.retired_host_ids.remove(&host_id);
-        self.pending_destroy_host_ids.remove(&host_id);
-    }
-
     /// Forget active dispatch metadata while reserving the host ID until
     /// connection teardown. Use when a protocol has no destructor request but
     /// its host-side proxy may still exist after the guest-facing global is
@@ -571,14 +584,36 @@ impl ShadowTable {
     }
 
     pub fn remove_id(&mut self, guest_id: u32) {
-        self.pending_destroy_guest_ids.remove(&guest_id);
-        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+        let host_id = self.guest_to_host.remove(&guest_id);
+        if let Some(host_id) = host_id {
             self.host_to_guest.remove(&host_id);
             self.host_interfaces.remove(&host_id);
             self.host_versions.remove(&host_id);
         }
-        self.interfaces.remove(&guest_id);
+        self.forget_guest_object(guest_id, host_id.is_some());
+    }
+
+    /// Forget the guest side of `guest_id`, whose mapping to a host object
+    /// the caller has just removed (`was_mapped`) or never had.
+    ///
+    /// The one place a guest object ends: its metadata goes, and an ID from
+    /// the server range returns to the allocator. A server-created object
+    /// gets no `delete_id`; libwayland-client frees its ID as soon as either
+    /// side destroys it, which is when the proxy drops its mapping. Nothing
+    /// is freed for an ID that named no object, so no ID is freed twice.
+    ///
+    /// # Returns
+    ///
+    /// The object's interface, if it still had one.
+    fn forget_guest_object(&mut self, guest_id: u32, was_mapped: bool) -> Option<String> {
+        debug_assert!(!self.guest_to_host.contains_key(&guest_id));
+        self.pending_destroy_guest_ids.remove(&guest_id);
         self.guest_versions.remove(&guest_id);
+        let interface = self.interfaces.remove(&guest_id);
+        if was_mapped || interface.is_some() {
+            self.guest_server_ids.release(guest_id);
+        }
+        interface
     }
 
     /// Remove only the guest-side half of a mapping.
@@ -589,9 +624,9 @@ impl ShadowTable {
     /// host interface reservation prevents a later allocation from reusing
     /// that ID and routing stale host events to a new object.
     pub fn remove_guest_mapping(&mut self, guest_id: u32) {
-        let guest_interface = self.interfaces.remove(&guest_id);
-        self.guest_versions.remove(&guest_id);
-        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+        let host_id = self.guest_to_host.remove(&guest_id);
+        let guest_interface = self.forget_guest_object(guest_id, host_id.is_some());
+        if let Some(host_id) = host_id {
             if self.host_to_guest.get(&host_id) == Some(&guest_id) {
                 self.host_to_guest.remove(&host_id);
             }
@@ -619,13 +654,18 @@ impl ShadowTable {
     /// metadata is intentionally removed so a destroyed object cannot accept
     /// another request.
     pub fn retire_guest_object(&mut self, guest_id: u32) {
+        let Some(&host_id) = self.guest_to_host.get(&guest_id) else {
+            // Nothing can name an unmapped object again: it ends here.
+            self.forget_guest_object(guest_id, false);
+            return;
+        };
         let interface = self.interfaces.remove(&guest_id);
         self.guest_versions.remove(&guest_id);
-        if let (Some(host_id), Some(interface)) = (self.guest_to_host.get(&guest_id), interface) {
+        if let Some(interface) = interface {
             self.pending_destroy_guest_ids.insert(guest_id);
-            self.host_interfaces.entry(*host_id).or_insert(interface);
+            self.host_interfaces.entry(host_id).or_insert(interface);
             self.host_versions
-                .entry(*host_id)
+                .entry(host_id)
                 .or_insert(Self::UNKNOWN_OBJECT_VERSION);
         }
     }
@@ -766,11 +806,6 @@ pub struct Context {
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
     pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
-    /// Async linux-dmabuf params objects whose guest destructor was sent
-    /// before the host emitted `created`/`failed`. The key is the host params
-    /// ID, which may outlive the guest mapping when the host acknowledges the
-    /// params destructor first.
-    pub orphaned_dmabuf_params: HashMap<u32, u32>,
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
@@ -1332,7 +1367,6 @@ impl Context {
             pools: HashMap::new(),
             render_buffers: RenderBufferRegistry::default(),
             pending_native_creates: HashMap::new(),
-            orphaned_dmabuf_params: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),
@@ -1639,52 +1673,18 @@ mod tests {
     }
 
     #[test]
-    fn allocate_host_id_skips_zero_and_one_after_wrap() {
-        // Verify that when next_host_id wraps from u32::MAX to 0, the allocator
-        // correctly skips the reserved IDs (0 = null, 1 = wl_display) and returns
-        // a valid ID ≥ 2 on both the allocation that reads u32::MAX *and* the
-        // subsequent allocation that reads the post-wrap value.
-        //
-        // Walk-through:
-        //   iter 0: id = u32::MAX, advance → wrapping_add(1)=0, .max(2)=2
-        //           u32::MAX >= 2 and not in map → return u32::MAX  ✓
-        //   (next call) iter 0: id = 2, advance → 3
-        //                       2 >= 2 and not in map → return 2  ✓
+    fn host_ids_stay_within_libwayland_servers_client_range() {
         let mut table = ShadowTable::new();
-        table.next_host_id = u32::MAX;
-
-        let id1 = table.allocate_host_id();
-        assert!(id1 >= 2, "must never return 0 or 1, got {}", id1);
-
-        // The second allocation happens after the counter has wrapped to 2.
-        // It must also return a valid ID and must not collide with id1.
-        let id2 = table.allocate_host_id();
+        assert_eq!(table.allocate_host_id(), 2, "0 is null and 1 is wl_display");
+        // libwayland-server accepts a client ID equal to WL_MAP_MAX_OBJECTS
+        // and refuses the next one.
+        table.host_ids = IdAllocator::new(WL_MAP_MAX_OBJECTS..ShadowTable::CLIENT_IDS.end);
+        assert_eq!(table.allocate_host_id(), 0x00f0_0000);
+        let exhausted =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.allocate_host_id()));
         assert!(
-            id2 >= 2,
-            "post-wrap allocation must skip reserved IDs, got {}",
-            id2
-        );
-        assert_ne!(id1, id2, "successive allocations must return distinct IDs");
-    }
-
-    #[test]
-    fn allocate_host_id_wraps_correctly() {
-        // Verify that starting with next_host_id = 0 (simulating a state where
-        // the counter was somehow zeroed) results in the first returned ID being
-        // a valid value ≥ 2.
-        //
-        // Walk-through:
-        //   iter 0: id = 0, advance → wrapping_add(1)=1, .max(2)=2
-        //           0 < 2 → skip
-        //   iter 1: id = 2, advance → 3
-        //           2 ≥ 2 and not in map → return 2  ✓
-        let mut table = ShadowTable::new();
-        table.next_host_id = 0;
-        let id = table.allocate_host_id();
-        assert!(
-            id >= 2,
-            "post-zero allocation must skip reserved IDs, got {}",
-            id
+            exhausted.is_err(),
+            "the allocator must not hand out an ID libwayland-server refuses"
         );
     }
 
@@ -1699,7 +1699,7 @@ mod tests {
     #[test]
     fn allocate_host_id_skips_host_interfaces_entries() {
         let mut table = ShadowTable::new();
-        // next_host_id starts at 2.
+        // Fresh IDs start at 2.
         // Register IDs 2 and 3 as host-tracked interfaces (no guest pair).
         table.track_host_interface(2, "zcr_keyboard_extension_v1".to_string());
         table.track_host_interface(3, "zwp_linux_dmabuf_v1".to_string());
@@ -1757,15 +1757,61 @@ mod tests {
     }
 
     #[test]
-    fn allocate_guest_server_id_wraps_inside_server_range() {
+    fn guest_server_ids_are_reused_and_stay_below_the_client_map_limit() {
         let mut table = ShadowTable::new();
-        table.next_guest_server_id = u32::MAX;
-
-        let last = table.allocate_guest_server_id();
         let first = table.allocate_guest_server_id();
+        table.map_id(first, ShadowTable::GUEST_SERVER_ID_START + 40);
+        table.track_interface(first, "wl_buffer".to_string());
+        table.remove_id(first);
+        assert_eq!(
+            table.allocate_guest_server_id(),
+            first,
+            "a destroyed server-created object frees its guest ID"
+        );
 
-        assert_eq!(last, u32::MAX);
-        assert_eq!(first, ShadowTable::GUEST_SERVER_ID_START);
+        // libwayland-client accepts the server index WL_MAP_MAX_OBJECTS
+        // itself and refuses the next one.
+        table.guest_server_ids =
+            IdAllocator::new(ShadowTable::SERVER_IDS.end - 1..ShadowTable::SERVER_IDS.end);
+        assert_eq!(table.allocate_guest_server_id(), 0xfff0_0000);
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.allocate_guest_server_id()
+        }));
+        assert!(
+            exhausted.is_err(),
+            "libwayland-client refuses server IDs past 0xff000000 + WL_MAP_MAX_OBJECTS"
+        );
+    }
+
+    #[test]
+    fn every_end_of_a_server_created_guest_object_frees_its_id() {
+        let mut table = ShadowTable::new();
+        let host_object = ShadowTable::GUEST_SERVER_ID_START + 40;
+
+        // The guest half goes while the host object stays reserved.
+        let guest = table.allocate_guest_server_id();
+        table.map_id(guest, host_object);
+        table.track_interface(guest, "zwp_text_input_v3".to_string());
+        table.remove_guest_mapping(guest);
+        assert_eq!(table.allocate_guest_server_id(), guest);
+
+        // A new guest object takes over the host object.
+        table.map_id(guest, host_object);
+        let replacement = table.allocate_guest_server_id();
+        table.map_id(replacement, host_object);
+        assert_eq!(table.get_host_id(guest), None);
+        assert_eq!(table.allocate_guest_server_id(), guest);
+
+        // Retiring keeps the ID until the mapping is removed, and frees it
+        // once.
+        table.track_interface(replacement, "wl_buffer".to_string());
+        table.retire_guest_object(replacement);
+        let next = table.allocate_guest_server_id();
+        assert_ne!(next, replacement, "a retired object still owns its ID");
+        table.remove_id(replacement);
+        table.remove_id(replacement);
+        assert_eq!(table.allocate_guest_server_id(), replacement);
+        assert_eq!(table.allocate_guest_server_id(), next + 1);
     }
 
     #[test]
@@ -1905,24 +1951,60 @@ mod tests {
         table.mark_pending_destroy_host(40);
         assert!(table.is_pending_destroy_host_only(40));
         assert!(!table.is_event_sender_known(40));
-        table.next_host_id = 40;
-        assert_eq!(
-            table.allocate_host_id(),
-            41,
-            "pending host-only IDs must not be reallocated"
-        );
+        assert!(!table.is_host_id_available(40));
 
         // The host acknowledgement is the only point at which the reservation
         // can be released.
-        assert!(table.consume_host_delete_id(40));
+        assert_eq!(table.release_deleted_host_id(40), DeletedHostId::HostOnly);
         assert!(!table.is_pending_destroy_host_only(40));
-        table.next_host_id = 40;
+        assert!(table.is_host_id_available(40));
+    }
+
+    #[test]
+    fn destroyed_host_allocated_object_frees_its_id_at_once() {
+        // The host allocates IDs from the server range and sends no
+        // delete_id for them; it may reuse one for its next new object.
+        let host_buffer = ShadowTable::GUEST_SERVER_ID_START + 5;
+        let mut table = ShadowTable::new();
+        table.track_host_interface(host_buffer, "wl_buffer".to_string());
+
+        assert!(table.mark_pending_destroy_host(host_buffer));
+        assert!(!table.is_event_sender_known(host_buffer));
+        assert!(
+            table.is_host_id_available(host_buffer),
+            "the host's next server-created object may reuse the ID"
+        );
+    }
+
+    #[test]
+    fn host_ids_are_reused_only_after_delete_id() {
+        let mut table = ShadowTable::new();
+        let first = table.allocate_host_id();
+        table.map_id(10, first);
+        table.track_interface(10, "wl_surface".to_string());
+        table.mark_pending_destroy(10);
+
+        let second = table.allocate_host_id();
+        assert_ne!(second, first, "an ID awaiting delete_id must not be reused");
+        table.map_id(11, second);
+
+        assert_eq!(
+            table.release_deleted_host_id(first),
+            DeletedHostId::Paired(10)
+        );
+        assert_eq!(table.get_host_id(10), None);
+        assert_eq!(table.get_interface(10), None);
         assert_eq!(
             table.allocate_host_id(),
-            40,
-            "the acknowledged ID may be reused after delete_id"
+            first,
+            "a deleted ID is reused first"
         );
-        assert!(!table.consume_host_delete_id(40));
+        assert_eq!(
+            table.release_deleted_host_id(first + 100),
+            DeletedHostId::Untracked,
+            "a delete_id for an ID never allocated changes nothing"
+        );
+        assert_eq!(table.allocate_host_id(), second + 1);
     }
 
     #[test]

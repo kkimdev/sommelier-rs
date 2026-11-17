@@ -21,6 +21,94 @@ use std::os::unix::io::RawFd;
 /// The object ID of the `wl_display` singleton on every connection.
 pub const WL_DISPLAY_ID: u32 = 1;
 
+/// The header that starts every Wayland wire message.
+///
+/// Wire layout (Wayland specification, "Wire Format"), both words
+/// native-endian:
+///   - word 0 (bytes 0-3): the sender object ID;
+///   - word 1 (bytes 4-7): the total message length in bytes, header
+///     included, in the upper 16 bits and the opcode in the lower 16 bits.
+///
+/// This type owns that layout: every header is decoded by [`Self::parse`]
+/// (or [`Self::frame`]) and written by [`Self::encode`] or
+/// [`Self::set_sender`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageHeader {
+    pub sender_id: u32,
+    pub opcode: u16,
+    /// The total message length in bytes, header included.
+    pub len: usize,
+}
+
+/// How much of a message the start of a byte stream holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// The header or the body is still arriving.
+    Partial,
+    /// The length field cannot describe a message; the stream is corrupt.
+    Invalid(MessageHeader),
+    /// A whole message of `len` bytes.
+    Complete(MessageHeader),
+}
+
+impl MessageHeader {
+    /// The size of the header in bytes.
+    pub const LEN: usize = 8;
+    /// The largest length the 16-bit length field can carry.
+    const MAX_LEN: usize = u16::MAX as usize;
+
+    /// Decode the header at the start of `bytes`, or `None` while fewer than
+    /// [`Self::LEN`] bytes are available.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let (sender, rest) = bytes.split_first_chunk::<4>()?;
+        let word = u32::from_ne_bytes(*rest.first_chunk::<4>()?);
+        Some(Self {
+            sender_id: u32::from_ne_bytes(*sender),
+            opcode: (word & 0xffff) as u16,
+            len: (word >> 16) as usize,
+        })
+    }
+
+    /// Whether the length field describes a message the wire can carry: at
+    /// least a header, 4-byte aligned, and within the 16-bit field.
+    pub fn has_valid_len(&self) -> bool {
+        (Self::LEN..=Self::MAX_LEN).contains(&self.len) && self.len.is_multiple_of(4)
+    }
+
+    /// Frame the message at the start of the byte stream `stream`.
+    pub fn frame(stream: &[u8]) -> Framing {
+        match Self::parse(stream) {
+            None => Framing::Partial,
+            Some(header) if !header.has_valid_len() => Framing::Invalid(header),
+            Some(header) if header.len > stream.len() => Framing::Partial,
+            Some(header) => Framing::Complete(header),
+        }
+    }
+
+    /// Replace the sender ID of the encoded message `message`.
+    pub fn set_sender(message: &mut [u8], sender_id: u32) {
+        let sender = message
+            .first_chunk_mut::<4>()
+            .expect("an encoded message starts with its header");
+        *sender = sender_id.to_ne_bytes();
+    }
+
+    /// Encode the header, or report why its length cannot be encoded.
+    fn encode(&self) -> Result<[u8; Self::LEN], ProtocolError> {
+        if self.len > Self::MAX_LEN {
+            return Err(ProtocolError::MessageTooLarge(self.len));
+        }
+        if !self.has_valid_len() {
+            return Err(ProtocolError::InvalidMessageLength(self.len));
+        }
+        let word = ((self.len as u32) << 16) | u32::from(self.opcode);
+        let mut header = [0; Self::LEN];
+        header[..4].copy_from_slice(&self.sender_id.to_ne_bytes());
+        header[4..].copy_from_slice(&word.to_ne_bytes());
+        Ok(header)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Forward,
@@ -309,21 +397,19 @@ impl MessageBuilder {
     /// Assemble a complete Wayland wire message, returning an error instead
     /// of truncating the 16-bit length field when the payload is too large.
     pub fn try_build_message(&self, sender_id: u32, opcode: u16) -> Result<Vec<u8>, ProtocolError> {
-        let total_len = self
+        let len = self
             .payload
             .len()
-            .checked_add(8)
+            .checked_add(MessageHeader::LEN)
             .ok_or(ProtocolError::MessageTooLarge(usize::MAX))?;
-        if total_len > 0xFFFF {
-            return Err(ProtocolError::MessageTooLarge(total_len));
+        let header = MessageHeader {
+            sender_id,
+            opcode,
+            len,
         }
-        if !total_len.is_multiple_of(4) {
-            return Err(ProtocolError::InvalidMessageLength(total_len));
-        }
-        let total_len = total_len as u32;
-        let mut msg = Vec::with_capacity(8 + self.payload.len());
-        msg.extend_from_slice(&sender_id.to_ne_bytes());
-        msg.extend_from_slice(&((total_len << 16) | opcode as u32).to_ne_bytes());
+        .encode()?;
+        let mut msg = Vec::with_capacity(len);
+        msg.extend_from_slice(&header);
         msg.extend_from_slice(&self.payload);
         Ok(msg)
     }
@@ -335,12 +421,8 @@ impl MessageBuilder {
     /// prevents accidentally building two messages from the same payload buffer,
     /// which would silently duplicate wire data.
     ///
-    /// Wire layout per the Wayland specification §4.3 (Wire Format):
-    ///   - Word 0 (bytes 0–3): `sender_id` (u32, native-endian)
-    ///   - Word 1 (bytes 4–7): `(total_len_bytes << 16) | opcode` (u32, native-endian)
-    ///     - Upper 16 bits: total message length in bytes (header + payload)
-    ///     - Lower 16 bits: request/event opcode
-    ///   - Remaining bytes: payload accumulated via `write_*` calls
+    /// The header layout is owned by [`MessageHeader`]; the payload is the
+    /// bytes accumulated via `write_*` calls.
     ///
     /// # Panics
     /// Panics if the total message does not fit within Wayland's 16-bit
@@ -362,7 +444,78 @@ impl MessageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageBuilder, ProtocolError, WireMessage};
+    use super::{Framing, MessageBuilder, MessageHeader, ProtocolError, WireMessage};
+
+    #[test]
+    fn header_length_is_the_high_half_of_the_second_word() {
+        // Wire bytes are native-endian words; on little-endian targets the
+        // opcode occupies bytes 4..6 and the length bytes 6..8, so decoding
+        // the length from bytes 4..6 reads the opcode instead.
+        let message = MessageBuilder::new().build_message(7, 3);
+        assert_eq!(
+            MessageHeader::parse(&message),
+            Some(MessageHeader {
+                sender_id: 7,
+                opcode: 3,
+                len: 8,
+            })
+        );
+        assert_eq!(MessageHeader::parse(&message[..7]), None);
+    }
+
+    #[test]
+    fn framing_waits_for_the_whole_message_and_flags_corrupt_lengths() {
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(2);
+        let mut message = builder.build_message(1, 0);
+        let header = MessageHeader::parse(&message).unwrap();
+        for partial in 0..message.len() {
+            assert_eq!(MessageHeader::frame(&message[..partial]), Framing::Partial);
+        }
+        assert_eq!(MessageHeader::frame(&message), Framing::Complete(header));
+        message.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            MessageHeader::frame(&message),
+            Framing::Complete(header),
+            "bytes of the next message do not change this one"
+        );
+
+        // A length below the header size can never complete.
+        message[4..8].copy_from_slice(&(6_u32 << 16).to_ne_bytes());
+        assert!(matches!(
+            MessageHeader::frame(&message),
+            Framing::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn set_sender_rewrites_only_the_sender() {
+        let mut message = MessageBuilder::new().build_message(7, 3);
+        MessageHeader::set_sender(&mut message, 9);
+        assert_eq!(
+            MessageHeader::parse(&message),
+            Some(MessageHeader {
+                sender_id: 9,
+                opcode: 3,
+                len: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn header_length_validity_matches_the_wire_limits() {
+        let header = |len| MessageHeader {
+            sender_id: 1,
+            opcode: 0,
+            len,
+        };
+        for valid in [8, 12, 65_532] {
+            assert!(header(valid).has_valid_len(), "{valid}");
+        }
+        for invalid in [0, 4, 7, 10, 65_536] {
+            assert!(!header(invalid).has_valid_len(), "{invalid}");
+        }
+    }
 
     #[test]
     fn wire_message_rejects_truncated_scalar() {

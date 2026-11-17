@@ -992,18 +992,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         let id = ctx.last_sender_id;
         ctx.used_dmabuf_params.remove(&id);
         if let Some(host_id) = ctx.shadow_table.get_host_id(id) {
-            if ctx
-                .pending_native_creates
-                .remove(&HostId(host_id))
-                .is_some()
-            {
-                // The host may acknowledge params.destroy before its
-                // asynchronous created/failed event. Keep a host-keyed marker
-                // so the late event can still be dispatched after the guest
-                // mapping is retired. Removing the pending generation here
-                // also closes its synchronization descriptor immediately.
-                ctx.orphaned_dmabuf_params.insert(host_id, id);
-            }
+            // The host may still emit the created/failed event it owes
+            // before it processes params.destroy; `on_created` and
+            // `on_failed` recognize it by the guest's pending destructor.
+            // Removing the pending generation here closes its
+            // synchronization descriptor immediately.
+            ctx.pending_native_creates.remove(&HostId(host_id));
         }
         if let Some(params) = ctx.pending_params.remove(&id) {
             for p in params {
@@ -1160,35 +1154,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
     fn on_created(&mut self, ctx: &mut Context, buffer: u32) -> Action {
         let host_params_id = ctx.last_sender_id;
-        if ctx.orphaned_dmabuf_params.contains_key(&host_params_id) {
-            if !ctx.shadow_table.is_host_id_available(buffer) {
-                error!(
-                    "Host returned an already-used wl_buffer ID {} for orphaned dmabuf",
-                    buffer
-                );
-                ctx.fatal_protocol_error = true;
-                return Action::Drop;
-            }
-            let version = ctx
-                .shadow_table
-                .host_object_version_or_unknown(host_params_id);
-            ctx.shadow_table.track_host_interface_with_version(
-                buffer,
-                "wl_buffer".to_string(),
-                version,
-            );
-            crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
-            ctx.retire_destroyed_host_object(buffer);
-            ctx.orphaned_dmabuf_params.remove(&host_params_id);
-            ctx.pending_native_creates.remove(&HostId(host_params_id));
-            // If delete_id for params arrived first, the host params interface
-            // was retained only to dispatch this late event. Its destructor
-            // has already been acknowledged, so release that reservation now.
-            if ctx.shadow_table.get_guest_id(host_params_id).is_none() {
-                ctx.shadow_table.remove_host_interface(host_params_id);
-            }
-            return Action::Drop;
-        }
         if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
             let orphaned = ctx.shadow_table.is_pending_destroy_guest(guest_params_id);
             if orphaned {
@@ -1216,7 +1181,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 );
                 crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
                 ctx.retire_destroyed_host_object(buffer);
-                ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }
@@ -1244,19 +1208,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
     fn on_failed(&mut self, ctx: &mut Context) -> Action {
         let host_params_id = ctx.last_sender_id;
-        if ctx.orphaned_dmabuf_params.contains_key(&host_params_id) {
-            ctx.orphaned_dmabuf_params.remove(&host_params_id);
-            ctx.pending_native_creates.remove(&HostId(host_params_id));
-            // When params delete_id preceded this event, retain the host
-            // interface only until this final async result is consumed.
-            if ctx.shadow_table.get_guest_id(host_params_id).is_none() {
-                ctx.shadow_table.remove_host_interface(host_params_id);
-            }
-            return Action::Drop;
-        }
         if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
             if ctx.shadow_table.is_pending_destroy_guest(guest_params_id) {
-                ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }
@@ -1367,13 +1320,11 @@ mod tests {
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-    use crate::test_support::{any_fd_has_identity, fd_identity, TestFdIdentity};
+    use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::{Action, WireMessage};
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    fn message_opcode(message: &[u8]) -> u16 {
-        u16::from_ne_bytes(message[4..6].try_into().unwrap())
-    }
+    use crate::test_support::msg_opcode as message_opcode;
 
     fn pending_native_create(guest_params_id: u32, dimensions: (i32, i32)) -> PendingNativeCreate {
         // A descriptor number from `/dev/null` can be reused by another
@@ -1394,64 +1345,6 @@ mod tests {
             // into `File`, which owns it until the pending generation drops.
             sync_fds: vec![unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) }.into()],
         }
-    }
-
-    fn orphan_old_params_and_reuse_guest_id() -> (Context, LinuxDmabufHandler, i32, TestFdIdentity)
-    {
-        let guest_params_id = 7;
-        let old_host_params_id = 8;
-        let replacement_host_params_id = 9;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(guest_params_id, old_host_params_id);
-        ctx.shadow_table.track_interface_with_version(
-            guest_params_id,
-            "zwp_linux_buffer_params_v1".into(),
-            4,
-        );
-        ctx.shadow_table.set_host_version(old_host_params_id, 4);
-
-        let old_pending = pending_native_create(guest_params_id, (16, 8));
-        let old_sync_fd = old_pending.sync_fds[0].as_raw_fd();
-        let old_sync_identity = fd_identity(old_sync_fd);
-        ctx.pending_native_creates
-            .insert(HostId(old_host_params_id), old_pending);
-
-        let mut handler = LinuxDmabufHandler;
-        ctx.last_sender_id = guest_params_id;
-        assert_eq!(
-            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        assert!(
-            !any_fd_has_identity(old_sync_identity),
-            "destroying old params must close that generation's synchronization descriptor"
-        );
-        ctx.shadow_table.mark_pending_destroy(guest_params_id);
-
-        let mut display = DisplayHandler;
-        assert_eq!(
-            WlDisplayHandler::on_delete_id(&mut display, &mut ctx, old_host_params_id),
-            Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_guest_id(old_host_params_id), None);
-        assert!(ctx.orphaned_dmabuf_params.contains_key(&old_host_params_id));
-
-        ctx.shadow_table
-            .map_id(guest_params_id, replacement_host_params_id);
-        ctx.shadow_table.track_interface_with_version(
-            guest_params_id,
-            "zwp_linux_buffer_params_v1".into(),
-            4,
-        );
-        ctx.shadow_table
-            .set_host_version(replacement_host_params_id, 4);
-        let replacement = pending_native_create(guest_params_id, (32, 16));
-        let replacement_sync_fd = replacement.sync_fds[0].as_raw_fd();
-        let replacement_sync_identity = fd_identity(replacement_sync_fd);
-        ctx.pending_native_creates
-            .insert(HostId(replacement_host_params_id), replacement);
-
-        (ctx, handler, replacement_sync_fd, replacement_sync_identity)
     }
 
     #[test]
@@ -1500,7 +1393,7 @@ mod tests {
         );
         assert!(messages
             .iter()
-            .all(|(message, _)| { u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 77 }));
+            .all(|(message, _)| { crate::test_support::msg_sender(message) == 77 }));
         assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
 
         let table_fd = messages[0].1[0];
@@ -1514,10 +1407,7 @@ mod tests {
             unsafe { libc::pread(table_fd, table.as_mut_ptr().cast(), table.len(), 0) },
             table.len() as isize
         );
-        assert_eq!(
-            u32::from_ne_bytes(table[0..4].try_into().unwrap()),
-            pairs[0].0
-        );
+        assert_eq!(crate::test_support::msg_sender(&table), pairs[0].0);
         assert_eq!(
             u64::from_ne_bytes(table[8..16].try_into().unwrap()),
             pairs[0].1
@@ -2157,13 +2047,10 @@ mod tests {
         );
         let (destroy_message, destroy_fds) = ctx.client_to_host_queue.last().unwrap();
         assert_eq!(
-            u32::from_ne_bytes(destroy_message[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(destroy_message),
             host_buffer_id
         );
-        assert_eq!(
-            u16::from_ne_bytes(destroy_message[4..6].try_into().unwrap()),
-            0
-        );
+        assert_eq!(crate::test_support::msg_opcode(destroy_message), 0);
         assert!(destroy_fds.is_empty());
 
         ctx.shadow_table
@@ -2207,7 +2094,10 @@ mod tests {
             .shadow_table
             .get_guest_id(host_buffer_id)
             .expect("reused host buffer ID must map to a new guest server ID");
-        assert_ne!(second_guest_buffer, first_guest_buffer);
+        assert_eq!(
+            second_guest_buffer, first_guest_buffer,
+            "a destroyed server-created buffer's guest ID is reused first"
+        );
         assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
         assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
         assert!(!ctx.fatal_protocol_error);
@@ -2344,13 +2234,13 @@ mod tests {
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
-                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())),
+                .map(|(message, _)| crate::test_support::msg_sender(message)),
             Some(host_buffer_id)
         );
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
-                .map(|(message, _)| u32::from_ne_bytes(message[4..8].try_into().unwrap()) as u16),
+                .map(|(message, _)| crate::test_support::msg_opcode(message)),
             Some(crate::protocols::wayland::wl_buffer::REQ_DESTROY)
         );
         assert!(ctx
@@ -2360,14 +2250,15 @@ mod tests {
             .shadow_table
             .get_host_interface(host_buffer_id)
             .is_none());
-        assert!(ctx.shadow_table.consume_host_delete_id(host_buffer_id));
+        assert!(!ctx.shadow_table.is_host_id_available(host_buffer_id));
+        WlDisplayHandler::on_delete_id(&mut DisplayHandler, &mut ctx, host_buffer_id);
+        assert!(ctx.shadow_table.is_host_id_available(host_buffer_id));
     }
 
     #[test]
-    fn late_async_created_after_params_delete_id_is_destroyed_locally() {
+    fn params_delete_id_ends_an_orphaned_async_create() {
         let guest_params_id = 7;
         let host_params_id = 8;
-        let host_buffer_id: u32 = 42;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.map_id(guest_params_id, host_params_id);
         ctx.shadow_table.track_interface_with_version(
@@ -2376,212 +2267,46 @@ mod tests {
             4,
         );
         ctx.shadow_table.set_host_version(host_params_id, 4);
-        ctx.pending_native_creates.insert(
-            HostId(host_params_id),
-            pending_native_create(guest_params_id, (16, 8)),
-        );
+        let pending = pending_native_create(guest_params_id, (16, 8));
+        let sync_identity = fd_identity(pending.sync_fds[0].as_raw_fd());
+        ctx.pending_native_creates
+            .insert(HostId(host_params_id), pending);
         let mut handler = LinuxDmabufHandler;
         ctx.last_sender_id = guest_params_id;
         assert_eq!(
             ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
             Action::Forward
+        );
+        assert!(
+            !any_fd_has_identity(sync_identity),
+            "destroying the params must close its generation's synchronization descriptor"
         );
         // The generated dispatcher records the guest destructor after the
         // handler returns.
         ctx.shadow_table.mark_pending_destroy(guest_params_id);
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
 
+        // The host destroyed the params object before emitting created or
+        // failed, so it can no longer emit either: nothing waits for them,
+        // and the host ID is free for the next object.
         let mut display = DisplayHandler;
         assert_eq!(
             WlDisplayHandler::on_delete_id(&mut display, &mut ctx, host_params_id),
             Action::Drop
         );
+        assert!(!ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
         assert_eq!(ctx.shadow_table.get_guest_id(host_params_id), None);
-        assert!(ctx
-            .shadow_table
-            .get_host_interface(host_params_id)
-            .is_some_and(|name| name == "zwp_linux_buffer_params_v1"));
-        assert!(ctx.orphaned_dmabuf_params.contains_key(&host_params_id));
-        assert!(
-            ctx.host_to_client_queue
-                .iter()
-                .any(
-                    |(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap())
-                        == guest_params_id
-                ),
+        assert_eq!(ctx.shadow_table.get_host_interface(host_params_id), None);
+        assert!(ctx.shadow_table.is_host_id_available(host_params_id));
+        assert_eq!(
+            crate::test_support::queued_headers(&ctx.host_to_client_queue),
+            vec![(1, crate::protocols::wayland::wl_display::EVT_DELETE_ID)],
             "params delete_id must still reach the guest"
         );
-
-        ctx.last_sender_id = host_params_id;
-        let payload = host_buffer_id.to_ne_bytes();
-        let mut message = WireMessage::new(
-            host_params_id,
-            zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-            &[],
-        );
         assert_eq!(
-            zwp_linux_buffer_params_v1::dispatch_event(&mut message, &mut handler, &mut ctx),
-            Ok(None)
+            &ctx.host_to_client_queue[0].0[8..],
+            &guest_params_id.to_ne_bytes()
         );
-        assert!(!ctx.orphaned_dmabuf_params.contains_key(&host_params_id));
-        assert!(ctx
-            .shadow_table
-            .get_host_interface(host_params_id)
-            .is_none());
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(host_buffer_id));
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .any(
-                    |(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap())
-                        == host_buffer_id
-                ),
-            "late created must destroy the host-only wl_buffer"
-        );
-    }
-
-    #[test]
-    fn late_orphan_created_cannot_consume_reused_guest_generation() {
-        let old_host_params_id = 8;
-        let replacement_host_params_id = 9;
-        let old_host_buffer_id: u32 = 42;
-        let (mut ctx, mut handler, replacement_sync_fd, replacement_sync_identity) =
-            orphan_old_params_and_reuse_guest_id();
-
-        ctx.last_sender_id = old_host_params_id;
-        let payload = old_host_buffer_id.to_ne_bytes();
-        let mut message = WireMessage::new(
-            old_host_params_id,
-            zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-            &[],
-        );
-        assert_eq!(
-            zwp_linux_buffer_params_v1::dispatch_event(&mut message, &mut handler, &mut ctx),
-            Ok(None)
-        );
-
-        let replacement = ctx
-            .pending_native_creates
-            .get(&HostId(replacement_host_params_id))
-            .expect("late old created must preserve replacement generation");
-        assert_eq!(replacement.guest_params_id, 7);
-        assert_eq!(replacement.dimensions, (32, 16));
-        assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
-        assert!(
-            any_fd_has_identity(replacement_sync_identity),
-            "late old created must not close the replacement synchronization descriptor"
-        );
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(old_host_buffer_id));
-
-        drop(ctx);
-        assert!(
-            !any_fd_has_identity(replacement_sync_identity),
-            "dropping the owning replacement generation must close its descriptor"
-        );
-    }
-
-    #[test]
-    fn late_orphan_failed_cannot_consume_reused_guest_generation() {
-        let old_host_params_id = 8;
-        let replacement_host_params_id = 9;
-        let (mut ctx, mut handler, replacement_sync_fd, replacement_sync_identity) =
-            orphan_old_params_and_reuse_guest_id();
-
-        ctx.last_sender_id = old_host_params_id;
-        let mut message = WireMessage::new(
-            old_host_params_id,
-            zwp_linux_buffer_params_v1::EVT_FAILED,
-            &[],
-            &[],
-        );
-        assert_eq!(
-            zwp_linux_buffer_params_v1::dispatch_event(&mut message, &mut handler, &mut ctx),
-            Ok(None)
-        );
-
-        let replacement = ctx
-            .pending_native_creates
-            .get(&HostId(replacement_host_params_id))
-            .expect("late old failed must preserve replacement generation");
-        assert_eq!(replacement.guest_params_id, 7);
-        assert_eq!(replacement.dimensions, (32, 16));
-        assert_eq!(replacement.sync_fds[0].as_raw_fd(), replacement_sync_fd);
-        assert!(
-            any_fd_has_identity(replacement_sync_identity),
-            "late old failed must not close the replacement synchronization descriptor"
-        );
-
-        drop(ctx);
-        assert!(
-            !any_fd_has_identity(replacement_sync_identity),
-            "dropping the owning replacement generation must close its descriptor"
-        );
-    }
-
-    #[test]
-    fn orphan_params_delete_id_does_not_clear_reused_guest_generation() {
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        let replacement_host_params_id = 9;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(guest_params_id, host_params_id);
-        ctx.shadow_table.track_interface_with_version(
-            guest_params_id,
-            "zwp_linux_buffer_params_v1".into(),
-            4,
-        );
-        ctx.shadow_table.set_host_version(host_params_id, 4);
-        ctx.pending_native_creates.insert(
-            HostId(host_params_id),
-            pending_native_create(guest_params_id, (16, 8)),
-        );
-        let mut handler = LinuxDmabufHandler;
-        ctx.last_sender_id = guest_params_id;
-        assert_eq!(
-            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        ctx.shadow_table.mark_pending_destroy(guest_params_id);
-
-        // The old guest object has already received its delete_id and the
-        // client immediately reuses the numeric ID for a replacement params
-        // object. Keep the old host event reservation while installing the
-        // replacement mapping and dimensions.
-        ctx.shadow_table.remove_guest_mapping(guest_params_id);
-        ctx.shadow_table
-            .clear_pending_destroy_guest(guest_params_id);
-        ctx.shadow_table
-            .map_id(guest_params_id, replacement_host_params_id);
-        ctx.shadow_table.track_interface_with_version(
-            guest_params_id,
-            "zwp_linux_buffer_params_v1".into(),
-            4,
-        );
-        ctx.shadow_table
-            .set_host_version(replacement_host_params_id, 4);
-        ctx.pending_native_creates.insert(
-            HostId(replacement_host_params_id),
-            pending_native_create(guest_params_id, (32, 16)),
-        );
-
-        let mut display = DisplayHandler;
-        assert_eq!(
-            WlDisplayHandler::on_delete_id(&mut display, &mut ctx, host_params_id),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.pending_native_creates
-                .get(&HostId(replacement_host_params_id))
-                .map(|pending| pending.dimensions),
-            Some((32, 16)),
-            "late delete_id for the old host object must not clear the replacement generation"
-        );
-        assert!(ctx.orphaned_dmabuf_params.contains_key(&host_params_id));
     }
 
     #[test]

@@ -972,10 +972,7 @@ mod tests {
         let opcodes: Vec<u16> = ctx
             .client_to_host_queue
             .iter()
-            .map(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                (word2 & 0xffff) as u16
-            })
+            .map(|(message, _)| msg_opcode(message))
             .collect();
         assert_eq!(
             opcodes,
@@ -995,13 +992,12 @@ mod tests {
             .client_to_host_queue
             .iter()
             .find(|(message, _)| {
-                let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                u32::from_ne_bytes(message[0..4].try_into().unwrap())
+                msg_sender(message)
                     == ctx
                         .window_placement
                         .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
                         .unwrap()
-                    && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
+                    && msg_opcode(message) == REQ_SET_WINDOW_BOUNDS
             })
             .expect("window bounds request")
             .0
@@ -1155,10 +1151,7 @@ mod tests {
             let opcodes: Vec<u16> = ctx
                 .client_to_host_queue
                 .iter()
-                .map(|(message, _)| {
-                    let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                    (word2 & 0xffff) as u16
-                })
+                .map(|(message, _)| msg_opcode(message))
                 .collect();
             assert!(
                 opcodes.contains(&REQ_SET_WINDOW_BOUNDS),
@@ -1176,13 +1169,12 @@ mod tests {
                 .client_to_host_queue
                 .iter()
                 .find(|(message, _)| {
-                    let word2 = u32::from_ne_bytes(message[4..8].try_into().unwrap());
-                    u32::from_ne_bytes(message[0..4].try_into().unwrap())
+                    msg_sender(message)
                         == ctx
                             .window_placement
                             .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
                             .unwrap()
-                        && (word2 & 0xffff) as u16 == REQ_SET_WINDOW_BOUNDS
+                        && msg_opcode(message) == REQ_SET_WINDOW_BOUNDS
                 })
                 .expect("window bounds request")
                 .0

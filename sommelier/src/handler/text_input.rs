@@ -1825,6 +1825,10 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
+        let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
+            return Action::Drop;
+        };
+        state.count_guest_commit();
         if !v3_is_focused(ctx, guest_id) {
             return Action::Drop;
         }
@@ -2027,15 +2031,14 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
 
-    /// Helper: extract opcode from a wire message at the given index in a queue.
+    /// The opcode of the message at `idx` in a queue.
     fn msg_opcode(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u16 {
-        let word2 = u32::from_ne_bytes(queue[idx].0[4..8].try_into().unwrap());
-        (word2 & 0xffff) as u16
+        crate::test_support::msg_opcode(&queue[idx].0)
     }
 
-    /// Helper: extract sender_id from a wire message.
+    /// The sender of the message at `idx` in a queue.
     fn msg_sender(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
-        u32::from_ne_bytes(queue[idx].0[0..4].try_into().unwrap())
+        crate::test_support::msg_sender(&queue[idx].0)
     }
 
     fn set_test_focus(
@@ -2075,13 +2078,14 @@ mod tests {
             Action::Drop
         );
         assert_eq!(handler.on_set_content_type(&mut ctx, 0, 13), Action::Drop);
-        let before = ctx.text_inputs[&guest_id].clone();
+        let mut expected = ctx.text_inputs[&guest_id].clone();
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.client_to_host_queue.is_empty());
         let state = &ctx.text_inputs[&guest_id];
-        assert_eq!(state, &before);
-        assert_eq!(state.guest_commit_serial, 0);
+        // The protocol counts the commit even though nothing reached the host.
+        expected.guest_commit_serial = crate::state::CommitCount::at(1);
+        assert_eq!(state, &expected);
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.surrounding_text_dirty);
         assert!(state.committed_content_type.is_none());
@@ -2128,7 +2132,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 0,
+                guest_commit_serial: crate::state::CommitCount::at(0),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -2239,7 +2243,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = 42;
+            state.guest_commit_serial = crate::state::CommitCount::at(42);
         }
 
         let mut handler = TextInputV1Handler;
@@ -2418,7 +2422,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = 42;
+            state.guest_commit_serial = crate::state::CommitCount::at(42);
             state.current_preedit = "미완성".to_string();
         }
 
@@ -2461,7 +2465,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = 42;
+            state.guest_commit_serial = crate::state::CommitCount::at(42);
         }
 
         let mut handler = TextInputV1Handler;
@@ -2541,7 +2545,7 @@ mod tests {
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.committed_surrounding_text = Some(("가나다".to_string(), 6, 6));
-            state.guest_commit_serial = 42;
+            state.guest_commit_serial = crate::state::CommitCount::at(42);
         }
 
         let mut handler = ExtendedTextInputV1Handler;
@@ -2666,7 +2670,7 @@ mod tests {
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.current_preedit = "나".to_string();
-            state.guest_commit_serial = 42;
+            state.guest_commit_serial = crate::state::CommitCount::at(42);
             state.record_preedit_selection(0, 3);
             state.record_preedit_cursor(3);
             assert!(state.record_delete(3, 0));
@@ -2750,7 +2754,7 @@ mod tests {
             .client_to_host_queue
             .iter()
             .filter_map(|(msg, _)| {
-                let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+                let opcode = u32::from(crate::test_support::msg_opcode(msg));
                 (opcode == 9).then(|| u32::from_ne_bytes(msg[8..12].try_into().unwrap()))
             })
             .collect();
@@ -2783,7 +2787,7 @@ mod tests {
         ctx.text_inputs
             .get_mut(&guest_id)
             .unwrap()
-            .guest_commit_serial = 2;
+            .guest_commit_serial = crate::state::CommitCount::at(2);
         let mut handler = ExtendedTextInputV1Handler;
 
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
@@ -3005,7 +3009,7 @@ mod tests {
         );
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = 2;
+            state.guest_commit_serial = crate::state::CommitCount::at(2);
             state.committed_surrounding_text = Some(("A가".to_string(), 4, 4));
             state.pending_surrounding_text = state.committed_surrounding_text.clone();
         }
@@ -3427,7 +3431,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 0,
+                guest_commit_serial: crate::state::CommitCount::at(0),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -3550,7 +3554,7 @@ mod tests {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = 17;
+            state.guest_commit_serial = crate::state::CommitCount::at(17);
             state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
             state.committed_surrounding_text = Some(("current".to_string(), 7, 7));
             state.surrounding_text_dirty = true;
@@ -3566,7 +3570,7 @@ mod tests {
         let active_surface = state.active_surface;
         assert_eq!(state.apply_focus(active_surface), active_surface);
 
-        assert_eq!(state.guest_commit_serial, 17);
+        assert_eq!(state.guest_commit_serial.get(), 17);
         assert!(state.host_is_active());
         assert!(!state.pending_enabled);
         assert!(!state.committed_enabled);
@@ -3777,14 +3781,14 @@ mod tests {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = u32::MAX;
+            state.guest_commit_serial = crate::state::CommitCount::at(u32::MAX);
             state.host_activation = HostActivationState::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
         handler.on_commit(&mut ctx);
 
-        assert_eq!(ctx.text_inputs[&guest_id].guest_commit_serial, 0);
+        assert_eq!(ctx.text_inputs[&guest_id].guest_commit_serial.get(), 0);
         let commit_state = ctx.client_to_host_queue.last().unwrap();
         assert_eq!(msg_done_serial(std::slice::from_ref(commit_state), 0), 0);
     }
@@ -5217,7 +5221,7 @@ mod tests {
         // Should NOT send activate (opcode 0) to host because active_surface is None.
         let mut found_activate = false;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 0 {
                 found_activate = true;
             }
@@ -5241,7 +5245,7 @@ mod tests {
         let mut found_activate = false;
         let mut activate_surface = 0u32;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 0 {
                 found_activate = true;
                 let payload = &msg[8..];
@@ -5264,7 +5268,7 @@ mod tests {
         // Now it should have sent deactivate (opcode 1).
         let mut found_deactivate = false;
         for (msg, _) in &ctx.client_to_host_queue {
-            let opcode = u32::from_ne_bytes(msg[4..8].try_into().unwrap()) & 0xffff;
+            let opcode = u32::from(crate::test_support::msg_opcode(msg));
             if opcode == 1 {
                 found_deactivate = true;
             }
@@ -5292,9 +5296,9 @@ mod tests {
                 state.content_purpose,
                 state.cursor_rect,
                 state.text_change_cause,
-                state.guest_commit_serial,
             )
         };
+        let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial.get();
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
 
@@ -5326,10 +5330,78 @@ mod tests {
                 state.content_purpose,
                 state.cursor_rect,
                 state.text_change_cause,
-                state.guest_commit_serial,
             ),
             before,
             "inactive v3 requests must not mutate double-buffered state"
+        );
+        assert_eq!(
+            state.guest_commit_serial.get(),
+            commits_before.wrapping_add(1),
+            "an inactive commit still counts toward the done serial"
+        );
+    }
+
+    /// text-input-v3 numbers `done` by every commit on the object, so the
+    /// commits a client makes while unfocused must count as well.
+    #[test]
+    fn v3_done_serial_counts_commits_made_while_unfocused() {
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let first_surface = ctx.text_inputs[&guest_id].active_surface;
+        let next_surface = 901;
+        ctx.shadow_table.map_id(next_surface, 902);
+        ctx.shadow_table
+            .track_interface(next_surface, "wl_surface".to_string());
+        let guest_seat = ctx.text_inputs[&guest_id].guest_seat;
+        let mut v3 = TextInputV3Handler;
+
+        // Focus leaves; the client disables and commits while unfocused.
+        apply_keyboard_focus_changes(
+            &mut ctx,
+            &[SeatFocusChange {
+                guest_seat,
+                previous_surface: first_surface,
+                current_surface: None,
+            }],
+        );
+        let barrier = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("leaving deactivates the host text input behind a barrier");
+        ctx.last_sender_id = guest_id;
+        assert_eq!(v3.on_disable(&mut ctx), Action::Drop);
+        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
+
+        // Focus enters again; the client enables and commits.
+        apply_keyboard_focus_changes(
+            &mut ctx,
+            &[SeatFocusChange {
+                guest_seat,
+                previous_surface: None,
+                current_surface: Some(next_surface),
+            }],
+        );
+        ctx.last_sender_id = guest_id;
+        assert_eq!(v3.on_enable(&mut ctx), Action::Drop);
+        assert_eq!(v3.on_commit(&mut ctx), Action::Drop);
+        ctx.last_sender_id = barrier.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        assert!(ctx.text_inputs[&guest_id].host_is_active());
+
+        // The IME commits text; `done` must carry the client's commit count.
+        ctx.host_to_client_queue.clear();
+        ctx.last_sender_id = host_v1_id;
+        assert_eq!(
+            TextInputV1Handler.on_commit_string(&mut ctx, 2, &"가".to_string()),
+            Action::Drop
+        );
+        let done = ctx.host_to_client_queue.len() - 1;
+        assert_eq!(
+            msg_opcode(&ctx.host_to_client_queue, done),
+            zwp_text_input_v3::EVT_DONE
+        );
+        assert_eq!(
+            msg_done_serial(&ctx.host_to_client_queue, done),
+            2,
+            "the client made two commits"
         );
     }
 }

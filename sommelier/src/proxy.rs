@@ -14,16 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::connection::WaylandConnection;
+use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::state::{Context, PostDispatch, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{ProtocolError, WireMessage};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
 use std::io;
-use std::os::fd::BorrowedFd;
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -39,6 +37,15 @@ type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 // dozen small requests per frame at 4K; 32 messages still amortizes a send
 // while bounding the opposite direction to roughly one frame of work.
 const MAX_MESSAGES_PER_BATCH: usize = 32;
+
+/// How long the accept loop waits after a failed accept.
+///
+/// A failed accept such as EMFILE or ENFILE leaves the pending connection
+/// queued, so the listener stays readable and an immediate retry fails
+/// again: without a pause the loop spins on the one thread every client
+/// shares. Descriptors come back as clients close, which takes far longer
+/// than this pause, while a new client waits at most this long.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -57,17 +64,7 @@ fn translated_sender_id(
     }
 }
 
-fn checked_message_end(offset: usize, message_len: usize) -> Option<usize> {
-    offset.checked_add(message_len)
-}
-
-fn valid_message_length(length: usize) -> bool {
-    // Wayland stores the total byte length in the upper 16 bits of the
-    // second header word. The largest aligned representable length is 65532.
-    (8..=0xffff).contains(&length) && length.is_multiple_of(4)
-}
-
-fn close_pending_output_fds(out_fds: &mut Vec<RawFd>, still_owned_fds: &[RawFd]) {
+fn close_pending_output_fds(out: &mut OutgoingMessages, still_owned_fds: &[RawFd]) {
     // FDs decoded from an incoming message remain owned by the connection
     // until the read buffer is drained (or the connection is dropped). A
     // handler can also queue newly-created descriptors that are not present in
@@ -76,7 +73,7 @@ fn close_pending_output_fds(out_fds: &mut Vec<RawFd>, still_owned_fds: &[RawFd])
     // turn the connection drop into a double-close.
     let protected: std::collections::HashSet<_> = still_owned_fds.iter().copied().collect();
     let mut closed = std::collections::HashSet::new();
-    for fd in out_fds.drain(..) {
+    for fd in out.take_fds() {
         if fd >= 0 && !protected.contains(&fd) && closed.insert(fd) {
             let _ = nix::unistd::close(fd);
         }
@@ -97,27 +94,20 @@ fn pending_host_event_is_stale(
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
         && ctx.host_buffer_is_guest_destroyed(sender_id);
     // An asynchronous linux-dmabuf create can legally be followed by
-    // params.destroy before the compositor emits `created`.  The host still
-    // owns the newly-created wl_buffer in that case, so let the event reach
-    // the handler, which turns it into a host-only buffer and destroys it.
-    // Dropping `created` here would leak the host buffer because generated
-    // new_id mapping only runs when the event is forwarded.
-    let allows_orphan_dmabuf_created = host_interface
+    // params.destroy before the compositor emits `created` or `failed`.
+    // The host still owns a newly-created wl_buffer in that case, so let
+    // the event reach the handler, which turns it into a host-only buffer
+    // and destroys it. Dropping `created` here would leak the host buffer
+    // because generated new_id mapping only runs when the event is
+    // forwarded.
+    let allows_orphan_dmabuf_result = host_interface
         .or(guest_interface)
         .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
-        && opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
-        && (guest_id.is_some_and(|gid| ctx.shadow_table.is_pending_destroy_guest(gid))
-            || ctx.orphaned_dmabuf_params.contains_key(&sender_id));
-    let allows_orphan_dmabuf_failed = host_interface
-        .or(guest_interface)
-        .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
-        && opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED
-        && (guest_id.is_some_and(|gid| ctx.shadow_table.is_pending_destroy_guest(gid))
-            || ctx.orphaned_dmabuf_params.contains_key(&sender_id));
+        && (opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
+            || opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED);
     ctx.shadow_table.is_pending_destroy_host(sender_id)
         && !allows_deferred_buffer_release
-        && !allows_orphan_dmabuf_created
-        && !allows_orphan_dmabuf_failed
+        && !allows_orphan_dmabuf_result
 }
 
 /// Apply the work a handler deferred until its message was forwarded (see
@@ -129,17 +119,6 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
             xdg_toplevel,
         } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
     }
-}
-
-fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
-    // The raw descriptor is owned by the caller for the duration of this
-    // function. Preserve all existing status flags while adding O_NONBLOCK;
-    // F_SETFL replaces, rather than merges, the flag set.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let current = fcntl(borrowed, FcntlArg::F_GETFL)?;
-    let updated = OFlag::from_bits_truncate(current) | OFlag::O_NONBLOCK;
-    fcntl(borrowed, FcntlArg::F_SETFL(updated))?;
-    Ok(())
 }
 
 struct SommelierHandler {
@@ -391,8 +370,7 @@ impl Client {
         // messages; Wayland associates received descriptors by order, not by
         // an independently addressable byte offset. VirtWL's send path keeps
         // that same order when it chunks a large byte stream.
-        let mut out_buffer = Vec::new();
-        let mut out_fds = Vec::new();
+        let mut out = OutgoingMessages::default();
         let mut offset: usize = 0;
         let mut fd_offset: usize = 0;
         let mut processed_messages = 0;
@@ -402,42 +380,28 @@ impl Client {
         // may still complete the descriptor-owning message), but once another
         // complete message is available the association is irrecoverably
         // ambiguous and the connection must be torn down.
-        while let Some(header_end) = offset.checked_add(8) {
-            if header_end > conn.read_buf.len() {
-                break;
-            }
-            let sender_end = header_end - 4;
-            let sender_id =
-                u32::from_ne_bytes(conn.read_buf[offset..sender_end].try_into().unwrap());
-            let word2 =
-                u32::from_ne_bytes(conn.read_buf[offset + 4..header_end].try_into().unwrap());
-            let len = (word2 >> 16) as usize;
-            let opcode = (word2 & 0xFFFF) as u16;
-
-            if !valid_message_length(len) {
-                log::error!("Invalid message length: {}", len);
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
-                return false;
-            }
-            let Some(message_end) = checked_message_end(offset, len) else {
-                log::error!(
-                    "Message end overflows usize: offset={}, length={}",
-                    offset,
-                    len
-                );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
-                return false;
+        loop {
+            let MessageHeader {
+                sender_id,
+                opcode,
+                len,
+            } = match MessageHeader::frame(&conn.read_buf[offset..]) {
+                Framing::Partial => break,
+                Framing::Invalid(header) => {
+                    log::error!("Invalid message length: {}", header.len);
+                    close_pending_output_fds(&mut out, &conn.read_fds);
+                    return false;
+                }
+                Framing::Complete(header) => header,
             };
-            if message_end > conn.read_buf.len() {
-                break;
-            }
+            let message_end = offset + len;
 
             if conn.ambiguous_untracked_fd {
                 log::error!(
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             }
 
@@ -472,8 +436,12 @@ impl Client {
 
             let mut consumed_fds = 0;
             let result = if let Some(interface) = interface {
-                let mut msg =
-                    WireMessage::new(sender_id, opcode, &packet[8..], &conn.read_fds[fd_offset..]);
+                let mut msg = WireMessage::new(
+                    sender_id,
+                    opcode,
+                    &packet[MessageHeader::LEN..],
+                    &conn.read_fds[fd_offset..],
+                );
 
                 log::trace!("[{:?}] {}:{} (len={})", direction, interface, opcode, len);
 
@@ -526,7 +494,7 @@ impl Client {
                         // request makes the client believe the request was
                         // accepted and can desynchronize protocol state.
                         log::error!("Rejecting client request from unknown sender {}", sender_id);
-                        close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                        close_pending_output_fds(&mut out, &conn.read_fds);
                         return false;
                     }
                 } else {
@@ -563,9 +531,7 @@ impl Client {
                     // Patch ID in the forwarded message
                     if let Some(gid) = guest_id {
                         if let Some(tid) = target_sender_id {
-                            if data.len() >= 4 {
-                                data[0..4].copy_from_slice(&tid.to_ne_bytes());
-                            }
+                            MessageHeader::set_sender(&mut data, tid);
                         } else {
                             // If we can't map the ID, it might be a new object or error.
                             // For ClientToHost, it's usually sender which should be mapped.
@@ -574,8 +540,7 @@ impl Client {
                         }
                     }
 
-                    out_buffer.extend_from_slice(&data);
-                    out_fds.extend(fds);
+                    out.push(&data, &fds);
                     for effect in post_dispatch {
                         apply_post_dispatch(&mut self.ctx, effect);
                     }
@@ -592,7 +557,7 @@ impl Client {
                         .and_then(|gid| self.ctx.shadow_table.get_interface(gid).cloned())
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
-                    close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                    close_pending_output_fds(&mut out, &conn.read_fds);
                     return false;
                 }
             }
@@ -603,7 +568,7 @@ impl Client {
                     fd_offset,
                     consumed_fds
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             };
             if new_fd_offset > conn.read_fds.len() {
@@ -612,7 +577,7 @@ impl Client {
                     new_fd_offset,
                     conn.read_fds.len()
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             }
             fd_offset = new_fd_offset;
@@ -628,8 +593,7 @@ impl Client {
                     p_data.len(),
                     p_fds.len()
                 );
-                out_buffer.extend_from_slice(&p_data);
-                out_fds.extend(p_fds);
+                out.push(&p_data, &p_fds);
             }
 
             offset = message_end;
@@ -649,13 +613,13 @@ impl Client {
         self.ctx.synthetic_feedback_refresh_pending.clear();
 
         let mut success = true;
-        if !out_buffer.is_empty() && other_conn.send(&out_buffer, &out_fds).await.is_err() {
+        if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
             success = false;
         }
 
         let mut fds_to_close: std::collections::HashSet<std::os::unix::io::RawFd> =
             std::collections::HashSet::new();
-        fds_to_close.extend(out_fds.iter().copied());
+        fds_to_close.extend(out.fds().iter().copied());
 
         // Bidirectional queue: when processing events in one direction, the
         // handler may queue messages for the OPPOSITE direction. For example,
@@ -672,20 +636,16 @@ impl Client {
             Direction::ClientToHost => &mut self.ctx.host_to_client_queue,
             Direction::HostToClient => &mut self.ctx.client_to_host_queue,
         };
-        let mut reverse_out_buf = Vec::new();
-        let mut reverse_out_fds = Vec::new();
+        let mut reverse_out = OutgoingMessages::default();
         for (p_data, p_fds) in reverse_queue.drain(..) {
             log::debug!(
                 "  -> adding reverse queued message ({} bytes, {} fds)",
                 p_data.len(),
                 p_fds.len()
             );
-            reverse_out_buf.extend_from_slice(&p_data);
-            reverse_out_fds.extend(p_fds);
+            reverse_out.push(&p_data, &p_fds);
         }
-        if !reverse_out_buf.is_empty()
-            && conn.send(&reverse_out_buf, &reverse_out_fds).await.is_err()
-        {
+        if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
             // client connection. We still close every original below.
             success = false;
@@ -695,7 +655,7 @@ impl Client {
         // sendmsg(SCM_RIGHTS) succeeds it duplicates FDs into the kernel
         // cmsg buffer; the originals are still ours to close. When the send
         // fails or the buffer was empty, we obviously retain ownership.
-        fds_to_close.extend(reverse_out_fds.iter().copied());
+        fds_to_close.extend(reverse_out.fds().iter().copied());
 
         fds_to_close.extend(conn.read_fds.iter().take(fd_offset));
 
@@ -719,12 +679,15 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::test_support::{
+        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender,
+    };
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use std::ffi::CString;
     use std::fs;
     use std::io::Write;
+    use std::os::fd::IntoRawFd;
 
     #[test]
     fn generated_classifier_routes_each_protocol_family() {
@@ -749,7 +712,6 @@ mod tests {
 
     #[tokio::test]
     async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (_guest_peer, client_socket) =
@@ -757,8 +719,8 @@ mod tests {
         let (mut host_peer, host_socket) =
             UnixStream::pair().expect("host unix socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -785,16 +747,453 @@ mod tests {
         assert_eq!(client.host_conn.read_buf, host_event);
     }
 
+    /// A message whose header arrived in one read and whose body arrives in
+    /// a later one must wait for that read, not be redispatched in a loop.
+    #[test]
+    fn run_receives_the_rest_of_a_partially_buffered_message() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut guest_peer, client_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (mut host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        host_peer
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound the wait for the forwarded request");
+
+        // wl_display.sync has opcode 0, so the opcode bytes of its header
+        // read as an invalid zero length when decoded as the length field.
+        const GUEST_CALLBACK: u32 = 2;
+        let mut sync = MessageBuilder::new();
+        sync.write_u32(GUEST_CALLBACK);
+        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        let (header, body) = sync.split_at(MessageHeader::LEN);
+        // The body waits in the socket, so the proxy must read again to
+        // complete the message whose header it has already buffered.
+        guest_peer.write_all(body).expect("queue the message body");
+
+        // Run the proxy on its own thread: a loop that spins without
+        // awaiting would starve a runtime shared with this test.
+        let header = header.to_vec();
+        let proxy = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("proxy runtime")
+                .block_on(async move {
+                    let mut client = Client::new(
+                        WaylandConnection::new(client_socket.into()).expect("register test socket"),
+                        WaylandConnection::new(host_socket.into()).expect("register test socket"),
+                        Context::new_for_test(false, false, Vec::new()),
+                    );
+                    client.client_conn.read_buf.extend_from_slice(&header);
+                    client.run().await;
+                });
+        });
+
+        let mut forwarded = [0u8; 12];
+        host_peer
+            .read_exact(&mut forwarded)
+            .expect("the completed request must reach the host");
+        let forwarded_header = msg_header(&forwarded);
+        assert_eq!(
+            (forwarded_header.sender_id, forwarded_header.opcode),
+            (1, protocols::wayland::wl_display::REQ_SYNC)
+        );
+
+        drop(guest_peer);
+        drop(host_peer);
+        proxy
+            .join()
+            .expect("the proxy loop must end when its peers close");
+    }
+
+    /// A proxy whose peers are open sockets, with `wl_display` registered as
+    /// `Client::run` registers it.
+    fn client_with_socket_peers() -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        use std::os::unix::net::UnixStream;
+
+        let (guest_peer, client_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
+            Context::new_for_test(false, false, Vec::new()),
+        );
+        client.ctx.shadow_table.map_id(1, 1);
+        client
+            .ctx
+            .shadow_table
+            .track_interface(1, "wl_display".to_string());
+        (client, guest_peer, host_peer)
+    }
+
+    /// The guest sends `wl_display.sync(callback)`; return the host ID the
+    /// proxy allocated for the callback.
+    async fn guest_sync(client: &mut Client, callback: u32) -> u32 {
+        let mut sync = MessageBuilder::new();
+        sync.write_u32(callback);
+        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        client.client_conn.read_buf.extend_from_slice(&sync);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        client
+            .ctx
+            .shadow_table
+            .get_host_id(callback)
+            .expect("the callback is mapped to a host object")
+    }
+
+    /// The host delivers `events` to the proxy.
+    async fn host_events(client: &mut Client, events: &[Vec<u8>]) {
+        for event in events {
+            client.host_conn.read_buf.extend_from_slice(event);
+        }
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.host_conn.read_buf.is_empty());
+    }
+
+    fn callback_done(host_callback: u32) -> Vec<u8> {
+        let mut done = MessageBuilder::new();
+        done.write_u32(0);
+        done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE)
+    }
+
+    /// Discard what the proxy forwarded to `peer`, so a long exchange does
+    /// not fill the socket buffer.
+    fn drain(peer: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        peer.set_nonblocking(true).expect("non-blocking peer");
+        let mut sink = [0u8; 4096];
+        loop {
+            match peer.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("drain peer: {error}"),
+            }
+        }
+    }
+
+    fn delete_id(host_id: u32) -> Vec<u8> {
+        let mut delete_id = MessageBuilder::new();
+        delete_id.write_u32(host_id);
+        delete_id.build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
+    }
+
+    /// libwayland-server rejects client object IDs past its map limit, so a
+    /// host ID that grew with every object ever created would end the
+    /// session after enough frame callbacks.
+    #[tokio::test]
+    async fn host_ids_are_recycled_through_delete_id() {
+        const GUEST_CALLBACK: u32 = 3;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+
+        let first = guest_sync(&mut client, GUEST_CALLBACK).await;
+        host_events(&mut client, &[callback_done(first), delete_id(first)]).await;
+        for _ in 0..1000 {
+            let host_callback = guest_sync(&mut client, GUEST_CALLBACK).await;
+            assert_eq!(host_callback, first, "a deleted host ID must be reused");
+            host_events(
+                &mut client,
+                &[callback_done(host_callback), delete_id(host_callback)],
+            )
+            .await;
+            drain(&mut guest_peer);
+            drain(&mut host_peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_ids_are_not_reused_before_delete_id() {
+        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
+
+        // `done` destroys the callback on both sides and sends the guest its
+        // delete_id, so the guest may reuse its ID at once; the host ID must
+        // wait for the host's own delete_id.
+        let first = guest_sync(&mut client, 3).await;
+        host_events(&mut client, &[callback_done(first)]).await;
+        let second = guest_sync(&mut client, 3).await;
+        assert_ne!(second, first);
+
+        host_events(&mut client, &[delete_id(first)]).await;
+        assert_eq!(guest_sync(&mut client, 4).await, first);
+    }
+
+    /// CPU time this thread has used.
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
+            0
+        );
+        std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    fn test_client_config() -> ClientConfig {
+        ClientConfig {
+            local_compositor: None,
+            virtio_wayland: None,
+            gpu_accel: false,
+            xdg_decoration: false,
+            vm_identifier: "termina".to_string(),
+            placement: Arc::new(PlacementConfig::for_test(Vec::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_accepts_back_off_instead_of_spinning() {
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+
+        // A stream socket that never listened polls as hung up, so the event
+        // loop sees it readable, and every accept on it fails at once, as
+        // accepts do while the descriptor table is full.
+        let not_listening = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("create a socket");
+        let listener =
+            UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
+                .expect("register the socket");
+
+        let window = std::time::Duration::from_millis(500);
+        let cpu_before = thread_cpu_time();
+        let served = tokio::task::LocalSet::new()
+            .run_until(tokio::time::timeout(
+                window,
+                serve(listener, test_client_config(), None),
+            ))
+            .await;
+        let cpu = thread_cpu_time() - cpu_before;
+
+        assert!(served.is_err(), "serve runs until the process ends");
+        assert!(
+            cpu < window / 4,
+            "the accept loop used {cpu:?} of CPU in {window:?} of failing accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn sighup_without_a_shortcuts_file_does_not_end_the_proxy() {
+        let dir = crate::test_support::TempDir::new("sighup");
+        let listener = UnixListener::bind(dir.path().join("socket")).expect("bind listener");
+        let config = test_client_config();
+        assert!(config.placement.reload().is_none(), "no file to reload");
+        let local = tokio::task::LocalSet::new();
+        let serving = local.spawn_local(serve(listener, config, install_reload_signal()));
+        local
+            .run_until(async {
+                // Let serve start its reload task and wait for clients.
+                tokio::task::yield_now().await;
+                // Without a handler this would terminate the test process.
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            })
+            .await;
+        assert!(
+            !serving.is_finished(),
+            "the proxy keeps serving after the logged no-op reload"
+        );
+    }
+
+    /// A reload must not wait for the accept loop's retry pause.
+    #[tokio::test(start_paused = true)]
+    async fn reload_does_not_wait_for_the_accept_retry_pause() {
+        use crate::window_layout::WindowLayoutAction;
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+
+        let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
+        let dir = crate::test_support::TempDir::new("reload-during-retry");
+        let shortcuts = dir.write(
+            "shortcuts.toml",
+            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
+        );
+        let placement = Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&shortcuts),
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
+        assert_eq!(placement.action_for(&alt_q), Some(WindowLayoutAction::Left));
+        let config = ClientConfig {
+            placement: Arc::clone(&placement),
+            ..test_client_config()
+        };
+        // Every accept on a socket that never listened fails at once, so the
+        // accept loop is in its retry pause from the first step on.
+        let not_listening = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("create a socket");
+        let listener =
+            UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
+                .expect("register the socket");
+
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(listener, config, install_reload_signal()));
+        local
+            .run_until(async {
+                tokio::task::yield_now().await;
+                let started = tokio::time::Instant::now();
+                dir.write(
+                    "shortcuts.toml",
+                    b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
+                );
+                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+                // The clock is paused, so it moves only while every task waits.
+                while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(
+                    started.elapsed() < ACCEPT_RETRY_DELAY,
+                    "the reload waited {:?} for the accept loop",
+                    started.elapsed()
+                );
+            })
+            .await;
+    }
+
+    /// A VirtWL transaction carries at most 28 descriptors, so a batch that
+    /// forwards more must be split, between messages.
+    #[tokio::test]
+    async fn batches_send_at_most_the_transport_descriptor_limit_at_once() {
+        use crate::connection::MAX_FDS_PER_SEND;
+        use std::os::fd::AsRawFd;
+
+        const GUEST_OFFER: u32 = 30;
+        const HOST_OFFER: u32 = 31;
+        const RECEIVES: usize = MAX_FDS_PER_SEND + 2;
+        let (mut client, guest_peer, host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.map_id(GUEST_OFFER, HOST_OFFER);
+        client
+            .ctx
+            .shadow_table
+            .track_interface(GUEST_OFFER, "wl_data_offer".to_string());
+
+        // The guest asks for the selection once per descriptor, in one write
+        // the proxy dispatches as one batch.
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let mut receive = MessageBuilder::new();
+        receive.write_string("text/plain");
+        let receive =
+            receive.build_message(GUEST_OFFER, protocols::wayland::wl_data_offer::REQ_RECEIVE);
+        let requests = receive.repeat(RECEIVES);
+        let fds = [pipe[1]; RECEIVES];
+        let sent = nix::sys::socket::sendmsg::<()>(
+            guest_peer.as_raw_fd(),
+            &[std::io::IoSlice::new(&requests)],
+            &[nix::sys::socket::ControlMessage::ScmRights(&fds)],
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        )
+        .expect("send the guest requests");
+        assert_eq!(sent, requests.len());
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(
+            client
+                .client_conn
+                .recv()
+                .await
+                .expect("receive the requests"),
+            requests.len()
+        );
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+
+        // Read the host side one submission at a time.
+        let mut received_bytes = 0;
+        let mut per_submission = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let mut control = nix::cmsg_space!([RawFd; 253]);
+            let mut iov = [std::io::IoSliceMut::new(&mut data)];
+            let message = nix::sys::socket::recvmsg::<()>(
+                host_peer.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                nix::sys::socket::MsgFlags::empty(),
+            )
+            .expect("receive from the proxy");
+            if message.bytes == 0 {
+                break;
+            }
+            received_bytes += message.bytes;
+            let mut fds = Vec::new();
+            for cmsg in message.cmsgs().expect("control messages") {
+                if let nix::sys::socket::ControlMessageOwned::ScmRights(received) = cmsg {
+                    fds.extend(received);
+                }
+            }
+            for &fd in &fds {
+                unsafe { libc::close(fd) };
+            }
+            per_submission.push(fds.len());
+        }
+        drop(guest_peer);
+
+        assert_eq!(received_bytes, requests.len());
+        assert_eq!(per_submission.iter().sum::<usize>(), RECEIVES);
+        assert!(
+            per_submission
+                .iter()
+                .all(|&count| count <= MAX_FDS_PER_SEND),
+            "descriptors per submission: {per_submission:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_socket_lock_protects_the_live_socket() {
+        let dir = crate::test_support::TempDir::new("socket-lock");
+        let socket = dir.path().join("wayland-test");
+        let stale = std::os::unix::net::UnixListener::bind(&socket).expect("bind a stale socket");
+        drop(stale);
+
+        // No one holds the lock, so the socket is stale and is removed.
+        let lock = claim_display_socket(&socket).expect("claim the free socket path");
+        assert!(!socket.exists(), "the stale socket must be removed");
+
+        // While the lock is held, a second claim fails and leaves the
+        // owner's socket in place.
+        let live = std::os::unix::net::UnixListener::bind(&socket).expect("bind the live socket");
+        let error = claim_display_socket(&socket).expect_err("the path is claimed");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(socket.exists(), "a live socket must not be removed");
+
+        // Once the owner is gone, the path can be claimed again.
+        drop(live);
+        drop(lock);
+        claim_display_socket(&socket).expect("claim the released socket path");
+        assert!(!socket.exists());
+    }
+
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -837,7 +1236,6 @@ mod tests {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ) {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_peer, guest_socket) =
@@ -848,8 +1246,8 @@ mod tests {
             .set_nonblocking(true)
             .expect("guest peer should become nonblocking");
         let mut client = Client::new(
-            WaylandConnection::new(guest_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(guest_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1019,14 +1417,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_is_retained_when_followup_is_partial() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1072,14 +1469,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_survives_separate_receive_calls() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1129,14 +1525,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_terminates_before_followup_complete() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1176,14 +1571,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_client_sender_is_a_protocol_error() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1216,7 +1610,6 @@ mod tests {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ) {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_proxy, guest_peer) =
@@ -1224,8 +1617,8 @@ mod tests {
         let (host_proxy, host_peer) =
             UnixStream::pair().expect("host socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into_raw_fd()),
-            WaylandConnection::new(host_proxy.into_raw_fd()),
+            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
+            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
             Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test("")),
         );
         let ctx = &mut client.ctx;
@@ -1341,7 +1734,6 @@ mod tests {
     #[tokio::test]
     async fn invalid_registry_bind_flushes_display_error_before_disconnect() {
         use std::io::Read;
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_proxy, guest_peer) =
@@ -1349,8 +1741,8 @@ mod tests {
         let (host_proxy, host_peer) =
             UnixStream::pair().expect("host socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into_raw_fd()),
-            WaylandConnection::new(host_proxy.into_raw_fd()),
+            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
+            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1405,13 +1797,11 @@ mod tests {
         guest_peer
             .read_exact(&mut header)
             .expect("guest must receive the fatal display error before disconnect");
-        assert_eq!(u32::from_ne_bytes(header[0..4].try_into().unwrap()), 1);
-        assert_eq!(
-            (u32::from_ne_bytes(header[4..8].try_into().unwrap()) & 0xffff) as u16,
-            protocols::wayland::wl_display::EVT_ERROR
-        );
+        let header = msg_header(&header);
+        assert_eq!(header.sender_id, 1);
+        assert_eq!(header.opcode, protocols::wayland::wl_display::EVT_ERROR);
         assert!(
-            (u32::from_ne_bytes(header[4..8].try_into().unwrap()) >> 16) >= 20,
+            header.len >= 20,
             "display.error must include object, code, and a diagnostic string"
         );
     }
@@ -1426,9 +1816,13 @@ mod tests {
             ctx: &mut Context,
             message: Vec<u8>,
         ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-            let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-            let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-            let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+            let header = msg_header(&message);
+            let mut wire = WireMessage::new(
+                header.sender_id,
+                header.opcode,
+                &message[MessageHeader::LEN..],
+                &[],
+            );
             let result = Client::dispatch_event(handler, ctx, "wl_keyboard", &mut wire)
                 .expect("raw keyboard event must dispatch");
             assert!(
@@ -1590,9 +1984,13 @@ mod tests {
         interface: &str,
         message: Vec<u8>,
     ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let header = msg_header(&message);
+        let mut wire = WireMessage::new(
+            header.sender_id,
+            header.opcode,
+            &message[MessageHeader::LEN..],
+            &[],
+        );
         let result = Client::dispatch_event(handler, ctx, interface, &mut wire)
             .expect("raw host event must dispatch");
         assert!(
@@ -1620,9 +2018,13 @@ mod tests {
         interface: &str,
         message: Vec<u8>,
     ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
-        let sender_id = u32::from_ne_bytes(message[0..4].try_into().unwrap());
-        let opcode = (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) as u16;
-        let mut wire = WireMessage::new(sender_id, opcode, &message[8..], &[]);
+        let header = msg_header(&message);
+        let mut wire = WireMessage::new(
+            header.sender_id,
+            header.opcode,
+            &message[MessageHeader::LEN..],
+            &[],
+        );
         let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
             .expect("raw guest request must dispatch");
         assert!(
@@ -1633,11 +2035,11 @@ mod tests {
     }
 
     fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
-        u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+        msg_sender(&message.0)
     }
 
     fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
-        (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+        msg_opcode(&message.0)
     }
 
     #[test]
@@ -1673,7 +2075,7 @@ mod tests {
         assert!(ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         assert_eq!(
-            u32::from_ne_bytes(ctx.client_to_host_queue[0].0[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(&ctx.client_to_host_queue[0].0),
             AURA_SHELL
         );
 
@@ -1872,7 +2274,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -3289,23 +3691,6 @@ mod tests {
     }
 
     #[test]
-    fn checked_message_end_rejects_offset_overflow() {
-        assert_eq!(checked_message_end(usize::MAX - 8, 8), Some(usize::MAX));
-        assert_eq!(checked_message_end(usize::MAX, 1), None);
-    }
-
-    #[test]
-    fn message_lengths_must_be_aligned_and_include_the_header() {
-        assert!(!valid_message_length(0));
-        assert!(!valid_message_length(7));
-        assert!(valid_message_length(8));
-        assert!(valid_message_length(12));
-        assert!(!valid_message_length(10));
-        assert!(valid_message_length(65_532));
-        assert!(!valid_message_length(65_536));
-    }
-
-    #[test]
     fn early_output_cleanup_preserves_incoming_fd_ownership() {
         // A memfd has a unique inode for this ownership assertion; pipe
         // read/write ends share an inode and eventfds share an anonymous-inode
@@ -3315,7 +3700,8 @@ mod tests {
             .expect("memfd_create")
             .into_raw_fd();
         let incoming_identity = fd_identity(incoming_fd);
-        let mut output = vec![incoming_fd];
+        let mut output = OutgoingMessages::default();
+        output.push(&[], &[incoming_fd]);
         close_pending_output_fds(&mut output, &[incoming_fd]);
 
         // The incoming connection still owns this descriptor; the cleanup
@@ -3331,7 +3717,8 @@ mod tests {
             .expect("memfd_create")
             .into_raw_fd();
         let output_identity = fd_identity(fd);
-        let mut output = vec![fd];
+        let mut output = OutgoingMessages::default();
+        output.push(&[], &[fd]);
         close_pending_output_fds(&mut output, &[]);
         assert!(
             !any_fd_has_identity(output_identity),
@@ -3436,9 +3823,9 @@ mod tests {
         .expect("destroy_registry request should dispatch")
         .expect("destroy_registry request should be forwarded");
         assert!(fds.is_empty());
-        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 15);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), 15);
         assert_eq!(
-            u16::from_ne_bytes(forwarded[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(&forwarded),
             protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY
         );
         assert_eq!(
@@ -3620,7 +4007,7 @@ mod tests {
                 .expect("create_surface dispatch")
                 .expect("create_surface forwarded");
         assert!(fds.is_empty());
-        assert_eq!(u32::from_ne_bytes(forwarded[0..4].try_into().unwrap()), 20);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), 20);
         let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
         assert_eq!(
             u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
@@ -3855,6 +4242,16 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
+/// What every client connection needs from the proxy's configuration.
+struct ClientConfig {
+    local_compositor: Option<String>,
+    virtio_wayland: Option<String>,
+    gpu_accel: bool,
+    xdg_decoration: bool,
+    vm_identifier: String,
+    placement: Arc<PlacementConfig>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     display: &str,
@@ -3864,7 +4261,7 @@ pub async fn run(
     virtio_wayland: Option<String>,
     vm_identifier: String,
     placement: Arc<PlacementConfig>,
-    mut reload_signal: Option<tokio::signal::unix::Signal>,
+    reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
@@ -3886,128 +4283,200 @@ pub async fn run(
         }
     }
 
+    // Held until the process exits, like the socket itself.
+    let _socket_lock =
+        claim_display_socket(std::path::Path::new(display)).unwrap_or_else(|error| {
+            log::error!("Cannot claim the Wayland socket {display}: {error}");
+            std::process::exit(1);
+        });
     let listener = UnixListener::bind(display).expect("Failed to bind socket");
     log::info!("Listening on {}", display);
 
+    let config = ClientConfig {
+        local_compositor,
+        virtio_wayland,
+        gpu_accel,
+        xdg_decoration,
+        vm_identifier,
+        placement,
+    };
     // KeyboardHandler owns xkb state, which is intentionally !Send. Keep each
     // client task on this executor's thread instead of using `tokio::spawn`
     // (whose Send bound would require an unsound manual Send implementation).
     // `LocalSet::run_until` also makes the ownership requirement visible in
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            loop {
-                let accepted = tokio::select! {
-                    // The reload runs on this event loop between accepts, so
-                    // it never races a key event.
-                    Some(()) = next_reload_signal(&mut reload_signal) => {
-                        placement.reload_and_log();
-                        continue;
-                    }
-                    accepted = listener.accept() => accepted,
-                };
-                match accepted {
-                    Ok((stream, _)) => {
-                        log::info!("New client connected");
-
-                        let client_fd = stream.into_std().unwrap().into_raw_fd();
-                        if let Err(e) = set_nonblocking(client_fd) {
-                            log::error!("Failed to set non-blocking on client fd: {}", e);
-                            let _ = nix::unistd::close(client_fd);
-                            continue;
-                        }
-                        let client_conn = WaylandConnection::new(client_fd);
-
-                        let mut virtwayland_channel_ref = None;
-
-                        let host_conn = {
-                            let mut conn = None;
-
-                            if let Some(path) = &virtio_wayland {
-                                match VirtWaylandChannel::new(path) {
-                                    Ok(channel) => {
-                                        let channel_arc = Arc::new(channel);
-                                        virtwayland_channel_ref = Some(channel_arc.clone());
-                                        conn =
-                                            Some(WaylandConnection::new_virtwayland(channel_arc));
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to open virtio-wayland channel at {}: {}",
-                                            path,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            if conn.is_none() {
-                                if let Some(path) = local_compositor.as_ref() {
-                                    match UnixStream::connect(path).await {
-                                        Ok(stream) => {
-                                            let host_fd =
-                                                stream.into_std().unwrap().into_raw_fd();
-                                            if let Err(e) = set_nonblocking(host_fd) {
-                                                log::error!(
-                                                    "Failed to set non-blocking on host fd: {}",
-                                                    e
-                                                );
-                                                let _ = nix::unistd::close(host_fd);
-                                            } else {
-                                                conn = Some(WaylandConnection::new(host_fd));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to connect to host: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    log::error!(
-                                        "Local compositor path required if not using virtio-wayland (or if it failed)"
-                                    );
-                                }
-                            }
-                            conn
-                        };
-
-                        if let Some(host_conn) = host_conn {
-                            let mut client = Client::new(
-                                client_conn,
-                                host_conn,
-                                Context::new(
-                                    gpu_accel,
-                                    xdg_decoration,
-                                    vm_identifier.clone(),
-                                    Arc::clone(&placement),
-                                ),
-                            );
-                            if let Some(channel) = virtwayland_channel_ref {
-                                client.ctx.virtwayland_channel = Some(channel);
-                            }
-
-                            tokio::task::spawn_local(async move {
-                                client.run().await;
-                                log::info!("Client disconnected");
-                            });
-                        } else {
-                            log::error!("Failed to establish host connection, closing client");
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Accept error: {}", e);
-                    }
-                }
-            }
-        })
+    tokio::task::LocalSet::new()
+        .run_until(serve(listener, config, reload_signal))
         .await;
 }
 
-/// Wait for the next shortcut reload signal; never resolves without one.
-async fn next_reload_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
-    match signal {
-        Some(signal) => signal.recv().await,
-        None => std::future::pending().await,
+/// Claim the socket path `display` for this process, as libwayland claims
+/// its socket: take an exclusive lock on `<display>.lock` and, only while
+/// holding it, remove a socket a previous owner left behind.
+///
+/// The lock lasts as long as the returned value. Fails, leaving the socket
+/// alone, while another process holds the lock: that process is serving
+/// the socket, and removing it would cut its clients off from new
+/// connections.
+fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut lock_path = display.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o660)
+        .open(&lock_path)?;
+    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, errno)| match errno {
+            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another process holds its lock and is serving it",
+            ),
+            errno => io::Error::from(errno),
+        })?;
+    match std::fs::remove_file(display) {
+        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(lock)
+}
+
+/// Accept guest clients for the life of the process, and reload the
+/// shortcut configuration on each `reload_signal`.
+///
+/// A failure concerning one client is logged and ends only that client.
+/// Must run inside a `LocalSet`, like the clients it spawns.
+async fn serve(
+    listener: UnixListener,
+    config: ClientConfig,
+    reload_signal: Option<tokio::signal::unix::Signal>,
+) {
+    if let Some(signal) = reload_signal {
+        let reloads =
+            tokio::task::spawn_local(reload_on_signal(signal, Arc::clone(&config.placement)));
+        // SIGHUP stays handled after the task ends (its signal stream
+        // closed, or a reload panicked), so say that reloads have stopped.
+        tokio::task::spawn_local(async move {
+            match reloads.await {
+                Ok(()) => log::error!("SIGHUP reloads have stopped: the signal stream ended"),
+                Err(error) => log::error!("SIGHUP reloads have stopped: {error}"),
+            }
+        });
+    }
+    // Log a run of failed accepts once, not every retry.
+    let mut accept_failing = false;
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if std::mem::take(&mut accept_failing) {
+                    log::info!("Accepting clients again");
+                }
+                log::info!("New client connected");
+                if let Err(error) = start_client(stream, &config).await {
+                    log::error!("Closing the new client: {error}");
+                }
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut accept_failing, true) {
+                    log::error!(
+                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+/// Pair an accepted guest connection with a new host connection and serve
+/// the pair on its own task.
+async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<()> {
+    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
+    let (host_conn, virtwayland_channel) = connect_host(config).await?;
+    let mut client = Client::new(
+        client_conn,
+        host_conn,
+        Context::new(
+            config.gpu_accel,
+            config.xdg_decoration,
+            config.vm_identifier.clone(),
+            Arc::clone(&config.placement),
+        ),
+    );
+    client.ctx.virtwayland_channel = virtwayland_channel;
+    tokio::task::spawn_local(async move {
+        client.run().await;
+        log::info!("Client disconnected");
+    });
+    Ok(())
+}
+
+/// Open this client's connection to the host compositor: a VirtWL channel
+/// when configured, else (or when that fails) the local compositor socket.
+async fn connect_host(
+    config: &ClientConfig,
+) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
+    if let Some(path) = &config.virtio_wayland {
+        match VirtWaylandChannel::new(path) {
+            Ok(channel) => {
+                let channel = Arc::new(channel);
+                let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
+                return Ok((conn, Some(channel)));
+            }
+            Err(e) => {
+                log::error!("Failed to open virtio-wayland channel at {}: {}", path, e);
+            }
+        }
+    }
+    let Some(path) = &config.local_compositor else {
+        return Err(io::Error::other(
+            "no host connection: virtio-wayland is unavailable and no local compositor is set",
+        ));
+    };
+    let stream = UnixStream::connect(path).await?;
+    Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
+}
+
+/// Install the `SIGHUP` handler that reloads the shortcut configuration file.
+///
+/// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
+/// the signal through its own self-pipe; [`reload_on_signal`] runs the
+/// reload. `main`
+/// installs it before anything else can take long, whatever the
+/// configuration.
+///
+/// # Returns
+///
+/// `None` when the handler cannot be installed. That is logged and is not
+/// fatal: the proxy runs without reloads.
+pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .inspect_err(|error| {
+            log::error!(
+                "Failed to install the SIGHUP shortcut reload handler; reloads are disabled: {}",
+                error
+            );
+        })
+        .ok()
+}
+/// Reload the shortcut configuration on each `signal`.
+///
+/// A task of its own, so a reload never waits behind the accept loop (its
+/// retry pause, or a client's host connection). It runs on the proxy's one
+/// thread between other tasks' steps, so it never races a key event.
+/// `PlacementConfig::reload_and_log` owns what a reload means, including
+/// the logged no-op when there is no file.
+async fn reload_on_signal(
+    mut signal: tokio::signal::unix::Signal,
+    placement: Arc<PlacementConfig>,
+) {
+    while signal.recv().await.is_some() {
+        placement.reload_and_log();
     }
 }

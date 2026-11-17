@@ -63,7 +63,7 @@ pub struct TextInputState {
     /// serial. The same value is sent to the v1 host in `commit_state`, but
     /// Exo assigns its own serials to v1 events, so event translation must use
     /// this local counter rather than trusting the host event serial.
-    pub guest_commit_serial: u32,
+    pub guest_commit_serial: CommitCount,
     /// Cursor/selection metadata accumulated before the next v1 preedit event.
     pub pending_preedit_cursor: Option<i32>,
     pub pending_preedit_selection: Option<(u32, u32)>,
@@ -72,6 +72,27 @@ pub struct TextInputState {
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
     pub(crate) host_activation: HostActivationState,
+}
+
+/// The number of v3 `commit` requests a guest text input has made, which
+/// numbers its `done` events.
+///
+/// The count is private so that [`TextInputState::count_guest_commit`] is
+/// its only writer: a commit that is not counted desynchronizes every later
+/// `done`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CommitCount(u32);
+
+impl CommitCount {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// A count of `commits`, for test fixtures.
+    #[cfg(test)]
+    pub fn at(commits: u32) -> Self {
+        Self(commits)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,7 +171,7 @@ impl TextInputState {
             cursor_rect_dirty: false,
             text_change_cause: 0,
             current_preedit: String::new(),
-            guest_commit_serial: 0,
+            guest_commit_serial: CommitCount::default(),
             pending_preedit_cursor: None,
             pending_preedit_selection: None,
             pending_deletes: Vec::new(),
@@ -288,7 +309,20 @@ impl TextInputState {
         self.cursor_rect_dirty = true;
     }
 
-    /// Snapshot the next guest commit without mutating committed state.
+    /// Count one v3 `commit` request and return its serial.
+    ///
+    /// The protocol numbers `done` events by the count of commits on the
+    /// object, so every commit counts, including one the proxy does not
+    /// forward to the host because the object is unfocused or its state
+    /// cannot be encoded.
+    pub(crate) fn count_guest_commit(&mut self) -> u32 {
+        let count = &mut self.guest_commit_serial.0;
+        *count = count.wrapping_add(1);
+        *count
+    }
+
+    /// Snapshot the commit just counted by [`Self::count_guest_commit`]
+    /// without mutating committed state.
     ///
     /// The handler owns this plan while encoding every host message. Dropping
     /// the plan on an encoding failure leaves the state byte-for-byte
@@ -309,7 +343,7 @@ impl TextInputState {
             host_v1_id: self.host_v1_id,
             host_ext_id: self.host_ext_id,
             guest_seat: self.guest_seat,
-            serial: self.guest_commit_serial.wrapping_add(1),
+            serial: self.guest_commit_serial.get(),
             enabled,
             enable_conflict,
             resets_composition,
@@ -333,11 +367,10 @@ impl TextInputState {
         debug_assert_eq!(plan.guest_seat, self.guest_seat);
         debug_assert_eq!(
             plan.serial,
-            self.guest_commit_serial.wrapping_add(1),
-            "guest commit plans must be finished exactly once and in order"
+            self.guest_commit_serial.get(),
+            "a guest commit plan is finished for the commit that prepared it"
         );
 
-        self.guest_commit_serial = plan.serial;
         if plan.resets_composition {
             if plan.enable_conflict {
                 self.pending_enabled = self.committed_enabled;
@@ -385,7 +418,7 @@ impl TextInputState {
     pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
         self.host_is_active().then_some(HostPreeditPlan {
             guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
+            done_serial: self.guest_commit_serial.get(),
             had_preedit: !self.current_preedit.is_empty(),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
@@ -399,7 +432,7 @@ impl TextInputState {
         reset_commit_is_empty: bool,
         backspace_held: bool,
     ) -> bool {
-        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial.get());
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
@@ -415,7 +448,7 @@ impl TextInputState {
     pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
         self.host_is_active().then(|| HostCommitPlan {
             guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
+            done_serial: self.guest_commit_serial.get(),
             had_preedit: !self.current_preedit.is_empty(),
             deletes: self.pending_deletes.clone(),
             cursor_position: self.pending_cursor_position,
@@ -423,7 +456,7 @@ impl TextInputState {
     }
 
     pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan) {
-        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial.get());
         debug_assert_eq!(plan.deletes, self.pending_deletes);
         debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);
         debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
@@ -439,14 +472,14 @@ impl TextInputState {
             guest_seat: self.guest_seat,
             surrounding_text: surrounding_text.clone(),
             surrounding_cursor: *surrounding_cursor,
-            done_serial: self.guest_commit_serial,
+            done_serial: self.guest_commit_serial.get(),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
     }
 
     pub(crate) fn finish_preedit_region(&mut self, plan: PreeditRegionPlan, preedit_text: String) {
-        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial.get());
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         self.pending_preedit_selection = None;
@@ -457,7 +490,7 @@ impl TextInputState {
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
         self.host_is_active().then(|| ConfirmPreeditPlan {
             guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
+            done_serial: self.guest_commit_serial.get(),
             preedit_text: self.current_preedit.clone(),
         })
     }
@@ -465,7 +498,7 @@ impl TextInputState {
     /// Close a host composition transaction after its complete guest message
     /// sequence has been encoded.
     pub(crate) fn finish_confirm_preedit(&mut self, plan: ConfirmPreeditPlan) {
-        debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.done_serial, self.guest_commit_serial.get());
         debug_assert_eq!(plan.preedit_text, self.current_preedit);
         self.current_preedit.clear();
         self.pending_preedit_cursor = None;
@@ -1969,7 +2002,7 @@ mod tests {
         state.cursor_rect_dirty = true;
         state.text_change_cause = 1;
         state.current_preedit = "조합".to_string();
-        state.guest_commit_serial = 17;
+        state.guest_commit_serial = crate::state::CommitCount::at(17);
         state.pending_preedit_cursor = Some(3);
         state.pending_preedit_selection = Some((0, 3));
         state.pending_deletes.push((3, 0));
@@ -1979,7 +2012,7 @@ mod tests {
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
         let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
-        expected.guest_commit_serial = 17;
+        expected.guest_commit_serial = crate::state::CommitCount::at(17);
         assert!(expected.activate_host());
         assert_eq!(state, expected);
     }
@@ -1993,6 +2026,7 @@ mod tests {
         state.set_content_type(3, 4);
         state.set_cursor_rect((1, 2, 3, 4));
         state.set_text_change_cause(1);
+        assert_eq!(state.count_guest_commit(), 1);
         let before = state.clone();
 
         let plan = state.prepare_guest_commit(false);
@@ -2020,10 +2054,11 @@ mod tests {
         state.set_cursor_rect((1, 2, 3, 4));
         state.set_text_change_cause(1);
 
+        state.count_guest_commit();
         let plan = state.prepare_guest_commit(false);
         state.finish_guest_commit(plan);
 
-        assert_eq!(state.guest_commit_serial, 1);
+        assert_eq!(state.guest_commit_serial.get(), 1);
         assert!(state.pending_enabled);
         assert!(state.committed_enabled);
         assert!(!state.enabled_dirty);
@@ -2061,11 +2096,12 @@ mod tests {
         state.pending_deletes.push((3, 0));
         state.begin_enabled_transaction(true);
 
+        state.count_guest_commit();
         let plan = state.prepare_guest_commit(true);
         assert!(!plan.enabled);
         state.finish_guest_commit(plan);
 
-        assert_eq!(state.guest_commit_serial, 1);
+        assert_eq!(state.guest_commit_serial.get(), 1);
         assert!(!state.pending_enabled);
         assert!(!state.committed_enabled);
         assert!(!state.enabled_dirty);
@@ -2076,12 +2112,13 @@ mod tests {
     #[test]
     fn guest_commit_serial_wraps_to_zero() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        state.guest_commit_serial = u32::MAX;
+        state.guest_commit_serial = crate::state::CommitCount::at(u32::MAX);
 
+        assert_eq!(state.count_guest_commit(), 0);
         let plan = state.prepare_guest_commit(false);
         assert_eq!(plan.serial, 0);
         state.finish_guest_commit(plan);
-        assert_eq!(state.guest_commit_serial, 0);
+        assert_eq!(state.guest_commit_serial.get(), 0);
     }
 
     #[test]
@@ -2089,7 +2126,7 @@ mod tests {
         let mut state = TextInputState::new(10, None, 12, Some(13));
         assert!(state.prepare_host_preedit().is_none());
         assert!(state.activate_host());
-        state.guest_commit_serial = 7;
+        state.guest_commit_serial = crate::state::CommitCount::at(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
@@ -2112,7 +2149,7 @@ mod tests {
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
         assert!(state.activate_host());
-        state.guest_commit_serial = 7;
+        state.guest_commit_serial = crate::state::CommitCount::at(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
@@ -2271,14 +2308,18 @@ mod tests {
                         assert!(next.cursor_rect_dirty);
                     }
                     Step::Commit if next.active_surface.is_some() => {
-                        let previous_serial = next.guest_commit_serial;
+                        let previous_serial = next.guest_commit_serial.get();
+                        next.count_guest_commit();
                         let plan = next.prepare_guest_commit(false);
                         let resets_composition = plan.resets_composition;
                         let commits_surrounding = plan.surrounding_text.is_some();
                         let commits_content_type = plan.content_type.is_some();
                         let commits_cursor_rect = plan.cursor_rect.is_some();
                         next.finish_guest_commit(plan);
-                        assert_eq!(next.guest_commit_serial, previous_serial.wrapping_add(1));
+                        assert_eq!(
+                            next.guest_commit_serial.get(),
+                            previous_serial.wrapping_add(1)
+                        );
                         if resets_composition {
                             assert!(!next.enabled_dirty);
                             assert!(next.current_preedit.is_empty());
@@ -2295,18 +2336,27 @@ mod tests {
                         }
                     }
                     Step::FailedCommit if next.active_surface.is_some() => {
+                        next.count_guest_commit();
                         let before = next.clone();
                         let _unencodable_plan = next.prepare_guest_commit(false);
                         assert_eq!(
                             next, before,
-                            "dropping an unencoded plan must not advance any state"
+                            "dropping an unencoded plan must advance only the commit count"
                         );
                     }
+                    Step::Commit | Step::FailedCommit => {
+                        // An unfocused commit is counted but changes nothing
+                        // else.
+                        let mut expected = next.clone();
+                        expected.count_guest_commit();
+                        next.count_guest_commit();
+                        assert_eq!(next, expected);
+                    }
                     Step::Destroy => {
-                        let serial = next.guest_commit_serial;
+                        let serial = next.guest_commit_serial.get();
                         let host_activation = next.host_activation();
                         next.begin_destroy();
-                        assert_eq!(next.guest_commit_serial, serial);
+                        assert_eq!(next.guest_commit_serial.get(), serial);
                         assert_eq!(next.host_activation(), host_activation);
                         assert!(!next.committed_enabled);
                         assert!(next.active_surface.is_none());

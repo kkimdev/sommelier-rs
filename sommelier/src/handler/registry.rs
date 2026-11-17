@@ -1381,7 +1381,7 @@ mod tests {
         );
         let message = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(message),
             11,
             "the synthetic event must target the second guest registry"
         );
@@ -1403,7 +1403,7 @@ mod tests {
         assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         let global = &ctx.host_to_client_queue[0].0;
-        assert_eq!(u32::from_ne_bytes(global[0..4].try_into().unwrap()), 10);
+        assert_eq!(crate::test_support::msg_sender(global), 10);
         let mut wire = crate::wire::WireMessage::new(10, 0, &global[8..], &[]);
         assert_eq!(wire.read_u32().unwrap(), 7);
         assert_eq!(wire.read_string().unwrap(), "gtk_shell1");
@@ -1414,7 +1414,7 @@ mod tests {
         assert_eq!(handler.on_global(&mut ctx, 7, &aura, 38), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(&ctx.host_to_client_queue[0].0),
             11
         );
 
@@ -1433,7 +1433,7 @@ mod tests {
             .rev()
             .find(|(message, _)| {
                 message[0..4] == 1u32.to_ne_bytes()
-                    && u16::from_ne_bytes(message[4..6].try_into().unwrap())
+                    && crate::test_support::msg_opcode(message)
                         == crate::protocols::wayland::wl_display::REQ_SYNC
             })
             .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
@@ -1446,12 +1446,9 @@ mod tests {
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         let capabilities = &ctx.host_to_client_queue[0].0;
+        assert_eq!(crate::test_support::msg_sender(capabilities), 50);
         assert_eq!(
-            u32::from_ne_bytes(capabilities[0..4].try_into().unwrap()),
-            50
-        );
-        assert_eq!(
-            u16::from_ne_bytes(capabilities[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(capabilities),
             gtk_shell1::EVT_CAPABILITIES
         );
         assert_eq!(
@@ -2098,12 +2095,14 @@ mod tests {
         );
         assert!(ctx.text_inputs.contains_key(&21));
         assert!(ctx.text_inputs[&21].host_ext_id.is_some());
-        assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == manager_id
-        }));
-        assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == extension_id
-        }));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| { crate::test_support::msg_sender(message) == manager_id }));
+        assert!(ctx
+            .client_to_host_queue
+            .iter()
+            .any(|(message, _)| { crate::test_support::msg_sender(message) == extension_id }));
     }
 
     #[test]
@@ -2290,8 +2289,7 @@ mod tests {
             ctx.client_to_host_queue
                 .iter()
                 .all(|(message, _)| message.len() < 8
-                    || u16::from_ne_bytes(message[4..6].try_into().unwrap())
-                        != ZAURA_SHELL_RELEASE),
+                    || crate::test_support::msg_opcode(message) != ZAURA_SHELL_RELEASE),
             "legacy aura shell must not receive an unsupported release request"
         );
     }
@@ -2335,16 +2333,14 @@ mod tests {
         );
         let shell_message = &ctx.client_to_host_queue[1].0;
         assert_eq!(
-            u16::from_ne_bytes(shell_message[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(shell_message),
             zaura_shell::REQ_RELEASE
         );
         assert!(
             ctx.client_to_host_queue
                 .iter()
-                .all(
-                    |(message, _)| u16::from_ne_bytes(message[4..6].try_into().unwrap())
-                        != zaura_surface::REQ_RELEASE
-                ),
+                .all(|(message, _)| crate::test_support::msg_opcode(message)
+                    != zaura_surface::REQ_RELEASE),
             "global removal must not release existing aura children"
         );
     }
@@ -2377,13 +2373,10 @@ mod tests {
             .0
             .clone();
         assert_eq!(
-            u16::from_ne_bytes(destroy[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(&destroy),
             zwp_linux_dmabuf_v1::REQ_DESTROY
         );
-        assert_eq!(
-            u32::from_ne_bytes(destroy[0..4].try_into().unwrap()),
-            host_id
-        );
+        assert_eq!(crate::test_support::msg_sender(&destroy), host_id);
     }
 
     #[test]

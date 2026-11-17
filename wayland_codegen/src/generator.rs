@@ -542,9 +542,8 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                             && ctx.shadow_table.is_local_only_guest_object(msg.sender_id);
                         let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
                         if handler_action == Action::Forward {
-                            #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::new();
-                            #(#mapping_and_writing)*
+                            // Check the sender before mapping any new_id: a
+                            // dropped request must not consume or map an ID.
                             let Some(host_sender_id) = host_sender_id else {
                                 log::debug!(
                                     "Dropping request from unmapped sender {}",
@@ -553,6 +552,9 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                                 #local_destructor_cleanup
                                 return Ok(None);
                             };
+                            #[allow(unused_mut)]
+                            let mut builder = MessageBuilder::new();
+                            #(#mapping_and_writing)*
                             let full_msg =
                                 builder.try_build_message(host_sender_id, #req_idx)?;
                             #destructor_cleanup
@@ -699,18 +701,19 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                         // same object rather than looking it up again.
                         let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
                         if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
-                            #[allow(unused_mut)]
-                            let mut builder = MessageBuilder::new();
-                            #(#mapping_and_writing)*
-                            let guest_sender_id = if let Some(id) = mapped_guest_sender_id {
-                                id
-                            } else {
+                            // Check the sender before mapping any new_id: a
+                            // dropped event must not consume a guest server
+                            // ID, since libwayland-client refuses gaps.
+                            let Some(guest_sender_id) = mapped_guest_sender_id else {
                                 log::debug!(
                                     "Dropping event from unmapped sender {}",
                                     msg.sender_id
                                 );
                                 return Ok(None);
                             };
+                            #[allow(unused_mut)]
+                            let mut builder = MessageBuilder::new();
+                            #(#mapping_and_writing)*
                             let full_msg =
                                 builder.try_build_message(guest_sender_id, #evt_idx)?;
                             #destructor_cleanup

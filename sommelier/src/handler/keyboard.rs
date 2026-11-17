@@ -1312,7 +1312,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -1362,11 +1362,11 @@ mod tests {
     }
 
     fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
-        u32::from_ne_bytes(message.0[0..4].try_into().unwrap())
+        crate::test_support::msg_sender(&message.0)
     }
 
     fn message_opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
-        (u32::from_ne_bytes(message.0[4..8].try_into().unwrap()) & 0xffff) as u16
+        crate::test_support::msg_opcode(&message.0)
     }
 
     fn message_first_u32(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
@@ -2853,15 +2853,13 @@ mod tests {
         // destroy message must have been queued to the host.
         assert_eq!(ctx.client_to_host_queue.len(), 1, "destroy must be queued");
         let (msg, _) = &ctx.client_to_host_queue[0];
-        // Message: [sender_id(4)] [size_opcode(4)]  — opcode 0, len 8.
-        let sender = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
-        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
+        let header = crate::test_support::msg_header(msg);
         assert_eq!(
-            sender, host_extended_id,
+            header.sender_id, host_extended_id,
             "destroy must target host_extended_id"
         );
-        assert_eq!(word2 >> 16, 8, "message length must be 8");
-        assert_eq!(word2 & 0xFFFF, 0, "opcode must be 0 (destroy)");
+        assert_eq!(header.len, 8, "message length must be 8");
+        assert_eq!(header.opcode, 0, "opcode must be 0 (destroy)");
     }
 
     #[test]
@@ -3157,7 +3155,7 @@ mod tests {
         );
         let (message, _) = &ctx.client_to_host_queue[0];
         assert_eq!(
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(message),
             50,
             "ack_key must target the child object, not the retired manager"
         );
@@ -4741,8 +4739,7 @@ mod tests {
         KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(10));
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let (msg, _) = &ctx.client_to_host_queue[0];
-        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
-        let opcode = word2 & 0xFFFF;
+        let opcode = crate::test_support::msg_opcode(msg);
         assert_eq!(
             opcode, 0,
             "get_extended_keyboard must use opcode 0, got {}",
@@ -4826,7 +4823,7 @@ mod tests {
         builder.write_u32(0x00000002);
         let msg = builder.build_message(42, 7);
 
-        let sender = u32::from_ne_bytes(msg[0..4].try_into().unwrap());
+        let sender = crate::test_support::msg_sender(&msg);
         assert_eq!(sender, 42, "sender_id wrong");
 
         let expected_total_len = 8u32 + payload.len() as u32; // header + payload
@@ -5076,7 +5073,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5169,7 +5166,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5257,7 +5254,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5322,7 +5319,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: String::new(),
-                guest_commit_serial: 1,
+                guest_commit_serial: crate::state::CommitCount::at(1),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: Vec::new(),
@@ -5403,7 +5400,7 @@ mod tests {
                     cursor_rect_dirty: false,
                     text_change_cause: 0,
                     current_preedit: String::new(),
-                    guest_commit_serial: 1,
+                    guest_commit_serial: crate::state::CommitCount::at(1),
                     pending_preedit_cursor: None,
                     pending_preedit_selection: None,
                     pending_deletes: Vec::new(),
@@ -5486,7 +5483,7 @@ mod tests {
                 cursor_rect_dirty: false,
                 text_change_cause: 0,
                 current_preedit: "한".to_string(),
-                guest_commit_serial: 9,
+                guest_commit_serial: crate::state::CommitCount::at(9),
                 pending_preedit_cursor: None,
                 pending_preedit_selection: None,
                 pending_deletes: vec![(3, 0)],
@@ -5506,16 +5503,16 @@ mod tests {
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
-        assert_eq!(state.guest_commit_serial, 9);
+        assert_eq!(state.guest_commit_serial.get(), 9);
 
         let deactivate = ctx.client_to_host_queue.iter().find(|(message, _)| {
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 50
-                && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) == 1
+            crate::test_support::msg_sender(message) == 50
+                && u32::from(crate::test_support::msg_opcode(message)) == 1
         });
         assert!(deactivate.is_some());
         assert!(ctx.host_to_client_queue.iter().any(|(message, _)| {
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()) == 40
-                && (u32::from_ne_bytes(message[4..8].try_into().unwrap()) & 0xffff) == 0
+            crate::test_support::msg_sender(message) == 40
+                && u32::from(crate::test_support::msg_opcode(message)) == 0
         }));
 
         ctx.key_generations

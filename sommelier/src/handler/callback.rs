@@ -134,12 +134,12 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         let message = &ctx.client_to_host_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
+            crate::test_support::msg_sender(message),
             1,
             "wl_display must own the sync request"
         );
         assert_eq!(
-            u16::from_ne_bytes(message[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(message),
             crate::protocols::wayland::wl_display::REQ_SYNC
         );
         assert_eq!(

@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_display;
-use crate::state::{Context, HostId};
+use crate::state::{Context, DeletedHostId, HostId};
 use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
 use log::error;
 
@@ -154,36 +154,18 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
     }
 
     fn on_delete_id(&mut self, ctx: &mut Context, id: u32) -> Action {
-        if ctx.shadow_table.consume_host_delete_id(id) {
-            // Internal host-only objects have no guest object ID. Consume
-            // their destructor acknowledgement locally instead of emitting an
-            // invalid delete_id(0) event to the guest.
-            ctx.remove_render_buffer_host(id);
-            return Action::Drop;
-        }
-        if let Some(&guest_id) = ctx.orphaned_dmabuf_params.get(&id) {
-            // An async linux-dmabuf create may emit `created`/`failed` after
-            // the host has acknowledged params.destroy. Retain the host
-            // interface metadata so that late event can still be dispatched,
-            // but complete the guest-side delete_id now.
-            let mapping_alive = ctx.shadow_table.get_guest_id(id) == Some(guest_id);
-            if mapping_alive && queue_guest_delete_id(ctx, guest_id) {
-                ctx.shadow_table.remove_guest_mapping(guest_id);
-                // remove_guest_mapping intentionally leaves the host
-                // interface reserved for the late async event. Clear
-                // only the guest pending-destroy marker; remove_id would
-                // discard the host interface before `created`/`failed`.
-                ctx.shadow_table.clear_pending_destroy_guest(guest_id);
-            }
-            return Action::Drop;
-        }
-        let guest_id = ctx.shadow_table.get_guest_id(id).unwrap_or(0);
-        if guest_id != 0 {
-            ctx.remove_render_buffer_host(id);
-            ctx.shadow_table.remove_id(guest_id);
-            ctx.pending_native_creates.remove(&HostId(id));
-
-            // Forward the corrected delete_id event to the client
+        // The host has destroyed the object, so no later event can name it,
+        // and the ID may go to the next new object: drop all state keyed by
+        // the host ID along with the ID itself.
+        let paired_guest = match ctx.shadow_table.release_deleted_host_id(id) {
+            DeletedHostId::Untracked => return Action::Drop,
+            DeletedHostId::HostOnly => None,
+            DeletedHostId::Paired(guest_id) => Some(guest_id),
+        };
+        ctx.remove_render_buffer_host(id);
+        ctx.pending_native_creates.remove(&HostId(id));
+        if let Some(guest_id) = paired_guest {
+            // Forward the translated acknowledgement for the guest object.
             queue_delete_id(ctx, guest_id);
         }
         Action::Drop
@@ -242,6 +224,23 @@ mod tests {
             ctx.fatal_protocol_error = true;
             Action::Drop
         }
+    }
+
+    #[test]
+    fn delete_id_for_an_untracked_host_id_changes_nothing() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        const UNTRACKED: u32 = 40;
+        assert!(ctx.register_native_buffer(UNTRACKED, (1, 1), Vec::new()));
+
+        assert_eq!(
+            DisplayHandler.on_delete_id(&mut ctx, UNTRACKED),
+            Action::Drop
+        );
+        assert!(
+            ctx.has_render_buffer_host(HostId(UNTRACKED)),
+            "a delete_id the table does not track must not end other state"
+        );
+        assert!(ctx.host_to_client_queue.is_empty());
     }
 
     #[test]

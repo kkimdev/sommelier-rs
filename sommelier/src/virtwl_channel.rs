@@ -546,9 +546,9 @@ mod tests {
             .expect("receive wl_callback.done through live VirtWL");
         assert!(fds.is_empty());
         assert!(reply.len() >= 12, "truncated wl_callback.done reply");
-        assert_eq!(u32::from_ne_bytes(reply[0..4].try_into().unwrap()), 2);
-        assert_eq!(u16::from_ne_bytes(reply[4..6].try_into().unwrap()), 0);
-        assert_eq!(u16::from_ne_bytes(reply[6..8].try_into().unwrap()), 12);
+        assert_eq!(crate::test_support::msg_sender(&reply), 2);
+        assert_eq!(crate::test_support::msg_opcode(&reply), 0);
+        assert_eq!(crate::test_support::msg_header(&reply).len, 12);
     }
 
     #[test]

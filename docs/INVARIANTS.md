@@ -30,6 +30,14 @@ always consumed; a configuration problem never stops the proxy) is owned by
   descriptor batch.
   Tests: `recvmsg_scm_rights_truncation_closes_kernel_installed_descriptors`,
   `truncated_scm_rights_closes_descriptors_recovered_from_control_buffer`.
+- **Received descriptors are bounded.** A connection holds at most
+  `MAX_PENDING_FDS` (1024, libwayland's incoming descriptor ring) received
+  descriptors that no message has consumed yet; one more ends that
+  connection, whose teardown closes them. The bound is per connection and
+  the number of clients is not, so it cannot keep the process within its
+  descriptor limit; `main` raises the soft `RLIMIT_NOFILE` to the hard
+  limit to leave room for many clients at their bound.
+  Test: `too_many_unconsumed_fds_end_the_connection`.
 - **Coalesced sends are correct.** Translated messages of one ordered
   stream MAY go out in one transport submission, because descriptors belong
   to the start of the ordered stream, not to a byte offset. Do not switch
@@ -37,6 +45,15 @@ always consumed; a configuration problem never stops the proxy) is owned by
   ioctls add latency and regress input throughput. Introduce
   message-granular sends only for a transport constraint that a regression
   test or device contract demonstrates.
+- **A submission carries at most 28 descriptors.** That is the VirtWL
+  transaction limit (`VIRTWL_SEND_MAX_ALLOCS`) and libwayland's
+  `MAX_FDS_OUT`, and `MAX_FDS_PER_SEND` applies it to both transports.
+  `WaylandConnection::send_messages` is the only way to send, and splits a
+  batch only between messages, so each message's descriptors travel with
+  its bytes and the receiver never meets a message whose descriptors have
+  not arrived. No single message carries more than 28.
+  Tests: `batches_send_at_most_the_transport_descriptor_limit_at_once`,
+  `send_messages_splits_only_between_messages`.
 - **VirtWL ioctl errors still own their descriptors.** Every descriptor
   returned in a transaction buffer belongs to the proxy, even when the
   ioctl reports an error after partially writing the buffer. Error paths
@@ -48,6 +65,14 @@ always consumed; a configuration problem never stops the proxy) is owned by
 
 ## Wire messages
 
+- **One owner for the header.** Production code reads and writes the
+  8-byte header only through `wire::MessageHeader`: the sender ID word, then
+  one native-endian word with the length in its upper 16 bits and the
+  opcode in its lower 16 bits. `MessageHeader::frame` alone decides whether
+  a buffered message is complete: one whose bytes have not all arrived
+  waits for the next receive, and an invalid length ends the connection.
+  Tests: `run_receives_the_rest_of_a_partially_buffered_message`,
+  `buffered_message_readiness_distinguishes_partial_and_complete_frames`.
 - **Host data is untrusted.** A message that carries host-provided strings
   or arrays MUST be built with the fallible `try_build_message` and handle
   `MessageTooLarge` without panicking; generated forwarding already does.
@@ -88,12 +113,36 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   that synthesize `delete_id` themselves (such as `wl_callback.done`) may
   retire their mapping when they queue it.
   Test: `destructor_mapping_survives_until_host_delete_id`.
+- **An ID returns only when its object is gone on both sides.** An ID the
+  proxy allocated on the host connection becomes reusable only through
+  `ShadowTable::release_deleted_host_id`, on the host's `delete_id`: the
+  host has then forgotten it, so every mapping of it is dropped and no
+  later event can name it. A `delete_id` for an ID the proxy does not track
+  changes nothing. An ID the host allocated (from `0xff000000`) gets no
+  `delete_id`; it stops being reserved as soon as the proxy destroys the
+  object. A guest ID from the server range returns, through
+  `ShadowTable::forget_guest_object`, when its guest object ends. Generated
+  dispatchers map a `new_id` only for a message they forward, so a dropped
+  message consumes no ID. Freed IDs are reused first, so the ID spaces stay
+  as dense as the live objects, and each stays within libwayland's map
+  limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`) inclusive, the ID itself
+  on the client side and its offset from `0xff000000` on the server side.
+  A client that exhausts a range ends; allocation runs in its own task, so
+  no other client is affected.
+  Tests: `host_ids_are_recycled_through_delete_id`,
+  `host_ids_are_not_reused_before_delete_id`,
+  `destroyed_host_allocated_object_frees_its_id_at_once`,
+  `every_end_of_a_server_created_guest_object_frees_its_id`,
+  `cycled_data_offers_keep_their_guest_id_small`,
+  `delete_id_for_an_untracked_host_id_changes_nothing`,
+  `event_from_an_unmapped_sender_maps_no_new_id`,
+  `host_ids_stay_within_libwayland_servers_client_range`.
 - **Host-only objects keep their ID reservation.** A host-only proxy object
   with a wire destructor keeps its host ID reserved until the host's
   `delete_id` arrives. Its dispatch metadata may go at once to suppress
-  stale events, but allocation skips the pending ID, and the display
-  handler consumes the acknowledgment without forwarding an invalid guest
-  ID. `Context::retire_destroyed_host_object` is the one way to retire such
+  stale events, and the display handler consumes the acknowledgment
+  without forwarding an invalid guest ID.
+  `Context::retire_destroyed_host_object` is the one way to retire such
   an object after its destructor is queued, and a refused retirement is
   fatal. An object with no wire destructor stays reserved for the
   connection, but `ShadowTable::retire_host_interface` retires its dispatch
@@ -290,6 +339,38 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   as stale once the surface mapping is gone. Teardown is explicit and
   idempotent: the later delayed leave does not duplicate the event.
   Test: `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`.
+- **Every v3 commit counts.** A text-input-v3 `done` serial is the number
+  of `commit` requests the guest made on the object, including commits made
+  while unfocused or whose state could not be encoded; those are still not
+  forwarded to the host. The count is a `CommitCount`, which only
+  `TextInputState::count_guest_commit` advances.
+  Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
+  `v3_requests_after_leave_are_ignored_until_next_enter`.
+
+## Process
+
+The proxy serves every Linux GUI app, so no single client and no signal may
+end it.
+
+- **One client's failure ends only that client.** Setting up an accepted
+  client returns errors instead of panicking. A failed accept (such as
+  EMFILE) pauses the accept loop for `ACCEPT_RETRY_DELAY` (100 ms) instead
+  of spinning on the shared thread, and is logged once until an accept
+  succeeds.
+  Tests: `unregistrable_descriptor_is_an_error_not_a_panic`,
+  `failing_accepts_back_off_instead_of_spinning`.
+- **`SIGHUP` never ends the proxy.** `prepare_process` in `main` installs
+  the handler first, in every configuration, before the shortcut file is
+  first read. Reloads run in their own task, so they never wait for the
+  accept loop, and an error is logged if that task ever ends.
+  Tests: `sighup_after_process_preparation_reaches_the_reload_handler`,
+  `sighup_without_a_shortcuts_file_does_not_end_the_proxy`,
+  `reload_does_not_wait_for_the_accept_retry_pause`.
+- **The socket belongs to the process holding its lock.** Like libwayland,
+  the proxy takes `flock(LOCK_EX | LOCK_NB)` on `<socket>.lock` for its
+  lifetime and only then removes a stale socket. If another process holds
+  the lock, the proxy exits and leaves that socket alone.
+  Test: `a_held_socket_lock_protects_the_live_socket`.
 
 ## ChromeOS shelf application IDs
 

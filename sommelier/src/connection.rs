@@ -15,11 +15,12 @@ limitations under the License.
 */
 
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::wire::{Framing, MessageHeader};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::HashSet;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -30,6 +31,69 @@ use tokio::io::unix::AsyncFd;
 // smaller, VirtWL-specific batch size. The parser below still handles
 // truncation defensively for malformed or non-Linux transports.
 const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
+
+/// The most received descriptors a connection holds before messages
+/// consume them.
+///
+/// Descriptors travel apart from the bytes, so a peer can attach them to
+/// messages that take none and make the proxy hold them indefinitely; with
+/// no bound, one client could exhaust the descriptor table that every
+/// client shares. libwayland buffers a connection's incoming descriptors in
+/// a 4096-byte ring, 1024 descriptors, and disconnects a peer that
+/// overflows it. Using the same bound refuses no peer that a libwayland
+/// compositor would accept.
+const MAX_PENDING_FDS: usize = 1024;
+
+/// The most descriptors one transport submission carries.
+///
+/// A VirtWL transaction has room for `VIRTWL_SEND_MAX_ALLOCS` (28), the
+/// same number libwayland sends per `sendmsg` (`MAX_FDS_OUT`). Both
+/// transports split batches at this bound, so the behavior tested over Unix
+/// sockets is the behavior on the device.
+pub(crate) const MAX_FDS_PER_SEND: usize = crate::virtwl::VIRTWL_SEND_MAX_ALLOCS;
+
+/// An ordered run of outgoing Wayland messages and their descriptors.
+///
+/// Sent by [`WaylandConnection::send_messages`], which coalesces messages
+/// into as few submissions as [`MAX_FDS_PER_SEND`] allows.
+#[derive(Debug, Default)]
+pub(crate) struct OutgoingMessages {
+    bytes: Vec<u8>,
+    fds: Vec<RawFd>,
+    /// Where each message ends in `bytes` and in `fds`.
+    ends: Vec<(usize, usize)>,
+}
+
+impl OutgoingMessages {
+    pub(crate) fn push(&mut self, message: &[u8], fds: &[RawFd]) {
+        // No Wayland message has that many descriptor arguments; one that
+        // did could not be sent in a single submission.
+        debug_assert!(
+            fds.len() <= MAX_FDS_PER_SEND,
+            "a message carries {} descriptors",
+            fds.len()
+        );
+        self.bytes.extend_from_slice(message);
+        self.fds.extend_from_slice(fds);
+        self.ends.push((self.bytes.len(), self.fds.len()));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The descriptors of every message, which the caller still owns.
+    pub(crate) fn fds(&self) -> &[RawFd] {
+        &self.fds
+    }
+
+    /// Discard the messages, returning their descriptors.
+    pub(crate) fn take_fds(&mut self) -> Vec<RawFd> {
+        self.bytes.clear();
+        self.ends.clear();
+        std::mem::take(&mut self.fds)
+    }
+}
 
 pub struct WaylandConnection {
     transport: ConnectionTransport,
@@ -235,27 +299,21 @@ fn recv_unix_message(
 }
 
 impl WaylandConnection {
-    pub fn new(fd: RawFd) -> Self {
-        // Safety: We assume we own the fd passed in
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        // Ensure non-blocking mode for AsyncFd
-        let raw_fd = owned.as_raw_fd();
-        unsafe {
-            let borrowed_fd = std::os::fd::BorrowedFd::borrow_raw(raw_fd);
-            let flags_int = fcntl(borrowed_fd, FcntlArg::F_GETFL).unwrap_or(0);
-            let flags = OFlag::from_bits_truncate(flags_int);
-            let _ = fcntl(borrowed_fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK));
-        }
-
-        Self {
-            transport: ConnectionTransport::Unix(
-                AsyncFd::new(owned).expect("Failed to create AsyncFd"),
-            ),
+    /// Wrap a Unix socket, which the connection then owns.
+    ///
+    /// Fails when the descriptor cannot be made non-blocking or registered
+    /// with the event loop; the caller drops only this connection.
+    pub fn new(fd: OwnedFd) -> io::Result<Self> {
+        // AsyncFd requires a non-blocking descriptor. F_SETFL replaces the
+        // status flags, so keep the existing ones.
+        let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+        fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self {
+            transport: ConnectionTransport::Unix(AsyncFd::new(fd)?),
             read_buf: Vec::new(),
             read_fds: Vec::new(),
             ambiguous_untracked_fd: false,
-        }
+        })
     }
 
     pub fn new_virtwayland(channel: Arc<VirtWaylandChannel>) -> Self {
@@ -265,6 +323,29 @@ impl WaylandConnection {
             read_fds: Vec::new(),
             ambiguous_untracked_fd: false,
         }
+    }
+
+    /// Append one receive to the ordered byte and descriptor buffers.
+    ///
+    /// Fails once more than [`MAX_PENDING_FDS`] descriptors are pending; the
+    /// caller then closes the connection, which closes them.
+    fn append_received(
+        &mut self,
+        data: &[u8],
+        fds: impl IntoIterator<Item = RawFd>,
+    ) -> io::Result<()> {
+        self.read_buf.extend_from_slice(data);
+        self.read_fds.extend(fds);
+        if self.read_fds.len() > MAX_PENDING_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer has {} unconsumed file descriptors; the limit is {MAX_PENDING_FDS}",
+                    self.read_fds.len()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Return whether the buffered byte stream contains a complete Wayland
@@ -277,18 +358,17 @@ impl WaylandConnection {
     /// `read_buf` (which must be dispatched without waiting for new socket
     /// activity).
     pub(crate) fn has_complete_message(&self) -> bool {
-        if self.read_buf.len() < 8 {
-            return false;
-        }
-        let length = u16::from_ne_bytes([self.read_buf[4], self.read_buf[5]]) as usize;
         // An invalid length is "ready" too: dispatching it lets the normal
         // protocol validation report the error instead of spinning on a
         // permanently buffered malformed header. A valid message is ready
         // only once all of its bytes are buffered.
-        length < 8 || !length.is_multiple_of(4) || length <= self.read_buf.len()
+        !matches!(MessageHeader::frame(&self.read_buf), Framing::Partial)
     }
 
-    pub async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    /// Send one transport submission. Private: everything outgoing goes
+    /// through [`Self::send_messages`], which keeps each submission within
+    /// [`MAX_FDS_PER_SEND`].
+    async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
         if data.is_empty() && fds.is_empty() {
             return Ok(());
         }
@@ -346,6 +426,33 @@ impl WaylandConnection {
         }
     }
 
+    /// Send `messages` in order, in as few submissions as
+    /// [`MAX_FDS_PER_SEND`] allows.
+    ///
+    /// A submission ends only between messages, so every message's
+    /// descriptors travel with its bytes: a receiver must never meet a
+    /// message whose descriptors have not arrived yet.
+    pub(crate) async fn send_messages(&mut self, messages: &OutgoingMessages) -> io::Result<()> {
+        let mut start = (0, 0);
+        let mut end = start;
+        for &message_end in &messages.ends {
+            if message_end.1 - start.1 > MAX_FDS_PER_SEND {
+                self.send(
+                    &messages.bytes[start.0..end.0],
+                    &messages.fds[start.1..end.1],
+                )
+                .await?;
+                start = end;
+            }
+            end = message_end;
+        }
+        self.send(
+            &messages.bytes[start.0..end.0],
+            &messages.fds[start.1..end.1],
+        )
+        .await
+    }
+
     pub async fn recv(&mut self) -> io::Result<usize> {
         match &mut self.transport {
             ConnectionTransport::Unix(fd) => {
@@ -361,8 +468,7 @@ impl WaylandConnection {
 
                     match result {
                         Ok(Ok((bytes, fds))) => {
-                            self.read_buf.extend_from_slice(&buf[..bytes]);
-                            self.read_fds.extend(fds);
+                            self.append_received(&buf[..bytes], fds)?;
                             return Ok(bytes);
                         }
                         Ok(Err(e)) => return Err(e),
@@ -372,11 +478,8 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => {
                 let (data, fds) = channel.recv().await?;
-                let len = data.len();
-                self.read_buf.extend(data);
-                self.read_fds
-                    .extend(fds.into_iter().map(|fd| fd.into_raw_fd()));
-                Ok(len)
+                self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                Ok(data.len())
             }
         }
     }
@@ -393,8 +496,7 @@ impl WaylandConnection {
                 let mut cmsg_space = nix::cmsg_space!([RawFd; UNIX_MAX_SCM_RIGHTS_FDS]);
                 match recv_unix_message(fd.as_raw_fd(), &mut buf, &mut cmsg_space) {
                     Ok((bytes, fds)) => {
-                        self.read_buf.extend_from_slice(&buf[..bytes]);
-                        self.read_fds.extend(fds);
+                        self.append_received(&buf[..bytes], fds)?;
                         Ok(Some(bytes))
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -403,11 +505,8 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => match channel.try_recv()? {
                 Some((data, fds)) => {
-                    let len = data.len();
-                    self.read_buf.extend(data);
-                    self.read_fds
-                        .extend(fds.into_iter().map(|fd| fd.into_raw_fd()));
-                    Ok(Some(len))
+                    self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                    Ok(Some(data.len()))
                 }
                 None => Ok(None),
             },
@@ -437,15 +536,19 @@ impl Drop for WaylandConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection};
+    use super::{
+        decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
+        WaylandConnection, MAX_PENDING_FDS,
+    };
     use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     use std::ffi::CString;
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -459,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn try_recv_is_nonblocking_and_preserves_the_ordered_stream() {
         let (mut peer, socket) = UnixStream::pair().expect("unix socket pair");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
 
         assert_eq!(
             connection.try_recv().expect("empty non-blocking receive"),
@@ -474,6 +577,99 @@ mod tests {
         );
         assert_eq!(connection.read_buf, message);
         assert!(connection.read_fds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unregistrable_descriptor_is_an_error_not_a_panic() {
+        // epoll refuses regular files, so the event loop cannot watch one.
+        let name = CString::new("sommelier-unpollable").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        assert!(WaylandConnection::new(memfd).is_err());
+    }
+
+    /// Send one byte with `fd` attached, as a message that takes no
+    /// descriptor would carry it.
+    fn send_with_fd(peer: &UnixStream, fd: RawFd) {
+        use std::os::fd::AsRawFd;
+        let sent = sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(b"x")],
+            &[ControlMessage::ScmRights(&[fd])],
+            MsgFlags::empty(),
+            None,
+        )
+        .expect("send a descriptor");
+        assert_eq!(sent, 1);
+    }
+
+    #[tokio::test]
+    async fn send_messages_splits_only_between_messages() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let name = CString::new("sommelier-split-batch").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let fd = memfd.as_raw_fd();
+
+        // (bytes, descriptors) per message: the second message would take
+        // the first submission past the limit, so it starts the next one.
+        let mut messages = OutgoingMessages::default();
+        for (len, fds) in [(8, 20), (12, 10), (16, 0), (20, 5)] {
+            messages.push(&vec![0; len], &vec![fd; fds]);
+        }
+        connection
+            .send_messages(&messages)
+            .await
+            .expect("send the batch");
+        drop(connection);
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let mut control = vec![0u8; 4096];
+            let (bytes, fds) =
+                recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
+            if bytes == 0 {
+                break;
+            }
+            for &received in &fds {
+                unsafe { libc::close(received) };
+            }
+            submissions.push((bytes, fds.len()));
+        }
+        assert_eq!(submissions, vec![(8, 20), (48, 15)]);
+    }
+
+    #[tokio::test]
+    async fn too_many_unconsumed_fds_end_the_connection() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        // Stand-ins for descriptors already pending; negative entries are
+        // never closed, so the test does not need a thousand real ones.
+        connection.read_fds.resize(MAX_PENDING_FDS - 1, -1);
+
+        let name = CString::new("sommelier-pending-fd-limit").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let identity = fd_identity(memfd.as_raw_fd());
+        send_with_fd(&peer, memfd.as_raw_fd());
+        send_with_fd(&peer, memfd.as_raw_fd());
+        drop(memfd);
+
+        assert_eq!(
+            connection
+                .recv()
+                .await
+                .expect("the limit itself is allowed"),
+            1
+        );
+        assert!(
+            connection.recv().await.is_err(),
+            "one descriptor past the limit must end the connection"
+        );
+        drop(connection);
+        assert!(
+            !any_fd_has_identity(identity),
+            "closing the connection must close every pending descriptor"
+        );
     }
 
     #[tokio::test]
@@ -494,7 +690,9 @@ mod tests {
         unsafe {
             libc::close(pipe_fds[1]);
         }
-        let mut connection = WaylandConnection::new(read_fd);
+        let mut connection =
+            WaylandConnection::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) })
+                .expect("register test pipe");
         connection.read_fds.push(pending_fd);
         drop(connection);
 
@@ -601,30 +799,37 @@ mod tests {
     #[tokio::test]
     async fn buffered_message_readiness_distinguishes_partial_and_complete_frames() {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
 
-        // A partial header/body must wait for another recvmsg call.
-        connection.read_buf.extend_from_slice(&[0; 7]);
-        assert!(!connection.has_complete_message());
-        connection.read_buf.push(0);
-        // Wayland length is 8 bytes for a header-only message.
-        connection.read_buf[4..6].copy_from_slice(&8_u16.to_ne_bytes());
-        assert!(connection.has_complete_message());
-
+        // Opcode 0 keeps the bytes that hold the opcode zero, so a decoder
+        // that reads the length from the opcode half sees an invalid length
+        // and reports a partial frame as ready.
+        let mut builder = MessageBuilder::new();
+        builder.write_u32(2);
+        let message = builder.build_message(1, 0);
+        for partial in 0..message.len() {
+            connection.read_buf.clear();
+            connection.read_buf.extend_from_slice(&message[..partial]);
+            assert!(
+                !connection.has_complete_message(),
+                "{partial} of {} bytes must wait for the rest",
+                message.len()
+            );
+        }
         connection.read_buf.clear();
-        connection.read_buf.extend_from_slice(&[0; 8]);
-        connection.read_buf[4..6].copy_from_slice(&16_u16.to_ne_bytes());
-        assert!(!connection.has_complete_message());
-        connection.read_buf.extend_from_slice(&[0; 8]);
+        connection.read_buf.extend_from_slice(&message);
         assert!(connection.has_complete_message());
     }
 
     #[tokio::test]
     async fn malformed_buffered_length_is_ready_for_protocol_validation() {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
-        connection.read_buf.extend_from_slice(&[0; 8]);
-        connection.read_buf[4..6].copy_from_slice(&6_u16.to_ne_bytes());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let mut message = MessageBuilder::new().build_message(1, 0);
+        // Rewrite the length to 6, below the header size.
+        let invalid_word = (6_u32 << 16).to_ne_bytes();
+        message[4..8].copy_from_slice(&invalid_word);
+        connection.read_buf.extend_from_slice(&message);
         assert!(
             connection.has_complete_message(),
             "invalid buffered headers must not make the event loop wait forever"

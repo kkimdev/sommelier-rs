@@ -91,6 +91,17 @@ mod tests {
                 && compact.contains("remove_id(msg.sender_id)"),
             "generated server-object destructors must release mappings without delete_id"
         );
+        // wl_display.sync is the first request arm and has a new_id.
+        let sender_check = compact
+            .find("Droppingrequestfromunmappedsender")
+            .expect("request sender check");
+        let allocation = compact
+            .find("allocate_host_id()")
+            .expect("new_id allocation");
+        assert!(
+            sender_check < allocation,
+            "a request's sender must be checked before its new_id is mapped"
+        );
         assert!(
             compact.contains("queue_local_delete_id"),
             "generated local-only destructors must synthesize a guest delete_id"

@@ -2849,7 +2849,7 @@ mod tests {
         assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(
-            u16::from_ne_bytes(ctx.client_to_host_queue[0].0[4..6].try_into().unwrap()),
+            crate::test_support::msg_opcode(&ctx.client_to_host_queue[0].0),
             0,
             "rollback must queue wl_buffer.destroy"
         );
@@ -3270,7 +3270,10 @@ mod tests {
         assert!(ctx.host_to_client_queue.is_empty());
 
         let reused_guest = register_test_server_native(&mut ctx, host_buffer);
-        assert_ne!(reused_guest, guest_buffer);
+        assert_eq!(
+            reused_guest, guest_buffer,
+            "a destroyed server-created buffer's guest ID is reused first"
+        );
         assert_eq!(
             ctx.shadow_table.get_host_id(reused_guest),
             Some(host_buffer),
