@@ -383,19 +383,17 @@ impl KeyboardHandler {
                 .keyboard_to_extended_keyboard
                 .contains_key(&host_keyboard_id)
             {
-                let host_extended_id = HostId::from_allocated(ctx.shadow_table.allocate_host_id());
+                let extended_version = ctx
+                    .shadow_table
+                    .host_object_version_or_unknown(extension_host_id.0);
+                let host_extended_id = HostId::from_allocated(
+                    ctx.shadow_table
+                        .create_host_only("zcr_extended_keyboard_v1", extended_version),
+                );
                 ctx.keyboard_to_extended_keyboard
                     .insert(host_keyboard_id, host_extended_id);
                 ctx.extended_keyboard_to_keyboard
                     .insert(host_extended_id, host_keyboard_id);
-                let extended_version = ctx
-                    .shadow_table
-                    .host_object_version_or_unknown(extension_host_id.0);
-                ctx.shadow_table.track_host_interface_with_version(
-                    host_extended_id.0,
-                    "zcr_extended_keyboard_v1".to_string(),
-                    extended_version,
-                );
 
                 ctx.client_to_host_queue.push(
                     zcr_keyboard_extension_v1::req::get_extended_keyboard(

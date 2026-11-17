@@ -30,11 +30,9 @@ pub struct CallbackHandler;
 /// The callback's host ID, which stays reserved until the host's
 /// `wl_display.delete_id`.
 pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> HostId {
-    let callback = HostId(ctx.shadow_table.allocate_host_id());
-    ctx.shadow_table.track_host_interface_with_version(
-        callback.0,
-        "wl_callback".to_string(),
-        wl_callback::VERSION,
+    let callback = HostId(
+        ctx.shadow_table
+            .create_host_only("wl_callback", wl_callback::VERSION),
     );
     ctx.internal_callbacks.register(callback, waits_for);
     ctx.client_to_host_queue

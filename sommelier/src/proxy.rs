@@ -159,7 +159,8 @@ struct Client {
 }
 
 impl Client {
-    fn new(client_conn: WaylandConnection, host_conn: WaylandConnection, ctx: Context) -> Self {
+    fn new(client_conn: WaylandConnection, host_conn: WaylandConnection, mut ctx: Context) -> Self {
+        ctx.shadow_table.create_display();
         Self {
             client_conn,
             host_conn,
@@ -169,11 +170,6 @@ impl Client {
     }
 
     async fn run(mut self) {
-        self.ctx.shadow_table.map_id(1, 1);
-        self.ctx
-            .shadow_table
-            .track_interface(1, "wl_display".to_string());
-
         // When both streams already have complete messages buffered, alternate
         // directions. This gives host input (keyboard/IME) a bounded wait even
         // while a large client render burst is being drained.

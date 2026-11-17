@@ -94,12 +94,9 @@ pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u3
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
     let shell = ctx.host_zaura_shell?;
-    let child_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        child_host_id,
-        child.interface.to_string(),
-        shell.version,
-    );
+    let child_host_id = ctx
+        .shadow_table
+        .create_host_only(child.interface, shell.version);
     ctx.client_to_host_queue
         .push((child.get)(shell.id, child_host_id, parent_host_id));
     Some(child_host_id)

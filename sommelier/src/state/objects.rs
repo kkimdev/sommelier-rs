@@ -21,6 +21,8 @@ use std::collections::HashMap;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
 use super::{GuestId, HostId, INERT_BIND_INTERFACE};
+use crate::protocols::wayland::wl_display;
+use crate::wire::WL_DISPLAY_ID;
 use log::warn;
 
 /// What a host `wl_display.delete_id` ended
@@ -244,6 +246,99 @@ impl ShadowTable {
             // allocated (a test fixture) gets here.
             warn!("Skipping guest server ID {id}, which is registered but was never allocated");
         }
+    }
+
+    /// Create `wl_display`, the object a connection starts with, under the
+    /// ID it has on both sides.
+    pub fn create_display(&mut self) {
+        let (guest, host) = (GuestId(WL_DISPLAY_ID), HostId(WL_DISPLAY_ID));
+        let interface = || Interface {
+            name: "wl_display".to_string(),
+            version: wl_display::VERSION,
+        };
+        self.insert_pair(guest, interface(), host, interface());
+    }
+
+    /// Create guest object `guest_id` and a host object for it, paired, each
+    /// with `interface` and its own version.
+    ///
+    /// # Returns
+    ///
+    /// The host object's ID, newly allocated.
+    pub fn create_paired(
+        &mut self,
+        guest_id: u32,
+        interface: &str,
+        version: u32,
+        host_version: u32,
+    ) -> u32 {
+        self.create_bridged(guest_id, interface, version, interface, host_version)
+    }
+
+    /// Like [`Self::create_paired`], for a guest object backed by a host
+    /// object of another interface: a guest `zwp_text_input_v3` backed by a
+    /// host `zwp_text_input_v1`.
+    pub fn create_bridged(
+        &mut self,
+        guest_id: u32,
+        interface: &str,
+        version: u32,
+        host_interface: &str,
+        host_version: u32,
+    ) -> u32 {
+        let host = HostId(self.allocate_host_id());
+        self.insert_pair(
+            GuestId(guest_id),
+            Interface {
+                name: interface.to_string(),
+                version,
+            },
+            host,
+            Interface {
+                name: host_interface.to_string(),
+                version: host_version,
+            },
+        );
+        host.0
+    }
+
+    /// Create a host object that only the proxy uses.
+    ///
+    /// # Returns
+    ///
+    /// Its ID, newly allocated.
+    pub fn create_host_only(&mut self, interface: &str, version: u32) -> u32 {
+        let host = HostId(self.allocate_host_id());
+        let object = HostObject::HostOnly {
+            interface: interface.to_string(),
+            version: Some(version),
+        };
+        self.hosts.insert(host, object);
+        host.0
+    }
+
+    /// Record a new pairing of two unused IDs.
+    fn insert_pair(&mut self, guest: GuestId, interface: Interface, host: HostId, own: Interface) {
+        let host_object = HostObject::Paired {
+            guest,
+            interface: Some(own.name),
+            version: Some(own.version),
+        };
+        let guest_object = GuestObject::Paired {
+            host,
+            interface: Some(interface),
+            state: GuestState::Live,
+        };
+        let previous = (
+            self.hosts.insert(host, host_object),
+            self.guests.insert(guest, guest_object),
+        );
+        debug_assert!(
+            matches!(previous, (None, None)),
+            "pairing guest ID {} or host ID {} in use",
+            guest.0,
+            host.0
+        );
     }
 
     /// Pair the hard-coded IDs of a test fixture as one object of
@@ -512,6 +607,7 @@ impl ShadowTable {
 
     /// Record the interface of guest object `guest_id`, keeping its version
     /// if it has one.
+    #[cfg(test)]
     pub fn track_interface(&mut self, guest_id: u32, interface: String) {
         let version = self
             .guests

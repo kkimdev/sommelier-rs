@@ -714,18 +714,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // format/modifier pairs and synthesize the v4 feedback object.
             // v2 still keeps create_immed available on older hosts.
             let host_bind_version = client_version.min(LINUX_DMABUF_CAPABILITY_VERSION);
-            let host_id = ctx.shadow_table.allocate_host_id();
+            // The host compositor sends format/modifier events to the
+            // dmabuf factory object after we bind it.
+            let host_id = ctx
+                .shadow_table
+                .create_host_only("zwp_linux_dmabuf_v1", host_bind_version);
             ctx.host_dmabuf_id = Some(host_id);
             ctx.host_dmabuf_global_name = Some(name);
             ctx.host_dmabuf_generation = Some(generation);
             ctx.dmabuf_capabilities.entry(generation).or_default();
-            // Register for event dispatch: the host compositor sends format/modifier
-            // events to the dmabuf factory object after we bind it.
-            ctx.shadow_table.track_host_interface_with_version(
-                host_id,
-                "zwp_linux_dmabuf_v1".to_string(),
-                host_bind_version,
-            );
 
             if ctx.gpu_accel {
                 if can_synthesize_feedback {
@@ -781,17 +778,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 advertise_text_input_manager_v3(ctx, name);
                 return Action::Drop;
             }
-            let host_id = ctx.shadow_table.allocate_host_id();
+            // This object is internal: there is no guest-side pair.
+            let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
             ctx.host_text_input_manager_v1_id = Some(host_id);
             ctx.host_text_input_manager_v1_global_name = Some(name);
-            // This object is internal (there is no guest-side pair), but it
-            // still occupies a host object ID and must be reserved so a later
-            // allocation cannot collide with it.
-            ctx.shadow_table.track_host_interface_with_version(
-                host_id,
-                interface.clone(),
-                bound_version,
-            );
 
             advertise_text_input_manager_v3(ctx, name);
 
@@ -816,16 +806,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             let bound_version = version.min(TEXT_INPUT_EXTENSION_VERSION);
             ctx.hidden_host_globals.insert(name, interface.clone());
             record_registry_global_visibility(ctx, name, false);
-            let host_id = ctx.shadow_table.allocate_host_id();
+            let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
             ctx.host_text_input_extension_v1_id = Some(host_id);
             ctx.host_text_input_extension_v1_global_name = Some(name);
-            // Reserve internal host-only objects in the allocator even though
-            // the factory does not emit events addressed to this object.
-            ctx.shadow_table.track_host_interface_with_version(
-                host_id,
-                interface.clone(),
-                bound_version,
-            );
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
@@ -851,17 +834,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // specific protocol that enables the ack-key mechanism for
             // controlling host accelerator processing. Version 2 additionally
             // reports physical keys consumed by IME via peek_key.
-            let host_id = ctx.shadow_table.allocate_host_id();
+            // An internal host-only factory object. Its ID is also used as
+            // the sender for get_extended_keyboard requests.
+            let bound_version = keyboard_extension_version(version);
+            let host_id = ctx.shadow_table.create_host_only(interface, bound_version);
             ctx.host_keyboard_extension_id = Some(HostId::from_allocated(host_id));
             ctx.host_keyboard_extension_global_name = Some(name);
-            let bound_version = keyboard_extension_version(version);
-            // Reserve this internal host-only factory object. Its ID is also
-            // used as the sender for get_extended_keyboard requests.
-            ctx.shadow_table.track_host_interface_with_version(
-                host_id,
-                interface.clone(),
-                bound_version,
-            );
 
             let registry_host_id = ctx.last_sender_id;
             queue_internal_bind(
@@ -901,18 +879,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // IDs and GTK startup IDs. The host-specific global is replaced
             // at the guest boundary with gtk_shell1, using the same numeric
             // registry name so its global_remove lifecycle remains paired.
-            let host_id = ctx.shadow_table.allocate_host_id();
             let bound_version = std::cmp::min(version, ZAURA_SHELL_MAX_VERSION);
+            let host_id = ctx
+                .shadow_table
+                .create_host_only("zaura_shell", bound_version);
             ctx.host_zaura_shell = Some(HostAuraShell {
                 id: host_id,
                 global_name: name,
                 version: bound_version,
             });
-            ctx.shadow_table.track_host_interface_with_version(
-                host_id,
-                "zaura_shell".to_string(),
-                bound_version,
-            );
             ctx.host_globals.insert(
                 name,
                 HostGlobal {
@@ -961,7 +936,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 record_registry_global_visibility(ctx, name, visible);
                 return Action::Drop;
             }
-            let host_id = ctx.shadow_table.allocate_host_id();
+            // wl_shm is emulated: on_bind drops the guest request and sends synthetic
+            // format events, so the host never sends wl_shm events to us. It is
+            // nevertheless a live host object.
+            let host_id = ctx.shadow_table.create_host_only(interface, 1);
             ctx.host_shm_id = Some(host_id);
             ctx.host_shm_global_name = Some(name);
             ctx.host_globals.insert(
@@ -971,11 +949,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     version: 1,
                 },
             );
-            // wl_shm is emulated: on_bind drops the guest request and sends synthetic
-            // format events, so the host never sends wl_shm events to us. It is
-            // nevertheless a live host object and its ID must be reserved.
-            ctx.shadow_table
-                .track_host_interface_with_version(host_id, interface.clone(), 1);
 
             // Bind to wl_shm
             let registry_host_id = ctx.last_sender_id;
@@ -1211,11 +1184,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             return Action::Drop;
         }
 
-        // Translation logic for other interfaces
-        let host_new_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table.map_id(*guest_new_id, host_new_id);
-        ctx.shadow_table
-            .track_interface_with_version(*guest_new_id, interface.clone(), *version);
+        // Every other global is paired with a host binding.
+        //
         // The guest-facing dmabuf global is synthesized at v4, while the
         // host object used for params/create may only be v2/v3. Keep the
         // guest metadata at v4 so feedback requests are accepted locally,
@@ -1229,7 +1199,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         } else {
             *version
         };
-        ctx.shadow_table.set_host_version(host_new_id, host_version);
+        let host_new_id =
+            ctx.shadow_table
+                .create_paired(*guest_new_id, interface, *version, host_version);
 
         // We need to send the bind request to the host.
         // The sender is the registry object.

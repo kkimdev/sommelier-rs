@@ -1235,17 +1235,36 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             log::error!("Cannot create v3 text input without a host v1 manager");
             return Action::Drop;
         };
-        let host_v1_id = ctx.shadow_table.allocate_host_id();
+        // A new object takes its parent's version: the guest text input its
+        // guest manager's, and each host object its host manager's.
+        let guest_manager_version = ctx
+            .shadow_table
+            .guest_object_version_or_unknown(ctx.last_sender_id);
+        let host_manager_version = ctx
+            .shadow_table
+            .host_object_version_or_unknown(host_manager_id);
+        let host_v1_id = ctx.shadow_table.create_bridged(
+            id,
+            "zwp_text_input_v3",
+            guest_manager_version,
+            "zwp_text_input_v1",
+            host_manager_version,
+        );
         ctx.client_to_host_queue
             .push(zwp_text_input_manager_v1::req::create_text_input(
                 host_manager_id,
                 host_v1_id,
             ));
 
-        let host_ext = ctx
+        let host_ext_id = ctx
             .host_text_input_extension_v1_id
             .map(|host_ext_manager_id| {
-                let host_ext_id = ctx.shadow_table.allocate_host_id();
+                let host_ext_version = ctx
+                    .shadow_table
+                    .host_object_version_or_unknown(host_ext_manager_id);
+                let host_ext_id = ctx
+                    .shadow_table
+                    .create_host_only("zcr_extended_text_input_v1", host_ext_version);
                 ctx.client_to_host_queue.push(
                     zcr_text_input_extension_v1::req::get_extended_text_input(
                         host_ext_manager_id,
@@ -1253,49 +1272,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                         host_v1_id,
                     ),
                 );
-                (host_ext_id, host_ext_manager_id)
+                host_ext_id
             });
-
-        // A new object takes its parent's version: the guest text input its
-        // guest manager's, and each host object its host manager's.
-        ctx.shadow_table.map_id(id, host_v1_id);
-        let guest_manager_version = ctx
-            .shadow_table
-            .guest_object_version_or_unknown(ctx.last_sender_id);
-        ctx.shadow_table.track_interface_with_version(
-            id,
-            "zwp_text_input_v3".to_string(),
-            guest_manager_version,
-        );
-        let host_manager_version = ctx
-            .shadow_table
-            .host_object_version_or_unknown(host_manager_id);
-        ctx.shadow_table.track_host_interface_with_version(
-            host_v1_id,
-            "zwp_text_input_v1".to_string(),
-            host_manager_version,
-        );
-        if let Some((host_ext_id, host_ext_manager_id)) = host_ext {
-            let host_ext_version = ctx
-                .shadow_table
-                .host_object_version_or_unknown(host_ext_manager_id);
-            ctx.shadow_table.track_host_interface_with_version(
-                host_ext_id,
-                "zcr_extended_text_input_v1".to_string(),
-                host_ext_version,
-            );
-        }
 
         let active_surface = ctx.keyboard_focus.surface_for_seat(seat);
 
         ctx.text_inputs.insert(
             id,
-            crate::state::TextInputState::new(
-                host_v1_id,
-                host_ext.map(|(host_ext_id, _)| host_ext_id),
-                seat,
-                active_surface,
-            ),
+            crate::state::TextInputState::new(host_v1_id, host_ext_id, seat, active_surface),
         );
 
         // A text-input object created after keyboard focus was established

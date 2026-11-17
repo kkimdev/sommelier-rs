@@ -1167,16 +1167,10 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // We need to map buffer_id manually because we are dropping the request.
         // Codegen would map it if we forwarded.
         // buffer_id is new_id wl_buffer.
-        let host_buffer_id = ctx.shadow_table.allocate_host_id();
         let buffer_version = ctx.shadow_table.guest_object_version_or_unknown(params_id);
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table.track_interface_with_version(
-            buffer_id,
-            "wl_buffer".to_string(),
-            buffer_version,
-        );
-        ctx.shadow_table
-            .set_host_version(host_buffer_id, buffer_version);
+        let host_buffer_id =
+            ctx.shadow_table
+                .create_paired(buffer_id, "wl_buffer", buffer_version, buffer_version);
         if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
             ctx.client_to_host_queue
                 .push(zwp_linux_buffer_params_v1::req::create_immed(

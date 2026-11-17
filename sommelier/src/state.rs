@@ -107,11 +107,11 @@ impl HostId {
         Self(ctx.last_sender_id)
     }
 
-    /// Wrap an ID freshly returned by [`ShadowTable::allocate_host_id`].
+    /// Wrap the ID of a host object a [`ShadowTable`] constructor just
+    /// created, such as [`ShadowTable::create_host_only`].
     ///
-    /// Using this constructor (rather than the bare `HostId(raw)` tuple syntax)
-    /// makes allocation sites auditable: a code search for `from_allocated` finds
-    /// every place a new host-side object is created.
+    /// Using this constructor rather than the bare `HostId(raw)` tuple syntax
+    /// states where the ID came from.
     #[inline]
     pub(crate) fn from_allocated(id: u32) -> Self {
         Self(id)

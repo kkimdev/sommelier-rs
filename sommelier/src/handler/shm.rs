@@ -1537,21 +1537,20 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         return;
     }
 
-    let host_pool_id = ctx.shadow_table.allocate_host_id();
     // The temporary host wl_shm_pool remains live until the queued
-    // destroy request is processed by the compositor. Reserve its
-    // ID even though it has no guest-side object or event
-    // callbacks. A new object takes its parent's version.
+    // destroy request is processed by the compositor, although it has no
+    // guest-side object or event callbacks. A new object takes its
+    // parent's version.
     let pool_version = ctx
         .shadow_table
         .host_object_version_or_unknown(host_wl_shm_id);
-    ctx.shadow_table.track_host_interface_with_version(
-        host_pool_id,
-        "wl_shm_pool".to_string(),
-        pool_version,
-    );
+    let host_pool_id = ctx
+        .shadow_table
+        .create_host_only("wl_shm_pool", pool_version);
 
-    let host_buffer_id = ctx.shadow_table.allocate_host_id();
+    let host_buffer_id = ctx
+        .shadow_table
+        .create_paired(request.id, "wl_buffer", 1, 1);
     ctx.client_to_host_queue.extend([
         wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
         // The buffer starts the pool, and keeps its SHM (not DRM) format.
@@ -1687,16 +1686,13 @@ fn create_dmabuf_buffer(
         (std::ptr::null_mut(), 0)
     };
 
-    let params_id = ctx.shadow_table.allocate_host_id();
     // A new object takes its parent's version.
     let params_version = ctx
         .shadow_table
         .host_object_version_or_unknown(host_dmabuf_id);
-    ctx.shadow_table.track_host_interface_with_version(
-        params_id,
-        "zwp_linux_buffer_params_v1".to_string(),
-        params_version,
-    );
+    let params_id = ctx
+        .shadow_table
+        .create_host_only("zwp_linux_buffer_params_v1", params_version);
     ctx.client_to_host_queue
         .push(zwp_linux_dmabuf_v1::req::create_params(
             host_dmabuf_id,
@@ -1727,7 +1723,9 @@ fn create_dmabuf_buffer(
             ));
     }
 
-    let host_buffer_id = ctx.shadow_table.allocate_host_id();
+    let host_buffer_id = ctx
+        .shadow_table
+        .create_paired(request.id, "wl_buffer", 1, 1);
     ctx.client_to_host_queue
         .push(zwp_linux_buffer_params_v1::req::create_immed(
             params_id,
@@ -1768,8 +1766,9 @@ fn create_dmabuf_buffer(
     );
 }
 
-/// Map the guest `wl_buffer` to its host buffer and register its storage. A
-/// duplicate host generation rolls the buffer back and reports `failure`.
+/// Register the storage of the guest `wl_buffer` paired with host buffer
+/// `host_buffer_id`. A duplicate host generation rolls the buffer back and
+/// reports `failure`.
 fn register_shm_buffer(
     ctx: &mut Context,
     request: &ShmBufferRequest,
@@ -1777,10 +1776,6 @@ fn register_shm_buffer(
     state: BufferState,
     failure: &'static str,
 ) {
-    ctx.shadow_table.map_id(request.id, host_buffer_id);
-    ctx.shadow_table
-        .track_interface_with_version(request.id, "wl_buffer".to_string(), 1);
-    ctx.shadow_table.set_host_version(host_buffer_id, 1);
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
         error!("Duplicate render buffer host ID {}", host_buffer_id);
         rollback_registered_buffer(ctx, request.id, host_buffer_id);

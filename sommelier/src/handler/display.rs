@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::protocols::wayland::wl_display;
+use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
 use crate::state::{Context, DeletedHostId, HostId};
 use crate::wire::{queue_or_drop, Action, ProtocolError, WL_DISPLAY_ID};
 use log::error;
@@ -133,10 +133,12 @@ pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
 
 impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
-        let host_registry_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table.map_id(registry, host_registry_id);
-        ctx.shadow_table
-            .track_interface(registry, "wl_registry".to_string());
+        let host_registry_id = ctx.shadow_table.create_paired(
+            registry,
+            "wl_registry",
+            wl_registry::VERSION,
+            wl_registry::VERSION,
+        );
 
         ctx.client_to_host_queue.push(wl_display::req::get_registry(
             WL_DISPLAY_ID,
@@ -147,10 +149,12 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
     }
 
     fn on_sync(&mut self, ctx: &mut Context, callback: u32) -> Action {
-        let host_callback_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table.map_id(callback, host_callback_id);
-        ctx.shadow_table
-            .track_interface(callback, "wl_callback".to_string());
+        let host_callback_id = ctx.shadow_table.create_paired(
+            callback,
+            "wl_callback",
+            wl_callback::VERSION,
+            wl_callback::VERSION,
+        );
 
         ctx.client_to_host_queue
             .push(wl_display::req::sync(WL_DISPLAY_ID, host_callback_id));
