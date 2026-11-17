@@ -13,6 +13,26 @@ always consumed; a configuration problem never stops the proxy) is owned by
 
 ## Transport and file descriptors
 
+- **Every descriptor has one owner.** A descriptor the proxy holds is one
+  `OwnedFd` from the receive that installed it to the send that passes a
+  copy on, and whoever holds it last closes it by dropping it: the
+  connection's queue (`WaylandConnection::read_fds`), then the decoded
+  message (`WireMessage::read_fd` takes the next one), then the outgoing
+  message (`wire::Outgoing`, `OutgoingMessages`). A message that is
+  dropped, suppressed or rejected therefore closes its descriptors, and a
+  batch closes the ones it sent once the send returns. Handlers get a
+  `BorrowedFd` and duplicate a descriptor to keep it. Only the kernel and
+  device boundaries (the `recvmsg` decoder, `virtwl_channel.rs` and the
+  allocator's fence export) take over or close a raw descriptor; elsewhere
+  a raw number is only lent to a system call while its owner lives.
+  `sommelier/clippy.toml` rejects `close`, libc's `dup`, `dup2`, `dup3`,
+  `from_raw_fd`, `into_raw_fd` and `borrow_raw` outside those boundaries;
+  a test module that builds descriptors by hand allows
+  `clippy::disallowed_methods` itself.
+  Tests: `early_output_cleanup_preserves_incoming_fd_ownership`,
+  `context_drop_closes_queued_and_pending_fds`,
+  `drops_unconsumed_received_fds`,
+  `test_generate_descriptor_ownership`.
 - **Descriptors follow the ordered stream, not byte-buffer boundaries.**
   One `sendmsg` or VirtWL transaction may carry several messages, and a
   descriptor may belong to a later message whose bytes have not arrived. A

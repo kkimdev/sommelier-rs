@@ -67,6 +67,27 @@ VirtWL ioctls would add latency without changing the byte and descriptor
 order (see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
 
+### Descriptors
+
+A received descriptor is an `OwnedFd` from the moment `recvmsg` or the
+VirtWL receive returns it, and its ownership moves with the message it
+belongs to:
+
+1. The connection queues it in stream order (`WaylandConnection::read_fds`).
+2. Decoding an `fd` argument moves the next one into the generated
+   `Request` or `Event`, which closes it if the message is not forwarded.
+   The handler sees a `BorrowedFd`; one that keeps the descriptor (an SHM
+   pool, a dma-buf plane, a clipboard pipe) duplicates it.
+3. Forwarding moves it into the `wire::Outgoing` message, and the batch's
+   `OutgoingMessages` closes it after the send, which passes the peer a
+   copy.
+
+A descriptor the proxy creates enters at step 3: the encoder that takes it
+returns a `wire::Outgoing` that owns it. Outside the kernel and device
+boundaries nothing takes over or closes a descriptor by number, so a
+descriptor cannot be closed twice or leak on an early return; the rule is
+under [transport invariants](INVARIANTS.md#transport-and-file-descriptors).
+
 ## Protocol code generation
 
 `wayland_codegen` turns the vendored XML in
