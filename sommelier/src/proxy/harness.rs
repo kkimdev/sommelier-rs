@@ -76,6 +76,11 @@ impl Session {
         }
     }
 
+    /// The proxy's state, for a test that injects a fault no peer can cause.
+    pub(super) fn ctx(&mut self) -> &mut Context {
+        &mut self.client.ctx
+    }
+
     /// The guest sends `requests`, which must not end the session.
     pub(super) async fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
         assert!(
@@ -84,11 +89,27 @@ impl Session {
         );
     }
 
+    /// The guest sends `requests`, which must end the session.
+    pub(super) async fn guest_fatal(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+        assert!(
+            !self.send(Direction::ClientToHost, requests).await,
+            "the guest's requests did not end the session"
+        );
+    }
+
     /// The host sends `events`, which must not end the session.
     pub(super) async fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
         assert!(
             self.send(Direction::HostToClient, events).await,
             "the host's events ended the session"
+        );
+    }
+
+    /// The host sends `events`, which must end the session.
+    pub(super) async fn host_fatal(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+        assert!(
+            !self.send(Direction::HostToClient, events).await,
+            "the host's events did not end the session"
         );
     }
 
@@ -102,6 +123,35 @@ impl Session {
     /// of each event.
     pub(super) fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
         std::mem::take(&mut self.guest.received)
+    }
+
+    /// What the proxy sent the guest since the last call before the
+    /// `wl_display.error` that ended the session, and that error's object
+    /// and code. The error must be the guest's one error and its last
+    /// event, and carry a diagnostic.
+    pub(super) fn guest_received_and_error(&mut self) -> (Vec<(u32, AnyEvent)>, (u32, u32)) {
+        assert!(self.client.ended, "the session goes on");
+        let mut events = self.guest_received();
+        let Some((
+            WL_DISPLAY_ID,
+            AnyEvent::WlDisplay(wl_display::Event::Error {
+                object_id,
+                code,
+                message,
+            }),
+        )) = events.pop()
+        else {
+            panic!("the guest's last event is not an error: {events:?}");
+        };
+        assert!(!message.is_empty(), "an error carries a diagnostic");
+        assert!(
+            !events.iter().any(|(_, event)| matches!(
+                event,
+                AnyEvent::WlDisplay(wl_display::Event::Error { .. })
+            )),
+            "the guest got more than one error: {events:?}"
+        );
+        (events, (object_id, code))
     }
 
     /// A guest object ID no object has had.
@@ -211,7 +261,7 @@ impl Session {
     }
 
     /// The guest's `wl_registry`, which it creates on first use.
-    async fn registry(&mut self) -> Object {
+    pub(super) async fn registry(&mut self) -> Object {
         if let Some(registry) = self.registry {
             return registry;
         }

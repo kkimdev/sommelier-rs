@@ -770,6 +770,7 @@ impl Client {
 mod tests {
     use super::harness::Session;
     use super::*;
+    use crate::protocols::AnyRequest;
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
         any_fd_has_identity, fd_identity, fds_with_identity, msg_header, msg_opcode, msg_sender,
@@ -922,21 +923,6 @@ mod tests {
         (client, guest_peer, host_peer)
     }
 
-    /// The guest sends `wl_display.sync(callback)`; return the host ID the
-    /// proxy allocated for the callback.
-    async fn guest_sync(client: &mut Client, callback: u32) -> u32 {
-        let mut sync = MessageBuilder::new();
-        sync.write_u32(callback);
-        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
-        client.client_conn.read_buf.extend_from_slice(&sync);
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
-        client
-            .ctx
-            .shadow_table
-            .get_host_id(callback)
-            .expect("the callback is mapped to a host object")
-    }
-
     /// The host delivers `events` to the proxy.
     async fn host_events(client: &mut Client, events: &[Vec<u8>]) {
         for event in events {
@@ -944,6 +930,14 @@ mod tests {
         }
         assert!(client.handle_msgs(Direction::HostToClient).await);
         assert!(client.host_conn.read_buf.is_empty());
+    }
+
+    /// A message no encoder builds, such as a malformed one: `words` as
+    /// the payload of `opcode` from `sender`.
+    fn raw(sender: u32, opcode: u16, words: &[u32]) -> Outgoing {
+        let mut message = MessageBuilder::new();
+        words.iter().for_each(|&word| message.write_u32(word));
+        (message.build_message(sender, opcode), Vec::new())
     }
 
     fn callback_done(host_callback: u32) -> Vec<u8> {
@@ -1797,32 +1791,17 @@ mod tests {
     /// done and a delete_id ahead of the error.
     #[tokio::test]
     async fn a_rejected_host_event_sends_nothing_of_its_own() {
-        use protocols::wayland::wl_display;
-        const CALLBACK: u32 = 3;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        let host_callback = guest_sync(&mut client, CALLBACK).await;
-        let mut done = MessageBuilder::new();
-        done.write_u32(0);
-        done.write_u32(0xdead);
-        client
-            .host_conn
-            .read_buf
-            .extend(done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE));
-
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        let headers: Vec<_> = crate::test_support::frames(&events)
-            .map(|(header, _)| (header.sender_id, header.opcode))
-            .collect();
+        use protocols::wayland::{wl_callback, wl_display};
+        let mut s = Session::new();
+        let callback = s.new_id();
+        let host_callback = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+            .await;
+        s.host_fatal([raw(host_callback, wl_callback::EVT_DONE, &[0, 0xdead])])
+            .await;
         assert_eq!(
-            headers,
-            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
@@ -1832,30 +1811,12 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_request_sends_nothing_of_its_own() {
         use protocols::wayland::{wl_display, wl_shm_pool};
-        const POOL: u32 = 21;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
-        let mut destroy = MessageBuilder::new();
-        destroy.write_u32(0xdead);
-        client
-            .client_conn
-            .read_buf
-            .extend(destroy.build_message(POOL, wl_shm_pool::REQ_DESTROY));
-
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        let headers: Vec<_> = crate::test_support::frames(&events)
-            .map(|(header, _)| (header.sender_id, header.opcode))
-            .collect();
+        let (mut s, pool) = session_with_a_shm_pool().await;
+        s.guest_fatal([raw(pool, wl_shm_pool::REQ_DESTROY, &[0xdead])])
+            .await;
         assert_eq!(
-            headers,
-            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
         );
     }
 
@@ -1865,29 +1826,36 @@ mod tests {
     #[tokio::test]
     async fn earlier_reverse_output_reaches_the_guest_before_the_error() {
         use protocols::wayland::{wl_display, wl_shm_pool};
-        const POOL: u32 = 21;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
-        let destroy = MessageBuilder::new().build_message(POOL, wl_shm_pool::REQ_DESTROY);
-        let malformed = MessageBuilder::new().build_message(crate::wire::WL_DISPLAY_ID, 99);
-        client.client_conn.read_buf.extend(destroy);
-        client.client_conn.read_buf.extend(malformed);
+        let (mut s, pool) = session_with_a_shm_pool().await;
+        s.guest_fatal([wl_shm_pool::req::destroy(pool), raw(WL_DISPLAY_ID, 99, &[])])
+            .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (
+                vec![(
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: pool }.into()
+                )],
+                (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)
+            )
+        );
+    }
 
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        assert_eq!(
-            stream_headers(&events),
-            [
-                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_DELETE_ID),
-                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR),
-            ]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)]
-        );
+    /// A session whose guest has a `wl_shm_pool`, which the proxy implements.
+    async fn session_with_a_shm_pool() -> (Session, u32) {
+        use protocols::wayland::wl_shm;
+        let mut s = Session::new();
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        let pool = s.new_id();
+        s.guest([wl_shm::req::create_pool(
+            shm,
+            pool,
+            shm_pool_file(&[0; 64]).into(),
+            64,
+        )])
+        .await;
+        assert_eq!(s.host_received(), [], "the pool is the proxy's own");
+        (s, pool)
     }
 
     /// A handler that ends the session sends nothing, not even the message
@@ -2110,60 +2078,54 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_client_sender_is_a_protocol_error() {
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
 
         // A client request with an unknown sender is malformed Wayland
         // traffic. It must not be silently discarded because doing so leaves
         // the client believing that the request succeeded.
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(20);
-        let request = builder.build_message(999, protocols::wayland::wl_display::REQ_GET_REGISTRY);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(
-            !client.handle_msgs(Direction::ClientToHost).await,
-            "unknown client sender IDs must terminate the connection"
-        );
-        drop(client);
+        s.guest_fatal([wl_display::req::get_registry(999, 20)])
+            .await;
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
-            )],
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_OBJECT)),
             "the guest learns why, as libwayland-server reports an unknown sender"
         );
     }
 
     #[tokio::test]
     async fn undecodable_request_is_reported_after_forwarding_earlier_requests() {
-        use std::io::Read;
-        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+        use protocols::wayland::wl_display;
+        let mut s = Session::new();
+        let callback = s.new_id();
 
         // A whole wl_display.sync, then one without its callback argument.
-        let mut sync = MessageBuilder::new();
-        sync.write_u32(2);
-        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
-        let truncated =
-            MessageBuilder::new().build_message(1, protocols::wayland::wl_display::REQ_SYNC);
-        client.client_conn.read_buf.extend_from_slice(&sync);
-        client.client_conn.read_buf.extend_from_slice(&truncated);
-
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
+        s.guest_fatal([
+            wl_display::req::sync(WL_DISPLAY_ID, callback),
+            raw(WL_DISPLAY_ID, wl_display::REQ_SYNC, &[]),
+        ])
+        .await;
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(1, protocols::wayland::wl_display::ERROR_INVALID_METHOD)]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
         );
-        let mut forwarded = Vec::new();
-        host_peer
-            .read_to_end(&mut forwarded)
-            .expect("read the forwarded requests");
-        assert_eq!(
-            stream_headers(&forwarded),
-            [(1, protocols::wayland::wl_display::REQ_SYNC)],
+        assert!(
+            matches!(
+                s.host_received()[..],
+                [(
+                    WL_DISPLAY_ID,
+                    AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                )]
+            ),
             "the valid request before the bad one still reaches the host"
         );
+    }
+
+    /// A session whose guest has a `wl_surface`.
+    async fn session_with_a_surface() -> (Session, super::harness::Object) {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        (s, surface)
     }
 
     /// The guest's `wl_surface` in [`client_with_a_surface`].
@@ -2187,47 +2149,38 @@ mod tests {
         (client, guest_peer, host_peer)
     }
 
-    /// The errors the guest receives when, after `prepare`, `SURFACE`
-    /// sends request `opcode` with `payload`.
-    async fn surface_request_errors(
-        prepare: impl FnOnce(&mut Client),
-        opcode: u16,
-        payload: &[u32],
-    ) -> Vec<(u32, u32)> {
-        let (mut client, mut guest_peer, _host_peer) = client_with_a_surface();
-        prepare(&mut client);
-        let mut request = MessageBuilder::new();
-        payload.iter().for_each(|&word| request.write_u32(word));
-        client
-            .client_conn
-            .read_buf
-            .extend(request.build_message(SURFACE, opcode));
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        display_errors(&mut guest_peer)
-    }
-
     /// libwayland-server reports every rejected request on `wl_display`,
     /// and only an unusable sender as `invalid_object`: the code is read
     /// against the interface of the error's object.
     #[tokio::test]
     async fn rejected_requests_report_invalid_method_on_the_display() {
         use protocols::wayland::wl_display::ERROR_INVALID_METHOD;
-        use protocols::wayland::wl_surface::REQ_ATTACH;
-        let expected = [(crate::wire::WL_DISPLAY_ID, ERROR_INVALID_METHOD)];
+        use protocols::wayland::wl_surface;
+        let expected = (vec![], (WL_DISPLAY_ID, ERROR_INVALID_METHOD));
 
+        let (mut s, surface) = session_with_a_surface().await;
+        s.guest_fatal([raw(surface.id, wl_surface::REQ_ATTACH, &[0])])
+            .await;
         assert_eq!(
-            surface_request_errors(|_| {}, REQ_ATTACH, &[0]).await,
+            s.guest_received_and_error(),
             expected,
             "an attach without its offsets does not decode"
         );
+
+        let (mut s, surface) = session_with_a_surface().await;
+        s.guest_fatal([wl_surface::req::attach(surface.id, Some(999), 0, 0)])
+            .await;
         assert_eq!(
-            surface_request_errors(|_| {}, REQ_ATTACH, &[999, 0, 0]).await,
+            s.guest_received_and_error(),
             expected,
             "an attach of an unknown buffer names an unusable object argument"
         );
+
+        let (mut s, surface) = session_with_a_surface().await;
+        s.guest_fatal([wl_surface::req::attach(surface.id, Some(surface.id), 0, 0)])
+            .await;
         assert_eq!(
-            surface_request_errors(|_| {}, REQ_ATTACH, &[SURFACE, 0, 0]).await,
+            s.guest_received_and_error(),
             expected,
             "a bad object argument is invalid_method even when it is the sender"
         );
@@ -2235,59 +2188,57 @@ mod tests {
 
     #[tokio::test]
     async fn a_destroyed_sender_is_an_invalid_object_whatever_it_sends() {
-        let errors =
-            surface_request_errors(|client| client.ctx.guest_destroyed(SURFACE), 99, &[]).await;
+        use protocols::wayland::{wl_display, wl_surface};
+        let (mut s, surface) = session_with_a_surface().await;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
         assert_eq!(
-            errors,
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
-            )],
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Destroy {}.into())]
+        );
+        s.guest_fatal([raw(surface.id, 99, &[])]).await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_OBJECT)),
             "the sender is checked before its opcode, as in libwayland-server"
         );
     }
 
     #[tokio::test]
     async fn a_session_gets_exactly_one_error() {
-        use protocols::wayland::wl_surface::{REQ_COMMIT, REQ_SET_BUFFER_SCALE};
+        use protocols::wayland::{wl_display, wl_surface};
         // The handler rejects scale 0 with wl_surface.invalid_scale; the
         // extra word then leaves trailing data, which must not add another.
+        let (mut s, surface) = session_with_a_surface().await;
+        s.guest_fatal([raw(surface.id, wl_surface::REQ_SET_BUFFER_SCALE, &[0, 0])])
+            .await;
         assert_eq!(
-            surface_request_errors(|_| {}, REQ_SET_BUFFER_SCALE, &[0, 0]).await,
-            [(SURFACE, 0)]
+            s.guest_received_and_error(),
+            (vec![], (surface.id, wl_surface::ERROR_INVALID_SCALE))
         );
+
         // A handler can end the session without queueing an error (a host
         // storage failure, say); the trailing data still gets reported.
+        let (mut s, surface) = session_with_a_surface().await;
+        s.ctx().end_session(SessionEnd::Internal);
+        s.guest_fatal([raw(surface.id, wl_surface::REQ_COMMIT, &[0])])
+            .await;
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.end_session(SessionEnd::Internal),
-                REQ_COMMIT,
-                &[0]
-            )
-            .await,
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_INVALID_METHOD
-            )]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
         );
     }
 
     #[tokio::test]
     async fn an_internal_failure_ends_the_session_with_an_implementation_error() {
-        use protocols::wayland::wl_surface::REQ_COMMIT;
+        use protocols::wayland::{wl_display, wl_surface};
         // As a failed dma-buf sync during a commit does: fatal, with no
         // error of its own.
+        let (mut s, surface) = session_with_a_surface().await;
+        s.ctx().end_session(SessionEnd::Internal);
+        s.guest_fatal([wl_surface::req::commit(surface.id)]).await;
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.end_session(SessionEnd::Internal),
-                REQ_COMMIT,
-                &[]
-            )
-            .await,
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
-            )]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
@@ -2674,54 +2625,54 @@ mod tests {
     /// follows it gets none of its own, even in a later batch.
     #[tokio::test]
     async fn a_host_error_is_the_sessions_only_error() {
-        let (mut client, mut guest_peer, _host_peer) = client_with_a_surface();
-        let host_surface = client.ctx.shadow_table.get_host_id(SURFACE).unwrap();
-        let mut error = MessageBuilder::new();
-        error.write_u32(host_surface);
-        error.write_u32(2);
-        error.write_string("host failure");
-        client.host_conn.read_buf.extend(error.build_message(
-            crate::wire::WL_DISPLAY_ID,
-            protocols::wayland::wl_display::EVT_ERROR,
-        ));
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
-        client
-            .client_conn
-            .read_buf
-            .extend(MessageBuilder::new().build_message(SURFACE, 99));
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
+        use protocols::wayland::{wl_display, wl_surface};
+        let (mut s, surface) = session_with_a_surface().await;
+        s.host_fatal([wl_display::evt::error(
+            WL_DISPLAY_ID,
+            surface.host,
+            wl_surface::ERROR_INVALID_SIZE,
+            "host failure",
+        )
+        .unwrap()])
+            .await;
+        s.guest_fatal([raw(surface.id, 99, &[])]).await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (surface.id, wl_surface::ERROR_INVALID_SIZE))
+        );
     }
 
     /// The host may report an error on an object only the proxy uses, such
-    /// as an Aura child or a temporary pool. The guest cannot be told which
-    /// object failed, but the session still ends with one error.
+    /// as its own `zaura_shell` or a temporary pool. The guest cannot be
+    /// told which object failed, but the session still ends with one error.
     #[tokio::test]
     async fn a_host_error_on_a_host_only_object_ends_the_session() {
-        const HOST_POOL: u32 = 77;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client
-            .ctx
-            .shadow_table
-            .insert_host_only_for_test(HOST_POOL, "wl_shm_pool", 1);
-        let mut error = MessageBuilder::new();
-        error.write_u32(HOST_POOL);
-        error.write_u32(2);
-        error.write_string("host failure");
-        client.host_conn.read_buf.extend(error.build_message(
-            crate::wire::WL_DISPLAY_ID,
-            protocols::wayland::wl_display::EVT_ERROR,
-        ));
+        use protocols::aura_shell::zaura_shell;
+        use protocols::wayland::{wl_display, wl_registry};
+        let mut s = Session::new();
+        s.advertise("zaura_shell", zaura_shell::VERSION).await;
+        let host_shell = match &s.host_received()[..] {
+            [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))]
+                if id.0 == "zaura_shell" =>
+            {
+                id.2
+            }
+            other => panic!("the proxy did not bind zaura_shell alone: {other:?}"),
+        };
+        // The guest sees gtk_shell1 in its place.
+        s.guest_received();
 
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
-        drop(client);
+        s.host_fatal([wl_display::evt::error(
+            WL_DISPLAY_ID,
+            host_shell,
+            zaura_shell::ERROR_AURA_SURFACE_EXISTS,
+            "host failure",
+        )
+        .unwrap()])
+            .await;
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
-            )]
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
         );
     }
 
@@ -2730,115 +2681,106 @@ mod tests {
     /// by one error.
     #[tokio::test]
     async fn an_invalid_host_event_is_reported_after_the_valid_ones() {
-        use protocols::wayland::{wl_data_device, wl_display};
-        const DATA_DEVICE: u32 = 10;
-        const HOST_DATA_DEVICE: u32 = 80;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.insert_paired_with_version_for_test(
-            DATA_DEVICE,
-            HOST_DATA_DEVICE,
-            "wl_data_device",
-            3,
-        );
+        use protocols::wayland::{wl_data_device, wl_data_device_manager, wl_display, wl_seat};
+        let mut s = Session::new();
+        let seat = s.bind("wl_seat", wl_seat::VERSION).await;
+        let manager = s
+            .bind("wl_data_device_manager", wl_data_device_manager::VERSION)
+            .await;
+        let device = s.new_id();
+        let host_device = s
+            .create(wl_data_device_manager::req::get_data_device(
+                manager, device, seat,
+            ))
+            .await;
         // A server-range offer, then one from the client range, which only
         // the proxy allocates from.
-        for offer in [0xff00_0001u32, 123] {
-            let mut event = MessageBuilder::new();
-            event.write_u32(offer);
-            client
-                .host_conn
-                .read_buf
-                .extend(event.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER));
-        }
-
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
-        drop(client);
-        let mut events = Vec::new();
-        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
-        let received: Vec<_> = crate::test_support::frames(&events)
-            .map(|(header, payload)| {
-                let first = WireMessage::new(header.sender_id, header.opcode, payload)
-                    .read_u32()
-                    .unwrap();
-                (header.sender_id, header.opcode, first)
-            })
-            .collect();
+        s.host_fatal([
+            wl_data_device::evt::data_offer(host_device, 0xff00_0001),
+            wl_data_device::evt::data_offer(host_device, 123),
+        ])
+        .await;
         assert_eq!(
-            received,
-            [
-                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER, 0xff00_0000),
-                (
-                    crate::wire::WL_DISPLAY_ID,
-                    wl_display::EVT_ERROR,
-                    crate::wire::WL_DISPLAY_ID
-                ),
-            ]
-        );
-        assert_eq!(
-            display_errors_in(&events),
-            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+            s.guest_received_and_error(),
+            (
+                vec![(
+                    device,
+                    wl_data_device::Event::DataOffer { id: 0xff00_0000 }.into()
+                )],
+                (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
+            )
         );
     }
 
     #[tokio::test]
     async fn an_invalid_message_length_is_reported_before_closing() {
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        let mut s = Session::new();
         // A header claiming 6 bytes, less than the header itself.
-        client
-            .client_conn
-            .read_buf
-            .extend([1u32.to_ne_bytes(), (6u32 << 16).to_ne_bytes()].concat());
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
+        let header = [WL_DISPLAY_ID.to_ne_bytes(), (6u32 << 16).to_ne_bytes()].concat();
+        s.guest_fatal([(header, Vec::new())]).await;
         assert_eq!(
-            display_errors(&mut guest_peer),
-            [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_INVALID_METHOD
-            )]
+            s.guest_received_and_error(),
+            (
+                vec![],
+                (
+                    WL_DISPLAY_ID,
+                    protocols::wayland::wl_display::ERROR_INVALID_METHOD
+                )
+            )
         );
     }
 
     #[tokio::test]
     async fn a_request_over_4096_bytes_is_an_invalid_method() {
-        use protocols::wayland::wl_data_source::REQ_OFFER;
-        use std::io::Read;
-        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(5, 6, "wl_data_source");
-        // `wl_data_source.offer` of `bytes` in all, header included. The
-        // header is written by hand: no encoder builds a message this long.
-        let offer = |bytes: usize| {
-            let mut mime_type = MessageBuilder::new();
-            // The string's length word, then its bytes and NUL.
-            mime_type.write_string(&"x".repeat(bytes - MessageHeader::LEN - 4 - 1));
-            let word = ((bytes as u32) << 16) | u32::from(REQ_OFFER);
-            let message = [5u32.to_ne_bytes(), word.to_ne_bytes()].concat();
-            let message = [message, mime_type.into_payload()].concat();
-            assert_eq!(message.len(), bytes);
-            message
-        };
+        use protocols::wayland::{wl_data_device_manager, wl_data_source, wl_display};
+        let mut s = Session::new();
+        let manager = s
+            .bind("wl_data_device_manager", wl_data_device_manager::VERSION)
+            .await;
+        let source = s.new_id();
+        let host_source = s
+            .create(wl_data_device_manager::req::create_data_source(
+                manager, source,
+            ))
+            .await;
+        // `wl_data_source.offer` of a MIME type that makes the message
+        // `bytes` long: its length word, its bytes and NUL.
+        let mime_type = |bytes: usize| "x".repeat(bytes - MessageHeader::LEN - 4 - 1);
         // libwayland-server's limit is the message's length, not its
-        // arguments': one of 4096 bytes is valid, one word more is not.
-        client.client_conn.read_buf.extend(offer(4096));
-        client.client_conn.read_buf.extend(offer(4100));
+        // arguments': one of 4096 bytes is valid, one word more is not, and
+        // no encoder builds it, so its header is written by hand.
+        let too_long = {
+            let mut offer = MessageBuilder::new();
+            offer.write_string(&mime_type(4100));
+            let word = (4100u32 << 16) | u32::from(wl_data_source::REQ_OFFER);
+            [
+                source.to_ne_bytes().as_slice(),
+                &word.to_ne_bytes(),
+                &offer.into_payload(),
+            ]
+            .concat()
+        };
+        assert_eq!(too_long.len(), 4100);
 
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
+        s.guest_fatal([
+            wl_data_source::req::offer(source, &mime_type(4096)).unwrap(),
+            (too_long, Vec::new()),
+        ])
+        .await;
         assert_eq!(
-            display_errors(&mut guest_peer),
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD))
+        );
+        assert_eq!(
+            s.host_received(),
             [(
-                crate::wire::WL_DISPLAY_ID,
-                protocols::wayland::wl_display::ERROR_INVALID_METHOD
+                host_source,
+                wl_data_source::Request::Offer {
+                    mime_type: mime_type(4096)
+                }
+                .into()
             )]
         );
-        let mut forwarded = Vec::new();
-        host_peer
-            .read_to_end(&mut forwarded)
-            .expect("read the forwarded requests");
-        assert_eq!(stream_headers(&forwarded), [(6, REQ_OFFER)]);
     }
 
     const XDG_SURFACE: u32 = 10;
@@ -2997,75 +2939,35 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_registry_bind_flushes_display_error_before_disconnect() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-
-        let (guest_proxy, guest_peer) =
-            UnixStream::pair().expect("guest socket pair should be created");
-        let (host_proxy, host_peer) =
-            UnixStream::pair().expect("host socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
-            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
-
-        // Register one advertised global under the host-side registry ID so
-        // the bind reaches the registry handler's validation path.
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(10, 20, "wl_registry");
-        client.ctx.host_globals.insert(
-            7,
-            crate::state::HostGlobal {
-                interface: "wl_compositor".to_string(),
-                version: 1,
-            },
-        );
-        client
-            .ctx
-            .registry_global_names
-            .entry(20)
-            .or_default()
-            .insert(7);
-        client.ctx.global_generations.insert(7, 1);
-        client
-            .ctx
-            .registry_global_generations
-            .entry(20)
-            .or_default()
-            .insert(7, 1);
+        use protocols::wayland::{wl_display, wl_registry};
+        let mut s = Session::new();
+        let registry = s.registry().await;
+        let name = s.advertise("wl_compositor", 1).await;
+        let compositor = s.new_id();
 
         // Ask for the advertised global with a mismatched interface. The
-        // proxy must send wl_display.error to the guest and then terminate
-        // this direction rather than silently dropping the request.
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(7);
-        builder.write_string("wl_seat");
-        builder.write_u32(1);
-        builder.write_u32(30);
-        let request = builder.build_message(10, protocols::wayland::wl_registry::REQ_BIND);
-        client.client_conn.read_buf.extend_from_slice(&request);
-
-        assert!(
-            !client.handle_msgs(Direction::ClientToHost).await,
-            "an invalid bind must terminate the guest session"
-        );
-        drop(host_peer);
-        drop(client);
-
-        let mut header = [0u8; 8];
-        let mut guest_peer = guest_peer;
-        guest_peer
-            .read_exact(&mut header)
-            .expect("guest must receive the fatal display error before disconnect");
-        let header = msg_header(&header);
-        assert_eq!(header.sender_id, 1);
-        assert_eq!(header.opcode, protocols::wayland::wl_display::EVT_ERROR);
-        assert!(
-            header.len >= 20,
-            "display.error must include object, code, and a diagnostic string"
+        // proxy must send wl_display.error to the guest and then end the
+        // session rather than silently dropping the request. Like
+        // libwayland-server, it reports the bind on the registry as
+        // `wl_display.invalid_object`.
+        s.guest_fatal([
+            wl_registry::req::bind(registry.id, name, "wl_seat", 1, compositor).unwrap(),
+        ])
+        .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (
+                vec![(
+                    registry.id,
+                    wl_registry::Event::Global {
+                        name,
+                        interface: "wl_compositor".to_string(),
+                        version: 1
+                    }
+                    .into()
+                )],
+                (registry.id, wl_display::ERROR_INVALID_OBJECT)
+            )
         );
     }
 
