@@ -182,6 +182,29 @@ fn shown_buffer_size(ctx: &Context, state: &SurfaceState) -> Option<(i32, i32)> 
         .or(state.current_buffer_dimensions())
 }
 
+/// Log, once per surface, `problem`: a viewport rule the proxy leaves
+/// unenforced, as Exo does (see INVARIANTS, "Protocol errors"). Called once
+/// the commit can no longer roll back, which would clear the flag and repeat
+/// the log on every frame.
+fn log_unenforced_viewport_rule(
+    ctx: &mut Context,
+    surface_id: u32,
+    problem: &str,
+    mapping: &SurfaceMapping,
+) {
+    let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+        return;
+    };
+    if !std::mem::replace(&mut surface.logged_viewport_rule, true) {
+        log::warn!(
+            "wl_surface {} has {}, which Exo accepts, so the commit is forwarded: {:?}",
+            surface_id,
+            problem,
+            mapping
+        );
+    }
+}
+
 /// Build the host damage requests and the commit for one guest commit, or
 /// `None` when the surface has no host object. The host takes surface-local
 /// damage only, so buffer damage goes through `mapping`.
@@ -598,6 +621,11 @@ impl WlSurfaceHandler for CompositorHandler {
         }
 
         let mapping = commit.state.mapping(shown_buffer_size(ctx, &commit.state));
+        // wp_viewport.out_of_buffer is deliberately not raised: Exo accepts a
+        // source outside the buffer, so ending the session would break apps
+        // that work today. It is logged instead, once the commit is final.
+        let viewport_problem =
+            (!mapping.source_fits_buffer()).then_some("a wp_viewport source outside its buffer");
         let attached_full_mapping =
             attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
         let surface_damage = commit.surface_damage.rects();
@@ -707,6 +735,9 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
+        if let Some(problem) = viewport_problem {
+            log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
+        }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
@@ -3538,6 +3569,83 @@ mod tests {
                 .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
             "invalid viewport state must not forward the surface commit"
         );
+    }
+
+    /// Set the viewport source of `TEST_SURFACE`, whose viewport is 700.
+    fn set_test_viewport_source(ctx: &mut Context, source: (i32, i32, i32, i32)) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = 700;
+        let (x, y, width, height) = source;
+        assert_eq!(
+            handler.on_set_source(ctx, x, y, width, height),
+            Action::Forward
+        );
+        ctx.last_sender_id = TEST_SURFACE;
+    }
+
+    /// Commit a buffer of `size` at scale 2 through a viewport with
+    /// `source` (24.8 fixed point) and a destination, which lets the
+    /// source be fractional.
+    fn commit_viewport_source(size: (i32, i32), source: (i32, i32, i32, i32)) -> Context {
+        let (mut ctx, ..) = setup_ctx();
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Action::Forward
+        );
+        assert_eq!(handler.on_set_buffer_scale(&mut ctx, 2), Action::Forward);
+        set_test_viewport_source(&mut ctx, source);
+        ctx.last_sender_id = 700;
+        assert_eq!(
+            handler.on_set_destination(&mut ctx, 10, 10),
+            Action::Forward
+        );
+        register_test_native(&mut ctx, 42, size);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        ctx
+    }
+
+    /// Whether the last commit reached the host without ending the session,
+    /// and whether the surface's source leaving its buffer was logged.
+    fn forwarded_and_logged(ctx: &Context) -> (bool, bool) {
+        let forwarded = !ctx.is_fatal()
+            && queued_headers(&ctx.client_to_host_queue).last() == Some(&(200, REQ_COMMIT));
+        (forwarded, ctx.surfaces[&TEST_SURFACE].logged_viewport_rule)
+    }
+
+    #[test]
+    fn viewport_source_outside_the_buffer_is_logged_and_forwarded() {
+        const ONE: i32 = 256;
+        // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
+        let whole = (0, 0, 4 * ONE, 3 * ONE);
+        let ctx = commit_viewport_source((8, 6), whole);
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
+
+        // Half a unit to the right the source leaves the buffer. Exo accepts
+        // that, so the commit is forwarded and only logged.
+        let ctx = commit_viewport_source((8, 6), (ONE / 2, 0, 4 * ONE, 3 * ONE));
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+
+        // A later, smaller buffer under the unchanged viewport.
+        let mut ctx = commit_viewport_source((8, 6), whole);
+        register_test_native(&mut ctx, 43, (6, 6));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 43);
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+
+        // Detaching the buffer in the same commit exempts any source.
+        let mut ctx = commit_viewport_source((8, 6), whole);
+        let mut handler = CompositorHandler;
+        assert_eq!(handler.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        set_test_viewport_source(&mut ctx, (0, 0, 100 * ONE, 100 * ONE));
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
+
+        // An odd buffer ends at a fractional unit, 3.5x2.5, which the source
+        // may reach exactly.
+        let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
+        let ctx = commit_viewport_source((7, 5), edge);
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
     }
 
     #[test]

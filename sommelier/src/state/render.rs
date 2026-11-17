@@ -390,6 +390,24 @@ impl SurfaceMapping {
         self.integer_scale() == Some(1)
     }
 
+    /// Whether the viewport source lies within the buffer, as
+    /// `wp_viewport.out_of_buffer` asks. Without a buffer it always does.
+    /// The edge `(x + width) / 256` must not pass `W' / scale`, compared
+    /// exactly as `(x + width) * scale <= W' * 256` in i64, where it cannot
+    /// overflow.
+    pub fn source_fits_buffer(&self) -> bool {
+        let (Some((x, y, width, height)), Some((buffer_width, buffer_height))) =
+            (self.viewport.source, self.transformed_buffer())
+        else {
+            return true;
+        };
+        let fits = |start: i32, length: i32, extent: i32| {
+            (i64::from(start) + i64::from(length)) * i64::from(self.scale)
+                <= i64::from(extent) * i64::from(FIXED_ONE)
+        };
+        fits(x, width, buffer_width) && fits(y, height, buffer_height)
+    }
+
     fn integer_scale(&self) -> Option<i32> {
         let only_scaled =
             self.transform == wl_output::TRANSFORM_NORMAL && self.viewport.is_identity();
@@ -536,6 +554,9 @@ pub struct SurfaceState {
     pub viewport: Option<ViewportState>,
     /// State the next commit applies.
     pub pending: SurfacePending,
+    /// Whether the proxy has logged a viewport rule it leaves unenforced,
+    /// which it does once per surface rather than every frame.
+    pub logged_viewport_rule: bool,
 }
 
 /// Everything a `wl_surface` request sets for the next commit, which
@@ -791,6 +812,7 @@ impl Default for SurfaceState {
             current_buffer_transform: 0,
             viewport: None,
             pending: SurfacePending::default(),
+            logged_viewport_rule: false,
         }
     }
 }
@@ -1249,7 +1271,7 @@ impl RenderBufferRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferRect, SurfaceRect};
+    use super::{BufferRect, SurfaceMapping, SurfaceRect, SurfaceState, ViewportState};
 
     #[test]
     fn scaling_damage_clamps_to_non_negative_i32_edges() {
@@ -1272,5 +1294,49 @@ mod tests {
             SurfaceRect::new(0, 0, i32::MAX, i32::MAX).scaled(i32::MAX),
             BufferRect::new(0, 0, i32::MAX, i32::MAX)
         );
+    }
+
+    /// How a surface at `scale` and `transform` shows a buffer of `buffer`
+    /// pixels through viewport source `source` (24.8 fixed point).
+    fn viewed(
+        buffer: Option<(i32, i32)>,
+        scale: i32,
+        transform: i32,
+        source: (i32, i32, i32, i32),
+    ) -> SurfaceMapping {
+        let surface = SurfaceState {
+            current_buffer_scale: scale,
+            current_buffer_transform: transform,
+            viewport: Some(ViewportState {
+                source: Some(source),
+                destination: None,
+            }),
+            ..SurfaceState::default()
+        };
+        surface.mapping(buffer)
+    }
+
+    #[test]
+    fn viewport_source_must_fit_the_transformed_scaled_buffer() {
+        const ONE: i32 = 256;
+        // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
+        let whole = (0, 0, 4 * ONE, 3 * ONE);
+        assert!(viewed(Some((8, 6)), 2, 0, whole).source_fits_buffer());
+        let shifted = (ONE / 2, 0, 4 * ONE, 3 * ONE);
+        assert!(!viewed(Some((8, 6)), 2, 0, shifted).source_fits_buffer());
+        // A smaller buffer under the same source.
+        assert!(!viewed(Some((6, 6)), 2, 0, whole).source_fits_buffer());
+        // A 90-degree transform makes the surface 3x4.
+        assert!(viewed(Some((8, 6)), 2, 1, (0, 0, 3 * ONE, 4 * ONE)).source_fits_buffer());
+        assert!(!viewed(Some((8, 6)), 2, 1, whole).source_fits_buffer());
+        // An odd buffer at scale 2 ends at a fractional unit, 3.5x2.5,
+        // which the source may reach exactly but not pass.
+        let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
+        assert!(viewed(Some((7, 5)), 2, 0, edge).source_fits_buffer());
+        let past = (1, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
+        assert!(!viewed(Some((7, 5)), 2, 0, past).source_fits_buffer());
+        // Without a buffer the source has nothing to leave.
+        let huge = (0, 0, 100 * ONE, 100 * ONE);
+        assert!(viewed(None, 2, 0, huge).source_fits_buffer());
     }
 }

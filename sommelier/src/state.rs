@@ -1319,6 +1319,7 @@ mod tests {
                     destination: Some((20, 30)),
                 })),
             },
+            logged_viewport_rule: false,
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
 
@@ -1381,6 +1382,7 @@ mod tests {
                 attach_offset: Some((11, 12)),
                 viewport: Some(None),
             },
+            logged_viewport_rule: false,
         };
         surface.set_current_buffer_for_test(Some(1), Some((10, 20)));
         let before = surface.clone();
