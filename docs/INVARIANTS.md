@@ -615,9 +615,21 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   or a seat without a host object deferred, when the guest changes it,
   when the field's surrounding text appears or goes, and when an enable
   starts a new field. It sends none while no input method is attached and
-  none the host already has, because a resend can reset Exo's
-  composition. Exo keeps surrounding text and the cursor rectangle without
-  an input method, so they are forwarded as committed and never replayed.
+  none the host already has: with a v8 extension Exo ignores an unchanged
+  type, but before v8 `set_content_type` and `deprecated_set_input_type`
+  map flags differently, so a resend changes the type twice, and each
+  change can reset the input method's composition. Exo keeps surrounding
+  text and the cursor rectangle without an input method, so they are
+  forwarded as committed and never replayed.
+  `HostApplied` is sound only because Exo attaches or detaches the input
+  method on its own only as its seat's focus moves or the surface goes,
+  and each of those reaches the proxy as a `wl_keyboard.leave` or `enter`
+  or as the surface's destruction, which ends the text input's focus and
+  makes the proxy `deactivate`. A host `leave` or `enter` MUST therefore
+  reach the text-input focus in order with the requests around it, never
+  suppressed or coalesced with its pair: otherwise the proxy would believe
+  an input method attached that Exo detached, or the reverse, and send
+  content types Exo drops or withhold the one it needs.
   Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
   `a_host_without_surrounding_text_support_gets_no_resend`,
