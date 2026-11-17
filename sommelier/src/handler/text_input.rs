@@ -1331,7 +1331,7 @@ fn queue_host_deactivation_barrier(
             "Text-input {} was not active when its drain barrier was installed",
             guest_id
         );
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
         return;
     }
     ctx.client_to_host_queue

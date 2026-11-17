@@ -617,7 +617,7 @@ impl Client {
 
             offset = message_end;
             processed_messages += 1;
-            if self.ctx.fatal_protocol_error {
+            if self.ctx.is_fatal() {
                 break;
             }
             if processed_messages >= MAX_MESSAGES_PER_BATCH {
@@ -629,7 +629,7 @@ impl Client {
         // not queue one. Toward the guest it goes with the forwarded events;
         // otherwise it is in the reverse queue sent below.
         crate::handler::display::queue_error_if_none_queued(&mut self.ctx);
-        if self.ctx.fatal_protocol_error && matches!(direction, Direction::HostToClient) {
+        if self.ctx.is_fatal() && matches!(direction, Direction::HostToClient) {
             for (p_data, p_fds) in self.ctx.host_to_client_queue.drain(..) {
                 out.push(&p_data, &p_fds);
             }
@@ -696,7 +696,7 @@ impl Client {
         conn.read_fds.drain(..fd_offset);
         conn.read_buf.drain(..offset);
 
-        if self.ctx.fatal_protocol_error {
+        if self.ctx.is_fatal() {
             // A wl_display.error is fatal, but the queued diagnostic must
             // reach the guest before the proxy tears down this session.
             success = false;
@@ -1780,12 +1780,7 @@ mod tests {
         // A handler can end the session without queueing an error (a host
         // storage failure, say); the trailing data still gets reported.
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.fatal_protocol_error = true,
-                REQ_COMMIT,
-                &[0]
-            )
-            .await,
+            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[0]).await,
             [(
                 crate::wire::WL_DISPLAY_ID,
                 protocols::wayland::wl_display::ERROR_INVALID_METHOD
@@ -1799,12 +1794,7 @@ mod tests {
         // As a failed dma-buf sync during a commit does: fatal, with no
         // error of its own.
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.fatal_protocol_error = true,
-                REQ_COMMIT,
-                &[]
-            )
-            .await,
+            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[]).await,
             [(
                 crate::wire::WL_DISPLAY_ID,
                 protocols::wayland::wl_display::ERROR_IMPLEMENTATION

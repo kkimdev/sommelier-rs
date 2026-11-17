@@ -589,7 +589,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Unable to destroy wl_surface {} without its host generation",
                 wl_surface_guest_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         };
         // Keep the references owned by this surface before removing its
@@ -868,7 +868,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Cannot commit wl_surface {} without its host object",
                 surface_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                 commit.rollback(surface);
             }
@@ -920,7 +920,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     // wl_surface.commit has no recoverable failure response.
                     // Disconnect rather than silently rolling back a request
                     // the guest reasonably believes was accepted.
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                         commit.rollback(surface);
                     }
@@ -961,7 +961,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
                     snapshot_updated,
                 );
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                     commit.rollback(surface);
                 }
@@ -1153,7 +1153,7 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 "Unable to destroy xdg_toplevel {} without its host generation",
                 xdg_toplevel_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         };
         // The Aura toplevel goes before the role destructor (see
@@ -1566,7 +1566,7 @@ mod tests {
         ctx.last_sender_id = surface;
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(ctx.native_buffer_uses_implicit_sync(buffer));
         assert_eq!(
             ctx.client_to_host_queue
@@ -1578,7 +1578,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
@@ -1603,7 +1603,7 @@ mod tests {
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(!ctx.native_buffer_uses_implicit_sync(buffer));
         assert!(
             ctx.client_to_host_queue
@@ -1642,7 +1642,7 @@ mod tests {
         ctx.last_sender_id = surface;
         assert_eq!(handler.on_attach(ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
@@ -1652,7 +1652,7 @@ mod tests {
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(handler.on_set_buffer_scale(ctx, scale), Action::Forward);
         assert_eq!(handler.on_commit(ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Draw the client's next frame into `buffer`: every pool byte becomes
@@ -2563,7 +2563,7 @@ mod tests {
             ),
             Action::Drop
         );
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         let mut buffer =
             mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all());
         buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
@@ -2581,7 +2581,7 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(protocol_error_code(&ctx), wl_shm::ERROR_INVALID_FD);
         let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
@@ -2864,7 +2864,7 @@ mod tests {
                 );
             }
             assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
-            assert!(!ctx.fatal_protocol_error);
+            assert!(!ctx.is_fatal());
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue).last(),
                 Some(&(wl_surface_host, REQ_COMMIT))
@@ -2951,7 +2951,7 @@ mod tests {
             ctx.host_to_client_queue.clear();
             ctx.clear_protocol_error_for_test();
             assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
-            assert!(ctx.fatal_protocol_error);
+            assert!(ctx.is_fatal());
             assert_eq!(ctx.host_to_client_queue.len(), 1);
             assert_eq!(protocol_error_code(&ctx), code);
         };
@@ -2986,7 +2986,7 @@ mod tests {
             None
         );
         assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
@@ -3193,7 +3193,7 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
     }
@@ -3217,7 +3217,7 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
         assert_eq!(
@@ -3573,20 +3573,20 @@ mod tests {
         ctx.last_sender_id = 700;
         assert_eq!(handler.on_set_source(&mut ctx, -1, 0, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -3608,7 +3608,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -3630,7 +3630,7 @@ mod tests {
         ctx.last_sender_id = surface_id;
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 1);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(
             ctx.client_to_host_queue
                 .iter()

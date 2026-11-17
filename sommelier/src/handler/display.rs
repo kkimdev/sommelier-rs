@@ -26,7 +26,7 @@ pub struct DisplayHandler;
 /// a commit, say) mark the session fatal without an error of their own,
 /// and every session closed for a protocol reason gets exactly one.
 pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
-    if ctx.fatal_protocol_error {
+    if ctx.is_fatal() {
         // A no-op when an error is already queued.
         queue_protocol_error(
             ctx,
@@ -66,7 +66,7 @@ pub(crate) fn queue_protocol_error(
 ) {
     // Whether or not the diagnostic itself fits in the Wayland wire limit,
     // the malformed request is fatal and must terminate the session.
-    ctx.fatal_protocol_error = true;
+    ctx.fail_session();
     if !ctx.note_protocol_error() {
         return;
     }
@@ -186,7 +186,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         // The host ends the connection after its error, so the session is
         // over, and its error is the guest's one error unless the guest
         // already has one.
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
         let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
             // wl_display.error.object_id is a non-null object argument. An
             // internal host-only object has no valid guest ID; forwarding 0
@@ -228,7 +228,7 @@ mod tests {
 
     impl WlDisplayHandler for ProbeHandler {
         fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             Action::Drop
         }
     }
@@ -262,7 +262,7 @@ mod tests {
             Err(ProtocolError::InvalidSender(999))
         );
         assert!(
-            !ctx.fatal_protocol_error,
+            !ctx.is_fatal(),
             "an invalid sender must not reach a mutating handler"
         );
     }
@@ -303,7 +303,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         queue_protocol_error(&mut ctx, 7, 3, "x".repeat(65_520));
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(
             ctx.host_to_client_queue.len(),
             1,

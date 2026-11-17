@@ -807,7 +807,7 @@ mod tests {
             [(1, EVT_DELETE_ID)]
         );
         assert_eq!(ctx.shadow_table.get_interface(10), None);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Forwards every `zxdg_output_v1` message, as the proxy's dispatcher

@@ -469,7 +469,7 @@ impl LinuxDmabufHandler {
             // missing host mapping is an internal state corruption rather
             // than a recoverable client error. Do not let callers continue
             // with a CREATE that has no corresponding host params object.
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return None;
         };
 
@@ -494,7 +494,7 @@ impl LinuxDmabufHandler {
                     for param in params {
                         unsafe { libc::close(param.fd) };
                     }
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     return None;
                 }
             }
@@ -503,7 +503,7 @@ impl LinuxDmabufHandler {
             for param in params {
                 unsafe { libc::close(param.fd) };
             }
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return None;
         }
 
@@ -1094,7 +1094,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                         "Duplicate asynchronous dmabuf params host ID {}",
                         host_params_id.0
                     );
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                 }
             }
         }
@@ -1117,7 +1117,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                         "Host returned an already-used wl_buffer ID {} for orphaned dmabuf",
                         buffer
                     );
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     return Action::Drop;
                 }
                 let version = ctx
@@ -1139,7 +1139,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
                         host_params_id, guest_params_id, pending.guest_params_id
                     );
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     return Action::Drop;
                 }
                 // The generated dispatcher maps this host-created buffer to a
@@ -1148,7 +1148,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 // the guest ID through the shadow table after forwarding.
                 if !ctx.register_native_buffer(buffer, pending.dimensions, pending.sync_fds) {
                     error!("Duplicate render buffer host ID {}", buffer);
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                 }
             }
         }
@@ -1168,7 +1168,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                         "Async dmabuf params generation diverged: host {} maps to guest {}, pending guest {}",
                         host_params_id, guest_params_id, pending.guest_params_id
                     );
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     return Action::Drop;
                 }
             }
@@ -1247,7 +1247,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 ));
             if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
             }
         } else {
             ctx.shadow_table.remove_id(buffer_id);
@@ -1417,7 +1417,7 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
             u32::from_ne_bytes(error[8..12].try_into().unwrap()),
@@ -1441,7 +1441,7 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
             u32::from_ne_bytes(error[8..12].try_into().unwrap()),
@@ -1641,7 +1641,7 @@ mod tests {
             Action::Drop
         );
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(
@@ -1692,7 +1692,7 @@ mod tests {
             handler.on_add(&mut ctx, pipe_fds[1], 2, 0, 64, 0, 0),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
             1
@@ -1724,7 +1724,7 @@ mod tests {
             handler.on_add(&mut ctx, second_pipe[1], 0, 4096, 64, 0, 0),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
             2
@@ -1762,7 +1762,7 @@ mod tests {
             handler.on_create(&mut ctx, 0, 16, 0x3432_5258, 0),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
             5
@@ -2103,7 +2103,7 @@ mod tests {
         );
         assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
         assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
 
         unsafe {
             libc::close(first_pipe[0]);

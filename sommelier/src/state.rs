@@ -812,9 +812,9 @@ pub struct Context {
     pub client_to_host_queue: Vec<Outgoing>,
     /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
     pub host_to_client_queue: Vec<Outgoing>,
-    /// A queued `wl_display.error` must be flushed before the client session
-    /// is torn down. This is set by fatal protocol validation paths.
-    pub fatal_protocol_error: bool,
+    /// Whether the session ends after this batch; see
+    /// [`Self::fail_session`].
+    fatal_protocol_error: bool,
     /// Whether a `wl_display.error` has been queued for the guest; see
     /// [`Self::note_protocol_error`].
     protocol_error_queued: bool,
@@ -1004,6 +1004,18 @@ impl Context {
     /// discarded if the message is dropped or rejected.
     pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
         self.post_dispatch.push(effect);
+    }
+
+    /// End the session once the current batch is handled: the proxy
+    /// flushes the queued events, the guest's `wl_display.error` among
+    /// them, and then closes it. A session never recovers.
+    pub(crate) fn fail_session(&mut self) {
+        self.fatal_protocol_error = true;
+    }
+
+    /// Whether [`Self::fail_session`] has ended the session.
+    pub(crate) fn is_fatal(&self) -> bool {
+        self.fatal_protocol_error
     }
 
     /// Record that a `wl_display.error` is being queued for the guest, and
@@ -1237,7 +1249,7 @@ impl Context {
                 "Host object {} was not a live host-only object when it was retired",
                 host_id
             );
-            self.fatal_protocol_error = true;
+            self.fail_session();
         }
     }
 
@@ -1635,11 +1647,11 @@ mod tests {
             .track_host_interface(host_id, "wl_shm_pool".to_string());
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
 
         // A second retirement means the bookkeeping diverged.
         ctx.retire_destroyed_host_object(host_id);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]

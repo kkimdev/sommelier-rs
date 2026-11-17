@@ -1134,7 +1134,7 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: Ho
             guest_id,
             host_id.0
         );
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
     }
 }
 
@@ -1234,7 +1234,7 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
             "Render buffer {} could not finish its destroyed-surface use",
             guest_id
         );
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
     }
 }
 
@@ -1964,7 +1964,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                     "Render buffer {} could not enter guest-destroyed state",
                     guest_id
                 );
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
             }
             ctx.shadow_table.retire_guest_object(guest_id);
             return Action::Drop;
@@ -2098,7 +2098,7 @@ mod tests {
 
         ctx.last_sender_id = 10;
         assert_eq!(handler.on_create_pool(&mut ctx, 20, -1, 0), Action::Drop);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
@@ -2142,7 +2142,7 @@ mod tests {
             ),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
@@ -2172,7 +2172,7 @@ mod tests {
             ),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
@@ -2214,12 +2214,12 @@ mod tests {
 
         // libwayland accepts a resize to the current size.
         assert_eq!(resize(&mut ctx, 4096), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(ctx.host_to_client_queue.is_empty());
         assert_eq!(ctx.pools[&pool_id].size, 4096);
 
         assert_eq!(resize(&mut ctx, 2048), Action::Drop);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
@@ -2812,7 +2812,7 @@ mod tests {
             Action::Drop
         );
 
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(ctx.shadow_table.get_host_id(buffer_id).is_some());
         let host_pool = msg_sender(&ctx.client_to_host_queue[1].0);
         assert_eq!(
@@ -2877,7 +2877,7 @@ mod tests {
             Action::Drop
         );
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),

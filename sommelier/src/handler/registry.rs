@@ -769,7 +769,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             if bound && can_synthesize_feedback {
                 queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
             } else if !bound {
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
             }
 
             // Drop the original global event so we don't send the host's
@@ -1266,7 +1266,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             host_new_id,
         ) {
             ctx.shadow_table.remove_id(*guest_new_id);
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         }
         if interface == "wl_output" {
@@ -1564,7 +1564,7 @@ mod tests {
             1,
             "invalid wl_registry.bind must report a fatal wl_display.error"
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -1828,7 +1828,7 @@ mod tests {
 
         let bind = ("wl_output".to_string(), 3, 20);
         assert_eq!(RegistryHandler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
         assert!(ctx.outputs.is_empty_for_test());
@@ -2456,7 +2456,7 @@ mod tests {
         let bind = (seat, 5, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
         assert_eq!(ctx.shadow_table.get_interface(20), None);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     /// libwayland-server lets a bind cross its global's removal on the
@@ -2484,7 +2484,7 @@ mod tests {
         ctx.last_sender_id = 1;
         let bind = (output.clone(), 3, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "nothing reaches the host"
@@ -2499,7 +2499,7 @@ mod tests {
             handler.on_bind(&mut ctx, 10, &(output, 3, 21)),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error, "registry 2 never saw name 10");
+        assert!(ctx.is_fatal(), "registry 2 never saw name 10");
         assert_eq!(ctx.shadow_table.get_interface(21), None);
     }
 
@@ -2709,7 +2709,7 @@ mod tests {
 
             let bind = (compositor.clone(), guest_version, 20);
             assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
-            assert!(!ctx.fatal_protocol_error);
+            assert!(!ctx.is_fatal());
             let host_id = ctx
                 .shadow_table
                 .get_host_id(20)
@@ -2731,7 +2731,7 @@ mod tests {
 
             let invalid_bind = (compositor, guest_version + 1, 21);
             assert_eq!(handler.on_bind(&mut ctx, 7, &invalid_bind), Action::Drop);
-            assert!(ctx.fatal_protocol_error);
+            assert!(ctx.is_fatal());
             assert_eq!(ctx.shadow_table.get_host_id(21), None);
             assert!(ctx.client_to_host_queue.is_empty());
         }
