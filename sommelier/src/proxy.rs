@@ -536,9 +536,10 @@ impl Client {
                     None
                 }
             };
-            // Work deferred until the message is forwarded runs only if it is.
+            // Work deferred until the message is forwarded runs only if it
+            // is, which a message that ends the session never is.
             let after_forward = self.ctx.take_post_dispatch();
-            if forward.is_some() {
+            if forward.is_some() && !self.ctx.is_fatal() {
                 for effect in after_forward {
                     apply_post_dispatch(&mut self.ctx, effect);
                 }
@@ -2381,6 +2382,24 @@ mod tests {
     async fn rejected_get_toplevel_discards_its_deferred_work() {
         let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
         let request = get_toplevel_request(&[0]);
+        client.client_conn.read_buf.extend_from_slice(&request);
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        assert_eq!(
+            client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
+            None
+        );
+        assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
+    }
+
+    /// A get_toplevel that is forwarded but ends the session (here, as if
+    /// its handler had failed) runs none of its deferred work: no role is
+    /// recorded and no Aura toplevel is created.
+    #[tokio::test]
+    async fn a_forward_that_ends_the_session_discards_its_deferred_work() {
+        let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
+        client.ctx.end_session(SessionEnd::Internal);
+        let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
         assert!(!client.handle_msgs(Direction::ClientToHost).await);

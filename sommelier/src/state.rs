@@ -222,8 +222,9 @@ pub struct GtkSurfaceState {
 /// handler returns. Work that must only happen for a forwarded request, or
 /// that needs a new ID's host mapping, is recorded with
 /// [`Context::defer_until_forwarded`]. The proxy loop takes it after every
-/// message and applies it only when the message was forwarded. Requests it
-/// queues follow the forwarded bytes and the requests the handler queued.
+/// message and applies it only when the message is forwarded: it has a
+/// forward and did not end the session. What it queues joins the message's
+/// effects, after what the handler queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PostDispatch {
     /// `xdg_surface.get_toplevel` created `xdg_toplevel` from `xdg_surface`.
@@ -501,7 +502,6 @@ impl Context {
     }
 
     /// Whether the message being dispatched ends the session.
-    #[cfg(test)]
     pub(crate) fn is_fatal(&self) -> bool {
         self.session_end.is_some()
     }
