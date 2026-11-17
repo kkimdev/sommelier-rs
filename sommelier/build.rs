@@ -72,7 +72,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", protocol_path.display());
 
         let protocol =
-            parse(protocol_path).unwrap_or_else(|_| panic!("Failed to parse {}", path_str));
+            parse(protocol_path).unwrap_or_else(|e| panic!("Failed to parse {path_str}: {e}"));
         let code = generate(&protocol);
 
         fs::write(&dest_path, code)
