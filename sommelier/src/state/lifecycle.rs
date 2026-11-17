@@ -132,7 +132,10 @@ impl Context {
 /// Forget the state of guest object `guest`, of `interface`, at its first
 /// end, through the owner of each interface's state. `host` is its host
 /// object; a local object has none. `host_deleted` says the host deleted
-/// that object, so nothing may be sent to it.
+/// that object, so nothing may be sent to it. Only the text-input arm reads
+/// it, since only a text input sends to its own host object as it ends (a
+/// `deactivate`); the other arms send only to other objects, such as Aura
+/// children or an extended keyboard, which the host's delete leaves live.
 ///
 /// Every interface with per-object state has an arm. A `wl_buffer`'s state
 /// is its render buffer, keyed by host ID ([`forget_host_id`]), and an
