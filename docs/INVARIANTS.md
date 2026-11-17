@@ -255,7 +255,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   spaces stay as dense as the live objects, and each stays within
   libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
   inclusive, the ID itself on the client side and its offset from
-  `0xff000000` on the server side.
+  `0xff000000` on the server side. A `new_id` either peer sends past that
+  limit is refused like a reused one, as libwayland refuses it.
   A client that exhausts a range ends; allocation runs in its own task, so
   no other client is affected.
   Tests: `host_ids_are_recycled_through_delete_id`,
@@ -268,6 +269,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_delete_id_for_a_live_host_only_object_changes_nothing`,
   `an_abandoned_object_frees_both_ids`,
   `host_data_offer_rejects_a_client_range_id`,
+  `guest_id_availability_rejects_reserved_and_reused_ids`,
+  `host_new_ids_must_be_fresh_server_ids`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **An object's state ends with it, once.** Every end of an object goes
