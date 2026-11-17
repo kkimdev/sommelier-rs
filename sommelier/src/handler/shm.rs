@@ -3302,7 +3302,7 @@ mod tests {
     #[test]
     fn destroying_idle_server_created_buffer_ends_without_delete_id() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         let mut handler = ShmHandler;
 
@@ -3334,7 +3334,7 @@ mod tests {
     #[test]
     fn destroying_submitted_server_created_buffer_retires_after_release() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         let mut handler = ShmHandler;
@@ -3365,7 +3365,7 @@ mod tests {
     #[test]
     fn released_server_created_buffer_retires_on_later_guest_destroy() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         let mut handler = ShmHandler;
