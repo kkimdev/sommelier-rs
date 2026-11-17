@@ -25,9 +25,8 @@ use crate::protocols::wayland::wl_keyboard;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent,
-    HostActivationState, HostContentType, HostId, HostTarget, InternalCallback, SeatFocusChange,
-    TextInputState,
+    reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
+    HostContentType, HostId, HostTarget, InternalCallback, SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, Outgoing};
 
@@ -1443,18 +1442,7 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     let host_surface = state
         .active_surface
         .and_then(|surface| ctx.shadow_table.get_host_id(surface));
-    if target.active && !target.seat_live && state.host.activation == HostActivationState::Inactive
-    {
-        log::warn!(
-            "Cannot activate text input {guest_id}: guest seat {} has no live host seat",
-            state.guest_seat
-        );
-    } else if target.active && matches!(state.host.activation, HostActivationState::Draining { .. })
-    {
-        log::debug!(
-            "Deferring text input {guest_id} activation until the previous generation drains"
-        );
-    }
+    let (host, guest_seat) = (state.host, state.guest_seat);
 
     match steps.activation {
         Some(ActivationStep::Activate) => {
@@ -1503,6 +1491,18 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
             log::debug!("Text input {guest_id} lost its host seat while active");
             if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
                 state.host.deactivate_without_barrier();
+            }
+        }
+        // An activation the target needs and the host cannot take yet.
+        None if target.active && !matches!(host, HostApplied::Active { .. }) => {
+            if matches!(host, HostApplied::Draining { .. }) {
+                log::debug!(
+                    "Deferring text input {guest_id} activation until the previous generation drains"
+                );
+            } else {
+                log::warn!(
+                    "Cannot activate text input {guest_id}: guest seat {guest_seat} has no live host seat"
+                );
             }
         }
         None => {}
@@ -2037,7 +2037,7 @@ mod tests {
             let mut state =
                 crate::state::TextInputState::new(host_v1_id, Some(host_ext_id), 0, Some(900));
             state.committed.enabled = true;
-            state.host.activation = HostActivationState::Active;
+            state.host = HostApplied::Active { content_type: None };
             state
         });
         (ctx, host_v1_id, guest_id)
@@ -2667,7 +2667,8 @@ mod tests {
             .collect();
         assert_eq!(commit_serials, vec![1, 2]);
 
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Active;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
+            HostApplied::Active { content_type: None };
         ctx.host_to_client_queue.clear();
         ctx.last_sender_id = host_v1_id;
         let mut v1_handler = TextInputV1Handler;
@@ -3093,7 +3094,7 @@ mod tests {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.active_surface = Some(guest_surface);
             state.committed.enabled = false;
-            state.host.activation = HostActivationState::Inactive;
+            state.host = HostApplied::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -3377,7 +3378,7 @@ mod tests {
                 let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
                 state.guest_seat = 7;
                 state.committed.enabled = false;
-                state.host.activation = HostActivationState::Inactive;
+                state.host = HostApplied::Inactive;
             }
             ctx.last_sender_id = guest_id;
             let mut v3 = TextInputV3Handler;
@@ -3476,7 +3477,7 @@ mod tests {
         replacement.host_v1_id = 11;
         replacement.committed.enabled = true;
         replacement.active_surface = Some(901);
-        replacement.host.activation = HostActivationState::Inactive;
+        replacement.host = HostApplied::Inactive;
         ctx.shadow_table
             .insert_paired_for_test(901, 902, "wl_surface");
         ctx.text_inputs.insert(guest_id, replacement);
@@ -3504,7 +3505,7 @@ mod tests {
                 let state = ctx.text_inputs.get_mut(&first_id).unwrap();
                 state.active_surface = Some(surface);
                 state.committed.enabled = false;
-                state.host.activation = HostActivationState::Inactive;
+                state.host = HostApplied::Inactive;
             }
             let second_id = 21;
             ctx.shadow_table
@@ -3569,7 +3570,8 @@ mod tests {
 
         ctx.last_sender_id = guest_id;
         v3_handler.on_commit(&mut ctx);
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Active;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host =
+            HostApplied::Active { content_type: None };
         ctx.last_sender_id = 30;
         ext_handler.on_set_preedit_region(&mut ctx, -3, 3);
         assert_eq!(
@@ -3728,8 +3730,9 @@ mod tests {
         );
 
         // GTK resends the unchanged terminal content type after IME events.
-        // Replaying set_content_type/set_input_type into Exo at that point
-        // resets its active Korean preedit before the next key arrives.
+        // Before v8, replaying set_content_type/deprecated_set_input_type
+        // into Exo at that point resets its active Korean preedit before
+        // the next key arrives.
         handler.on_set_content_type(&mut ctx, 0, 13);
         handler.on_commit(&mut ctx);
 
@@ -3826,8 +3829,9 @@ mod tests {
             ]
         );
 
-        // While the support holds, the content type is not resent: that
-        // could reset Exo's composition.
+        // While the support holds, the content type is not resent: before
+        // v8 a resend changes Exo's type twice, which can reset its
+        // composition.
         handler.on_set_surrounding_text(&mut ctx, &"abcd".to_string(), 4, 4);
         handler.on_set_content_type(&mut ctx, 0, 0);
         handler.on_commit(&mut ctx);
@@ -3953,7 +3957,7 @@ mod tests {
     #[test]
     fn inactive_host_ime_events_are_ignored() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Inactive;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host = HostApplied::Inactive;
         ctx.last_sender_id = host_v1_id;
         let mut handler = TextInputV1Handler;
 
@@ -3972,7 +3976,7 @@ mod tests {
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.set_guest_commits(u32::MAX);
-            state.host.activation = HostActivationState::Inactive;
+            state.host = HostApplied::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -5323,7 +5327,7 @@ mod tests {
             .get_mut(&guest_id)
             .expect("text input fixture")
             .active_surface = None;
-        ctx.text_inputs.get_mut(&guest_id).unwrap().host.activation = HostActivationState::Inactive;
+        ctx.text_inputs.get_mut(&guest_id).unwrap().host = HostApplied::Inactive;
 
         // Guest calls commit before focus (active_surface is None).
         ctx.last_sender_id = guest_id;

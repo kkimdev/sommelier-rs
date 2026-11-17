@@ -3451,7 +3451,7 @@ mod tests {
             state.committed.enabled = true;
             state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
             state.set_guest_commits(1);
-            state.host.activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 

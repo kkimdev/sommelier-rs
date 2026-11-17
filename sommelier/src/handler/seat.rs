@@ -113,7 +113,7 @@ mod tests {
         ctx.text_inputs.insert(guest_text_input, {
             let mut state = TextInputState::new(60, None, guest_seat, Some(guest_surface));
             state.current_preedit = "한".to_string();
-            state.host.activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 
