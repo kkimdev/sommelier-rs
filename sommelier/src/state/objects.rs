@@ -637,24 +637,24 @@ impl ShadowTable {
         true
     }
 
-    /// Forget active dispatch metadata while reserving the host ID until
-    /// connection teardown. Use when a protocol has no destructor request but
-    /// its host-side proxy may still exist after the guest-facing global is
-    /// removed.
+    /// Retire host-only object `host_id`, which has no destructor, once its
+    /// guest object or global is gone: stale events stop reaching it, and
+    /// its ID stays reserved for the connection.
     ///
-    /// A paired object is not a binding of the proxy's own, so it is left
-    /// alone; the host's `delete_id` cannot give a binding's ID to one (see
-    /// [`Self::release_deleted_host_id`]).
+    /// Only a live host-only object is retired. A paired object is not a
+    /// binding of the proxy's own, and an ID with no entry has nothing to
+    /// keep reserved: reserving it would let it collide with the
+    /// allocator's next object. Either is refused with a warning.
     pub fn retire_host(&mut self, host_id: u32) {
-        let host = HostId(host_id);
-        if let Some(guest) = self.guest_id_of(host) {
-            warn!(
+        match self.hosts.get_mut(&HostId(host_id)) {
+            Some(object @ HostObject::HostOnly(_)) => *object = HostObject::Retired,
+            Some(HostObject::Retired) => {}
+            Some(HostObject::Paired { guest, .. }) => warn!(
                 "Not retiring host object {host_id}, which guest object {} uses",
                 guest.0
-            );
-            return;
+            ),
+            None => warn!("Not retiring host object {host_id}, which is untracked"),
         }
-        self.hosts.insert(host, HostObject::Retired);
     }
 
     /// Apply the host's `wl_display.delete_id` for `host_id`.
@@ -1201,6 +1201,16 @@ mod tests {
         table.retire_host(next);
         assert_eq!(table.get_host_id(11), Some(next));
         assert!(table.is_event_sender_known(next));
+    }
+
+    /// Retiring an ID that holds no object must not reserve it, or the
+    /// allocator's next object would collide with the reservation.
+    #[test]
+    fn retiring_an_untracked_host_id_changes_nothing() {
+        let mut table = ShadowTable::new();
+        table.retire_host(2);
+        assert!(table.is_host_id_available(2));
+        assert_eq!(table.create_host_only("wl_shm", 1), 2);
     }
 
     /// An object whose creation never reached the host frees its host ID
