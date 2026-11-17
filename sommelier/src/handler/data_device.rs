@@ -149,9 +149,9 @@ mod tests {
             .track_interface(10, "wl_data_device".to_string());
 
         // wl_data_device.data_offer(new_id wl_data_offer) is a host-generated
-        // object event. The host is free to choose any ID; it must not be
-        // forwarded verbatim into the guest namespace.
-        let host_offer_id: u32 = 123;
+        // object event. The host chooses its ID, which must not be forwarded
+        // verbatim into the guest namespace.
+        let host_offer_id: u32 = 0xff00_0123;
         let payload = host_offer_id.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
@@ -188,22 +188,44 @@ mod tests {
         ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
             .track_interface(10, "wl_data_device".to_string());
+        let host_surface = 0xff00_0123;
         ctx.shadow_table
-            .track_host_interface(123, "wl_surface".to_string());
+            .track_host_interface(host_surface, "wl_surface".to_string());
 
-        let payload = 123u32.to_ne_bytes();
+        let payload = host_surface.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
         let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx);
 
         assert_eq!(
             raw_dispatch(result),
-            Err(crate::wire::ProtocolError::InvalidObjectId(123))
+            Err(crate::wire::ProtocolError::InvalidObjectId(host_surface))
         );
         assert!(
-            ctx.shadow_table.get_guest_id(123).is_none(),
+            ctx.shadow_table.get_guest_id(host_surface).is_none(),
             "a colliding host ID must not overwrite an existing mapping"
         );
+    }
+
+    /// libwayland-server creates objects only with server IDs. One from the
+    /// client range is the proxy's to allocate, so taking it would let the
+    /// proxy's next object collide with it.
+    #[test]
+    fn host_data_offer_rejects_a_client_range_id() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(10, 80);
+        ctx.shadow_table
+            .track_interface(10, "wl_data_device".to_string());
+
+        let payload = 123u32.to_ne_bytes();
+        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
+        let result = wl_data_device::dispatch_event(&mut msg, &mut DataDeviceHandler, &mut ctx);
+
+        assert_eq!(
+            raw_dispatch(result),
+            Err(crate::wire::ProtocolError::InvalidObjectId(123))
+        );
+        assert!(ctx.shadow_table.is_host_id_available(123));
     }
 
     #[test]

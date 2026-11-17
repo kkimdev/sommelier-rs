@@ -523,6 +523,16 @@ impl ShadowTable {
         host_id > 1 && !self.hosts.contains_key(&HostId(host_id))
     }
 
+    /// Return whether a host event may create an object with ID `host_id`:
+    /// an ID from the server range that no object holds.
+    ///
+    /// libwayland-server allocates every object it creates from the server
+    /// range. An ID from the client range is one this proxy allocates, so a
+    /// host that sent one could later collide with the proxy's own objects.
+    pub fn accepts_host_new_id(&self, host_id: u32) -> bool {
+        host_id >= Self::GUEST_SERVER_ID_START && self.is_host_id_available(host_id)
+    }
+
     pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
         self.guest_id_of(HostId(host_id)).map(|guest| guest.0)
     }

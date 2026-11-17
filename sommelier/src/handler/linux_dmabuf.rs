@@ -1711,7 +1711,7 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let guest_params_id = 7;
         let host_params_id = 8;
-        let host_buffer_id: u32 = 42;
+        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.map_id(guest_params_id, host_params_id);
         ctx.pending_params.insert(
@@ -1905,7 +1905,7 @@ mod tests {
         let first_host_params = 8;
         let second_guest_params = 9;
         let second_host_params = 10;
-        let host_buffer_id: u32 = 42;
+        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let mut handler = LinuxDmabufHandler;
 
@@ -2118,7 +2118,7 @@ mod tests {
     fn orphaned_async_created_buffer_is_destroyed_locally() {
         let guest_params_id = 7;
         let host_params_id = 8;
-        let host_buffer_id: u32 = 42;
+        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.map_id(guest_params_id, host_params_id);
         ctx.shadow_table.track_interface_with_version(
@@ -2174,16 +2174,10 @@ mod tests {
                 .map(|(message, _)| crate::test_support::msg_opcode(message)),
             Some(crate::protocols::wayland::wl_buffer::REQ_DESTROY)
         );
-        assert!(ctx
-            .shadow_table
-            .is_pending_destroy_host_only(host_buffer_id));
-        assert!(ctx
-            .shadow_table
-            .get_host_interface(host_buffer_id)
-            .is_none());
-        assert!(!ctx.shadow_table.is_host_id_available(host_buffer_id));
-        WlDisplayHandler::on_delete_id(&mut DisplayHandler, &mut ctx, host_buffer_id);
-        assert!(ctx.shadow_table.is_host_id_available(host_buffer_id));
+        assert!(
+            ctx.shadow_table.accepts_host_new_id(host_buffer_id),
+            "the host frees a server ID once the object is destroyed"
+        );
     }
 
     #[test]

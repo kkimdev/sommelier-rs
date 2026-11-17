@@ -1313,7 +1313,7 @@ fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
         match arg.typ.as_str() {
             "new_id" if arg.interface.is_some() => {
                 validations.push(quote! {
-                    if !ctx.shadow_table.is_host_id_available(#name) {
+                    if !ctx.shadow_table.accepts_host_new_id(#name) {
                         return Err(ProtocolError::InvalidObjectId(#name));
                     }
                 });
