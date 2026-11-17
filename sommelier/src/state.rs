@@ -429,6 +429,12 @@ pub struct Context {
     pub registry_global_visibility: HashMap<u32, HashMap<u32, bool>>,
     pub global_generations: HashMap<u32, u64>,
     pub next_global_generation: u64,
+    /// The generation of each global whose current advertisement the host
+    /// removed, from the first registry's `global_remove` until the global
+    /// is retired or advertised anew. It outlives the registries that saw
+    /// the removal, which a guest may destroy before the last registry that
+    /// lists the global sees it.
+    pub removed_global_generations: HashMap<u32, u64>,
     /// Globals that have been removed from the host registry. Keep their
     /// metadata until every registry has observed the removal so a second
     /// registry can still receive its own global_remove event, while blocking
@@ -983,6 +989,7 @@ impl Context {
             registry_global_visibility: HashMap::new(),
             global_generations: HashMap::new(),
             next_global_generation: 1,
+            removed_global_generations: HashMap::new(),
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
             used_dmabuf_params: HashSet::new(),
