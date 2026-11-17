@@ -25,7 +25,7 @@ limitations under the License.
 
 use crate::handler::aura_objects;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
-use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
+use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
@@ -117,9 +117,8 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         // Forward would put wl_output.release ahead of the queued Aura
         // release, so queue the translated destructor explicitly.
         ctx.shadow_table.mark_pending_destroy(guest_output_id);
-        let release_message =
-            crate::wire::MessageBuilder::new().build_message(host_output_id, REQ_RELEASE_WL_OUTPUT);
-        ctx.client_to_host_queue.push((release_message, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_output::req::release(host_output_id));
         Action::Drop
     }
 }
@@ -703,7 +702,7 @@ mod tests {
         assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), OUTPUT_HOST);
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_RELEASE_WL_OUTPUT
+            wl_output::REQ_RELEASE
         );
         assert!(ctx.outputs.primary().is_none());
         assert!(ctx.outputs.is_empty_for_test());
@@ -734,7 +733,7 @@ mod tests {
             Action::Drop
         );
         let queued = queued_headers(&ctx.client_to_host_queue);
-        assert_eq!(queued, vec![(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]);
+        assert_eq!(queued, vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)]);
         assert!(!ctx
             .shadow_table
             .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
@@ -788,7 +787,7 @@ mod tests {
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
-            [(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]
+            [(OUTPUT_HOST, wl_output::REQ_RELEASE)]
         );
         assert!(ctx.host_to_client_queue.is_empty());
         assert!(ctx.shadow_table.is_pending_destroy_guest(10));

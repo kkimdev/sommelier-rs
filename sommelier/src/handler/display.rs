@@ -174,10 +174,10 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(registry, "wl_registry".to_string());
 
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_registry_id);
-        let get_registry = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_GET_REGISTRY);
-        ctx.client_to_host_queue.push((get_registry, Vec::new()));
+        ctx.client_to_host_queue.push(wl_display::req::get_registry(
+            WL_DISPLAY_ID,
+            host_registry_id,
+        ));
 
         Action::Drop
     }
@@ -188,10 +188,8 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(callback, "wl_callback".to_string());
 
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_callback_id);
-        let sync = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_SYNC);
-        ctx.client_to_host_queue.push((sync, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_display::req::sync(WL_DISPLAY_ID, host_callback_id));
 
         Action::Drop
     }

@@ -25,18 +25,14 @@ use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
-use crate::protocols::wayland::wl_surface::{
-    WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY, REQ_OFFSET_SINCE,
-};
-use crate::protocols::xdg_shell::xdg_toplevel::{
-    REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
-};
+use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
+use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
     PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::Action;
+use crate::wire::{queue_or_drop, Action};
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -197,22 +193,6 @@ fn map_surface_damage(rect: DamageRect) -> DamageRect {
 
 pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
     format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
-}
-
-pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
-    // A string is encoded as a u32 length (including NUL), the bytes, and
-    // 32-bit padding. Keep the complete message within Wayland's 16-bit
-    // length field before handing it to MessageBuilder.
-    let Some(length_with_nul) = value.len().checked_add(1) else {
-        return false;
-    };
-    let Some(padded_length) = length_with_nul.checked_add(3).map(|len| len & !3) else {
-        return false;
-    };
-    8usize
-        .checked_add(4)
-        .and_then(|header_and_length| header_and_length.checked_add(padded_length))
-        .is_some_and(|total| total <= 0xffff)
 }
 
 /// Record the XDG role of a forwarded `xdg_surface.get_toplevel`
@@ -447,17 +427,15 @@ fn build_surface_commit_messages(
         if rect.width <= 0 || rect.height <= 0 {
             continue;
         }
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_i32(rect.x);
-        builder.write_i32(rect.y);
-        builder.write_i32(rect.width);
-        builder.write_i32(rect.height);
-        let damage = builder.build_message(host_surface_id, REQ_DAMAGE);
-        messages.push((damage, Vec::new()));
+        messages.push(wl_surface::req::damage(
+            host_surface_id,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        ));
     }
-
-    let commit = crate::wire::MessageBuilder::new().build_message(host_surface_id, REQ_COMMIT);
-    messages.push((commit, Vec::new()));
+    messages.push(wl_surface::req::commit(host_surface_id));
     Some(messages)
 }
 
@@ -653,9 +631,8 @@ impl WlSurfaceHandler for CompositorHandler {
         // The generated dispatcher cannot express the ordering required by
         // the aura-shell integration: zaura_surface.release must precede the
         // paired wl_surface destructor.
-        let surface_destroy =
-            crate::wire::MessageBuilder::new().build_message(wl_surface_host_id, REQ_DESTROY);
-        ctx.client_to_host_queue.push((surface_destroy, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_surface::req::destroy(wl_surface_host_id));
         ctx.surfaces.remove(&ctx.last_sender_id);
         ctx.forget_surface_buffer_copies(wl_surface_guest_id);
         crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
@@ -1178,9 +1155,8 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // `aura_objects::release`). Retain the guest ID until the host
         // acknowledges the role destructor.
         window_placement::release_toplevel(ctx, xdg_toplevel_id);
-        let destroy_message = crate::wire::MessageBuilder::new()
-            .build_message(host_xdg_toplevel_id, REQ_DESTROY_XDG_TOPLEVEL);
-        ctx.client_to_host_queue.push((destroy_message, Vec::new()));
+        ctx.client_to_host_queue
+            .push(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
         ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
         Action::Drop
@@ -1201,29 +1177,19 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // ChromeOS classify every guest window as the same generic ARC app and
         // loses the client's shelf/icon identity.
         let native_app_id = native_wayland_app_id(&ctx.vm_identifier, app_id);
-        if !wayland_string_fits_message(&native_app_id) {
-            log::warn!(
-                "Dropping oversized application ID for xdg_toplevel {} ({} bytes)",
-                xdg_toplevel_id,
-                native_app_id.len()
-            );
-            return Action::Drop;
-        }
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
         // shelf/application matching. Keep that request namespaced as in the
         // reference Sommelier path rather than forwarding the guest's
-        // unqualified ID directly.
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_string(&native_app_id);
-        let Ok(message) = builder.try_build_message(xdg_toplevel_host_id, REQ_SET_APP_ID) else {
-            log::warn!(
-                "Dropping oversized namespaced app ID for xdg_toplevel {}",
-                xdg_toplevel_id
-            );
+        // unqualified ID directly. An ID too long for one message reaches
+        // neither the role nor the Aura surface.
+        if !queue_or_drop(
+            &mut ctx.client_to_host_queue,
+            xdg_toplevel::req::set_app_id(xdg_toplevel_host_id, &native_app_id),
+            format_args!("the application ID of xdg_toplevel {xdg_toplevel_id}"),
+        ) {
             return Action::Drop;
-        };
-        ctx.client_to_host_queue.push((message, Vec::new()));
+        }
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
@@ -1305,7 +1271,7 @@ mod tests {
     use crate::protocols::viewporter::wp_viewporter::WpViewporterHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+    use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY};
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
     use crate::state::ARC_APPLICATION_ID_PREFIX;
@@ -1960,8 +1926,8 @@ mod tests {
     fn namespaced_app_id_wire_size_boundary_is_checked() {
         // Exercise the exact 16-bit boundary independently of the namespace
         // prefix used by the production path.
-        assert!(wayland_string_fits_message(&"x".repeat(65_519)));
-        assert!(!wayland_string_fits_message(&"x".repeat(65_520)));
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_519)).is_ok());
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_520)).is_err());
     }
 
     #[test]

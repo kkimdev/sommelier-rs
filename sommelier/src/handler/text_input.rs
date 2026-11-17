@@ -28,7 +28,7 @@ use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
     InternalCallback, SeatFocusChange, ShadowTable,
 };
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action, MessageBuilder};
 use std::os::unix::io::RawFd;
 
 /// Push a wire message built by `builder` onto `queue`, binding it to
@@ -1284,26 +1284,23 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             return Action::Drop;
         };
         let host_v1_id = ctx.shadow_table.allocate_host_id();
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_v1_id);
-        let create = builder.build_message(
-            host_manager_id,
-            zwp_text_input_manager_v1::REQ_CREATE_TEXT_INPUT,
-        );
-        ctx.client_to_host_queue.push((create, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zwp_text_input_manager_v1::req::create_text_input(
+                host_manager_id,
+                host_v1_id,
+            ));
 
         let host_ext = ctx
             .host_text_input_extension_v1_id
             .map(|host_ext_manager_id| {
                 let host_ext_id = ctx.shadow_table.allocate_host_id();
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(host_ext_id);
-                builder.write_u32(host_v1_id);
-                let get_extended = builder.build_message(
-                    host_ext_manager_id,
-                    zcr_text_input_extension_v1::REQ_GET_EXTENDED_TEXT_INPUT,
+                ctx.client_to_host_queue.push(
+                    zcr_text_input_extension_v1::req::get_extended_text_input(
+                        host_ext_manager_id,
+                        host_ext_id,
+                        host_v1_id,
+                    ),
                 );
-                ctx.client_to_host_queue.push((get_extended, Vec::new()));
                 (host_ext_id, host_ext_manager_id)
             });
 
@@ -1384,10 +1381,8 @@ fn queue_host_deactivation_barrier(
         ctx.fatal_protocol_error = true;
         return;
     }
-    let mut deactivate = MessageBuilder::new();
-    deactivate.write_u32(host_seat);
-    let deactivate = deactivate.build_message(host_v1_id, zwp_text_input_v1::REQ_DEACTIVATE);
-    ctx.client_to_host_queue.push((deactivate, Vec::new()));
+    ctx.client_to_host_queue
+        .push(zwp_text_input_v1::req::deactivate(host_v1_id, host_seat));
     let callback = queue_internal_sync(
         ctx,
         InternalCallback::TextInputDrained {
@@ -1495,11 +1490,12 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
                 host_v1_id,
                 host_surface,
             );
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_seat);
-        builder.write_u32(host_surface);
-        let activate = builder.build_message(host_v1_id, zwp_text_input_v1::REQ_ACTIVATE);
-        ctx.client_to_host_queue.push((activate, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zwp_text_input_v1::req::activate(
+                host_v1_id,
+                host_seat,
+                host_surface,
+            ));
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             let activated = state.activate_host();
             debug_assert!(activated, "activation state was checked above");
@@ -1679,9 +1675,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
         // Stop extension events and remove all local routing state.
         if let Some(host_ext_id) = state.host_ext_id {
-            let destroy = MessageBuilder::new()
-                .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_DESTROY);
-            ctx.client_to_host_queue.push((destroy, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zcr_extended_text_input_v1::req::destroy(host_ext_id));
             ctx.retire_destroyed_host_object(host_ext_id);
         }
         // The v3 object is guest-facing but backed by a v1 host object whose
@@ -1869,15 +1864,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                     cursor,
                     anchor
                 );
-                let mut builder = MessageBuilder::new();
-                builder.write_string(text);
-                builder.write_u32(*cursor as u32);
-                builder.write_u32(*anchor as u32);
-                if !push_msg(
+                if !queue_or_drop(
                     &mut transaction,
-                    plan.host_v1_id,
-                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
-                    builder,
+                    zwp_text_input_v1::req::set_surrounding_text(
+                        plan.host_v1_id,
+                        text,
+                        *cursor as u32,
+                        *anchor as u32,
+                    ),
+                    format_args!("the surrounding text of text input {guest_id}"),
                 ) {
                     return Action::Drop;
                 }
@@ -1887,15 +1882,10 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 // the previous surrounding string and can make a later IME
                 // transaction operate on stale private/editor contents.
                 log::debug!("  -> clearing v1 surrounding text for guest {}", guest_id);
-                let mut builder = MessageBuilder::new();
-                builder.write_string("");
-                builder.write_u32(0);
-                builder.write_u32(0);
-                if !push_msg(
+                if !queue_or_drop(
                     &mut transaction,
-                    plan.host_v1_id,
-                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
-                    builder,
+                    zwp_text_input_v1::req::set_surrounding_text(plan.host_v1_id, "", 0, 0),
+                    format_args!("the surrounding text of text input {guest_id}"),
                 ) {
                     return Action::Drop;
                 }
@@ -1914,29 +1904,22 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ) {
                     // This request applies to the following content-type
                     // request, so keep both in the same transaction.
-                    let mut builder = MessageBuilder::new();
-                    builder.write_u32(u32::from(plan.has_surrounding_text));
-                    let support = builder.build_message(
-                        host_ext_id,
-                        zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT,
+                    transaction.push(
+                        zcr_extended_text_input_v1::req::set_surrounding_text_support(
+                            host_ext_id,
+                            u32::from(plan.has_surrounding_text),
+                        ),
                     );
-                    transaction.push((support, Vec::new()));
                 }
             }
 
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(v1_hint);
-            builder.write_u32(v1_purpose);
-            let content_type =
-                builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_SET_CONTENT_TYPE);
-            transaction.push((content_type, Vec::new()));
+            transaction.push(zwp_text_input_v1::req::set_content_type(
+                plan.host_v1_id,
+                v1_hint,
+                v1_purpose,
+            ));
 
             if let Some(host_ext_id) = plan.host_ext_id {
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(input_type);
-                builder.write_u32(input_mode);
-                builder.write_u32(input_flags);
-                builder.write_u32(learning_mode);
                 // zcr_extended_text_input_v1 v8 replaced the deprecated
                 // four-argument request with a five-argument request that
                 // carries inline-composition support. Older hosts must
@@ -1949,19 +1932,25 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ) {
                     // A text-input-v3 client supports inline preedit by
                     // definition.
-                    builder.write_u32(1);
-                    let input_type = builder
-                        .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE);
-                    transaction.push((input_type, Vec::new()));
+                    transaction.push(zcr_extended_text_input_v1::req::set_input_type(
+                        host_ext_id,
+                        input_type,
+                        input_mode,
+                        input_flags,
+                        learning_mode,
+                        1,
+                    ));
                 } else if extension_version_allows(
                     host_ext_version,
                     zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
                 ) {
-                    let input_type = builder.build_message(
+                    transaction.push(zcr_extended_text_input_v1::req::deprecated_set_input_type(
                         host_ext_id,
-                        zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE,
-                    );
-                    transaction.push((input_type, Vec::new()));
+                        input_type,
+                        input_mode,
+                        input_flags,
+                        learning_mode,
+                    ));
                 }
             }
         }
@@ -1974,22 +1963,20 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 w,
                 h
             );
-            let mut builder = MessageBuilder::new();
-            builder.write_i32(x);
-            builder.write_i32(y);
-            builder.write_i32(w);
-            builder.write_i32(h);
-            let cursor_rectangle =
-                builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_SET_CURSOR_RECTANGLE);
-            transaction.push((cursor_rectangle, Vec::new()));
+            transaction.push(zwp_text_input_v1::req::set_cursor_rectangle(
+                plan.host_v1_id,
+                x,
+                y,
+                w,
+                h,
+            ));
         }
 
         log::debug!("  -> sending v1 commit_state(serial={})", plan.serial);
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(plan.serial);
-        let commit_state =
-            builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_COMMIT_STATE);
-        transaction.push((commit_state, Vec::new()));
+        transaction.push(zwp_text_input_v1::req::commit_state(
+            plan.host_v1_id,
+            plan.serial,
+        ));
 
         if plan.enable_conflict {
             log::warn!(

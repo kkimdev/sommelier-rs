@@ -30,37 +30,37 @@ limitations under the License.
 
 use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface, zaura_toplevel};
 use crate::state::{Context, HostAuraShell};
-use crate::wire::MessageBuilder;
+use crate::wire::Outgoing;
 
 /// What the proxy needs to know about one kind of host Aura child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct AuraChild {
     interface: &'static str,
-    /// The `zaura_shell` request that creates the child. Each takes the new
-    /// child's ID followed by the object it extends.
-    get_opcode: u16,
+    /// The `zaura_shell` request that creates the child, from the shell,
+    /// the new child's ID and the object it extends.
+    get: fn(u32, u32, u32) -> Outgoing,
     /// The child's destructor, which exists from `release_since` on.
-    release_opcode: u16,
+    release: fn(u32) -> Outgoing,
     release_since: u32,
 }
 
 impl AuraChild {
     pub(crate) const SURFACE: Self = Self {
         interface: "zaura_surface",
-        get_opcode: zaura_shell::REQ_GET_AURA_SURFACE,
-        release_opcode: zaura_surface::REQ_RELEASE,
+        get: zaura_shell::req::get_aura_surface,
+        release: zaura_surface::req::release,
         release_since: zaura_surface::REQ_RELEASE_SINCE,
     };
     pub(crate) const TOPLEVEL: Self = Self {
         interface: "zaura_toplevel",
-        get_opcode: zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
-        release_opcode: zaura_toplevel::REQ_RELEASE,
+        get: zaura_shell::req::get_aura_toplevel_for_xdg_toplevel,
+        release: zaura_toplevel::req::release,
         release_since: zaura_toplevel::REQ_RELEASE_SINCE,
     };
     pub(crate) const OUTPUT: Self = Self {
         interface: "zaura_output",
-        get_opcode: zaura_shell::REQ_GET_AURA_OUTPUT,
-        release_opcode: zaura_output::REQ_RELEASE,
+        get: zaura_shell::req::get_aura_output,
+        release: zaura_output::req::release,
         release_since: zaura_output::REQ_RELEASE_SINCE,
     };
 }
@@ -100,11 +100,8 @@ pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -
         child.interface.to_string(),
         shell.version,
     );
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(child_host_id);
-    builder.write_u32(parent_host_id);
-    let message = builder.build_message(shell.id, child.get_opcode);
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue
+        .push((child.get)(shell.id, child_host_id, parent_host_id));
     Some(child_host_id)
 }
 
@@ -119,7 +116,7 @@ pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
         ctx,
         child_host_id,
         version,
-        child.release_opcode,
+        child.release,
         child.release_since,
     );
 }
@@ -131,7 +128,7 @@ pub(crate) fn release_shell(ctx: &mut Context, shell: HostAuraShell) {
         ctx,
         shell.id,
         shell.version,
-        zaura_shell::REQ_RELEASE,
+        zaura_shell::req::release,
         zaura_shell::REQ_RELEASE_SINCE,
     );
 }
@@ -148,12 +145,11 @@ fn release_host_only(
     ctx: &mut Context,
     host_id: u32,
     version: u32,
-    release_opcode: u16,
+    release: fn(u32) -> Outgoing,
     release_since: u32,
 ) {
     if version >= release_since {
-        let message = MessageBuilder::new().build_message(host_id, release_opcode);
-        ctx.client_to_host_queue.push((message, Vec::new()));
+        ctx.client_to_host_queue.push(release(host_id));
         ctx.retire_destroyed_host_object(host_id);
     } else {
         ctx.shadow_table.retire_host_interface(host_id);
@@ -213,7 +209,25 @@ mod tests {
 
     const SHELL_HOST: u32 = 0xff00_0001;
     const PARENT_HOST: u32 = 0xff00_0002;
-    const ALL: [AuraChild; 3] = [AuraChild::SURFACE, AuraChild::TOPLEVEL, AuraChild::OUTPUT];
+    /// Each child with the opcodes of its `zaura_shell` request and its
+    /// destructor.
+    const ALL: [(AuraChild, u16, u16); 3] = [
+        (
+            AuraChild::SURFACE,
+            zaura_shell::REQ_GET_AURA_SURFACE,
+            zaura_surface::REQ_RELEASE,
+        ),
+        (
+            AuraChild::TOPLEVEL,
+            zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL,
+            zaura_toplevel::REQ_RELEASE,
+        ),
+        (
+            AuraChild::OUTPUT,
+            zaura_shell::REQ_GET_AURA_OUTPUT,
+            zaura_output::REQ_RELEASE,
+        ),
+    ];
 
     fn ctx_with_shell(version: u32) -> Context {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -229,12 +243,12 @@ mod tests {
     fn create_queues_the_shell_request_with_the_shell_version() {
         // The oldest shell that can create every child.
         let version = zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
-        for child in ALL {
+        for (child, get_opcode, _) in ALL {
             let mut ctx = ctx_with_shell(version);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue),
-                vec![(SHELL_HOST, child.get_opcode)]
+                vec![(SHELL_HOST, get_opcode)]
             );
             assert_eq!(
                 ctx.client_to_host_queue[0].0[8..16],
@@ -257,7 +271,7 @@ mod tests {
 
     #[test]
     fn release_follows_each_childs_release_version() {
-        for child in ALL {
+        for (child, _, release_opcode) in ALL {
             let since = child.release_since;
             let mut ctx = ctx_with_shell(since);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
@@ -265,7 +279,7 @@ mod tests {
             release(&mut ctx, child, id);
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue),
-                vec![(id, child.release_opcode)]
+                vec![(id, release_opcode)]
             );
             assert!(ctx.shadow_table.is_pending_destroy_host_only(id));
 

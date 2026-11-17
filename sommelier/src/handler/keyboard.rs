@@ -28,6 +28,9 @@ limitations under the License.
 //!
 //! See `sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md` for the full protocol flow.
 
+use crate::protocols::keyboard_extension_unstable_v1::{
+    zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
+};
 use crate::protocols::wayland::wl_keyboard;
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
@@ -50,22 +53,6 @@ pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
 /// `wl_keyboard.keymap` format value for XKB (Wayland spec §wl_keyboard.keymap_format).
 const WL_KEYMAP_FORMAT_NO_KEYMAP: u32 = 0;
 const WL_KEYMAP_FORMAT_XKB_V1: u32 = 1;
-
-// Opcodes are taken directly from the XML protocol definition:
-// third_party/protocols/keyboard-extension-unstable-v1.xml
-//
-// zcr_extended_keyboard_v1 requests:
-//   request index 0 = destroy
-//   request index 1 = ack_key
-// zcr_keyboard_extension_v1 requests:
-//   request index 0 = get_extended_keyboard
-//
-// These are validated against the generated protocol code in the
-// `opcode_constants_match_generated_protocol` test below. If the XML
-// is ever updated, update both the constants and the test.
-const ZCR_EXTENDED_KEYBOARD_DESTROY: u16 = 0;
-const ZCR_EXTENDED_KEYBOARD_ACK_KEY: u16 = 1;
-const ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD: u16 = 0;
 
 /// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -426,16 +413,13 @@ impl KeyboardHandler {
                     extended_version,
                 );
 
-                // zcr_keyboard_extension_v1.get_extended_keyboard(new_id, keyboard)
-                // payload = [new_id(4)][keyboard(4)] = 8 bytes.
-                let mut builder = crate::wire::MessageBuilder::new();
-                builder.write_u32(host_extended_id.0);
-                builder.write_u32(host_keyboard_id.0);
-                let msg = builder.build_message(
-                    extension_host_id.0,
-                    ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD,
+                ctx.client_to_host_queue.push(
+                    zcr_keyboard_extension_v1::req::get_extended_keyboard(
+                        extension_host_id.0,
+                        host_extended_id.0,
+                        host_keyboard_id.0,
+                    ),
                 );
-                ctx.client_to_host_queue.push((msg, Vec::new()));
                 log::debug!(
                     "Bound extended keyboard: host_extended_id={} for host_keyboard_id={}",
                     host_extended_id.0,
@@ -465,12 +449,12 @@ impl KeyboardHandler {
             );
             return;
         };
-        // zcr_extended_keyboard_v1.ack_key — payload = [serial(4)][handled(4)].
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_u32(serial);
-        builder.write_u32(if handled { 1u32 } else { 0u32 });
-        let msg = builder.build_message(host_extended_id.0, ZCR_EXTENDED_KEYBOARD_ACK_KEY);
-        ctx.client_to_host_queue.push((msg, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zcr_extended_keyboard_v1::req::ack_key(
+                host_extended_id.0,
+                serial,
+                u32::from(handled),
+            ));
     }
 }
 
@@ -1023,10 +1007,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id)
         {
             ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
-            // zcr_extended_keyboard_v1.destroy — no payload (8-byte header only).
-            let msg = crate::wire::MessageBuilder::new()
-                .build_message(host_extended_id.0, ZCR_EXTENDED_KEYBOARD_DESTROY);
-            ctx.client_to_host_queue.push((msg, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zcr_extended_keyboard_v1::req::destroy(host_extended_id.0));
             // Unregister from the host dispatch table so stale peek_key events
             // (version ≥ 2) sent after destroy cannot be dispatched to a dead object.
             ctx.retire_destroyed_host_object(host_extended_id.0);
@@ -4817,43 +4799,6 @@ mod tests {
         assert_eq!(word2 & 0xFFFF, 7, "opcode field wrong");
 
         assert_eq!(&msg[8..], &payload, "payload bytes wrong");
-    }
-
-    /// Validate that our hand-written opcode constants match the values the
-    /// code-generator derives from the XML. If the XML is ever updated and
-    /// the generated opcodes change, this test fails \u2014 preventing the silent
-    /// serialization corruption that would otherwise occur.
-    ///
-    /// The generated `Request::opcode()` method is the authoritative source:
-    ///   zcr_extended_keyboard_v1::Request::Destroy => 0
-    ///   zcr_extended_keyboard_v1::Request::AckKey  => 1
-    ///   zcr_keyboard_extension_v1::Request::GetExtendedKeyboard => 0
-    #[test]
-    fn opcode_constants_match_generated_protocol() {
-        use crate::protocols::keyboard_extension_unstable_v1::{
-            zcr_extended_keyboard_v1::Request as ExtKbReq,
-            zcr_keyboard_extension_v1::Request as ExtFactReq,
-        };
-
-        assert_eq!(
-            ExtKbReq::Destroy {}.opcode(),
-            ZCR_EXTENDED_KEYBOARD_DESTROY,
-            "ZCR_EXTENDED_KEYBOARD_DESTROY constant out of sync with generated protocol"
-        );
-        assert_eq!(
-            ExtKbReq::AckKey {
-                serial: 0,
-                handled: 0
-            }
-            .opcode(),
-            ZCR_EXTENDED_KEYBOARD_ACK_KEY,
-            "ZCR_EXTENDED_KEYBOARD_ACK_KEY constant out of sync with generated protocol"
-        );
-        assert_eq!(
-            ExtFactReq::GetExtendedKeyboard { id: 0, keyboard: 0 }.opcode(),
-            ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD,
-            "ZCR_KEYBOARD_EXTENSION_GET_EXTENDED_KEYBOARD constant out of sync with generated protocol"
-        );
     }
 
     /// Accelerator suppression must be cleared when a new keymap arrives so

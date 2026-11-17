@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols;
 use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-use crate::protocols::wayland::wl_display::REQ_SYNC;
+use crate::protocols::wayland::wl_display;
 use crate::state::{Context, HostId, InternalCallback};
 use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
 use log::debug;
@@ -38,10 +38,8 @@ pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback
         protocols::wayland::wl_callback::VERSION,
     );
     ctx.internal_callbacks.register(callback, waits_for);
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(callback.0);
-    let message = builder.build_message(WL_DISPLAY_ID, REQ_SYNC);
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue
+        .push(wl_display::req::sync(WL_DISPLAY_ID, callback.0));
     callback
 }
 

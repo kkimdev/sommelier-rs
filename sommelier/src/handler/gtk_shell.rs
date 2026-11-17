@@ -17,27 +17,22 @@ limitations under the License.
 use crate::handler::aura_objects::ensure_host_zaura_surface;
 use crate::handler::compositor::native_wayland_app_id;
 use crate::handler::window_placement::set_aura_application_id;
-use crate::protocols::aura_shell::zaura_surface::REQ_SET_STARTUP_ID;
+use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::state::{Context, GtkSurfaceState};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action, MessageBuilder};
 
 pub struct GtkShellHandler;
 
 /// Queue the GTK activation token to an Aura surface. Every Aura surface
 /// supports `set_startup_id`: the registry binds no older `zaura_shell`.
 fn queue_startup_id(ctx: &mut Context, zaura_surface_id: u32, startup_id: Option<&str>) {
-    let mut builder = MessageBuilder::new();
-    builder.write_nullable_string(startup_id);
-    match builder.try_build_message(zaura_surface_id, REQ_SET_STARTUP_ID) {
-        Ok(message) => ctx.client_to_host_queue.push((message, Vec::new())),
-        Err(error) => log::warn!(
-            "Dropping oversized GTK startup ID for zaura_surface {}: {}",
-            zaura_surface_id,
-            error
-        ),
-    }
+    queue_or_drop(
+        &mut ctx.client_to_host_queue,
+        zaura_surface::req::set_startup_id(zaura_surface_id, startup_id),
+        format_args!("GTK startup ID for zaura_surface {zaura_surface_id}"),
+    );
 }
 
 /// The `gtk_shell1.capabilities` bitfield this proxy announces: it
@@ -243,7 +238,7 @@ mod tests {
         assert_eq!(msg_sender(get_aura_surface), ZAURA_SHELL_HOST);
         assert_eq!(msg_opcode(get_aura_surface), REQ_GET_AURA_SURFACE);
         let startup_id = &ctx.client_to_host_queue[1].0;
-        assert_eq!(msg_opcode(startup_id), REQ_SET_STARTUP_ID);
+        assert_eq!(msg_opcode(startup_id), zaura_surface::REQ_SET_STARTUP_ID);
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
         assert!(ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE));
         assert_eq!(
@@ -390,7 +385,7 @@ mod tests {
             queued,
             vec![
                 (shell_host, REQ_GET_AURA_SURFACE),
-                (zaura_surface, REQ_SET_STARTUP_ID),
+                (zaura_surface, zaura_surface::REQ_SET_STARTUP_ID),
                 (zaura_surface, REQ_SET_APPLICATION_ID),
             ]
         );

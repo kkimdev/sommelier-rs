@@ -22,8 +22,9 @@ use crate::handler::shm::{
 };
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
-use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
-use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
+use crate::protocols::linux_dmabuf_v1::{
+    zwp_linux_dmabuf_v1, ALLOWED_INTERFACES as DMABUF_ALLOWED,
+};
 use crate::protocols::text_input_unstable_v3::{
     zwp_text_input_manager_v3, ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED,
 };
@@ -39,7 +40,7 @@ use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
     PendingDmabufGlobal, INERT_BIND_INTERFACE,
 };
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action, MessageBuilder};
 use log::error;
 
 /// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
@@ -48,8 +49,7 @@ use log::error;
 /// proxy synthesizes the guest's feedback object from. `create_immed` is
 /// available since v2 and explicit modifier events since v3, so bind at v3
 /// when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 =
-    crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
+const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 /// The newest host `zwp_text_input_manager_v1` the proxy binds: the vendored
 /// XML's. The generated code knows no message added after it, so a newer
 /// binding could deliver events whose unknown opcodes end the session.
@@ -344,26 +344,11 @@ fn queue_internal_bind(
     version: u32,
     host_id: u32,
 ) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(name);
-    builder.write_string(interface);
-    builder.write_u32(version);
-    builder.write_u32(host_id);
-    match builder.try_build_message(registry_host_id, wl_registry::REQ_BIND) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Dropping oversized internal bind {}:{}: {}",
-                name,
-                interface,
-                error
-            );
-            false
-        }
-    }
+    queue_or_drop(
+        &mut ctx.client_to_host_queue,
+        wl_registry::req::bind(registry_host_id, name, interface, version, host_id),
+        format_args!("internal bind {name}:{interface}"),
+    )
 }
 
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
@@ -390,8 +375,8 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             // A registry global removal invalidates the name, not objects
             // already bound from it. Explicitly destroy our hidden binding so
             // the host does not retain a proxy until connection teardown.
-            let message = MessageBuilder::new().build_message(host_id, DMABUF_DESTROY);
-            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zwp_linux_dmabuf_v1::req::destroy(host_id));
             ctx.retire_destroyed_host_object(host_id);
         }
         ctx.host_dmabuf_global_name = None;

@@ -27,6 +27,38 @@ pub const WL_DISPLAY_ID: u32 = 1;
 /// send queues hold it until the message is sent.
 pub type Outgoing = (Vec<u8>, Vec<RawFd>);
 
+/// Queue an encoded message, or log and drop one that could not be encoded.
+///
+/// Only the encoder of a message with a string or array fails, when the
+/// data does not fit the wire's 16-bit length. That data can come from the
+/// host or a guest, so dropping the one message keeps the session alive
+/// instead of ending it.
+///
+/// # Arguments
+///
+/// * `what` - names the message in the log, such as
+///   `format_args!("startup ID for zaura_surface {id}")`.
+///
+/// # Returns
+///
+/// Whether the message was queued.
+pub fn queue_or_drop(
+    queue: &mut Vec<Outgoing>,
+    message: Result<Outgoing, ProtocolError>,
+    what: impl fmt::Display,
+) -> bool {
+    match message {
+        Ok(message) => {
+            queue.push(message);
+            true
+        }
+        Err(error) => {
+            log::warn!("Dropping {what}: {error}");
+            false
+        }
+    }
+}
+
 /// The header that starts every Wayland wire message.
 ///
 /// Wire layout (Wayland specification, "Wire Format"), both words

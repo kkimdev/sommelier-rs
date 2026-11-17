@@ -49,17 +49,14 @@ use crate::handler::aura_objects::{
 use crate::handler::callback::queue_internal_sync;
 use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
 use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL_SINCE;
-use crate::protocols::aura_shell::zaura_surface::{
-    REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP, REQ_UNSET_SNAP_SINCE,
-};
+use crate::protocols::aura_shell::zaura_surface::{self, REQ_UNSET_SNAP_SINCE};
 use crate::protocols::aura_shell::zaura_toplevel::{
-    REQ_SET_SUPPORTS_SCREEN_COORDINATES, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE,
-    REQ_SET_WINDOW_BOUNDS, REQ_SET_WINDOW_BOUNDS_SINCE,
+    self, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE, REQ_SET_WINDOW_BOUNDS_SINCE,
 };
-use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
+use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{Context, HostId, InternalCallback};
 use crate::window_layout::{Rect, WindowLayoutAction};
-use crate::wire::MessageBuilder;
+use crate::wire::{queue_or_drop, MessageBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The `zaura_shell` version placement needs.
@@ -172,11 +169,6 @@ fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedTo
     })
 }
 
-fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) {
-    let message = MessageBuilder::new().build_message(host_xdg_toplevel_id, opcode);
-    ctx.client_to_host_queue.push((message, Vec::new()));
-}
-
 /// Leave fullscreen, maximized and snapped state before new bounds apply.
 ///
 /// The Aura surface may predate `unset_snap`: it keeps the version of the
@@ -184,11 +176,13 @@ fn queue_xdg_request(ctx: &mut Context, host_xdg_toplevel_id: u32, opcode: u16) 
 /// bound. Such a surface cannot be snapped by this proxy, and sending it
 /// the request would be a protocol error, so it is skipped.
 fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surface_id: u32) {
-    queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_FULLSCREEN);
-    queue_xdg_request(ctx, host_xdg_toplevel_id, REQ_UNSET_MAXIMIZED);
+    ctx.client_to_host_queue.extend([
+        xdg_toplevel::req::unset_fullscreen(host_xdg_toplevel_id),
+        xdg_toplevel::req::unset_maximized(host_xdg_toplevel_id),
+    ]);
     if aura_object_version(ctx, zaura_surface_id) >= REQ_UNSET_SNAP_SINCE {
-        let message = MessageBuilder::new().build_message(zaura_surface_id, REQ_UNSET_SNAP);
-        ctx.client_to_host_queue.push((message, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zaura_surface::req::unset_snap(zaura_surface_id));
     }
 }
 
@@ -261,14 +255,15 @@ pub(crate) fn place_focused(
     );
 
     clear_window_state(ctx, host_xdg_toplevel_id, zaura_surface_id);
-    let mut builder = MessageBuilder::new();
-    builder.write_i32(bounds.x);
-    builder.write_i32(bounds.y);
-    builder.write_i32(bounds.width);
-    builder.write_i32(bounds.height);
-    builder.write_u32(output_host_id);
-    let message = builder.build_message(zaura_toplevel_id, REQ_SET_WINDOW_BOUNDS);
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue
+        .push(zaura_toplevel::req::set_window_bounds(
+            zaura_toplevel_id,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            output_host_id,
+        ));
     queue_window_bounds_barrier(ctx, zaura_toplevel_id);
     log::info!(
         "window layout {:?}: xdg_toplevel={} zaura_toplevel={} bounds=({}, {}, {}, {}) output={}",
@@ -324,22 +319,16 @@ pub(crate) fn set_aura_application_id(
         }
         return;
     }
-    let mut builder = MessageBuilder::new();
-    builder.write_string(native_application_id);
-    match builder.try_build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID) {
-        Ok(message) => {
-            log::debug!(
-                "Set application ID to {} on zaura_surface (host_id={})",
-                native_application_id,
-                zaura_surface_host_id
-            );
-            ctx.client_to_host_queue.push((message, Vec::new()));
-        }
-        Err(error) => log::warn!(
-            "Dropping the application ID of zaura_surface {}: {}",
-            zaura_surface_host_id,
-            error
-        ),
+    if queue_or_drop(
+        &mut ctx.client_to_host_queue,
+        zaura_surface::req::set_application_id(zaura_surface_host_id, Some(native_application_id)),
+        format_args!("the application ID of zaura_surface {zaura_surface_host_id}"),
+    ) {
+        log::debug!(
+            "Set application ID to {} on zaura_surface (host_id={})",
+            native_application_id,
+            zaura_surface_host_id
+        );
     }
 }
 
@@ -372,15 +361,15 @@ fn apply_arc_identity(
     };
     // The identity is proxy-generated and at most
     // `ARC_APPLICATION_ID_PREFIX` plus ten digits, so it always fits.
-    let mut builder = MessageBuilder::new();
-    builder.write_string(&application_id);
-    let message = builder.build_message(zaura_surface_host_id, REQ_SET_APPLICATION_ID);
+    let message =
+        zaura_surface::req::set_application_id(zaura_surface_host_id, Some(&application_id))
+            .expect("an ARC identity fits a message");
     log::debug!(
         "Set ARC policy application ID {} on zaura_surface (host_id={})",
         application_id,
         zaura_surface_host_id
     );
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue.push(message);
     ctx.window_placement
         .mark_arc_application_id_applied(wl_surface_guest_id);
     true
@@ -407,10 +396,10 @@ fn ensure_zaura_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) -> Optio
     }
     let zaura_toplevel_host_id =
         aura_objects::create(ctx, AuraChild::TOPLEVEL, xdg_toplevel_host_id)?;
-    let coordinate_message = MessageBuilder::new()
-        .build_message(zaura_toplevel_host_id, REQ_SET_SUPPORTS_SCREEN_COORDINATES);
     ctx.client_to_host_queue
-        .push((coordinate_message, Vec::new()));
+        .push(zaura_toplevel::req::set_supports_screen_coordinates(
+            zaura_toplevel_host_id,
+        ));
     ctx.window_placement
         .remember_aura_toplevel(xdg_toplevel_guest_id, zaura_toplevel_host_id);
     Some(zaura_toplevel_host_id)
@@ -783,6 +772,8 @@ mod tests {
     use crate::handler::display::DisplayHandler;
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_TOPLEVEL_FOR_XDG_TOPLEVEL;
+    use crate::protocols::aura_shell::zaura_surface::{REQ_SET_APPLICATION_ID, REQ_UNSET_SNAP};
+    use crate::protocols::aura_shell::zaura_toplevel::REQ_SET_WINDOW_BOUNDS;
     use crate::protocols::aura_shell::zaura_toplevel::{
         REQ_RELEASE as REQ_RELEASE_AURA_TOPLEVEL,
         REQ_RELEASE_SINCE as REQ_RELEASE_AURA_TOPLEVEL_SINCE,
@@ -792,6 +783,7 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_toplevel::{
         XdgToplevelHandler, REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL,
     };
+    use crate::protocols::xdg_shell::xdg_toplevel::{REQ_UNSET_FULLSCREEN, REQ_UNSET_MAXIMIZED};
     use crate::state::ARC_APPLICATION_ID_PREFIX;
     use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::Action;
