@@ -44,10 +44,18 @@
   `EAGAIN` under `O_NONBLOCK`. The ChromiumOS `virtio_wl.c` does both, but
   no transfer has been checked on a device since the pumps stopped
   blocking.
-- The dma-buf fence wait still waits on the guest GPU on the event loop,
-  the one exception to the
-  [event-loop rule](docs/INVARIANTS.md#process); the fence re-dispatch
-  follow-up named at `wait_sync_file` removes it.
+- A commit of a dma-buf the guest GPU is still writing is parked and
+  dispatched again instead of waiting on the event loop
+  ([native buffers are fenced](docs/INVARIANTS.md#dma-buf)). No device
+  has exercised a pending fence since: neither the sync_file wait nor
+  the `VIRTGPU_WAIT_NOWAIT` polling of the virtio-gpu fallback.
+- A send awaits room in the peer's socket without a bound. A guest that
+  stops reading its socket while its own writes block can therefore
+  stall its connection for good, with the proxy waiting to send to it
+  and the guest waiting to send to the proxy. This predates fence
+  parking, which can lead to it (a parked stream is not read), and the
+  fence deadline does not bound it, because the loop is waiting in the
+  send. Only that client stalls.
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.

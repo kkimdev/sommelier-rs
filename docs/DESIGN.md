@@ -62,7 +62,8 @@ them: after a batch in one direction it prefers the other, and
 `next_buffered_direction` first tries a non-blocking receive on that
 preferred side so bytes still in the kernel queue are not starved. A
 client that streams render requests would otherwise hold keyboard and IME
-events behind several frames on the single thread.
+events behind several frames on the single thread. A parked guest stream
+(see [Message effects](#message-effects)) is never offered.
 32 messages still amortize a send while bounding the wait to about one
 frame. Translated messages of one batch are sent in as few transport
 submissions as the 28-descriptor limit allows, usually one; per-message
@@ -251,16 +252,34 @@ or host error wins over an internal failure. After dispatch,
   descriptors, and ends the batch. After the batch's earlier, valid
   messages, `handler::display::session_error` encodes the session's one
   `wl_display.error`. Nothing else writes one.
+- If it waits for a guest GPU fence (`return ctx.wait_for_fence(wait)`,
+  which a `wl_surface.commit` of a busy dma-buf does before it changes
+  anything), it leaves the message and everything after it buffered and
+  ends the batch. Only a guest request with no descriptor arguments may
+  wait: only the guest stream can be parked, and the descriptors would
+  be gone when the request is dispatched again. `Client` parks the guest
+  stream (`ParkedRequest`): it neither reads nor dispatches guest
+  messages, and fair dispatch does not offer them, while host events and
+  other clients go on. Once the exported sync_file is readable, or, for
+  the virtio-gpu fallback, which has no descriptor to wait on, a poll
+  interval after it parked, it dispatches the same message again, which
+  checks its fence afresh. The interval starts at `FENCE_POLL_INTERVAL`
+  (2 ms) and doubles each time the message waits again, up to
+  `MAX_FENCE_POLL_INTERVAL` (16 ms), since each ask costs several
+  ioctls; it ends at a fixed instant, which host traffic waking the loop
+  does not postpone. The deadline is set when the message first waits
+  and kept across those dispatches; one that passes it ends the session
+  as an internal failure.
 
 A session that ends never handles another message (`Client` remembers
 that it ended), so a fatal branch rolls nothing back: only output could
 escape, and the loop drops it.
 
-Effects cover only wire output. What a handler does outside the wire
-takes effect at once: it starts clipboard pumps, copies pixels into a
-buffer's host storage, waits for dma-buf fences and allocates GBM
-buffers. A session that ends aborts its pumps (`Client::run`), and its
-`Context` frees the rest.
+Effects cover only wire output and the fence wait. What a handler does
+outside the wire takes effect at once: it starts clipboard pumps, copies
+pixels into a buffer's host storage and allocates GBM buffers. A session
+that ends aborts its pumps (`Client::run`), and its `Context` frees the
+rest.
 
 Encoded output, a `wire::Outgoing`, never outlives its message. State
 that a later message releases, such as the configures a placement barrier
@@ -334,7 +353,9 @@ Guest dma-buf (`linux_dmabuf.rs`) is forwarded rather than copied. For
 classic virtio-gpu PRIME buffers, `allocator.rs` replaces the guest's
 plane-0 stride and modifier with the kernel-reported values, because the
 guest's are stale for host import. Before forwarding a commit, the proxy
-waits for the guest GPU's fence, matching ChromiumOS Sommelier.
+waits for the guest GPU's fence, matching ChromiumOS Sommelier, but
+without stalling the event loop: the commit is parked and dispatched
+again (see [Message effects](#message-effects)).
 
 The same descriptor problem applies to clipboard pipes: for each
 `wl_data_offer.receive`, `data_device.rs` sends the host a VirtWL pipe
