@@ -160,11 +160,23 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 ## Surfaces, damage and SHM
 
 - **Copy before commit.** Damaged pixels are copied from the guest buffer
-  into its host storage before the host `wl_surface.commit` is queued. A
-  failed copy drops that commit and forces a full copy on the next one.
-  A buffer attached and then destroyed before the commit keeps its backing
-  until that commit.
-  Test: `destroyed_pending_shm_attach_survives_until_commit`.
+  into its host storage before the host `wl_surface.commit` is queued. If
+  the guest's pool cannot supply them (a short read, as after the client
+  truncated the file), the commit queues `wl_shm.invalid_fd` on the
+  `wl_buffer` and the session ends, as with libwayland's SIGBUS guard. If
+  the host storage fails (mapping, dma-buf sync, EFAULT), the commit is
+  dropped and the next one copies in full. A buffer attached and then
+  destroyed before the commit keeps its backing until that commit.
+  Tests: `commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash`,
+  `copy_into_an_unwritable_destination_blames_the_host_storage`,
+  `destroyed_pending_shm_attach_survives_until_commit`.
+- **Pools are read, never mapped, and must be regular files.** The proxy
+  reads pool pixels with `pread`, because a mapping read past a truncated
+  file's end raises SIGBUS and kills every guest GUI app. A pool fd MUST be
+  a regular file, such as a memfd, tmpfs or `shm_open` file, of at least
+  the declared size; any other is rejected with `wl_shm.invalid_fd` at
+  `create_pool` and `resize`.
+  Test: `pool_backing_must_be_a_long_enough_regular_file`.
 - **Damage-only commits (open).** The rule this project has followed says
   a damage-only commit (no new `attach`) MUST also copy the damaged pixels
   of the currently committed SHM buffer, since gating the copy on a new

@@ -3535,16 +3535,10 @@ mod tests {
     }
 
     fn test_buffer_state() -> crate::state::BufferState {
-        use crate::state::{BufferState, PoolInner, PoolState};
-        use std::sync::{Arc, RwLock};
+        use crate::state::BufferState;
+        use std::sync::Arc;
         BufferState {
-            pool: Arc::new(PoolState {
-                client_fd: -1,
-                inner: RwLock::new(PoolInner {
-                    client_ptr: std::ptr::null_mut(),
-                    size: 0,
-                }),
-            }),
+            pool_file: Arc::new(crate::test_support::shm_pool_file(&[])),
             offset: 0,
             width: 1,
             height: 1,

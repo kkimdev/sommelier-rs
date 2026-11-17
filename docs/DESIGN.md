@@ -136,17 +136,22 @@ VirtWL can carry only descriptors the `virtio_wl` device allocated, so a
 guest memfd cannot reach the host. The proxy therefore implements guest
 `wl_shm` itself:
 
-- Guest pools are mapped in the proxy. Each guest `wl_buffer` gets host
-  storage, chosen once by `select_shm_backing` (`shm.rs`): VirtWL shared
-  memory laid out exactly like the guest buffer and imported by the host as
-  a `wl_shm` pool, or, with `--gpu-accel` and a kernel that supports VirtWL
-  dma-buf allocation, a host-backed PRIME dma-buf imported through the
-  host's linux-dmabuf. `ShmBacking` records the choice, so the copy path
-  re-checks nothing.
+- Guest pools are never mapped in the proxy: the copy reads pixels with
+  `pread` from the pool's file, so a client that shrinks the file after
+  `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
+  Each guest `wl_buffer` gets host storage, chosen once by
+  `select_shm_backing` (`shm.rs`): VirtWL shared memory laid out exactly
+  like the guest buffer and imported by the host as a `wl_shm` pool, or,
+  with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
+  a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
+  `ShmBacking` records the choice, so the copy path re-checks nothing.
 - On commit, the damaged region is copied from the guest pool into the host
   storage before the host `wl_surface.commit` is queued, so the host never
-  samples stale or uninitialized pixels. A failed copy drops the commit and
-  forces a full copy next time. This is a copy, not zero-copy.
+  samples stale or uninitialized pixels. A pool that cannot supply the
+  pixels (a short read) is the client's error and ends the session with
+  `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
+  the commit and forces a full copy next time. This is a copy, not
+  zero-copy.
 - `RenderBufferRegistry` tracks each buffer's use by the host
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,

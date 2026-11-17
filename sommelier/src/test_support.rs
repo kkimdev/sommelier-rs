@@ -85,6 +85,19 @@ pub fn any_fd_has_identity(identity: TestFdIdentity) -> bool {
         .any(|current| current == identity)
 }
 
+/// A memfd holding `bytes`, as a guest client creates a `wl_shm` pool file.
+pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
+    use std::io::Write;
+    let fd = nix::sys::memfd::memfd_create(
+        c"sommelier-test-shm-pool",
+        nix::sys::memfd::MFdFlags::empty(),
+    )
+    .expect("memfd_create");
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes).expect("fill the SHM pool file");
+    file
+}
+
 /// A uniquely named scratch directory removed when dropped.
 ///
 /// Tests run in parallel inside one process, so the name combines the process

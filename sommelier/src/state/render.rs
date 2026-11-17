@@ -15,52 +15,30 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::os::unix::io::{OwnedFd, RawFd};
-use std::sync::{Arc, RwLock};
+use std::fs::File;
+use std::os::unix::io::OwnedFd;
+use std::sync::Arc;
 
 use super::HostId;
 
-pub struct PoolInner {
-    pub client_ptr: *mut libc::c_void,
+/// A guest `wl_shm_pool`.
+///
+/// The bridge reads the pool's pixels with `pread` and never maps the file.
+/// A client may shrink the file after `wl_shm.create_pool`, and a read
+/// through a mapping past the new end of file raises SIGBUS, which would
+/// kill the proxy and every guest GUI app with it. A short `pread` is an
+/// ordinary error instead.
+pub struct ShmPool {
+    /// The pool's file, shared with every buffer created from the pool, so
+    /// it outlives `wl_shm_pool.destroy` while those buffers live.
+    pub file: Arc<File>,
+    /// The size the client declared. `wl_shm_pool.resize` only grows it.
     pub size: usize,
 }
 
-unsafe impl Send for PoolInner {}
-unsafe impl Sync for PoolInner {}
-
-pub struct PoolState {
-    pub client_fd: RawFd,
-    pub inner: RwLock<PoolInner>,
-}
-
-impl Drop for PoolState {
-    fn drop(&mut self) {
-        // `Drop` must release the mapping even when a worker panicked while
-        // holding the lock. `RwLock::write()` returns an error for a poisoned
-        // lock; treating that error as "nothing to clean up" leaks the entire
-        // SHM pool until process exit. `get_mut()` is safe here because `&mut
-        // self` proves that no other thread can access the lock during drop,
-        // and `PoisonError::get_mut()` still exposes the protected value.
-        let inner = match self.inner.get_mut() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        unsafe {
-            if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
-                libc::munmap(inner.client_ptr, inner.size);
-                inner.client_ptr = std::ptr::null_mut();
-            }
-        }
-        unsafe {
-            if self.client_fd >= 0 {
-                libc::close(self.client_fd);
-            }
-        }
-    }
-}
-
 pub struct BufferState {
-    pub pool: Arc<PoolState>,
+    /// The file of the pool the buffer was created from.
+    pub pool_file: Arc<File>,
     pub offset: i32,
     pub width: i32,
     pub height: i32,

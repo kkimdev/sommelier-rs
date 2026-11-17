@@ -18,15 +18,17 @@ use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::state::{BufferState, Context, DamageRect, HostId, PoolInner, PoolState};
+use crate::state::{BufferState, Context, DamageRect, HostId, ShmPool};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
 use std::collections::HashSet;
+use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::fs::FileExt;
+use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub struct ShmHandler;
 
@@ -52,7 +54,7 @@ pub(crate) const SUPPORTED_SHM_FORMATS: [u32; 6] = [
 /// `wl_shm.error` codes. The generated protocol code has no enum constants.
 const WL_SHM_ERROR_INVALID_FORMAT: u32 = 0;
 const WL_SHM_ERROR_INVALID_STRIDE: u32 = 1;
-const WL_SHM_ERROR_INVALID_FD: u32 = 2;
+pub(crate) const WL_SHM_ERROR_INVALID_FD: u32 = 2;
 
 const MANDATORY_SHM_FORMATS: [u32; 2] = [
     0, // WL_SHM_FORMAT_ARGB8888
@@ -206,23 +208,16 @@ fn format_bytes_per_pixel(format: u32) -> Option<usize> {
     }
 }
 
-fn backing_fd_has_size(fd: RawFd, size: usize) -> bool {
-    if fd < 0 {
-        return false;
-    }
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return false;
-    }
-
-    let mode = stat.st_mode as libc::mode_t;
-    if mode & libc::S_IFMT == libc::S_IFREG {
-        stat.st_size >= i64::try_from(size).unwrap_or(i64::MAX)
-    } else {
-        // Non-regular shared-memory providers (for example a virtwl fd) do
-        // not expose a meaningful st_size. mmap remains the final check.
-        true
-    }
+/// Whether `file` is a regular file of at least `size` bytes.
+///
+/// The bridge reads pools with `pread`, which needs a regular file: a memfd,
+/// or a tmpfs or `shm_open` file. Checking the size here reports a short pool
+/// when it is created or resized; a later truncation fails the read itself.
+fn regular_file_has_size(file: &File, size: usize) -> bool {
+    file.metadata().is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && u64::try_from(size).is_ok_and(|size| metadata.len() >= size)
+    })
 }
 
 /// Whether two descriptors refer to the same dma-buf object, by inode.
@@ -666,12 +661,11 @@ struct PlaneCopy {
 
 /// Bounds and layout metadata for copying one guest SHM buffer.
 ///
-/// Keeping the raw pointers separate from this value makes the copy entry
-/// point difficult to call with mismatched dimensions while avoiding a
-/// long list of loosely-related scalar arguments.
+/// Keeping the source file and destination pointer separate from this value
+/// makes the copy entry point difficult to call with mismatched dimensions
+/// while avoiding a long list of loosely-related scalar arguments.
 #[derive(Clone, Copy)]
 pub(crate) struct ShmCopyLayout {
-    pub(crate) pool_size: usize,
     pub(crate) dest_size: usize,
     pub(crate) format: u32,
     pub(crate) offset: usize,
@@ -686,7 +680,23 @@ pub(crate) struct ShmCopyLayout {
     pub(crate) height: usize,
 }
 
-fn valid_plane_copy(pool_size: usize, dest_size: usize, plane: PlaneCopy) -> Option<usize> {
+/// Why copying a SHM buffer to its host storage failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ShmCopyError {
+    /// The host storage cannot take the copy: the buffer metadata does not
+    /// fit it, or it could not be mapped or synchronized. A later commit
+    /// retries the copy.
+    #[error("the host storage cannot take the SHM copy")]
+    Destination,
+    /// The guest's pool file could not supply the pixels, for example
+    /// because the client truncated it after creating the pool.
+    #[error("cannot read the guest SHM pool: {0}")]
+    Source(#[from] io::Error),
+}
+
+/// Check one plane span against the destination mapping, and that its last
+/// source byte is addressable.
+fn valid_plane_copy(dest_size: usize, plane: PlaneCopy) -> bool {
     if plane.src_stride == 0
         || plane.dst_stride == 0
         || plane.rows == 0
@@ -694,18 +704,20 @@ fn valid_plane_copy(pool_size: usize, dest_size: usize, plane: PlaneCopy) -> Opt
         || plane.row_bytes > plane.src_stride
         || plane.row_bytes > plane.dst_stride
     {
-        return None;
+        return false;
     }
-    let last_row = plane.rows.checked_sub(1)?;
-    let src_end = plane
-        .src_offset
-        .checked_add(last_row.checked_mul(plane.src_stride)?)?
-        .checked_add(plane.row_bytes)?;
-    let dst_end = plane
-        .dst_offset
-        .checked_add(last_row.checked_mul(plane.dst_stride)?)?
-        .checked_add(plane.row_bytes)?;
-    (src_end <= pool_size && dst_end <= dest_size).then_some(plane.row_bytes)
+    let Some(last_row) = plane.rows.checked_sub(1) else {
+        return false;
+    };
+    let src_end = last_row
+        .checked_mul(plane.src_stride)
+        .and_then(|value| value.checked_add(plane.src_offset))
+        .and_then(|value| value.checked_add(plane.row_bytes));
+    let dst_end = last_row
+        .checked_mul(plane.dst_stride)
+        .and_then(|value| value.checked_add(plane.dst_offset))
+        .and_then(|value| value.checked_add(plane.row_bytes));
+    src_end.is_some() && dst_end.is_some_and(|dst_end| dst_end <= dest_size)
 }
 
 fn clipped_damage(
@@ -866,13 +878,12 @@ pub(crate) fn coalesce_damage_rects(damage: &[DamageRect]) -> Vec<DamageRect> {
 /// Validate every plane and every rectangle before touching either destination
 /// plane so malformed client metadata cannot leave a partially updated buffer.
 pub(crate) fn copy_shm_damage(
-    src_ptr: *const u8,
+    source: &File,
     dst_ptr: *mut u8,
     layout: ShmCopyLayout,
     damage: &[DamageRect],
-) -> bool {
+) -> Result<(), ShmCopyError> {
     let ShmCopyLayout {
-        pool_size,
         dest_size,
         format,
         offset,
@@ -883,15 +894,13 @@ pub(crate) fn copy_shm_damage(
         dst_plane1_stride,
         height,
     } = layout;
-    if src_ptr.is_null()
-        || src_ptr as *const libc::c_void == libc::MAP_FAILED
-        || dst_ptr.is_null()
+    if dst_ptr.is_null()
         || dst_ptr as *mut libc::c_void == libc::MAP_FAILED
         || width == 0
         || height == 0
         || format_bytes_per_pixel(format).is_none()
     {
-        return false;
+        return Err(ShmCopyError::Destination);
     }
 
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
@@ -920,15 +929,15 @@ pub(crate) fn copy_shm_damage(
                         1usize,
                         match offset.checked_add(match height.checked_mul(src_stride) {
                             Some(value) => value,
-                            None => return false,
+                            None => return Err(ShmCopyError::Destination),
                         }) {
                             Some(value) => value,
-                            None => return false,
+                            None => return Err(ShmCopyError::Destination),
                         },
                         if dst_plane1_stride == 0 {
                             match height.checked_mul(dst_stride) {
                                 Some(value) => value,
-                                None => return false,
+                                None => return Err(ShmCopyError::Destination),
                             }
                         } else {
                             dst_plane1_offset
@@ -951,28 +960,28 @@ pub(crate) fn copy_shm_damage(
                 .checked_sub(x0)
                 .and_then(|width| width.checked_mul(plane_bpp))
             else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let Some(y_offset) = y0.checked_mul(src_stride) else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let Some(x_offset) = x0.checked_mul(plane_bpp) else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let Some(src_offset) = plane_src_offset
                 .checked_add(y_offset)
                 .and_then(|value| value.checked_add(x_offset))
             else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let Some(y_offset) = y0.checked_mul(plane_dst_stride) else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let Some(dst_offset) = plane_dst_offset
                 .checked_add(y_offset)
                 .and_then(|value| value.checked_add(x_offset))
             else {
-                return false;
+                return Err(ShmCopyError::Destination);
             };
             let plane = PlaneCopy {
                 src_offset,
@@ -982,74 +991,67 @@ pub(crate) fn copy_shm_damage(
                 rows,
                 row_bytes,
             };
-            if valid_plane_copy(pool_size, dest_size, plane).is_none() {
-                return false;
+            if !valid_plane_copy(dest_size, plane) {
+                return Err(ShmCopyError::Destination);
             }
             spans.push(plane);
         }
     }
 
-    // An empty damage list is a valid no-op. This is important for a
-    // damage-only commit that carries no actual damage.
-    if spans.is_empty() {
-        return true;
-    }
-
-    // Safety: every plane's final source and destination byte was checked
-    // against the corresponding mapping length above. The mappings are
-    // disjoint buffers allocated for this wl_buffer, so non-overlapping copy
-    // is valid.
-    unsafe {
-        for plane in spans {
-            // A full-width image with matching strides is physically
-            // contiguous in both mappings.  One large copy is noticeably
-            // cheaper than issuing one call per row for 4K buffers.
+    // Every span was validated above, before the first read, so bad
+    // metadata leaves the host storage untouched. A read that fails part
+    // way does leave it partly updated; the caller then stales the whole
+    // host copy, or ends the session. An empty list is a valid no-op.
+    for plane in spans {
+        // A full-width span with matching strides is one contiguous range in
+        // both the pool file and the destination, which one read copies.
+        // That is the common case, and avoids a syscall per row of a 4K
+        // buffer.
+        let (chunk_bytes, chunks) =
             if plane.row_bytes == plane.src_stride && plane.row_bytes == plane.dst_stride {
-                let Some(bytes) = plane.row_bytes.checked_mul(plane.rows) else {
-                    return false;
-                };
-                ptr::copy_nonoverlapping(
-                    src_ptr.add(plane.src_offset),
-                    dst_ptr.add(plane.dst_offset),
-                    bytes,
-                );
-                continue;
-            }
-            for row in 0..plane.rows {
-                let Some(row_src_offset) = row.checked_mul(plane.src_stride) else {
-                    return false;
-                };
-                let Some(row_dst_offset) = row.checked_mul(plane.dst_stride) else {
-                    return false;
-                };
-                let Some(src_row) = plane.src_offset.checked_add(row_src_offset) else {
-                    return false;
-                };
-                let Some(dst_row) = plane.dst_offset.checked_add(row_dst_offset) else {
-                    return false;
-                };
-                ptr::copy_nonoverlapping(
-                    src_ptr.add(src_row),
-                    dst_ptr.add(dst_row),
-                    plane.row_bytes,
-                );
-            }
+                (plane.row_bytes * plane.rows, 1)
+            } else {
+                (plane.row_bytes, plane.rows)
+            };
+        for chunk in 0..chunks {
+            let src_offset = plane.src_offset + chunk * plane.src_stride;
+            let dst_offset = plane.dst_offset + chunk * plane.dst_stride;
+            // Safety: valid_plane_copy checked that every row of the span,
+            // and so this chunk, lies inside the destination mapping, and
+            // nothing else references that memory during the copy.
+            let destination =
+                unsafe { std::slice::from_raw_parts_mut(dst_ptr.add(dst_offset), chunk_bytes) };
+            // The read fails, instead of raising SIGBUS like a mapping
+            // would, if the client truncated the pool file. EFAULT is the
+            // destination mapping's fault, not the client's. (A FUSE-backed
+            // pool could also return EFAULT; it is then treated as a host
+            // storage failure, which only drops the commit.)
+            source
+                .read_exact_at(destination, src_offset as u64)
+                .map_err(|error| match error.raw_os_error() {
+                    Some(libc::EFAULT) => ShmCopyError::Destination,
+                    _ => ShmCopyError::Source(error),
+                })?;
         }
     }
-    true
+    Ok(())
 }
 
 /// Copy a complete SHM image. This remains a separate helper because a newly
 /// allocated host buffer has no valid pixels until its first commit.
 #[cfg(test)]
-pub(crate) fn copy_shm_planes(src_ptr: *const u8, dst_ptr: *mut u8, layout: ShmCopyLayout) -> bool {
+pub(crate) fn copy_shm_planes(
+    source: &File,
+    dst_ptr: *mut u8,
+    layout: ShmCopyLayout,
+) -> Result<(), ShmCopyError> {
     let rect = DamageRect::new(
         0,
         0,
         i32::try_from(layout.width).unwrap_or(i32::MAX),
         i32::try_from(layout.height).unwrap_or(i32::MAX),
     );
-    copy_shm_damage(src_ptr, dst_ptr, layout, std::slice::from_ref(&rect))
+    copy_shm_damage(source, dst_ptr, layout, std::slice::from_ref(&rect))
 }
 
 /// Report a resource failure while creating a `wl_buffer`.
@@ -1253,9 +1255,31 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             );
             return Action::Drop;
         };
-        if !backing_fd_has_size(fd, pool_size) {
+        // proxy.rs closes `fd` after this handler returns, so the pool owns
+        // a duplicate, close-on-exec like every descriptor the proxy keeps.
+        let duplicate = if fd < 0 {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
+        } else {
+            // Safety: the dispatcher keeps `fd` open until this handler
+            // returns, and it is not -1.
+            unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+        };
+        let file = match duplicate {
+            Ok(duplicate) => File::from(duplicate),
+            Err(error) => {
+                error!("Failed to dup FD for SHM pool: {}", error);
+                queue_protocol_error(
+                    ctx,
+                    ctx.last_sender_id,
+                    WL_SHM_ERROR_INVALID_FD,
+                    "invalid wl_shm pool fd",
+                );
+                return Action::Drop;
+            }
+        };
+        if !regular_file_has_size(&file, pool_size) {
             warn!(
-                "Rejecting SHM pool fd {} that is shorter than declared size {}",
+                "Rejecting SHM pool fd {} that is not a regular file of at least {} bytes",
                 fd, pool_size
             );
             queue_protocol_error(
@@ -1266,58 +1290,10 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             );
             return Action::Drop;
         }
-        debug!("Creating pool, fd={}", fd);
-
-        // Duplicate the FD for PoolState because proxy.rs closes the original 'fd'
-        // after this handler returns.
-        let pool_fd = unsafe { libc::dup(fd) };
-        debug!("Dup result={}", pool_fd);
-
-        if pool_fd < 0 {
-            error!("Failed to dup FD for SHM pool");
-            queue_protocol_error(
-                ctx,
-                ctx.last_sender_id,
-                WL_SHM_ERROR_INVALID_FD,
-                "invalid wl_shm pool fd",
-            );
-            return Action::Drop;
-        }
-
-        // Mmap the file
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                pool_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                pool_fd,
-                0,
-            )
+        let pool = ShmPool {
+            file: Arc::new(file),
+            size: pool_size,
         };
-        debug!("Mmap result={:?}", ptr);
-
-        if ptr == libc::MAP_FAILED {
-            error!("Failed to mmap SHM pool");
-            unsafe {
-                libc::close(pool_fd);
-            }
-            queue_protocol_error(
-                ctx,
-                ctx.last_sender_id,
-                WL_SHM_ERROR_INVALID_FD,
-                "invalid wl_shm pool fd",
-            );
-            return Action::Drop;
-        }
-
-        let pool = Arc::new(PoolState {
-            client_fd: pool_fd, // Takes ownership of new FD
-            inner: RwLock::new(PoolInner {
-                client_ptr: ptr,
-                size: pool_size,
-            }),
-        });
 
         ctx.pools.insert(pool_id, pool);
         ctx.shadow_table
@@ -1342,7 +1318,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 struct ShmBufferRequest {
     id: u32,
     pool_id: u32,
-    pool: Arc<PoolState>,
+    pool_file: Arc<File>,
     offset: i32,
     width: i32,
     height: i32,
@@ -1477,7 +1453,7 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
 fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd: OwnedFd) {
     let ShmBufferRequest {
         pool_id,
-        ref pool,
+        ref pool_file,
         offset,
         width,
         height,
@@ -1586,7 +1562,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         (0, 0)
     };
     let state = BufferState {
-        pool: pool.clone(),
+        pool_file: Arc::clone(pool_file),
         offset,
         width,
         height,
@@ -1621,7 +1597,7 @@ fn create_dmabuf_buffer(
 ) {
     let ShmBufferRequest {
         pool_id,
-        ref pool,
+        ref pool_file,
         offset,
         width,
         height,
@@ -1744,7 +1720,7 @@ fn create_dmabuf_buffer(
     queue_host_params_destroy(ctx, params_id);
 
     let state = BufferState {
-        pool: pool.clone(),
+        pool_file: Arc::clone(pool_file),
         offset,
         width,
         height,
@@ -1809,14 +1785,13 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             return Action::Drop;
         }
-        let pool = match ctx.pools.get(&pool_id) {
-            Some(p) => p.clone(),
-            None => {
-                warn!("Unknown pool ID: {}", pool_id);
-                queue_protocol_error(ctx, pool_id, WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool");
-                return Action::Drop;
-            }
+        let Some(pool) = ctx.pools.get(&pool_id) else {
+            warn!("Unknown pool ID: {}", pool_id);
+            queue_protocol_error(ctx, pool_id, WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool");
+            return Action::Drop;
         };
+        let pool_file = Arc::clone(&pool.file);
+        let pool_size = pool.size;
         if !supported_shm_format(format) || !guest_shm_format_available(ctx, format) {
             warn!("Rejecting unsupported SHM buffer format {:#010x}", format);
             queue_protocol_error(
@@ -1841,14 +1816,6 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             return Action::Drop;
         }
 
-        let pool_size = match pool.inner.read() {
-            Ok(inner) => inner.size,
-            Err(_) => {
-                warn!("Cannot inspect SHM pool {}", pool_id);
-                queue_buffer_creation_error(ctx, pool_id, "unable to inspect wl_shm pool");
-                return Action::Drop;
-            }
-        };
         let Some(buffer_size) =
             valid_buffer_layout(pool_size, offset, width, height, stride, format)
         else {
@@ -1868,7 +1835,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         let request = ShmBufferRequest {
             id,
             pool_id,
-            pool,
+            pool_file,
             offset,
             width,
             height,
@@ -1905,73 +1872,40 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             return Action::Drop;
         }
-        debug!("Resizing pool id={}", pool_id);
-        if let Some(pool) = ctx.pools.get(&pool_id).cloned() {
-            if let Ok(mut inner) = pool.inner.write() {
-                let Some(new_size) = valid_pool_resize(inner.size, size) else {
-                    // wl_shm_pool.resize is an expansion-only operation. A
-                    // client that needs a smaller pool must create a new pool;
-                    // shrinking an existing mapping could invalidate live
-                    // wl_buffers that still reference the old tail.
-                    warn!(
-                        "Rejecting non-growing SHM pool resize from {} to {}",
-                        inner.size, size
-                    );
-                    queue_protocol_error(
-                        ctx,
-                        pool_id,
-                        WL_SHM_ERROR_INVALID_STRIDE,
-                        "invalid wl_shm pool resize",
-                    );
-                    return Action::Drop;
-                };
-                if !backing_fd_has_size(pool.client_fd, new_size) {
-                    warn!(
-                        "Rejecting SHM pool resize to {}: backing fd {} is too short",
-                        new_size, pool.client_fd
-                    );
-                    queue_protocol_error(
-                        ctx,
-                        pool_id,
-                        WL_SHM_ERROR_INVALID_FD,
-                        "invalid wl_shm pool fd",
-                    );
-                    return Action::Drop;
-                }
+        let Some(pool) = ctx.pools.get_mut(&pool_id) else {
+            warn!("Pool not found for resize: {}", pool_id);
+            return Action::Drop;
+        };
+        let error = match valid_pool_resize(pool.size, size) {
+            // wl_shm_pool.resize is an expansion-only operation. A client
+            // that needs a smaller pool must create a new pool; shrinking
+            // could invalidate live wl_buffers that still reference the old
+            // tail.
+            None => {
+                warn!(
+                    "Rejecting non-growing SHM pool resize from {} to {}",
+                    pool.size, size
+                );
+                Some((WL_SHM_ERROR_INVALID_STRIDE, "invalid wl_shm pool resize"))
+            }
+            Some(new_size) if !regular_file_has_size(&pool.file, new_size) => {
+                warn!(
+                    "Rejecting SHM pool resize to {}: the pool file is too short",
+                    new_size
+                );
+                Some((WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool fd"))
+            }
+            Some(new_size) => {
                 debug!(
                     "Resizing pool id={} from {} to {}",
-                    pool_id, inner.size, size
+                    pool_id, pool.size, new_size
                 );
-                // mremap with MREMAP_MAYMOVE
-                let new_ptr = unsafe {
-                    libc::mremap(inner.client_ptr, inner.size, new_size, libc::MREMAP_MAYMOVE)
-                };
-
-                if new_ptr == libc::MAP_FAILED {
-                    error!(
-                        "Failed to mremap pool: {:?}",
-                        std::io::Error::last_os_error()
-                    );
-                    // A failed resize must be fatal.  Otherwise the client
-                    // continues with the old mapping while believing that
-                    // the pool has grown, and a later buffer request can
-                    // address memory outside the mapped range.
-                    queue_protocol_error(
-                        ctx,
-                        pool_id,
-                        WL_SHM_ERROR_INVALID_FD,
-                        "invalid wl_shm pool fd",
-                    );
-                } else {
-                    inner.client_ptr = new_ptr;
-                    inner.size = new_size;
-                    debug!("Pool resized successfully to {:?}", new_ptr);
-                }
-            } else {
-                error!("Failed to acquire write lock on pool");
+                pool.size = new_size;
+                None
             }
-        } else {
-            warn!("Pool not found for resize: {}", pool_id);
+        };
+        if let Some((code, message)) = error {
+            queue_protocol_error(ctx, pool_id, code, message);
         }
         Action::Drop
     }
@@ -2067,22 +2001,25 @@ mod tests {
     use super::map_dmabuf;
     use super::ShmHandler;
     use super::{
-        backing_fd_has_size, clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats,
-        coalesce_damage_rects, copy_shm_damage, copy_shm_planes, guest_shm_format_available,
-        record_host_shm_drm_format, record_host_shm_format, record_host_shm_wl_format,
-        register_guest_shm, retire_eligible_buffers, rollback_registered_buffer,
+        clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, coalesce_damage_rects,
+        copy_shm_damage, copy_shm_planes, guest_shm_format_available, record_host_shm_drm_format,
+        record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
+        regular_file_has_size, retire_eligible_buffers, rollback_registered_buffer,
         same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, WL_SHM_FORMAT_NV12,
+        valid_shm_stride, validate_dmabuf_layout, ShmCopyError, WL_SHM_ERROR_INVALID_FD,
+        WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::DamageRect;
-    use crate::state::{BufferState, Context, HostId, PoolInner, PoolState, RenderBufferLifecycle};
+    use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool};
+    use crate::test_support::shm_pool_file;
     use crate::wire::{Action, WireMessage};
-    use std::os::fd::{AsRawFd, IntoRawFd};
-    use std::sync::{Arc, RwLock};
+    use std::fs::File;
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
 
     fn register_test_local(ctx: &mut Context, guest_id: u32, host_id: u32, backing: BufferState) {
         assert!(ctx.register_local_buffer(guest_id, host_id, backing));
@@ -2187,29 +2124,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_pool_resize_queues_invalid_fd_error() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let fd = memfd_create(
-            CString::new("sommelier-failed-resize").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        nix::unistd::ftruncate(&fd, 8192).expect("ftruncate");
+    fn pool_resize_past_the_file_end_queues_invalid_fd_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let pool_id = 20;
         ctx.pools.insert(
             pool_id,
-            Arc::new(PoolState {
-                client_fd: fd.into_raw_fd(),
-                inner: RwLock::new(PoolInner {
-                    // MAP_FAILED makes mremap fail deterministically without
-                    // touching a live mapping.
-                    client_ptr: libc::MAP_FAILED,
-                    size: 4096,
-                }),
-            }),
+            ShmPool {
+                file: Arc::new(shm_pool_file(&[0; 4096])),
+                size: 4096,
+            },
         );
         ctx.last_sender_id = pool_id;
         let mut handler = ShmHandler;
@@ -2225,9 +2148,10 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            2,
-            "mremap failure must use wl_shm.invalid_fd"
+            WL_SHM_ERROR_INVALID_FD,
+            "a resize past the file's end must use wl_shm.invalid_fd"
         );
+        assert_eq!(ctx.pools[&pool_id].size, 4096);
     }
 
     #[test]
@@ -2340,10 +2264,9 @@ mod tests {
         let mut destination = [0u8; 24];
 
         assert!(copy_shm_planes(
-            source.as_ptr(),
+            &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
-                pool_size: source.len(),
                 dest_size: destination.len(),
                 format: WL_SHM_FORMAT_NV12,
                 offset: 0,
@@ -2354,17 +2277,18 @@ mod tests {
                 dst_plane1_stride: 0,
                 height: 4,
             },
-        ));
+        )
+        .is_ok());
         assert_eq!(&destination[..16], &[0x11; 16]);
         assert_eq!(&destination[16..], &[0x22; 8]);
 
+        // The Y plane fits a 23-byte destination, but the UV plane does not.
         destination.fill(0);
-        assert!(!copy_shm_planes(
-            source.as_ptr(),
+        assert!(copy_shm_planes(
+            &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
-                pool_size: 23,
-                dest_size: destination.len(),
+                dest_size: 23,
                 format: WL_SHM_FORMAT_NV12,
                 offset: 0,
                 width: 4,
@@ -2374,7 +2298,8 @@ mod tests {
                 dst_plane1_stride: 0,
                 height: 4,
             },
-        ));
+        )
+        .is_err());
         assert!(
             destination.iter().all(|byte| *byte == 0),
             "an invalid UV span must not leave the Y plane partially copied"
@@ -2382,11 +2307,10 @@ mod tests {
     }
 
     #[test]
-    fn copy_rejects_null_or_failed_mappings_before_pointer_arithmetic() {
-        let mut destination = [0u8; 4];
+    fn copy_rejects_null_or_failed_destinations_before_pointer_arithmetic() {
+        let source = shm_pool_file(&[0u8; 4]);
         let layout = super::ShmCopyLayout {
-            pool_size: 4,
-            dest_size: destination.len(),
+            dest_size: 4,
             format: 0,
             offset: 0,
             width: 1,
@@ -2397,24 +2321,68 @@ mod tests {
             height: 1,
         };
         let damage = [DamageRect::new(0, 0, 1, 1)];
-        assert!(!copy_shm_damage(
-            std::ptr::null(),
-            destination.as_mut_ptr(),
-            layout,
-            &damage
+        for destination in [std::ptr::null_mut(), libc::MAP_FAILED.cast()] {
+            assert!(matches!(
+                copy_shm_damage(&source, destination, layout, &damage),
+                Err(ShmCopyError::Destination)
+            ));
+        }
+    }
+
+    #[test]
+    fn copy_from_a_truncated_pool_file_fails_instead_of_faulting() {
+        // A client may shrink its pool file after creating the pool. Reading
+        // a mapping past the new end raised SIGBUS and killed the proxy.
+        let source = shm_pool_file(&[0x11; 8]);
+        source.set_len(4).unwrap();
+        let mut destination = [0u8; 8];
+        let layout = super::ShmCopyLayout {
+            dest_size: destination.len(),
+            format: 0,
+            offset: 0,
+            width: 1,
+            src_stride: 4,
+            dst_stride: 4,
+            dst_plane1_offset: 0,
+            dst_plane1_stride: 0,
+            height: 2,
+        };
+        assert!(matches!(
+            copy_shm_planes(&source, destination.as_mut_ptr(), layout),
+            Err(ShmCopyError::Source(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
-        assert!(!copy_shm_damage(
-            [0u8; 4].as_ptr(),
-            std::ptr::null_mut(),
-            layout,
-            &damage
-        ));
-        assert!(!copy_shm_damage(
-            libc::MAP_FAILED.cast(),
-            destination.as_mut_ptr(),
-            layout,
-            &damage
-        ));
+    }
+
+    #[test]
+    fn copy_into_an_unwritable_destination_blames_the_host_storage() {
+        // The kernel reports a fault in the destination as EFAULT, which must
+        // not become the client's invalid_fd.
+        let source = shm_pool_file(&[0x11; 4]);
+        let destination = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(destination, libc::MAP_FAILED);
+        let layout = super::ShmCopyLayout {
+            dest_size: 4,
+            format: 0,
+            offset: 0,
+            width: 1,
+            src_stride: 4,
+            dst_stride: 4,
+            dst_plane1_offset: 0,
+            dst_plane1_stride: 0,
+            height: 1,
+        };
+        let result = copy_shm_planes(&source, destination.cast(), layout);
+        unsafe { libc::munmap(destination, 4096) };
+        assert!(matches!(result, Err(ShmCopyError::Destination)));
     }
 
     #[test]
@@ -2425,10 +2393,9 @@ mod tests {
         let mut destination = [0u8; 32];
 
         assert!(copy_shm_planes(
-            source.as_ptr(),
+            &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
-                pool_size: source.len(),
                 dest_size: destination.len(),
                 format: WL_SHM_FORMAT_NV12,
                 offset: 0,
@@ -2439,7 +2406,8 @@ mod tests {
                 dst_plane1_stride: 4,
                 height: 4,
             },
-        ));
+        )
+        .is_ok());
         assert_eq!(&destination[..16], &[0x11; 16]);
         assert_eq!(&destination[16..20], &[0; 4]);
         assert_eq!(&destination[20..28], &[0x22; 8]);
@@ -2455,10 +2423,9 @@ mod tests {
         let mut destination = [0xcc; 36];
 
         assert!(copy_shm_damage(
-            source.as_ptr(),
+            &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
-                pool_size: source.len(),
                 dest_size: destination.len(),
                 format: WL_SHM_FORMAT_NV12,
                 offset: 0,
@@ -2470,7 +2437,8 @@ mod tests {
                 height: 4,
             },
             &[DamageRect::new(0, 2, 4, 2)],
-        ));
+        )
+        .is_ok());
 
         // Only the damaged bottom half is changed.  The UV row must use its
         // own eight-byte destination stride, not the four-byte Y stride.
@@ -2705,19 +2673,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_regular_pool_backing_that_is_too_short() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
+    fn pool_backing_must_be_a_long_enough_regular_file() {
+        let file = shm_pool_file(&[]);
+        assert!(regular_file_has_size(&file, 0));
+        assert!(!regular_file_has_size(&file, 4096));
+        file.set_len(4096).unwrap();
+        assert!(regular_file_has_size(&file, 4096));
 
-        let fd = memfd_create(
-            CString::new("sommelier-short-shm").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        assert!(backing_fd_has_size(fd.as_raw_fd(), 0));
-        assert!(!backing_fd_has_size(fd.as_raw_fd(), 4096));
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
-        assert!(backing_fd_has_size(fd.as_raw_fd(), 4096));
+        // `pread` cannot read a pool from a pipe or a device.
+        let (pipe_read, _pipe_write) = nix::unistd::pipe().expect("pipe");
+        assert!(!regular_file_has_size(&File::from(pipe_read), 0));
     }
 
     #[test]
@@ -2759,13 +2724,10 @@ mod tests {
         let buffer_id = 30;
         ctx.pools.insert(
             pool_id,
-            Arc::new(PoolState {
-                client_fd: fd.into_raw_fd(),
-                inner: RwLock::new(PoolInner {
-                    client_ptr: libc::MAP_FAILED,
-                    size: 4096,
-                }),
-            }),
+            ShmPool {
+                file: Arc::new(File::from(fd)),
+                size: 4096,
+            },
         );
         ctx.shadow_table
             .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
@@ -2979,12 +2941,9 @@ mod tests {
             Action::Drop
         );
         assert_eq!(
-            ctx.pools
-                .get(&30)
-                .and_then(|pool| pool.inner.read().ok())
-                .map(|inner| inner.size),
+            ctx.pools.get(&30).map(|pool| pool.size),
             Some(4096),
-            "a stale pool must not resize its local mapping"
+            "a stale pool must not resize"
         );
         assert_eq!(
             crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_create_buffer(
@@ -3028,19 +2987,12 @@ mod tests {
         let mut surface_state = crate::state::SurfaceState::default();
         surface_state.set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
         ctx.surfaces.insert(surface, surface_state);
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: std::ptr::null_mut(),
-                size: 0,
-            }),
-        });
         register_test_local(
             &mut ctx,
             guest_buffer,
             host_buffer,
             BufferState {
-                pool,
+                pool_file: Arc::new(shm_pool_file(&[])),
                 offset: 0,
                 width: 1,
                 height: 1,
@@ -3118,19 +3070,12 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: std::ptr::null_mut(),
-                size: 0,
-            }),
-        });
         register_test_local(
             &mut ctx,
             guest_buffer,
             host_buffer,
             BufferState {
-                pool,
+                pool_file: Arc::new(shm_pool_file(&[])),
                 offset: 0,
                 width: 1,
                 height: 1,
@@ -3338,19 +3283,12 @@ mod tests {
                 .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
             ctx.shadow_table.set_host_version(host_id, 1);
         }
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: std::ptr::null_mut(),
-                size: 0,
-            }),
-        });
         register_test_local(
             &mut ctx,
             local_buffer,
             local_host,
             BufferState {
-                pool,
+                pool_file: Arc::new(shm_pool_file(&[])),
                 offset: 0,
                 width: 1,
                 height: 1,
@@ -3414,19 +3352,12 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
         ctx.shadow_table.set_host_version(host_buffer, 1);
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: std::ptr::null_mut(),
-                size: 0,
-            }),
-        });
         register_test_local(
             &mut ctx,
             guest_buffer,
             host_buffer,
             BufferState {
-                pool,
+                pool_file: Arc::new(shm_pool_file(&[])),
                 offset: 0,
                 width: 1,
                 height: 1,
