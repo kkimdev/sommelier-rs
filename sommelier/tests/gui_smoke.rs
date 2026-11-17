@@ -12,6 +12,8 @@ use std::process::Command;
 /// ```
 #[test]
 #[ignore = "requires a live Wayland compositor and locally built GUI binaries"]
+// The test waits for its script from a plain thread, with no event loop.
+#[allow(clippy::disallowed_methods)]
 fn sample_gui_runs_through_gpu_accel_proxy() {
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/sommelier-gui-smoke.sh");

@@ -44,7 +44,10 @@ handler intercepts the ones whose meaning changes across the boundary.
   owns xkb state, which is `!Send`; keeping every task on one thread avoids
   locks and makes that requirement part of the future's type. `SIGHUP`
   reloads run in a task of their own on the same thread, so a reload never
-  races a key event and never waits for an accept.
+  races a key event and never waits for an accept. One thread also means
+  that a call that waits for a peer stalls every client, so nothing on it
+  waits on a guest client or on host data (see
+  [process invariants](INVARIANTS.md#process)).
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
   `connection.rs` hides the difference behind `WaylandConnection`.
@@ -183,7 +186,7 @@ encode wire bytes ad hoc.
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
-| Clipboard | `data_device.rs` | clipboard pumps in `Context` |
+| Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs`, `window_placement.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, `window_placement.rs` |
 
@@ -296,8 +299,20 @@ plane-0 stride and modifier with the kernel-reported values, because the
 guest's are stale for host import. Before forwarding a commit, the proxy
 waits for the guest GPU's fence, matching ChromiumOS Sommelier.
 
-The same descriptor problem applies to clipboard pipes: `data_device.rs`
-creates a VirtWL pipe and pumps bytes between it and the guest pipe.
+The same descriptor problem applies to clipboard pipes: for each
+`wl_data_offer.receive`, `data_device.rs` sends the host a VirtWL pipe
+and pumps what the host writes into the guest's descriptor.
+`data_device::pump` waits on the VirtWL pipe, and on a guest pipe or
+socket, through `AsyncFd` (a regular file it writes directly), without
+touching the flags the guest's descriptor shares with the client. A peer
+that stalls parks only its own transfer, until `PUMP_IDLE_TIMEOUT` ends
+it. Ending it closes the guest's pipe as a whole transfer does, so the
+guest cannot tell a cut-off paste from a complete one; a pipe has no way
+to carry an error (see [process invariants](INVARIANTS.md#process)).
+`Context::clipboard_pumps` (`ClipboardPumps`) owns a connection's pumps:
+it gives a `PumpSlot`, the only way to start one, while fewer than
+`MAX_CLIPBOARD_PUMPS` are in flight, and aborts them all when the
+connection ends.
 
 ## Keyboard and IME
 

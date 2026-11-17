@@ -214,7 +214,7 @@ impl Client {
         // them before dropping the connection so an unfinished VirtWL transfer
         // cannot keep its duplicated descriptors or task alive after either
         // endpoint disconnects.
-        self.ctx.stop_clipboard_pumps().await;
+        self.ctx.clipboard_pumps.stop().await;
     }
 
     /// Choose the next buffered direction while opportunistically receiving
@@ -342,7 +342,6 @@ impl Client {
         if self.ended {
             return false;
         }
-        self.ctx.reap_clipboard_pumps();
         let (conn, other_conn) = match direction {
             Direction::ClientToHost => (&mut self.client_conn, &mut self.host_conn),
             Direction::HostToClient => (&mut self.host_conn, &mut self.client_conn),

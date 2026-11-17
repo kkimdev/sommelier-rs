@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// The VirtWL device boundary: its ioctls return raw descriptors, which this
-// module takes over or closes, even on error paths.
-#![allow(clippy::disallowed_methods)]
+// The VirtWL device boundary: its ioctls return raw descriptors, which the
+// functions below that allow `clippy::disallowed_methods` take over or
+// close, even on error paths. The allow is per function so the blocking
+// guard still covers the rest of the channel.
 
 use crate::virtwl::{
     virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send,
@@ -62,6 +63,7 @@ fn add_nonblocking_flag(flags: nix::fcntl::OFlag) -> nix::fcntl::OFlag {
     flags | nix::fcntl::OFlag::O_NONBLOCK
 }
 
+#[allow(clippy::disallowed_methods)]
 fn close_raw_fds(fds: &[i32]) {
     let mut seen = HashSet::new();
     for &fd in fds {
@@ -71,12 +73,14 @@ fn close_raw_fds(fds: &[i32]) {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn close_returned_fd(fd: i32) {
     if fd >= 0 {
         let _ = nix::unistd::close(fd);
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn owned_fds_from_txn(raw_fds: &[i32]) -> io::Result<Vec<OwnedFd>> {
     let mut packed = true;
     let mut seen = HashSet::new();
@@ -120,6 +124,7 @@ pub struct VirtWaylandChannel {
 }
 
 impl VirtWaylandChannel {
+    #[allow(clippy::disallowed_methods)]
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let dev_file = OpenOptions::new()
             .read(true)
@@ -203,6 +208,7 @@ impl VirtWaylandChannel {
         self.supports_dmabuf
     }
 
+    #[allow(clippy::disallowed_methods)]
     pub fn allocate(&self, size: u32) -> io::Result<(OwnedFd, u32)> {
         let mut new_alloc = crate::virtwl::virtwl_ioctl_new::new_alloc(size);
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_alloc) };
@@ -227,6 +233,7 @@ impl VirtWaylandChannel {
     /// The returned descriptor is mapped into the guest by the VirtWL kernel
     /// driver.  It can be sent to the host compositor as a linux-dmabuf plane
     /// descriptor and can be CPU-accessed after a `sync` begin operation.
+    #[allow(clippy::disallowed_methods)]
     pub fn allocate_dmabuf(
         &self,
         width: u32,
@@ -293,6 +300,7 @@ impl VirtWaylandChannel {
             .map_err(io::Error::from)
     }
 
+    #[allow(clippy::disallowed_methods)]
     pub fn create_pipe(&self, read: bool) -> io::Result<OwnedFd> {
         let mut new_pipe = if read {
             crate::virtwl::virtwl_ioctl_new::new_pipe_read()
@@ -456,6 +464,8 @@ fn recv_message(fd: RawFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         add_nonblocking_flag, close_raw_fds, close_returned_fd, dmabuf_probe_supported,
