@@ -1336,6 +1336,126 @@ fn queue_host_deactivation_barrier(
     debug_assert!(draining, "the host object was checked to be active above");
 }
 
+/// Push the host requests that set the v3 content type `(hint, purpose)`
+/// of the text input on `(host_v1_id, host_ext_id)`, and return the
+/// surrounding-text support they told the host, if they told any.
+fn push_content_type(
+    transaction: &mut Vec<Outgoing>,
+    ctx: &Context,
+    (host_v1_id, host_ext_id): (u32, Option<u32>),
+    (hint, purpose): (u32, u32),
+    has_surrounding_text: bool,
+) -> Option<bool> {
+    let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
+        map_v3_content_type(hint, purpose);
+    let host_ext = host_ext_id.map(|host_ext_id| {
+        (
+            host_ext_id,
+            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
+        )
+    });
+    match host_ext {
+        // The extension XML says v8's set_input_type is "used in place of"
+        // v1 set_content_type. Exo applies the pending surrounding-text
+        // support to whichever of the two comes first and then resets it to
+        // supported, so sending both would always report the surrounding
+        // text as supported.
+        Some((host_ext_id, version))
+            if extension_version_allows(
+                version,
+                zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
+            ) =>
+        {
+            let support = extension_version_allows(
+                version,
+                zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
+            )
+            .then_some(has_surrounding_text);
+            if let Some(supported) = support {
+                transaction.push(
+                    zcr_extended_text_input_v1::req::set_surrounding_text_support(
+                        host_ext_id,
+                        if supported {
+                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
+                        } else {
+                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+                        },
+                    ),
+                );
+            }
+            // A text-input-v3 client supports inline preedit by definition.
+            transaction.push(zcr_extended_text_input_v1::req::set_input_type(
+                host_ext_id,
+                input_type,
+                input_mode,
+                input_flags,
+                learning_mode,
+                zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+            ));
+            support
+        }
+        // Before v8 the XML replaces nothing, so the four-argument request
+        // follows v1 set_content_type; v8's set_input_type would be a
+        // protocol error on v1-v7.
+        host_ext => {
+            transaction.push(zwp_text_input_v1::req::set_content_type(
+                host_v1_id, v1_hint, v1_purpose,
+            ));
+            if let Some((host_ext_id, _)) = host_ext.filter(|&(_, version)| {
+                extension_version_allows(
+                    version,
+                    zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
+                )
+            }) {
+                transaction.push(zcr_extended_text_input_v1::req::deprecated_set_input_type(
+                    host_ext_id,
+                    input_type,
+                    input_mode,
+                    input_flags,
+                    learning_mode,
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// Resend the committed content type after an activation that a drain
+/// barrier deferred.
+///
+/// The commit that enabled the text input reached Exo before this
+/// activation, while the host object had no input method. Exo drops a
+/// content type then (`SetTypeModeFlags` returns early), and attaching the
+/// input method resets the type and mode to text but keeps the previous
+/// field's flags, learning mode and surrounding-text support: a password
+/// field would be treated as text the IME may learn. Exo keeps surrounding
+/// text and the cursor rectangle without an input method, so they need no
+/// replay.
+fn replay_committed_content_type(ctx: &mut Context, guest_id: u32) {
+    let Some(state) = ctx.text_inputs.get(&guest_id) else {
+        return;
+    };
+    let Some(content_type) = state.committed_content_type else {
+        return;
+    };
+    let host_ids = (state.host_v1_id, state.host_ext_id);
+    let serial = state.guest_commit_serial();
+    let has_surrounding_text = state.committed_surrounding_text.is_some();
+    let mut transaction = Vec::new();
+    let support = push_content_type(
+        &mut transaction,
+        ctx,
+        host_ids,
+        content_type,
+        has_surrounding_text,
+    );
+    transaction.push(zwp_text_input_v1::req::commit_state(host_ids.0, serial));
+    ctx.client_to_host_queue.extend(transaction);
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.record_surrounding_text_support(support);
+    }
+}
+
 /// Complete one host activation barrier
 /// ([`InternalCallback::TextInputDrained`]) and reconcile the newest guest
 /// state.
@@ -1350,6 +1470,13 @@ pub(crate) fn complete_host_activation_barrier(
     });
     if completed {
         update_host_activation(ctx, guest_id);
+        if ctx
+            .text_inputs
+            .get(&guest_id)
+            .is_some_and(|state| state.host_is_active())
+        {
+            replay_committed_content_type(ctx, guest_id);
+        }
     }
 }
 
@@ -1817,83 +1944,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             }
         }
 
-        let mut surrounding_text_support = None;
-        if let Some((hint, purpose)) = plan.content_type {
-            let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
-                map_v3_content_type(hint, purpose);
-            let host_ext = plan.host_ext_id.map(|host_ext_id| {
-                (
-                    host_ext_id,
-                    ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
-                )
-            });
-            match host_ext {
-                // The extension XML says v8's set_input_type is "used in
-                // place of" v1 set_content_type. Exo applies the pending
-                // surrounding-text support to whichever of the two comes
-                // first and then resets it to supported, so sending both
-                // would always report the surrounding text as supported.
-                Some((host_ext_id, version))
-                    if extension_version_allows(
-                        version,
-                        zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
-                    ) =>
-                {
-                    if extension_version_allows(
-                        version,
-                        zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-                    ) {
-                        transaction.push(
-                            zcr_extended_text_input_v1::req::set_surrounding_text_support(
-                                host_ext_id,
-                                if plan.has_surrounding_text {
-                                    zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
-                                } else {
-                                    zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-                                },
-                            ),
-                        );
-                        surrounding_text_support = Some(plan.has_surrounding_text);
-                    }
-                    // A text-input-v3 client supports inline preedit by
-                    // definition.
-                    transaction.push(zcr_extended_text_input_v1::req::set_input_type(
-                        host_ext_id,
-                        input_type,
-                        input_mode,
-                        input_flags,
-                        learning_mode,
-                        zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-                    ));
-                }
-                // Before v8 the XML replaces nothing, so the four-argument
-                // request follows v1 set_content_type; v8's set_input_type
-                // would be a protocol error on v1-v7.
-                host_ext => {
-                    transaction.push(zwp_text_input_v1::req::set_content_type(
-                        plan.host_v1_id,
-                        v1_hint,
-                        v1_purpose,
-                    ));
-                    if let Some((host_ext_id, _)) = host_ext.filter(|&(_, version)| {
-                        extension_version_allows(
-                            version,
-                            zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
-                        )
-                    }) {
-                        transaction.push(
-                            zcr_extended_text_input_v1::req::deprecated_set_input_type(
-                                host_ext_id,
-                                input_type,
-                                input_mode,
-                                input_flags,
-                                learning_mode,
-                            ),
-                        );
-                    }
-                }
-            }
-        }
+        let surrounding_text_support = plan.content_type.and_then(|content_type| {
+            push_content_type(
+                &mut transaction,
+                ctx,
+                (plan.host_v1_id, plan.host_ext_id),
+                content_type,
+                plan.has_surrounding_text,
+            )
+        });
 
         if let Some((x, y, w, h)) = plan.cursor_rect {
             log::debug!(
@@ -3234,17 +3293,85 @@ mod tests {
 
         ctx.last_sender_id = callback_id.0;
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
-        let activate_index = ctx.client_to_host_queue.len() - 1;
-        assert_eq!(
-            (
-                msg_sender(&ctx.client_to_host_queue, activate_index),
-                msg_opcode(&ctx.client_to_host_queue, activate_index)
-            ),
-            (host_v1_id, 0)
-        );
+        let activate_index = (0..ctx.client_to_host_queue.len())
+            .position(|index| {
+                (
+                    msg_sender(&ctx.client_to_host_queue, index),
+                    msg_opcode(&ctx.client_to_host_queue, index),
+                ) == (host_v1_id, zwp_text_input_v1::REQ_ACTIVATE)
+            })
+            .expect("the barrier activates the text input");
         assert!(
             commit_state_index < activate_index,
             "the host must receive the new editor transaction before reactivation"
+        );
+    }
+
+    #[test]
+    fn a_deferred_activation_replays_the_committed_content_type() {
+        use zcr_extended_text_input_v1::{
+            REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT,
+            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED,
+        };
+        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_COMMIT_STATE};
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        ctx.shadow_table
+            .insert_paired_for_test(900, 901, "wl_surface");
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+
+        // A field switch: the old field is disabled, and the new one, a
+        // password field, is enabled before the host's deactivation drains.
+        v3.on_disable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        let callback_id = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("deactivation opens a barrier");
+        v3.on_enable(&mut ctx);
+        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+        v3.on_commit(&mut ctx);
+        assert!(!ctx.text_inputs[&guest_id].host_is_active());
+        ctx.client_to_host_queue.clear();
+
+        ctx.last_sender_id = callback_id.0;
+        assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
+        // Exo dropped the content type sent while the text input was
+        // inactive, so it follows the activation again.
+        let queue = &ctx.client_to_host_queue;
+        let requests = (0..queue.len())
+            .map(|index| (msg_sender(queue, index), msg_opcode(queue, index)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests,
+            [
+                (host_v1_id, REQ_ACTIVATE),
+                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
+                (30, REQ_SET_INPUT_TYPE),
+                (host_v1_id, REQ_COMMIT_STATE),
+            ]
+        );
+        let mut support = wire_message(queue, 1);
+        assert_eq!(
+            support.read_u32().unwrap(),
+            SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+        );
+        let (_, _, input_type, input_mode, input_flags, learning_mode) =
+            map_v3_content_type(0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+        let mut set_input_type = wire_message(queue, 2);
+        let arguments = [(); 4].map(|()| set_input_type.read_u32().unwrap());
+        assert_eq!(
+            arguments,
+            [input_type, input_mode, input_flags, learning_mode]
+        );
+        assert_eq!(input_type, zcr_extended_text_input_v1::INPUT_TYPE_PASSWORD);
+        assert_eq!(
+            learning_mode,
+            zcr_extended_text_input_v1::LEARNING_MODE_DISABLED
+        );
+        let mut commit_state = wire_message(queue, 3);
+        assert_eq!(
+            commit_state.read_u32().unwrap(),
+            ctx.text_inputs[&guest_id].guest_commit_serial()
         );
     }
 
@@ -3626,6 +3753,52 @@ mod tests {
         // could reset Exo's composition.
         handler.on_set_surrounding_text(&mut ctx, &"abcd".to_string(), 4, 4);
         handler.on_set_content_type(&mut ctx, 0, 0);
+        handler.on_commit(&mut ctx);
+        assert_eq!(take_extension_requests(&mut ctx), []);
+
+        // A disable and enable reset the editor state: the content type is
+        // replayed with the support of the field's new, empty state.
+        handler.on_disable(&mut ctx);
+        handler.on_enable(&mut ctx);
+        handler.on_set_content_type(&mut ctx, 0, 0);
+        handler.on_commit(&mut ctx);
+        assert_eq!(
+            take_extension_requests(&mut ctx),
+            [
+                (
+                    REQ_SET_SURROUNDING_TEXT_SUPPORT,
+                    SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+                ),
+                (REQ_SET_INPUT_TYPE, input_type),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_without_surrounding_text_support_gets_no_resend() {
+        let (mut ctx, _, guest_id) = setup_v1_ctx();
+        // v8 has set_input_type but not set_surrounding_text_support.
+        ctx.shadow_table
+            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 8);
+        ctx.shadow_table
+            .insert_paired_for_test(900, 901, "wl_surface");
+        ctx.last_sender_id = guest_id;
+        let mut handler = TextInputV3Handler;
+
+        handler.on_enable(&mut ctx);
+        handler.on_set_content_type(&mut ctx, 0, 0);
+        handler.on_commit(&mut ctx);
+        assert_eq!(
+            take_extension_requests(&mut ctx),
+            [(
+                zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE,
+                map_v3_content_type(0, 0).2
+            )]
+        );
+
+        // The host was told no support, so gaining surrounding text changes
+        // nothing it knows.
+        handler.on_set_surrounding_text(&mut ctx, &"abc".to_string(), 3, 3);
         handler.on_commit(&mut ctx);
         assert_eq!(take_extension_requests(&mut ctx), []);
     }

@@ -486,7 +486,19 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   support; nothing else resends an unchanged content type, which can
   reset Exo's composition.
   Tests: `content_type_takes_one_host_request_per_extension_version`,
-  `surrounding_text_support_follows_the_field_and_resends_only_on_change`.
+  `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
+  `a_host_without_surrounding_text_support_gets_no_resend`.
+- **A deferred activation replays the content type.** A commit that
+  enables a text input while its previous host generation still drains
+  reaches Exo before the deferred `activate`, while no input method is
+  attached. Exo drops a content type then, and attaching resets the type
+  and mode but keeps the previous field's flags, learning mode and
+  surrounding-text support, so a password field would be treated as text
+  the IME may learn. The `activate` that ends the barrier is therefore
+  followed by the committed content type, with its support, and a
+  `commit_state`. Exo keeps surrounding text and the cursor rectangle
+  without an input method, so they are not replayed.
+  Test: `a_deferred_activation_replays_the_committed_content_type`.
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A
