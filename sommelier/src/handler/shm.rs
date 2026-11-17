@@ -67,9 +67,10 @@ fn valid_pool_size(size: i32) -> Option<usize> {
         .filter(|&size| size <= isize::MAX as usize)
 }
 
+/// `wl_shm_pool.resize` may only grow the pool; the same size is a no-op.
 fn valid_pool_resize(current_size: usize, new_size: i32) -> Option<usize> {
     let new_size = valid_pool_size(new_size)?;
-    (new_size > current_size).then_some(new_size)
+    (new_size >= current_size).then_some(new_size)
 }
 
 fn supported_shm_format(format: u32) -> bool {
@@ -1877,16 +1878,15 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             return Action::Drop;
         };
         let error = match valid_pool_resize(pool.size, size) {
-            // wl_shm_pool.resize is an expansion-only operation. A client
-            // that needs a smaller pool must create a new pool; shrinking
-            // could invalidate live wl_buffers that still reference the old
-            // tail.
+            // A client that needs a smaller pool must create a new one;
+            // shrinking could invalidate live wl_buffers that still
+            // reference the old tail. libwayland reports it as invalid_fd.
             None => {
                 warn!(
-                    "Rejecting non-growing SHM pool resize from {} to {}",
+                    "Rejecting shrinking SHM pool resize from {} to {}",
                     pool.size, size
                 );
-                Some((WL_SHM_ERROR_INVALID_STRIDE, "invalid wl_shm pool resize"))
+                Some((WL_SHM_ERROR_INVALID_FD, "shrinking pool invalid"))
             }
             Some(new_size) if !regular_file_has_size(&pool.file, new_size) => {
                 warn!(
@@ -2157,10 +2157,48 @@ mod tests {
     #[test]
     fn shm_pool_resize_only_allows_growth() {
         assert_eq!(valid_pool_resize(4096, 8192), Some(8192));
-        assert_eq!(valid_pool_resize(4096, 4096), None);
+        assert_eq!(valid_pool_resize(4096, 4096), Some(4096));
         assert_eq!(valid_pool_resize(4096, 2048), None);
         assert_eq!(valid_pool_resize(4096, 0), None);
         assert_eq!(valid_pool_resize(4096, -1), None);
+    }
+
+    #[test]
+    fn pool_resize_accepts_the_same_size_and_rejects_shrinking_as_invalid_fd() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let pool_id = 20;
+        ctx.pools.insert(
+            pool_id,
+            ShmPool {
+                file: Arc::new(shm_pool_file(&[0; 4096])),
+                size: 4096,
+            },
+        );
+        ctx.last_sender_id = pool_id;
+        let mut handler = ShmHandler;
+        let mut resize = |ctx: &mut Context, size| {
+            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_resize(
+                &mut handler,
+                ctx,
+                size,
+            )
+        };
+
+        // libwayland accepts a resize to the current size.
+        assert_eq!(resize(&mut ctx, 4096), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert_eq!(ctx.pools[&pool_id].size, 4096);
+
+        assert_eq!(resize(&mut ctx, 2048), Action::Drop);
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            WL_SHM_ERROR_INVALID_FD,
+            "shrinking a pool is wl_shm.invalid_fd, as in libwayland"
+        );
+        assert_eq!(ctx.pools[&pool_id].size, 4096);
     }
 
     #[test]
