@@ -53,9 +53,19 @@ descriptor, and either answer the stream's closing `wl_display.sync` or
 send `wl_display.error`. The fake compositor behind the proxy also checks
 that every request it receives comes from a live host object, creates
 only fresh IDs and names live objects of the right interface; it deletes
-destroyed objects at once, so the proxy's host ID reuse is exercised.
+destroyed objects at once, so the proxy's host ID reuse is exercised,
+creates objects of its own (a data offer for each data device, a buffer
+for each asynchronous dma-buf create), and, as weston does, destroys a
+destroyed surface's pending frame callbacks without `done`. When a case's
+requests are whole and undamaged, the guest checks that it receives what
+the proxy should send, which is stricter than what libwayland-client
+tolerates: every event comes from and names only objects it has, a
+`wl_display.delete_id` names only an object it destroyed or a frame
+callback the compositor cancelled, once (and every cancelled callback
+gets one before the closing sync is answered), and each object the server
+creates gets a fresh ID from the server range.
 The suite runs 5000 cases from seed 0; run more, from another seed,
-after changing how the proxy reads guest requests:
+after changing how the proxy reads guest requests or tracks objects:
 
 ```bash
 SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
