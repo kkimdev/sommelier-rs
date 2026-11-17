@@ -203,14 +203,17 @@ Tests: `invalid_shm_requests_are_protocol_errors`,
 `fatal_protocol_error_keeps_a_bounded_diagnostic`.
 
 Deliberately left unenforced, matching Exo: `wl_surface.invalid_size`, a
-buffer that is not a multiple of its scale, and `wp_viewport.out_of_buffer`,
-a viewport source outside a non-NULL buffer. Exo accepts both, so
-enforcing either would end the session of Crostini apps that work today,
-with nothing on screen to explain why. The proxy forwards such a commit
-unchanged and logs the first source outside the buffer on each surface,
-with the source, buffer size, scale and transform.
+buffer that is not a multiple of its scale; `wp_viewport.bad_size`, a
+fractional source size without a destination, which Exo takes as a
+fractional surface size; and `wp_viewport.out_of_buffer`, a viewport
+source outside a non-NULL buffer. Exo accepts all three, so enforcing any
+would end the session of Crostini apps that work today, with nothing on
+screen to explain why. The proxy forwards such a commit unchanged and logs
+the first viewport violation on each surface, with the source, buffer
+size, scale and transform.
 Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
-`viewport_source_outside_the_buffer_is_logged_and_forwarded`.
+`viewport_source_outside_the_buffer_is_logged_and_forwarded`,
+`fractional_source_without_destination_is_logged_and_forwarded`.
 
 ## Object lifetimes
 

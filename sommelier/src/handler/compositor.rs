@@ -596,36 +596,17 @@ impl WlSurfaceHandler for CompositorHandler {
         // commits non-blocking.
         let wait_for_native_sync = attached_buffer_id.is_some();
 
-        // The viewporter protocol permits fractional source rectangles only
-        // when a destination size is also set. If the source is fractional
-        // and the destination is unset, the compositor must raise
-        // wp_viewport.bad_size when this double-buffered state is applied.
-        // Report it against the viewport object, if it is still present, and
-        // do not forward a commit that would otherwise apply invalid state.
-        if commit.has_invalid_fractional_viewport() {
-            if let Some((&viewport_id, _)) = ctx
-                .viewport_to_wl_surface
-                .iter()
-                .find(|(_, &owner)| owner == surface_id)
-            {
-                return ctx.reject(
-                    viewport_id,
-                    wp_viewport::ERROR_BAD_SIZE,
-                    "fractional wp_viewport source requires a destination",
-                );
-            }
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                commit.rollback(surface);
-            }
-            return Action::Drop;
-        }
-
         let mapping = commit.state.mapping(shown_buffer_size(ctx, &commit.state));
-        // wp_viewport.out_of_buffer is deliberately not raised: Exo accepts a
-        // source outside the buffer, so ending the session would break apps
-        // that work today. It is logged instead, once the commit is final.
-        let viewport_problem =
-            (!mapping.source_fits_buffer()).then_some("a wp_viewport source outside its buffer");
+        // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
+        // Exo accepts both, so ending the session would break apps that work
+        // today. They are logged instead, once the commit is final.
+        let viewport_problem = if commit.has_invalid_fractional_viewport() {
+            Some("a fractional wp_viewport source without a destination")
+        } else if !mapping.source_fits_buffer() {
+            Some("a wp_viewport source outside its buffer")
+        } else {
+            None
+        };
         let attached_full_mapping =
             attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
         let surface_damage = commit.surface_damage.rects();
@@ -3497,31 +3478,21 @@ mod tests {
     }
 
     #[test]
-    fn fractional_source_without_destination_is_bad_size_on_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
+    fn fractional_source_without_destination_is_logged_and_forwarded() {
+        // Exo takes the fractional source size as the surface size, and the
+        // host damage covers it, rounded up.
+        let (mut ctx, ..) = setup_ctx();
         let mut handler = CompositorHandler;
-
-        ctx.last_sender_id = surface_id;
+        ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Forward
         );
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            handler.on_set_source(&mut ctx, 0, 0, 128, 256),
-            Action::Forward
-        );
-        ctx.last_sender_id = surface_id;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(protocol_error_code(&ctx), 1);
-        assert!(ctx.is_fatal());
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
-            "invalid viewport state must not forward the surface commit"
-        );
+        set_test_viewport_source(&mut ctx, (0, 0, 128, 256));
+        register_test_native(&mut ctx, 42, (1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+        assert_eq!(host_damage(&ctx), [(0, 0, 1, 1)]);
     }
 
     /// Set the viewport source of `TEST_SURFACE`, whose viewport is 700.
