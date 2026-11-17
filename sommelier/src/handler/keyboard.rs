@@ -1247,11 +1247,10 @@ mod tests {
                 guest_seat,
                 Some(900),
             );
-            state.pending_enabled = true;
-            state.committed_enabled = true;
-            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.committed.enabled = true;
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
     }
@@ -4467,8 +4466,8 @@ mod tests {
             let state = ctx.text_inputs.get_mut(&40).expect("text input");
             state.active_surface = Some(20);
             state.current_preedit = "한".to_string();
-            state.committed_enabled = true;
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.committed.enabled = true;
+            state.host = crate::state::HostApplied::Active { content_type: None };
         }
         ctx.last_sender_id = 100;
 
@@ -5009,10 +5008,10 @@ mod tests {
         ctx.text_inputs.insert(guest_text_input, {
             let mut state =
                 crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 
@@ -5082,10 +5081,10 @@ mod tests {
         ctx.text_inputs.insert(guest_text_input, {
             let mut state =
                 crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 
@@ -5150,10 +5149,10 @@ mod tests {
         ctx.text_inputs.insert(guest_text_input, {
             let mut state =
                 crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.current_preedit = "한".to_string();
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 
@@ -5191,9 +5190,9 @@ mod tests {
         ctx.text_inputs.insert(40, {
             let mut state =
                 crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
-            state.committed_enabled = true;
+            state.committed.enabled = true;
             state.set_guest_commits(1);
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
 
@@ -5251,9 +5250,9 @@ mod tests {
                     guest_seat,
                     active_surface,
                 );
-                state.committed_enabled = true;
+                state.committed.enabled = true;
                 state.set_guest_commits(1);
-                state.host_activation = crate::state::HostActivationState::Active;
+                state.host = crate::state::HostApplied::Active { content_type: None };
                 state
             });
         }
@@ -5265,8 +5264,8 @@ mod tests {
             .values()
             .all(|state| state.active_surface.is_none()));
         assert!(ctx.text_inputs.values().all(|state| {
-            !state.pending_enabled
-                && !state.committed_enabled
+            state.pending.enabled.is_none()
+                && !state.committed.enabled
                 && !state.host_is_active()
                 && state.current_preedit.is_empty()
         }));
@@ -5313,14 +5312,14 @@ mod tests {
             .insert_paired_for_test(20, 30, "wl_surface");
         ctx.text_inputs.insert(40, {
             let mut state = crate::state::TextInputState::new(50, None, 7, Some(21));
-            state.pending_enabled = true;
-            state.committed_enabled = true;
-            state.pending_surrounding_text = Some(("stale".to_string(), 5, 5));
-            state.committed_surrounding_text = Some(("stale".to_string(), 5, 5));
+            state.pending.enabled = Some(true);
+            state.committed.enabled = true;
+            state.pending.surrounding_text = Some(Some(("stale".to_string(), 5, 5)));
+            state.committed.surrounding_text = Some(("stale".to_string(), 5, 5));
             state.current_preedit = "한".to_string();
             state.set_guest_commits(9);
             state.pending_deletes = vec![(3, 0)];
-            state.host_activation = crate::state::HostActivationState::Active;
+            state.host = crate::state::HostApplied::Active { content_type: None };
             state
         });
         ctx.last_sender_id = 10;
@@ -5329,10 +5328,10 @@ mod tests {
 
         let state = &ctx.text_inputs[&40];
         assert_eq!(state.active_surface, Some(20));
-        assert!(!state.pending_enabled);
-        assert!(!state.committed_enabled);
+        assert!(state.pending.enabled.is_none());
+        assert!(!state.committed.enabled);
         assert!(!state.host_is_active());
-        assert!(state.committed_surrounding_text.is_none());
+        assert!(state.committed.surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
         assert_eq!(state.guest_commit_serial(), 9);

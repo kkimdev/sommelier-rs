@@ -20,15 +20,242 @@ use super::{serial_is_after, HostId};
 
 const MAX_PENDING_IME_DELETES: usize = 256;
 
+/// A text-input-v3 content type: `(hint, purpose)`.
+pub type ContentType = (u32, u32);
+/// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
+pub type SurroundingText = (String, i32, i32);
+/// A text-input-v3 cursor rectangle: `(x, y, width, height)`.
+pub type CursorRect = (i32, i32, i32, i32);
+
+/// The text-input-v3 requests a guest made since its most recent commit,
+/// each `None` until made.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct V3Pending {
+    pub enabled: Option<bool>,
+    pub surrounding_text: Option<Option<SurroundingText>>,
+    pub content_type: Option<ContentType>,
+    pub cursor_rect: Option<CursorRect>,
+}
+
+impl V3Pending {
+    /// The pending state after `enable` or `disable`, which reset every
+    /// other piece of state. The host's v1 has no unset cursor rectangle,
+    /// so an empty one stands for it.
+    pub fn reset(enabled: bool) -> Self {
+        Self {
+            enabled: Some(enabled),
+            surrounding_text: Some(None),
+            content_type: Some(ContentType::default()),
+            cursor_rect: Some(CursorRect::default()),
+        }
+    }
+}
+
+/// The text-input-v3 state a guest has committed, but the cursor
+/// rectangle, which only the host keeps.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct V3Committed {
+    pub enabled: bool,
+    pub surrounding_text: Option<SurroundingText>,
+    pub content_type: ContentType,
+}
+
+/// A content type as the host applies it: the v3 content type, and the
+/// surrounding-text support told with it, or `None` if the host's
+/// extension cannot be told one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostContentType {
+    pub content_type: ContentType,
+    pub surrounding_text_support: Option<bool>,
+}
+
+/// What a host `zwp_text_input_v1` has effectively applied, by Exo's rules
+/// (Chromium `components/exo/text_input.cc`, `TextInput`, and the request
+/// handlers in `components/exo/wayland/zwp_text_input_manager.cc`):
+///
+/// - `Activate` attaches the input method if the seat's focus is on the
+///   surface, as it is on the surface of the proxy's keyboard focus, and
+///   `AttachInputMethod` resets the type and mode to text: the content
+///   type is unknown until sent again.
+/// - `Deactivate` detaches it (`DetachInputMethod`), and `SetTypeModeFlags`
+///   drops a content type while none is attached.
+/// - `set_input_type` takes the pending `set_surrounding_text_support` and
+///   resets it to supported, so the support is sent right before it.
+/// - `SetSurroundingText` and `SetCaretBounds` keep their value with or
+///   without an input method, and Exo edits its copy of the surrounding
+///   text as the input method commits, so neither is modelled: each guest
+///   commit forwards the ones it states.
+///
+/// Exo reports every attach as `zwp_text_input_v1.enter` and every detach
+/// as `leave` (`Activated` and `Deactivated` of its text-input delegate),
+/// and it also attaches and detaches on its own:
+///
+/// - It detaches when its seat's focus leaves the surface
+///   (`OnSurfaceFocused`), when the surface is destroyed
+///   (`OnSurfaceDestroying`) and when the input method is destroyed
+///   (`OnInputMethodDestroyed`). Each goes through `Deactivate`, so Exo
+///   then has no surface and attaches again only on a new `activate`. A
+///   `leave` while active is such a detach, since the proxy's own
+///   `deactivate` starts draining first: the generation ends there, with
+///   no barrier, as the `leave` follows its every event, and reconciling
+///   activates again if the target still wants it.
+/// - It attaches on its own only when its focus reaches a surface an
+///   `activate` found unfocused. Exo sent `wl_keyboard.leave` before it
+///   handled that `activate`, so the proxy is draining by the time the
+///   `enter` arrives. An `enter` while active therefore answers the proxy's
+///   own `activate`, and the content type the proxy sent after it reached
+///   the attached input method.
+///
+/// The model holds only while every host `zwp_text_input_v1.leave` and
+/// `wl_keyboard.leave` and `enter` reaches the proxy's state in order:
+/// dropping, delaying past a later event or coalescing one would let the
+/// model believe an input method attached that Exo detached, or the
+/// reverse.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum HostActivationState {
-    /// The host object has no live activation generation.
+pub enum HostApplied {
+    /// No input method is attached and no events are in flight.
     #[default]
     Inactive,
-    /// Host text-input events belong to the current guest generation.
-    Active,
-    /// A host sync callback is draining events from the prior generation.
+    /// The input method is attached, and host text-input events belong to
+    /// the current guest generation.
+    Active {
+        /// The content type the input method applied, `None` until known.
+        content_type: Option<HostContentType>,
+    },
+    /// `deactivate` detached the input method, and a host sync callback is
+    /// draining the events the host sent before it.
     Draining { callback: HostId },
+}
+
+impl HostApplied {
+    /// `activate` reached the host: its input method attached.
+    pub fn activate(&mut self) -> bool {
+        if *self != Self::Inactive {
+            return false;
+        }
+        *self = Self::Active { content_type: None };
+        true
+    }
+
+    /// `deactivate` reached the host, and `callback` drains the events it
+    /// sent before.
+    pub fn begin_draining(&mut self, callback: HostId) -> bool {
+        if !matches!(self, Self::Active { .. }) {
+            return false;
+        }
+        *self = Self::Draining { callback };
+        true
+    }
+
+    /// The exact matching `callback` drained the deactivated generation.
+    pub fn complete_draining(&mut self, callback: HostId) -> bool {
+        if *self != (Self::Draining { callback }) {
+            return false;
+        }
+        *self = Self::Inactive;
+        true
+    }
+
+    /// End an active generation without a drain barrier: no live host seat
+    /// can deactivate it, or Exo detached its input method itself, whose
+    /// `leave` follows every event of that generation.
+    ///
+    /// A draining generation cannot be forced inactive because its callback
+    /// remains the ownership proof for events already queued by the host.
+    pub fn end_without_barrier(&mut self) -> bool {
+        if !matches!(self, Self::Active { .. }) {
+            return false;
+        }
+        *self = Self::Inactive;
+        true
+    }
+
+    /// A content type reached the host, whose input method applies it if
+    /// one is attached.
+    pub fn apply_content_type(&mut self, applied: HostContentType) {
+        if let Self::Active { content_type } = self {
+            *content_type = Some(applied);
+        }
+    }
+
+    /// The guest enabled or disabled the field, which resets it: what the
+    /// host applied belongs to the old field, so the new one is told its
+    /// content type again, even an unchanged one. That is a no-op for Exo
+    /// with a v8 extension, whose `SetTypeModeFlags` ignores an unchanged
+    /// type; with an older one, `set_content_type` and
+    /// `deprecated_set_input_type` map flags differently, so the pair
+    /// changes the type twice, as on every content type it is sent.
+    pub fn new_field(&mut self) {
+        if let Self::Active { content_type } = self {
+            *content_type = None;
+        }
+    }
+}
+
+/// The host state a text input should have, from its committed v3 state,
+/// its focus and what the host can be told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostTarget {
+    /// The guest committed an enable, on a focused surface the host knows.
+    pub active: bool,
+    /// The host seat can carry an `activate` or `deactivate`.
+    pub seat_live: bool,
+    pub content_type: HostContentType,
+}
+
+/// How a host text input's activation changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationStep {
+    /// `zwp_text_input_v1.activate`.
+    Activate,
+    /// `zwp_text_input_v1.deactivate`, behind a drain barrier.
+    Deactivate,
+    /// No live seat can carry a `deactivate`: the generation ends locally.
+    /// Exo keeps the input method attached until its own focus moves or the
+    /// surface goes, and its `leave` then usually arrives while inactive and
+    /// is ignored. If the guest first reuses the seat ID and the text input
+    /// activates again, Exo's `activate` does nothing on the surface it
+    /// still has; on another surface it detaches first, and that `leave`
+    /// arrives while active: the proxy ends the new generation and
+    /// activates once more, which Exo ignores for the surface it now has.
+    /// That costs one redundant `activate` and content type.
+    Abandon,
+}
+
+/// The host requests that bring a text input to its target, in order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostSteps {
+    pub activation: Option<ActivationStep>,
+    pub content_type: Option<HostContentType>,
+}
+
+/// The requests that make what the host applied equal `target`, and no
+/// others: a content type the host would drop or already has is not sent.
+/// A resend would be a no-op for a v8 extension, but before v8 it changes
+/// Exo's type twice, and each `OnTextInputTypeChanged` can reset the
+/// input method's composition. A draining host waits for its barrier,
+/// whose completion reconciles again.
+pub fn reconcile(target: &HostTarget, applied: &HostApplied) -> HostSteps {
+    use HostApplied::{Active, Inactive};
+    let activation = match (target.active, applied) {
+        (true, Inactive) if target.seat_live => Some(ActivationStep::Activate),
+        (false, Active { .. }) if target.seat_live => Some(ActivationStep::Deactivate),
+        (false, Active { .. }) => Some(ActivationStep::Abandon),
+        _ => None,
+    };
+    // What the attached input method has after that step, or `None` if no
+    // input method is attached to apply a content type.
+    let attached = match (activation, applied) {
+        (Some(ActivationStep::Activate), _) => Some(None),
+        (None, &Active { content_type }) => Some(content_type),
+        _ => None,
+    };
+    HostSteps {
+        activation,
+        content_type: attached
+            .filter(|&applied| applied != Some(target.content_type))
+            .map(|_| target.content_type),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,29 +264,10 @@ pub struct TextInputState {
     pub host_ext_id: Option<u32>,
     pub guest_seat: u32,
     pub active_surface: Option<u32>,
-    /// State requested by the guest since its most recent v3 commit.
-    pub pending_enabled: bool,
-    /// State applied by the most recent v3 commit.
-    pub committed_enabled: bool,
-    /// Whether an enable/disable request is waiting for the next commit.
-    pub enabled_dirty: bool,
-    /// Double-buffered v3 surrounding-text state.
-    pub pending_surrounding_text: Option<(String, i32, i32)>,
-    pub committed_surrounding_text: Option<(String, i32, i32)>,
-    pub surrounding_text_dirty: bool,
-    pub content_hint: u32,
-    pub content_purpose: u32,
-    /// Content type last committed to the host. `None` forces the next v3
-    /// transaction to replay the pending type after an enable/disable reset.
-    pub committed_content_type: Option<(u32, u32)>,
-    pub content_type_dirty: bool,
-    /// Whether the host was last told, with the committed content type,
-    /// that the field has surrounding text, or `None` if it was not told.
-    /// Exo applies `set_surrounding_text_support` only with a content type,
-    /// so a change resends the content type.
-    committed_surrounding_text_support: Option<bool>,
-    pub cursor_rect: Option<(i32, i32, i32, i32)>,
-    pub cursor_rect_dirty: bool,
+    /// Requests since the most recent v3 commit, which the next applies.
+    pub pending: V3Pending,
+    /// State the v3 commits applied.
+    pub committed: V3Committed,
     pub current_preedit: String,
     /// Number of v3 commit requests received from this guest object.
     ///
@@ -79,22 +287,16 @@ pub struct TextInputState {
     /// `commit_string` event.
     pub pending_deletes: Vec<(u32, u32)>,
     pub pending_cursor_position: Option<(i32, i32)>,
-    pub(crate) host_activation: HostActivationState,
+    /// What the host text input has applied.
+    pub(crate) host: HostApplied,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GuestCommitPlan {
-    pub host_v1_id: u32,
-    pub host_ext_id: Option<u32>,
-    pub guest_seat: u32,
-    pub serial: u32,
-    pub enabled: bool,
-    pub enable_conflict: bool,
-    pub resets_composition: bool,
-    pub surrounding_text: Option<Option<(String, i32, i32)>>,
-    pub has_surrounding_text: bool,
-    pub content_type: Option<(u32, u32)>,
-    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+/// What a v3 commit asks of the host beyond its committed state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V3Commit {
+    /// The commit enabled or disabled the field, which resets it.
+    pub new_field: bool,
+    pub cursor_rect: Option<CursorRect>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,151 +346,48 @@ impl TextInputState {
             host_ext_id,
             guest_seat,
             active_surface,
-            pending_enabled: false,
-            committed_enabled: false,
-            enabled_dirty: false,
-            pending_surrounding_text: None,
-            committed_surrounding_text: None,
-            surrounding_text_dirty: false,
-            content_hint: 0,
-            content_purpose: 0,
-            committed_content_type: None,
-            content_type_dirty: false,
-            committed_surrounding_text_support: None,
-            cursor_rect: None,
-            cursor_rect_dirty: false,
+            pending: V3Pending::default(),
+            committed: V3Committed::default(),
             current_preedit: String::new(),
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
             pending_preedit_selection: None,
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
-            host_activation: HostActivationState::Inactive,
+            host: HostApplied::default(),
         }
     }
 
     /// Return whether host text-input events belong to this guest generation.
     pub fn host_is_active(&self) -> bool {
-        self.host_activation == HostActivationState::Active
-    }
-
-    /// Return the complete host activation state.
-    pub fn host_activation(&self) -> HostActivationState {
-        self.host_activation
-    }
-
-    /// Start a host activation from an inactive generation.
-    pub fn activate_host(&mut self) -> bool {
-        if self.host_activation != HostActivationState::Inactive {
-            return false;
-        }
-        self.host_activation = HostActivationState::Active;
-        true
-    }
-
-    /// Begin draining the active generation behind `callback`.
-    pub fn begin_host_draining(&mut self, callback: HostId) -> bool {
-        if self.host_activation != HostActivationState::Active {
-            return false;
-        }
-        self.host_activation = HostActivationState::Draining { callback };
-        true
-    }
-
-    /// Complete the generation drained by the exact matching `callback`.
-    pub fn complete_host_draining(&mut self, callback: HostId) -> bool {
-        if self.host_activation != (HostActivationState::Draining { callback }) {
-            return false;
-        }
-        self.host_activation = HostActivationState::Inactive;
-        true
-    }
-
-    /// Drop an active generation when no live host seat can carry a barrier.
-    ///
-    /// A draining generation cannot be forced inactive because its callback
-    /// remains the ownership proof for events already queued by the host.
-    pub fn deactivate_host_without_barrier(&mut self) -> bool {
-        if self.host_activation != HostActivationState::Active {
-            return false;
-        }
-        self.host_activation = HostActivationState::Inactive;
-        true
+        matches!(self.host, HostApplied::Active { .. })
     }
 
     /// Return the callback that owns the draining generation, if any.
     #[cfg(test)]
     pub fn draining_callback(&self) -> Option<HostId> {
-        match self.host_activation {
-            HostActivationState::Draining { callback } => Some(callback),
-            HostActivationState::Inactive | HostActivationState::Active => None,
+        match self.host {
+            HostApplied::Draining { callback } => Some(callback),
+            HostApplied::Inactive | HostApplied::Active { .. } => None,
         }
     }
 
     /// Apply a keyboard-focus generation boundary.
     ///
     /// text-input-v3 requires the client to resend enable and editor state
-    /// after every enter. The guest commit serial and host activation marker
-    /// deliberately survive so the bridge can deactivate the previous host
-    /// generation with the correct transaction ordering.
+    /// after every enter. The guest commit serial and what the host applied
+    /// survive, so reconciling deactivates the previous host generation.
     pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
-        let previous_surface = self.active_surface;
-        self.pending_enabled = false;
-        self.committed_enabled = false;
-        self.enabled_dirty = false;
-        self.pending_surrounding_text = None;
-        self.committed_surrounding_text = None;
-        self.surrounding_text_dirty = false;
-        self.content_hint = 0;
-        self.content_purpose = 0;
-        self.committed_content_type = None;
-        self.content_type_dirty = false;
-        self.committed_surrounding_text_support = None;
-        self.cursor_rect = None;
-        self.cursor_rect_dirty = false;
+        self.pending = V3Pending::default();
+        self.committed = V3Committed::default();
         self.clear_host_composition();
-        self.active_surface = active_surface;
-        previous_surface
+        std::mem::replace(&mut self.active_surface, active_surface)
     }
 
     /// Move the object to its final disabled target before host reconciliation.
     pub fn begin_destroy(&mut self) {
-        self.committed_enabled = false;
+        self.committed.enabled = false;
         self.active_surface = None;
-    }
-
-    /// Start a new text-input-v3 enable or disable transaction.
-    ///
-    /// Both requests reset the pending editor state. Committed state remains
-    /// untouched until [`Self::finish_guest_commit`] publishes a fully encoded
-    /// host transaction.
-    pub fn begin_enabled_transaction(&mut self, enabled: bool) {
-        self.pending_enabled = enabled;
-        self.enabled_dirty = true;
-        self.pending_surrounding_text = None;
-        self.surrounding_text_dirty = true;
-        self.content_hint = 0;
-        self.content_purpose = 0;
-        self.content_type_dirty = true;
-        self.cursor_rect = None;
-        self.cursor_rect_dirty = true;
-    }
-
-    pub fn set_surrounding_text(&mut self, text: String, cursor: i32, anchor: i32) {
-        self.pending_surrounding_text = Some((text, cursor, anchor));
-        self.surrounding_text_dirty = true;
-    }
-
-    pub fn set_content_type(&mut self, hint: u32, purpose: u32) {
-        self.content_hint = hint;
-        self.content_purpose = purpose;
-        self.content_type_dirty =
-            self.enabled_dirty || self.committed_content_type != Some((hint, purpose));
-    }
-
-    pub fn set_cursor_rect(&mut self, rect: (i32, i32, i32, i32)) {
-        self.cursor_rect = Some(rect);
-        self.cursor_rect_dirty = true;
     }
 
     /// Count one v3 `commit` request and return its serial.
@@ -313,96 +412,35 @@ impl TextInputState {
         self.guest_commit_serial = commits;
     }
 
-    /// Snapshot the commit just counted by [`Self::count_guest_commit`]
-    /// without mutating committed state.
-    ///
-    /// The handler owns this plan while encoding every host message. Dropping
-    /// the plan on an encoding failure leaves the state byte-for-byte
-    /// unchanged; only [`Self::finish_guest_commit`] advances the transaction.
-    pub(crate) fn prepare_guest_commit(&self, enable_conflict: bool) -> GuestCommitPlan {
-        let resets_composition = self.enabled_dirty;
-        let enabled = if resets_composition && !enable_conflict {
-            self.pending_enabled
-        } else {
-            self.committed_enabled
-        };
-        let effective_surrounding_text = if self.surrounding_text_dirty {
-            &self.pending_surrounding_text
-        } else {
-            &self.committed_surrounding_text
-        };
-        let has_surrounding_text = effective_surrounding_text.is_some();
-        // Resend an unchanged content type only when the support the host
-        // was told no longer holds: a resend can reset Exo's composition.
-        let support_changed = self
-            .committed_surrounding_text_support
-            .is_some_and(|supported| supported != has_surrounding_text);
-        GuestCommitPlan {
-            host_v1_id: self.host_v1_id,
-            host_ext_id: self.host_ext_id,
-            guest_seat: self.guest_seat,
-            serial: self.guest_commit_serial,
+    /// Apply the pending state, as the v3 commit just counted by
+    /// [`Self::count_guest_commit`] does, except an enable that
+    /// `enable_conflict` rejects because another text input on the
+    /// connection is enabled. Returns the cursor rectangle it states, which
+    /// only the host keeps, and whether it started a new field.
+    pub(crate) fn commit(&mut self, enable_conflict: bool) -> V3Commit {
+        let V3Pending {
             enabled,
-            enable_conflict,
-            resets_composition,
-            surrounding_text: self
-                .surrounding_text_dirty
-                .then(|| self.pending_surrounding_text.clone()),
-            has_surrounding_text,
-            content_type: (self.content_type_dirty || support_changed)
-                .then_some((self.content_hint, self.content_purpose)),
-            cursor_rect: self
-                .cursor_rect_dirty
-                .then_some(self.cursor_rect.unwrap_or((0, 0, 0, 0))),
-        }
-    }
-
-    /// Publish a previously encoded guest commit plan.
-    ///
-    /// `surrounding_text_support` is the support the encoded transaction
-    /// told the host with the plan's content type, if it told any: only a
-    /// host extension with `set_surrounding_text_support` is told.
-    pub(crate) fn finish_guest_commit(
-        &mut self,
-        plan: GuestCommitPlan,
-        surrounding_text_support: Option<bool>,
-    ) {
-        debug_assert_eq!(plan.host_v1_id, self.host_v1_id);
-        debug_assert_eq!(plan.host_ext_id, self.host_ext_id);
-        debug_assert_eq!(plan.guest_seat, self.guest_seat);
-        debug_assert_eq!(
-            plan.serial, self.guest_commit_serial,
-            "a guest commit plan is finished for the commit that prepared it"
-        );
-
-        if plan.resets_composition {
-            if plan.enable_conflict {
-                self.pending_enabled = self.committed_enabled;
-            } else {
-                self.pending_enabled = plan.enabled;
-                self.committed_enabled = plan.enabled;
+            surrounding_text,
+            content_type,
+            cursor_rect,
+        } = std::mem::take(&mut self.pending);
+        if let Some(enabled) = enabled {
+            if !enable_conflict {
+                self.committed.enabled = enabled;
             }
-            self.enabled_dirty = false;
             self.clear_host_composition();
+            self.host.new_field();
         }
-        if let Some(surrounding_text) = plan.surrounding_text {
-            self.surrounding_text_dirty = false;
-            self.committed_surrounding_text = surrounding_text;
+        if let Some(surrounding_text) = surrounding_text {
+            self.committed.surrounding_text = surrounding_text;
         }
-        if let Some(content_type) = plan.content_type {
-            self.content_type_dirty = false;
-            self.committed_content_type = Some(content_type);
-            self.record_surrounding_text_support(surrounding_text_support);
+        if let Some(content_type) = content_type {
+            self.committed.content_type = content_type;
         }
-        if plan.cursor_rect.is_some() {
-            self.cursor_rect_dirty = false;
+        V3Commit {
+            new_field: enabled.is_some(),
+            cursor_rect,
         }
-    }
-
-    /// Record the surrounding-text support the host was told with the
-    /// committed content type, or `None` if it was told none.
-    pub(crate) fn record_surrounding_text_support(&mut self, support: Option<bool>) {
-        self.committed_surrounding_text_support = support;
     }
 
     pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
@@ -477,7 +515,7 @@ impl TextInputState {
         if !self.host_is_active() {
             return None;
         }
-        let (surrounding_text, surrounding_cursor, _) = self.committed_surrounding_text.as_ref()?;
+        let (surrounding_text, surrounding_cursor, _) = self.committed.surrounding_text.as_ref()?;
         Some(PreeditRegionPlan {
             guest_seat: self.guest_seat,
             surrounding_text: surrounding_text.clone(),
@@ -513,6 +551,23 @@ impl TextInputState {
         self.current_preedit.clear();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
+    }
+
+    /// Exo detached the input method on its own: end the host generation
+    /// without a barrier ([`HostApplied::end_without_barrier`]) and drop the
+    /// composition it was building.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no generation was active; otherwise whether the guest was
+    /// shown a preedit, which it must now be told to clear.
+    pub(crate) fn end_on_host_detach(&mut self) -> Option<bool> {
+        if !self.host.end_without_barrier() {
+            return None;
+        }
+        let had_preedit = !self.current_preedit.is_empty();
+        self.clear_host_composition();
+        Some(had_preedit)
     }
 
     fn clear_host_composition(&mut self) {
@@ -1868,6 +1923,9 @@ mod tests {
     use super::*;
     use crate::state::Context;
 
+    /// An attached input method with no known content type.
+    const ACTIVE: HostApplied = HostApplied::Active { content_type: None };
+
     #[test]
     fn host_activation_transitions_match_the_model_for_all_short_sequences() {
         #[derive(Clone, Copy)]
@@ -1877,7 +1935,7 @@ mod tests {
             BeginDrainingB,
             CompleteDrainingA,
             CompleteDrainingB,
-            DeactivateWithoutBarrier,
+            EndWithoutBarrier,
         }
 
         const CALLBACK_A: HostId = HostId(100);
@@ -1888,74 +1946,64 @@ mod tests {
             Operation::BeginDrainingB,
             Operation::CompleteDrainingA,
             Operation::CompleteDrainingB,
-            Operation::DeactivateWithoutBarrier,
+            Operation::EndWithoutBarrier,
         ];
-        const INITIAL_STATES: [HostActivationState; 4] = [
-            HostActivationState::Inactive,
-            HostActivationState::Active,
-            HostActivationState::Draining {
+        const INITIAL_STATES: [HostApplied; 4] = [
+            HostApplied::Inactive,
+            ACTIVE,
+            HostApplied::Draining {
                 callback: CALLBACK_A,
             },
-            HostActivationState::Draining {
+            HostApplied::Draining {
                 callback: CALLBACK_B,
             },
         ];
 
-        fn model_transition(
-            state: HostActivationState,
-            operation: Operation,
-        ) -> (HostActivationState, bool) {
+        fn model_transition(state: HostApplied, operation: Operation) -> (HostApplied, bool) {
             match (state, operation) {
-                (HostActivationState::Inactive, Operation::Activate) => {
-                    (HostActivationState::Active, true)
-                }
-                (HostActivationState::Active, Operation::BeginDrainingA) => (
-                    HostActivationState::Draining {
+                (HostApplied::Inactive, Operation::Activate) => (ACTIVE, true),
+                (ACTIVE, Operation::BeginDrainingA) => (
+                    HostApplied::Draining {
                         callback: CALLBACK_A,
                     },
                     true,
                 ),
-                (HostActivationState::Active, Operation::BeginDrainingB) => (
-                    HostActivationState::Draining {
+                (ACTIVE, Operation::BeginDrainingB) => (
+                    HostApplied::Draining {
                         callback: CALLBACK_B,
                     },
                     true,
                 ),
                 (
-                    HostActivationState::Draining {
+                    HostApplied::Draining {
                         callback: CALLBACK_A,
                     },
                     Operation::CompleteDrainingA,
                 )
                 | (
-                    HostActivationState::Draining {
+                    HostApplied::Draining {
                         callback: CALLBACK_B,
                     },
                     Operation::CompleteDrainingB,
-                ) => (HostActivationState::Inactive, true),
-                (HostActivationState::Active, Operation::DeactivateWithoutBarrier) => {
-                    (HostActivationState::Inactive, true)
-                }
+                ) => (HostApplied::Inactive, true),
+                (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
                 _ => (state, false),
             }
         }
 
-        fn assert_invariants(state: &TextInputState, expected: HostActivationState) {
-            assert_eq!(state.host_activation(), expected);
-            assert_eq!(
-                state.host_is_active(),
-                expected == HostActivationState::Active
-            );
+        fn assert_invariants(state: &TextInputState, expected: HostApplied) {
+            assert_eq!(state.host, expected);
+            assert_eq!(state.host_is_active(), expected == ACTIVE);
             assert_eq!(
                 state.draining_callback(),
                 match expected {
-                    HostActivationState::Draining { callback } => Some(callback),
-                    HostActivationState::Inactive | HostActivationState::Active => None,
+                    HostApplied::Draining { callback } => Some(callback),
+                    HostApplied::Inactive | HostApplied::Active { .. } => None,
                 }
             );
         }
 
-        fn walk(state: TextInputState, expected: HostActivationState, remaining: usize) {
+        fn walk(state: TextInputState, expected: HostApplied, remaining: usize) {
             assert_invariants(&state, expected);
             if remaining == 0 {
                 return;
@@ -1964,12 +2012,12 @@ mod tests {
             for operation in OPERATIONS {
                 let mut next = state.clone();
                 let actual_changed = match operation {
-                    Operation::Activate => next.activate_host(),
-                    Operation::BeginDrainingA => next.begin_host_draining(CALLBACK_A),
-                    Operation::BeginDrainingB => next.begin_host_draining(CALLBACK_B),
-                    Operation::CompleteDrainingA => next.complete_host_draining(CALLBACK_A),
-                    Operation::CompleteDrainingB => next.complete_host_draining(CALLBACK_B),
-                    Operation::DeactivateWithoutBarrier => next.deactivate_host_without_barrier(),
+                    Operation::Activate => next.host.activate(),
+                    Operation::BeginDrainingA => next.host.begin_draining(CALLBACK_A),
+                    Operation::BeginDrainingB => next.host.begin_draining(CALLBACK_B),
+                    Operation::CompleteDrainingA => next.host.complete_draining(CALLBACK_A),
+                    Operation::CompleteDrainingB => next.host.complete_draining(CALLBACK_B),
+                    Operation::EndWithoutBarrier => next.host.end_without_barrier(),
                 };
                 let (next_expected, expected_changed) = model_transition(expected, operation);
                 assert_eq!(actual_changed, expected_changed);
@@ -1979,39 +2027,155 @@ mod tests {
 
         for initial in INITIAL_STATES {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = initial;
+            state.host = initial;
             walk(state, initial, 5);
         }
+    }
+
+    /// Every host state a test of [`reconcile`] starts from: each
+    /// activation, with each content type the host could have.
+    fn host_states(content_types: &[HostContentType]) -> Vec<HostApplied> {
+        let mut states = vec![
+            HostApplied::Inactive,
+            HostApplied::Draining {
+                callback: HostId(100),
+            },
+        ];
+        for content_type in std::iter::once(None).chain(content_types.iter().copied().map(Some)) {
+            states.push(HostApplied::Active { content_type });
+        }
+        states
+    }
+
+    /// Apply `steps` to `applied` as the host does.
+    fn apply_steps(applied: &HostApplied, steps: HostSteps) -> HostApplied {
+        let mut next = *applied;
+        let changed = match steps.activation {
+            Some(ActivationStep::Activate) => next.activate(),
+            Some(ActivationStep::Deactivate) => next.begin_draining(HostId(101)),
+            Some(ActivationStep::Abandon) => next.end_without_barrier(),
+            None => true,
+        };
+        assert!(changed, "{steps:?} must be a transition from {applied:?}");
+        if let Some(content_type) = steps.content_type {
+            let before = next;
+            next.apply_content_type(content_type);
+            assert_ne!(
+                next, before,
+                "{steps:?} sends a content type the host drops or has"
+            );
+        }
+        next
+    }
+
+    #[test]
+    fn reconcile_reaches_every_target_with_only_needed_requests() {
+        let content_types = [(1, 2), (3, 4)]
+            .into_iter()
+            .flat_map(|content_type| {
+                [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
+                    content_type,
+                    surrounding_text_support,
+                })
+            })
+            .collect::<Vec<_>>();
+        for applied in host_states(&content_types) {
+            for (active, seat_live, &content_type) in [false, true]
+                .into_iter()
+                .flat_map(|active| [false, true].map(|seat_live| (active, seat_live)))
+                .flat_map(|(active, seat_live)| {
+                    content_types
+                        .iter()
+                        .map(move |content_type| (active, seat_live, content_type))
+                })
+            {
+                let target = HostTarget {
+                    active,
+                    seat_live,
+                    content_type,
+                };
+                let steps = reconcile(&target, &applied);
+                let reached = apply_steps(&applied, steps);
+                let expected = match (applied, active, seat_live) {
+                    // The barrier's completion reconciles again.
+                    (HostApplied::Draining { .. }, ..) => applied,
+                    (_, true, true) => HostApplied::Active {
+                        content_type: Some(content_type),
+                    },
+                    (HostApplied::Active { .. }, false, true) => HostApplied::Draining {
+                        callback: HostId(101),
+                    },
+                    (_, false, _) => HostApplied::Inactive,
+                    // A seat that cannot carry an activate keeps the host
+                    // as it is, with the content type it can still take.
+                    (HostApplied::Inactive, true, false) => applied,
+                    (HostApplied::Active { .. }, true, false) => HostApplied::Active {
+                        content_type: Some(content_type),
+                    },
+                };
+                assert_eq!(reached, expected, "{target:?} from {applied:?}");
+                assert_eq!(
+                    reconcile(&target, &reached),
+                    HostSteps::default(),
+                    "{target:?} is reached from {applied:?} in one reconciliation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reached_content_type_is_resent_only_after_the_host_forgets_it() {
+        let content_type = HostContentType {
+            content_type: (1, 2),
+            surrounding_text_support: Some(false),
+        };
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
+        };
+        let mut applied = HostApplied::default();
+        assert_eq!(
+            reconcile(&target, &applied),
+            HostSteps {
+                activation: Some(ActivationStep::Activate),
+                content_type: Some(content_type),
+            }
+        );
+        assert!(applied.activate());
+        applied.apply_content_type(content_type);
+        assert_eq!(reconcile(&target, &applied), HostSteps::default());
+
+        // A new field is told its content type even if it is unchanged.
+        applied.new_field();
+        assert_eq!(
+            reconcile(&target, &applied).content_type,
+            Some(content_type)
+        );
     }
 
     #[test]
     fn only_active_host_generation_accepts_ime_events() {
         for activation in [
-            HostActivationState::Inactive,
-            HostActivationState::Active,
-            HostActivationState::Draining {
+            HostApplied::Inactive,
+            ACTIVE,
+            HostApplied::Draining {
                 callback: HostId(100),
             },
         ] {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = activation;
-            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.host = activation;
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
 
-            assert_eq!(
-                state.prepare_host_preedit().is_some(),
-                activation == HostActivationState::Active
-            );
-            assert_eq!(
-                state.prepare_host_commit().is_some(),
-                activation == HostActivationState::Active
-            );
+            assert_eq!(state.prepare_host_preedit().is_some(), activation == ACTIVE);
+            assert_eq!(state.prepare_host_commit().is_some(), activation == ACTIVE);
             assert_eq!(
                 state.prepare_preedit_region().is_some(),
-                activation == HostActivationState::Active
+                activation == ACTIVE
             );
             assert_eq!(
                 state.prepare_confirm_preedit().is_some(),
-                activation == HostActivationState::Active
+                activation == ACTIVE
             );
         }
     }
@@ -2019,177 +2183,144 @@ mod tests {
     #[test]
     fn editor_lifecycle_boundaries_preserve_host_activation_generation() {
         for activation in [
-            HostActivationState::Inactive,
-            HostActivationState::Active,
-            HostActivationState::Draining {
+            HostApplied::Inactive,
+            ACTIVE,
+            HostApplied::Draining {
                 callback: HostId(100),
             },
         ] {
             let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host_activation = activation;
+            state.host = activation;
 
             state.apply_focus(Some(14));
-            assert_eq!(state.host_activation(), activation);
+            assert_eq!(state.host, activation);
             state.begin_destroy();
-            assert_eq!(state.host_activation(), activation);
+            assert_eq!(state.host, activation);
         }
     }
 
     #[test]
     fn text_input_focus_boundary_resets_editor_state_only() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.pending_enabled = true;
-        state.committed_enabled = true;
-        state.enabled_dirty = true;
-        state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
-        state.committed_surrounding_text = Some(("committed".to_string(), 9, 9));
-        state.surrounding_text_dirty = true;
-        state.content_hint = 5;
-        state.content_purpose = 6;
-        state.committed_content_type = Some((5, 6));
-        state.content_type_dirty = true;
-        state.cursor_rect = Some((1, 2, 3, 4));
-        state.cursor_rect_dirty = true;
+        state.pending = V3Pending {
+            enabled: Some(true),
+            surrounding_text: Some(Some(("pending".to_string(), 7, 7))),
+            content_type: Some((5, 6)),
+            cursor_rect: Some((1, 2, 3, 4)),
+        };
+        state.committed = V3Committed {
+            enabled: true,
+            surrounding_text: Some(("committed".to_string(), 9, 9)),
+            content_type: (5, 6),
+        };
         state.current_preedit = "조합".to_string();
         state.set_guest_commits(17);
         state.pending_preedit_cursor = Some(3);
         state.pending_preedit_selection = Some((0, 3));
         state.pending_deletes.push((3, 0));
         state.pending_cursor_position = Some((1, 1));
-        assert!(state.activate_host());
+        let applied = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (5, 6),
+                surrounding_text_support: Some(true),
+            }),
+        };
+        state.host = applied;
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
+        // What the host applied is the host's, so it survives: reconciling
+        // the reset target deactivates it and forgets the content type.
         let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
         expected.set_guest_commits(17);
-        assert!(expected.activate_host());
+        expected.host = applied;
         assert_eq!(state, expected);
-    }
-
-    #[test]
-    fn preparing_guest_commit_is_non_mutating_until_finish() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.committed_content_type = Some((1, 2));
-        state.begin_enabled_transaction(true);
-        state.set_surrounding_text("가나다".to_string(), 9, 9);
-        state.set_content_type(3, 4);
-        state.set_cursor_rect((1, 2, 3, 4));
-        assert_eq!(state.count_guest_commit(), 1);
-        let before = state.clone();
-
-        let plan = state.prepare_guest_commit(false);
-
-        assert_eq!(state, before);
-        assert_eq!(plan.serial, 1);
-        assert!(plan.enabled);
+        let target = HostTarget {
+            active: state.committed.enabled,
+            seat_live: true,
+            content_type: HostContentType {
+                content_type: state.committed.content_type,
+                surrounding_text_support: Some(false),
+            },
+        };
         assert_eq!(
-            plan.surrounding_text,
-            Some(Some(("가나다".to_string(), 9, 9)))
+            reconcile(&target, &state.host),
+            HostSteps {
+                activation: Some(ActivationStep::Deactivate),
+                content_type: None,
+            }
         );
-        assert_eq!(plan.content_type, Some((3, 4)));
-        assert_eq!(plan.cursor_rect, Some((1, 2, 3, 4)));
     }
 
     #[test]
-    fn finishing_guest_commit_applies_exact_owned_snapshot() {
+    fn commit_applies_every_pending_field_and_starts_a_new_field() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        assert!(state.host.activate());
+        let content_type = HostContentType {
+            content_type: (3, 4),
+            surrounding_text_support: Some(true),
+        };
+        state.host.apply_content_type(content_type);
         state.current_preedit = "이전".to_string();
         state.pending_preedit_cursor = Some(3);
         state.pending_deletes.push((3, 0));
-        state.begin_enabled_transaction(true);
-        state.set_surrounding_text("가나다".to_string(), 9, 9);
-        state.set_content_type(3, 4);
-        state.set_cursor_rect((1, 2, 3, 4));
-
+        state.pending = V3Pending {
+            surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
+            content_type: Some((3, 4)),
+            cursor_rect: Some((1, 2, 3, 4)),
+            ..V3Pending::reset(true)
+        };
         state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        state.finish_guest_commit(plan, None);
 
-        assert_eq!(state.guest_commit_serial(), 1);
-        assert!(state.pending_enabled);
-        assert!(state.committed_enabled);
-        assert!(!state.enabled_dirty);
         assert_eq!(
-            state.committed_surrounding_text,
-            Some(("가나다".to_string(), 9, 9))
+            state.commit(false),
+            V3Commit {
+                new_field: true,
+                cursor_rect: Some((1, 2, 3, 4)),
+            }
         );
-        assert!(!state.surrounding_text_dirty);
-        assert_eq!(state.committed_content_type, Some((3, 4)));
-        assert!(!state.content_type_dirty);
-        assert!(!state.cursor_rect_dirty);
+        assert_eq!(state.guest_commit_serial(), 1);
+        assert_eq!(state.pending, V3Pending::default());
+        assert_eq!(
+            state.committed,
+            V3Committed {
+                enabled: true,
+                surrounding_text: Some(("가나다".to_string(), 9, 9)),
+                content_type: (3, 4),
+            }
+        );
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_preedit_cursor.is_none());
         assert!(state.pending_deletes.is_empty());
+        // The new field is told its content type even though it is the old
+        // field's.
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
+        };
+        assert_eq!(
+            reconcile(&target, &state.host).content_type,
+            Some(content_type)
+        );
+
+        // A commit without enable or disable keeps the field.
+        state.pending.content_type = Some((3, 4));
+        state.host.apply_content_type(content_type);
+        assert!(!state.commit(false).new_field);
+        assert_eq!(reconcile(&target, &state.host), HostSteps::default());
     }
 
     #[test]
-    fn a_change_of_the_told_surrounding_text_support_resends_the_content_type() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.begin_enabled_transaction(true);
-        state.set_content_type(3, 4);
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        assert!(!plan.has_surrounding_text);
-        state.finish_guest_commit(plan, Some(false));
-
-        // Unchanged support: nothing to resend.
-        state.set_content_type(3, 4);
-        state.count_guest_commit();
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // The field gains surrounding text: the host was told otherwise.
-        state.set_surrounding_text("abc".to_string(), 3, 3);
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        assert!(plan.has_surrounding_text);
-        assert_eq!(plan.content_type, Some((3, 4)));
-        state.finish_guest_commit(plan, Some(true));
-        state.count_guest_commit();
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // Only a host that was told a support can be told wrong.
-        state.record_surrounding_text_support(Some(false));
-        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
-        state.record_surrounding_text_support(None);
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // A focus change forgets what the host was told, with the rest of
-        // the editor state.
-        state.record_surrounding_text_support(Some(true));
-        state.apply_focus(Some(14));
-        assert!(!state.prepare_guest_commit(false).has_surrounding_text);
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-    }
-
-    #[test]
-    fn enable_replays_same_content_type_but_ordinary_repeat_is_clean() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.committed_content_type = Some((3, 4));
-
-        state.set_content_type(3, 4);
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        state.begin_enabled_transaction(true);
-        state.set_content_type(3, 4);
-        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
-    }
-
-    #[test]
-    fn rejected_enable_advances_serial_and_closes_composition() {
+    fn rejected_enable_closes_composition_but_stays_disabled() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
         state.current_preedit = "가".to_string();
         state.pending_deletes.push((3, 0));
-        state.begin_enabled_transaction(true);
+        state.pending = V3Pending::reset(true);
 
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(true);
-        assert!(!plan.enabled);
-        state.finish_guest_commit(plan, None);
-
-        assert_eq!(state.guest_commit_serial(), 1);
-        assert!(!state.pending_enabled);
-        assert!(!state.committed_enabled);
-        assert!(!state.enabled_dirty);
+        assert!(state.commit(true).new_field);
+        assert_eq!(state.pending, V3Pending::default());
+        assert!(!state.committed.enabled);
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
     }
@@ -2200,9 +2331,7 @@ mod tests {
         state.set_guest_commits(u32::MAX);
 
         assert_eq!(state.count_guest_commit(), 0);
-        let plan = state.prepare_guest_commit(false);
-        assert_eq!(plan.serial, 0);
-        state.finish_guest_commit(plan, None);
+        state.commit(false);
         assert_eq!(state.guest_commit_serial(), 0);
     }
 
@@ -2210,7 +2339,7 @@ mod tests {
     fn host_preedit_metadata_is_consumed_only_after_finish() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
         assert!(state.prepare_host_preedit().is_none());
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.set_guest_commits(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -2233,7 +2362,7 @@ mod tests {
     #[test]
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.set_guest_commits(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
@@ -2266,7 +2395,7 @@ mod tests {
     #[test]
     fn confirming_preedit_closes_only_preedit_metadata() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
@@ -2288,7 +2417,7 @@ mod tests {
     #[test]
     fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
         let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.activate_host());
+        assert!(state.host.activate());
         for index in 0..MAX_PENDING_IME_DELETES {
             assert!(state.record_delete(index as u32, 0));
         }
@@ -2366,69 +2495,40 @@ mod tests {
                 match step {
                     Step::Focus | Step::Leave => {
                         let serial = next.guest_commit_serial;
-                        let host_activation = next.host_activation();
+                        let host_activation = next.host;
                         let surface = matches!(step, Step::Focus).then_some(13);
                         next.apply_focus(surface);
                         let mut expected = TextInputState::new(10, Some(11), 12, surface);
                         expected.guest_commit_serial = serial;
-                        expected.host_activation = host_activation;
+                        expected.host = host_activation;
                         assert_eq!(next, expected);
                     }
                     Step::Enable | Step::Disable if next.active_surface.is_some() => {
-                        next.begin_enabled_transaction(matches!(step, Step::Enable));
-                        assert!(next.enabled_dirty);
-                        assert!(next.surrounding_text_dirty);
-                        assert!(next.content_type_dirty);
-                        assert!(next.cursor_rect_dirty);
+                        next.pending = V3Pending::reset(matches!(step, Step::Enable));
                     }
                     Step::Surrounding if next.active_surface.is_some() => {
-                        next.set_surrounding_text("가".to_string(), 3, 3);
-                        assert!(next.surrounding_text_dirty);
+                        next.pending.surrounding_text = Some(Some(("가".to_string(), 3, 3)));
                     }
                     Step::ContentType if next.active_surface.is_some() => {
-                        next.set_content_type(3, 4);
+                        next.pending.content_type = Some((3, 4));
                     }
                     Step::CursorRect if next.active_surface.is_some() => {
-                        next.set_cursor_rect((1, 2, 3, 4));
-                        assert!(next.cursor_rect_dirty);
+                        next.pending.cursor_rect = Some((1, 2, 3, 4));
                     }
                     Step::Commit if next.active_surface.is_some() => {
                         let previous_serial = next.guest_commit_serial();
                         next.count_guest_commit();
-                        let plan = next.prepare_guest_commit(false);
-                        let resets_composition = plan.resets_composition;
-                        let commits_surrounding = plan.surrounding_text.is_some();
-                        let commits_content_type = plan.content_type.is_some();
-                        let commits_cursor_rect = plan.cursor_rect.is_some();
-                        next.finish_guest_commit(plan, None);
+                        let new_field = next.commit(false).new_field;
                         assert_eq!(next.guest_commit_serial(), previous_serial.wrapping_add(1));
-                        if resets_composition {
-                            assert!(!next.enabled_dirty);
+                        assert_eq!(next.pending, V3Pending::default());
+                        if new_field {
                             assert!(next.current_preedit.is_empty());
                             assert!(next.pending_deletes.is_empty());
                         }
-                        if commits_surrounding {
-                            assert!(!next.surrounding_text_dirty);
-                        }
-                        if commits_content_type {
-                            assert!(!next.content_type_dirty);
-                        }
-                        if commits_cursor_rect {
-                            assert!(!next.cursor_rect_dirty);
-                        }
-                    }
-                    Step::FailedCommit if next.active_surface.is_some() => {
-                        next.count_guest_commit();
-                        let before = next.clone();
-                        let _unencodable_plan = next.prepare_guest_commit(false);
-                        assert_eq!(
-                            next, before,
-                            "dropping an unencoded plan must advance only the commit count"
-                        );
                     }
                     Step::Commit | Step::FailedCommit => {
-                        // An unfocused commit is counted but changes nothing
-                        // else.
+                        // An unfocused commit, or one the handler cannot
+                        // encode, is counted but changes nothing else.
                         let mut expected = next.clone();
                         expected.count_guest_commit();
                         next.count_guest_commit();
@@ -2436,11 +2536,11 @@ mod tests {
                     }
                     Step::Destroy => {
                         let serial = next.guest_commit_serial();
-                        let host_activation = next.host_activation();
+                        let host_activation = next.host;
                         next.begin_destroy();
                         assert_eq!(next.guest_commit_serial(), serial);
-                        assert_eq!(next.host_activation(), host_activation);
-                        assert!(!next.committed_enabled);
+                        assert_eq!(next.host, host_activation);
+                        assert!(!next.committed.enabled);
                         assert!(next.active_surface.is_none());
                     }
                     _ => {}
@@ -2450,7 +2550,7 @@ mod tests {
         }
 
         let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(initial.activate_host());
+        assert!(initial.host.activate());
         walk(initial, 4);
     }
 

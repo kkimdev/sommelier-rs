@@ -185,6 +185,10 @@ fn guest_streams_cannot_crash_hang_or_leak() {
                 deferred > 0,
                 "no checked case deferred a text-input activation, so that went untested"
             );
+            assert!(
+                restarts > 0,
+                "no input method restarted while attached, so Exo's own detach went untested"
+            );
         }
         println!(
             "{cases} cases from seed {first_seed} passed: {outcomes:?}, {reused} host IDs reused, \
@@ -1078,8 +1082,9 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
 }
 
 /// Activations the guest's typing deferred
-/// ([`typing::Typed::deferred_activations`]), across the cases whose text
-/// fields were checked.
+/// ([`typing::Typed::deferred_activations`]: counted from the guest's plan,
+/// accurate only while every drain barrier's answer is held), across the
+/// cases whose text fields were checked.
 static DEFERRED_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Enabled text fields whose host state was checked, across all cases.
@@ -1611,7 +1616,7 @@ fn compositor(
                         &mut deleted,
                     ));
                 }
-                if RESTART_INPUT_METHODS && rng.one_in(8) && exo.destroy_input_method() {
+                if rng.one_in(8) && exo.destroy_input_method() {
                     INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
                 }
                 let callback = WireMessage::new(sender, opcode, payload)
@@ -1732,13 +1737,9 @@ fn destroy_live_objects(
         .collect()
 }
 
-/// Whether the compositor's input method now and then goes away as it
-/// answers a sync, as when its process restarts. Off for now: the proxy
-/// does not yet activate again a text input Exo deactivated on its own.
-const RESTART_INPUT_METHODS: bool = false;
-
-/// Input methods that went away while attached ([`RESTART_INPUT_METHODS`]),
-/// across all cases.
+/// Input methods that went away while attached, as when their process
+/// restarts: one answer to a sync in eight takes them away. Across all
+/// cases.
 static INPUT_METHOD_RESTARTS: AtomicU64 = AtomicU64::new(0);
 
 /// `zwp_text_input_v1.leave` events the compositor sent, across all cases.

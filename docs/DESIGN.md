@@ -298,8 +298,9 @@ becomes an unused variable, which CI rejects. There is no generic
 
 - `SurfacePending` (`render.rs`) follows it for a `wl_surface`'s
   attachment, damage, scale, transform, offsets and viewport.
-- The `pending_*` fields of `TextInputState` (`input.rs`) predate it and
-  have not moved yet.
+- `V3Pending` (`input.rs`) follows it for a text-input-v3 object's
+  enable, surrounding text, content type and cursor rectangle, which
+  `TextInputState::commit` applies to `V3Committed`.
 - `OutputRecord` (`outputs.rs`) is a deliberate exception: an output event
   edits a copy-on-write `Option<OutputState>` of the whole state, which
   `wl_output.done` publishes.
@@ -378,6 +379,21 @@ Exo delivers IME input through `zwp_text_input_v1` and the
 `zcr_text_input_extension_v1` extension, while GTK and other toolkits speak
 `zwp_text_input_v3`. The proxy exposes a synthetic text-input-v3 manager
 and bridges each guest v3 object to a host v1 object plus its extension.
+
+The bridge reconciles state rather than translating requests, because Exo
+applies a request against state the proxy cannot see: it drops a content
+type while no input method is attached, and attaching one resets the
+type. `HostApplied` (`input.rs`) models what the host text input has
+applied, by those rules, and the pure `reconcile` returns the requests
+that make it match the target the guest committed (`HostTarget`): the
+activation step and, when the attached input method lacks it, the content
+type. `text_input::reconcile_host` sends them wherever the target or the
+host's ability to apply it changes: a guest commit, a focus change, a
+drain barrier's completion, a `wl_seat` bind and the object's destroy.
+The surrounding text and cursor rectangle are not reconciled: Exo keeps
+both regardless and edits its copy of the text as the input method
+commits, so each guest commit forwards the ones it states. The rules are
+under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical

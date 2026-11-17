@@ -600,30 +600,73 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   to `set_input_type` is lossy: the `latin` hint, `multiline` outside the
   normal, alpha and name purposes, and the `terminal` purpose have no
   equivalent. They had no effect before either, because `set_input_type`
-  replaced what Exo derived from `set_content_type`. Because Exo learns
-  the support only with a content type, a commit that changes whether the
-  field has surrounding text resends the content type with the new
-  support; nothing else resends an unchanged content type, which can
-  reset Exo's composition.
-  Tests: `content_type_takes_one_host_request_per_extension_version`,
+  replaced what Exo derived from `set_content_type`.
+  Test: `content_type_takes_one_host_request_per_extension_version`.
+- **The host gets each content type once it can apply it, and only
+  then.** Exo applies a content type only while an input method is
+  attached: it drops one after `deactivate` and before `activate`, and
+  attaching resets the type and mode to text while keeping the previous
+  field's flags, learning mode and surrounding-text support, so a password
+  field would be treated as text the IME may learn. It learns whether the
+  field has surrounding text only with a content type. So the proxy keeps
+  what the host applied (`HostApplied`) and `reconcile` sends the
+  committed content type, with its support, whenever the attached input
+  method lacks it: after every `activate`, including one a drain barrier
+  or a seat without a host object deferred, when the guest changes it,
+  when the field's surrounding text appears or goes, and when an enable
+  starts a new field. It sends none while no input method is attached and
+  none the host already has: with a v8 extension Exo ignores an unchanged
+  type, but before v8 `set_content_type` and `deprecated_set_input_type`
+  map flags differently, so a resend changes the type twice, and each
+  change can reset the input method's composition. Exo keeps surrounding
+  text and the cursor rectangle without an input method, so they are
+  forwarded as committed and never replayed.
+  Exo reports every attach of its input method as
+  `zwp_text_input_v1.enter` and every detach as `leave`, including those
+  it makes on its own. It detaches on its own when its seat's focus
+  leaves the surface, the surface is destroyed or the input method is
+  destroyed, each time through `Deactivate`, so it attaches again only on
+  a new `activate`. A `leave` while the proxy's host generation is active
+  is such a detach, since the proxy's own `deactivate` starts draining
+  first: the generation ends there without a barrier, its composition is
+  dropped, a preedit the guest shows is cleared with an empty
+  `preedit_string` and `done`, and reconciling activates again if the
+  guest still wants input. If that `leave` beats the `wl_keyboard.leave`
+  of the same focus change, the activation finds Exo unfocused and the
+  keyboard leave drains it. Exo attaches on its own only when focus
+  reaches a surface an `activate` found unfocused, after a
+  `wl_keyboard.leave` that set the proxy draining, so an `enter` while
+  active answers the proxy's own `activate` and resends nothing.
+  `HostApplied` is therefore sound only while every host
+  `zwp_text_input_v1.leave`, `wl_keyboard.leave` and `wl_keyboard.enter`
+  reaches the text-input state in order with the events around it, never
+  dropped, delayed or coalesced with its pair: otherwise the proxy would
+  believe an input method attached that Exo detached, or the reverse, and
+  send content types Exo drops or withhold the one it needs.
+  Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
-  `a_host_without_surrounding_text_support_gets_no_resend`, and the
-  fuzzer's end state against its model of Exo
-  (`guest_streams_cannot_crash_hang_or_leak`; see
+  `a_host_without_surrounding_text_support_gets_no_resend`,
+  `a_deferred_activation_replays_the_committed_content_type`,
+  `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
+  `a_content_type_waits_for_the_host_to_attach`,
+  `the_enter_answering_an_activate_resends_nothing`,
+  `an_exo_detach_activates_again_with_the_content_type`,
+  `a_content_type_waits_for_exo_to_attach_again`,
+  `the_leave_answering_a_deactivate_is_ignored`,
+  `an_exo_detach_clears_the_guest_preedit`,
+  `an_exo_detach_before_the_keyboard_leave_activates_then_drains`, and
+  the fuzzer's end state against its model of Exo, whose input method
+  sometimes restarts (`guest_streams_cannot_crash_hang_or_leak`; see
   [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
-- **A deferred activation replays the content type.** A commit that
-  enables a text input while its previous host generation still drains
-  reaches Exo before the deferred `activate`, while no input method is
-  attached. Exo drops a content type then, and attaching resets the type
-  and mode but keeps the previous field's flags, learning mode and
-  surrounding-text support, so a password field would be treated as text
-  the IME may learn. The `activate` that ends the barrier is therefore
-  followed by the committed content type, with its support, and a
-  `commit_state`. Exo keeps surrounding text and the cursor rectangle
-  without an input method, so they are not replayed.
-  Tests: `a_deferred_activation_replays_the_committed_content_type`, and
-  the fuzzer's end state against its model of Exo
-  (`guest_streams_cannot_crash_hang_or_leak`).
+- **One text input on a connection is enabled at a time.** Exo has one
+  seat, and its `Activate` gives the input method to the text input that
+  activated last without telling the one it replaced. That one keeps its
+  activation but gets no input, and `Activate` on the same surface does
+  nothing, so it would stay deaf until deactivated. A text-input-v3 enable
+  while another text input on the connection is enabled, for any guest
+  `wl_seat`, is therefore ignored: the commit counts, closes the
+  composition and changes nothing else.
+  Test: `second_text_input_enable_on_the_connection_is_ignored`.
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A
