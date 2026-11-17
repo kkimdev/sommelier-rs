@@ -533,9 +533,10 @@ impl LinuxDmabufHandler {
 
         // Keep one descriptor for every plane. Multi-plane formats may use
         // separate dma-buf objects, so waiting only plane zero can present
-        // plane-one GPU writes before they complete. Linux anon-inode
-        // metadata cannot reliably prove that two descriptors are the same
-        // dma-buf, while an extra wait on shared backing is harmless.
+        // plane-one GPU writes before they complete. Inode identity proves
+        // two descriptors are the same dma-buf only on some kernels (see
+        // `shm::same_dma_buf_object`), while an extra wait on shared backing
+        // is harmless.
         // The queued ADD owns the original descriptor while these duplicates
         // live with the render-buffer generation through its final destroy.
         let mut sync_fds = Vec::new();

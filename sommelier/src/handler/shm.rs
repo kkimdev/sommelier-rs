@@ -220,6 +220,11 @@ fn backing_fd_has_size(fd: RawFd, size: usize) -> bool {
     }
 }
 
+/// Whether two descriptors refer to the same dma-buf object, by inode.
+///
+/// Each dma-buf has its own inode only from Linux 5.3; on older kernels all
+/// dma-bufs share one anonymous inode, and this reports any two of them as
+/// the same object. A `true` is therefore not proof on every kernel.
 fn same_dma_buf_object(first_fd: RawFd, second_fd: RawFd) -> bool {
     if first_fd < 0 || second_fd < 0 {
         return false;
@@ -267,14 +272,132 @@ fn valid_buffer_layout(
     i32::try_from(bytes).ok()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DmabufLayout {
-    stride0: usize,
-    stride1: usize,
-    offset0: usize,
-    offset1: usize,
-    span: usize,
+/// Validated dma-buf layouts. A submodule so that nothing in this file can
+/// build a [`DmabufLayout`] except [`validate_dmabuf_layout`].
+mod dmabuf_layout {
+    use super::WL_SHM_FORMAT_NV12;
+
+    /// Where one plane lies in a dma-buf, as `zwp_linux_buffer_params_v1.add`
+    /// sends it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct DmabufPlane {
+        pub(super) offset: u32,
+        pub(super) stride: u32,
+    }
+
+    /// A dma-buf layout that [`validate_dmabuf_layout`], its only constructor,
+    /// accepted. The private fields keep its invariants: plane 1 exists only
+    /// for NV12 and begins after all of plane 0, and `span` covers every plane.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct DmabufLayout {
+        plane0: DmabufPlane,
+        plane1: Option<DmabufPlane>,
+        span: usize,
+    }
+
+    impl DmabufLayout {
+        pub(super) fn plane0(&self) -> DmabufPlane {
+            self.plane0
+        }
+
+        /// The NV12 chroma plane, in the same dma-buf after all of plane 0.
+        pub(super) fn plane1(&self) -> Option<DmabufPlane> {
+            self.plane1
+        }
+
+        /// One past the last byte of the planes.
+        pub(super) fn span(&self) -> usize {
+            self.span
+        }
+
+        /// Plane 1's offset from plane 0, or 0 for a single-plane format.
+        pub(super) fn plane1_relative_offset(&self) -> usize {
+            self.plane1
+                .map_or(0, |plane1| (plane1.offset - self.plane0.offset) as usize)
+        }
+
+        /// Plane 1's stride, or 0 for a single-plane format.
+        pub(super) fn plane1_stride(&self) -> usize {
+            self.plane1.map_or(0, |plane1| plane1.stride as usize)
+        }
+    }
+
+    /// Validate the metadata returned by a host dma-buf allocator and calculate
+    /// the byte span that must be mapped in the guest.
+    ///
+    /// The host may pad rows and place plane 1 after an implementation-defined
+    /// gap.  Deriving the span from the returned offsets/strides keeps all mmap
+    /// and copy bounds checks consistent with the metadata sent to the compositor.
+    pub(super) fn validate_dmabuf_layout(
+        format: u32,
+        width: i32,
+        height: i32,
+        strides: [u32; 3],
+        offsets: [u32; 3],
+    ) -> Option<DmabufLayout> {
+        let width = usize::try_from(width).ok()?;
+        let height = usize::try_from(height).ok()?;
+        if width == 0 || height == 0 || strides[0] == 0 {
+            return None;
+        }
+
+        let (plane0_bpp, plane_count) = if format == WL_SHM_FORMAT_NV12 {
+            if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+                return None;
+            }
+            (1usize, 2usize)
+        } else if format == 0x3631_4752 {
+            (2usize, 1usize)
+        } else if matches!(
+            format,
+            0x3432_5258 | 0x3432_5241 | 0x3432_4258 | 0x3432_4241
+        ) {
+            (4usize, 1usize)
+        } else {
+            return None;
+        };
+        let plane0 = DmabufPlane {
+            offset: offsets[0],
+            stride: strides[0],
+        };
+        let stride0 = strides[0] as usize;
+        let offset0 = offsets[0] as usize;
+        let minimum0 = width.checked_mul(plane0_bpp)?;
+        if stride0 < minimum0 {
+            return None;
+        }
+        let plane0_end = offset0.checked_add(stride0.checked_mul(height)?)?;
+
+        if plane_count == 1 {
+            return Some(DmabufLayout {
+                plane0,
+                plane1: None,
+                span: plane0_end,
+            });
+        }
+
+        let stride1 = strides[1] as usize;
+        let offset1 = offsets[1] as usize;
+        let minimum1 = width;
+        // VirtWL and the GBM path use one contiguous dma-buf for NV12. Plane 1
+        // must begin after the complete Y plane; merely checking against
+        // `offset0` would allow overlapping planes and make the copy layout
+        // ambiguous.
+        if stride1 < minimum1 || !stride1.is_multiple_of(2) || offset1 < plane0_end {
+            return None;
+        }
+        let plane1_end = offset1.checked_add(stride1.checked_mul(height / 2)?)?;
+        Some(DmabufLayout {
+            plane0,
+            plane1: Some(DmabufPlane {
+                offset: offsets[1],
+                stride: strides[1],
+            }),
+            span: plane0_end.max(plane1_end),
+        })
+    }
 }
+use dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
 
 /// The host storage chosen for one guest SHM buffer.
 enum ShmBacking {
@@ -289,105 +412,36 @@ enum ShmBacking {
 }
 
 /// A host dma-buf allocation for a guest SHM buffer.
+///
+/// Both planes of an NV12 buffer are expected in the one dma-buf `fd`, which
+/// the copy path maps for both: VirtWL allocates a single object, and
+/// [`allocate_gbm_buffer`] rejects plane objects that
+/// [`same_dma_buf_object`] can tell apart.
 struct DmabufAllocation {
     bo: Option<gbm::BufferObject<()>>,
     fd: OwnedFd,
-    /// An additional descriptor for plane 1 when the allocator returns
-    /// separate dma-buf objects (GBM may do this for multi-planar formats).
-    /// VirtWL's NV12 allocation is a single object, so this remains `None`
-    /// and the plane-0 descriptor is duplicated for both protocol planes.
+    /// GBM's own descriptor for NV12 plane 1, which plane 1's `add` sends.
+    /// [`same_dma_buf_object`] cannot prove it is `fd`'s object on every
+    /// kernel, so the host gets exactly what GBM returned. `None` for VirtWL,
+    /// whose single descriptor plane 1 duplicates.
     plane1_fd: Option<OwnedFd>,
-    stride0: u32,
+    layout: DmabufLayout,
     modifier: u64,
-    offset0: u32,
-    total_size: u64,
-    plane1_offset: usize,
-    plane1_stride: usize,
     dmabuf_sync: bool,
 }
 
-/// Validate the metadata returned by a host dma-buf allocator and calculate
-/// the byte span that must be mapped in the guest.
-///
-/// The host may pad rows and place plane 1 after an implementation-defined
-/// gap.  Deriving the span from the returned offsets/strides keeps all mmap
-/// and copy bounds checks consistent with the metadata sent to the compositor.
-fn validate_dmabuf_layout(
-    format: u32,
-    width: i32,
-    height: i32,
-    strides: [u32; 3],
-    offsets: [u32; 3],
-) -> Option<DmabufLayout> {
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    if width == 0 || height == 0 || strides[0] == 0 {
-        return None;
-    }
-
-    let (plane0_bpp, plane_count) = if format == WL_SHM_FORMAT_NV12 {
-        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return None;
-        }
-        (1usize, 2usize)
-    } else if format == 0x3631_4752 {
-        (2usize, 1usize)
-    } else if matches!(
-        format,
-        0x3432_5258 | 0x3432_5241 | 0x3432_4258 | 0x3432_4241
-    ) {
-        (4usize, 1usize)
-    } else {
-        return None;
-    };
-    let stride0 = strides[0] as usize;
-    let offset0 = offsets[0] as usize;
-    let minimum0 = width.checked_mul(plane0_bpp)?;
-    if stride0 < minimum0 {
-        return None;
-    }
-    let plane0_end = offset0.checked_add(stride0.checked_mul(height)?)?;
-
-    if plane_count == 1 {
-        return Some(DmabufLayout {
-            stride0,
-            stride1: 0,
-            offset0,
-            offset1: 0,
-            span: plane0_end,
-        });
-    }
-
-    let stride1 = strides[1] as usize;
-    let offset1 = offsets[1] as usize;
-    let minimum1 = width;
-    // VirtWL and the GBM path use one contiguous dma-buf for NV12. Plane 1
-    // must begin after the complete Y plane; merely checking against
-    // `offset0` would allow overlapping planes and make the copy layout
-    // ambiguous.
-    if stride1 < minimum1 || !stride1.is_multiple_of(2) || offset1 < plane0_end {
-        return None;
-    }
-    let plane1_end = offset1.checked_add(stride1.checked_mul(height / 2)?)?;
-    Some(DmabufLayout {
-        stride0,
-        stride1,
-        offset0,
-        offset1,
-        span: plane0_end.max(plane1_end),
-    })
-}
-
 fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
-    if fd < 0 || layout.span <= layout.offset0 {
+    let offset0 = layout.plane0().offset as usize;
+    let span = layout.span();
+    if fd < 0 || span <= offset0 {
         return None;
     }
     // `mmap` takes a signed length and an `off_t` offset. Avoid lossy casts
     // even on a wider host where a malicious Wayland metadata value can fit
     // in usize but not in either syscall argument.
-    if layout.span > isize::MAX as usize
-        || layout.span - layout.offset0 > isize::MAX as usize
-        || libc::off_t::try_from(layout.offset0).is_err()
+    if span > isize::MAX as usize
+        || span - offset0 > isize::MAX as usize
+        || libc::off_t::try_from(offset0).is_err()
     {
         return None;
     }
@@ -396,7 +450,7 @@ fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
     // rather than mapping the wrong bytes.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page_size = usize::try_from(page_size).ok()?;
-    if page_size == 0 || !layout.offset0.is_multiple_of(page_size) {
+    if page_size == 0 || !offset0.is_multiple_of(page_size) {
         return None;
     }
     // A successful mmap does not prove that a regular file is large enough:
@@ -417,12 +471,12 @@ fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
     // has to rely on mmap as the final validation.
     if file_type == libc::S_IFREG || stat.st_size > 0 {
         let file_size = u64::try_from(stat.st_size).ok()?;
-        let required_size = u64::try_from(layout.span).ok()?;
+        let required_size = u64::try_from(span).ok()?;
         if file_size < required_size {
             return None;
         }
     }
-    let map_size = layout.span - layout.offset0;
+    let map_size = span - offset0;
     let ptr = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -430,7 +484,7 @@ fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
-            libc::off_t::try_from(layout.offset0).ok()?,
+            libc::off_t::try_from(offset0).ok()?,
         )
     };
     if ptr == libc::MAP_FAILED {
@@ -472,26 +526,12 @@ fn allocate_virtwl_dmabuf(
         metadata.offsets,
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid VirtWL dma-buf layout"))?;
-    let (plane1_offset, plane1_stride) = if drm_format == WL_SHM_FORMAT_NV12 {
-        (layout.offset1 - layout.offset0, layout.stride1)
-    } else {
-        (0, 0)
-    };
     // Probe the exact mapping that the copy path will use while the allocation
     // is still owned by this function.  A VirtWL driver may expose the ioctl
     // but return metadata that cannot be mmaped (for example a non-page-aligned
     // plane-0 offset); treat that as an allocation failure so the caller can
     // fall back to ordinary VirtWL shared memory.
-    if let Some((mapped_ptr, mapped_size)) = map_dmabuf(
-        fd.as_raw_fd(),
-        DmabufLayout {
-            stride0: layout.stride0,
-            stride1: layout.stride1,
-            offset0: layout.offset0,
-            offset1: layout.offset1,
-            span: layout.span,
-        },
-    ) {
+    if let Some((mapped_ptr, mapped_size)) = map_dmabuf(fd.as_raw_fd(), layout) {
         unsafe {
             libc::munmap(mapped_ptr as *mut libc::c_void, mapped_size);
         }
@@ -501,32 +541,12 @@ fn allocate_virtwl_dmabuf(
             "VirtWL dma-buf cannot be mapped",
         ));
     }
-    let total_size = u64::try_from(layout.span).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "VirtWL dma-buf size overflows u64",
-        )
-    })?;
     Ok(DmabufAllocation {
         bo: None,
         fd,
         plane1_fd: None,
-        stride0: u32::try_from(layout.stride0).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VirtWL dma-buf stride overflows u32",
-            )
-        })?,
+        layout,
         modifier: 0,
-        offset0: u32::try_from(layout.offset0).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VirtWL dma-buf offset overflows u32",
-            )
-        })?,
-        total_size,
-        plane1_offset,
-        plane1_stride,
         dmabuf_sync: true,
     })
 }
@@ -559,7 +579,7 @@ fn allocate_gbm_buffer(
     let fd = bo.fd().map_err(io::Error::other)?;
     let plane_count = bo.plane_count().map_err(io::Error::other)?;
     let offset0 = bo.offset(0).map_err(io::Error::other)?;
-    let (plane1_fd, plane1_offset, plane1_stride) = if drm_format == WL_SHM_FORMAT_NV12 {
+    let (plane1_fd, stride1, offset1) = if drm_format == WL_SHM_FORMAT_NV12 {
         if plane_count != 2 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -577,6 +597,8 @@ fn allocate_gbm_buffer(
                 "GBM returned invalid NV12 plane-1 metadata",
             ));
         }
+        // The copy path maps `fd` for both planes, so they must be the same
+        // dma-buf object.
         let plane1_fd = bo.fd_for_plane(1).map_err(io::Error::other)?;
         if !same_dma_buf_object(fd.as_raw_fd(), plane1_fd.as_raw_fd()) {
             return Err(io::Error::new(
@@ -584,7 +606,7 @@ fn allocate_gbm_buffer(
                 "GBM NV12 planes use separate dma-buf objects",
             ));
         }
-        (Some(plane1_fd), offset1 - offset0, stride1)
+        (Some(plane1_fd), stride1, offset1)
     } else {
         if plane_count != 1 {
             return Err(io::Error::new(
@@ -609,32 +631,20 @@ fn allocate_gbm_buffer(
             format!("GBM returned non-linear NV12 modifier {modifier:#x}"),
         ));
     }
-    let offset1 = offset0.checked_add(plane1_offset).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "GBM plane-1 offset arithmetic overflows",
-        )
-    })?;
     let layout = validate_dmabuf_layout(
         drm_format,
         width,
         height,
-        [stride0, plane1_stride, 0],
+        [stride0, stride1, 0],
         [offset0, offset1, 0],
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid GBM buffer layout"))?;
-    let total_size = u64::try_from(layout.span)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid GBM buffer size"))?;
     Ok(DmabufAllocation {
         bo: Some(bo),
         fd,
         plane1_fd,
-        stride0,
+        layout,
         modifier,
-        offset0,
-        total_size,
-        plane1_offset: plane1_offset as usize,
-        plane1_stride: plane1_stride as usize,
         dmabuf_sync: false,
     })
 }
@@ -1382,7 +1392,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         width,
                         height,
                         format,
-                        allocation.stride0,
+                        allocation.layout.plane0().stride,
                         allocation.modifier
                     );
                     Some(ShmBacking::Dmabuf {
@@ -1448,7 +1458,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         width,
                         height,
                         format,
-                        allocation.stride0,
+                        allocation.layout.plane0().stride,
                         allocation.modifier
                     );
                     ShmBacking::Dmabuf {
@@ -1622,47 +1632,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         let DmabufAllocation {
             bo,
             fd: dmabuf_fd_owned,
-            plane1_fd: plane1_fd_owned,
-            stride0: bo_stride,
+            plane1_fd,
+            layout,
             modifier,
-            offset0: blob_offset,
-            total_size,
-            plane1_offset,
-            plane1_stride,
             dmabuf_sync,
         } = allocation;
 
-        let host_plane1_offset = match (blob_offset as usize).checked_add(plane1_offset) {
-            Some(offset) => offset,
-            None => {
-                error!("VirtWL dma-buf plane-1 offset overflows usize");
-                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
-                return Action::Drop;
-            }
-        };
-        let host_plane1_offset_u32 = match u32::try_from(host_plane1_offset) {
-            Ok(offset) => offset,
-            Err(_) => {
-                error!("VirtWL dma-buf plane-1 offset overflows u32");
-                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
-                return Action::Drop;
-            }
-        };
-        let plane1_stride_u32 = match u32::try_from(plane1_stride) {
-            Ok(stride) => stride,
-            Err(_) => {
-                error!("VirtWL dma-buf plane-1 stride overflows u32");
-                queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
-                return Action::Drop;
-            }
-        };
-        if format == WL_SHM_FORMAT_NV12
-            && (plane1_stride == 0 || host_plane1_offset < blob_offset as usize)
-        {
-            error!("VirtWL dma-buf returned invalid NV12 plane-1 metadata");
-            queue_buffer_creation_error(ctx, pool_id, "invalid wl_shm dma-buf plane metadata");
-            return Action::Drop;
-        }
         // Duplicate the descriptors the ADDs hand to the host before mapping
         // or queueing anything, so a failure has nothing to undo.
         let fd_to_send = match dmabuf_fd_owned.try_clone() {
@@ -1677,13 +1652,9 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 return Action::Drop;
             }
         };
-        let plane1_fd_to_send = if format == WL_SHM_FORMAT_NV12 {
-            match plane1_fd_owned
-                .as_ref()
-                .unwrap_or(&dmabuf_fd_owned)
-                .try_clone()
-            {
-                Ok(fd) => Some(fd),
+        let plane1_add = if let Some(plane1) = layout.plane1() {
+            match plane1_fd.as_ref().unwrap_or(&dmabuf_fd_owned).try_clone() {
+                Ok(fd) => Some((plane1, fd)),
                 Err(error) => {
                     error!("Failed to duplicate NV12 dma-buf fd: {}", error);
                     queue_buffer_creation_error(
@@ -1698,18 +1669,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             None
         };
 
-        let layout = DmabufLayout {
-            stride0: bo_stride as usize,
-            stride1: plane1_stride,
-            offset0: blob_offset as usize,
-            offset1: host_plane1_offset,
-            span: usize::try_from(total_size).unwrap_or(0),
-        };
         let (dest_ptr, dest_size) = if bo.is_none() {
             let Some((ptr, size)) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
                 error!(
                     "dma-buf cannot be safely mmaped (offset={}, size={})",
-                    blob_offset, total_size
+                    layout.plane0().offset,
+                    layout.span()
                 );
                 queue_buffer_creation_error(ctx, pool_id, "unable to map wl_shm dma-buf backing");
                 return Action::Drop;
@@ -1749,18 +1714,18 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
 
         let mut add = MessageBuilder::new();
         add.write_u32(0); // plane index
-        add.write_u32(blob_offset);
-        add.write_u32(bo_stride);
+        add.write_u32(layout.plane0().offset);
+        add.write_u32(layout.plane0().stride);
         add.write_u32((modifier >> 32) as u32);
         add.write_u32(modifier as u32);
         let add = add.build_message(params_id, zwp_linux_buffer_params_v1::REQ_ADD);
         ctx.client_to_host_queue
             .push((add, vec![fd_to_send.into_raw_fd()]));
-        if let Some(plane1_fd) = plane1_fd_to_send {
+        if let Some((plane1, plane1_fd)) = plane1_add {
             let mut add_plane1 = MessageBuilder::new();
             add_plane1.write_u32(1);
-            add_plane1.write_u32(host_plane1_offset_u32);
-            add_plane1.write_u32(plane1_stride_u32);
+            add_plane1.write_u32(plane1.offset);
+            add_plane1.write_u32(plane1.stride);
             add_plane1.write_u32((modifier >> 32) as u32);
             add_plane1.write_u32(modifier as u32);
             let add_plane1 =
@@ -1799,9 +1764,9 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 format,
                 bo,
                 dmabuf_fd: Some(dmabuf_fd_owned),
-                bo_stride,
-                dmabuf_plane1_offset: plane1_offset,
-                dmabuf_plane1_stride: plane1_stride,
+                bo_stride: layout.plane0().stride,
+                dmabuf_plane1_offset: layout.plane1_relative_offset(),
+                dmabuf_plane1_stride: layout.plane1_stride(),
                 dmabuf_sync,
                 dest_ptr,
                 dest_size,
@@ -1977,6 +1942,7 @@ impl ShmHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::dmabuf_layout::DmabufPlane;
     use super::map_dmabuf;
     use super::ShmHandler;
     use super::{
@@ -1985,7 +1951,7 @@ mod tests {
         record_host_shm_drm_format, record_host_shm_format, record_host_shm_wl_format,
         register_guest_shm, retire_eligible_buffers, rollback_registered_buffer,
         same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, DmabufLayout, WL_SHM_FORMAT_NV12,
+        valid_shm_stride, validate_dmabuf_layout, WL_SHM_FORMAT_NV12,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -2399,19 +2365,34 @@ mod tests {
     fn validates_dmabuf_metadata_without_assuming_plane_one_for_single_plane() {
         let layout = validate_dmabuf_layout(0x3432_5258, 64, 32, [512, 0, 0], [4096, 0, 0])
             .expect("single-plane metadata with a non-zero plane-0 offset");
-        assert_eq!(layout.offset0, 4096);
-        assert_eq!(layout.offset1, 0);
-        assert_eq!(layout.stride1, 0);
-        assert_eq!(layout.span, 4096 + 512 * 32);
+        assert_eq!(
+            layout.plane0(),
+            DmabufPlane {
+                offset: 4096,
+                stride: 512
+            }
+        );
+        assert_eq!(layout.plane1(), None);
+        assert_eq!(layout.plane1_relative_offset(), 0);
+        assert_eq!(layout.plane1_stride(), 0);
+        assert_eq!(layout.span(), 4096 + 512 * 32);
 
-        assert!(validate_dmabuf_layout(
+        let nv12 = validate_dmabuf_layout(
             WL_SHM_FORMAT_NV12,
             64,
             32,
             [64, 64, 0],
             [0, 64 * 32 + 4096, 0],
         )
-        .is_some());
+        .expect("NV12 metadata with a gap before plane 1");
+        assert_eq!(
+            nv12.plane1(),
+            Some(DmabufPlane {
+                offset: 64 * 32 + 4096,
+                stride: 64
+            })
+        );
+        assert_eq!(nv12.plane1_relative_offset(), 64 * 32 + 4096);
         assert!(
             validate_dmabuf_layout(WL_SHM_FORMAT_NV12, 64, 32, [64, 64, 0], [4096, 0, 0],)
                 .is_none()
@@ -2430,30 +2411,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unrepresentable_or_unaligned_dmabuf_mappings() {
-        let too_large = usize::try_from(isize::MAX).unwrap().saturating_add(1);
-        assert!(map_dmabuf(
-            0,
-            DmabufLayout {
-                stride0: 4,
-                stride1: 0,
-                offset0: 0,
-                offset1: 0,
-                span: too_large,
-            }
-        )
-        .is_none());
-        assert!(map_dmabuf(
-            0,
-            DmabufLayout {
-                stride0: 4,
-                stride1: 0,
-                offset0: 1,
-                offset1: 0,
-                span: 4097,
-            }
-        )
-        .is_none());
+    fn rejects_unaligned_dmabuf_mappings() {
+        // A layout's span cannot exceed isize::MAX on a 64-bit host (u32
+        // offsets and strides, i32 rows), so only the alignment rule is
+        // reachable here.
+        let layout = validate_dmabuf_layout(0x3432_5258, 1, 1, [4, 0, 0], [1, 0, 0])
+            .expect("a valid but unaligned single-plane layout");
+        assert!(map_dmabuf(0, layout).is_none());
     }
 
     #[test]
@@ -2471,13 +2435,8 @@ mod tests {
         assert!(
             map_dmabuf(
                 fd.as_raw_fd(),
-                DmabufLayout {
-                    stride0: 64,
-                    stride1: 0,
-                    offset0: 0,
-                    offset1: 0,
-                    span: 8192,
-                }
+                validate_dmabuf_layout(0x3432_5258, 16, 128, [64, 0, 0], [0, 0, 0])
+                    .expect("an 8192-byte single-plane layout")
             )
             .is_none(),
             "mmap preflight must reject a regular backing that would SIGBUS"
