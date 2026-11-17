@@ -25,8 +25,10 @@ mod window_placement;
 mod xdg_roles;
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
@@ -151,13 +153,32 @@ pub struct PendingDmabufGlobal {
     pub generation: u64,
 }
 
-impl Drop for Context {
-    fn drop(&mut self) {
-        // Context is also dropped on synchronous protocol-error paths. Tokio
-        // JoinHandle::drop detaches a task, so explicitly abort every active
-        // clipboard pump instead of allowing it to outlive the connection.
-        for pump in self.clipboard_pumps.drain(..) {
-            pump.abort();
+/// The clipboard transfers of one connection.
+///
+/// Each pump owns its two descriptors until its transfer ends. The pumps
+/// belong to the connection: stopping the set, or dropping it with the
+/// [`Context`] on any path, aborts every unfinished one.
+#[derive(Default)]
+pub(crate) struct ClipboardPumps(JoinSet<()>);
+
+impl ClipboardPumps {
+    /// Start a pump, after forgetting the ones that have finished.
+    pub(crate) fn start(&mut self, pump: impl Future<Output = ()> + Send + 'static) {
+        self.reap();
+        self.0.spawn(pump);
+    }
+
+    /// Abort every pump and wait until each has dropped its descriptors.
+    pub(crate) async fn stop(&mut self) {
+        self.0.shutdown().await;
+    }
+
+    /// Forget the pumps that have finished, reporting any that panicked.
+    fn reap(&mut self) {
+        while let Some(result) = self.0.try_join_next() {
+            if let Err(e) = result {
+                error!("A clipboard pump failed: {}", e);
+            }
         }
     }
 }
@@ -425,11 +446,8 @@ pub struct Context {
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
     pub viewport_to_wl_surface: HashMap<u32, u32>,
-    /// Clipboard transfer tasks own the VirtWL/read and client/write
-    /// descriptors until the transfer reaches EOF. Keep their join handles
-    /// with the connection so a client disconnect can cancel the transfer
-    /// instead of leaving a detached task and two open descriptors behind.
-    pub(crate) clipboard_pumps: Vec<tokio::task::JoinHandle<()>>,
+    /// The connection's clipboard transfers.
+    pub(crate) clipboard_pumps: ClipboardPumps,
 }
 
 pub(crate) struct LocalBufferCopyResources<'a> {
@@ -935,25 +953,8 @@ impl Context {
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
             viewport_to_wl_surface: HashMap::new(),
-            clipboard_pumps: Vec::new(),
+            clipboard_pumps: ClipboardPumps::default(),
         }
-    }
-
-    /// Cancel clipboard pumps when the client connection is going away.
-    ///
-    /// The asynchronous caller should await this method so Tokio runs each
-    /// cancelled future's destructor and closes its owned descriptors.
-    pub(crate) async fn stop_clipboard_pumps(&mut self) {
-        let pumps = std::mem::take(&mut self.clipboard_pumps);
-        for pump in pumps {
-            pump.abort();
-            let _ = pump.await;
-        }
-    }
-
-    /// Remove completed transfer handles while retaining active pumps.
-    pub(crate) fn reap_clipboard_pumps(&mut self) {
-        self.clipboard_pumps.retain(|pump| !pump.is_finished());
     }
 
     /// Test-only constructor that reads no environment variable, probes no
@@ -1155,15 +1156,13 @@ mod tests {
         let pipe = crate::test_support::fd_identity(pipe_fds[0]);
         let read_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let write_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
-        let pump = tokio::spawn(async move {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.clipboard_pumps.start(async move {
             let mut input = tokio::fs::File::from_std(std::fs::File::from(read_owned));
             let mut output = tokio::fs::File::from_std(std::fs::File::from(write_owned));
             let _ = tokio::io::copy(&mut input, &mut output).await;
         });
-
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.clipboard_pumps.push(pump);
-        ctx.stop_clipboard_pumps().await;
+        ctx.clipboard_pumps.stop().await;
 
         assert!(!crate::test_support::any_fd_has_identity(pipe));
     }

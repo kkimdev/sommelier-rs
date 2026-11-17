@@ -120,7 +120,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
                 debug!("Clipboard pump finished");
             };
 
-            ctx.clipboard_pumps.push(tokio::spawn(pump_task));
+            ctx.clipboard_pumps.start(pump_task);
 
             // Drop original action (we handled it)
             return Action::Drop;
