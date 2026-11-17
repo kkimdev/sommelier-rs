@@ -2527,150 +2527,149 @@ mod tests {
         }
     }
 
+    const KEYBOARD_A: HostId = HostId(10);
+    const KEYBOARD_B: HostId = HostId(11);
+
+    /// Seat 1's focus on guest surface 20, host surface 200.
+    const ON_20: KeyboardFocus = KeyboardFocus {
+        guest_seat: 1,
+        guest_surface: 20,
+        host_surface: 200,
+    };
+    /// Seat 1's focus on guest surface 21, host surface 201.
+    const ON_21: KeyboardFocus = KeyboardFocus {
+        guest_seat: 1,
+        guest_surface: 21,
+        host_surface: 201,
+    };
+
+    fn accepted(
+        seat_changes: Vec<SeatFocusChange>,
+        retired_keyboards: Vec<HostId>,
+    ) -> KeyboardFocusUpdate {
+        KeyboardFocusUpdate {
+            accepted: true,
+            seat_changes,
+            retired_keyboards,
+        }
+    }
+
     #[test]
     fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
         let mut registry = KeyboardFocusRegistry::default();
 
         assert_eq!(
-            registry.enter(keyboard_a, focus_a),
-            KeyboardFocusUpdate {
-                accepted: true,
-                seat_changes: vec![SeatFocusChange {
+            registry.enter(KEYBOARD_A, ON_20),
+            accepted(
+                vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: None,
                     current_surface: Some(20),
                 }],
-                retired_keyboards: Vec::new(),
-            }
+                Vec::new()
+            )
         );
         assert_eq!(
-            registry.enter(keyboard_b, focus_b),
-            KeyboardFocusUpdate {
-                accepted: true,
-                seat_changes: vec![SeatFocusChange {
+            registry.enter(KEYBOARD_B, ON_21),
+            accepted(
+                vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: Some(20),
                     current_surface: Some(21),
                 }],
-                retired_keyboards: vec![keyboard_a],
-            }
+                vec![KEYBOARD_A]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), Some(21));
         assert_eq!(
-            registry.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate {
-                accepted: true,
-                ..KeyboardFocusUpdate::default()
-            },
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
+            accepted(Vec::new(), Vec::new()),
             "a delayed leave must balance the retired guest enter once"
         );
         assert_eq!(
-            registry.leave(keyboard_a, focus_a.host_surface),
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
             KeyboardFocusUpdate::default(),
             "a duplicate delayed leave must be rejected"
         );
         assert_eq!(registry.surface_for_seat(1), Some(21));
     }
 
+    /// A delayed leave answers an enter the guest saw. Once that enter is
+    /// gone, superseded by a newer enter on the same keyboard, released or
+    /// destroyed, the leave changes nothing.
     #[test]
-    fn keyboard_focus_registry_rejects_old_leave_after_same_keyboard_reenter() {
-        let keyboard = HostId(10);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
-        let mut registry = KeyboardFocusRegistry::default();
+    fn keyboard_focus_registry_rejects_a_leave_for_a_superseded_or_ended_enter() {
+        struct Case {
+            what_ended_the_enter: &'static str,
+            end_the_enter: fn(&mut KeyboardFocusRegistry),
+            expected_focus_of_a: Option<KeyboardFocus>,
+        }
+        let cases = [
+            Case {
+                what_ended_the_enter: "a newer enter on the same keyboard",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_A, ON_21);
+                },
+                expected_focus_of_a: Some(ON_21),
+            },
+            Case {
+                what_ended_the_enter: "a release, after another keyboard took the seat",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_B, ON_21);
+                    registry.release(KEYBOARD_A);
+                },
+                expected_focus_of_a: None,
+            },
+            Case {
+                what_ended_the_enter: "a destroy, after another keyboard took the seat",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_B, ON_21);
+                    registry.destroy_surface(ON_20.guest_surface);
+                },
+                expected_focus_of_a: None,
+            },
+        ];
+        for case in cases {
+            let mut registry = KeyboardFocusRegistry::default();
+            registry.enter(KEYBOARD_A, ON_20);
+            (case.end_the_enter)(&mut registry);
 
-        registry.enter(keyboard, focus_a);
-        registry.enter(keyboard, focus_b);
-        assert_eq!(
-            registry.leave(keyboard, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "an old leave on the same resource must not clear its newer enter"
-        );
-        assert_eq!(registry.focus_for_keyboard(keyboard), Some(focus_b));
-    }
-
-    #[test]
-    fn keyboard_focus_registry_release_and_destroy_discard_retired_enters() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
-
-        let mut released = KeyboardFocusRegistry::default();
-        released.enter(keyboard_a, focus_a);
-        released.enter(keyboard_b, focus_b);
-        released.release(keyboard_a);
-        assert_eq!(
-            released.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "a released keyboard resource cannot receive a delayed leave"
-        );
-
-        let mut destroyed = KeyboardFocusRegistry::default();
-        destroyed.enter(keyboard_a, focus_a);
-        destroyed.enter(keyboard_b, focus_b);
-        destroyed.destroy_surface(focus_a.guest_surface);
-        assert_eq!(
-            destroyed.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "a destroyed guest surface cannot receive a delayed leave"
-        );
+            let what = case.what_ended_the_enter;
+            assert_eq!(
+                registry.leave(KEYBOARD_A, ON_20.host_surface),
+                KeyboardFocusUpdate::default(),
+                "{what}"
+            );
+            assert_eq!(
+                registry.focus_for_keyboard(KEYBOARD_A),
+                case.expected_focus_of_a,
+                "{what}"
+            );
+            assert_eq!(registry.surface_for_seat(1), Some(21), "{what}");
+        }
     }
 
     #[test]
     fn keyboard_focus_registry_keeps_shared_surface_until_last_owner() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
         let mut registry = KeyboardFocusRegistry::default();
-        registry.enter(keyboard_a, focus);
-        registry.enter(keyboard_b, focus);
+        registry.enter(KEYBOARD_A, ON_20);
+        registry.enter(KEYBOARD_B, ON_20);
 
-        let first_leave = registry.leave(keyboard_a, focus.host_surface);
-        assert!(first_leave.accepted);
-        assert!(first_leave.seat_changes.is_empty());
-        assert_eq!(registry.surface_for_seat(1), Some(20));
-
-        let last_leave = registry.leave(keyboard_b, focus.host_surface);
         assert_eq!(
-            last_leave.seat_changes,
-            vec![SeatFocusChange {
-                guest_seat: 1,
-                previous_surface: Some(20),
-                current_surface: None,
-            }]
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
+            accepted(Vec::new(), vec![KEYBOARD_A])
+        );
+        assert_eq!(registry.surface_for_seat(1), Some(20));
+        assert_eq!(
+            registry.leave(KEYBOARD_B, ON_20.host_surface),
+            accepted(
+                vec![SeatFocusChange {
+                    guest_seat: 1,
+                    previous_surface: Some(20),
+                    current_surface: None,
+                }],
+                vec![KEYBOARD_B]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), None);
     }
@@ -2678,20 +2677,12 @@ mod tests {
     #[test]
     fn keyboard_focus_registry_destroys_surface_across_seats_without_fallback() {
         let mut registry = KeyboardFocusRegistry::default();
+        registry.enter(KEYBOARD_A, ON_20);
         registry.enter(
-            HostId(10),
-            KeyboardFocus {
-                guest_seat: 1,
-                guest_surface: 20,
-                host_surface: 200,
-            },
-        );
-        registry.enter(
-            HostId(11),
+            KEYBOARD_B,
             KeyboardFocus {
                 guest_seat: 2,
-                guest_surface: 20,
-                host_surface: 200,
+                ..ON_20
             },
         );
         registry.enter(
@@ -2703,22 +2694,23 @@ mod tests {
             },
         );
 
-        let update = registry.destroy_surface(20);
-        assert_eq!(update.retired_keyboards, vec![HostId(10), HostId(11)]);
         assert_eq!(
-            update.seat_changes,
-            vec![
-                SeatFocusChange {
-                    guest_seat: 1,
-                    previous_surface: Some(20),
-                    current_surface: None,
-                },
-                SeatFocusChange {
-                    guest_seat: 2,
-                    previous_surface: Some(20),
-                    current_surface: None,
-                },
-            ]
+            registry.destroy_surface(20),
+            accepted(
+                vec![
+                    SeatFocusChange {
+                        guest_seat: 1,
+                        previous_surface: Some(20),
+                        current_surface: None,
+                    },
+                    SeatFocusChange {
+                        guest_seat: 2,
+                        previous_surface: Some(20),
+                        current_surface: None,
+                    },
+                ],
+                vec![KEYBOARD_A, KEYBOARD_B]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), None);
         assert_eq!(registry.surface_for_seat(2), None);
@@ -2729,42 +2721,23 @@ mod tests {
     fn keyboard_focus_registry_preserves_invariants_for_all_short_sequences() {
         #[derive(Clone, Copy)]
         enum Operation {
-            EnterA20,
-            EnterA21,
-            EnterB20,
-            EnterB21,
-            LeaveA20,
-            LeaveA21,
-            LeaveB20,
-            LeaveB21,
-            ReleaseA,
-            ReleaseB,
-            Destroy20,
-            Destroy21,
-        }
-
-        #[derive(Clone, Copy)]
-        enum GuestDelivery {
             Enter(HostId, KeyboardFocus),
-            Leave(HostId, u32),
+            /// The keyboard leaves the focus's host surface.
+            Leave(HostId, KeyboardFocus),
             Release(HostId),
-            Destroy(u32),
+            /// The focus's guest surface is destroyed.
+            Destroy(KeyboardFocus),
         }
 
-        let operations = [
-            Operation::EnterA20,
-            Operation::EnterA21,
-            Operation::EnterB20,
-            Operation::EnterB21,
-            Operation::LeaveA20,
-            Operation::LeaveA21,
-            Operation::LeaveB20,
-            Operation::LeaveB21,
-            Operation::ReleaseA,
-            Operation::ReleaseB,
-            Operation::Destroy20,
-            Operation::Destroy21,
-        ];
+        let mut operations = Vec::new();
+        for keyboard in [KEYBOARD_A, KEYBOARD_B] {
+            for focus in [ON_20, ON_21] {
+                operations.push(Operation::Enter(keyboard, focus));
+                operations.push(Operation::Leave(keyboard, focus));
+            }
+            operations.push(Operation::Release(keyboard));
+        }
+        operations.extend([Operation::Destroy(ON_20), Operation::Destroy(ON_21)]);
         let sequence_len = 5;
         let sequence_count = operations.len().pow(sequence_len);
 
@@ -2776,107 +2749,37 @@ mod tests {
             // account for this model exactly.
             let mut guest_focus = HashMap::new();
             for _ in 0..sequence_len {
-                let (update, delivery) = match operations[encoded % operations.len()] {
-                    Operation::EnterA20 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 20,
-                            host_surface: 200,
-                        };
-                        (
-                            registry.enter(HostId(10), focus),
-                            GuestDelivery::Enter(HostId(10), focus),
-                        )
-                    }
-                    Operation::EnterA21 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 21,
-                            host_surface: 201,
-                        };
-                        (
-                            registry.enter(HostId(10), focus),
-                            GuestDelivery::Enter(HostId(10), focus),
-                        )
-                    }
-                    Operation::EnterB20 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 20,
-                            host_surface: 200,
-                        };
-                        (
-                            registry.enter(HostId(11), focus),
-                            GuestDelivery::Enter(HostId(11), focus),
-                        )
-                    }
-                    Operation::EnterB21 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 21,
-                            host_surface: 201,
-                        };
-                        (
-                            registry.enter(HostId(11), focus),
-                            GuestDelivery::Enter(HostId(11), focus),
-                        )
-                    }
-                    Operation::LeaveA20 => (
-                        registry.leave(HostId(10), 200),
-                        GuestDelivery::Leave(HostId(10), 200),
-                    ),
-                    Operation::LeaveA21 => (
-                        registry.leave(HostId(10), 201),
-                        GuestDelivery::Leave(HostId(10), 201),
-                    ),
-                    Operation::LeaveB20 => (
-                        registry.leave(HostId(11), 200),
-                        GuestDelivery::Leave(HostId(11), 200),
-                    ),
-                    Operation::LeaveB21 => (
-                        registry.leave(HostId(11), 201),
-                        GuestDelivery::Leave(HostId(11), 201),
-                    ),
-                    Operation::ReleaseA => (
-                        registry.release(HostId(10)),
-                        GuestDelivery::Release(HostId(10)),
-                    ),
-                    Operation::ReleaseB => (
-                        registry.release(HostId(11)),
-                        GuestDelivery::Release(HostId(11)),
-                    ),
-                    Operation::Destroy20 => {
-                        (registry.destroy_surface(20), GuestDelivery::Destroy(20))
-                    }
-                    Operation::Destroy21 => {
-                        (registry.destroy_surface(21), GuestDelivery::Destroy(21))
-                    }
-                };
+                let operation = operations[encoded % operations.len()];
                 encoded /= operations.len();
-
-                match delivery {
-                    GuestDelivery::Enter(keyboard, focus) => {
+                let update = match operation {
+                    Operation::Enter(keyboard, focus) => {
+                        let update = registry.enter(keyboard, focus);
                         if update.accepted {
                             guest_focus.insert(keyboard, focus);
                         }
+                        update
                     }
-                    GuestDelivery::Leave(keyboard, host_surface) => {
+                    Operation::Leave(keyboard, focus) => {
+                        let update = registry.leave(keyboard, focus.host_surface);
                         if update.accepted {
                             assert_eq!(
                                 guest_focus.get(&keyboard).map(|focus| focus.host_surface),
-                                Some(host_surface),
+                                Some(focus.host_surface),
                                 "only a guest-visible enter can accept a leave"
                             );
                             guest_focus.remove(&keyboard);
                         }
+                        update
                     }
-                    GuestDelivery::Release(keyboard) => {
+                    Operation::Release(keyboard) => {
                         guest_focus.remove(&keyboard);
+                        registry.release(keyboard)
                     }
-                    GuestDelivery::Destroy(surface) => {
-                        guest_focus.retain(|_, focus| focus.guest_surface != surface);
+                    Operation::Destroy(focus) => {
+                        guest_focus.retain(|_, guest| guest.guest_surface != focus.guest_surface);
+                        registry.destroy_surface(focus.guest_surface)
                     }
-                }
+                };
 
                 for change in &update.seat_changes {
                     assert_ne!(change.previous_surface, change.current_surface);
