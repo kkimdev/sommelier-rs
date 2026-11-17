@@ -161,18 +161,19 @@ From the repository root:
 
 ```bash
 # Build
-cargo build --release
+cargo build --locked --release -p sommelier
 
 # Test
-cargo test --workspace --all-targets -- --test-threads=1
-
-# Verify formatting and lints
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets -- --test-threads=1
 
 # Run the proxy from the local build
 ./target/release/sommelier --virtio-wl /dev/wl0 --gpu-accel wayland-2
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md#before-you-open-a-pull-request) lists the
+full set of checks CI runs, and
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the Rust toolchain;
+rustup installs it on first use.
 
 The standalone IME GUI is useful for manual input and glyph verification:
 
@@ -258,7 +259,6 @@ upload with `--version` and rejects one that needs a newer glibc than the
 current baseline. Once both architectures pass, it creates `SHA256SUMS` and
 publishes the prerelease with all assets; `gh release create` keeps the
 release a draft until every upload has finished.
-The fork currently keeps `virtwl` as its only development branch.
 
 ## Repository layout
 
