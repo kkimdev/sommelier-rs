@@ -15,52 +15,30 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::os::unix::io::{OwnedFd, RawFd};
-use std::sync::{Arc, RwLock};
+use std::fs::File;
+use std::os::unix::io::OwnedFd;
+use std::sync::Arc;
 
 use super::HostId;
 
-pub struct PoolInner {
-    pub client_ptr: *mut libc::c_void,
+/// A guest `wl_shm_pool`.
+///
+/// The bridge reads the pool's pixels with `pread` and never maps the file.
+/// A client may shrink the file after `wl_shm.create_pool`, and a read
+/// through a mapping past the new end of file raises SIGBUS, which would
+/// kill the proxy and every guest GUI app with it. A short `pread` is an
+/// ordinary error instead.
+pub struct ShmPool {
+    /// The pool's file, shared with every buffer created from the pool, so
+    /// it outlives `wl_shm_pool.destroy` while those buffers live.
+    pub file: Arc<File>,
+    /// The size the client declared. `wl_shm_pool.resize` only grows it.
     pub size: usize,
 }
 
-unsafe impl Send for PoolInner {}
-unsafe impl Sync for PoolInner {}
-
-pub struct PoolState {
-    pub client_fd: RawFd,
-    pub inner: RwLock<PoolInner>,
-}
-
-impl Drop for PoolState {
-    fn drop(&mut self) {
-        // `Drop` must release the mapping even when a worker panicked while
-        // holding the lock. `RwLock::write()` returns an error for a poisoned
-        // lock; treating that error as "nothing to clean up" leaks the entire
-        // SHM pool until process exit. `get_mut()` is safe here because `&mut
-        // self` proves that no other thread can access the lock during drop,
-        // and `PoisonError::get_mut()` still exposes the protected value.
-        let inner = match self.inner.get_mut() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        unsafe {
-            if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
-                libc::munmap(inner.client_ptr, inner.size);
-                inner.client_ptr = std::ptr::null_mut();
-            }
-        }
-        unsafe {
-            if self.client_fd >= 0 {
-                libc::close(self.client_fd);
-            }
-        }
-    }
-}
-
 pub struct BufferState {
-    pub pool: Arc<PoolState>,
+    /// The file of the pool the buffer was created from.
+    pub pool_file: Arc<File>,
     pub offset: i32,
     pub width: i32,
     pub height: i32,
@@ -84,10 +62,8 @@ pub struct BufferState {
     pub dmabuf_sync: bool,
     pub dest_ptr: *mut u8,
     pub dest_size: usize,
-    /// Newly allocated host storage is uninitialized. The first committed
-    /// frame must therefore copy the complete guest buffer even if the client
-    /// omitted an explicit damage request.
-    pub needs_full_copy: bool,
+    /// The pixels the host copy lacks, which the next copy covers.
+    pub stale: StalePixels,
 }
 
 unsafe impl Send for BufferState {}
@@ -100,6 +76,81 @@ impl Drop for BufferState {
                 libc::munmap(self.dest_ptr as *mut libc::c_void, self.dest_size);
                 self.dest_ptr = std::ptr::null_mut();
             }
+        }
+    }
+}
+
+/// The pixels a local buffer's host copy lacks, relative to the surface it
+/// was last copied for.
+///
+/// Damage is relative to the surface's current contents, not to the frame a
+/// buffer last showed: a client alternating buffers A, B, A damages only what
+/// changed since B. Each buffer has its own host copy, so every commit on a
+/// surface also stales its pixels in the host copies of the surface's other
+/// buffers, and a buffer copies what it lacks the next time it is
+/// committed. That relation holds only on one surface: a buffer committed
+/// on another surface, or new, copies everything.
+#[derive(Debug)]
+pub struct StalePixels {
+    damage: DamageRegion,
+    surface: Option<u32>,
+}
+
+impl StalePixels {
+    /// New host storage holds no pixels yet.
+    pub fn all() -> Self {
+        Self {
+            damage: DamageRegion::Full,
+            surface: None,
+        }
+    }
+
+    /// A host copy that already matches its buffer as shown on `surface`.
+    #[cfg(test)]
+    pub fn in_sync_on(surface: u32) -> Self {
+        Self {
+            damage: DamageRegion::Empty,
+            surface: Some(surface),
+        }
+    }
+
+    /// The region to copy before the buffer is shown on `surface`.
+    pub fn to_copy_on(&self, surface: u32) -> DamageRegion {
+        if self.surface == Some(surface) {
+            self.damage.clone()
+        } else {
+            DamageRegion::Full
+        }
+    }
+
+    /// The host copy now matches the buffer as shown on `surface`.
+    pub fn copied_on(&mut self, surface: u32) {
+        self.damage = DamageRegion::Empty;
+        self.surface = Some(surface);
+    }
+
+    /// Nothing in the host copy can be trusted, as after a failed copy.
+    pub fn invalidate(&mut self) {
+        *self = Self::all();
+    }
+
+    /// A commit on `surface` changed `damage` of the surface's contents, in
+    /// this buffer's pixels, or `None` when the contents cannot be related to
+    /// this buffer pixel for pixel.
+    fn add_surface_damage(&mut self, surface: u32, damage: Option<&DamageRegion>) {
+        if self.surface != Some(surface) {
+            return;
+        }
+        match damage {
+            Some(damage) => self.damage.extend(damage),
+            None => self.damage = DamageRegion::Full,
+        }
+    }
+
+    /// `surface` was destroyed, and its ID may name a new surface.
+    fn forget_surface(&mut self, surface: u32) {
+        if self.surface == Some(surface) {
+            self.invalidate();
         }
     }
 }
@@ -152,6 +203,23 @@ impl DamageRect {
             height,
         }
     }
+
+    /// This rectangle scaled by `factor`, clamped to non-negative i32
+    /// coordinates. The copy clips damage to the buffer, which lies inside
+    /// that range, so the clamp drops nothing it would copy.
+    fn scaled(self, factor: i32) -> Self {
+        let scale = |value: i64| {
+            let scaled = value.saturating_mul(i64::from(factor));
+            scaled.clamp(0, i64::from(i32::MAX)) as i32
+        };
+        let edges = |start: i32, length: i32| {
+            let start = i64::from(start);
+            (scale(start), scale(start + i64::from(length)))
+        };
+        let (x0, x1) = edges(self.x, self.width);
+        let (y0, y1) = edges(self.y, self.height);
+        Self::new(x0, y0, x1 - x0, y1 - y0)
+    }
 }
 
 pub(super) const MAX_PENDING_DAMAGE_RECTS: usize = 256;
@@ -184,6 +252,15 @@ impl DamageRegion {
             }
             Self::Rects(rects) => rects.push(rect),
             Self::Full => unreachable!("full damage returned above"),
+        }
+    }
+
+    /// Add every rectangle of `other` to this region.
+    pub fn extend(&mut self, other: &DamageRegion) {
+        match other {
+            Self::Empty => {}
+            Self::Full => *self = Self::Full,
+            Self::Rects(rects) => rects.iter().for_each(|&rect| self.push(rect)),
         }
     }
 
@@ -343,18 +420,57 @@ impl SurfaceCommit {
             .transition_from(self.previous.current_buffer_id())
     }
 
+    /// Whether this commit changes how buffer pixels map onto the surface:
+    /// its scale, transform or viewport. Pixel damage in one buffer then no
+    /// longer carries over to the surface's others. (An offset moves the
+    /// surface, not its pixels.)
+    pub fn changes_buffer_mapping(&self) -> bool {
+        self.previous.current_buffer_scale != self.state.current_buffer_scale
+            || self.previous.current_buffer_transform != self.state.current_buffer_transform
+            || self.previous.viewport != self.state.viewport
+    }
+
     pub fn has_full_damage(&self) -> bool {
         self.surface_damage.is_full() || self.buffer_damage.is_full()
     }
 
     pub fn uses_full_mapping(&self) -> bool {
-        self.state.current_buffer_scale != 1
-            || self.state.current_buffer_transform != 0
-            || (self.has_buffer_attach() && self.buffer_offset != (0, 0))
-            || self
-                .state
-                .viewport
-                .is_some_and(|viewport| !viewport.is_identity())
+        self.surface_to_buffer_scale() != Some(1)
+    }
+
+    /// The integer factor from surface coordinates to buffer pixels, or
+    /// `None` when a transform, a viewport or an attach offset makes the
+    /// mapping more than a scale.
+    fn surface_to_buffer_scale(&self) -> Option<i32> {
+        let state = &self.state;
+        let only_scaled = state.current_buffer_transform == 0
+            && !(self.has_buffer_attach() && self.buffer_offset != (0, 0))
+            && state.viewport.is_none_or(ViewportState::is_identity);
+        only_scaled.then_some(state.current_buffer_scale)
+    }
+
+    /// This commit's damage in the pixel coordinates of the surface's
+    /// buffer: the pixels the SHM bridge copies to the host.
+    ///
+    /// Buffer damage is already in buffer pixels. Surface damage maps to them
+    /// exactly under an integer buffer scale (HiDPI clients); any other
+    /// mapping falls back to the whole buffer.
+    pub fn buffer_copy_damage(&self) -> DamageRegion {
+        if self.has_full_damage() {
+            return DamageRegion::Full;
+        }
+        let surface_rects = self.surface_damage.rects();
+        let mut damage = self.buffer_damage.clone();
+        if surface_rects.is_empty() {
+            return damage;
+        }
+        let Some(scale) = self.surface_to_buffer_scale() else {
+            return DamageRegion::Full;
+        };
+        for &rect in surface_rects {
+            damage.push(rect.scaled(scale));
+        }
+        damage
     }
 
     pub fn has_invalid_fractional_viewport(&self) -> bool {
@@ -688,6 +804,50 @@ impl RenderBufferRegistry {
         }
     }
 
+    /// Stale the pixels that a commit of `surface` changed in the host copies
+    /// of the surface's local buffers.
+    ///
+    /// `damage` is in the pixels of `shown`, the buffer the surface shows
+    /// after the commit, or `None` when no host copy relates to the new
+    /// contents (no contents, or a buffer attached with a new mapping).
+    /// Another buffer's host copy relates to it pixel for pixel only at the
+    /// same size and while the commit keeps the buffer-to-surface mapping;
+    /// otherwise all of its pixels become stale. A held buffer shown without
+    /// an attach keeps its pixels when the mapping changes.
+    pub(super) fn stale_surface_pixels(
+        &mut self,
+        surface: u32,
+        shown: Option<HostId>,
+        damage: &DamageRegion,
+        mapping_changed: bool,
+    ) {
+        let shown_size = shown.and_then(|host_id| self.dimensions(host_id));
+        for (host_id, buffer) in self.local_copies_mut() {
+            let same_size = shown_size == Some((buffer.width, buffer.height));
+            let related = same_size && (shown == Some(host_id) || !mapping_changed);
+            buffer
+                .stale
+                .add_surface_damage(surface, related.then_some(damage));
+        }
+    }
+
+    /// `surface` was destroyed, and its ID may name a new surface: no host
+    /// copy is relative to it any more.
+    pub(super) fn forget_surface(&mut self, surface: u32) {
+        for (_, buffer) in self.local_copies_mut() {
+            buffer.stale.forget_surface(surface);
+        }
+    }
+
+    fn local_copies_mut(&mut self) -> impl Iterator<Item = (HostId, &mut BufferState)> {
+        self.entries.iter_mut().filter_map(|(&host_id, buffer)| {
+            match &mut buffer.active_mut()?.backing {
+                RenderBufferBacking::LocalCopy(backing) => Some((host_id, backing)),
+                RenderBufferBacking::Native { .. } => None,
+            }
+        })
+    }
+
     pub(super) fn dimensions(&self, host_id: HostId) -> Option<(i32, i32)> {
         match &self.entries.get(&host_id)?.active()?.backing {
             RenderBufferBacking::LocalCopy(backing) => Some((backing.width, backing.height)),
@@ -896,5 +1056,33 @@ impl RenderBufferRegistry {
         }
         *buffer = RenderBuffer::HostDestroyQueued;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DamageRect;
+
+    #[test]
+    fn scaling_damage_clamps_to_non_negative_i32_edges() {
+        assert_eq!(
+            DamageRect::new(1, 2, 3, 4).scaled(2),
+            DamageRect::new(2, 4, 6, 8)
+        );
+        // A rectangle reaching left of the buffer keeps its visible part.
+        assert_eq!(
+            DamageRect::new(-1, -1, 3, 2).scaled(2),
+            DamageRect::new(0, 0, 4, 2)
+        );
+        // Huge edges saturate instead of wrapping, so the copy still covers
+        // the whole buffer.
+        assert_eq!(
+            DamageRect::new(-(1 << 30), 0, i32::MAX, 1).scaled(2),
+            DamageRect::new(0, 0, i32::MAX - 1, 2)
+        );
+        assert_eq!(
+            DamageRect::new(0, 0, i32::MAX, i32::MAX).scaled(i32::MAX),
+            DamageRect::new(0, 0, i32::MAX, i32::MAX)
+        );
     }
 }

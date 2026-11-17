@@ -160,21 +160,65 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 ## Surfaces, damage and SHM
 
 - **Copy before commit.** Damaged pixels are copied from the guest buffer
-  into its host storage before the host `wl_surface.commit` is queued. A
-  failed copy drops that commit and forces a full copy on the next one.
-  A buffer attached and then destroyed before the commit keeps its backing
-  until that commit.
-  Test: `destroyed_pending_shm_attach_survives_until_commit`.
-- **Damage-only commits (open).** The rule this project has followed says
-  a damage-only commit (no new `attach`) MUST also copy the damaged pixels
-  of the currently committed SHM buffer, since gating the copy on a new
-  attach leaves the host image stale while its damage is signaled. The
-  current code copies only on a new attach: commit `227206b` deliberately
-  renamed `damage_only_commit_copies_mutated_committed_shm_buffer` to
-  `damage_only_commit_does_not_recopy_mutated_released_shm_buffer`, which
-  asserts that behavior. The two disagree, and a separate pull request is
-  resolving it; until it lands, do not change either without resolving it
-  here.
+  into its host storage before the host `wl_surface.commit` is queued. If
+  the guest's pool cannot supply them (a short read, as after the client
+  truncated the file), the commit queues `wl_shm.invalid_fd` on the
+  `wl_buffer` and the session ends, as with libwayland's SIGBUS guard. If
+  the host storage fails (mapping, dma-buf sync, EFAULT), the commit is
+  dropped and the next one copies in full. A buffer attached and then
+  destroyed before the commit keeps its backing until that commit.
+  Tests: `commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash`,
+  `copy_into_an_unwritable_destination_blames_the_host_storage`,
+  `destroyed_pending_shm_attach_survives_until_commit`.
+- **Pools are read, never mapped, and must be regular files.** The proxy
+  reads pool pixels with `pread`, because a mapping read past a truncated
+  file's end raises SIGBUS and kills every guest GUI app. A pool fd MUST be
+  a regular file, such as a memfd, tmpfs or `shm_open` file, of at least
+  the declared size; any other is rejected with `wl_shm.invalid_fd` at
+  `create_pool` and `resize`.
+  Test: `pool_backing_must_be_a_long_enough_regular_file`.
+- **Damage-only commits copy from a buffer the host holds.** A commit
+  without a new `attach` still damages the surface's current buffer, which
+  the host samples again, so its damaged pixels MUST be copied before the
+  commit is forwarded; gating the copy on a new attach leaves the host
+  image stale while its damage is signaled. The one exception is a buffer
+  the host has released (`Released`): per `wl_buffer.release` the client
+  then owns the storage and may be drawing its next frame into it, so
+  reading it could tear, and the host no longer samples it. That commit's
+  damage stays stale in the buffer's host copy (see the next rule) and is
+  copied at its next attach. Exo releases a buffer only after it is
+  detached, so with Exo every damage-only commit copies. A commit with
+  nothing to copy (no damage, or damage outside the buffer) skips the copy
+  path entirely (no dma-buf sync or BO map), so a damage-free commit, such
+  as one acknowledging a configure, is never dropped by a host storage
+  failure.
+  Known limit: a release carries no serial. If a surface is destroyed while
+  buffer A awaits release (`ReleaseOwed`) and A is attached elsewhere before
+  the owed release arrives, that release marks A `Released` while the host
+  holds it, and damage-only commits skip A's copy until its next attach.
+  Tests: `damage_only_commit_copies_the_mutated_current_shm_buffer`,
+  `damage_only_commit_does_not_read_a_released_shm_buffer`,
+  `commit_without_damage_on_a_held_buffer_skips_the_copy`.
+- **Each host copy tracks the pixels it lacks.** Damage is relative to the
+  surface's current contents, so a client alternating buffers A, B, A
+  damages only what changed since B, while each guest SHM buffer has its
+  own host copy. Every commit therefore stales its buffer-space damage in
+  the host copies of all the surface's local buffers (`StalePixels`), and a
+  buffer copies everything it lacks before it is shown. A host copy that
+  cannot be related pixel for pixel copies in full: a buffer that is new,
+  new to the surface, of another size than the shown buffer, after a
+  failed copy, or after a commit that changed the scale, transform or
+  viewport (for every buffer but a held one shown without an attach).
+  Destroying a surface drops the relation, because its ID can be reused.
+  Tests: `reattached_buffer_copies_the_damage_of_the_frames_it_missed`,
+  `reattached_buffer_copies_the_damage_of_every_frame_it_missed`,
+  `damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach`,
+  `a_frame_of_another_size_stales_the_whole_host_copy`,
+  `a_buffer_moving_between_surfaces_copies_everything`,
+  `a_failed_copy_stales_the_whole_host_copy`,
+  `a_mapping_change_stales_the_other_host_copies`,
+  `a_buffer_attached_with_a_new_mapping_copies_everything`,
+  `destroying_a_surface_stales_the_host_copies_it_showed`.
 - **`attach` offsets at version 5.** For a `wl_surface` at version 5 or
   newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
   a committed `wl_surface.offset` survives a later zero-coordinate attach.

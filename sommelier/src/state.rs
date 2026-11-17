@@ -25,13 +25,11 @@ mod xdg_roles;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{OwnedFd, RawFd};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::RwLock;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
-use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
+use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use log::{error, warn};
@@ -49,8 +47,8 @@ pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
 };
 pub(crate) use self::render::{
-    BufferState, DamageRect, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
-    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
+    StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
@@ -764,7 +762,7 @@ pub(crate) struct HostAuraShell {
 
 pub struct Context {
     pub shadow_table: ShadowTable,
-    pub pools: HashMap<u32, Arc<PoolState>>,
+    pub pools: HashMap<u32, ShmPool>,
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
     pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
@@ -831,8 +829,8 @@ pub struct Context {
     /// replacement host wl_shm binding to service the old object.
     pub stale_shm_guest_objects: HashSet<u32>,
     /// Synthetic wl_shm_pool children created before the host capability
-    /// binding disappeared. They remain destroyable, but must not resize
-    /// local mappings or create buffers through a replacement host binding.
+    /// binding disappeared. They remain destroyable, but must not resize or
+    /// create buffers through a replacement host binding.
     pub stale_shm_pools: HashSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
@@ -1063,6 +1061,31 @@ impl Context {
     #[cfg(test)]
     pub(crate) fn render_buffer_count(&self) -> usize {
         self.render_buffers.len()
+    }
+
+    /// Stale what `commit` of `surface` changed in the host copies of the
+    /// surface's local buffers. See [`StalePixels`].
+    pub(crate) fn stale_surface_pixels(&mut self, surface: u32, commit: &SurfaceCommit) {
+        // A buffer attached together with a new mapping was last copied for
+        // the old one, while the client's damage is relative to the new one:
+        // then no host copy relates to the new contents pixel for pixel.
+        let relatable = !(commit.has_buffer_attach() && commit.changes_buffer_mapping());
+        let shown = commit
+            .state
+            .current_buffer_id()
+            .filter(|_| relatable)
+            .and_then(|buffer| self.render_buffer_host_id(buffer));
+        self.render_buffers.stale_surface_pixels(
+            surface,
+            shown,
+            &commit.buffer_copy_damage(),
+            commit.changes_buffer_mapping(),
+        );
+    }
+
+    /// Drop every host copy's relation to the destroyed `surface`.
+    pub(crate) fn forget_surface_buffer_copies(&mut self, surface: u32) {
+        self.render_buffers.forget_surface(surface);
     }
 
     pub(crate) fn buffer_dimensions(&self, guest_buffer_id: u32) -> Option<(i32, i32)> {
@@ -1985,62 +2008,6 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_pool_lock_still_unmaps_pool_memory_on_drop() {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        assert!(page_size > 0);
-        let page_size = page_size as usize;
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mapped, libc::MAP_FAILED);
-
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let pool = PoolState {
-            client_fd: pipe_fds[0],
-            inner: RwLock::new(PoolInner {
-                client_ptr: mapped,
-                size: page_size,
-            }),
-        };
-
-        // Poison the lock while retaining the mapping in its protected value.
-        // PoolState::drop must clean it up instead of treating the poisoned
-        // write lock as an empty pool.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = pool.inner.write().expect("lock should initially work");
-            panic!("intentional pool lock poison");
-        }));
-
-        let mut residency = 0u8;
-        assert_eq!(
-            unsafe { libc::mincore(mapped, page_size, &mut residency) },
-            0,
-            "mapping should still exist before PoolState::drop"
-        );
-
-        drop(pool);
-        unsafe {
-            libc::close(pipe_fds[1]);
-        }
-
-        errno_reset();
-        assert_eq!(
-            unsafe { libc::mincore(mapped, page_size, &mut residency) },
-            -1,
-            "PoolState::drop must unmap a poisoned pool"
-        );
-        assert_eq!(errno_value(), libc::ENOMEM);
-    }
-
-    #[test]
     fn surface_commit_applies_every_pending_field_atomically() {
         let mut surface = SurfaceState {
             current_content: None,
@@ -2586,15 +2553,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn errno_reset() {
-        unsafe {
-            *libc::__errno_location() = 0;
-        }
-    }
-
-    fn errno_value() -> i32 {
-        unsafe { *libc::__errno_location() }
     }
 }

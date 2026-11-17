@@ -32,8 +32,9 @@
   `--gpu-accel` and the fork do not cover.
 - Upstream review and eventual rebase/cherry-pick coordination remain
   separate from this fork's `virtwl` branch.
-- The damage-only commit rule and the code disagree; see
-  [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).
+- A late owed `wl_buffer.release` can mark a buffer released while the
+  host holds it, which skips its damage-only copies until the next attach;
+  see [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).
 - ChromiumOS parity reviews left these differences unconfirmed, with no
   reproducer: commits on a surface with no role or window, cleanup of a
   keyboard leave for a pending surface, and two keyboards on one seat (the

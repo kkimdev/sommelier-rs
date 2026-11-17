@@ -14,8 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::allocator::Allocator;
 use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
+use crate::handler::shm::{
+    copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD,
+};
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
@@ -30,9 +34,10 @@ use crate::protocols::xdg_shell::xdg_toplevel::{
     REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
 };
 use crate::state::{
-    is_valid_transform, transformed_extent, Context, DamageRect, PostDispatch, ShadowTable,
-    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
+    PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
+use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::Action;
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
@@ -409,61 +414,6 @@ pub(crate) fn record_xdg_toplevel(
     window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_damage_to_ptr(
-    format: u32,
-    offset: i32,
-    width: i32,
-    height: i32,
-    src_stride: u32,
-    needs_full_copy: bool,
-    src_ptr: *const u8,
-    pool_size: usize,
-    dst_ptr: *mut u8,
-    dest_size: usize,
-    dst_stride: usize,
-    dst_plane1_offset: usize,
-    dst_plane1_stride: usize,
-    surface_damage: &[DamageRect],
-    buffer_damage: &[DamageRect],
-    surface_mapping_requires_full_copy: bool,
-) -> bool {
-    if src_ptr.is_null() || dst_ptr.is_null() {
-        return false;
-    }
-    let Some(offset) = usize::try_from(offset).ok() else {
-        return false;
-    };
-    let Some(height) = usize::try_from(height).ok() else {
-        return false;
-    };
-    let Some(width) = usize::try_from(width).ok() else {
-        return false;
-    };
-    let layout = crate::handler::shm::ShmCopyLayout {
-        pool_size,
-        dest_size,
-        format,
-        offset,
-        width,
-        src_stride: src_stride as usize,
-        dst_stride,
-        dst_plane1_offset,
-        dst_plane1_stride,
-        height,
-    };
-    let full_damage = [DamageRect::new(0, 0, width as i32, height as i32)];
-    if needs_full_copy || (surface_mapping_requires_full_copy && !surface_damage.is_empty()) {
-        crate::handler::shm::copy_shm_damage(src_ptr, dst_ptr, layout, &full_damage)
-    } else {
-        let mut merged = Vec::with_capacity(surface_damage.len() + buffer_damage.len());
-        merged.extend_from_slice(surface_damage);
-        merged.extend_from_slice(buffer_damage);
-        // Keep the temporary vector alive through the copy call.
-        crate::handler::shm::copy_shm_damage(src_ptr, dst_ptr, layout, &merged)
-    }
-}
-
 fn saturating_i32(value: f64) -> i32 {
     if value.is_nan() {
         return 0;
@@ -684,152 +634,146 @@ fn build_surface_commit_messages(
     Some(messages)
 }
 
-/// Copy one locally bridged SHM buffer before its prepared surface commit.
+/// The buffer whose host copy `commit` refreshes before it reaches the host.
+///
+/// An attached buffer always is. A commit without an attach still damages
+/// the surface's current buffer, which the host samples again, so the SHM
+/// Commit Copy Invariant refreshes its copy too, while the host holds the
+/// buffer. Once the host has released it, the client owns the storage and
+/// may be drawing its next frame there (`wl_buffer.release`): reading it
+/// could tear, and the host no longer samples it.
+fn buffer_to_copy(ctx: &Context, commit: &SurfaceCommit) -> Option<u32> {
+    match commit.attachment {
+        SurfaceAttachment::Attach(buffer_id) => Some(buffer_id),
+        SurfaceAttachment::Unchanged => commit
+            .state
+            .current_buffer_id()
+            .filter(|&buffer_id| ctx.buffer_is_submitted(buffer_id)),
+        SurfaceAttachment::Detach => None,
+    }
+}
+
+/// Copy what a locally bridged SHM buffer's host copy lacks before it is
+/// shown on `surface_id`.
 ///
 /// Native linux-dmabuf buffers have no local copy state and are immediately
-/// ready. Every SHM failure keeps `needs_full_copy` armed so retrying the
-/// transaction cannot lose the damaged pixels that were consumed while the
-/// commit was prepared.
-fn copy_surface_buffer(ctx: &mut Context, buffer_id: u32, commit: &SurfaceCommit) -> bool {
+/// ready. Stale pixels are cleared only by a successful copy, so a failed
+/// one loses nothing; it still stales the whole host copy, as a
+/// conservative reset after the host storage misbehaved.
+fn copy_surface_buffer(
+    ctx: &mut Context,
+    surface_id: u32,
+    buffer_id: u32,
+) -> Result<(), ShmCopyError> {
     let Some(host_id) = ctx.render_buffer_host_id(buffer_id) else {
-        return true;
+        return Ok(());
     };
     let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
-        return true;
+        return Ok(());
     };
-    let allocator = resources.allocator;
-    let virtwayland_channel = resources.channel;
     let buffer = resources.buffer;
+    let damage = buffer.stale.to_copy_on(surface_id);
+    // Nothing to copy needs no dma-buf sync or BO map either. Skipping them
+    // also keeps a commit without damage, such as one that acknowledges a
+    // configure, from being dropped when the host storage misbehaves.
+    if !damage_reaches_buffer(&damage, buffer) {
+        buffer.stale.copied_on(surface_id);
+        return Ok(());
+    }
+    let result = copy_to_host_storage(buffer, resources.allocator, resources.channel, &damage);
+    match &result {
+        Ok(()) => {
+            buffer.stale.copied_on(surface_id);
+            // A 4K frame can reach this path every refresh. Keep the
+            // per-frame diagnostic at trace level.
+            trace!(
+                "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
+                 width={}, height={}, format={:#010x}, buffer.offset={}, \
+                 dest_size={}",
+                buffer.bo_stride,
+                buffer.stride,
+                buffer.width,
+                buffer.height,
+                buffer.format,
+                buffer.offset,
+                buffer.dest_size
+            );
+        }
+        Err(error) => {
+            log::warn!("SHM copy for guest buffer {} failed: {}", buffer_id, error);
+            buffer.stale.invalidate();
+        }
+    }
+    result
+}
 
-    let mut copy_ok = false;
-    let pool = &buffer.pool;
-    if let Ok(inner) = pool.inner.read() {
-        if !inner.client_ptr.is_null() && inner.client_ptr != libc::MAP_FAILED {
-            let src_ptr = inner.client_ptr as *const u8;
-            let format = buffer.format;
-            let offset = buffer.offset;
-            let buffer_width = buffer.width;
-            let buffer_height = buffer.height;
-            let source_stride = buffer.stride;
-            let needs_full_copy = buffer.needs_full_copy;
-            let mut sync_guard = if buffer.dmabuf_sync {
-                let guard = DmabufWriteSync::begin(
-                    virtwayland_channel,
-                    buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd),
-                );
-                if guard.is_none() {
-                    log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
-                }
-                guard
-            } else {
-                None
-            };
-            let sync_started = !buffer.dmabuf_sync || sync_guard.is_some();
-            if sync_started {
-                copy_ok = if !buffer.dest_ptr.is_null() {
-                    copy_damage_to_ptr(
-                        format,
-                        offset,
-                        buffer_width,
-                        buffer_height,
-                        source_stride,
-                        needs_full_copy || commit.has_full_damage(),
-                        src_ptr,
-                        inner.size,
-                        buffer.dest_ptr,
-                        buffer.dest_size,
-                        buffer.bo_stride as usize,
-                        buffer.dmabuf_plane1_offset,
-                        buffer.dmabuf_plane1_stride,
-                        commit.surface_damage.rects(),
-                        commit.buffer_damage.rects(),
-                        commit.uses_full_mapping(),
-                    )
-                } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
-                    match (u32::try_from(buffer_width), u32::try_from(buffer_height)) {
-                        (Ok(width), Ok(height)) => {
-                            match bo.map_mut(&allocator.device, 0, 0, width, height, |mapped| {
-                                copy_damage_to_ptr(
-                                    format,
-                                    offset,
-                                    buffer_width,
-                                    buffer_height,
-                                    source_stride,
-                                    needs_full_copy || commit.has_full_damage(),
-                                    src_ptr,
-                                    inner.size,
-                                    mapped.buffer_mut().as_mut_ptr(),
-                                    mapped.buffer().len(),
-                                    mapped.stride() as usize,
-                                    buffer.dmabuf_plane1_offset,
-                                    buffer.dmabuf_plane1_stride,
-                                    commit.surface_damage.rects(),
-                                    commit.buffer_damage.rects(),
-                                    commit.uses_full_mapping(),
-                                )
-                            }) {
-                                Ok(Ok(copy_ok)) => copy_ok,
-                                Ok(Err(error)) => {
-                                    log::warn!("GBM BO map failed: {}", error);
-                                    false
-                                }
-                                Err(_) => {
-                                    log::warn!("GBM BO belongs to a different allocator device");
-                                    false
-                                }
-                            }
-                        }
-                        (Err(_), _) => {
-                            log::warn!("SHM buffer width cannot be represented as u32");
-                            false
-                        }
-                        (_, Err(_)) => {
-                            log::warn!("SHM buffer height cannot be represented as u32");
-                            false
-                        }
-                    }
-                } else {
-                    // No destination mapping is available. This can happen
-                    // only for a malformed or unsupported allocation path.
-                    false
+/// Copy `damage` from `buffer`'s pool into its host storage, inside the
+/// VirtWL dma-buf CPU-write interval when the storage needs one.
+fn copy_to_host_storage(
+    buffer: &mut BufferState,
+    allocator: Option<&Allocator>,
+    channel: Option<&Arc<VirtWaylandChannel>>,
+    damage: &DamageRegion,
+) -> Result<(), ShmCopyError> {
+    let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
+        return Err(ShmCopyError::Destination);
+    };
+    let sync_guard = if buffer.dmabuf_sync {
+        let fd = buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd);
+        let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
+            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
+            return Err(ShmCopyError::Destination);
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let result = if !buffer.dest_ptr.is_null() {
+        copy_shm_damage(&buffer.pool_file, buffer.dest_ptr, layout, damage)
+    } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
+        // `layout` holds the buffer's non-negative i32 dimensions, which fit
+        // in u32.
+        match bo.map_mut(
+            &allocator.device,
+            0,
+            0,
+            layout.width as u32,
+            layout.height as u32,
+            |mapped| {
+                let layout = ShmCopyLayout {
+                    dest_size: mapped.buffer().len(),
+                    dst_stride: mapped.stride() as usize,
+                    ..layout
                 };
+                copy_shm_damage(
+                    &buffer.pool_file,
+                    mapped.buffer_mut().as_mut_ptr(),
+                    layout,
+                    damage,
+                )
+            },
+        ) {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                log::warn!("GBM BO map failed: {}", error);
+                Err(ShmCopyError::Destination)
             }
-            if let Some(guard) = sync_guard.take() {
-                if !guard.end() {
-                    copy_ok = false;
-                }
+            Err(_) => {
+                log::warn!("GBM BO belongs to a different allocator device");
+                Err(ShmCopyError::Destination)
             }
-            if copy_ok {
-                buffer.needs_full_copy = false;
-                // A 4K frame can reach this path every refresh. Keep the
-                // per-frame diagnostic at trace level.
-                trace!(
-                    "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
-                     width={}, height={}, format={:#010x}, buffer.offset={}, \
-                     pool_size={}, dest_size={}",
-                    buffer.bo_stride,
-                    buffer.stride,
-                    buffer.width,
-                    buffer.height,
-                    buffer.format,
-                    buffer.offset,
-                    inner.size,
-                    buffer.dest_size
-                );
-            } else {
-                log::warn!("Deferring SHM commit with an invalid or unmappable destination");
-            }
-        } else {
-            log::warn!("SHM pool has no valid client mapping");
         }
     } else {
-        log::warn!("Unable to read SHM pool while committing buffer");
-    }
-
-    if !copy_ok {
-        buffer.needs_full_copy = true;
-    }
-    copy_ok
+        // No destination mapping is available. This can happen only for a
+        // malformed or unsupported allocation path.
+        Err(ShmCopyError::Destination)
+    };
+    let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
+    result.and(if sync_ended {
+        Ok(())
+    } else {
+        Err(ShmCopyError::Destination)
+    })
 }
 
 impl WlSurfaceHandler for CompositorHandler {
@@ -886,6 +830,7 @@ impl WlSurfaceHandler for CompositorHandler {
             crate::wire::MessageBuilder::new().build_message(wl_surface_host_id, REQ_DESTROY);
         ctx.client_to_host_queue.push((surface_destroy, Vec::new()));
         ctx.surfaces.remove(&ctx.last_sender_id);
+        ctx.forget_surface_buffer_copies(wl_surface_guest_id);
         crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
         // Pending-only objects do not receive a host release event. Retire
         // every buffer made eligible by removing this surface in one pass.
@@ -1076,6 +1021,7 @@ impl WlSurfaceHandler for CompositorHandler {
             SurfaceState::prepare_commit,
         );
         let attached_buffer_id = commit.attached_buffer_id();
+        let copied_buffer_id = buffer_to_copy(ctx, &commit);
         let attached_full_mapping = attached_buffer_id.is_some() && commit.uses_full_mapping();
         // A native dma-buf acquire fence belongs to the new contents submitted
         // by an attach.  Re-running the dma-buf wait for a damage-only commit
@@ -1112,14 +1058,11 @@ impl WlSurfaceHandler for CompositorHandler {
 
         let surface_damage = commit.surface_damage.rects();
         let buffer_damage = commit.buffer_damage.rects();
-        // Keep a snapshot of the committed surface state for damage
-        // translation. The buffer copy below can clear `needs_full_copy`, so
-        // the pre-copy value is retained separately for the host damage
-        // request.
-        let needs_full_damage = attached_buffer_id
+        ctx.stale_surface_pixels(surface_id, &commit);
+        // A buffer that copies everything shows the host a whole new image.
+        let needs_full_damage = copied_buffer_id
             .and_then(|buffer_id| ctx.local_buffer(buffer_id))
-            .map(|buffer| buffer.needs_full_copy)
-            .unwrap_or(false);
+            .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
         let force_full_damage = needs_full_damage
             || commit.has_full_damage()
             || (commit.buffer_offset != (0, 0)
@@ -1148,21 +1091,31 @@ impl WlSurfaceHandler for CompositorHandler {
         // A SHM-backed buffer is copied into host storage before the host
         // commit is queued. Forwarding the commit first would let the host
         // compositor sample stale or uninitialised pixels if dma-buf sync,
-        // mmap, or GBM mapping fails. A failed copy leaves `needs_full_copy`
-        // set so a later commit retries the complete image.
-        let commit_ready =
-            attached_buffer_id.is_none_or(|buffer_id| copy_surface_buffer(ctx, buffer_id, &commit));
-
-        if !commit_ready {
-            log::warn!(
-                "Skipping host wl_surface.commit for {} because its SHM copy failed",
-                surface_id
-            );
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                commit.rollback(surface);
+        // mmap, or GBM mapping fails. A failed copy stales the whole host
+        // copy, so a later commit retries the complete image.
+        if let Some(buffer_id) = copied_buffer_id {
+            if let Err(error) = copy_surface_buffer(ctx, surface_id, buffer_id) {
+                match error {
+                    // The client broke its pool, for example by truncating
+                    // the file. Like libwayland's SIGBUS guard, report it on
+                    // the buffer and end the session.
+                    ShmCopyError::Source(_) => queue_protocol_error(
+                        ctx,
+                        buffer_id,
+                        WL_SHM_ERROR_INVALID_FD,
+                        "error accessing SHM buffer",
+                    ),
+                    ShmCopyError::Destination => log::warn!(
+                        "Skipping host wl_surface.commit for {} because its SHM copy failed",
+                        surface_id
+                    ),
+                }
+                if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+                    commit.rollback(surface);
+                }
+                crate::handler::shm::retire_eligible_buffers(ctx);
+                return Action::Drop;
             }
-            crate::handler::shm::retire_eligible_buffers(ctx);
-            return Action::Drop;
         }
 
         if wait_for_native_sync {
@@ -1550,13 +1503,11 @@ mod tests {
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
     use crate::state::ARC_APPLICATION_ID_PREFIX;
-    use crate::state::{
-        BufferState, Context, PoolInner, PoolState, RenderBufferLifecycle, RenderBufferUse,
-    };
-    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
+    use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
+    use crate::test_support::{msg_opcode, msg_sender, queued_headers, shm_pool_file};
     use crate::window_layout::Rect;
     use std::os::fd::{FromRawFd, OwnedFd};
-    use std::sync::{Arc, RwLock};
+    use std::os::unix::fs::FileExt;
 
     fn protocol_error_code(ctx: &Context) -> u32 {
         let message = &ctx.host_to_client_queue[0].0;
@@ -2140,23 +2091,12 @@ mod tests {
         width: i32,
         height: i32,
         stride: u32,
-        needs_full_copy: bool,
+        stale: StalePixels,
     ) -> BufferState {
         let source_size = usize::try_from(height)
             .unwrap()
             .checked_mul(stride as usize)
             .unwrap();
-        let source_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                source_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(source_ptr, libc::MAP_FAILED);
         let destination_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -2168,15 +2108,8 @@ mod tests {
             )
         };
         assert_ne!(destination_ptr, libc::MAP_FAILED);
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: source_ptr,
-                size: source_size,
-            }),
-        });
         BufferState {
-            pool,
+            pool_file: Arc::new(shm_pool_file(&vec![0; source_size])),
             offset: 0,
             width,
             height,
@@ -2190,8 +2123,20 @@ mod tests {
             dmabuf_sync: false,
             dest_ptr: destination_ptr as *mut u8,
             dest_size: source_size,
-            needs_full_copy,
+            stale,
         }
+    }
+
+    /// The pool file of local-copy buffer `guest_id`, which a test writes
+    /// as the client would draw.
+    fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<std::fs::File> {
+        Arc::clone(&ctx.local_buffer(guest_id).unwrap().pool_file)
+    }
+
+    /// The host copy of local-copy buffer `guest_id`.
+    fn test_destination(ctx: &Context, guest_id: u32) -> Vec<u8> {
+        let buffer = ctx.local_buffer(guest_id).unwrap();
+        unsafe { std::slice::from_raw_parts(buffer.dest_ptr, buffer.dest_size) }.to_vec()
     }
 
     fn register_test_local(ctx: &mut Context, guest_id: u32, backing: BufferState) {
@@ -2321,131 +2266,148 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mapped_buffer_damage_copies_only_buffer_pixel_rectangles() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-        let damage = [DamageRect::new(1, 1, 1, 2)];
+    /// The wl_surface that `setup_ctx` maps to a host surface.
+    const TEST_SURFACE: u32 = 100;
+    /// The side of the square ARGB8888 frames of the copy tests.
+    const FRAME_SIDE: usize = 4;
+    const FRAME_STRIDE: usize = FRAME_SIDE * 4;
 
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            source.as_ptr(),
-            source.len(),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &damage,
-            true,
-        ));
+    /// Register a 4x4 ARGB8888 local-copy buffer and commit it once on
+    /// `surface`, so that its host copy holds a frame and later commits copy
+    /// only what they must.
+    fn commit_test_frame(ctx: &mut Context, surface: u32, buffer: u32) {
+        let side = FRAME_SIDE as i32;
+        register_test_local(
+            ctx,
+            buffer,
+            mapped_test_buffer(buffer, side, side, FRAME_STRIDE as u32, StalePixels::all()),
+        );
+        attach_and_commit(ctx, surface, buffer);
+    }
 
-        for index in 0..destination.len() {
-            let row = index / STRIDE;
-            let column = index % STRIDE;
-            let in_damage = (row == 1 || row == 2) && (4..8).contains(&column);
-            assert_eq!(
-                destination[index],
-                if in_damage { source[index] } else { 0xee },
-                "unexpected copy at byte {index}"
-            );
-        }
+    fn attach_and_commit(ctx: &mut Context, surface: u32, buffer: u32) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = surface;
+        assert_eq!(handler.on_attach(ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+    }
+
+    /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
+    /// so that later frames keep the mapping.
+    fn commit_test_buffer_scale(ctx: &mut Context, scale: i32) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_set_buffer_scale(ctx, scale), Action::Forward);
+        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+    }
+
+    /// Draw the client's next frame into `buffer`: every pool byte becomes
+    /// `pixel`. The host copy is cleared, so `copied_pixels` then shows
+    /// exactly what the next commit copies.
+    fn draw_test_frame(ctx: &Context, buffer: u32, pixel: u8) {
+        let local = ctx.local_buffer(buffer).unwrap();
+        let bytes = vec![pixel; local.dest_size];
+        local.pool_file.write_all_at(&bytes, 0).unwrap();
+        unsafe { std::ptr::write_bytes(local.dest_ptr, 0, local.dest_size) };
+    }
+
+    /// The (x, y) pixels of `buffer`'s host copy that hold `pixel`.
+    fn copied_pixels(ctx: &Context, buffer: u32, pixel: u8) -> Vec<(usize, usize)> {
+        let host_copy = test_destination(ctx, buffer);
+        (0..FRAME_SIDE)
+            .flat_map(|y| (0..FRAME_SIDE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let start = y * FRAME_STRIDE + x * 4;
+                host_copy[start..start + 4]
+                    .iter()
+                    .all(|&byte| byte == pixel)
+            })
+            .collect()
+    }
+
+    /// The (x, y) pixels of a rectangle, in `copied_pixels` order.
+    fn rect_pixels(x: usize, y: usize, width: usize, height: usize) -> Vec<(usize, usize)> {
+        (y..y + height)
+            .flat_map(|y| (x..x + width).map(move |x| (x, y)))
+            .collect()
     }
 
     #[test]
-    fn mapped_surface_damage_uses_conservative_full_copy() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            source.as_ptr(),
-            source.len(),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[DamageRect::new(1, 1, 1, 1)],
-            &[],
-            true,
-        ));
-        assert_eq!(destination, source);
+    fn buffer_damage_under_a_buffer_scale_copies_only_its_pixels() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_buffer_scale(&mut ctx, 2);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 2), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 1, 1, 2));
     }
 
     #[test]
-    fn initialized_buffer_without_damage_performs_no_copy() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source = [0x11; STRIDE * HEIGHT];
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            source.as_ptr(),
-            source.len(),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &[],
-            true,
-        ));
-        assert_eq!(destination, vec![0xee; STRIDE * HEIGHT]);
+    fn surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels() {
+        // A HiDPI client: buffer scale 2, transform 0, no viewport. Its
+        // surface damage maps exactly to buffer pixels, so a small update
+        // must not copy the whole buffer every frame.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_buffer_scale(&mut ctx, 2);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage(&mut ctx, 1, 0, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(2, 0, 2, 2));
     }
 
     #[test]
-    fn collapsed_damage_copies_the_complete_buffer() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
+    fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        // WL_OUTPUT_TRANSFORM_90: the bridge does not rotate surface damage.
+        assert_eq!(
+            handler.on_set_buffer_transform(&mut ctx, 1),
+            Action::Forward
+        );
+        assert_eq!(handler.on_damage(&mut ctx, 1, 1, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x22),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
+    }
 
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            source.as_ptr(),
-            source.len(),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &[DamageRect::new(0, 0, i32::MAX, i32::MAX)],
-            false,
-        ));
-        assert_eq!(destination, source);
+    #[test]
+    fn commit_without_damage_copies_nothing() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+    }
+
+    #[test]
+    fn damage_beyond_the_buffer_is_clipped_to_it() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, 0, 0, i32::MAX, i32::MAX),
+            Action::Drop
+        );
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x22),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
     }
 
     fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
@@ -2669,7 +2631,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false),
+            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         assert!(ctx.mark_buffer_submitted(buffer_id));
         assert!(ctx.mark_buffer_released(buffer_id));
@@ -2693,7 +2655,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false),
+            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         assert!(ctx.mark_buffer_submitted(buffer_id));
         assert!(ctx.mark_buffer_released(buffer_id));
@@ -2886,7 +2848,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, false),
+            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
@@ -2989,7 +2951,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, true),
+            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::all()),
         );
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
@@ -3158,7 +3120,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             old_buffer,
-            mapped_test_buffer(old_buffer, 1, 1, 4, false),
+            mapped_test_buffer(old_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
 
         let mut compositor = CompositorHandler;
@@ -3206,7 +3168,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         // The buffer was committed by an earlier surface state and destroyed
@@ -3228,73 +3190,37 @@ mod tests {
     }
 
     #[test]
-    fn damage_only_commit_does_not_recopy_mutated_released_shm_buffer() {
+    fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
+        use crate::protocols::wayland::wl_shm::WlShmHandler;
+        use std::os::fd::AsRawFd;
+
         const BUFFER_BYTES: usize = 4;
-
-        // Use real anonymous mappings so the test detects any accidental copy
-        // after the explicit attachment has already been committed.
-        let source_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                BUFFER_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(source_ptr, libc::MAP_FAILED);
-        let destination_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                BUFFER_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(destination_ptr, libc::MAP_FAILED);
-
-        let source_ptr = source_ptr as *mut u8;
-        let destination_ptr = destination_ptr as *mut u8;
-        unsafe {
-            std::ptr::write_bytes(source_ptr, 0x11, BUFFER_BYTES);
-            std::ptr::write_bytes(destination_ptr, 0, BUFFER_BYTES);
-        }
-
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
+        let shm_id = 10;
+        let pool_id = 20;
         let buffer_id = 42;
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: source_ptr.cast(),
-                size: BUFFER_BYTES,
-            }),
-        });
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            BufferState {
-                pool,
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: BUFFER_BYTES as u32,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: BUFFER_BYTES as u32,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: destination_ptr,
-                dest_size: BUFFER_BYTES,
-                needs_full_copy: true,
-            },
+        let surface_id = 100;
+        let client_file = shm_pool_file(&[0x11; BUFFER_BYTES]);
+        ctx.last_sender_id = shm_id;
+        assert_eq!(
+            crate::handler::shm::ShmHandler.on_create_pool(
+                &mut ctx,
+                pool_id,
+                client_file.as_raw_fd(),
+                BUFFER_BYTES as i32,
+            ),
+            Action::Drop
         );
+        assert!(!ctx.fatal_protocol_error);
+        let mut buffer =
+            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all());
+        buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
+        register_test_local(&mut ctx, buffer_id, buffer);
 
+        // The client shrinks its pool file behind the proxy's back. Reading
+        // the pixels through a mapping of it raised SIGBUS and killed the
+        // proxy with every guest GUI app.
+        client_file.set_len(0).unwrap();
         let mut handler = CompositorHandler;
         ctx.last_sender_id = surface_id;
         assert_eq!(
@@ -3302,72 +3228,308 @@ mod tests {
             Action::Forward
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        unsafe {
-            assert_eq!(
-                std::slice::from_raw_parts(destination_ptr, BUFFER_BYTES),
-                &[0x11; BUFFER_BYTES]
-            );
-            std::ptr::write_bytes(source_ptr, 0x22, BUFFER_BYTES);
-        }
 
-        // No attach is submitted here. The surface keeps its existing content,
-        // and the mutated wl_buffer storage must not be sampled again.
-        assert_eq!(handler.on_damage(&mut ctx, 0, 0, 1, 1), Action::Drop);
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        unsafe {
+        assert!(ctx.fatal_protocol_error);
+        assert_eq!(protocol_error_code(&ctx), WL_SHM_ERROR_INVALID_FD);
+        let error = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
+            buffer_id,
+            "the error names the buffer whose pool failed, as libwayland does"
+        );
+        assert!(
+            ctx.client_to_host_queue.is_empty(),
+            "the commit must not reach the host"
+        );
+    }
+
+    #[test]
+    fn reattached_buffer_copies_the_damage_of_the_frames_it_missed() {
+        // Damage is relative to the surface's current contents. A client
+        // alternating A, B, A damages only what changed since B, so A's host
+        // copy must also receive what B's frame changed.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
+        let mut handler = CompositorHandler;
+
+        draw_test_frame(&ctx, 44, 0x22);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 0, 0, 2, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 44);
+        assert_eq!(copied_pixels(&ctx, 44, 0x22), rect_pixels(0, 0, 2, 1));
+
+        // A's next frame holds B's change too, but damages only its own.
+        draw_test_frame(&ctx, 42, 0x33);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 2, 3, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        let mut expected = rect_pixels(0, 0, 2, 1);
+        expected.extend(rect_pixels(2, 3, 1, 1));
+        assert_eq!(copied_pixels(&ctx, 42, 0x33), expected);
+    }
+
+    fn damage_test_buffer(ctx: &mut Context, surface: u32, rect: (i32, i32, i32, i32)) {
+        ctx.last_sender_id = surface;
+        let (x, y, width, height) = rect;
+        assert_eq!(
+            CompositorHandler.on_damage_buffer(ctx, x, y, width, height),
+            Action::Drop
+        );
+    }
+
+    #[test]
+    fn reattached_buffer_copies_the_damage_of_every_frame_it_missed() {
+        // A, B, C, A: A must also receive what both B's and C's frames changed.
+        let (mut ctx, ..) = setup_ctx();
+        for buffer in [42, 44, 46] {
+            commit_test_frame(&mut ctx, TEST_SURFACE, buffer);
+        }
+        // B changes pixel (0, 0), then C changes pixel (1, 0).
+        for (buffer, x) in [(44, 0), (46, 1)] {
+            damage_test_buffer(&mut ctx, TEST_SURFACE, (x, 0, 1, 1));
+            attach_and_commit(&mut ctx, TEST_SURFACE, buffer);
+        }
+        draw_test_frame(&ctx, 42, 0x44);
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (3, 3, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x44), [(0, 0), (1, 0), (3, 3)]);
+    }
+
+    #[test]
+    fn damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        assert!(ctx.mark_buffer_released(42));
+        draw_test_frame(&ctx, 42, 0x22);
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (1, 2, 2, 1));
+        assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
+    }
+
+    #[test]
+    fn a_buffer_moving_between_surfaces_copies_everything() {
+        // Its host copy relates to the contents of one surface only.
+        let (mut ctx, ..) = setup_ctx();
+        let other_surface = 101;
+        ctx.shadow_table.map_id(other_surface, 201);
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        for surface in [other_surface, TEST_SURFACE] {
+            draw_test_frame(&ctx, 42, 0x22);
+            damage_test_buffer(&mut ctx, surface, (0, 0, 1, 1));
+            attach_and_commit(&mut ctx, surface, 42);
             assert_eq!(
-                std::slice::from_raw_parts(destination_ptr, BUFFER_BYTES),
-                &[0x11; BUFFER_BYTES]
+                copied_pixels(&ctx, 42, 0x22),
+                rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
             );
+        }
+    }
+
+    #[test]
+    fn a_failed_copy_stales_the_whole_host_copy() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let set_dmabuf_sync = |ctx: &mut Context, enabled| {
+            let host_id = ctx.render_buffer_host_id(42).unwrap();
+            ctx.local_buffer_copy_resources(host_id)
+                .unwrap()
+                .buffer
+                .dmabuf_sync = enabled;
+        };
+        // Without a VirtWL channel the dma-buf sync, and so the copy, fails.
+        set_dmabuf_sync(&mut ctx, true);
+        draw_test_frame(&ctx, 42, 0x22);
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+
+        set_dmabuf_sync(&mut ctx, false);
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x22),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
+    }
+
+    #[test]
+    fn a_mapping_change_stales_the_other_host_copies() {
+        // B's frame is rotated 180 degrees: its pixel damage does not mark
+        // the same pixels of A, which was shown unrotated.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            CompositorHandler.on_set_buffer_transform(&mut ctx, 2),
+            Action::Forward
+        );
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 44);
+
+        draw_test_frame(&ctx, 42, 0x33);
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x33),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
+    }
+
+    #[test]
+    fn a_buffer_attached_with_a_new_mapping_copies_everything() {
+        // A's host copy holds its old frame, unrotated. The client rotates A
+        // by 180 degrees and damages one pixel: the rest of A's host copy no
+        // longer matches what the surface shows.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_frame(&mut ctx, TEST_SURFACE, 44);
+        draw_test_frame(&ctx, 42, 0x33);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            CompositorHandler.on_set_buffer_transform(&mut ctx, 2),
+            Action::Forward
+        );
+        damage_test_buffer(&mut ctx, TEST_SURFACE, (0, 0, 1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x33),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
+    }
+
+    #[test]
+    fn a_frame_of_another_size_stales_the_whole_host_copy() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        register_test_local(
+            &mut ctx,
+            46,
+            mapped_test_buffer(46, 2, 2, 8, StalePixels::all()),
+        );
+        attach_and_commit(&mut ctx, TEST_SURFACE, 46);
+
+        draw_test_frame(&ctx, 42, 0x33);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 0, 0, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x33),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
+    }
+
+    #[test]
+    fn destroying_a_surface_stales_the_host_copies_it_showed() {
+        // A new surface may reuse the ID; nothing relates to its contents.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let in_sync = |ctx: &Context| {
+            ctx.local_buffer(42)
+                .unwrap()
+                .stale
+                .to_copy_on(TEST_SURFACE)
+                .is_empty()
+        };
+        assert!(in_sync(&ctx));
+
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
+        );
+        assert!(!in_sync(&ctx));
+    }
+
+    #[test]
+    fn damage_only_commit_copies_the_mutated_current_shm_buffer() {
+        // The SHM Commit Copy Invariant: the host samples the current buffer
+        // again for a commit without an attach, so its damage must be copied
+        // before the commit is forwarded.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        ctx.client_to_host_queue.clear();
+        draw_test_frame(&ctx, 42, 0x22);
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
+        );
+    }
+
+    #[test]
+    fn damage_only_commit_does_not_read_a_released_shm_buffer() {
+        // After wl_buffer.release the client owns the storage and may be
+        // drawing its next frame there; the host no longer samples it.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        assert!(ctx.mark_buffer_released(42));
+        ctx.client_to_host_queue.clear();
+        draw_test_frame(&ctx, 42, 0x22);
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
+        );
+    }
+
+    #[test]
+    fn commit_without_damage_on_a_held_buffer_skips_the_copy() {
+        // A commit that only acknowledges a configure must reach the host
+        // even when the buffer's dma-buf sync would fail (here: no channel).
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let host_id = ctx.render_buffer_host_id(42).unwrap();
+        ctx.local_buffer_copy_resources(host_id)
+            .unwrap()
+            .buffer
+            .dmabuf_sync = true;
+        ctx.client_to_host_queue.clear();
+
+        // No damage at all, then damage that clips to nothing.
+        for damage in [None, Some((FRAME_SIDE as i32, 0, 1, 1))] {
+            ctx.last_sender_id = TEST_SURFACE;
+            if let Some((x, y, width, height)) = damage {
+                assert_eq!(
+                    CompositorHandler.on_damage_buffer(&mut ctx, x, y, width, height),
+                    Action::Drop
+                );
+            }
+            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert!(!ctx.fatal_protocol_error);
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue).last(),
+                Some(&(wl_surface_host, REQ_COMMIT))
+            );
+            ctx.client_to_host_queue.clear();
         }
     }
 
     #[test]
     fn destroyed_pending_shm_attach_survives_until_commit() {
         const BUFFER_BYTES: usize = 4;
-        let source_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                BUFFER_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        let destination_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                BUFFER_BYTES,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(source_ptr, libc::MAP_FAILED);
-        assert_ne!(destination_ptr, libc::MAP_FAILED);
-
-        let source_ptr = source_ptr as *mut u8;
-        let destination_ptr = destination_ptr as *mut u8;
-        unsafe {
-            std::ptr::write_bytes(source_ptr, 0x11, BUFFER_BYTES);
-            std::ptr::write_bytes(destination_ptr, 0, BUFFER_BYTES);
-        }
-
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
         ctx.shadow_table
             .track_interface_with_version(surface_id, "wl_surface".to_string(), 5);
-        let pool = Arc::new(PoolState {
-            client_fd: -1,
-            inner: RwLock::new(PoolInner {
-                client_ptr: source_ptr.cast(),
-                size: BUFFER_BYTES,
-            }),
-        });
         ctx.shadow_table.map_id(buffer_id, host_buffer_id);
         ctx.shadow_table
             .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
@@ -3375,24 +3537,10 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            BufferState {
-                pool,
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: BUFFER_BYTES as u32,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: BUFFER_BYTES as u32,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: destination_ptr,
-                dest_size: BUFFER_BYTES,
-                needs_full_copy: true,
-            },
+            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all()),
         );
+        let pool = test_pool_file(&ctx, buffer_id);
+        let destination = ctx.local_buffer(buffer_id).unwrap().dest_ptr;
         // This buffer has completed a previous compositor-use interval. A new
         // attach must reopen that interval even when the guest destroys the
         // object before commit.
@@ -3420,18 +3568,15 @@ mod tests {
             Some(SurfaceAttachment::Attach(buffer_id))
         );
 
-        unsafe {
-            std::ptr::write_bytes(source_ptr, 0x22, BUFFER_BYTES);
-        }
+        pool.write_all_at(&[0x22; BUFFER_BYTES], 0).unwrap();
         ctx.last_sender_id = surface_id;
         assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        unsafe {
-            assert_eq!(
-                std::slice::from_raw_parts(destination_ptr, BUFFER_BYTES),
-                &[0x22; BUFFER_BYTES],
-                "destroying the guest buffer before commit must not lose its frame"
-            );
-        }
+        // The guest object is gone, but the local backing is not.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(destination, BUFFER_BYTES) },
+            [0x22; BUFFER_BYTES],
+            "destroying the guest buffer before commit must not lose its frame"
+        );
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)
@@ -3632,7 +3777,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, true),
+            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all()),
         );
 
         ctx.last_sender_id = surface_id;
@@ -3659,7 +3804,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, true);
+        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all());
         let destination_ptr = buffer.dest_ptr;
         buffer.dest_ptr = std::ptr::null_mut();
         buffer.dest_size = 0;
@@ -3681,7 +3826,7 @@ mod tests {
         );
         assert!(
             ctx.local_buffer(buffer_id)
-                .is_some_and(|buffer| buffer.needs_full_copy),
+                .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full()),
             "a failed copy must force a complete retry on the next commit"
         );
     }
@@ -3823,7 +3968,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false),
+            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
 
         ctx.last_sender_id = surface_id;
@@ -3871,7 +4016,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false),
+            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending_offset = Some((3, 0));
@@ -3898,7 +4043,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, false),
+            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending_offset = Some((3, 0));
@@ -3975,11 +4120,6 @@ mod tests {
     fn viewport_damage_uses_committed_crop_and_destination() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
-        register_test_local(
-            &mut ctx,
-            42,
-            mapped_test_buffer(42, 2048, 2048, 8192, false),
-        );
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3997,9 +4137,18 @@ mod tests {
             Action::Forward
         );
 
-        // The viewport update becomes current at this commit, and the buffer
-        // damage is converted from buffer pixels into destination coordinates.
+        // The viewport becomes current at its own commit, as a client sets
+        // it once; a later frame's buffer damage is converted from buffer
+        // pixels into destination coordinates. (A buffer attached with a new
+        // mapping damages the whole host surface.)
         ctx.last_sender_id = surface_id;
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        ctx.client_to_host_queue.clear();
+        register_test_local(
+            &mut ctx,
+            42,
+            mapped_test_buffer(42, 2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
+        );
         assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(
             handler.on_damage_buffer(&mut ctx, 256, 512, 256, 256),
@@ -4367,7 +4516,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
@@ -4413,7 +4562,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         ctx.mark_buffer_submitted(guest_buffer);
         set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
@@ -4462,7 +4611,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         // This is a committed buffer whose surface was detached before the
@@ -4509,7 +4658,7 @@ mod tests {
             register_test_local(
                 &mut ctx,
                 guest_buffer,
-                mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+                mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
             );
         }
 
@@ -4612,7 +4761,7 @@ mod tests {
             register_test_local(
                 &mut ctx,
                 guest_buffer,
-                mapped_test_buffer(guest_buffer, 1, 1, 4, false),
+                mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
             );
         }
 
