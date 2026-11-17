@@ -386,7 +386,11 @@ impl Client {
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                return false;
+                // Only host events can be untracked: a guest request from an
+                // unknown sender is an error. The events before this one were
+                // valid and reach the guest ahead of its one error.
+                self.ctx.fail_session();
+                break;
             }
 
             let packet = &conn.read_buf[offset..message_end];
@@ -1624,6 +1628,53 @@ mod tests {
         drop(client);
 
         assert_fd_released(pending_fd, &pending_target);
+    }
+
+    /// Descriptor ambiguity ends the session like any host protocol error:
+    /// the valid events before it reach the guest, then one error.
+    #[tokio::test]
+    async fn descriptor_ambiguity_is_reported_after_the_valid_events() {
+        use protocols::wayland::{wl_data_device, wl_display};
+        const DATA_DEVICE: u32 = 10;
+        const HOST_DATA_DEVICE: u32 = 80;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            DATA_DEVICE,
+            HOST_DATA_DEVICE,
+            "wl_data_device",
+            3,
+        );
+        let (pending, _) = std::os::unix::net::UnixStream::pair().expect("a descriptor");
+        let mut offer = MessageBuilder::new();
+        offer.write_u32(0xff00_0001);
+        let offer = offer.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER);
+        // An untracked message with a descriptor it may or may not own, then
+        // a complete follow-up the descriptor might belong to.
+        let stale_event = MessageBuilder::new().build_message(77, 0);
+        let follow_up = MessageBuilder::new().build_message(HOST_DATA_DEVICE, 0);
+        for event in [offer, stale_event, follow_up] {
+            client.host_conn.read_buf.extend_from_slice(&event);
+        }
+        client.host_conn.read_fds.push_back(pending.into());
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER),
+                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR),
+            ]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
     }
 
     /// The object and code of each `wl_display.error` the guest received
