@@ -240,11 +240,8 @@ explains the ARC application-ID workaround it relies on.
 The `virtwl` branch CI builds, tests, and checks formatting and Clippy on
 x86_64 and aarch64, each on a native GitHub-hosted Ubuntu 24.04 runner, with
 the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
-Successful pushes also upload debug binaries to
-the Actions run and create non-release tags such as
-`virtwl-ci-<run-id>-<attempt>-<sha>`. Those artifacts expire after seven days;
-the cleanup job keeps the ten newest CI build runs by default. Set the
-repository variable `CI_KEEP_COUNT` to change that limit.
+Successful pushes also upload the debug `sommelier` binaries to the Actions
+run, where they expire after seven days.
 
 Maintainer releases use tags whose base version matches
 `sommelier/Cargo.toml`. Optional `-rN` suffixes are accepted for rebuilds:

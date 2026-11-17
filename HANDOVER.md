@@ -7,8 +7,8 @@
 - The fork is based on `google/sommelier-rs:virtwl` and carries ChromeOS
   VirtWL, shelf-ID, protocol-hardening, and Korean IME fixes.
 - The current release and its assets are listed under
-  [Current release](README.md#current-release), and the CI artifact and tag
-  policy under [CI and release workflow](README.md#ci-and-release-workflow).
+  [Current release](README.md#current-release), and the CI artifact and
+  release policy under [CI and release workflow](README.md#ci-and-release-workflow).
 - The `chromeos-dev-setup` flake in `monorepo-public` installs the package
   through this repository's flake overlay. It picks up a release once
   `nix/package-bin.nix` is updated here and the `chromeos-dev-setup`
