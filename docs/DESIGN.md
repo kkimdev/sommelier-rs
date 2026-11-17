@@ -26,25 +26,30 @@ handler intercepts the ones whose meaning changes across the boundary.
 
 ## Process and connections
 
-- `main.rs` parses the command line and resolves every process-wide setting
-  once, before the first client connects: the VM identifier
-  (`state::vm_identifier_from_environment`) and the placement configuration
-  (`PlacementConfig::from_environment`). Connections receive the results.
+- `main.rs` parses the command line, installs the `SIGHUP` handler and
+  raises the open-file soft limit (`prepare_process`), and resolves every
+  process-wide setting once, before the first client connects: the VM
+  identifier (`state::vm_identifier_from_environment`) and the placement
+  configuration (`PlacementConfig::from_environment`). Connections receive
+  the results.
   `Context::from_parts` and the test constructors read no environment
   (`test_contexts_read_no_environment`), with two exceptions below `main`:
   `Context::new` creates the GBM allocator, which reads
   `SOMMELIER_DRM_DEVICE` (`allocator.rs`) on every connection, and the ARC
   task-ID reservation reads `XDG_RUNTIME_DIR` (`arc_task_ids.rs`).
-- `proxy::run` accepts guest clients and gives each a `Client` with its own
-  guest connection, host connection and `Context`. All clients run on one
+- `proxy::run` claims the socket through its lock file, then `serve`
+  accepts guest clients and gives each a `Client` with its own guest
+  connection, host connection and `Context`. All clients run on one
   current-thread Tokio runtime inside a `LocalSet`. The keyboard handler
   owns xkb state, which is `!Send`; keeping every task on one thread avoids
   locks and makes that requirement part of the future's type. `SIGHUP`
-  reloads run on the same loop, between accepts, so a reload never races a
-  key event.
+  reloads run in a task of their own on the same thread, so a reload never
+  races a key event and never waits for an accept.
 - The host side is VirtWL (`virtwl_channel.rs`, ioctls in `virtwl.rs`) or,
   for debugging only, a local compositor socket (`--local-compositor`).
   `connection.rs` hides the difference behind `WaylandConnection`.
+  `wire::MessageHeader::frame` cuts the received byte stream into messages,
+  both for `Client::handle_msgs` and for the connection's readiness check.
 
 ### Fair dispatch
 
@@ -56,9 +61,10 @@ preferred side so bytes still in the kernel queue are not starved. A
 client that streams render requests would otherwise hold keyboard and IME
 events behind several frames on the single thread.
 32 messages still amortize a send while bounding the wait to about one
-frame. Translated messages of one batch are sent in one transport
-submission; per-message VirtWL ioctls would add latency without changing
-the byte and descriptor order (see
+frame. Translated messages of one batch are sent in as few transport
+submissions as the 28-descriptor limit allows, usually one; per-message
+VirtWL ioctls would add latency without changing the byte and descriptor
+order (see
 [transport invariants](INVARIANTS.md#transport-and-file-descriptors)).
 
 ## Protocol code generation
@@ -90,14 +96,18 @@ same list, so the proxy never restates which protocol owns an interface.
 `state::ShadowTable` maps every guest object ID to its host ID and records
 each side's interface and negotiated version. Guest and host ID spaces are
 independent: the proxy allocates host IDs itself, and host-created objects
-get guest IDs in the server range (`0xff000000` and above).
+get guest IDs in the server range (`0xff000000` and above). Both come from
+a `state::IdAllocator`, which, like libwayland's object map, reuses the
+last freed ID before a fresh one, so a long session never outgrows the
+peer's map.
 
 Destruction is asymmetric. A guest destructor request is forwarded, but the
 mapping survives until the host's `wl_display.delete_id` arrives, so late
 host events can still be translated (and are filtered) and the `delete_id`
 itself can be forwarded. Host-only objects the proxy created keep their ID
 reserved the same way; `Context::retire_destroyed_host_object` is the one
-way to retire one.
+way to retire one. The `delete_id` then ends everything the proxy knows
+about the host ID and frees it (`ShadowTable::release_deleted_host_id`).
 
 ## Handlers and state
 
