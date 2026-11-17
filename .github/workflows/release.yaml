@@ -1,10 +1,11 @@
 name: Virtwl Release
 
+# A release is cut by pushing a tag; see "CI and release workflow" in the
+# README.
 on:
   push:
     tags:
       - "virtwl-v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +16,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Released binaries need at most this glibc symbol version today, so they
+  # run on Debian bookworm (2.36), the Crostini container base. A build that
+  # needs a newer one fails here; raising this is a compatibility decision.
+  MAX_GLIBC_VERSION: "2.34"
 
 jobs:
   build:
@@ -51,6 +56,7 @@ jobs:
             echo "::error::Cargo.toml version does not match the release tag"
             exit 1
           }
+          echo "CARGO_VERSION=${cargo_version}" >> "${GITHUB_ENV}"
 
       - name: Run regression tests
         run: cargo test --locked --workspace --all-targets -- --test-threads=1
@@ -62,17 +68,37 @@ jobs:
         shell: bash
         env:
           ARCH: ${{ matrix.arch }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          version="${RELEASE_TAG#virtwl-}"
-          artifact="sommelier_rs_virtwl-${version}-${ARCH}"
+          artifact="dist/sommelier_rs_${GITHUB_REF_NAME}-${ARCH}"
           install -Dm755 target/release/sommelier "${artifact}"
+          echo "ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
+
+      - name: Smoke-test the release artifact
+        shell: bash
+        run: |
+          # Run the exact file that will be uploaded. --version exits before
+          # the proxy opens any device or socket.
+          reported="$("./${ARTIFACT}" --version)"
+          echo "${reported}"
+          test "${reported}" = "sommelier ${CARGO_VERSION}" || {
+            echo "::error::${ARTIFACT} reported '${reported}'"
+            exit 1
+          }
+
+          needed_glibc="$(objdump -T "${ARTIFACT}" \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
+          echo "Highest glibc symbol version: ${needed_glibc}"
+          newest="$(printf '%s\n' "${needed_glibc}" "${MAX_GLIBC_VERSION}" | sort -V | tail -n 1)"
+          test "${newest}" = "${MAX_GLIBC_VERSION}" || {
+            echo "::error::${ARTIFACT} needs glibc ${needed_glibc}, above ${MAX_GLIBC_VERSION}"
+            exit 1
+          }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: virtwl-${{ matrix.arch }}
-          path: sommelier_rs_virtwl-*
+          path: ${{ env.ARTIFACT }}
           if-no-files-found: error
           retention-days: 7
 
@@ -95,31 +121,18 @@ jobs:
         working-directory: dist
         run: sha256sum sommelier_rs_virtwl-* > SHA256SUMS
 
-      - name: Create draft release and upload assets
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          draft: true
-          prerelease: true
-          generate_release_notes: true
-
-      - name: Publish release
-        shell: bash
+      - name: Publish the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        # With assets, gh creates the release as a draft, uploads every file,
+        # and only then publishes it (or deletes the draft if an upload
+        # fails), so a published release never lacks an asset. A job killed
+        # mid-upload cannot clean up and leaves an orphan draft; delete it
+        # before rerunning.
         run: |
-          release_id="$(
-            gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"${TAG_NAME}\") | .id"
-          )"
-          test -n "${release_id}" || {
-            echo "::error::Draft release for ${TAG_NAME} was not found"
-            exit 1
-          }
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-            -f draft=false
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

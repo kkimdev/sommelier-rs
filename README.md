@@ -255,10 +255,12 @@ git tag -a virtwl-v0.2.6 personal/virtwl -m "Release virtwl-v0.2.6"
 git push personal refs/tags/virtwl-v0.2.6
 ```
 
-The release workflow builds both architectures on the same native runners,
-runs the regression suite on each, creates `SHA256SUMS`, and
-uploads all assets while the release is a draft. It publishes the
-prerelease only after both architecture builds succeed.
+The release workflow builds both architectures on the same native runners
+and runs the regression suite on each. It then runs each binary it will
+upload with `--version` and rejects one that needs a newer glibc than the
+current baseline. Once both architectures pass, it creates `SHA256SUMS` and
+publishes the prerelease with all assets; `gh release create` keeps the
+release a draft until every upload has finished.
 The fork currently keeps `virtwl` as its only development branch.
 
 ## Repository layout
