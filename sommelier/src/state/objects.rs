@@ -17,7 +17,7 @@ limitations under the License.
 //! The objects of one connection on each side of the proxy, and how the
 //! two sides pair up.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
 use super::{GuestId, HostId, INERT_BIND_INTERFACE};
@@ -35,21 +35,126 @@ pub enum DeletedHostId {
     Paired(u32),
 }
 
-#[allow(dead_code)]
+/// The interface and negotiated version of a guest object.
+#[derive(Debug)]
+struct Interface {
+    name: String,
+    version: u32,
+}
+
+/// An object the guest has.
+#[derive(Debug)]
+enum GuestObject {
+    /// An object with no host counterpart, which the proxy implements
+    /// ([`ShadowTable::is_local_only_guest_object`]). A handler that tracks
+    /// a new object before its dispatcher pairs it (`wl_seat.get_keyboard`)
+    /// makes one for the rest of that dispatch.
+    Local(Interface),
+    /// An object paired with a host object, which records the pairing too.
+    Paired {
+        host: HostId,
+        /// `None` until the interface is tracked, and once
+        /// [`ShadowTable::retire_guest_object`] has moved it to the host
+        /// object.
+        interface: Option<Interface>,
+        state: GuestState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestState {
+    Live,
+    /// The guest destroyed the object. It rejects requests, but stays paired
+    /// until the host's `delete_id` (or the event that ends it), so late
+    /// events still resolve.
+    DestroyPending,
+}
+
+impl GuestObject {
+    fn interface(&self) -> Option<&Interface> {
+        match self {
+            Self::Local(interface) => Some(interface),
+            Self::Paired { interface, .. } => interface.as_ref(),
+        }
+    }
+
+    fn host(&self) -> Option<HostId> {
+        match self {
+            Self::Local(_) => None,
+            Self::Paired { host, .. } => Some(*host),
+        }
+    }
+}
+
+/// What holds a host ID. An ID is in use exactly while it has one.
+#[derive(Debug)]
+enum HostObject {
+    /// An object paired with a guest object, which records the pairing too.
+    /// `interface` and `version` are the host object's own, when recorded:
+    /// an interface that differs from the guest's (a v3 text input backed
+    /// by v1), or the guest's once [`ShadowTable::retire_guest_object`] has
+    /// moved it here. A missing version falls back to the guest object's,
+    /// and an event may name the object by either interface.
+    Paired {
+        guest: GuestId,
+        interface: Option<String>,
+        version: Option<u32>,
+    },
+    /// A live object that only the proxy uses.
+    HostOnly {
+        interface: String,
+        version: Option<u32>,
+    },
+    /// An object whose destructor is queued, until the host's `delete_id`.
+    AwaitingDeleteId,
+    /// An object without a destructor that nothing uses any more. Nothing
+    /// frees its ID but a `delete_id` the host sends anyway.
+    ReservedForConnection,
+}
+
+impl HostObject {
+    fn guest(&self) -> Option<GuestId> {
+        match self {
+            Self::Paired { guest, .. } => Some(*guest),
+            _ => None,
+        }
+    }
+
+    /// The object's own interface.
+    fn interface(&self) -> Option<&String> {
+        match self {
+            Self::Paired { interface, .. } => interface.as_ref(),
+            Self::HostOnly { interface, .. } => Some(interface),
+            Self::AwaitingDeleteId | Self::ReservedForConnection => None,
+        }
+    }
+
+    /// The object's own version.
+    fn version(&self) -> Option<u32> {
+        match self {
+            Self::Paired { version, .. } | Self::HostOnly { version, .. } => *version,
+            Self::AwaitingDeleteId | Self::ReservedForConnection => None,
+        }
+    }
+
+    /// Whether the object can still send events.
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Paired { .. } | Self::HostOnly { .. })
+    }
+}
+
+/// The objects of one connection on each side of the proxy, and how they
+/// pair up.
+///
+/// Each side has one entry per object, and a pairing is recorded in both
+/// entries. Guest and host IDs are independent: only [`Self::map_id`] pairs
+/// two objects, and every change that ends a pairing changes both entries.
 pub struct ShadowTable {
-    guest_to_host: HashMap<u32, u32>,
-    host_to_guest: HashMap<u32, u32>,
-    interfaces: HashMap<u32, String>,
-    host_interfaces: HashMap<u32, String>,
-    guest_versions: HashMap<u32, u32>,
-    host_versions: HashMap<u32, u32>,
-    retired_host_ids: HashSet<u32>,
-    /// Host-only objects whose destructor was queued but whose host
-    /// `wl_display.delete_id` acknowledgement has not arrived yet.
-    pending_destroy_host_ids: HashSet<u32>,
-    /// Guest objects whose destructor request has reached the host but whose
-    /// host-side `wl_display.delete_id` has not arrived yet.
-    pending_destroy_guest_ids: HashSet<u32>,
+    /// Every object the guest has.
+    guests: HashMap<GuestId, GuestObject>,
+    /// Every host ID in use: [`Self::allocate_host_id`] skips these, and a
+    /// host `new_id` may not name one.
+    hosts: HashMap<HostId, HostObject>,
     /// The IDs this proxy allocates for its objects on the host connection.
     /// An ID returns here only through [`Self::release_deleted_host_id`].
     host_ids: IdAllocator,
@@ -57,7 +162,7 @@ pub struct ShadowTable {
     /// server and sent to the client in an event. Host and guest object
     /// namespaces are independent, so host-generated `new_id` values must be
     /// translated to a fresh ID in this range before they reach the guest.
-    /// An ID returns here when [`Self::remove_id`] forgets its object.
+    /// An ID returns here when its guest object ends.
     guest_server_ids: IdAllocator,
 }
 
@@ -79,15 +184,8 @@ impl ShadowTable {
 
     pub fn new() -> Self {
         Self {
-            guest_to_host: HashMap::new(),
-            host_to_guest: HashMap::new(),
-            interfaces: HashMap::new(),
-            host_interfaces: HashMap::new(),
-            guest_versions: HashMap::new(),
-            host_versions: HashMap::new(),
-            retired_host_ids: HashSet::new(),
-            pending_destroy_host_ids: HashSet::new(),
-            pending_destroy_guest_ids: HashSet::new(),
+            guests: HashMap::new(),
+            hosts: HashMap::new(),
             host_ids: IdAllocator::new(Self::CLIENT_IDS),
             guest_server_ids: IdAllocator::new(Self::SERVER_IDS),
         }
@@ -110,7 +208,7 @@ impl ShadowTable {
                 log::error!("Ending the client: its host object IDs are exhausted");
                 panic!("host Wayland object IDs exhausted");
             };
-            if !self.is_host_id_registered(id) {
+            if !self.hosts.contains_key(&HostId(id)) {
                 return id;
             }
             // Only an object registered under an ID this allocator did not
@@ -119,35 +217,6 @@ impl ShadowTable {
             // warning keeps the cause visible.
             warn!("Skipping host ID {id}, which is registered but was never allocated");
         }
-    }
-
-    /// Apply the host's `wl_display.delete_id` for `host_id`.
-    ///
-    /// The host has destroyed the object and forgotten its ID, so no later
-    /// event can name it. Forget every mapping of the ID and return it to
-    /// the allocator. As in libwayland-client, this is the only way an ID
-    /// this proxy allocated becomes reusable: an ID is never reused while
-    /// its `delete_id` is outstanding, and objects without a destructor keep
-    /// theirs for the connection.
-    ///
-    /// A `delete_id` for an ID this proxy did not allocate, or no longer
-    /// tracks, changes nothing and returns [`DeletedHostId::Untracked`].
-    pub fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
-        if !self.host_ids.contains(host_id) || !self.is_host_id_registered(host_id) {
-            warn!("Ignoring wl_display.delete_id for untracked host ID {host_id}");
-            return DeletedHostId::Untracked;
-        }
-        let guest_id = self.host_to_guest.get(&host_id).copied();
-        if let Some(guest_id) = guest_id {
-            self.remove_id(guest_id);
-        }
-        self.host_to_guest.remove(&host_id);
-        self.host_interfaces.remove(&host_id);
-        self.host_versions.remove(&host_id);
-        self.retired_host_ids.remove(&host_id);
-        self.pending_destroy_host_ids.remove(&host_id);
-        self.host_ids.release(host_id);
-        guest_id.map_or(DeletedHostId::HostOnly, DeletedHostId::Paired)
     }
 
     /// Allocate an ID in Wayland's server-generated ID range.
@@ -168,7 +237,7 @@ impl ShadowTable {
                 log::error!("Ending the client: its guest server IDs are exhausted");
                 panic!("guest Wayland server IDs exhausted");
             };
-            if !self.guest_to_host.contains_key(&id) && !self.interfaces.contains_key(&id) {
+            if !self.guests.contains_key(&GuestId(id)) {
                 return id;
             }
             // As in `allocate_host_id`: only an ID registered without being
@@ -200,23 +269,74 @@ impl ShadowTable {
         self.track_interface(guest_id, interface.to_string());
     }
 
+    /// Pair guest object `guest_id` with host object `host_id`, creating
+    /// either entry that does not exist.
+    ///
+    /// Production pairs only unused IDs; test fixtures also remap paired
+    /// ones. The guest object's old host object then keeps its own
+    /// interface, without a version, as a host-only object, or ends if it
+    /// has none; the host object's old guest object ends.
     pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
-        if let Some(old_host_id) = self.guest_to_host.insert(guest_id, host_id) {
-            if old_host_id != host_id && self.host_to_guest.get(&old_host_id) == Some(&guest_id) {
-                self.host_to_guest.remove(&old_host_id);
-                self.host_versions.remove(&old_host_id);
+        let (guest, host) = (GuestId(guest_id), HostId(host_id));
+        if let Some(old_host) = self.host_id_of(guest).filter(|&old_host| old_host != host) {
+            if let Some(HostObject::Paired {
+                interface: Some(interface),
+                ..
+            }) = self.remove_paired_host(old_host, guest)
+            {
+                let host_only = HostObject::HostOnly {
+                    interface,
+                    version: None,
+                };
+                self.hosts.insert(old_host, host_only);
             }
         }
-        if let Some(old_guest_id) = self.host_to_guest.insert(host_id, guest_id) {
-            if old_guest_id != guest_id && self.guest_to_host.get(&old_guest_id) == Some(&host_id) {
-                self.guest_to_host.remove(&old_guest_id);
-                self.forget_guest_object(old_guest_id, true);
+
+        let (interface, version) = match self.hosts.remove(&host) {
+            Some(HostObject::Paired {
+                guest: old_guest,
+                interface,
+                version,
+            }) => {
+                if old_guest != guest {
+                    self.forget_guest_object(old_guest);
+                }
+                (interface, version)
             }
-        }
+            Some(HostObject::HostOnly { interface, version }) => (Some(interface), version),
+            reserved => {
+                debug_assert!(reserved.is_none(), "pairing reserved host ID {host_id}");
+                (None, None)
+            }
+        };
+        self.hosts.insert(
+            host,
+            HostObject::Paired {
+                guest,
+                interface,
+                version,
+            },
+        );
+
+        let (interface, state) = match self.guests.remove(&guest) {
+            Some(GuestObject::Paired {
+                interface, state, ..
+            }) => (interface, state),
+            Some(GuestObject::Local(interface)) => (Some(interface), GuestState::Live),
+            None => (None, GuestState::Live),
+        };
+        self.guests.insert(
+            guest,
+            GuestObject::Paired {
+                host,
+                interface,
+                state,
+            },
+        );
     }
 
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
-        self.guest_to_host.get(&guest_id).cloned()
+        self.host_id_of(GuestId(guest_id)).map(|host| host.0)
     }
 
     /// Check that a guest object has the interface required by a request
@@ -224,46 +344,44 @@ impl ShadowTable {
     /// happen to be mapped; forwarding a `wl_surface` where a `wl_seat` is
     /// expected would otherwise send a type-invalid request to the host.
     pub fn guest_object_matches(&self, guest_id: u32, interface: &str) -> bool {
-        self.interfaces
-            .get(&guest_id)
+        self.get_interface(guest_id)
             .is_some_and(|actual| actual == interface)
     }
 
-    /// Synthetic guest objects are intentionally not paired with a host
-    /// object. Their handlers consume requests locally (such as the SHM shim,
-    /// the v3 text-input manager, and an inert `wl_output` whose bind crossed
-    /// its global's removal, with its `zxdg_output_v1`), so the generated dispatcher must let those
-    /// requests reach the handler while rejecting every other unmapped
-    /// sender before it can mutate state.
+    /// Whether the proxy implements guest object `guest_id` itself, with no
+    /// host counterpart.
+    ///
+    /// Its handlers consume the requests locally (the SHM shim, the v3
+    /// text-input manager, and an inert `wl_output` whose bind crossed its
+    /// global's removal, with its `zxdg_output_v1`), so the generated
+    /// dispatcher lets them reach the handler while it rejects every other
+    /// unmapped sender before it can mutate state.
     pub fn is_local_only_guest_object(&self, guest_id: u32) -> bool {
+        let Some(GuestObject::Local(interface)) = self.guests.get(&GuestId(guest_id)) else {
+            return false;
+        };
         matches!(
-            self.interfaces.get(&guest_id).map(String::as_str),
-            Some(
-                "wl_shm"
-                    | "wl_shm_pool"
-                    // An inert output and the xdg_output created for it.
-                    | INERT_BIND_INTERFACE
-                    | "zxdg_output_v1"
-                    | "zwp_text_input_manager_v3"
-                    | "zwp_linux_dmabuf_feedback_v1"
-                    | "gtk_shell1"
-                    | "gtk_surface1"
-            )
+            interface.name.as_str(),
+            "wl_shm"
+                | "wl_shm_pool"
+                // An inert output and the xdg_output created for it.
+                | INERT_BIND_INTERFACE
+                | "zxdg_output_v1"
+                | "zwp_text_input_manager_v3"
+                | "zwp_linux_dmabuf_feedback_v1"
+                | "gtk_shell1"
+                | "gtk_surface1"
         )
     }
 
-    /// Check the interface of a host object carried by an event. Host-created
-    /// objects are recorded in `host_interfaces`, while objects paired with a
-    /// guest object use the guest-side interface metadata.
+    /// Check the interface of a host object carried by an event: its own,
+    /// or that of the guest object it is paired with.
     pub fn host_object_matches(&self, host_id: u32, interface: &str) -> bool {
-        self.host_interfaces
-            .get(&host_id)
+        self.get_host_interface(host_id)
             .is_some_and(|actual| actual == interface)
             || self
-                .host_to_guest
-                .get(&host_id)
-                .and_then(|guest_id| self.interfaces.get(guest_id))
-                .is_some_and(|actual| actual == interface)
+                .get_guest_id(host_id)
+                .is_some_and(|guest_id| self.guest_object_matches(guest_id, interface))
     }
 
     /// Return whether a guest request may allocate `guest_id`.
@@ -275,8 +393,7 @@ impl ShadowTable {
     pub fn is_guest_id_available(&self, guest_id: u32) -> bool {
         guest_id > 1
             && guest_id < Self::GUEST_SERVER_ID_START
-            && !self.guest_to_host.contains_key(&guest_id)
-            && !self.interfaces.contains_key(&guest_id)
+            && !self.guests.contains_key(&GuestId(guest_id))
     }
 
     /// Return whether `guest_id` belongs to the range reserved for objects
@@ -294,45 +411,38 @@ impl ShadowTable {
     /// server-generated `new_id` event.
     ///
     /// Host IDs share one namespace across guest-paired objects and internal
-    /// proxy objects. A reused ID would otherwise overwrite the reverse map
-    /// and route subsequent host events to the wrong guest object.
+    /// proxy objects. A reused ID would otherwise overwrite the pairing and
+    /// route subsequent host events to the wrong guest object.
     pub fn is_host_id_available(&self, host_id: u32) -> bool {
-        host_id > 1 && !self.is_host_id_registered(host_id)
-    }
-
-    /// Whether any table entry names `host_id`: a paired or host-only
-    /// object, or a reservation awaiting `delete_id` or teardown.
-    fn is_host_id_registered(&self, host_id: u32) -> bool {
-        self.host_to_guest.contains_key(&host_id)
-            || self.host_interfaces.contains_key(&host_id)
-            || self.retired_host_ids.contains(&host_id)
-            || self.pending_destroy_host_ids.contains(&host_id)
+        host_id > 1 && !self.hosts.contains_key(&HostId(host_id))
     }
 
     pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
-        self.host_to_guest.get(&host_id).cloned()
+        self.guest_id_of(HostId(host_id)).map(|guest| guest.0)
     }
 
     /// Return whether a host event sender belongs to an object that this
-    /// connection is currently tracking.
+    /// connection is currently tracking: a paired object, or one that
+    /// Sommelier binds internally (for example the host `wl_shm` and
+    /// keyboard-extension objects).
     ///
-    /// Paired guest objects live in `host_to_guest`; objects that Sommelier
-    /// binds internally (for example the host `wl_shm` and keyboard-extension
-    /// objects) live in `host_interfaces`. An event from neither namespace is
-    /// stale or malformed and must not reach a handler, because handlers may
-    /// update proxy state before the generated forwarding code can discover
-    /// that the sender has no guest representation.
+    /// An event from any other sender is stale or malformed and must not
+    /// reach a handler, because handlers may update proxy state before the
+    /// generated forwarding code can discover that the sender has no guest
+    /// representation.
     pub fn is_event_sender_known(&self, host_id: u32) -> bool {
-        self.host_to_guest.contains_key(&host_id) || self.host_interfaces.contains_key(&host_id)
+        self.hosts
+            .get(&HostId(host_id))
+            .is_some_and(HostObject::is_live)
     }
 
     /// Mark a forwarded destructor as pending host deletion. Retain the
     /// interface metadata so a subsequent request reaches the generated
-    /// dispatcher and is rejected explicitly, while retaining both numeric
-    /// maps until the host emits `wl_display.delete_id`.
+    /// dispatcher and is rejected explicitly, while retaining the pairing
+    /// until the host emits `wl_display.delete_id`.
     pub fn mark_pending_destroy(&mut self, guest_id: u32) {
-        if self.guest_to_host.contains_key(&guest_id) {
-            self.pending_destroy_guest_ids.insert(guest_id);
+        if let Some(GuestObject::Paired { state, .. }) = self.guests.get_mut(&GuestId(guest_id)) {
+            *state = GuestState::DestroyPending;
         }
     }
 
@@ -348,82 +458,153 @@ impl ShadowTable {
     /// Handlers go through
     /// [`Context::retire_destroyed_host_object`](super::Context::retire_destroyed_host_object), which
     /// owns what a refusal means.
+    ///
+    /// # Returns
+    ///
+    /// `false`, changing nothing, unless `host_id` is a live host-only
+    /// object.
     pub(super) fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
-        if self.host_to_guest.contains_key(&host_id) || !self.host_interfaces.contains_key(&host_id)
-        {
+        let host = HostId(host_id);
+        if !matches!(self.hosts.get(&host), Some(HostObject::HostOnly { .. })) {
             return false;
         }
-        self.host_interfaces.remove(&host_id);
-        self.host_versions.remove(&host_id);
-        self.retired_host_ids.remove(&host_id);
-        !self.host_ids.contains(host_id) || self.pending_destroy_host_ids.insert(host_id)
+        if self.host_ids.contains(host_id) {
+            self.hosts.insert(host, HostObject::AwaitingDeleteId);
+        } else {
+            self.hosts.remove(&host);
+        }
+        true
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_pending_destroy_host_only(&self, host_id: u32) -> bool {
-        self.pending_destroy_host_ids.contains(&host_id)
+        matches!(
+            self.hosts.get(&HostId(host_id)),
+            Some(HostObject::AwaitingDeleteId)
+        )
     }
 
     pub fn is_pending_destroy_guest(&self, guest_id: u32) -> bool {
-        self.pending_destroy_guest_ids.contains(&guest_id)
+        matches!(
+            self.guests.get(&GuestId(guest_id)),
+            Some(GuestObject::Paired {
+                state: GuestState::DestroyPending,
+                ..
+            })
+        )
     }
 
     pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
-        self.host_to_guest
-            .get(&host_id)
-            .is_some_and(|guest_id| self.is_pending_destroy_guest(*guest_id))
+        self.get_guest_id(host_id)
+            .is_some_and(|guest_id| self.is_pending_destroy_guest(guest_id))
     }
 
+    /// Record the interface of guest object `guest_id`, keeping its version
+    /// if it has one.
     pub fn track_interface(&mut self, guest_id: u32, interface: String) {
-        self.interfaces.insert(guest_id, interface);
-        self.guest_versions
-            .entry(guest_id)
-            .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+        let version = self
+            .guests
+            .get(&GuestId(guest_id))
+            .and_then(GuestObject::interface)
+            .map_or(Self::UNKNOWN_OBJECT_VERSION, |known| known.version);
+        self.track_interface_with_version(guest_id, interface, version);
     }
 
+    /// Record the interface and version of guest object `guest_id`.
     pub fn track_interface_with_version(&mut self, guest_id: u32, interface: String, version: u32) {
-        self.interfaces.insert(guest_id, interface);
-        self.guest_versions.insert(guest_id, version);
+        let tracked = Interface {
+            name: interface,
+            version,
+        };
+        match self.guests.get_mut(&GuestId(guest_id)) {
+            Some(GuestObject::Local(interface)) => *interface = tracked,
+            Some(GuestObject::Paired { interface, .. }) => *interface = Some(tracked),
+            None => {
+                self.guests
+                    .insert(GuestId(guest_id), GuestObject::Local(tracked));
+            }
+        }
     }
 
-    #[allow(dead_code)]
+    /// Record the host object's own interface, keeping its version if it
+    /// has one. An ID with no live object becomes a host-only object.
+    #[cfg(test)]
     pub fn track_host_interface(&mut self, host_id: u32, interface: String) {
-        self.host_interfaces.insert(host_id, interface);
-        self.host_versions
-            .entry(host_id)
-            .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+        self.set_host_interface(HostId(host_id), interface, None);
     }
 
+    /// Record the host object's own interface and version. An ID with no
+    /// live object becomes a host-only object.
     pub fn track_host_interface_with_version(
         &mut self,
         host_id: u32,
         interface: String,
         version: u32,
     ) {
-        self.host_interfaces.insert(host_id, interface);
-        self.host_versions.insert(host_id, version);
+        self.set_host_interface(HostId(host_id), interface, Some(version));
     }
 
-    /// Set the negotiated version for a host object that is already paired
-    /// with a guest object. Keeping this separate from `host_interfaces`
-    /// avoids treating every paired object as an internal host-only object.
+    /// Record `host`'s own interface, and `version` or, when `None`, the
+    /// version it has (else the unknown one).
+    fn set_host_interface(&mut self, host: HostId, interface: String, version: Option<u32>) {
+        let new_version =
+            |own: Option<u32>| Some(version.or(own).unwrap_or(Self::UNKNOWN_OBJECT_VERSION));
+        match self.hosts.get_mut(&host) {
+            Some(HostObject::Paired {
+                interface: own,
+                version: own_version,
+                ..
+            }) => {
+                *own = Some(interface);
+                *own_version = new_version(*own_version);
+            }
+            Some(HostObject::HostOnly {
+                interface: own,
+                version: own_version,
+            }) => {
+                *own = interface;
+                *own_version = new_version(*own_version);
+            }
+            reserved => {
+                debug_assert!(reserved.is_none(), "tracking reserved host ID {host:?}");
+                let version = new_version(None);
+                self.hosts
+                    .insert(host, HostObject::HostOnly { interface, version });
+            }
+        }
+    }
+
+    /// Set the negotiated version of a live host object, usually one just
+    /// paired with a guest object.
     pub fn set_host_version(&mut self, host_id: u32, version: u32) {
-        self.host_versions.insert(host_id, version);
+        let object = self.hosts.get_mut(&HostId(host_id));
+        debug_assert!(
+            object.as_deref().is_some_and(HostObject::is_live),
+            "no live host object {host_id} to version"
+        );
+        if let Some(
+            HostObject::Paired { version: own, .. } | HostObject::HostOnly { version: own, .. },
+        ) = object
+        {
+            *own = Some(version);
+        }
     }
 
+    /// The guest object's version, or else its host object's.
     pub fn guest_object_version(&self, guest_id: u32) -> Option<u32> {
-        self.guest_versions.get(&guest_id).copied().or_else(|| {
-            self.guest_to_host
-                .get(&guest_id)
-                .and_then(|host_id| self.host_versions.get(host_id).copied())
-        })
+        let object = self.guests.get(&GuestId(guest_id))?;
+        object
+            .interface()
+            .map(|interface| interface.version)
+            .or_else(|| self.hosts.get(&object.host()?)?.version())
     }
 
+    /// The host object's own version, or else its guest object's.
     pub fn host_object_version(&self, host_id: u32) -> Option<u32> {
-        self.host_versions.get(&host_id).copied().or_else(|| {
-            self.host_to_guest
-                .get(&host_id)
-                .and_then(|guest_id| self.guest_versions.get(guest_id).copied())
+        let object = self.hosts.get(&HostId(host_id))?;
+        object.version().or_else(|| {
+            let guest = self.guests.get(&object.guest()?)?;
+            guest.interface().map(|interface| interface.version)
         })
     }
 
@@ -451,64 +632,59 @@ impl ShadowTable {
     /// connection teardown. Use when a protocol has no destructor request but
     /// its host-side proxy may still exist after the guest-facing global is
     /// removed.
+    ///
+    /// Production retires only host-only objects. A paired object would stay
+    /// reserved through its guest object, so it loses only its own
+    /// interface and version.
     pub fn retire_host_interface(&mut self, host_id: u32) {
-        self.host_interfaces.remove(&host_id);
-        self.host_versions.remove(&host_id);
-        self.pending_destroy_host_ids.remove(&host_id);
-        self.retired_host_ids.insert(host_id);
+        let host = HostId(host_id);
+        let object = self.hosts.get_mut(&host);
+        debug_assert!(
+            object.as_deref().and_then(HostObject::guest).is_none(),
+            "retiring paired host object {host_id}"
+        );
+        if let Some(HostObject::Paired {
+            interface, version, ..
+        }) = object
+        {
+            *interface = None;
+            *version = None;
+        } else {
+            self.hosts.insert(host, HostObject::ReservedForConnection);
+        }
     }
 
     pub fn get_interface(&self, guest_id: u32) -> Option<&String> {
-        self.interfaces.get(&guest_id)
+        let object = self.guests.get(&GuestId(guest_id))?;
+        object.interface().map(|interface| &interface.name)
     }
 
+    /// The host object's own interface (see [`HostObject::Paired`]).
     pub fn get_host_interface(&self, host_id: u32) -> Option<&String> {
-        self.host_interfaces.get(&host_id)
+        self.hosts.get(&HostId(host_id))?.interface()
     }
 
     /// Typed lookup: translate a guest-allocated object ID to its host counterpart.
     /// Use in **client→host request** handlers where `ctx.last_sender_id` is a guest ID.
     pub fn host_id_of(&self, guest: GuestId) -> Option<HostId> {
-        self.guest_to_host.get(&guest.0).map(|&h| HostId(h))
+        self.guests.get(&guest)?.host()
     }
 
     /// Typed lookup: translate a host-allocated object ID to its guest counterpart.
     /// Use in **host→client event** handlers where `ctx.last_sender_id` is a host ID.
     pub fn guest_id_of(&self, host: HostId) -> Option<GuestId> {
-        self.host_to_guest.get(&host.0).map(|&g| GuestId(g))
+        self.hosts.get(&host)?.guest()
     }
 
+    /// End guest object `guest_id` and the host object paired with it.
     pub fn remove_id(&mut self, guest_id: u32) {
-        let host_id = self.guest_to_host.remove(&guest_id);
-        if let Some(host_id) = host_id {
-            self.host_to_guest.remove(&host_id);
-            self.host_interfaces.remove(&host_id);
-            self.host_versions.remove(&host_id);
+        let guest = GuestId(guest_id);
+        if let Some(host) = self
+            .forget_guest_object(guest)
+            .and_then(|object| object.host())
+        {
+            self.remove_paired_host(host, guest);
         }
-        self.forget_guest_object(guest_id, host_id.is_some());
-    }
-
-    /// Forget the guest side of `guest_id`, whose mapping to a host object
-    /// the caller has just removed (`was_mapped`) or never had.
-    ///
-    /// The one place a guest object ends: its metadata goes, and an ID from
-    /// the server range returns to the allocator. A server-created object
-    /// gets no `delete_id`; libwayland-client frees its ID as soon as either
-    /// side destroys it, which is when the proxy drops its mapping. Nothing
-    /// is freed for an ID that named no object, so no ID is freed twice.
-    ///
-    /// # Returns
-    ///
-    /// The object's interface, if it still had one.
-    fn forget_guest_object(&mut self, guest_id: u32, was_mapped: bool) -> Option<String> {
-        debug_assert!(!self.guest_to_host.contains_key(&guest_id));
-        self.pending_destroy_guest_ids.remove(&guest_id);
-        self.guest_versions.remove(&guest_id);
-        let interface = self.interfaces.remove(&guest_id);
-        if was_mapped || interface.is_some() {
-            self.guest_server_ids.release(guest_id);
-        }
-        interface
     }
 
     /// Remove only the guest-side half of a mapping.
@@ -516,25 +692,31 @@ impl ShadowTable {
     /// Some host protocols (notably `zwp_text_input_v1`) have no wire-level
     /// destructor. The guest-facing object can be destroyed while the
     /// host-side proxy remains alive until the connection closes. Keeping the
-    /// host interface reservation prevents a later allocation from reusing
-    /// that ID and routing stale host events to a new object.
+    /// host object as a host-only object prevents a later allocation from
+    /// reusing that ID and routing stale host events to a new object.
     pub fn remove_guest_mapping(&mut self, guest_id: u32) {
-        let host_id = self.guest_to_host.remove(&guest_id);
-        let guest_interface = self.forget_guest_object(guest_id, host_id.is_some());
-        if let Some(host_id) = host_id {
-            if self.host_to_guest.get(&host_id) == Some(&guest_id) {
-                self.host_to_guest.remove(&host_id);
-            }
-            // Production callers normally register the real host interface
-            // separately (a guest v3 text input is backed by a host v1
-            // object). If that registration is absent, retain the guest
-            // interface as a conservative reservation instead of allowing
-            // the host ID to be reused while queued host traffic is in flight.
-            if let (std::collections::hash_map::Entry::Vacant(entry), Some(interface)) =
-                (self.host_interfaces.entry(host_id), guest_interface)
-            {
-                entry.insert(interface);
-            }
+        let guest = GuestId(guest_id);
+        let Some(object) = self.forget_guest_object(guest) else {
+            return;
+        };
+        let Some(host) = object.host() else {
+            return;
+        };
+        let Some(HostObject::Paired {
+            interface, version, ..
+        }) = self.remove_paired_host(host, guest)
+        else {
+            return;
+        };
+        // Production callers normally register the real host interface
+        // separately (a guest v3 text input is backed by a host v1
+        // object). If that registration is absent, retain the guest
+        // interface as a conservative reservation instead of allowing
+        // the host ID to be reused while queued host traffic is in flight.
+        let guest_interface = object.interface().map(|interface| interface.name.clone());
+        if let Some(interface) = interface.or(guest_interface) {
+            self.hosts
+                .insert(host, HostObject::HostOnly { interface, version });
         }
     }
 
@@ -543,40 +725,97 @@ impl ShadowTable {
     ///
     /// Requests carrying this guest ID will fail the interface validation,
     /// while events from the still-live host object can continue to resolve
-    /// back to the retired guest ID until [`remove_id`] is called. Preserve the
-    /// interface metadata on the host side as well: proxy dispatch needs an
-    /// interface name before it can invoke the event handler, and the guest
-    /// metadata is intentionally removed so a destroyed object cannot accept
-    /// another request.
+    /// back to the retired guest ID until [`Self::remove_id`] is called.
+    /// Preserve the interface metadata on the host side as well: proxy
+    /// dispatch needs an interface name before it can invoke the event
+    /// handler, and the guest metadata is intentionally removed so a
+    /// destroyed object cannot accept another request.
     pub fn retire_guest_object(&mut self, guest_id: u32) {
-        let Some(&host_id) = self.guest_to_host.get(&guest_id) else {
-            // Nothing can name an unmapped object again: it ends here.
-            self.forget_guest_object(guest_id, false);
+        let guest = GuestId(guest_id);
+        let Some(object) = self.guests.get_mut(&guest) else {
             return;
         };
-        let interface = self.interfaces.remove(&guest_id);
-        self.guest_versions.remove(&guest_id);
-        if let Some(interface) = interface {
-            self.pending_destroy_guest_ids.insert(guest_id);
-            self.host_interfaces.entry(host_id).or_insert(interface);
-            self.host_versions
-                .entry(host_id)
-                .or_insert(Self::UNKNOWN_OBJECT_VERSION);
+        let GuestObject::Paired {
+            host,
+            interface,
+            state,
+        } = object
+        else {
+            // Nothing can name an unpaired object again: it ends here.
+            self.forget_guest_object(guest);
+            return;
+        };
+        let Some(interface) = interface.take() else {
+            return;
+        };
+        *state = GuestState::DestroyPending;
+        if let Some(HostObject::Paired {
+            interface: own,
+            version,
+            ..
+        }) = self.hosts.get_mut(host)
+        {
+            own.get_or_insert(interface.name);
+            version.get_or_insert(Self::UNKNOWN_OBJECT_VERSION);
         }
     }
 
-    #[allow(dead_code)]
-    pub fn find_by_interface(&self, interface_name: &str) -> Vec<u32> {
-        self.interfaces
-            .iter()
-            .filter_map(|(id, name)| {
-                if name == interface_name {
-                    Some(*id)
-                } else {
-                    None
-                }
-            })
-            .collect()
+    /// Apply the host's `wl_display.delete_id` for `host_id`.
+    ///
+    /// The host has destroyed the object and forgotten its ID, so no later
+    /// event can name it. End the object and the guest object paired with
+    /// it, and return the ID to the allocator. As in libwayland-client, this
+    /// is the only way an ID this proxy allocated becomes reusable: an ID is
+    /// never reused while its `delete_id` is outstanding, and objects without
+    /// a destructor keep theirs for the connection.
+    ///
+    /// A `delete_id` for an ID this proxy did not allocate, or no longer
+    /// tracks, changes nothing and returns [`DeletedHostId::Untracked`].
+    pub fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
+        let host = HostId(host_id);
+        let object = if self.host_ids.contains(host_id) {
+            self.hosts.remove(&host)
+        } else {
+            None
+        };
+        let Some(object) = object else {
+            warn!("Ignoring wl_display.delete_id for untracked host ID {host_id}");
+            return DeletedHostId::Untracked;
+        };
+        self.host_ids.release(host_id);
+        let Some(guest) = object.guest() else {
+            return DeletedHostId::HostOnly;
+        };
+        let paired = self
+            .forget_guest_object(guest)
+            .and_then(|object| object.host());
+        debug_assert_eq!(paired, Some(host), "guest {guest:?} was not paired");
+        DeletedHostId::Paired(guest.0)
+    }
+
+    /// End guest object `guest`: the one place a guest object ends.
+    ///
+    /// An ID from the server range returns to the allocator. A
+    /// server-created object gets no `delete_id`; libwayland-client frees its
+    /// ID as soon as either side destroys it, which is when the proxy drops
+    /// its mapping. Nothing is freed for an ID that named no object, so no
+    /// ID is freed twice.
+    fn forget_guest_object(&mut self, guest: GuestId) -> Option<GuestObject> {
+        let object = self.guests.remove(&guest)?;
+        self.guest_server_ids.release(guest.0);
+        Some(object)
+    }
+
+    /// Remove `host`, the host object paired with `guest`, whose entry the
+    /// caller is ending or has ended.
+    fn remove_paired_host(&mut self, host: HostId, guest: GuestId) -> Option<HostObject> {
+        let object = self.hosts.remove(&host);
+        debug_assert_eq!(
+            object.as_ref().and_then(HostObject::guest),
+            Some(guest),
+            "host {host:?} was not paired"
+        );
+        object
     }
 }
 
@@ -606,33 +845,19 @@ mod tests {
         );
     }
 
-    /// Regression: allocate_host_id must not re-issue IDs already registered in
-    /// `host_interfaces` (used for internally-bound objects like
-    /// `zcr_keyboard_extension_v1` that have no guest-side counterpart and are
-    /// therefore absent from `host_to_guest`).
-    ///
-    /// Without the `host_interfaces` check the allocator was blind to these IDs
-    /// and could return an ID that is already in use, causing the dispatcher to
-    /// route messages to the wrong handler.
+    /// Regression: allocate_host_id must not re-issue the ID of a host-only
+    /// object, such as the internally bound `zcr_keyboard_extension_v1`,
+    /// which has no guest counterpart. An allocator blind to these IDs could
+    /// return one in use and route messages to the wrong handler.
     #[test]
     fn allocate_host_id_skips_host_interfaces_entries() {
         let mut table = ShadowTable::new();
         // Fresh IDs start at 2.
-        // Register IDs 2 and 3 as host-tracked interfaces (no guest pair).
         table.track_host_interface(2, "zcr_keyboard_extension_v1".to_string());
         table.track_host_interface(3, "zwp_linux_dmabuf_v1".to_string());
 
-        // The allocator must skip 2 and 3 (in host_interfaces) and return 4.
         let id = table.allocate_host_id();
-        assert_eq!(
-            id, 4,
-            "allocator must skip IDs registered in host_interfaces, got {}",
-            id
-        );
-        assert!(
-            !table.host_interfaces.contains_key(&id) || id == 4,
-            "returned ID must not be in host_interfaces"
-        );
+        assert_eq!(id, 4, "allocator must skip host-only objects, got {id}");
     }
 
     #[test]
