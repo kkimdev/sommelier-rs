@@ -56,12 +56,17 @@ only fresh IDs and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,
 creates objects of its own (a data offer for each data device, a buffer
 for each asynchronous dma-buf create), and, as weston does, destroys a
-destroyed surface's pending frame callbacks without `done`. When a case's
+destroyed surface's pending frame callbacks without `done`. In a quarter
+of the cases it also destroys the live objects of one interface on its
+own as it answers a sync. After every batch that keeps the session, the
+proxy must hold no state for an object that has ended
+(`Context::assert_no_orphans`). When a case's
 requests are whole and undamaged, the guest checks that it receives what
 the proxy should send, which is stricter than what libwayland-client
 tolerates: every event comes from and names only objects it has, a
-`wl_display.delete_id` names only an object it destroyed or a frame
-callback the compositor cancelled, once (and every cancelled callback
+`wl_display.delete_id` names only an object it destroyed, a frame
+callback the compositor cancelled, or an object the compositor destroyed
+on its own, once (and every cancelled callback
 gets one before the closing sync is answered), and each object the server
 creates gets a fresh ID from the server range.
 The suite runs 5000 cases from seed 0; run more, from another seed,

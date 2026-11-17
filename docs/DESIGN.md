@@ -154,7 +154,9 @@ The table's API keeps those entries consistent by construction:
   `guest_ended_host_kept`, `guest_ended_host_destroyed`,
   `local_destroyed`, `abandon` (for an object that never reached the
   host), `host_destroy_queued`, `retire_host` and
-  `release_deleted_host_id`.
+  `release_deleted_host_id`. Those that end a guest object are visible
+  only in `state`; everything else ends one through its `Context` wrapper
+  (see [Object ends](#object-ends)).
 - **Generated dispatch** resolves each sender and object argument once,
   before the handler runs, which validates and translates it together:
   `request_sender` and `request_object` return a `Link` (a host ID, or
@@ -173,7 +175,7 @@ host events can still be translated (and are filtered) and the `delete_id`
 itself can be forwarded. Host-only objects the proxy created keep their ID
 reserved the same way; `Context::retire_destroyed_host_object` is the one
 way to retire one. The `delete_id` then ends everything the proxy knows
-about the host ID and frees it (`ShadowTable::release_deleted_host_id`).
+about the host ID and frees it (`Context::release_deleted_host_id`).
 
 ## Handlers and state
 
@@ -198,6 +200,36 @@ Two mechanisms let a handler act outside its own message:
 - `callback::queue_internal_sync` issues a host-only `wl_display.sync` and
   `state::InternalCallbacks` records what it waits for, such as the
   text-input drain or the placement barrier.
+
+### Object ends
+
+Per-object state lives with the module that owns it (`surfaces`,
+`OutputRegistry`, the keyboard maps, and so on), keyed by the object's
+guest or host ID. `state/lifecycle.rs` ends it with the object, whichever
+way the object ends: each `Context` wrapper of a table transition that
+ends an object runs one hook.
+
+- `forget_object` runs once per object, at its first end: a guest
+  destructor, a terminal event, a local destructor, a bind that never
+  reached the host, or a host `delete_id` while the guest object was live
+  (`DeletedHostId::Paired` reports `was_live`). Its one `match` on the
+  interface is the inventory of per-object state: each arm calls the
+  owner's `forget_*` function (`forget_surface`, `forget_keyboard`,
+  `forget_output`, `forget_registry`, ...). It is the one place `state`
+  calls into handlers, because ending an object can send requests, such
+  as an Aura release or an extended keyboard's destructor.
+- `forget_host_id` runs when the host releases the ID, for state that
+  outlives the guest object: a render buffer the host still shows. It
+  drops an asynchronous dma-buf create too, as a backstop, though
+  `forget_params` already did at the params' end.
+
+What a hook sends joins the current message's effects, so the wire order
+is the handler's: a destructor handler that must order its own destructor
+against that output queues the part that goes first before it calls the
+wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
+In tests, `Context::assert_no_orphans` checks every per-object key, and
+every object such state names, against the table; `proxy::fuzz` runs it
+after every batch.
 
 ### Message effects
 

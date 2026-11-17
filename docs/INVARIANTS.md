@@ -232,7 +232,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   host has then forgotten it, so every mapping of it is dropped and no
   later event can name it. The host may destroy a guest's object on its
   own, as compositors do with the pending frame callbacks of a destroyed
-  surface, so its `delete_id` ends the object and reaches the guest. A live
+  surface, so its `delete_id` ends the object and reaches the guest. A
+  guest request from it after that, a destructor included, ends the
+  session with `invalid_object`, as libwayland-server answers a request
+  to an ID whose resource it destroyed. A live
   object only the proxy uses (a binding, an Aura child, an internal
   callback, host-only params) is one the host never destroys on its own: a
   `delete_id` for one, or for an ID the proxy does not track, changes
@@ -266,6 +269,33 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `host_data_offer_rejects_a_client_range_id`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
+- **An object's state ends with it, once.** Every end of an object goes
+  through a `Context` wrapper of its table transition (the transitions
+  are `pub(super)`), which forgets the object's per-interface state at its
+  first end: a guest destructor, terminal event, local destructor,
+  abandoned bind, or a host `delete_id` for a live object, which forgets
+  what the guest's destructor would but sends nothing to the deleted
+  object. The `delete_id` that acknowledges a destructor forgets nothing
+  again, and a render buffer, which outlives its guest object while the
+  host shows it, ends when the host releases its ID. An asynchronous
+  dma-buf create ends with its params; releasing the host ID drops it
+  too, as a backstop. A new map of per-object
+  state gets its arm in `state::lifecycle::forget_object` and its check in
+  `Context::assert_no_orphans`. Ending an object sends its teardown in the
+  current message's effects, in the wire order its destructor handler
+  had: the Aura objects of a surface or toplevel are released before its
+  destructor, and a surface's text-input leave and buffer retirement
+  follow it.
+  Tests: `a_host_destroyed_output_is_forgotten`,
+  `a_host_destroyed_keyboard_is_forgotten`,
+  `a_host_destroyed_surface_is_forgotten`,
+  `a_host_destroyed_text_input_sends_nothing_to_its_host_object`,
+  `a_delete_id_after_the_destructor_forgets_nothing_again`,
+  `wl_surface_destroy_releases_its_aura_children_first`,
+  `wl_surface_destroy_releases_zaura_surface`,
+  `xdg_toplevel_destroy_reserves_aura_id_until_host_delete_id`,
+  `wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave`,
+  `guest_streams_cannot_crash_hang_or_leak`.
 - **Host-only objects keep their ID reservation.** A host-only proxy object
   with a wire destructor keeps its host ID reserved until the host's
   `delete_id` arrives. Its dispatch metadata may go at once to suppress
@@ -341,6 +371,20 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `set_fullscreen_on_an_inert_output_is_forwarded_without_an_output`,
   `xdg_output_of_an_inert_output_is_inert`,
   `global_remove_forwards_only_visible_globals_and_invalidates_bind`.
+- **A removed global waits for every registry that lists it.** Its
+  connection-wide metadata, and the internal binding it backs, stay until
+  every registry that listed it has seen its `global_remove`, so each can
+  still be sent its own; then the name is tombstoned and new binds of it
+  are refused. A registry destroyed through `wl_fixes` before it sees the
+  removal no longer counts, and if it was the last, its destruction
+  retires the global. The removal is on record connection-wide from the
+  first `global_remove` until the global is retired or advertised anew,
+  so this holds even when every registry that saw it was destroyed first.
+  A registry destroyed while the global is still advertised retires
+  nothing.
+  Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
+  `a_removal_outlives_the_registry_that_saw_it`,
+  `destroying_a_registry_keeps_a_global_no_registry_saw_removed`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the
   connection-wide metadata for that name MUST be replaced before the new
