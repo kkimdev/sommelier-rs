@@ -21,6 +21,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const DRM_DEVICE_ENV: &str = "SOMMELIER_DRM_DEVICE";
 const DRM_DEVICE_DIR: &str = "/dev/dri";
@@ -30,6 +31,9 @@ const VIRTGPU_GETPARAM_COMMAND: u8 = DRM_COMMAND_BASE + 0x03;
 const VIRTGPU_RESOURCE_INFO_COMMAND: u8 = DRM_COMMAND_BASE + 0x05;
 const VIRTGPU_WAIT_COMMAND: u8 = DRM_COMMAND_BASE + 0x08;
 const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
+/// `VIRTGPU_WAIT_NOWAIT`: report a busy buffer as `EBUSY` instead of
+/// waiting for it.
+const VIRTGPU_WAIT_NOWAIT: u32 = 1;
 const DMA_BUF_SYNC_READ: u32 = 1;
 
 #[repr(C)]
@@ -206,31 +210,26 @@ fn ioctl_getparam(fd: RawFd, getparam: &mut DrmVirtGpuGetParam) -> io::Result<()
     }
 }
 
-// A blocking wait on the event loop, bounded to a second per plane.
-// TODO(fence re-dispatch): park the client's requests and re-dispatch the
-// commit once the fence signals, instead of waiting here.
+/// Whether `sync_file`'s fence has signalled. A sync_file is readable once
+/// it has, so a pending one is returned for the event loop to await.
+// A poll with a zero timeout never waits.
 #[allow(clippy::disallowed_methods)]
-fn wait_sync_file(fd: RawFd) -> io::Result<()> {
+pub(crate) fn sync_file_fence(sync_file: OwnedFd) -> io::Result<DmabufFence> {
     let mut pollfd = libc::pollfd {
-        fd,
+        fd: sync_file.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     loop {
-        // Match ChromiumOS Sommelier's bounded fence wait. A GPU hang must
-        // not permanently stall the proxy's single Wayland event loop.
-        let result = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, 1_000) };
+        let result = unsafe { libc::poll(std::ptr::from_mut(&mut pollfd), 1, 0) };
         if result > 0 {
             if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                 return Err(io::Error::other("dma-buf sync fence reported an error"));
             }
-            return Ok(());
+            return Ok(DmabufFence::Signalled);
         }
         if result == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "dma-buf sync fence wait timed out",
-            ));
+            return Ok(DmabufFence::Pending(PendingFence::SyncFile(sync_file)));
         }
         let error = io::Error::last_os_error();
         if !matches!(error.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
@@ -606,7 +605,9 @@ impl Allocator {
         )
     }
 
-    fn wait_for_virtgpu_resource(&self, fd: RawFd) -> io::Result<()> {
+    /// Whether virtio-gpu has finished writing dma-buf `fd`, asked without
+    /// waiting.
+    fn virtgpu_resource_idle(&self, fd: RawFd) -> io::Result<bool> {
         let mut prime = DrmPrimeHandle {
             fd,
             ..DrmPrimeHandle::default()
@@ -624,7 +625,7 @@ impl Allocator {
 
         let mut wait = DrmVirtGpuWait {
             handle: prime.handle,
-            flags: 0,
+            flags: VIRTGPU_WAIT_NOWAIT,
         };
         let wait_result = unsafe {
             libc::ioctl(
@@ -646,20 +647,59 @@ impl Allocator {
                 std::ptr::from_mut(&mut close),
             )
         };
-        if let Some(error) = wait_error {
-            return Err(error);
-        }
+        let idle = match wait_error {
+            None => true,
+            Some(error) if error.raw_os_error() == Some(libc::EBUSY) => false,
+            Some(error) => return Err(error),
+        };
         if close_result != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(idle)
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DmabufWaitResult {
-    Synchronized,
+/// Whether the guest GPU has finished writing a dma-buf ([`dmabuf_fence`]).
+#[derive(Debug)]
+pub(crate) enum DmabufFence {
+    /// Every write has completed.
+    Signalled,
+    /// A write is still in flight.
+    Pending(PendingFence),
+    /// The kernel offers neither fence mechanism, so the host compositor
+    /// relies on implicit synchronization.
     ImplicitSyncFallback,
+}
+
+/// A guest GPU write still in flight.
+#[derive(Debug)]
+pub(crate) enum PendingFence {
+    /// The dma-buf's exported sync_file, readable once the write completes.
+    SyncFile(OwnedFd),
+    /// The virtio-gpu fallback, which gives nothing to wait on: ask again
+    /// later.
+    Busy,
+}
+
+/// How long a commit waits for a sync_file on each plane: ChromiumOS
+/// Sommelier's bounded fence wait.
+pub(crate) const SYNC_FILE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a commit waits for the virtio-gpu fallback on each plane: the
+/// kernel's own bound for a blocking `DRM_IOCTL_VIRTGPU_WAIT` (`15 * HZ` in
+/// `virtio_gpu_wait_ioctl`), which the proxy used before it stopped
+/// blocking on it.
+pub(crate) const VIRTGPU_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+impl PendingFence {
+    /// How long a commit waits for this fence on each plane before its
+    /// session ends: a hung guest GPU must not hold its commit for ever.
+    pub(crate) fn timeout(&self) -> Duration {
+        match self {
+            Self::SyncFile(_) => SYNC_FILE_TIMEOUT,
+            Self::Busy => VIRTGPU_WAIT_TIMEOUT,
+        }
+    }
 }
 
 fn dmabuf_sync_capability_unavailable(error: &io::Error) -> bool {
@@ -669,45 +709,38 @@ fn dmabuf_sync_capability_unavailable(error: &io::Error) -> bool {
     )
 }
 
-/// Wait until a guest dma-buf's outstanding writers have completed.
+/// Whether a guest dma-buf's outstanding writers have completed, asked
+/// without waiting.
 ///
 /// Exporting and polling the dma-buf's sync file requires only the plane fd,
 /// so it is always attempted. A DRM allocator is an optional compatibility
 /// fallback for kernels that require the virtio-gpu GEM wait path. Kernels
 /// which implement neither mechanism retain ChromiumOS Sommelier's implicit
 /// synchronization compatibility path; actual I/O failures remain fatal.
-pub(crate) fn wait_for_dmabuf(
-    fd: RawFd,
+pub(crate) fn dmabuf_fence(
+    fd: BorrowedFd<'_>,
     allocator: Option<&Allocator>,
-) -> io::Result<DmabufWaitResult> {
-    if fd < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid dma-buf descriptor",
-        ));
-    }
-
+) -> io::Result<DmabufFence> {
+    let fd = fd.as_raw_fd();
     match export_dmabuf_read_fence(fd) {
-        Ok(sync_file) => {
-            wait_sync_file(sync_file.as_fd().as_raw_fd())?;
-            Ok(DmabufWaitResult::Synchronized)
-        }
+        Ok(sync_file) => sync_file_fence(sync_file),
         Err(export_error) => {
             let export_capability_missing = dmabuf_sync_capability_unavailable(&export_error);
             let Some(allocator) = allocator else {
                 return if export_capability_missing {
-                    Ok(DmabufWaitResult::ImplicitSyncFallback)
+                    Ok(DmabufFence::ImplicitSyncFallback)
                 } else {
                     Err(export_error)
                 };
             };
-            match allocator.wait_for_virtgpu_resource(fd) {
-                Ok(()) => Ok(DmabufWaitResult::Synchronized),
+            match allocator.virtgpu_resource_idle(fd) {
+                Ok(true) => Ok(DmabufFence::Signalled),
+                Ok(false) => Ok(DmabufFence::Pending(PendingFence::Busy)),
                 Err(fallback_error)
                     if export_capability_missing
                         && dmabuf_sync_capability_unavailable(&fallback_error) =>
                 {
-                    Ok(DmabufWaitResult::ImplicitSyncFallback)
+                    Ok(DmabufFence::ImplicitSyncFallback)
                 }
                 Err(fallback_error) => {
                     if export_capability_missing {
@@ -726,15 +759,15 @@ pub(crate) fn wait_for_dmabuf(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        apply_dmabuf_plane0_fixup, dmabuf_sync_capability_unavailable, drm_device_candidates,
-        is_virtio_gpu_driver, open_drm_device, render_node_number, resource_info_type_supported,
-        sorted_render_nodes, wait_for_dmabuf, wait_sync_file, DmabufWaitResult,
-        VirtGpuResourceInfo, VirtGpuResourceInfoProbe, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS,
-        DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
+        apply_dmabuf_plane0_fixup, dmabuf_fence, dmabuf_sync_capability_unavailable,
+        drm_device_candidates, is_virtio_gpu_driver, open_drm_device, render_node_number,
+        resource_info_type_supported, sorted_render_nodes, sync_file_fence, DmabufFence,
+        PendingFence, VirtGpuResourceInfo, VirtGpuResourceInfoProbe,
+        DRM_IOCTL_VIRTGPU_RESOURCE_INFO_CROS, DRM_IOCTL_VIRTGPU_RESOURCE_INFO_PROBE,
     };
     use std::ffi::OsStr;
     use std::io;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsFd, AsRawFd};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -891,26 +924,19 @@ mod tests {
         );
     }
 
+    /// A sync_file is readable once its fence signals; a pipe stands in.
     #[test]
-    fn ready_sync_file_returns_without_blocking() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let byte = [1_u8];
-        assert_eq!(
-            unsafe {
-                libc::write(
-                    pipe_fds[1],
-                    byte.as_ptr().cast::<libc::c_void>(),
-                    byte.len(),
-                )
-            },
-            1
-        );
-        assert!(wait_sync_file(pipe_fds[0]).is_ok());
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+    fn a_sync_file_fence_is_checked_without_waiting() {
+        let (fence, signal) = nix::unistd::pipe().unwrap();
+        let fence = match sync_file_fence(fence).unwrap() {
+            DmabufFence::Pending(PendingFence::SyncFile(fence)) => fence,
+            other => panic!("an unreadable sync_file is pending, not {other:?}"),
+        };
+        assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+        assert!(matches!(
+            sync_file_fence(fence).unwrap(),
+            DmabufFence::Signalled
+        ));
     }
 
     #[test]
@@ -928,18 +954,11 @@ mod tests {
     }
 
     #[test]
-    fn dmabuf_wait_without_allocator_uses_implicit_sync_when_ioctl_is_missing() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-
-        assert_eq!(
-            wait_for_dmabuf(pipe_fds[0], None).unwrap(),
-            DmabufWaitResult::ImplicitSyncFallback
-        );
-
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+    fn dmabuf_fence_without_allocator_uses_implicit_sync_when_ioctl_is_missing() {
+        let (not_a_dmabuf, _writer) = nix::unistd::pipe().unwrap();
+        assert!(matches!(
+            dmabuf_fence(not_a_dmabuf.as_fd(), None).unwrap(),
+            DmabufFence::ImplicitSyncFallback
+        ));
     }
 }
