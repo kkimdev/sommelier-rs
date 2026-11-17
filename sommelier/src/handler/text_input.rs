@@ -26,7 +26,7 @@ use crate::protocols::wayland::wl_keyboard;
 use crate::state::GuestKeyOwner;
 use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
-    InternalCallback, SeatFocusChange, ShadowTable,
+    InternalCallback, SeatFocusChange,
 };
 use crate::wire::{queue_or_drop, Action, Outgoing};
 
@@ -175,10 +175,9 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
 }
 
 fn extension_version_allows(version: u32, required: u32) -> bool {
-    // Test fixtures and older callers that predate version tracking use
-    // the unknown version. Keep those permissive while production objects
-    // are guarded by the negotiated protocol version.
-    ShadowTable::is_unknown_version(version) || version >= required
+    // The unknown version of a test fixture is the largest, so it allows
+    // every request.
+    version >= required
 }
 
 /// Return whether the repeat fallback belongs to this physical host
