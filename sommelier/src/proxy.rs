@@ -1220,10 +1220,17 @@ mod tests {
                     b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
                 );
                 assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-                // The clock is paused, so it moves only while every task waits.
-                while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
+                // The clock is paused, so it moves only while every task
+                // waits; the timeout fails a reload that never applies
+                // instead of hanging.
+                let applied = async {
+                    while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                };
+                tokio::time::timeout(ACCEPT_RETRY_DELAY * 10, applied)
+                    .await
+                    .expect("the reload applies");
                 assert!(
                     started.elapsed() < ACCEPT_RETRY_DELAY,
                     "the reload waited {:?} for the accept loop",
