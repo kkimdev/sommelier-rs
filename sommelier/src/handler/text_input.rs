@@ -480,7 +480,9 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
     true
 }
 
-fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
+/// Map a v3 content type to the host's v1 `(hint, purpose)` and the
+/// extension's `(input_type, input_mode, input_flags, learning_mode)`.
+pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
     use zcr_extended_text_input_v1 as ext;
     use zwp_text_input_v1 as v1;
     use zwp_text_input_v3 as v3;

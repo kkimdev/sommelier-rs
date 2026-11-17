@@ -20,15 +20,19 @@ limitations under the License.
 //! must survive whatever arrives. Each case builds a request stream from the
 //! vendored protocol XML (requests of live objects, typed arguments, real
 //! descriptors), mutates some requests, and writes the stream in random
-//! pieces over a socket to `Client::run`. The host peer is a compositor
+//! pieces over a socket to `Client::run`. Half the cases end like a client
+//! typing into text fields, switching the focus between surfaces and
+//! waiting for each with a roundtrip. The host peer is a compositor
 //! that advertised every global (and one `wl_output` it then removed, so a
 //! bind of it crosses the removal), answers each `wl_display.sync`, offers
 //! each new data device a selection and answers each asynchronous dma-buf
 //! create with a buffer of its own, deletes each object the proxy
 //! destroys, as weston does, destroys a destroyed surface's pending frame
 //! callbacks without `done`, and gives the keyboard focus to each surface
-//! the proxy commits, as a click on its window would. In some cases it also
-//! destroys live objects of one interface on its own ([`HOST_DESTROYED`]).
+//! the proxy commits, as a click on its window would, holds its answer to a
+//! text input's drain barrier, as a slow host would, and keeps the
+//! text-input state Exo would ([`exo`]). In some cases it also destroys
+//! live objects of one interface on its own ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -51,7 +55,14 @@ limitations under the License.
 //!   a frame callback the compositor cancelled, or an object the compositor
 //!   destroyed on its own, once (and, in a healthy
 //!   session, one for each cancelled callback), and objects the server
-//!   creates under fresh IDs from the server range.
+//!   creates under fresh IDs from the server range;
+//! - when such a healthy session typed into text fields, and the compositor
+//!   destroyed nothing on its own, leave Exo, once the proxy has closed the
+//!   connection, with the field the guest last committed on the focused
+//!   surface: for an enabled field, an attached input method, the content
+//!   type as the proxy maps it, the surrounding text and the support for
+//!   it, and the cursor rectangle; for a disabled one, no active text input
+//!   there.
 //!
 //! The cases run in a child process that runs nothing else, so the
 //! descriptor count is exact while other tests run in parallel. A case's
@@ -64,6 +75,7 @@ limitations under the License.
 // which no encoder can do.
 #![allow(clippy::disallowed_methods)]
 
+mod exo;
 mod typing;
 
 use super::{Client, Direction};
@@ -77,6 +89,7 @@ use crate::protocols::wayland::{
 use crate::state::Context;
 use crate::test_support::{frames, Rng};
 use crate::wire::{Framing, MessageBuilder, MessageHeader, WireMessage, WL_DISPLAY_ID};
+use exo::Exo;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IoSlice, Read, Write};
@@ -143,6 +156,8 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let server_objects = GUEST_SERVER_OBJECTS.load(Ordering::Relaxed);
         let cancelled = FRAME_CALLBACKS_CANCELLED.load(Ordering::Relaxed);
         let host_destroyed = LIVE_OBJECTS_HOST_DESTROYED.load(Ordering::Relaxed);
+        let fields = FIELDS_CHECKED.load(Ordering::Relaxed);
+        let deferred = DEFERRED_ACTIVATIONS.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
                 reused > 0,
@@ -160,10 +175,19 @@ fn guest_streams_cannot_crash_hang_or_leak() {
                 host_destroyed > 0,
                 "the host destroyed no live object, so forgetting one went untested"
             );
+            assert!(
+                fields > 0,
+                "no case checked an enabled text field, so Exo's view went untested"
+            );
+            assert!(
+                deferred > 0,
+                "no checked case deferred a text-input activation, so that went untested"
+            );
         }
         println!(
             "{cases} cases from seed {first_seed} passed: {outcomes:?}, {reused} host IDs reused, \
-             {server_objects} guest server objects checked, {cancelled} frame callbacks cancelled"
+             {server_objects} guest server objects checked, {cancelled} frame callbacks cancelled, \
+             {fields} text fields checked, {deferred} activations deferred"
         );
     });
 }
@@ -410,7 +434,7 @@ fn discover_globals(protocols: &Arc<Protocols>, config: Config) -> Vec<Global> {
         bytes: sync_request(callback).encode(),
         ..Submission::default()
     };
-    let events = exchange(protocols, config, vec![sync], true, callback, None)
+    let (events, _) = exchange(protocols, config, vec![sync], true, callback, None)
         .expect("the proxy answers a lone sync in time");
     frames(&events)
         .filter(|(header, _)| {
@@ -499,6 +523,7 @@ impl<'a> Guest<'a> {
                 .collect(),
             destroyed: BTreeSet::new(),
             cancelled: BTreeSet::new(),
+            typed: None,
         };
         Self {
             protocols,
@@ -858,6 +883,8 @@ struct GuestView {
     /// The frame callbacks of surfaces the guest destroyed, which the
     /// compositor destroys with their surface.
     cancelled: BTreeSet<u32>,
+    /// What the guest's typing into text fields left, if it typed.
+    typed: Option<typing::Typed>,
 }
 
 impl Case {
@@ -964,7 +991,7 @@ enum Outcome {
 fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed: u64) -> Outcome {
     let case = Case::generate(protocols, globals, seed);
     let framed = case.framed;
-    let events = exchange(
+    let (events, host) = exchange(
         protocols,
         config,
         case.sends,
@@ -992,6 +1019,26 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
     if let Some(guest) = &case.guest {
         let healthy = answered && !rejected;
         check_guest_events(protocols, guest, &events, healthy, case.host_destroys);
+        // Objects the compositor destroys on its own end the typing early.
+        if let Some(typed) = guest
+            .typed
+            .as_ref()
+            .filter(|_| healthy && case.host_destroys.is_none())
+        {
+            // Exo is read once the proxy has closed the host connection,
+            // not when the compositor answered the closing sync: that
+            // answer releases a held drain barrier's, and the deferred
+            // activation that follows reaches the host after it. The proxy
+            // sends the host nothing on teardown.
+            let expected: Vec<_> = typed.field.iter().map(typing::V3Field::on_host).collect();
+            assert_eq!(
+                host.focused_fields(),
+                expected,
+                "Exo's text fields on the focused surface differ from what the guest committed"
+            );
+            FIELDS_CHECKED.fetch_add(expected.len() as u64, Ordering::Relaxed);
+            DEFERRED_ACTIVATIONS.fetch_add(typed.deferred_activations, Ordering::Relaxed);
+        }
     }
     match (framed, answered, rejected) {
         (false, ..) => Outcome::Unframed,
@@ -1002,6 +1049,14 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
         }
     }
 }
+
+/// Activations the guest's typing deferred
+/// ([`typing::Typed::deferred_activations`]), across the cases whose text
+/// fields were checked.
+static DEFERRED_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Enabled text fields whose host state was checked, across all cases.
+static FIELDS_CHECKED: AtomicU64 = AtomicU64::new(0);
 
 /// Guest objects the server created that [`check_guest_events`] saw, across
 /// all cases: evidence that their IDs were checked.
@@ -1096,7 +1151,8 @@ fn check_guest_events(
 }
 
 /// Serve a guest that makes `sends` from one `Client` and return the events
-/// it received, or `None` if the proxy neither answered the guest's closing
+/// it received and what Exo would hold once the proxy closed the host
+/// connection, or `None` if the proxy neither answered the guest's closing
 /// sync (`callback`) nor closed the connection within [`CASE_TIMEOUT`].
 /// With `host_destroys`, the compositor destroys live objects of that
 /// interface on its own (see [`compositor`]).
@@ -1110,7 +1166,7 @@ fn exchange(
     framed: bool,
     callback: u32,
     host_destroys: Option<&'static str>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Exo)> {
     let deadline = Instant::now() + CASE_TIMEOUT;
     let (guest, proxy_guest) = UnixStream::pair().expect("guest socket pair");
     let (host, proxy_host) = UnixStream::pair().expect("host socket pair");
@@ -1145,10 +1201,10 @@ fn exchange(
         .recv_timeout(EXIT_GRACE)
         .expect("the proxy finishes once the guest has left");
     proxy.join().expect("the proxy does not panic");
-    compositor
+    let host = compositor
         .join()
         .expect("the host compositor accepts every request");
-    Some(events)
+    Some((events, host))
 }
 
 /// Serve the guest on this thread, as the accept loop serves a client,
@@ -1321,7 +1377,7 @@ impl ServerIds {
 /// with `host_destroys` destroys live objects of that interface on its own
 /// as it answers a sync ([`destroy_live_objects`]), answers a text input's
 /// drain barrier late (see below), and does nothing else, until the proxy
-/// closes the connection.
+/// closes the connection. Returns what Exo would hold then.
 ///
 /// The proxy deactivates a text input and then syncs, as a drain barrier
 /// that a later activation waits for. Like a slow host, the compositor
@@ -1337,7 +1393,7 @@ impl ServerIds {
 /// still in use, or an object argument naming an object the host does not
 /// have or one of the wrong interface. Proxy-side ID translation bugs show
 /// up here.
-fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&str>) {
+fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&str>) -> Exo {
     let mut objects = BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())]);
     // Objects destroyed on their own, until their ID is reused (see
     // `destroy_live_objects`).
@@ -1345,9 +1401,9 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
     let mut deleted = BTreeSet::new();
     // Each surface's frame callbacks, which never get `done` here.
     let mut frame_callbacks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    // The seat's keyboard focus: the surface committed last, as if each
-    // commit were a click on its window.
-    let mut focus = None;
+    // Exo's view, whose seat focuses the surface committed last, as if
+    // each commit were a click on its window.
+    let mut exo = Exo::default();
     let mut serial = 0;
     // Answers held back, and whether the last request was a deactivation.
     let mut held = Vec::new();
@@ -1422,6 +1478,11 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                     "new host object {id} is still {previous:?}"
                 );
             }
+            // A request from or naming an object the compositor destroyed
+            // changes nothing.
+            if !zombie && !named.iter().any(|object| zombies.contains_key(object)) {
+                exo.request(&interface, sender, opcode, payload);
+            }
             let mut reply = Vec::new();
             // Objects the compositor creates in reply.
             match (interface.as_str(), opcode) {
@@ -1436,24 +1497,26 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                     objects.insert(buffer, "wl_buffer".to_string());
                     reply.push(zwp_linux_buffer_params_v1::evt::created(sender, buffer).0);
                 }
-                ("wl_surface", wl_surface::REQ_COMMIT) if !zombie && focus != Some(sender) => {
+                ("wl_surface", wl_surface::REQ_COMMIT)
+                    if !zombie && exo.focus() != Some(sender) =>
+                {
                     let keyboards = objects
                         .iter()
                         .filter(|&(_, interface)| interface == "wl_keyboard")
                         .map(|(&keyboard, _)| keyboard);
                     for keyboard in keyboards {
-                        if let Some(surface) = focus {
+                        if let Some(surface) = exo.focus() {
                             serial += 1;
                             reply.push(wl_keyboard::evt::leave(keyboard, serial, surface).0);
                         }
                         serial += 1;
                         reply.push(keyboard_enter(keyboard, serial, sender));
                     }
-                    focus = Some(sender);
+                    exo.set_focus(Some(sender));
                 }
                 // A new keyboard learns the seat's focus at once.
                 ("wl_seat", wl_seat::REQ_GET_KEYBOARD) => {
-                    if let Some(surface) = focus {
+                    if let Some(surface) = exo.focus() {
                         serial += 1;
                         let keyboard = first_created.expect("a keyboard");
                         reply.push(keyboard_enter(keyboard, serial, surface));
@@ -1517,7 +1580,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 }
             }
             // A destroyed surface loses the focus without a `leave`.
-            focus = focus.filter(|surface| objects.contains_key(surface));
+            exo.forget(|id| objects.contains_key(&id));
             let release = !hold && !reply.is_empty();
             held.append(&mut reply);
             if release {
@@ -1534,6 +1597,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             "the proxy sent an invalid header"
         );
     }
+    exo
 }
 
 /// Interfaces of objects that the compositor of a case that lets it
