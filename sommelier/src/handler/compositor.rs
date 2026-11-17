@@ -167,27 +167,37 @@ fn logical_transformed_extent(
     )
 }
 
+/// The damage between the given edges, at least 1x1, with every edge
+/// inside the host damage headroom.
+fn clamped_damage(left: i64, top: i64, right: i64, bottom: i64) -> SurfaceRect {
+    let left = left.clamp(DAMAGE_MIN, DAMAGE_MAX - 1);
+    let top = top.clamp(DAMAGE_MIN, DAMAGE_MAX - 1);
+    let right = right.clamp(left + 1, DAMAGE_MAX);
+    let bottom = bottom.clamp(top + 1, DAMAGE_MAX);
+    SurfaceRect::new(
+        left as i32,
+        top as i32,
+        (right - left) as i32,
+        (bottom - top) as i32,
+    )
+}
+
+/// `rect` with every edge inside the host damage headroom.
+fn clamp_damage(rect: SurfaceRect) -> SurfaceRect {
+    let (x, y) = (i64::from(rect.x), i64::from(rect.y));
+    clamped_damage(x, y, x + i64::from(rect.width), y + i64::from(rect.height))
+}
+
 fn map_surface_damage(rect: SurfaceRect) -> SurfaceRect {
     if rect.width <= 0 || rect.height <= 0 {
         return SurfaceRect::new(0, 0, 0, 0);
     }
-    let left = clamp_damage_edge(i64::from(rect.x).saturating_sub(1));
-    let top = clamp_damage_edge(i64::from(rect.y).saturating_sub(1));
-    let right = clamp_damage_edge(
-        i64::from(rect.x)
-            .saturating_add(i64::from(rect.width))
-            .saturating_add(1),
-    );
-    let bottom = clamp_damage_edge(
-        i64::from(rect.y)
-            .saturating_add(i64::from(rect.height))
-            .saturating_add(1),
-    );
-    SurfaceRect::new(
-        left as i32,
-        top as i32,
-        (right - left).max(1) as i32,
-        (bottom - top).max(1) as i32,
+    let (x, y) = (i64::from(rect.x), i64::from(rect.y));
+    clamped_damage(
+        x - 1,
+        y - 1,
+        x + i64::from(rect.width) + 1,
+        y + i64::from(rect.height) + 1,
     )
 }
 
@@ -219,19 +229,6 @@ pub(crate) fn record_xdg_toplevel(
         return;
     };
     window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
-}
-
-fn saturating_i32(value: f64) -> i32 {
-    if value.is_nan() {
-        return 0;
-    }
-    if value <= f64::from(i32::MIN) {
-        i32::MIN
-    } else if value >= f64::from(i32::MAX) {
-        i32::MAX
-    } else {
-        value as i32
-    }
 }
 
 /// Convert one buffer-local damage rectangle into surface-local coordinates.
@@ -337,15 +334,11 @@ fn map_buffer_damage(
     // Attach/offset positions the new buffer relative to the previous
     // surface contents. It does not change the buffer-coordinate damage
     // mapping; ChromiumOS' implementation likewise omits that offset here.
-    let left = x0.min(x1).trunc().max(DAMAGE_MIN as f64);
-    let top = y0.min(y1).trunc().max(DAMAGE_MIN as f64);
-    let right = x0.max(x1).ceil().min(DAMAGE_MAX as f64);
-    let bottom = y0.max(y1).ceil().min(DAMAGE_MAX as f64);
-    SurfaceRect::new(
-        saturating_i32(left),
-        saturating_i32(top),
-        saturating_i32((right - left).max(1.0)),
-        saturating_i32((bottom - top).max(1.0)),
+    clamped_damage(
+        x0.min(x1).trunc() as i64,
+        y0.min(y1).trunc() as i64,
+        x0.max(x1).ceil() as i64,
+        y0.max(y1).ceil() as i64,
     )
 }
 
@@ -407,7 +400,11 @@ fn build_surface_commit_messages(
         .or(surface_state.current_buffer_dimensions())
         .unwrap_or((1, 1));
 
-    let full_damage = full_surface_damage(surface_state, buffer_width, buffer_height);
+    let full_damage = clamp_damage(full_surface_damage(
+        surface_state,
+        buffer_width,
+        buffer_height,
+    ));
     let mut mapped = Vec::with_capacity(surface_damage.len() + buffer_damage.len() + 1);
     if force_full_damage {
         mapped.push(full_damage);
@@ -3274,6 +3271,93 @@ mod tests {
         assert_eq!(wire.read_i32().unwrap(), 19);
         assert_eq!(wire.read_i32().unwrap(), 3);
         assert_eq!(wire.read_i32().unwrap(), 3);
+    }
+
+    /// The rectangles of the host `wl_surface.damage` requests queued so far.
+    fn host_damage(ctx: &Context) -> Vec<(i32, i32, i32, i32)> {
+        ctx.client_to_host_queue
+            .iter()
+            .filter(|(message, _)| msg_sender(message) == 200 && msg_opcode(message) == REQ_DAMAGE)
+            .map(|(message, _)| {
+                let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message[8..]);
+                let mut next = || wire.read_i32().unwrap();
+                (next(), next(), next(), next())
+            })
+            .collect()
+    }
+
+    /// A surface whose committed state shows its buffer at `scale` through
+    /// a viewport with `source` (in 24.8 fixed point) and `destination`.
+    fn viewed_surface(
+        scale: i32,
+        source: Option<(i32, i32, i32, i32)>,
+        destination: Option<(i32, i32)>,
+    ) -> SurfaceState {
+        let mut surface = SurfaceState::default();
+        surface.current_buffer_scale = scale;
+        surface.viewport = Some(ViewportState {
+            source,
+            destination,
+        });
+        surface
+    }
+
+    /// The host damage of a commit with buffer damage `rect` on `surface`,
+    /// which shows a buffer of `size`.
+    fn host_damage_for(
+        surface: SurfaceState,
+        size: (i32, i32),
+        rect: (i32, i32, i32, i32),
+    ) -> Vec<(i32, i32, i32, i32)> {
+        let (mut ctx, ..) = setup_ctx();
+        ctx.surfaces.insert(TEST_SURFACE, surface);
+        set_test_surface_content(&mut ctx, TEST_SURFACE, None, Some(size));
+        ctx.last_sender_id = TEST_SURFACE;
+        let (x, y, width, height) = rect;
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, x, y, width, height),
+            Action::Drop
+        );
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        host_damage(&ctx)
+    }
+
+    /// Every host damage rectangle, partial or full, keeps both edges within
+    /// the headroom, however far a viewport stretches the buffer.
+    #[test]
+    fn host_damage_is_clamped_on_both_edges() {
+        const MAX: i32 = i32::MAX / 10;
+        // A 1x1 buffer stretched to 1000x1000 puts damage at buffer pixel
+        // 1000000 past the headroom: it shrinks to the headroom's last unit.
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(1, None, Some((1000, 1000))),
+                (1, 1),
+                (1_000_000, 0, 1, 1)
+            ),
+            [(MAX - 1, -1000, 1, 3000)]
+        );
+        // Stretched to i32::MAX units, the left edge of the last pixel would
+        // leave no room for its width.
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(1, Some((0, 0, 256, 256)), Some((i32::MAX, 256))),
+                (1, 1),
+                (i32::MAX, 0, 1, 1)
+            ),
+            [(MAX - 1, -256, 1, 768)]
+        );
+        // A buffer attached under a viewport without damage damages the
+        // whole destination.
+        let (mut ctx, ..) = setup_ctx();
+        ctx.surfaces.insert(
+            TEST_SURFACE,
+            viewed_surface(1, None, Some((i32::MAX, i32::MAX))),
+        );
+        register_test_native(&mut ctx, 42, (1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(host_damage(&ctx), [(0, 0, MAX, MAX)]);
     }
 
     #[test]
