@@ -2016,6 +2016,90 @@ mod tests {
         assert_eq!(table.allocate_host_id(), second + 1);
     }
 
+    /// A guest `zwp_text_input_v3` is backed by a host `zwp_text_input_v1`,
+    /// which has no destructor.
+    #[test]
+    fn a_paired_host_object_keeps_its_own_interface() {
+        let mut table = ShadowTable::new();
+        table.map_id(20, 40);
+        table.track_interface_with_version(20, "zwp_text_input_v3".to_string(), 1);
+        table.track_host_interface_with_version(40, "zwp_text_input_v1".to_string(), 1);
+
+        assert_eq!(
+            table.get_interface(20),
+            Some(&"zwp_text_input_v3".to_string())
+        );
+        assert_eq!(
+            table.get_host_interface(40),
+            Some(&"zwp_text_input_v1".to_string())
+        );
+        assert!(table.host_object_matches(40, "zwp_text_input_v1"));
+        assert!(
+            table.host_object_matches(40, "zwp_text_input_v3"),
+            "a paired host object also matches its guest's interface"
+        );
+
+        // Once the guest object goes, the host object keeps its own
+        // interface, routes its events and stays reserved.
+        table.remove_guest_mapping(20);
+        assert_eq!(
+            table.get_host_interface(40),
+            Some(&"zwp_text_input_v1".to_string())
+        );
+        assert!(!table.host_object_matches(40, "zwp_text_input_v3"));
+        assert!(table.is_event_sender_known(40));
+        assert!(!table.is_host_id_available(40));
+    }
+
+    #[test]
+    fn retiring_a_host_object_awaiting_delete_id_keeps_its_id_reserved() {
+        let mut table = ShadowTable::new();
+        let host_id = table.allocate_host_id();
+        table.track_host_interface(host_id, "zaura_output".to_string());
+        assert!(table.mark_pending_destroy_host(host_id));
+
+        table.retire_host_interface(host_id);
+        assert!(!table.is_pending_destroy_host_only(host_id));
+        assert!(!table.is_event_sender_known(host_id));
+        assert!(!table.is_host_id_available(host_id));
+        assert_ne!(table.allocate_host_id(), host_id);
+
+        // The host's delete_id still frees it.
+        assert_eq!(
+            table.release_deleted_host_id(host_id),
+            DeletedHostId::HostOnly
+        );
+        assert!(table.is_host_id_available(host_id));
+    }
+
+    #[test]
+    fn a_remapped_guest_leaves_its_old_host_object_only_its_own_interface() {
+        let mut table = ShadowTable::new();
+        table.map_id(20, 40);
+        table.track_host_interface_with_version(40, "zwp_text_input_v1".to_string(), 3);
+        table.map_id(21, 41);
+        table.set_host_version(41, 3);
+
+        table.map_id(20, 42);
+        table.map_id(21, 43);
+
+        assert_eq!(table.get_host_id(20), Some(42));
+        assert_eq!(table.get_guest_id(40), None);
+        assert_eq!(
+            table.get_host_interface(40),
+            Some(&"zwp_text_input_v1".to_string()),
+            "an object with its own interface stays a host-only object"
+        );
+        assert_eq!(table.host_object_version(40), None);
+        assert!(table.is_event_sender_known(40));
+        assert_eq!(table.get_guest_id(41), None);
+        assert_eq!(table.host_object_version(41), None);
+        assert!(
+            table.is_host_id_available(41),
+            "an object without its own interface is forgotten"
+        );
+    }
+
     #[test]
     fn empty_or_missing_vm_identifier_defaults_to_termina() {
         assert_eq!(resolve_vm_identifier(None), "termina");
