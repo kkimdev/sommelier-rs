@@ -353,8 +353,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `release_does_not_end_child_text_input_focus`,
   `children_keep_an_ended_seat_whose_id_the_guest_reuses`,
   `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
-  `a_seat_id_reused_for_another_object_is_not_sent_as_a_seat`,
-  `a_released_seat_whose_id_becomes_a_surface_carries_no_deactivate`.
+  `a_seat_id_reused_for_another_object_is_not_sent_as_a_seat`.
 
 ## Registry globals
 
@@ -720,7 +719,6 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_host_without_surrounding_text_support_gets_no_resend`,
   `a_deferred_activation_replays_the_committed_content_type`,
   `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
-  `a_content_type_waits_for_the_host_to_attach`,
   `the_enter_answering_an_activate_resends_nothing`,
   `an_exo_detach_activates_again_with_the_content_type`,
   `a_content_type_waits_for_exo_to_attach_again`,
