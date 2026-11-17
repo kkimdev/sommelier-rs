@@ -66,15 +66,6 @@ fn translated_sender_id(
     }
 }
 
-/// Close the descriptors of messages that will not be sent.
-fn close_pending_output_fds(out: &mut OutgoingMessages) {
-    // Each one is unique: a decoded message takes its descriptors from the
-    // connection's queue, and an encoder takes its own.
-    for fd in out.take_fds() {
-        let _ = nix::unistd::close(fd);
-    }
-}
-
 fn pending_host_event_is_stale(
     ctx: &Context,
     sender_id: u32,
@@ -396,7 +387,6 @@ impl Client {
                         );
                         break;
                     }
-                    close_pending_output_fds(&mut out);
                     return false;
                 }
                 Framing::Complete(header) => header,
@@ -408,7 +398,6 @@ impl Client {
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                close_pending_output_fds(&mut out);
                 return false;
             }
 
@@ -539,7 +528,7 @@ impl Client {
                         }
                     }
 
-                    out.push(&data, &fds);
+                    out.push((data, fds));
                     for effect in post_dispatch {
                         apply_post_dispatch(&mut self.ctx, effect);
                     }
@@ -563,7 +552,6 @@ impl Client {
                         crate::handler::display::queue_request_error(&mut self.ctx, &e);
                         break;
                     }
-                    close_pending_output_fds(&mut out);
                     return false;
                 }
             }
@@ -573,13 +561,13 @@ impl Client {
                 Direction::ClientToHost => &mut self.ctx.client_to_host_queue,
                 Direction::HostToClient => &mut self.ctx.host_to_client_queue,
             };
-            for (p_data, p_fds) in queue.drain(..) {
+            for message in queue.drain(..) {
                 log::debug!(
                     "  -> adding queued message ({} bytes, {} fds)",
-                    p_data.len(),
-                    p_fds.len()
+                    message.0.len(),
+                    message.1.len()
                 );
-                out.push(&p_data, &p_fds);
+                out.push(message);
             }
 
             offset = message_end;
@@ -597,8 +585,8 @@ impl Client {
         // otherwise it is in the reverse queue sent below.
         crate::handler::display::queue_error_if_none_queued(&mut self.ctx);
         if self.ctx.is_fatal() && matches!(direction, Direction::HostToClient) {
-            for (p_data, p_fds) in self.ctx.host_to_client_queue.drain(..) {
-                out.push(&p_data, &p_fds);
+            for message in self.ctx.host_to_client_queue.drain(..) {
+                out.push(message);
             }
         }
 
@@ -608,13 +596,13 @@ impl Client {
         // publish a newer table after more capabilities have arrived.
         self.ctx.synthetic_feedback_refresh_pending.clear();
 
+        // A send passes the peer copies of the descriptors. `out` and
+        // `reverse_out` still own them and close them when the batch ends,
+        // whether or not their send succeeded, as on any early return.
         let mut success = true;
         if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
             success = false;
         }
-        // A send duplicates the descriptors it carries; the originals are
-        // still ours, whether or not the send succeeded.
-        close_pending_output_fds(&mut out);
 
         // Bidirectional queue: when processing events in one direction, the
         // handler may queue messages for the OPPOSITE direction. For example,
@@ -632,20 +620,19 @@ impl Client {
             Direction::HostToClient => &mut self.ctx.client_to_host_queue,
         };
         let mut reverse_out = OutgoingMessages::default();
-        for (p_data, p_fds) in reverse_queue.drain(..) {
+        for message in reverse_queue.drain(..) {
             log::debug!(
                 "  -> adding reverse queued message ({} bytes, {} fds)",
-                p_data.len(),
-                p_fds.len()
+                message.0.len(),
+                message.1.len()
             );
-            reverse_out.push(&p_data, &p_fds);
+            reverse_out.push(message);
         }
         if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
             // client connection.
             success = false;
         }
-        close_pending_output_fds(&mut reverse_out);
 
         conn.read_buf.drain(..offset);
 
@@ -663,8 +650,8 @@ impl Client {
 mod tests {
     use super::*;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, shm_pool_file,
-        stream_headers,
+        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, raw_dispatch,
+        shm_pool_file, stream_headers,
     };
     use crate::wire::MessageBuilder;
     use std::fs;
@@ -1275,12 +1262,12 @@ mod tests {
         (keymap_fd, keymap_target)
     }
 
-    fn stale_keymap_event(keymap_fd: RawFd) -> Vec<u8> {
+    /// A keymap event; its descriptor travels apart from its bytes.
+    fn stale_keymap_event() -> Vec<u8> {
         use crate::protocols::wayland::wl_keyboard;
 
         let mut keymap = MessageBuilder::new();
         keymap.write_u32(1);
-        keymap.write_fd(keymap_fd);
         keymap.write_u32(0);
         keymap.build_message(STALE_HOST_KEYBOARD, wl_keyboard::EVT_KEYMAP)
     }
@@ -1311,7 +1298,7 @@ mod tests {
     async fn pending_destroy_event_consumes_known_fd_before_live_event_in_same_batch() {
         let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
         let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
-        let keymap = stale_keymap_event(keymap_fd);
+        let keymap = stale_keymap_event();
         let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
         let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
 
@@ -1357,7 +1344,7 @@ mod tests {
 
         let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
         let (keymap_fd, keymap_target) = duplicate_pipe_read_fd();
-        let keymap = stale_keymap_event(keymap_fd);
+        let keymap = stale_keymap_event();
         let live_repeat_info = repeat_info_event(LIVE_HOST_KEYBOARD);
         let expected_repeat_info = repeat_info_event(LIVE_GUEST_KEYBOARD);
 
@@ -3829,10 +3816,12 @@ mod tests {
             &[],
         );
         assert_eq!(
-            protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                &mut destroy,
-                &mut handler,
-                &mut ctx,
+            raw_dispatch(
+                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
+                    &mut destroy,
+                    &mut handler,
+                    &mut ctx,
+                )
             ),
             Ok(None)
         );
@@ -3849,10 +3838,12 @@ mod tests {
             &[],
         );
         assert_eq!(
-            protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
-                &mut duplicate_destroy,
-                &mut handler,
-                &mut ctx,
+            raw_dispatch(
+                protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
+                    &mut duplicate_destroy,
+                    &mut handler,
+                    &mut ctx,
+                )
             ),
             Err(ProtocolError::InvalidSender(guest_id))
         );
@@ -3874,7 +3865,11 @@ mod tests {
         let mut destroy =
             WireMessage::new(guest_id, protocols::wayland::wl_shm_pool::REQ_DESTROY, &[]);
         assert_eq!(
-            protocols::wayland::wl_shm_pool::dispatch_request(&mut destroy, &mut handler, &mut ctx,),
+            raw_dispatch(protocols::wayland::wl_shm_pool::dispatch_request(
+                &mut destroy,
+                &mut handler,
+                &mut ctx,
+            )),
             Ok(None)
         );
         assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
@@ -3984,12 +3979,12 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            protocols::wayland::dispatch_event(
+            raw_dispatch(protocols::wayland::dispatch_event(
                 "wl_display",
                 &mut delete_id,
                 &mut handler,
                 &mut ctx
-            ),
+            )),
             Ok(None)
         );
         let (message, _) = ctx
@@ -4047,12 +4042,12 @@ mod tests {
         let mut delete_id =
             WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
-            protocols::wayland::dispatch_event(
+            raw_dispatch(protocols::wayland::dispatch_event(
                 "wl_display",
                 &mut delete_id,
                 &mut handler,
                 &mut ctx
-            ),
+            )),
             Ok(None)
         );
         let (message, _) = ctx
@@ -4181,7 +4176,7 @@ mod tests {
         let result =
             protocols::wayland::wl_registry::dispatch_event(&mut msg, &mut probe, &mut ctx);
 
-        assert_eq!(result, Ok(None));
+        assert_eq!(raw_dispatch(result), Ok(None));
         assert!(
             !probe.called,
             "an untracked host event must not reach a stateful handler"
@@ -4240,7 +4235,7 @@ mod tests {
         );
 
         assert_eq!(
-            result,
+            raw_dispatch(result),
             Err(ProtocolError::UnsupportedVersion {
                 object_id: 10,
                 required: 3,
@@ -4283,11 +4278,11 @@ mod tests {
         let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            protocols::wayland::wl_subcompositor::dispatch_request(
+            raw_dispatch(protocols::wayland::wl_subcompositor::dispatch_request(
                 &mut msg,
                 &mut handler,
                 &mut ctx,
-            ),
+            )),
             Err(ProtocolError::InvalidObjectId(surface)),
             "requests must not retain a pending-destroy object through another argument"
         );
@@ -4315,7 +4310,7 @@ mod tests {
             protocols::xdg_shell::dispatch_event("xdg_toplevel", &mut msg, &mut handler, &mut ctx);
 
         assert_eq!(
-            result,
+            raw_dispatch(result),
             Err(ProtocolError::UnsupportedVersion {
                 object_id: 20,
                 required: 4,
@@ -4338,7 +4333,11 @@ mod tests {
         let mut handler = SommelierHandler::new();
 
         assert_eq!(
-            protocols::wayland::wl_data_source::dispatch_request(&mut msg, &mut handler, &mut ctx,),
+            raw_dispatch(protocols::wayland::wl_data_source::dispatch_request(
+                &mut msg,
+                &mut handler,
+                &mut ctx,
+            )),
             Err(ProtocolError::MessageTooLarge(65_536)),
             "generated forwarding must not truncate the Wayland length field"
         );

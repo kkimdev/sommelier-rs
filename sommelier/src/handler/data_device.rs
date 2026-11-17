@@ -137,6 +137,7 @@ mod tests {
     use super::DataDeviceHandler;
     use crate::protocols::wayland::wl_data_device;
     use crate::state::Context;
+    use crate::test_support::raw_dispatch;
     use crate::wire::WireMessage;
 
     #[test]
@@ -196,7 +197,7 @@ mod tests {
         let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx);
 
         assert_eq!(
-            result,
+            raw_dispatch(result),
             Err(crate::wire::ProtocolError::InvalidObjectId(123))
         );
         assert!(
@@ -216,7 +217,11 @@ mod tests {
         let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
 
         assert_eq!(
-            wl_data_device::dispatch_event(&mut offer, &mut DataDeviceHandler, &mut ctx),
+            raw_dispatch(wl_data_device::dispatch_event(
+                &mut offer,
+                &mut DataDeviceHandler,
+                &mut ctx
+            )),
             Ok(None)
         );
         assert_eq!(ctx.shadow_table.get_guest_id(host_offer), None);

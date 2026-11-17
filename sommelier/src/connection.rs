@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Framing, MessageHeader};
+use crate::wire::{Framing, MessageHeader, Outgoing};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::VecDeque;
@@ -55,17 +55,19 @@ pub(crate) const MAX_FDS_PER_SEND: usize = crate::virtwl::VIRTWL_SEND_MAX_ALLOCS
 /// An ordered run of outgoing Wayland messages and their descriptors.
 ///
 /// Sent by [`WaylandConnection::send_messages`], which coalesces messages
-/// into as few submissions as [`MAX_FDS_PER_SEND`] allows.
+/// into as few submissions as [`MAX_FDS_PER_SEND`] allows. It owns the
+/// descriptors: a send passes copies to the peer, and dropping the run
+/// closes them, sent or not.
 #[derive(Debug, Default)]
 pub(crate) struct OutgoingMessages {
     bytes: Vec<u8>,
-    fds: Vec<RawFd>,
+    fds: Vec<OwnedFd>,
     /// Where each message ends in `bytes` and in `fds`.
     ends: Vec<(usize, usize)>,
 }
 
 impl OutgoingMessages {
-    pub(crate) fn push(&mut self, message: &[u8], fds: &[RawFd]) {
+    pub(crate) fn push(&mut self, (message, fds): Outgoing) {
         // No Wayland message has that many descriptor arguments; one that
         // did could not be sent in a single submission.
         debug_assert!(
@@ -73,20 +75,13 @@ impl OutgoingMessages {
             "a message carries {} descriptors",
             fds.len()
         );
-        self.bytes.extend_from_slice(message);
-        self.fds.extend_from_slice(fds);
+        self.bytes.extend_from_slice(&message);
+        self.fds.extend(fds);
         self.ends.push((self.bytes.len(), self.fds.len()));
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ends.is_empty()
-    }
-
-    /// Discard the messages, returning their descriptors.
-    pub(crate) fn take_fds(&mut self) -> Vec<RawFd> {
-        self.bytes.clear();
-        self.ends.clear();
-        std::mem::take(&mut self.fds)
     }
 }
 
@@ -364,15 +359,16 @@ impl WaylandConnection {
     /// Send one transport submission. Private: everything outgoing goes
     /// through [`Self::send_messages`], which keeps each submission within
     /// [`MAX_FDS_PER_SEND`].
-    async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    async fn send(&mut self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         if data.is_empty() && fds.is_empty() {
             return Ok(());
         }
 
         match &mut self.transport {
             ConnectionTransport::Unix(fd) => {
+                let raw_fds: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
                 let mut data_offset = 0;
-                let mut fds_to_send = fds;
+                let mut fds_to_send = raw_fds.as_slice();
 
                 while data_offset < data.len() || !fds_to_send.is_empty() {
                     let mut guard = fd.writable().await?;
@@ -594,13 +590,15 @@ mod tests {
         let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
         let name = CString::new("sommelier-split-batch").unwrap();
         let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
-        let fd = memfd.as_raw_fd();
 
         // (bytes, descriptors) per message: the second message would take
         // the first submission past the limit, so it starts the next one.
         let mut messages = OutgoingMessages::default();
         for (len, fds) in [(8, 20), (12, 10), (16, 0), (20, 5)] {
-            messages.push(&vec![0; len], &vec![fd; fds]);
+            let fds = (0..fds)
+                .map(|_| memfd.try_clone().expect("dup the memfd"))
+                .collect();
+            messages.push((vec![0; len], fds));
         }
         connection
             .send_messages(&messages)

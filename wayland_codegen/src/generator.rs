@@ -67,7 +67,7 @@ pub fn generate(protocol: &Protocol) -> String {
             #![allow(clippy::single_match)]
             #![allow(clippy::collapsible_match)]
 
-            use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+            use std::os::fd::OwnedFd;
             use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
             use crate::state::Context;
 
@@ -327,7 +327,7 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
         }
         "string" => quote! { builder.write_string(&#name) },
         "array" => quote! { builder.write_array(&#name) },
-        "fd" => quote! { builder.write_fd(#name.into_raw_fd()) },
+        "fd" => quote! { builder.write_fd(#name) },
         _ => quote! { builder.write_u32(#name) },
     }
 }
@@ -949,8 +949,8 @@ fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStre
 /// argument types of every message the proxy builds itself. A message that
 /// carries a string or an array can exceed the wire's 16-bit length and
 /// returns a `Result`; any other cannot and returns the message directly.
-/// Descriptors are `OwnedFd`s that become raw only once the message is
-/// built, so a failed build closes them.
+/// The message owns its descriptors, as `OwnedFd`s, so one that cannot be
+/// built or is never sent closes them.
 fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> TokenStream {
     let name = sanitize_ident(&message.name);
     let mut params = Vec::new();
@@ -1013,7 +1013,7 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
             }
             "fd" => {
                 params.push(quote! { #arg_name: OwnedFd });
-                fds.push(quote! { #arg_name.into_raw_fd() });
+                fds.push(quote! { #arg_name });
             }
             other => panic!(
                 "{}.{}: unknown argument type {}",
@@ -1037,11 +1037,11 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
             quote! { (builder.build_message(sender_id, super::#opcode), #fds) },
         )
     };
-    // A dropped encoder result loses the message without a trace and leaks
-    // its descriptors, which are raw once it is built. The reason keeps
-    // Clippy from calling the attribute redundant on a `Result`.
+    // A dropped encoder result loses the message without a trace. The
+    // reason keeps Clippy from calling the attribute redundant on a
+    // `Result`.
     quote! {
-        #[must_use = "a message that is not queued leaks its descriptors"]
+        #[must_use = "a message that is not queued is never sent"]
         pub fn #name(sender_id: u32, #(#params),*) -> #output {
             #[allow(unused_mut)]
             let mut builder = MessageBuilder::new();

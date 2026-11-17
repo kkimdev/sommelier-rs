@@ -2043,7 +2043,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
-    use crate::test_support::{msg_sender, queued_headers, shm_pool_file};
+    use crate::test_support::{msg_sender, queued_headers, raw_dispatch, shm_pool_file};
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd};
@@ -2661,11 +2661,11 @@ mod tests {
             &[],
         );
         assert_eq!(
-            crate::protocols::wayland::wl_shm::dispatch_request(
+            raw_dispatch(crate::protocols::wayland::wl_shm::dispatch_request(
                 &mut release,
                 &mut handler,
                 &mut ctx
-            ),
+            )),
             Ok(None)
         );
         assert!(!ctx.shm_guest_formats.contains_key(&guest_shm));
@@ -2825,8 +2825,7 @@ mod tests {
                 (host_pool, wl_shm_pool::REQ_DESTROY),
             ]
         );
-        let pool_fd =
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(ctx.client_to_host_queue[0].1[0]) };
+        let pool_fd = ctx.client_to_host_queue[0].1[0].as_fd();
         let pool_size = nix::sys::stat::fstat(pool_fd)
             .expect("fstat the pool")
             .st_size;

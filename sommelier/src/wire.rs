@@ -18,16 +18,16 @@ use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::RawFd;
 
 /// The object ID of the `wl_display` singleton on every connection.
 pub const WL_DISPLAY_ID: u32 = 1;
 
 /// One encoded message and the descriptors it carries, in argument order.
 ///
-/// The generated `req::` and `evt::` encoders return it, and the proxy's
-/// send queues hold it until the message is sent.
-pub type Outgoing = (Vec<u8>, Vec<RawFd>);
+/// The generated `req::` and `evt::` encoders and forwarding return it, and
+/// the proxy's send queues hold it until the message is sent. It owns its
+/// descriptors: dropping it, sent or not, closes them.
+pub type Outgoing = (Vec<u8>, Vec<OwnedFd>);
 
 /// Queue an encoded message, or log and drop one that could not be encoded.
 ///
@@ -388,7 +388,7 @@ impl<'a> WireMessage<'a> {
 /// allows `clippy::disallowed_methods` itself.
 pub struct MessageBuilder {
     payload: Vec<u8>,
-    fds: Vec<RawFd>,
+    fds: Vec<OwnedFd>,
 }
 
 impl MessageBuilder {
@@ -445,7 +445,7 @@ impl MessageBuilder {
             .resize(self.payload.len() + padding as usize, 0);
     }
 
-    pub fn write_fd(&mut self, fd: RawFd) {
+    pub fn write_fd(&mut self, fd: OwnedFd) {
         self.fds.push(fd);
     }
 }
@@ -510,6 +510,10 @@ impl MessageBuilder {
     /// The generated encoders call it only for messages without strings or
     /// arrays, which always fit.
     pub fn build_message(self, sender_id: u32, opcode: u16) -> Vec<u8> {
+        debug_assert!(
+            self.fds.is_empty(),
+            "build_message would close the descriptors; use try_build"
+        );
         self.try_build_message(sender_id, opcode)
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -526,9 +530,9 @@ mod tests {
     use crate::protocols::viewporter::wp_viewport;
     use crate::protocols::wayland::{wl_data_offer, wl_registry, wl_shm, wl_surface};
     use crate::protocols::xdg_shell::xdg_toplevel;
-    use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file, Rng};
+    use crate::test_support::{any_fd_has_identity, fd_identity, raw_message, shm_pool_file, Rng};
     use std::collections::VecDeque;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
 
     /// Decoding holds for arbitrary bytes: a frame never claims more bytes
     /// than the stream has, no read moves past the payload, and what
@@ -622,7 +626,7 @@ mod tests {
     #[test]
     fn encoders_match_hand_built_scalar_messages() {
         assert_eq!(
-            wl_surface::req::damage(3, -1, 2, 30, 40),
+            raw_message(wl_surface::req::damage(3, -1, 2, 30, 40)),
             (
                 hand_built(3, 2, |b| {
                     b.write_i32(-1);
@@ -634,12 +638,18 @@ mod tests {
             )
         );
         assert_eq!(
-            wl_surface::req::commit(3),
+            raw_message(wl_surface::req::commit(3)),
             (hand_built(3, 6, |_| {}), Vec::new())
         );
         // wl_fixed_t keeps its raw 24.8 bits.
         assert_eq!(
-            wp_viewport::req::set_source(4, -256, 0x0100_0001, 512, i32::MAX),
+            raw_message(wp_viewport::req::set_source(
+                4,
+                -256,
+                0x0100_0001,
+                512,
+                i32::MAX
+            )),
             (
                 hand_built(4, 1, |b| {
                     b.write_fixed(-256);
@@ -653,7 +663,7 @@ mod tests {
         // A nullable object encodes null as 0.
         for (buffer, raw) in [(None, 0), (Some(9), 9)] {
             assert_eq!(
-                wl_surface::req::attach(3, buffer, 0, 0),
+                raw_message(wl_surface::req::attach(3, buffer, 0, 0)),
                 (
                     hand_built(3, 1, |b| {
                         b.write_u32(raw);
@@ -673,7 +683,7 @@ mod tests {
         // test below is what checks the layout against the decoder.
         for interface in ["wl_shm", "wl_seat", "wl_output", "abcd"] {
             assert_eq!(
-                wl_registry::req::bind(2, 7, interface, 3, 12),
+                wl_registry::req::bind(2, 7, interface, 3, 12).map(raw_message),
                 Ok((
                     hand_built(2, 0, |b| {
                         b.write_u32(7);
@@ -687,7 +697,7 @@ mod tests {
         }
         for startup_id in [None, Some(""), Some("token")] {
             assert_eq!(
-                zaura_surface::req::set_startup_id(5, startup_id),
+                zaura_surface::req::set_startup_id(5, startup_id).map(raw_message),
                 Ok((
                     hand_built(5, 3, |b| b.write_nullable_string(startup_id)),
                     Vec::new()
@@ -696,7 +706,7 @@ mod tests {
         }
         let states = [1u32, 4].map(u32::to_ne_bytes).concat();
         assert_eq!(
-            xdg_toplevel::evt::configure(6, 800, 600, &states),
+            xdg_toplevel::evt::configure(6, 800, 600, &states).map(raw_message),
             Ok((
                 hand_built(6, 0, |b| {
                     b.write_i32(800);
@@ -708,7 +718,7 @@ mod tests {
         );
         // Two bytes of indices need two bytes of padding.
         assert_eq!(
-            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(6, &[1, 0]),
+            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(6, &[1, 0]).map(raw_message),
             Ok((hand_built(6, 5, |b| b.write_array(&[1, 0])), Vec::new()))
         );
     }
@@ -718,7 +728,7 @@ mod tests {
         let pool = descriptor();
         let raw_pool = pool.as_raw_fd();
         assert_eq!(
-            wl_shm::req::create_pool(8, 20, pool, 4096),
+            raw_message(wl_shm::req::create_pool(8, 20, pool, 4096)),
             (
                 hand_built(8, 0, |b| {
                     b.write_u32(20);
@@ -730,7 +740,9 @@ mod tests {
         let plane = descriptor();
         let raw_plane = plane.as_raw_fd();
         assert_eq!(
-            zwp_linux_buffer_params_v1::req::add(9, plane, 1, 64, 256, 0, 1),
+            raw_message(zwp_linux_buffer_params_v1::req::add(
+                9, plane, 1, 64, 256, 0, 1
+            )),
             (
                 hand_built(9, 1, |b| {
                     for value in [1, 64, 256, 0, 1] {
@@ -743,32 +755,24 @@ mod tests {
         let pipe_end = descriptor();
         let raw_pipe = pipe_end.as_raw_fd();
         assert_eq!(
-            wl_data_offer::req::receive(10, "text/plain", pipe_end),
+            wl_data_offer::req::receive(10, "text/plain", pipe_end).map(raw_message),
             Ok((
                 hand_built(10, 1, |b| b.write_string("text/plain")),
                 vec![raw_pipe]
             ))
         );
-        for raw in [raw_pool, raw_plane, raw_pipe] {
-            // The caller owns the raw descriptors once they are encoded.
-            nix::unistd::close(raw).expect("close an encoded descriptor");
-        }
     }
 
     /// Decode `outgoing` with `decode`, checking that its header frames the
     /// whole message and that the decoder consumes the whole payload.
     fn round_trip<T>(
-        (message, fds): &Outgoing,
+        (message, fds): Outgoing,
         decode: impl FnOnce(&mut WireMessage) -> Result<T, ProtocolError>,
     ) -> T {
-        let header = MessageHeader::parse(message).expect("header");
+        let header = MessageHeader::parse(&message).expect("header");
         assert_eq!(header.len, message.len());
         let payload = &message[MessageHeader::LEN..];
-        // SAFETY: the caller owns the descriptors of an encoded message.
-        let mut fds: VecDeque<OwnedFd> = fds
-            .iter()
-            .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
-            .collect();
+        let mut fds = VecDeque::from(fds);
         let mut wire =
             WireMessage::new(header.sender_id, header.opcode, payload).with_fds(&mut fds);
         let decoded = decode(&mut wire).expect("decode");
@@ -780,7 +784,7 @@ mod tests {
     fn encoded_messages_decode_to_the_same_arguments() {
         let bind = wl_registry::req::bind(2, 7, "wl_seat", 5, 12).unwrap();
         let wl_registry::Request::Bind { name, id } =
-            round_trip(&bind, wl_registry::Request::from_wire);
+            round_trip(bind, wl_registry::Request::from_wire);
         assert_eq!((name, id), (7, ("wl_seat".to_string(), 5, 12)));
 
         let states = [2u32].map(u32::to_ne_bytes).concat();
@@ -789,7 +793,7 @@ mod tests {
             width,
             height,
             states: decoded_states,
-        } = round_trip(&configure, xdg_toplevel::Event::from_wire)
+        } = round_trip(configure, xdg_toplevel::Event::from_wire)
         else {
             panic!("configure decodes as another event");
         };
@@ -797,7 +801,7 @@ mod tests {
 
         let startup_id = zaura_surface::req::set_startup_id(5, None).unwrap();
         let zaura_surface::Request::SetStartupId { startup_id } =
-            round_trip(&startup_id, zaura_surface::Request::from_wire)
+            round_trip(startup_id, zaura_surface::Request::from_wire)
         else {
             panic!("set_startup_id decodes as another request");
         };
@@ -806,10 +810,9 @@ mod tests {
         let table = descriptor();
         let raw_table = table.as_raw_fd();
         let format_table = zwp_linux_dmabuf_feedback_v1::evt::format_table(6, table, 32);
-        let zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } = round_trip(
-            &format_table,
-            zwp_linux_dmabuf_feedback_v1::Event::from_wire,
-        ) else {
+        let zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } =
+            round_trip(format_table, zwp_linux_dmabuf_feedback_v1::Event::from_wire)
+        else {
             panic!("format_table decodes as another event");
         };
         assert_eq!((fd.as_raw_fd(), size), (raw_table, 32));

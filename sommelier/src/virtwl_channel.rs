@@ -312,7 +312,8 @@ impl VirtWaylandChannel {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub async fn send(&self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    /// Send `data` with copies of `fds`, which stay open.
+    pub async fn send(&self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         if fds.len() > VIRTWL_SEND_MAX_ALLOCS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -336,7 +337,7 @@ impl VirtWaylandChannel {
         Ok(())
     }
 
-    async fn send_chunk(&self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    async fn send_chunk(&self, data: &[u8], fds: &[OwnedFd]) -> io::Result<()> {
         let header_size = std::mem::size_of::<virtwl_ioctl_txn>();
         let total_bytes = header_size + data.len();
 
@@ -351,7 +352,9 @@ impl VirtWaylandChannel {
             // `send` bounds `fds.len()` by VIRTWL_SEND_MAX_ALLOCS; unused
             // slots are -1.
             let (used, unused) = txn.fds.split_at_mut(fds.len());
-            used.copy_from_slice(fds);
+            for (slot, fd) in used.iter_mut().zip(fds) {
+                *slot = fd.as_raw_fd();
+            }
             unused.fill(-1);
 
             // Copy data after header

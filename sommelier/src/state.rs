@@ -690,19 +690,12 @@ impl Default for ShadowTable {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        // Raw FDs in these structures are owned by the proxy until the
-        // corresponding queued message is flushed. A protocol error or a
-        // disconnect can drop Context before proxy::handle_msgs drains them,
-        // so close every remaining descriptor here. De-duplicate defensively:
-        // a failed/partially handled request must never turn an accidental
+        // Pending dma-buf planes hold raw descriptors. A protocol error or a
+        // disconnect can drop Context before linux_dmabuf consumes them, so
+        // close every remaining one here. De-duplicate defensively: a
+        // failed/partially handled request must never turn an accidental
         // duplicate entry into a close of a subsequently reused descriptor.
         let mut owned_fds = HashSet::new();
-        for (_, fds) in self.client_to_host_queue.drain(..) {
-            owned_fds.extend(fds);
-        }
-        for (_, fds) in self.host_to_client_queue.drain(..) {
-            owned_fds.extend(fds);
-        }
         for params in self.pending_params.drain().map(|(_, params)| params) {
             owned_fds.extend(params.into_iter().map(|param| param.fd));
         }
@@ -1578,7 +1571,6 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::os::fd::{FromRawFd, OwnedFd};
 
     fn alt_q() -> crate::accelerator::Accelerator {
@@ -2064,34 +2056,22 @@ mod tests {
 
     #[test]
     fn context_drop_closes_queued_and_pending_fds() {
-        let mut pipes = [[-1; 2]; 3];
-        for pipe in &mut pipes {
-            let result = unsafe { libc::pipe(pipe.as_mut_ptr()) };
-            assert_eq!(result, 0, "pipe should be created");
-        }
-        let read_fds: Vec<_> = pipes.iter().map(|pipe| pipe[0]).collect();
-        let queued_fd = pipes[0][1];
-        let duplicate_queued_fd = pipes[1][1];
-        let pending_fd = pipes[2][1];
-        let owned_targets = [queued_fd, duplicate_queued_fd, pending_fd]
-            .into_iter()
-            .map(|fd| {
-                fs::read_link(format!("/proc/self/fd/{fd}"))
-                    .expect("owned test descriptor should have a procfs target")
-            })
-            .collect::<Vec<_>>();
+        use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        // Memfds have identities of their own, which no other test reuses.
+        let files: [_; 4] = std::array::from_fn(|_| shm_pool_file(&[]));
+        let identities = files.each_ref().map(|file| fd_identity(file.as_raw_fd()));
+        let [first, second, third, pending] = files.map(OwnedFd::from);
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        // The same descriptor appearing in two queues is not a normal path,
-        // but Drop must remain safe if an error path leaves duplicated
-        // bookkeeping behind.
-        ctx.client_to_host_queue.push((Vec::new(), vec![queued_fd]));
+        ctx.client_to_host_queue.push((Vec::new(), vec![first]));
         ctx.host_to_client_queue
-            .push((Vec::new(), vec![queued_fd, duplicate_queued_fd]));
+            .push((Vec::new(), vec![second, third]));
         ctx.pending_params.insert(
             7,
             vec![PendingParam {
-                fd: pending_fd,
+                fd: pending.into_raw_fd(),
                 plane_idx: 0,
                 offset: 0,
                 stride: 4,
@@ -2101,22 +2081,11 @@ mod tests {
         );
         drop(ctx);
 
-        for (fd, target) in [queued_fd, duplicate_queued_fd, pending_fd]
-            .into_iter()
-            .zip(owned_targets)
-        {
-            let current = fs::read_link(format!("/proc/self/fd/{fd}"));
+        for identity in identities {
             assert!(
-                current.as_ref().map_or(true, |current| current != &target),
-                "Context::drop must release fd {} (current target: {:?})",
-                fd,
-                current
+                !any_fd_has_identity(identity),
+                "Context::drop must release every descriptor it owns"
             );
-        }
-        for fd in read_fds {
-            unsafe {
-                libc::close(fd);
-            }
         }
     }
 

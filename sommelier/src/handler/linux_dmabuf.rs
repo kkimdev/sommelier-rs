@@ -1336,7 +1336,7 @@ mod tests {
             .all(|(message, _)| { crate::test_support::msg_sender(message) == 77 }));
         assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
 
-        let table_fd = messages[0].1[0];
+        let table_fd = messages[0].1[0].as_raw_fd();
         let expected_seals =
             libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
         let seals = unsafe { libc::fcntl(table_fd, libc::F_GET_SEALS) };
@@ -1357,11 +1357,7 @@ mod tests {
             pairs[1].1
         );
 
-        for (_, fds) in messages {
-            for fd in fds {
-                let _ = nix::unistd::close(fd);
-            }
-        }
+        drop(messages);
     }
 
     #[test]
@@ -1384,11 +1380,7 @@ mod tests {
         );
         assert!(messages.iter().all(|(message, _)| message.len() <= 65_532));
 
-        for (_, fds) in messages {
-            for fd in fds {
-                let _ = nix::unistd::close(fd);
-            }
-        }
+        drop(messages);
     }
 
     /// A factory without a capability generation is the proxy's own
@@ -2450,7 +2442,7 @@ mod tests {
         }
 
         assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let rewritten_fd = ctx.host_to_client_queue[0].1[0];
+        let rewritten_fd = ctx.host_to_client_queue[0].1[0].as_raw_fd();
         let mut rewritten = [0u8; 48];
         assert_eq!(
             unsafe {

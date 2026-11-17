@@ -224,7 +224,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
-    use crate::test_support::protocol_error_code;
+    use crate::test_support::{protocol_error_code, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
@@ -261,7 +261,11 @@ mod tests {
         let mut handler = ProbeHandler;
 
         assert_eq!(
-            wl_display::dispatch_request(&mut msg, &mut handler, &mut ctx),
+            raw_dispatch(wl_display::dispatch_request(
+                &mut msg,
+                &mut handler,
+                &mut ctx
+            )),
             Err(ProtocolError::InvalidSender(999))
         );
         assert!(
