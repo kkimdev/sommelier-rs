@@ -806,11 +806,6 @@ pub struct Context {
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
     pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
-    /// Async linux-dmabuf params objects whose guest destructor was sent
-    /// before the host emitted `created`/`failed`. The key is the host params
-    /// ID, which may outlive the guest mapping when the host acknowledges the
-    /// params destructor first.
-    pub orphaned_dmabuf_params: HashMap<u32, u32>,
     pub surfaces: HashMap<u32, SurfaceState>,
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
@@ -1372,7 +1367,6 @@ impl Context {
             pools: HashMap::new(),
             render_buffers: RenderBufferRegistry::default(),
             pending_native_creates: HashMap::new(),
-            orphaned_dmabuf_params: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),

@@ -992,19 +992,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         let id = ctx.last_sender_id;
         ctx.used_dmabuf_params.remove(&id);
         if let Some(host_id) = ctx.shadow_table.get_host_id(id) {
-            if ctx
-                .pending_native_creates
-                .remove(&HostId(host_id))
-                .is_some()
-            {
-                // The host may still emit the created/failed event it owes
-                // before it processes params.destroy. Keep a host-keyed
-                // marker so that event is consumed here; the params delete_id
-                // that follows it clears the marker. Removing the pending
-                // generation here also closes its synchronization descriptor
-                // immediately.
-                ctx.orphaned_dmabuf_params.insert(host_id, id);
-            }
+            // The host may still emit the created/failed event it owes
+            // before it processes params.destroy; `on_created` and
+            // `on_failed` recognize it by the guest's pending destructor.
+            // Removing the pending generation here closes its
+            // synchronization descriptor immediately.
+            ctx.pending_native_creates.remove(&HostId(host_id));
         }
         if let Some(params) = ctx.pending_params.remove(&id) {
             for p in params {
@@ -1161,29 +1154,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
     fn on_created(&mut self, ctx: &mut Context, buffer: u32) -> Action {
         let host_params_id = ctx.last_sender_id;
-        if ctx.orphaned_dmabuf_params.contains_key(&host_params_id) {
-            if !ctx.shadow_table.is_host_id_available(buffer) {
-                error!(
-                    "Host returned an already-used wl_buffer ID {} for orphaned dmabuf",
-                    buffer
-                );
-                ctx.fatal_protocol_error = true;
-                return Action::Drop;
-            }
-            let version = ctx
-                .shadow_table
-                .host_object_version_or_unknown(host_params_id);
-            ctx.shadow_table.track_host_interface_with_version(
-                buffer,
-                "wl_buffer".to_string(),
-                version,
-            );
-            crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
-            ctx.retire_destroyed_host_object(buffer);
-            ctx.orphaned_dmabuf_params.remove(&host_params_id);
-            ctx.pending_native_creates.remove(&HostId(host_params_id));
-            return Action::Drop;
-        }
         if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
             let orphaned = ctx.shadow_table.is_pending_destroy_guest(guest_params_id);
             if orphaned {
@@ -1211,7 +1181,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 );
                 crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
                 ctx.retire_destroyed_host_object(buffer);
-                ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }
@@ -1239,14 +1208,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
     fn on_failed(&mut self, ctx: &mut Context) -> Action {
         let host_params_id = ctx.last_sender_id;
-        if ctx.orphaned_dmabuf_params.contains_key(&host_params_id) {
-            ctx.orphaned_dmabuf_params.remove(&host_params_id);
-            ctx.pending_native_creates.remove(&HostId(host_params_id));
-            return Action::Drop;
-        }
         if let Some(guest_params_id) = ctx.shadow_table.get_guest_id(host_params_id) {
             if ctx.shadow_table.is_pending_destroy_guest(guest_params_id) {
-                ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }
@@ -2321,7 +2284,7 @@ mod tests {
         // The generated dispatcher records the guest destructor after the
         // handler returns.
         ctx.shadow_table.mark_pending_destroy(guest_params_id);
-        assert!(ctx.orphaned_dmabuf_params.contains_key(&host_params_id));
+        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
 
         // The host destroyed the params object before emitting created or
         // failed, so it can no longer emit either: nothing waits for them,
@@ -2331,7 +2294,7 @@ mod tests {
             WlDisplayHandler::on_delete_id(&mut display, &mut ctx, host_params_id),
             Action::Drop
         );
-        assert!(!ctx.orphaned_dmabuf_params.contains_key(&host_params_id));
+        assert!(!ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
         assert_eq!(ctx.shadow_table.get_guest_id(host_params_id), None);
         assert_eq!(ctx.shadow_table.get_host_interface(host_params_id), None);
         assert!(ctx.shadow_table.is_host_id_available(host_params_id));

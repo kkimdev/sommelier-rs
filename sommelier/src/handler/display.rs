@@ -164,7 +164,6 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         };
         ctx.remove_render_buffer_host(id);
         ctx.pending_native_creates.remove(&HostId(id));
-        ctx.orphaned_dmabuf_params.remove(&id);
         if let Some(guest_id) = paired_guest {
             // Forward the translated acknowledgement for the guest object.
             queue_delete_id(ctx, guest_id);
