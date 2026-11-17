@@ -28,7 +28,7 @@ limitations under the License.
 //! batch that keeps the session checks that the proxy holds no state for an
 //! ended object (`Context::assert_no_orphans`).
 
-use super::{Client, Direction};
+use super::{Client, Direction, ParkedRequest};
 use crate::connection::WaylandConnection;
 use crate::protocols::wayland::{wl_compositor, wl_display, wl_registry};
 use crate::protocols::{AnyEvent, AnyRequest};
@@ -111,6 +111,21 @@ impl Session {
             !self.send(Direction::HostToClient, events).await,
             "the host's events did not end the session"
         );
+    }
+
+    /// Whether a guest request waits for a fence, holding back the guest's
+    /// stream.
+    pub(super) fn parked(&self) -> bool {
+        self.client.parked.is_some()
+    }
+
+    /// Wait until the parked guest request is due, as `Client::run` does,
+    /// and dispatch the guest's stream from it, which must not end the
+    /// session.
+    pub(super) async fn resume(&mut self) {
+        assert!(self.parked(), "no guest request waits for a fence");
+        ParkedRequest::due(self.client.parked.as_ref()).await;
+        self.guest([]).await;
     }
 
     /// What the proxy sent the host since the last call, with the sender of
@@ -273,7 +288,8 @@ impl Session {
     }
 
     /// Queue `messages` on the proxy's connection to their sender and
-    /// dispatch them as `Client::run` does; returns whether the session
+    /// dispatch them as `Client::run` does, up to a guest request that
+    /// waits for a fence ([`Self::resume`]); returns whether the session
     /// goes on.
     async fn send(
         &mut self,
@@ -294,7 +310,8 @@ impl Session {
             let goes_on = self.client.handle_msgs(direction).await;
             self.guest.receive();
             self.host.receive();
-            if !goes_on || !self.client.connection(direction).has_complete_message() {
+            let parked = direction == Direction::ClientToHost && self.client.parked.is_some();
+            if !goes_on || parked || !self.client.connection(direction).has_complete_message() {
                 return goes_on;
             }
         }

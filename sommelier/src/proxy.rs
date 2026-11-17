@@ -2401,32 +2401,66 @@ mod tests {
         assert!(sent_messages(&mut guest_peer).contains(&(CALLBACK, wl_callback::EVT_DONE)));
     }
 
-    /// Once its fence signals, the parked commit is dispatched again and
-    /// forwarded once, unchanged, before the request after it, and the
-    /// descriptor it waited on is closed.
     #[tokio::test]
     async fn a_parked_commit_is_forwarded_once_when_its_fence_signals() {
-        use protocols::wayland::wl_surface;
-        let (mut client, _guest_peer, mut host_peer, signal) =
-            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, 1);
+        use protocols::wayland::{wl_display, wl_surface};
+        let (mut s, surface) = session_with_a_surface().await;
+        let (buffer, callback) = (s.new_id(), s.new_id());
+        // A native buffer whose one plane the guest GPU writes until
+        // `signal` is written.
+        let (plane, signal) = nix::unistd::pipe().expect("create the fence pipe");
         let fence = fd_identity(signal.as_raw_fd());
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        let ctx = s.ctx();
+        ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer,
+            HOST_FENCED_BUFFER,
+            "wl_buffer",
+            1,
+        );
+        assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
+
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
+            wl_surface::req::commit(surface.id),
+            wl_display::req::sync(WL_DISPLAY_ID, callback),
+        ])
+        .await;
+        assert!(s.parked());
+        assert_eq!(
+            s.host_received(),
+            [(
+                surface.host,
+                wl_surface::Request::Attach {
+                    buffer: HOST_FENCED_BUFFER,
+                    x: 0,
+                    y: 0
+                }
+                .into()
+            )]
+        );
         // The registered plane, the parked duplicate and `signal`.
         assert_eq!(fds_with_identity(fence), 3);
 
         assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
-        ParkedRequest::due(client.parked.as_ref()).await;
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
-        assert!(client.parked.is_none());
+        s.resume().await;
+        assert!(!s.parked());
         assert_eq!(fds_with_identity(fence), 2);
-
-        drop(client);
-        let forwarded = sent_messages(&mut host_peer);
-        assert_eq!(
-            forwarded.first(),
-            Some(&(SURFACE_HOST, wl_surface::REQ_ATTACH))
+        let forwarded = s.host_received();
+        assert!(
+            matches!(
+                &forwarded[..],
+                [
+                    (commit, AnyRequest::WlSurface(wl_surface::Request::Commit {})),
+                    (
+                        WL_DISPLAY_ID,
+                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                    ),
+                ] if *commit == surface.host
+            ),
+            "the commit, once, then the request after it: {forwarded:?}"
         );
-        assert_one_commit_then_sync(&forwarded);
+        drop(s);
         drop(signal);
         assert!(!any_fd_has_identity(fence));
     }
