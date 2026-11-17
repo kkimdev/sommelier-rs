@@ -19,10 +19,10 @@ use crate::protocols::wayland::wl_data_device_manager;
 use crate::protocols::wayland::wl_data_offer;
 use crate::protocols::wayland::wl_data_source;
 use crate::state::Context;
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action};
 use log::{debug, error};
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::RawFd;
 
 pub struct DataDeviceHandler;
 
@@ -98,20 +98,8 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
                 sender_id, host_sender_id
             );
 
-            let mut builder = MessageBuilder::new();
-            builder.write_string(mime_type);
-
-            let msg_data =
-                match builder.try_build_message(host_sender_id, wl_data_offer::REQ_RECEIVE) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        error!("Dropping oversized clipboard MIME type: {}", error);
-                        return Action::Drop;
-                    }
-                };
-
-            // Dup virtwl FD
-            // virtwl_pipe is OwnedFd, so it implements AsFd.
+            // The host writes into a duplicate of the pipe, and the pump
+            // below reads from the original.
             let virtwl_fd_dup = match virtwl_pipe.try_clone() {
                 Ok(f) => f,
                 Err(e) => {
@@ -119,10 +107,13 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
                     return Action::Drop;
                 }
             };
-
-            // Push to queue, converting OwnedFd to RawFd
-            ctx.client_to_host_queue
-                .push((msg_data, vec![virtwl_fd_dup.into_raw_fd()]));
+            if !queue_or_drop(
+                &mut ctx.client_to_host_queue,
+                wl_data_offer::req::receive(host_sender_id, mime_type, virtwl_fd_dup),
+                "an oversized clipboard MIME type",
+            ) {
+                return Action::Drop;
+            }
 
             // Spawn pump task
             let pump_task = async move {

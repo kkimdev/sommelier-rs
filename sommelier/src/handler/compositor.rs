@@ -17,26 +17,22 @@ limitations under the License.
 use crate::allocator::Allocator;
 use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::{
-    copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD,
-};
+use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
+use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
-use crate::protocols::wayland::wl_surface::{
-    WlSurfaceHandler, REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY, REQ_OFFSET_SINCE,
-};
-use crate::protocols::xdg_shell::xdg_toplevel::{
-    REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
-};
+use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
+use crate::protocols::wayland::{wl_output, wl_shm};
+use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
     PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::Action;
+use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -199,22 +195,6 @@ pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String
     format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
 }
 
-pub(crate) fn wayland_string_fits_message(value: &str) -> bool {
-    // A string is encoded as a u32 length (including NUL), the bytes, and
-    // 32-bit padding. Keep the complete message within Wayland's 16-bit
-    // length field before handing it to MessageBuilder.
-    let Some(length_with_nul) = value.len().checked_add(1) else {
-        return false;
-    };
-    let Some(padded_length) = length_with_nul.checked_add(3).map(|len| len & !3) else {
-        return false;
-    };
-    8usize
-        .checked_add(4)
-        .and_then(|header_and_length| header_and_length.checked_add(padded_length))
-        .is_some_and(|total| total <= 0xffff)
-}
-
 /// Record the XDG role of a forwarded `xdg_surface.get_toplevel`
 /// ([`PostDispatch::XdgToplevelCreated`]). Running only after the forward
 /// avoids stale application/surface state when validation rejects the
@@ -274,7 +254,7 @@ fn map_buffer_damage(
     // wl_surface transforms are forwarded to the host, but this small SHM
     // bridge does not rotate its linear copy. Damage the complete buffer until
     // a rotated copy path is available.
-    if surface.current_buffer_transform != 0 {
+    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
         if let Some(viewport) = surface.viewport.filter(|viewport| !viewport.is_identity()) {
             if let Some((destination_width, destination_height)) = viewport.destination {
                 return DamageRect::new(0, 0, destination_width, destination_height);
@@ -390,7 +370,7 @@ fn full_surface_damage(
         }
     }
 
-    if surface.current_buffer_transform != 0 {
+    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
         let (width, height) = logical_transformed_extent(
             surface.current_buffer_transform,
             width,
@@ -419,7 +399,7 @@ fn build_surface_commit_messages(
     buffer_damage: &[DamageRect],
     surface_state: &SurfaceState,
     force_full_damage: bool,
-) -> Option<Vec<(Vec<u8>, Vec<RawFd>)>> {
+) -> Option<Vec<Outgoing>> {
     let host_surface_id = ctx.shadow_table.get_host_id(surface_id)?;
     let (buffer_width, buffer_height) = surface_state
         .current_buffer_id()
@@ -447,17 +427,15 @@ fn build_surface_commit_messages(
         if rect.width <= 0 || rect.height <= 0 {
             continue;
         }
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_i32(rect.x);
-        builder.write_i32(rect.y);
-        builder.write_i32(rect.width);
-        builder.write_i32(rect.height);
-        let damage = builder.build_message(host_surface_id, REQ_DAMAGE);
-        messages.push((damage, Vec::new()));
+        messages.push(wl_surface::req::damage(
+            host_surface_id,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+        ));
     }
-
-    let commit = crate::wire::MessageBuilder::new().build_message(host_surface_id, REQ_COMMIT);
-    messages.push((commit, Vec::new()));
+    messages.push(wl_surface::req::commit(host_surface_id));
     Some(messages)
 }
 
@@ -611,7 +589,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Unable to destroy wl_surface {} without its host generation",
                 wl_surface_guest_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         };
         // Keep the references owned by this surface before removing its
@@ -653,9 +631,8 @@ impl WlSurfaceHandler for CompositorHandler {
         // The generated dispatcher cannot express the ordering required by
         // the aura-shell integration: zaura_surface.release must precede the
         // paired wl_surface destructor.
-        let surface_destroy =
-            crate::wire::MessageBuilder::new().build_message(wl_surface_host_id, REQ_DESTROY);
-        ctx.client_to_host_queue.push((surface_destroy, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_surface::req::destroy(wl_surface_host_id));
         ctx.surfaces.remove(&ctx.last_sender_id);
         ctx.forget_surface_buffer_copies(wl_surface_guest_id);
         crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
@@ -717,7 +694,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 surface_id,
-                3,
+                wl_surface::ERROR_INVALID_OFFSET,
                 "wl_surface.attach offset is non-zero for version 5+",
             );
             return Action::Drop;
@@ -781,7 +758,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wl_surface::ERROR_INVALID_SCALE,
                 "invalid wl_surface buffer scale",
             );
             return Action::Drop;
@@ -802,7 +779,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                1,
+                wl_surface::ERROR_INVALID_TRANSFORM,
                 "invalid wl_surface buffer transform",
             );
             return Action::Drop;
@@ -857,7 +834,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 queue_protocol_error(
                     ctx,
                     viewport_id,
-                    1,
+                    wp_viewport::ERROR_BAD_SIZE,
                     "fractional wp_viewport source requires a destination",
                 );
             }
@@ -891,7 +868,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Cannot commit wl_surface {} without its host object",
                 surface_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                 commit.rollback(surface);
             }
@@ -913,7 +890,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     ShmCopyError::Source(_) => queue_protocol_error(
                         ctx,
                         buffer_id,
-                        WL_SHM_ERROR_INVALID_FD,
+                        wl_shm::ERROR_INVALID_FD,
                         "error accessing SHM buffer",
                     ),
                     ShmCopyError::Destination => log::warn!(
@@ -943,7 +920,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     // wl_surface.commit has no recoverable failure response.
                     // Disconnect rather than silently rolling back a request
                     // the guest reasonably believes was accepted.
-                    ctx.fatal_protocol_error = true;
+                    ctx.fail_session();
                     if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                         commit.rollback(surface);
                     }
@@ -984,7 +961,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
                     snapshot_updated,
                 );
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                     commit.rollback(surface);
                 }
@@ -1006,7 +983,7 @@ impl WlRegionHandler for CompositorHandler {}
 impl WlSubcompositorHandler for CompositorHandler {}
 impl WlSubsurfaceHandler for CompositorHandler {}
 
-impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for CompositorHandler {
+impl wp_viewporter::WpViewporterHandler for CompositorHandler {
     fn on_get_viewport(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
         if ctx
             .viewport_to_wl_surface
@@ -1017,7 +994,7 @@ impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for Compos
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wp_viewporter::ERROR_VIEWPORT_EXISTS,
                 "wl_surface already has a wp_viewport",
             );
             return Action::Drop;
@@ -1029,7 +1006,7 @@ impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for Compos
     }
 }
 
-impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for CompositorHandler {
+impl wp_viewport::WpViewportHandler for CompositorHandler {
     fn on_set_source(
         &mut self,
         ctx: &mut Context,
@@ -1042,7 +1019,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                3,
+                wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
             return Action::Drop;
@@ -1050,7 +1027,12 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
         let unset = (x, y, width, height) == (-256, -256, -256, -256);
         if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
             log::warn!("Rejecting invalid wp_viewport source rectangle");
-            queue_protocol_error(ctx, ctx.last_sender_id, 0, "invalid wp_viewport source");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                wp_viewport::ERROR_BAD_VALUE,
+                "invalid wp_viewport source",
+            );
             return Action::Drop;
         }
         let surface = ctx.surfaces.entry(surface_id).or_default();
@@ -1069,7 +1051,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                3,
+                wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
             return Action::Drop;
@@ -1084,7 +1066,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wp_viewport::ERROR_BAD_VALUE,
                 "invalid wp_viewport destination",
             );
             return Action::Drop;
@@ -1171,16 +1153,15 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 "Unable to destroy xdg_toplevel {} without its host generation",
                 xdg_toplevel_id
             );
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         };
         // The Aura toplevel goes before the role destructor (see
         // `aura_objects::release`). Retain the guest ID until the host
         // acknowledges the role destructor.
         window_placement::release_toplevel(ctx, xdg_toplevel_id);
-        let destroy_message = crate::wire::MessageBuilder::new()
-            .build_message(host_xdg_toplevel_id, REQ_DESTROY_XDG_TOPLEVEL);
-        ctx.client_to_host_queue.push((destroy_message, Vec::new()));
+        ctx.client_to_host_queue
+            .push(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
         ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
         Action::Drop
@@ -1201,29 +1182,19 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
         // ChromeOS classify every guest window as the same generic ARC app and
         // loses the client's shelf/icon identity.
         let native_app_id = native_wayland_app_id(&ctx.vm_identifier, app_id);
-        if !wayland_string_fits_message(&native_app_id) {
-            log::warn!(
-                "Dropping oversized application ID for xdg_toplevel {} ({} bytes)",
-                xdg_toplevel_id,
-                native_app_id.len()
-            );
-            return Action::Drop;
-        }
 
         // The host xdg_toplevel carries the app ID used by ordinary Exo
         // shelf/application matching. Keep that request namespaced as in the
         // reference Sommelier path rather than forwarding the guest's
-        // unqualified ID directly.
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_string(&native_app_id);
-        let Ok(message) = builder.try_build_message(xdg_toplevel_host_id, REQ_SET_APP_ID) else {
-            log::warn!(
-                "Dropping oversized namespaced app ID for xdg_toplevel {}",
-                xdg_toplevel_id
-            );
+        // unqualified ID directly. An ID too long for one message reaches
+        // neither the role nor the Aura surface.
+        if !queue_or_drop(
+            &mut ctx.client_to_host_queue,
+            xdg_toplevel::req::set_app_id(xdg_toplevel_host_id, &native_app_id),
+            format_args!("the application ID of xdg_toplevel {xdg_toplevel_id}"),
+        ) {
             return Action::Drop;
-        };
-        ctx.client_to_host_queue.push((message, Vec::new()));
+        }
 
         // Resolve xdg_toplevel → wl_surface (guest) → wl_surface (host).
         if let Some(wl_surface_guest_id) = ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id) {
@@ -1305,7 +1276,7 @@ mod tests {
     use crate::protocols::viewporter::wp_viewporter::WpViewporterHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+    use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY};
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
     use crate::state::ARC_APPLICATION_ID_PREFIX;
@@ -1595,7 +1566,7 @@ mod tests {
         ctx.last_sender_id = surface;
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(ctx.native_buffer_uses_implicit_sync(buffer));
         assert_eq!(
             ctx.client_to_host_queue
@@ -1607,7 +1578,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert_eq!(
             ctx.client_to_host_queue
                 .last()
@@ -1632,7 +1603,7 @@ mod tests {
         assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(!ctx.native_buffer_uses_implicit_sync(buffer));
         assert!(
             ctx.client_to_host_queue
@@ -1671,7 +1642,7 @@ mod tests {
         ctx.last_sender_id = surface;
         assert_eq!(handler.on_attach(ctx, buffer, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
@@ -1681,7 +1652,7 @@ mod tests {
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(handler.on_set_buffer_scale(ctx, scale), Action::Forward);
         assert_eq!(handler.on_commit(ctx), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Draw the client's next frame into `buffer`: every pool byte becomes
@@ -1960,8 +1931,8 @@ mod tests {
     fn namespaced_app_id_wire_size_boundary_is_checked() {
         // Exercise the exact 16-bit boundary independently of the namespace
         // prefix used by the production path.
-        assert!(wayland_string_fits_message(&"x".repeat(65_519)));
-        assert!(!wayland_string_fits_message(&"x".repeat(65_520)));
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_519)).is_ok());
+        assert!(xdg_toplevel::req::set_app_id(1, &"x".repeat(65_520)).is_err());
     }
 
     #[test]
@@ -2592,7 +2563,7 @@ mod tests {
             ),
             Action::Drop
         );
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         let mut buffer =
             mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all());
         buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
@@ -2610,8 +2581,8 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
-        assert_eq!(protocol_error_code(&ctx), WL_SHM_ERROR_INVALID_FD);
+        assert!(ctx.is_fatal());
+        assert_eq!(protocol_error_code(&ctx), wl_shm::ERROR_INVALID_FD);
         let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
             u32::from_ne_bytes(error[8..12].try_into().unwrap()),
@@ -2893,7 +2864,7 @@ mod tests {
                 );
             }
             assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
-            assert!(!ctx.fatal_protocol_error);
+            assert!(!ctx.is_fatal());
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue).last(),
                 Some(&(wl_surface_host, REQ_COMMIT))
@@ -2980,7 +2951,7 @@ mod tests {
             ctx.host_to_client_queue.clear();
             ctx.clear_protocol_error_for_test();
             assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
-            assert!(ctx.fatal_protocol_error);
+            assert!(ctx.is_fatal());
             assert_eq!(ctx.host_to_client_queue.len(), 1);
             assert_eq!(protocol_error_code(&ctx), code);
         };
@@ -3015,7 +2986,7 @@ mod tests {
             None
         );
         assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
@@ -3222,7 +3193,7 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
     }
@@ -3246,7 +3217,7 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
         assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
         assert_eq!(
@@ -3602,20 +3573,20 @@ mod tests {
         ctx.last_sender_id = 700;
         assert_eq!(handler.on_set_source(&mut ctx, -1, 0, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -3637,7 +3608,7 @@ mod tests {
             Action::Drop
         );
         assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -3659,7 +3630,7 @@ mod tests {
         ctx.last_sender_id = surface_id;
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 1);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert!(
             ctx.client_to_host_queue
                 .iter()

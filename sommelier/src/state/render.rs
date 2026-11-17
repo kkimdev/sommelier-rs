@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::protocols::wayland::wl_output;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::OwnedFd;
@@ -443,7 +444,7 @@ impl SurfaceCommit {
     /// mapping more than a scale.
     fn surface_to_buffer_scale(&self) -> Option<i32> {
         let state = &self.state;
-        let only_scaled = state.current_buffer_transform == 0
+        let only_scaled = state.current_buffer_transform == wl_output::TRANSFORM_NORMAL
             && !(self.has_buffer_attach() && self.buffer_offset != (0, 0))
             && state.viewport.is_none_or(ViewportState::is_identity);
         only_scaled.then_some(state.current_buffer_scale)

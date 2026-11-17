@@ -617,7 +617,7 @@ impl Client {
 
             offset = message_end;
             processed_messages += 1;
-            if self.ctx.fatal_protocol_error {
+            if self.ctx.is_fatal() {
                 break;
             }
             if processed_messages >= MAX_MESSAGES_PER_BATCH {
@@ -629,7 +629,7 @@ impl Client {
         // not queue one. Toward the guest it goes with the forwarded events;
         // otherwise it is in the reverse queue sent below.
         crate::handler::display::queue_error_if_none_queued(&mut self.ctx);
-        if self.ctx.fatal_protocol_error && matches!(direction, Direction::HostToClient) {
+        if self.ctx.is_fatal() && matches!(direction, Direction::HostToClient) {
             for (p_data, p_fds) in self.ctx.host_to_client_queue.drain(..) {
                 out.push(&p_data, &p_fds);
             }
@@ -696,7 +696,7 @@ impl Client {
         conn.read_fds.drain(..fd_offset);
         conn.read_buf.drain(..offset);
 
-        if self.ctx.fatal_protocol_error {
+        if self.ctx.is_fatal() {
             // A wl_display.error is fatal, but the queued diagnostic must
             // reach the guest before the proxy tears down this session.
             success = false;
@@ -706,6 +706,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::test_support::{
@@ -1642,7 +1643,7 @@ mod tests {
             display_errors(&mut guest_peer),
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
             )],
             "the guest learns why, as libwayland-server reports an unknown sender"
         );
@@ -1666,7 +1667,7 @@ mod tests {
         drop(client);
         assert_eq!(
             display_errors(&mut guest_peer),
-            [(1, crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD)]
+            [(1, protocols::wayland::wl_display::ERROR_INVALID_METHOD)]
         );
         let mut forwarded = Vec::new();
         host_peer
@@ -1728,9 +1729,9 @@ mod tests {
     /// against the interface of the error's object.
     #[tokio::test]
     async fn rejected_requests_report_invalid_method_on_the_display() {
-        use crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD;
+        use protocols::wayland::wl_display::ERROR_INVALID_METHOD;
         use protocols::wayland::wl_surface::REQ_ATTACH;
-        let expected = [(crate::wire::WL_DISPLAY_ID, WL_DISPLAY_ERROR_INVALID_METHOD)];
+        let expected = [(crate::wire::WL_DISPLAY_ID, ERROR_INVALID_METHOD)];
 
         assert_eq!(
             surface_request_errors(|_| {}, REQ_ATTACH, &[0]).await,
@@ -1761,7 +1762,7 @@ mod tests {
             errors,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
             )],
             "the sender is checked before its opcode, as in libwayland-server"
         );
@@ -1779,15 +1780,10 @@ mod tests {
         // A handler can end the session without queueing an error (a host
         // storage failure, say); the trailing data still gets reported.
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.fatal_protocol_error = true,
-                REQ_COMMIT,
-                &[0]
-            )
-            .await,
+            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[0]).await,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+                protocols::wayland::wl_display::ERROR_INVALID_METHOD
             )]
         );
     }
@@ -1798,15 +1794,10 @@ mod tests {
         // As a failed dma-buf sync during a commit does: fatal, with no
         // error of its own.
         assert_eq!(
-            surface_request_errors(
-                |client| client.ctx.fatal_protocol_error = true,
-                REQ_COMMIT,
-                &[]
-            )
-            .await,
+            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[]).await,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_IMPLEMENTATION
+                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
             )]
         );
     }
@@ -1849,7 +1840,7 @@ mod tests {
             display_errors(&mut guest_peer),
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+                protocols::wayland::wl_display::ERROR_INVALID_METHOD
             )]
         );
     }
@@ -4378,7 +4369,7 @@ mod tests {
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(65_520));
-        let payload = builder.payload;
+        let payload = builder.into_payload();
         let mut msg = WireMessage::new(
             10,
             protocols::wayland::wl_data_source::REQ_OFFER,

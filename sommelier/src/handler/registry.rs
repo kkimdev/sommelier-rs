@@ -22,14 +22,15 @@ use crate::handler::shm::{
 };
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
-use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::REQ_DESTROY as DMABUF_DESTROY;
-use crate::protocols::linux_dmabuf_v1::ALLOWED_INTERFACES as DMABUF_ALLOWED;
+use crate::protocols::linux_dmabuf_v1::{
+    zwp_linux_dmabuf_v1, ALLOWED_INTERFACES as DMABUF_ALLOWED,
+};
 use crate::protocols::text_input_unstable_v3::{
     zwp_text_input_manager_v3, ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED,
 };
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
-use crate::protocols::wayland::{wl_fixes, wl_registry};
+use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_output_unstable_v1::{
     zxdg_output_manager_v1, ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED,
@@ -39,7 +40,7 @@ use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
     PendingDmabufGlobal, INERT_BIND_INTERFACE,
 };
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action};
 use log::error;
 
 /// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
@@ -48,8 +49,7 @@ use log::error;
 /// proxy synthesizes the guest's feedback object from. `create_immed` is
 /// available since v2 and explicit modifier events since v3, so bind at v3
 /// when the host supports it.
-const LINUX_DMABUF_CAPABILITY_VERSION: u32 =
-    crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
+const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
 /// The newest host `zwp_text_input_manager_v1` the proxy binds: the vendored
 /// XML's. The generated code knows no message added after it, so a newer
 /// binding could deliver events whose unknown opcodes end the session.
@@ -230,25 +230,11 @@ fn queue_synthetic_global_for_registry(
         .shadow_table
         .get_guest_id(registry_host_id)
         .unwrap_or(registry_host_id);
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(name);
-    builder.write_string(interface);
-    builder.write_u32(version);
-    match builder.try_build_message(registry_guest_id, wl_registry::EVT_GLOBAL) {
-        Ok(message) => {
-            ctx.host_to_client_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Dropping oversized synthetic global {}:{}: {}",
-                name,
-                interface,
-                error
-            );
-            false
-        }
-    }
+    queue_or_drop(
+        &mut ctx.host_to_client_queue,
+        wl_registry::evt::global(registry_guest_id, name, interface, version),
+        format_args!("synthetic global {name}:{interface}"),
+    )
 }
 
 fn defer_synthetic_dmabuf_global(
@@ -344,26 +330,11 @@ fn queue_internal_bind(
     version: u32,
     host_id: u32,
 ) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(name);
-    builder.write_string(interface);
-    builder.write_u32(version);
-    builder.write_u32(host_id);
-    match builder.try_build_message(registry_host_id, wl_registry::REQ_BIND) {
-        Ok(message) => {
-            ctx.client_to_host_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Dropping oversized internal bind {}:{}: {}",
-                name,
-                interface,
-                error
-            );
-            false
-        }
-    }
+    queue_or_drop(
+        &mut ctx.client_to_host_queue,
+        wl_registry::req::bind(registry_host_id, name, interface, version, host_id),
+        format_args!("internal bind {name}:{interface}"),
+    )
 }
 
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
@@ -390,8 +361,8 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             // A registry global removal invalidates the name, not objects
             // already bound from it. Explicitly destroy our hidden binding so
             // the host does not retain a proxy until connection teardown.
-            let message = MessageBuilder::new().build_message(host_id, DMABUF_DESTROY);
-            ctx.client_to_host_queue.push((message, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zwp_linux_dmabuf_v1::req::destroy(host_id));
             ctx.retire_destroyed_host_object(host_id);
         }
         ctx.host_dmabuf_global_name = None;
@@ -798,7 +769,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             if bound && can_synthesize_feedback {
                 queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
             } else if !bound {
-                ctx.fatal_protocol_error = true;
+                ctx.fail_session();
             }
 
             // Drop the original global event so we don't send the host's
@@ -1196,7 +1167,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 queue_protocol_error(
                     ctx,
                     ctx.last_sender_id,
-                    0,
+                    wl_display::ERROR_INVALID_OBJECT,
                     format!(
                         "invalid bind for global {} (interface {}, version {})",
                         name, interface, version
@@ -1295,7 +1266,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             host_new_id,
         ) {
             ctx.shadow_table.remove_id(*guest_new_id);
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             return Action::Drop;
         }
         if interface == "wl_output" {
@@ -1593,7 +1564,7 @@ mod tests {
             1,
             "invalid wl_registry.bind must report a fatal wl_display.error"
         );
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     #[test]
@@ -1857,7 +1828,7 @@ mod tests {
 
         let bind = ("wl_output".to_string(), 3, 20);
         assert_eq!(RegistryHandler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
         assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
         assert!(ctx.outputs.is_empty_for_test());
@@ -2066,6 +2037,8 @@ mod tests {
     #[test]
     fn bind_rejects_unadvertised_interfaces_without_mapping() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let id = ("zcr_text_input_extension_v1".to_string(), 1, 20);
 
@@ -2472,6 +2445,8 @@ mod tests {
     #[test]
     fn global_remove_forwards_only_visible_globals_and_invalidates_bind() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let seat = "wl_seat".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &seat, 5), Action::Forward);
@@ -2481,7 +2456,7 @@ mod tests {
         let bind = (seat, 5, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
         assert_eq!(ctx.shadow_table.get_interface(20), None);
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
     }
 
     /// libwayland-server lets a bind cross its global's removal on the
@@ -2509,7 +2484,7 @@ mod tests {
         ctx.last_sender_id = 1;
         let bind = (output.clone(), 3, 20);
         assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "nothing reaches the host"
@@ -2524,7 +2499,7 @@ mod tests {
             handler.on_bind(&mut ctx, 10, &(output, 3, 21)),
             Action::Drop
         );
-        assert!(ctx.fatal_protocol_error, "registry 2 never saw name 10");
+        assert!(ctx.is_fatal(), "registry 2 never saw name 10");
         assert_eq!(ctx.shadow_table.get_interface(21), None);
     }
 
@@ -2699,6 +2674,8 @@ mod tests {
     #[test]
     fn bind_rejects_version_above_advertised_global() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let seat = "wl_seat".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &seat, 3), Action::Forward);
@@ -2732,7 +2709,7 @@ mod tests {
 
             let bind = (compositor.clone(), guest_version, 20);
             assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
-            assert!(!ctx.fatal_protocol_error);
+            assert!(!ctx.is_fatal());
             let host_id = ctx
                 .shadow_table
                 .get_host_id(20)
@@ -2754,7 +2731,7 @@ mod tests {
 
             let invalid_bind = (compositor, guest_version + 1, 21);
             assert_eq!(handler.on_bind(&mut ctx, 7, &invalid_bind), Action::Drop);
-            assert!(ctx.fatal_protocol_error);
+            assert!(ctx.is_fatal());
             assert_eq!(ctx.shadow_table.get_host_id(21), None);
             assert!(ctx.client_to_host_queue.is_empty());
         }

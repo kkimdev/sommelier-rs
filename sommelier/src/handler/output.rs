@@ -24,18 +24,13 @@ limitations under the License.
 //! integer `wl_output.scale` cannot.
 
 use crate::handler::aura_objects;
-use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
-use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
+use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
+use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
 pub struct OutputHandler;
-
-/// `wl_output.mode.current` from the vendored protocol.
-const WL_OUTPUT_MODE_CURRENT: u32 = 1;
-/// `zaura_output.scale_property.current` from the vendored protocol.
-const ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT: u32 = 1;
 
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
 /// forwarded unchanged. Events from a released output never get here: the
@@ -82,7 +77,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         _refresh: i32,
     ) -> Action {
         ctx.outputs.update(ctx.last_sender_id, |output| {
-            if flags & WL_OUTPUT_MODE_CURRENT != 0
+            if flags & wl_output::MODE_CURRENT != 0
                 || output.mode_width <= 0
                 || output.mode_height <= 0
             {
@@ -117,9 +112,8 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         // Forward would put wl_output.release ahead of the queued Aura
         // release, so queue the translated destructor explicitly.
         ctx.shadow_table.mark_pending_destroy(guest_output_id);
-        let release_message =
-            crate::wire::MessageBuilder::new().build_message(host_output_id, REQ_RELEASE_WL_OUTPUT);
-        ctx.client_to_host_queue.push((release_message, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_output::req::release(host_output_id));
         Action::Drop
     }
 }
@@ -164,7 +158,7 @@ impl ZauraOutputHandler for OutputHandler {
 
     fn on_scale(&mut self, ctx: &mut Context, flags: u32, scale: u32) -> Action {
         // Preferred scales describe choices, not the active DP geometry.
-        if flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT == 0 {
+        if flags & zaura_output::SCALE_PROPERTY_CURRENT == 0 {
             return Action::Drop;
         }
         let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
@@ -318,9 +312,9 @@ pub(crate) mod fixture {
         let (x, y) = display.origin;
         let (width, height) = display.mode;
         handler.on_geometry(ctx, x, y, 0, 0, 0, &no_name, &no_name, display.transform);
-        handler.on_mode(ctx, WL_OUTPUT_MODE_CURRENT, width, height, 60);
+        handler.on_mode(ctx, wl_output::MODE_CURRENT, width, height, 60);
         ctx.last_sender_id = ctx.outputs.aura_output(host_output).expect("Aura output");
-        let current = ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT;
+        let current = zaura_output::SCALE_PROPERTY_CURRENT;
         ZauraOutputHandler::on_scale(&mut handler, ctx, current, 1000);
         handler.on_device_scale_factor(ctx, display.device_scale);
         handler.on_insets(ctx, 0, 0, display.shelf, 0);
@@ -703,7 +697,7 @@ mod tests {
         assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), OUTPUT_HOST);
         assert_eq!(
             msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_RELEASE_WL_OUTPUT
+            wl_output::REQ_RELEASE
         );
         assert!(ctx.outputs.primary().is_none());
         assert!(ctx.outputs.is_empty_for_test());
@@ -734,7 +728,7 @@ mod tests {
             Action::Drop
         );
         let queued = queued_headers(&ctx.client_to_host_queue);
-        assert_eq!(queued, vec![(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]);
+        assert_eq!(queued, vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)]);
         assert!(!ctx
             .shadow_table
             .is_pending_destroy_host_only(AURA_OUTPUT_HOST));
@@ -788,7 +782,7 @@ mod tests {
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
-            [(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]
+            [(OUTPUT_HOST, wl_output::REQ_RELEASE)]
         );
         assert!(ctx.host_to_client_queue.is_empty());
         assert!(ctx.shadow_table.is_pending_destroy_guest(10));
@@ -813,7 +807,7 @@ mod tests {
             [(1, EVT_DELETE_ID)]
         );
         assert_eq!(ctx.shadow_table.get_interface(10), None);
-        assert!(!ctx.fatal_protocol_error);
+        assert!(!ctx.is_fatal());
     }
 
     /// Forwards every `zxdg_output_v1` message, as the proxy's dispatcher
@@ -851,7 +845,7 @@ mod tests {
     #[test]
     fn xdg_output_passes_through_with_translated_ids_and_versions() {
         use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
+            self, dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
         };
         let mut ctx = Context::new_for_test(false, false, vec![]);
         bind_xdg_output_manager(&mut ctx, 1);
@@ -878,9 +872,8 @@ mod tests {
         assert_eq!(event[8..], size);
 
         // `description` is a v2 event, which a v1 xdg_output never gets.
-        let mut description = crate::wire::MessageBuilder::new();
-        description.write_string("Built-in display");
-        let description = description.build_message(host_xdg_output, EVT_DESCRIPTION);
+        let (description, _) =
+            zxdg_output_v1::evt::description(host_xdg_output, "Built-in display").unwrap();
         let mut event =
             crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..], &[]);
         assert!(matches!(

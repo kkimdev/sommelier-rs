@@ -14,11 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::protocols;
-use crate::protocols::wayland::wl_callback::WlCallbackHandler;
-use crate::protocols::wayland::wl_display::REQ_SYNC;
+use crate::protocols::wayland::wl_callback::{self, WlCallbackHandler};
+use crate::protocols::wayland::wl_display;
 use crate::state::{Context, HostId, InternalCallback};
-use crate::wire::{Action, MessageBuilder, WL_DISPLAY_ID};
+use crate::wire::{Action, WL_DISPLAY_ID};
 use log::debug;
 
 pub struct CallbackHandler;
@@ -35,13 +34,11 @@ pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback
     ctx.shadow_table.track_host_interface_with_version(
         callback.0,
         "wl_callback".to_string(),
-        protocols::wayland::wl_callback::VERSION,
+        wl_callback::VERSION,
     );
     ctx.internal_callbacks.register(callback, waits_for);
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(callback.0);
-    let message = builder.build_message(WL_DISPLAY_ID, REQ_SYNC);
-    ctx.client_to_host_queue.push((message, Vec::new()));
+    ctx.client_to_host_queue
+        .push(wl_display::req::sync(WL_DISPLAY_ID, callback.0));
     callback
 }
 
@@ -92,18 +89,11 @@ impl WlCallbackHandler for CallbackHandler {
                 guest_id
             );
 
-            // 1. Send done event to client
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(callback_data);
-            let done = builder.build_message(guest_id, protocols::wayland::wl_callback::EVT_DONE);
-            ctx.host_to_client_queue.push((done, Vec::new()));
-
-            // 2. Send delete_id to client
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(guest_id);
-            let delete_id =
-                builder.build_message(WL_DISPLAY_ID, protocols::wayland::wl_display::EVT_DELETE_ID);
-            ctx.host_to_client_queue.push((delete_id, Vec::new()));
+            // The done event, then the delete_id the guest expects for it.
+            ctx.host_to_client_queue.extend([
+                wl_callback::evt::done(guest_id, callback_data),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id),
+            ]);
 
             // The terminal event destroys the callback on both sides, but the
             // host numeric ID cannot be reused until its later delete_id. The

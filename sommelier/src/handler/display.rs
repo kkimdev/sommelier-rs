@@ -16,30 +16,22 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, DeletedHostId, HostId};
-use crate::wire::{Action, MessageBuilder, ProtocolError, WL_DISPLAY_ID};
+use crate::wire::{queue_or_drop, Action, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
-
-/// `wl_display.error` code: the request names an object that does not
-/// exist.
-pub(crate) const WL_DISPLAY_ERROR_INVALID_OBJECT: u32 = 0;
-/// `wl_display.error` code: the request is not valid for its object.
-pub(crate) const WL_DISPLAY_ERROR_INVALID_METHOD: u32 = 1;
-/// `wl_display.error` code: the compositor (here, the proxy) failed.
-pub(crate) const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 
 /// End a fatal session with an `implementation` error if nothing has told
 /// the guest why yet: internal failures (a dma-buf sync that fails during
 /// a commit, say) mark the session fatal without an error of their own,
 /// and every session closed for a protocol reason gets exactly one.
 pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
-    if ctx.fatal_protocol_error {
+    if ctx.is_fatal() {
         // A no-op when an error is already queued.
         queue_protocol_error(
             ctx,
             WL_DISPLAY_ID,
-            WL_DISPLAY_ERROR_IMPLEMENTATION,
+            wl_display::ERROR_IMPLEMENTATION,
             "the proxy failed to handle a request",
         );
     }
@@ -54,8 +46,8 @@ pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
 /// used, even one that names the sender).
 pub(crate) fn queue_request_error(ctx: &mut Context, error: &ProtocolError) {
     let code = match error {
-        ProtocolError::InvalidSender(_) => WL_DISPLAY_ERROR_INVALID_OBJECT,
-        _ => WL_DISPLAY_ERROR_INVALID_METHOD,
+        ProtocolError::InvalidSender(_) => wl_display::ERROR_INVALID_OBJECT,
+        _ => wl_display::ERROR_INVALID_METHOD,
     };
     queue_protocol_error(ctx, WL_DISPLAY_ID, code, error.to_string());
 }
@@ -74,7 +66,7 @@ pub(crate) fn queue_protocol_error(
 ) {
     // Whether or not the diagnostic itself fits in the Wayland wire limit,
     // the malformed request is fatal and must terminate the session.
-    ctx.fatal_protocol_error = true;
+    ctx.fail_session();
     if !ctx.note_protocol_error() {
         return;
     }
@@ -93,15 +85,10 @@ pub(crate) fn queue_protocol_error(
         }
         &message[..end]
     };
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(object_id);
-    builder.write_u32(code);
-    builder.write_string(diagnostic);
-    let _ = queue_message(
+    queue_or_drop(
         &mut ctx.host_to_client_queue,
-        WL_DISPLAY_ID,
-        wl_display::EVT_ERROR,
-        builder,
+        wl_display::evt::error(WL_DISPLAY_ID, object_id, code, diagnostic),
+        format_args!("the protocol error on object {object_id}"),
     );
 }
 
@@ -125,10 +112,8 @@ pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
 }
 
 fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(guest_id);
-    let delete_id = builder.build_message(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID);
-    ctx.host_to_client_queue.push((delete_id, Vec::new()));
+    ctx.host_to_client_queue
+        .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
 }
 
 /// Retire a synthetic guest object and queue its local delete acknowledgement.
@@ -146,27 +131,6 @@ pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
     }
 }
 
-fn queue_message(
-    queue: &mut Vec<(Vec<u8>, Vec<std::os::unix::io::RawFd>)>,
-    sender_id: u32,
-    opcode: u16,
-    builder: MessageBuilder,
-) -> bool {
-    match builder.try_build_message(sender_id, opcode) {
-        Ok(message) => {
-            queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            error!(
-                "Dropping display message sender={} opcode={}: {}",
-                sender_id, opcode, error
-            );
-            false
-        }
-    }
-}
-
 impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
         let host_registry_id = ctx.shadow_table.allocate_host_id();
@@ -174,10 +138,10 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(registry, "wl_registry".to_string());
 
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_registry_id);
-        let get_registry = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_GET_REGISTRY);
-        ctx.client_to_host_queue.push((get_registry, Vec::new()));
+        ctx.client_to_host_queue.push(wl_display::req::get_registry(
+            WL_DISPLAY_ID,
+            host_registry_id,
+        ));
 
         Action::Drop
     }
@@ -188,10 +152,8 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(callback, "wl_callback".to_string());
 
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_callback_id);
-        let sync = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_SYNC);
-        ctx.client_to_host_queue.push((sync, Vec::new()));
+        ctx.client_to_host_queue
+            .push(wl_display::req::sync(WL_DISPLAY_ID, host_callback_id));
 
         Action::Drop
     }
@@ -224,7 +186,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         // The host ends the connection after its error, so the session is
         // over, and its error is the guest's one error unless the guest
         // already has one.
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
         let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
             // wl_display.error.object_id is a non-null object argument. An
             // internal host-only object has no valid guest ID; forwarding 0
@@ -237,26 +199,22 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             );
             return Action::Drop;
         };
-        if !ctx.note_protocol_error() {
-            return Action::Drop;
-        }
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
         );
-
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(guest_id);
-        builder.write_u32(code);
-        builder.write_string(message);
-
-        queue_message(
-            &mut ctx.host_to_client_queue,
-            WL_DISPLAY_ID,
-            wl_display::EVT_ERROR,
-            builder,
-        );
-
+        // Only an error the guest receives takes the session's one error. A
+        // message too long to forward leaves the slot to the
+        // `implementation` error every fatal session ends with
+        // ([`queue_error_if_none_queued`]).
+        match wl_display::evt::error(WL_DISPLAY_ID, guest_id, code, message) {
+            Ok(event) => {
+                if ctx.note_protocol_error() {
+                    ctx.host_to_client_queue.push(event);
+                }
+            }
+            Err(error) => log::warn!("Dropping the host error on object {guest_id}: {error}"),
+        }
         Action::Drop
     }
 }
@@ -266,13 +224,14 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
+    use crate::test_support::protocol_error_code;
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
 
     impl WlDisplayHandler for ProbeHandler {
         fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
-            ctx.fatal_protocol_error = true;
+            ctx.fail_session();
             Action::Drop
         }
     }
@@ -306,7 +265,7 @@ mod tests {
             Err(ProtocolError::InvalidSender(999))
         );
         assert!(
-            !ctx.fatal_protocol_error,
+            !ctx.is_fatal(),
             "an invalid sender must not reach a mutating handler"
         );
     }
@@ -342,12 +301,32 @@ mod tests {
         );
     }
 
+    /// A host error too long to forward does not use up the session's one
+    /// error: the guest still learns why it ends.
+    #[test]
+    fn an_unforwardable_host_error_leaves_the_implementation_error() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.map_id(7, 77);
+
+        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520));
+        queue_error_if_none_queued(&mut ctx);
+
+        assert_eq!(ctx.host_to_client_queue.len(), 1, "exactly one error");
+        let error = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
+            WL_DISPLAY_ID,
+            "the error names the display"
+        );
+        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
+    }
+
     #[test]
     fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         queue_protocol_error(&mut ctx, 7, 3, "x".repeat(65_520));
 
-        assert!(ctx.fatal_protocol_error);
+        assert!(ctx.is_fatal());
         assert_eq!(
             ctx.host_to_client_queue.len(),
             1,

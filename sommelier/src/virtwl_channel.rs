@@ -463,7 +463,7 @@ mod tests {
     use crate::protocols::wayland::wl_display;
     use crate::test_support::{any_fd_has_identity, fd_identity, TestFdIdentity};
     use crate::virtwl::virtwl_ioctl_txn;
-    use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
+    use crate::wire::WL_DISPLAY_ID;
     use nix::fcntl::OFlag;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
@@ -532,13 +532,9 @@ mod tests {
             "AsyncFd receive must wait while the VirtWL context is empty"
         );
 
-        let mut sync = MessageBuilder::new();
-        sync.write_u32(2);
+        let (sync, _) = wl_display::req::sync(WL_DISPLAY_ID, 2);
         channel
-            .send(
-                &sync.build_message(WL_DISPLAY_ID, wl_display::REQ_SYNC),
-                &[],
-            )
+            .send(&sync, &[])
             .await
             .expect("send wl_display.sync through live VirtWL");
         let (reply, fds) = tokio::time::timeout(Duration::from_secs(5), recv_task)

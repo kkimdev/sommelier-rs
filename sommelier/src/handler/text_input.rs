@@ -28,108 +28,40 @@ use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
     InternalCallback, SeatFocusChange, ShadowTable,
 };
-use crate::wire::{Action, MessageBuilder};
-use std::os::unix::io::RawFd;
+use crate::wire::{queue_or_drop, Action, Outgoing};
 
-/// Push a wire message built by `builder` onto `queue`, binding it to
-/// `sender_id` / `opcode`. Centralizes the (header + payload) assembly that
-/// used to be open-coded with `extend_from_slice` + `(len << 16) | opcode`.
-fn push_msg(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    sender_id: u32,
-    opcode: u16,
-    builder: MessageBuilder,
-) -> bool {
-    match builder.try_build_message(sender_id, opcode) {
-        Ok(message) => {
-            queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            // Host-originated text is untrusted. A malformedly large commit
-            // or preedit must be dropped, not allowed to panic the proxy while
-            // encoding Wayland's 16-bit message length.
-            log::warn!(
-                "Dropping oversized text-input message sender={} opcode={}: {}",
-                sender_id,
-                opcode,
-                error
-            );
-            false
-        }
-    }
-}
-
-fn push_done_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, serial: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(serial);
-    let done = builder.build_message(guest_id, zwp_text_input_v3::EVT_DONE);
-    queue.push((done, Vec::new()));
-}
-
-fn push_enter_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, surface: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(surface);
-    let enter = builder.build_message(guest_id, zwp_text_input_v3::EVT_ENTER);
-    queue.push((enter, Vec::new()));
-}
-
-fn push_leave_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, surface: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(surface);
-    let leave = builder.build_message(guest_id, zwp_text_input_v3::EVT_LEAVE);
-    queue.push((leave, Vec::new()));
-}
-
+/// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
+/// fit a message (see [`queue_or_drop`]).
+///
+/// # Returns
+///
+/// Whether the event was queued.
 fn push_preedit_string_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
+    queue: &mut Vec<Outgoing>,
     guest_id: u32,
     text: &str,
     cursor_begin: i32,
     cursor_end: i32,
 ) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_string(text);
-    builder.write_i32(cursor_begin);
-    builder.write_i32(cursor_end);
-    push_msg(
+    queue_or_drop(
         queue,
-        guest_id,
-        zwp_text_input_v3::EVT_PREEDIT_STRING,
-        builder,
+        zwp_text_input_v3::evt::preedit_string(guest_id, Some(text), cursor_begin, cursor_end),
+        format_args!("the preedit of text input {guest_id}"),
     )
 }
 
-fn push_commit_string_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    guest_id: u32,
-    text: &str,
-) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_string(text);
-    push_msg(
+/// Queue `zwp_text_input_v3.commit_string`, or drop host text that does not
+/// fit a message (see [`queue_or_drop`]).
+///
+/// # Returns
+///
+/// Whether the event was queued.
+fn push_commit_string_to(queue: &mut Vec<Outgoing>, guest_id: u32, text: &str) -> bool {
+    queue_or_drop(
         queue,
-        guest_id,
-        zwp_text_input_v3::EVT_COMMIT_STRING,
-        builder,
+        zwp_text_input_v3::evt::commit_string(guest_id, Some(text)),
+        format_args!("the commit of text input {guest_id}"),
     )
-}
-
-fn push_delete_surrounding_text_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    guest_id: u32,
-    before_length: u32,
-    after_length: u32,
-) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(before_length);
-    builder.write_u32(after_length);
-    let delete = builder.build_message(guest_id, zwp_text_input_v3::EVT_DELETE_SURROUNDING_TEXT);
-    queue.push((delete, Vec::new()));
-}
-
-fn push_done(ctx: &mut Context, guest_id: u32, serial: u32) {
-    push_done_to(&mut ctx.host_to_client_queue, guest_id, serial);
 }
 
 fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> {
@@ -530,94 +462,107 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         );
         return false;
     }
-    for state in [1, 0] {
+    for state in [
+        wl_keyboard::KEY_STATE_PRESSED,
+        wl_keyboard::KEY_STATE_RELEASED,
+    ] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(ctx.synthetic_keyboard_serial);
-        builder.write_u32(held.time);
-        builder.write_u32(held.key);
-        builder.write_u32(state);
-        let key = builder.build_message(held.guest_keyboard_id, wl_keyboard::EVT_KEY);
-        ctx.host_to_client_queue.push((key, Vec::new()));
+        ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+            held.guest_keyboard_id,
+            ctx.synthetic_keyboard_serial,
+            held.time,
+            held.key,
+            state,
+        ));
     }
     true
 }
 
 fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
-    const V1_SENSITIVE_DATA: u32 = 0x80;
-    const INPUT_FLAG_AUTOCOMPLETE_ON: u32 = 1 << 0;
-    const INPUT_FLAG_SPELLCHECK_ON: u32 = 1 << 4;
-    const INPUT_FLAG_AUTOCAPITALIZE_NONE: u32 = 1 << 6;
-    const INPUT_FLAG_AUTOCAPITALIZE_CHARACTERS: u32 = 1 << 7;
-    const INPUT_FLAG_AUTOCAPITALIZE_WORDS: u32 = 1 << 8;
-    const INPUT_FLAG_AUTOCAPITALIZE_SENTENCES: u32 = 1 << 9;
-    const INPUT_FLAG_HAS_BEEN_PASSWORD: u32 = 1 << 10;
+    use zcr_extended_text_input_v1 as ext;
+    use zwp_text_input_v1 as v1;
+    use zwp_text_input_v3 as v3;
 
     // zwp_text_input_v1 has no PIN purpose and its values after PASSWORD are
     // shifted by one compared with v3.
     let mut v1_hint = hint;
     let v1_purpose = match purpose {
-        0..=8 => purpose,
-        9 => {
-            v1_hint |= V1_SENSITIVE_DATA;
-            2 // PIN -> DIGITS + sensitive_data
+        v3::CONTENT_PURPOSE_NORMAL..=v3::CONTENT_PURPOSE_PASSWORD => purpose,
+        v3::CONTENT_PURPOSE_PIN => {
+            v1_hint |= v1::CONTENT_HINT_SENSITIVE_DATA;
+            v1::CONTENT_PURPOSE_DIGITS
         }
-        10 => 9,  // DATE
-        11 => 10, // TIME
-        12 => 11, // DATETIME
-        13 => 12, // TERMINAL
-        _ => 0,   // Unknown values degrade to NORMAL.
+        v3::CONTENT_PURPOSE_DATE => v1::CONTENT_PURPOSE_DATE,
+        v3::CONTENT_PURPOSE_TIME => v1::CONTENT_PURPOSE_TIME,
+        v3::CONTENT_PURPOSE_DATETIME => v1::CONTENT_PURPOSE_DATETIME,
+        v3::CONTENT_PURPOSE_TERMINAL => v1::CONTENT_PURPOSE_TERMINAL,
+        _ => v1::CONTENT_PURPOSE_NORMAL, // Unknown values degrade to NORMAL.
     };
 
     // Chrome's extension uses TextInputType/TextInputMode enums rather than
     // Wayland's content-purpose enum.
-    let input_type = match (purpose, hint & 0x200 != 0) {
-        (0 | 1 | 7, true) => 14, // TEXT_AREA
-        (2 | 3 | 9, _) => 5,     // NUMBER
-        (4, _) => 6,             // TELEPHONE
-        (5, _) => 7,             // URL
-        (6, _) => 4,             // EMAIL
-        (8, _) => 2,             // PASSWORD
-        (10, _) => 8,            // DATE
-        (11, _) => 12,           // TIME
-        (12, _) => 9,            // DATE_TIME
-        _ => 1,                  // TEXT
+    let multiline = hint & v3::CONTENT_HINT_MULTILINE != 0;
+    let input_type = match (purpose, multiline) {
+        (
+            v3::CONTENT_PURPOSE_NORMAL | v3::CONTENT_PURPOSE_ALPHA | v3::CONTENT_PURPOSE_NAME,
+            true,
+        ) => ext::INPUT_TYPE_TEXT_AREA,
+        (v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_NUMBER | v3::CONTENT_PURPOSE_PIN, _) => {
+            ext::INPUT_TYPE_NUMBER
+        }
+        (v3::CONTENT_PURPOSE_PHONE, _) => ext::INPUT_TYPE_TELEPHONE,
+        (v3::CONTENT_PURPOSE_URL, _) => ext::INPUT_TYPE_URL,
+        (v3::CONTENT_PURPOSE_EMAIL, _) => ext::INPUT_TYPE_EMAIL,
+        (v3::CONTENT_PURPOSE_PASSWORD, _) => ext::INPUT_TYPE_PASSWORD,
+        (v3::CONTENT_PURPOSE_DATE, _) => ext::INPUT_TYPE_DATE,
+        (v3::CONTENT_PURPOSE_TIME, _) => ext::INPUT_TYPE_TIME,
+        (v3::CONTENT_PURPOSE_DATETIME, _) => ext::INPUT_TYPE_DATE_TIME,
+        _ => ext::INPUT_TYPE_TEXT,
     };
     let input_mode = match purpose {
-        2 | 9 => 6, // NUMERIC
-        3 => 7,     // DECIMAL
-        4 => 3,     // TEL
-        5 => 4,     // URL
-        6 => 5,     // EMAIL
-        _ => 0,     // DEFAULT
+        v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_PIN => ext::INPUT_MODE_NUMERIC,
+        v3::CONTENT_PURPOSE_NUMBER => ext::INPUT_MODE_DECIMAL,
+        v3::CONTENT_PURPOSE_PHONE => ext::INPUT_MODE_TEL,
+        v3::CONTENT_PURPOSE_URL => ext::INPUT_MODE_URL,
+        v3::CONTENT_PURPOSE_EMAIL => ext::INPUT_MODE_EMAIL,
+        _ => ext::INPUT_MODE_DEFAULT,
     };
 
-    let mut input_flags = 0;
-    if hint & 0x1 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCOMPLETE_ON;
+    let mut input_flags = ext::INPUT_FLAGS_NONE;
+    if hint & v3::CONTENT_HINT_COMPLETION != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCOMPLETE_ON;
     }
-    if hint & 0x2 != 0 {
+    if hint & v3::CONTENT_HINT_SPELLCHECK != 0 {
         // text-input-v3 calls bit 1 `spellcheck`. Chrome's extension keeps
         // spellchecking distinct from its separate autocorrect flag.
-        input_flags |= INPUT_FLAG_SPELLCHECK_ON;
+        input_flags |= ext::INPUT_FLAGS_SPELLCHECK_ON;
     }
-    if hint & 0x4 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_SENTENCES;
+    if hint & v3::CONTENT_HINT_AUTO_CAPITALIZATION != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_SENTENCES;
     }
-    if hint & 0x8 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_NONE;
+    if hint & v3::CONTENT_HINT_LOWERCASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_NONE;
     }
-    if hint & 0x10 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_CHARACTERS;
+    if hint & v3::CONTENT_HINT_UPPERCASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_CHARACTERS;
     }
-    if hint & 0x20 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_WORDS;
+    if hint & v3::CONTENT_HINT_TITLECASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_WORDS;
     }
-    if hint & (0x40 | 0x80) != 0 || matches!(purpose, 8 | 9) {
-        input_flags |= INPUT_FLAG_HAS_BEEN_PASSWORD;
+    let secret = hint & (v3::CONTENT_HINT_HIDDEN_TEXT | v3::CONTENT_HINT_SENSITIVE_DATA) != 0
+        || matches!(
+            purpose,
+            v3::CONTENT_PURPOSE_PASSWORD | v3::CONTENT_PURPOSE_PIN
+        );
+    if secret {
+        input_flags |= ext::INPUT_FLAGS_HAS_BEEN_PASSWORD;
     }
 
-    let learning_mode = u32::from(!matches!(purpose, 8 | 9) && hint & (0x40 | 0x80) == 0);
+    let learning_mode = if secret {
+        ext::LEARNING_MODE_DISABLED
+    } else {
+        ext::LEARNING_MODE_ENABLED
+    };
     (
         v1_hint,
         v1_purpose,
@@ -690,7 +635,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -760,13 +705,15 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         // applied as part of the following commit_string. Preserve that
         // transaction boundary when translating to v3.
         for &(before, after) in &plan.deletes {
-            push_delete_surrounding_text_to(&mut transaction, guest_id, before, after);
+            transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+                guest_id, before, after,
+            ));
         }
 
         if !push_commit_string_to(&mut transaction, guest_id, text) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -836,9 +783,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         if let Some((keyboard_id, host_keyboard_id)) = keyboard {
             if !matches!(
                 state,
-                crate::handler::keyboard::WL_KEY_PRESSED
-                    | crate::handler::keyboard::WL_KEY_REPEATED
-                    | crate::handler::keyboard::WL_KEY_RELEASED
+                wl_keyboard::KEY_STATE_PRESSED
+                    | wl_keyboard::KEY_STATE_REPEATED
+                    | wl_keyboard::KEY_STATE_RELEASED
             ) {
                 log::warn!(
                     "Ignoring keysym with invalid key state {} for sym=0x{:x}",
@@ -855,11 +802,11 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 .or_else(|| keysym_to_evdev_keycode(sym));
             if let Some(keycode) = keycode {
                 let event = match state {
-                    crate::handler::keyboard::WL_KEY_PRESSED => GuestKeyEvent::TextInputPress {
+                    wl_keyboard::KEY_STATE_PRESSED => GuestKeyEvent::TextInputPress {
                         serial: wayland_serial,
                     },
-                    crate::handler::keyboard::WL_KEY_REPEATED => GuestKeyEvent::TextInputRepeat,
-                    crate::handler::keyboard::WL_KEY_RELEASED => GuestKeyEvent::TextInputRelease {
+                    wl_keyboard::KEY_STATE_REPEATED => GuestKeyEvent::TextInputRepeat,
+                    wl_keyboard::KEY_STATE_RELEASED => GuestKeyEvent::TextInputRelease {
                         serial: wayland_serial,
                     },
                     _ => unreachable!("keysym state validated above"),
@@ -874,8 +821,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                     );
                     return Action::Drop;
                 }
-                if ((state == crate::handler::keyboard::WL_KEY_PRESSED
-                    || state == crate::handler::keyboard::WL_KEY_REPEATED)
+                if ((state == wl_keyboard::KEY_STATE_PRESSED
+                    || state == wl_keyboard::KEY_STATE_REPEATED)
                     && keycode != crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
                     || (decision.ends_repeat
                         && keycode == crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
@@ -888,13 +835,13 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                     "  -> forwarding wl_keyboard.key: keyboard_id={}, serial={}, time={}, keycode={}, state={}",
                     keyboard_id, wayland_serial, timestamp_millis, keycode, state
                 );
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(wayland_serial); // serial
-                builder.write_u32(timestamp_millis); // time
-                builder.write_u32(keycode); // key
-                builder.write_u32(state); // state (0: released, 1: pressed)
-                let key = builder.build_message(keyboard_id, wl_keyboard::EVT_KEY);
-                ctx.host_to_client_queue.push((key, Vec::new()));
+                ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+                    keyboard_id,
+                    wayland_serial,
+                    timestamp_millis,
+                    keycode,
+                    state,
+                ));
             } else {
                 log::warn!(
                     "  -> could not find keycode for sym=0x{:x} ({:?})",
@@ -1109,7 +1056,11 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
         let mut transaction = Vec::new();
-        push_delete_surrounding_text_to(&mut transaction, guest_id, before_length, after_length);
+        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+            guest_id,
+            before_length,
+            after_length,
+        ));
         if !push_preedit_string_to(
             &mut transaction,
             guest_id,
@@ -1119,7 +1070,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         ) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -1226,7 +1177,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 // before applying a key that passed through the active IME.
                 // A v1 confirm with no preedit has no text mutation, so its v3
                 // equivalent is an empty done.
-                push_done(ctx, guest_id, plan.done_serial);
+                ctx.host_to_client_queue
+                    .push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
                 return Action::Drop;
             }
             end_backspace_repeat_for_text_input(ctx, plan.guest_seat, guest_id);
@@ -1254,7 +1206,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         if !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -1284,26 +1236,23 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             return Action::Drop;
         };
         let host_v1_id = ctx.shadow_table.allocate_host_id();
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_v1_id);
-        let create = builder.build_message(
-            host_manager_id,
-            zwp_text_input_manager_v1::REQ_CREATE_TEXT_INPUT,
-        );
-        ctx.client_to_host_queue.push((create, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zwp_text_input_manager_v1::req::create_text_input(
+                host_manager_id,
+                host_v1_id,
+            ));
 
         let host_ext = ctx
             .host_text_input_extension_v1_id
             .map(|host_ext_manager_id| {
                 let host_ext_id = ctx.shadow_table.allocate_host_id();
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(host_ext_id);
-                builder.write_u32(host_v1_id);
-                let get_extended = builder.build_message(
-                    host_ext_manager_id,
-                    zcr_text_input_extension_v1::REQ_GET_EXTENDED_TEXT_INPUT,
+                ctx.client_to_host_queue.push(
+                    zcr_text_input_extension_v1::req::get_extended_text_input(
+                        host_ext_manager_id,
+                        host_ext_id,
+                        host_v1_id,
+                    ),
                 );
-                ctx.client_to_host_queue.push((get_extended, Vec::new()));
                 (host_ext_id, host_ext_manager_id)
             });
 
@@ -1353,7 +1302,8 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
         // still needs the current enter event; otherwise the client may wait
         // indefinitely for a focus transition before enabling IME.
         if let Some(surface) = active_surface {
-            push_enter_to(&mut ctx.host_to_client_queue, id, surface);
+            ctx.host_to_client_queue
+                .push(zwp_text_input_v3::evt::enter(id, surface));
         }
 
         Action::Drop
@@ -1381,13 +1331,11 @@ fn queue_host_deactivation_barrier(
             "Text-input {} was not active when its drain barrier was installed",
             guest_id
         );
-        ctx.fatal_protocol_error = true;
+        ctx.fail_session();
         return;
     }
-    let mut deactivate = MessageBuilder::new();
-    deactivate.write_u32(host_seat);
-    let deactivate = deactivate.build_message(host_v1_id, zwp_text_input_v1::REQ_DEACTIVATE);
-    ctx.client_to_host_queue.push((deactivate, Vec::new()));
+    ctx.client_to_host_queue
+        .push(zwp_text_input_v1::req::deactivate(host_v1_id, host_seat));
     let callback = queue_internal_sync(
         ctx,
         InternalCallback::TextInputDrained {
@@ -1495,11 +1443,12 @@ pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
                 host_v1_id,
                 host_surface,
             );
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(host_seat);
-        builder.write_u32(host_surface);
-        let activate = builder.build_message(host_v1_id, zwp_text_input_v1::REQ_ACTIVATE);
-        ctx.client_to_host_queue.push((activate, Vec::new()));
+        ctx.client_to_host_queue
+            .push(zwp_text_input_v1::req::activate(
+                host_v1_id,
+                host_seat,
+                host_surface,
+            ));
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             let activated = state.activate_host();
             debug_assert!(activated, "activation state was checked above");
@@ -1580,10 +1529,10 @@ fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32
         // duplicate guest leave/enter events in that case.
         if previous_surface != current_surface {
             if let Some(surface) = previous_surface {
-                push_leave_to(&mut events, guest_text_input_id, surface);
+                events.push(zwp_text_input_v3::evt::leave(guest_text_input_id, surface));
             }
             if let Some(surface) = current_surface {
-                push_enter_to(&mut events, guest_text_input_id, surface);
+                events.push(zwp_text_input_v3::evt::enter(guest_text_input_id, surface));
             }
         }
         text_inputs_to_update.push(guest_text_input_id);
@@ -1679,9 +1628,8 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
         // Stop extension events and remove all local routing state.
         if let Some(host_ext_id) = state.host_ext_id {
-            let destroy = MessageBuilder::new()
-                .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_DESTROY);
-            ctx.client_to_host_queue.push((destroy, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zcr_extended_text_input_v1::req::destroy(host_ext_id));
             ctx.retire_destroyed_host_object(host_ext_id);
         }
         // The v3 object is guest-facing but backed by a v1 host object whose
@@ -1869,15 +1817,15 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                     cursor,
                     anchor
                 );
-                let mut builder = MessageBuilder::new();
-                builder.write_string(text);
-                builder.write_u32(*cursor as u32);
-                builder.write_u32(*anchor as u32);
-                if !push_msg(
+                if !queue_or_drop(
                     &mut transaction,
-                    plan.host_v1_id,
-                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
-                    builder,
+                    zwp_text_input_v1::req::set_surrounding_text(
+                        plan.host_v1_id,
+                        text,
+                        *cursor as u32,
+                        *anchor as u32,
+                    ),
+                    format_args!("the surrounding text of text input {guest_id}"),
                 ) {
                     return Action::Drop;
                 }
@@ -1887,15 +1835,10 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 // the previous surrounding string and can make a later IME
                 // transaction operate on stale private/editor contents.
                 log::debug!("  -> clearing v1 surrounding text for guest {}", guest_id);
-                let mut builder = MessageBuilder::new();
-                builder.write_string("");
-                builder.write_u32(0);
-                builder.write_u32(0);
-                if !push_msg(
+                if !queue_or_drop(
                     &mut transaction,
-                    plan.host_v1_id,
-                    zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT,
-                    builder,
+                    zwp_text_input_v1::req::set_surrounding_text(plan.host_v1_id, "", 0, 0),
+                    format_args!("the surrounding text of text input {guest_id}"),
                 ) {
                     return Action::Drop;
                 }
@@ -1914,29 +1857,26 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ) {
                     // This request applies to the following content-type
                     // request, so keep both in the same transaction.
-                    let mut builder = MessageBuilder::new();
-                    builder.write_u32(u32::from(plan.has_surrounding_text));
-                    let support = builder.build_message(
-                        host_ext_id,
-                        zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT,
+                    transaction.push(
+                        zcr_extended_text_input_v1::req::set_surrounding_text_support(
+                            host_ext_id,
+                            if plan.has_surrounding_text {
+                                zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
+                            } else {
+                                zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+                            },
+                        ),
                     );
-                    transaction.push((support, Vec::new()));
                 }
             }
 
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(v1_hint);
-            builder.write_u32(v1_purpose);
-            let content_type =
-                builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_SET_CONTENT_TYPE);
-            transaction.push((content_type, Vec::new()));
+            transaction.push(zwp_text_input_v1::req::set_content_type(
+                plan.host_v1_id,
+                v1_hint,
+                v1_purpose,
+            ));
 
             if let Some(host_ext_id) = plan.host_ext_id {
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(input_type);
-                builder.write_u32(input_mode);
-                builder.write_u32(input_flags);
-                builder.write_u32(learning_mode);
                 // zcr_extended_text_input_v1 v8 replaced the deprecated
                 // four-argument request with a five-argument request that
                 // carries inline-composition support. Older hosts must
@@ -1949,19 +1889,25 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 ) {
                     // A text-input-v3 client supports inline preedit by
                     // definition.
-                    builder.write_u32(1);
-                    let input_type = builder
-                        .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE);
-                    transaction.push((input_type, Vec::new()));
+                    transaction.push(zcr_extended_text_input_v1::req::set_input_type(
+                        host_ext_id,
+                        input_type,
+                        input_mode,
+                        input_flags,
+                        learning_mode,
+                        zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+                    ));
                 } else if extension_version_allows(
                     host_ext_version,
                     zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
                 ) {
-                    let input_type = builder.build_message(
+                    transaction.push(zcr_extended_text_input_v1::req::deprecated_set_input_type(
                         host_ext_id,
-                        zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE,
-                    );
-                    transaction.push((input_type, Vec::new()));
+                        input_type,
+                        input_mode,
+                        input_flags,
+                        learning_mode,
+                    ));
                 }
             }
         }
@@ -1974,22 +1920,20 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                 w,
                 h
             );
-            let mut builder = MessageBuilder::new();
-            builder.write_i32(x);
-            builder.write_i32(y);
-            builder.write_i32(w);
-            builder.write_i32(h);
-            let cursor_rectangle =
-                builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_SET_CURSOR_RECTANGLE);
-            transaction.push((cursor_rectangle, Vec::new()));
+            transaction.push(zwp_text_input_v1::req::set_cursor_rectangle(
+                plan.host_v1_id,
+                x,
+                y,
+                w,
+                h,
+            ));
         }
 
         log::debug!("  -> sending v1 commit_state(serial={})", plan.serial);
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(plan.serial);
-        let commit_state =
-            builder.build_message(plan.host_v1_id, zwp_text_input_v1::REQ_COMMIT_STATE);
-        transaction.push((commit_state, Vec::new()));
+        transaction.push(zwp_text_input_v1::req::commit_state(
+            plan.host_v1_id,
+            plan.serial,
+        ));
 
         if plan.enable_conflict {
             log::warn!(
@@ -2054,10 +1998,7 @@ mod tests {
     #[test]
     fn oversized_host_text_is_dropped_without_panicking() {
         let mut queue = Vec::new();
-        let mut builder = MessageBuilder::new();
-        builder.write_string(&"x".repeat(65_528));
-
-        assert!(!push_msg(&mut queue, 7, 2, builder));
+        assert!(!push_commit_string_to(&mut queue, 7, &"x".repeat(65_528)));
         assert!(queue.is_empty());
     }
 
@@ -2874,8 +2815,8 @@ mod tests {
             );
             assert_eq!(ctx.host_to_client_queue.len(), 3);
             for (message, expected_state) in ctx.host_to_client_queue[..2].iter().zip([
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ]) {
                 assert_eq!(
                     msg_sender(std::slice::from_ref(message), 0),
@@ -4008,7 +3949,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4057,7 +3998,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_REPEATED,
+                wl_keyboard::KEY_STATE_REPEATED,
                 0,
             ),
             Action::Drop
@@ -4074,7 +4015,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_ne_bytes(payload[12..16].try_into().unwrap()),
-            crate::handler::keyboard::WL_KEY_REPEATED
+            wl_keyboard::KEY_STATE_REPEATED
         );
     }
 
@@ -4104,7 +4045,7 @@ mod tests {
                 10,
                 1,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4112,24 +4053,12 @@ mod tests {
 
         ctx.last_sender_id = host_extended_id;
         assert_eq!(
-            keyboard.on_peek_key(
-                &mut ctx,
-                1,
-                10,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            ),
+            keyboard.on_peek_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
             Action::Drop
         );
         ctx.last_sender_id = host_keyboard_id;
         assert_eq!(
-            keyboard.on_key(
-                &mut ctx,
-                1,
-                10,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            ),
+            keyboard.on_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
             Action::Drop,
             "the delayed keyboard channel must not emit a duplicate press"
         );
@@ -4141,7 +4070,7 @@ mod tests {
                 20,
                 2,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
                 0,
             ),
             Action::Drop
@@ -4155,8 +4084,8 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ]
         );
         assert_eq!(
@@ -4178,8 +4107,8 @@ mod tests {
         let mut handler = TextInputV1Handler;
 
         for (serial, state) in [
-            (1, crate::handler::keyboard::WL_KEY_PRESSED),
-            (2, crate::handler::keyboard::WL_KEY_RELEASED),
+            (1, wl_keyboard::KEY_STATE_PRESSED),
+            (2, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4197,7 +4126,7 @@ mod tests {
             10,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4207,8 +4136,8 @@ mod tests {
         );
 
         for (serial, state) in [
-            (3, crate::handler::keyboard::WL_KEY_PRESSED),
-            (4, crate::handler::keyboard::WL_KEY_RELEASED),
+            (3, wl_keyboard::KEY_STATE_PRESSED),
+            (4, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4230,7 +4159,7 @@ mod tests {
             10,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4252,10 +4181,10 @@ mod tests {
         let mut handler = TextInputV1Handler;
 
         for (serial, state) in [
-            (u32::MAX - 1, crate::handler::keyboard::WL_KEY_PRESSED),
-            (u32::MAX, crate::handler::keyboard::WL_KEY_RELEASED),
-            (0, crate::handler::keyboard::WL_KEY_PRESSED),
-            (1, crate::handler::keyboard::WL_KEY_RELEASED),
+            (u32::MAX - 1, wl_keyboard::KEY_STATE_PRESSED),
+            (u32::MAX, wl_keyboard::KEY_STATE_RELEASED),
+            (0, wl_keyboard::KEY_STATE_PRESSED),
+            (1, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4299,7 +4228,7 @@ mod tests {
             0x8000_0010,
             1000,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4307,7 +4236,7 @@ mod tests {
             1000,
             0x8000_0010,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         text_input.on_keysym(
@@ -4315,7 +4244,7 @@ mod tests {
             1010,
             0x8000_0011,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
@@ -4324,7 +4253,7 @@ mod tests {
             0x8000_0012,
             1020,
             keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
         );
 
         ctx.last_sender_id = host_v1_id;
@@ -4333,7 +4262,7 @@ mod tests {
             1100,
             0x8000_0020,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(ctx.host_to_client_queue.len(), 3);
@@ -4348,7 +4277,7 @@ mod tests {
             0x8000_0020,
             1100,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         assert_eq!(
             ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
@@ -4382,7 +4311,7 @@ mod tests {
             u32::MAX - 3,
             1000,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4390,17 +4319,11 @@ mod tests {
             1000,
             u32::MAX - 2,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            0,
-            1010,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
+        keyboard.on_peek_key(&mut ctx, 0, 1010, keycode, wl_keyboard::KEY_STATE_RELEASED);
 
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4408,7 +4331,7 @@ mod tests {
             1005,
             u32::MAX - 1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4427,7 +4350,7 @@ mod tests {
             1100,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         text_input.on_keysym(
@@ -4435,7 +4358,7 @@ mod tests {
             1010,
             u32::MAX,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         text_input.on_keysym(
@@ -4443,7 +4366,7 @@ mod tests {
             1110,
             2,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
 
@@ -4455,10 +4378,10 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ],
             "the old and current generations must each retain one balanced key pair"
         );
@@ -4484,37 +4407,19 @@ mod tests {
         let mut keyboard = KeyboardHandler::new();
 
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            10,
-            100,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
             &mut ctx,
             100,
             10,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            11,
-            110,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
-        keyboard.on_peek_key(
-            &mut ctx,
-            20,
-            200,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
+        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4522,7 +4427,7 @@ mod tests {
             110,
             11,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         assert!(
@@ -4537,8 +4442,8 @@ mod tests {
         );
 
         for (serial, state) in [
-            (20, crate::handler::keyboard::WL_KEY_PRESSED),
-            (21, crate::handler::keyboard::WL_KEY_RELEASED),
+            (20, wl_keyboard::KEY_STATE_PRESSED),
+            (21, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             text_input.on_keysym(
                 &mut ctx,
@@ -4557,10 +4462,10 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ],
             "each physical generation must produce one balanced guest pair"
         );
@@ -4586,42 +4491,24 @@ mod tests {
         let mut keyboard = KeyboardHandler::new();
 
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            10,
-            100,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
             &mut ctx,
             100,
             10,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            11,
-            110,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
-        keyboard.on_peek_key(
-            &mut ctx,
-            20,
-            200,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
+        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
         ctx.last_sender_id = host_v1_id;
         for (serial, state) in [
-            (20, crate::handler::keyboard::WL_KEY_PRESSED),
-            (21, crate::handler::keyboard::WL_KEY_RELEASED),
+            (20, wl_keyboard::KEY_STATE_PRESSED),
+            (21, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             text_input.on_keysym(
                 &mut ctx,
@@ -4643,7 +4530,7 @@ mod tests {
             110,
             11,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         assert_eq!(
@@ -4659,14 +4546,14 @@ mod tests {
         assert_eq!(
             states
                 .iter()
-                .filter(|&&state| state == crate::handler::keyboard::WL_KEY_PRESSED)
+                .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
                 .count(),
             2
         );
         assert_eq!(
             states
                 .iter()
-                .filter(|&&state| state == crate::handler::keyboard::WL_KEY_RELEASED)
+                .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
                 .count(),
             2,
             "both guest presses must eventually receive one release"
@@ -4699,7 +4586,7 @@ mod tests {
                 u32::MAX - 3,
                 1000,
                 keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
             );
             ctx.last_sender_id = host_v1_id;
             text_input.on_keysym(
@@ -4707,7 +4594,7 @@ mod tests {
                 1000,
                 u32::MAX - 2,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             );
             ctx.last_sender_id = host_extended_id;
@@ -4716,7 +4603,7 @@ mod tests {
                 u32::MAX - 1,
                 1010,
                 keycode,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
             );
 
             // The next keysym press is the first event of its generation. It
@@ -4728,7 +4615,7 @@ mod tests {
                 1100,
                 0,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             );
             assert_eq!(
@@ -4736,13 +4623,7 @@ mod tests {
                 Some(GuestKeyOwner::TextInputKeysym)
             );
             ctx.last_sender_id = host_extended_id;
-            keyboard.on_peek_key(
-                &mut ctx,
-                1,
-                1100,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            );
+            keyboard.on_peek_key(&mut ctx, 1, 1100, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
             ctx.last_sender_id = host_v1_id;
             let releases = if old_release_first {
@@ -4756,7 +4637,7 @@ mod tests {
                     timestamp,
                     serial,
                     xkbcommon::xkb::keysyms::KEY_a,
-                    crate::handler::keyboard::WL_KEY_RELEASED,
+                    wl_keyboard::KEY_STATE_RELEASED,
                     0,
                 );
             }
@@ -4774,14 +4655,14 @@ mod tests {
             assert_eq!(
                 states
                     .iter()
-                    .filter(|&&state| state == crate::handler::keyboard::WL_KEY_PRESSED)
+                    .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
                     .count(),
                 2
             );
             assert_eq!(
                 states
                     .iter()
-                    .filter(|&&state| state == crate::handler::keyboard::WL_KEY_RELEASED)
+                    .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
                     .count(),
                 2,
                 "both keysym-first generations must remain balanced"
@@ -4807,7 +4688,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_REPEATED,
+                wl_keyboard::KEY_STATE_REPEATED,
                 0,
             ),
             Action::Drop
@@ -4846,7 +4727,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4894,7 +4775,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_A,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4936,7 +4817,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_A,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4977,7 +4858,7 @@ mod tests {
                 124,
                 457,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
                 0,
             ),
             Action::Drop
@@ -5018,7 +4899,7 @@ mod tests {
             123,
             456,
             xkbcommon::xkb::keysyms::KEY_BackSpace,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         handler.on_keysym(
@@ -5026,7 +4907,7 @@ mod tests {
             124,
             457,
             xkbcommon::xkb::keysyms::KEY_BackSpace,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
 

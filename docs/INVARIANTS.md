@@ -73,11 +73,28 @@ always consumed; a configuration problem never stops the proxy) is owned by
   waits for the next receive, and an invalid length ends the connection.
   Tests: `run_receives_the_rest_of_a_partially_buffered_message`,
   `buffered_message_readiness_distinguishes_partial_and_complete_frames`.
-- **Host data is untrusted.** A message that carries host-provided strings
-  or arrays MUST be built with the fallible `try_build_message` and handle
-  `MessageTooLarge` without panicking; generated forwarding already does.
-  A message of only integers, object IDs and descriptors cannot exceed the
-  wire limit and uses `build_message`.
+- **Messages come from the XML.** Production code builds every message it
+  sends itself with a generated encoder, `<interface>::req::<request>` or
+  `<interface>::evt::<event>`, which takes the arguments in XML order and
+  type, and names protocol values with the generated enum constants.
+  `MessageBuilder` is for generated code: `sommelier/clippy.toml` rejects
+  `MessageBuilder::new` everywhere else, and its private fields leave no
+  other way to make one. A test module that needs frames no encoder makes,
+  such as malformed ones, allows `clippy::disallowed_methods` itself.
+  Tests: `encoders_match_hand_built_scalar_messages`,
+  `encoded_messages_decode_to_the_same_arguments`.
+- **Host data is untrusted.** The encoder of a message with a string or an
+  array returns a `Result`, because host or guest data can exceed the
+  wire's 16-bit length; every other encoder cannot fail. A message the
+  proxy builds itself that does not fit is dropped without panicking,
+  usually through `wire::queue_or_drop`, and the session goes on. A
+  forwarded message that does not fit is a `MessageTooLarge` protocol
+  error that ends the session instead of truncating the length.
+  An encoder takes descriptors as `OwnedFd`s, so a message that cannot be
+  built closes them.
+  Tests: `oversized_host_text_is_dropped_without_panicking`,
+  `generated_forwarding_rejects_messages_that_exceed_wire_length`,
+  `an_encoder_that_cannot_build_its_message_closes_its_descriptors`.
 - **A rejected request is reported.** A guest request the proxy cannot
   frame, decode or dispatch ends the session, with its descriptors closed,
   after one `wl_display.error` reaches the guest. The error is always on
@@ -100,8 +117,9 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `queue_protocol_error` queues only the first, so a handler's error is
   not followed by a decoding one, and a host's forwarded error counts as
   the one. A session an internal failure ended without an error of its
-  own (a failed dma-buf sync during a commit, say) gets `implementation`
-  on `wl_display` when its batch ends. The requests before the rejected
+  own (a failed dma-buf sync during a commit, say, or a host error too
+  long to forward) gets `implementation` on `wl_display` when its batch
+  ends. The requests before the rejected
   one in the same batch were valid and are forwarded.
   Tests: `unknown_client_sender_is_a_protocol_error`,
   `undecodable_request_is_reported_after_forwarding_earlier_requests`,
@@ -110,6 +128,7 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `a_session_gets_exactly_one_error`,
   `an_internal_failure_ends_the_session_with_an_implementation_error`,
   `a_host_error_is_the_sessions_only_error`,
+  `an_unforwardable_host_error_leaves_the_implementation_error`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors

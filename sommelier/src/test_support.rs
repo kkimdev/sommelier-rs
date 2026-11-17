@@ -212,6 +212,7 @@ impl Drop for TempDir {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::stream_headers;
     use crate::wire::MessageBuilder;

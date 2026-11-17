@@ -100,6 +100,8 @@ pub struct Enum {
     pub name: String,
     #[serde(rename = "@bitfield", default)]
     pub bitfield: Option<String>,
+    #[serde(rename = "@since", default)]
+    pub since: Option<u32>,
     #[serde(rename = "$value", default)]
     pub items: Vec<EnumItem>,
 }
