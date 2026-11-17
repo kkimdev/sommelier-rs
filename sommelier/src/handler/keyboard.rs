@@ -47,6 +47,12 @@ use xkbcommon::xkb;
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
 pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
 
+/// The largest `wl_keyboard.keymap` the proxy maps and compiles, in bytes.
+/// Exo's keymaps are about 60 KiB. The size of a VirtWL keymap cannot be
+/// checked against its file, and the proxy copies the keymap to compile it,
+/// so a host size near 4 GiB would otherwise abort the process.
+const MAX_KEYMAP_SIZE: u32 = 1 << 20;
+
 /// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyClass {
@@ -488,6 +494,13 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         // A zero-size keymap is malformed; mmap(len=0) is UB per POSIX.
         if size == 0 {
             log::warn!("on_keymap: received zero-size keymap from host, ignoring");
+            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            return Action::Forward;
+        }
+        if size > MAX_KEYMAP_SIZE {
+            log::warn!(
+                "on_keymap: keymap of {size} bytes exceeds the {MAX_KEYMAP_SIZE}-byte limit, ignoring"
+            );
             Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
             return Action::Forward;
         }
@@ -1167,17 +1180,7 @@ mod tests {
     /// on_keymap so the handler builds its XKB state. Returns the keymap
     /// object so tests can look up keycodes.
     fn load_test_keymap(handler: &mut KeyboardHandler, ctx: &mut Context) -> xkb::Keymap {
-        let dummy_ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
-            &dummy_ctx,
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .unwrap();
+        let keymap = default_keymap();
         let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
 
         // Use an anonymous memfd so we don't need the `tempfile` crate.
@@ -1201,6 +1204,20 @@ mod tests {
             "keymap should be loaded for the sending keyboard"
         );
         keymap
+    }
+
+    /// The default XKB keymap the tests' host sends.
+    fn default_keymap() -> xkb::Keymap {
+        xkb::Keymap::new_from_names(
+            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap()
     }
 
     /// Send keyboard `ctx.last_sender_id` a `wl_keyboard.modifiers` event
@@ -2878,6 +2895,57 @@ mod tests {
             !ctx.keyboard_keymaps.contains_key(&HostId(0)),
             "keymap must not be set after zero-size event"
         );
+    }
+
+    /// An oversized keymap replaces a loaded one like any keymap the proxy
+    /// cannot use: the proxy drops its XKB state and still forwards it.
+    #[test]
+    fn an_oversized_keymap_clears_the_loaded_one_and_is_forwarded() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.last_sender_id = 5;
+        load_test_keymap(&mut handler, &mut ctx);
+
+        // The size is refused before the descriptor is mapped.
+        let file = crate::test_support::shm_pool_file(&[]);
+        assert_eq!(
+            handler.on_keymap(
+                &mut ctx,
+                KEYMAP_FORMAT_XKB_V1,
+                file.as_fd(),
+                MAX_KEYMAP_SIZE + 1
+            ),
+            Action::Forward
+        );
+
+        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(5)));
+        assert!(!ctx.keyboard_keysym_to_keycode.contains_key(&HostId(5)));
+    }
+
+    #[test]
+    fn on_keymap_ignores_a_keymap_over_the_size_limit() {
+        for (size, accepted) in [(MAX_KEYMAP_SIZE, true), (MAX_KEYMAP_SIZE + 1, false)] {
+            let mut handler = KeyboardHandler::new();
+            let mut ctx = Context::new_for_test(false, false, Vec::new());
+            // A valid keymap, padded with blanks to `size` with its NUL.
+            let mut bytes = default_keymap()
+                .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+                .into_bytes();
+            bytes.resize(size as usize - 1, b' ');
+            bytes.push(0);
+            let file = crate::test_support::shm_pool_file(&bytes);
+
+            assert_eq!(
+                handler.on_keymap(&mut ctx, KEYMAP_FORMAT_XKB_V1, file.as_fd(), size),
+                Action::Forward
+            );
+            assert_eq!(
+                ctx.keyboard_keymaps.contains_key(&HostId(0)),
+                accepted,
+                "a keymap of {size} bytes"
+            );
+        }
     }
 
     #[test]

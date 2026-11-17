@@ -585,6 +585,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   the VirtWL and plain memfd paths. Do not switch to `MAP_SHARED` because
   one host happens to allow it.
   Test: `keymap_mmap_is_private_not_shared`.
+- **Keymaps are bounded.** A host keymap larger than `MAX_KEYMAP_SIZE`
+  (1 MiB; Exo's are about 60 KiB) is refused before it is mapped. Like any
+  other keymap the proxy cannot use, it clears the keyboard's XKB state, so
+  no chord is classified until a usable keymap arrives, and it is still
+  forwarded. The size of a VirtWL keymap cannot be checked against its
+  file, and the proxy copies a keymap to compile it, so a size near 4 GiB
+  would otherwise abort every client.
+  Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
+  `an_oversized_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
   flags and focus markers used to bridge ChromeOS IME events belong to the
   originating keyboard or seat, never to the process. Synthetic
