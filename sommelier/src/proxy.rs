@@ -1910,48 +1910,29 @@ mod tests {
     #[tokio::test]
     async fn a_failed_send_ends_the_session() {
         use protocols::wayland::{wl_callback, wl_display, wl_shm_pool};
-        const CALLBACK: u32 = 3;
-        const POOL: u32 = 4;
-        let sync = |callback| wl_display::req::sync(WL_DISPLAY_ID, callback).0;
-        // Every send to the guest fails. Closing the guest's end would not
-        // do: a process another test spawns may hold a copy of it.
-        let stop_writing_to_the_guest = |client: &Client| {
-            let socket = client.client_conn.as_raw_fd();
-            assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
-        };
 
         // The forward of a host event.
-        let (mut client, _guest_peer, mut host_peer) = client_with_socket_peers();
-        client.client_conn.read_buf.extend(sync(CALLBACK));
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
-        let host_callback = client.ctx.shadow_table.get_host_id(CALLBACK).unwrap();
-        stop_writing_to_the_guest(&client);
-        client
-            .host_conn
-            .read_buf
-            .extend(wl_callback::evt::done(host_callback, 0).0);
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
-        client.client_conn.read_buf.extend(sync(CALLBACK + 1));
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        assert_eq!(
-            sent_messages(&mut host_peer),
-            [(WL_DISPLAY_ID, wl_display::REQ_SYNC)]
-        );
+        let mut s = Session::new();
+        let callback = s.new_id();
+        let host_callback = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+            .await;
+        s.break_guest_connection();
+        s.host_fatal([wl_callback::evt::done(host_callback, 0)])
+            .await;
+        let later = s.new_id();
+        s.guest_fatal([wl_display::req::sync(WL_DISPLAY_ID, later)])
+            .await;
+        assert_eq!(s.host_received(), []);
 
         // The delete_id a guest request sends back to the guest.
-        let (mut client, _guest_peer, mut host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
-        stop_writing_to_the_guest(&client);
-        client
-            .client_conn
-            .read_buf
-            .extend(wl_shm_pool::req::destroy(POOL).0);
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        client.client_conn.read_buf.extend(sync(CALLBACK));
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
-        drop(client);
-        assert_eq!(sent_messages(&mut host_peer), []);
+        let (mut s, pool) = session_with_a_shm_pool().await;
+        s.break_guest_connection();
+        s.guest_fatal([wl_shm_pool::req::destroy(pool)]).await;
+        let later = s.new_id();
+        s.guest_fatal([wl_display::req::sync(WL_DISPLAY_ID, later)])
+            .await;
+        assert_eq!(s.host_received(), []);
     }
 
     /// A message that ends the session sends nothing back to its source

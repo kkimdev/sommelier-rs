@@ -36,7 +36,7 @@ use crate::state::Context;
 use crate::test_support::decode;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage, WL_DISPLAY_ID};
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 /// A guest object and the host object the proxy paired it with.
@@ -111,6 +111,14 @@ impl Session {
             !self.send(Direction::HostToClient, events).await,
             "the host's events did not end the session"
         );
+    }
+
+    /// Make every later send to the guest fail, as when its connection
+    /// breaks. Closing the guest's end would not do: a process another test
+    /// spawns may hold a copy of it.
+    pub(super) fn break_guest_connection(&self) {
+        let socket = self.client.client_conn.as_raw_fd();
+        assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_WR) }, 0);
     }
 
     /// Whether a guest request waits for a fence, holding back the guest's
