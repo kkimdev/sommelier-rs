@@ -780,10 +780,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 host_bind_version,
                 host_id,
             );
-            if bound && can_synthesize_feedback {
+            if !bound {
+                return ctx.fail(format_args!("Failed to bind host {interface} internally"));
+            }
+            if can_synthesize_feedback {
                 queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
-            } else if !bound {
-                ctx.fail(format_args!("Failed to bind host {interface} internally"));
             }
 
             // Drop the original global event so we don't send the host's

@@ -468,6 +468,7 @@ impl Context {
     /// Reject the message being dispatched with protocol error `code` on
     /// guest object `object` (see [`Self::end_session`]). A handler returns
     /// the [`Action::Drop`] this returns.
+    #[must_use = "a handler returns the Action::Drop"]
     pub(crate) fn reject(&mut self, object: u32, code: u32, message: impl Into<String>) -> Action {
         self.end_session(SessionEnd::Protocol {
             object,
@@ -480,6 +481,7 @@ impl Context {
     /// End the session because the proxy failed to handle the message being
     /// dispatched, and log `why` (see [`Self::end_session`]). A handler
     /// returns the [`Action::Drop`] this returns.
+    #[must_use = "a handler returns the Action::Drop"]
     pub(crate) fn fail(&mut self, why: impl std::fmt::Display) -> Action {
         error!("{why}");
         self.end_session(SessionEnd::Internal);
@@ -725,7 +727,9 @@ impl Context {
     /// session.
     pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
         if !self.shadow_table.host_destroy_queued(host_id) {
-            self.fail(format_args!(
+            // Deep in object teardown: the session ends, and the loop
+            // drops this message's effects whatever its handler returns.
+            let _ = self.fail(format_args!(
                 "Host object {host_id} was not a live host-only object when it was retired"
             ));
         }

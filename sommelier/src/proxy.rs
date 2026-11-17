@@ -2081,9 +2081,7 @@ mod tests {
         // storage failure, say); the trailing data still gets reported.
         assert_eq!(
             surface_request_errors(
-                |client| {
-                    client.ctx.fail("a host storage failure");
-                },
+                |client| client.ctx.end_session(SessionEnd::Internal),
                 REQ_COMMIT,
                 &[0]
             )
@@ -2102,9 +2100,7 @@ mod tests {
         // error of its own.
         assert_eq!(
             surface_request_errors(
-                |client| {
-                    client.ctx.fail("a host storage failure");
-                },
+                |client| client.ctx.end_session(SessionEnd::Internal),
                 REQ_COMMIT,
                 &[]
             )

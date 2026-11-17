@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.reject(7, 3, "x".repeat(4_084));
+        assert_eq!(ctx.reject(7, 3, "x".repeat(4_084)), Action::Drop);
 
         let (error, _) = session_error(ctx.session_end().expect("the session ends"));
         assert!(

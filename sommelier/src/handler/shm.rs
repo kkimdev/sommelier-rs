@@ -1067,14 +1067,15 @@ pub(crate) fn copy_shm_damage(
     Ok(())
 }
 
-/// Report a resource failure while creating a `wl_buffer`.
+/// Reject a `wl_buffer` creation the proxy has no resources for.
 ///
 /// `create_buffer` carries a client supplied `new_id`; silently dropping the
 /// request leaves the client believing that the ID was created while the
 /// proxy has no object to service it.  Wayland errors terminate the connection,
 /// which is the only safe outcome once allocation has failed.
-fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'static str) {
-    ctx.reject(object_id, wl_shm::ERROR_INVALID_FD, message);
+#[must_use = "a handler returns the Action::Drop"]
+fn reject_buffer_creation(ctx: &mut Context, object_id: u32, message: &'static str) -> Action {
+    ctx.reject(object_id, wl_shm::ERROR_INVALID_FD, message)
 }
 
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
@@ -1109,7 +1110,9 @@ fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
 
 fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: HostId) {
     if !ctx.complete_queued_buffer_destroy(guest_id, host_id) {
-        ctx.fail(format_args!(
+        // Deep in buffer teardown: the session ends, and the loop drops this
+        // message's effects whatever its handler returns.
+        let _ = ctx.fail(format_args!(
             "Render buffer generation diverged while destroying guest {} host {}",
             guest_id, host_id.0
         ));
@@ -1208,7 +1211,9 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     if ctx.host_buffer_use(guest_id).is_some()
         && !ctx.finish_surface_destroy_use(guest_id, references.has_current(guest_id))
     {
-        ctx.fail(format_args!(
+        // Deep in surface teardown: the session ends, and the loop drops this
+        // message's effects whatever its handler returns.
+        let _ = ctx.fail(format_args!(
             "Render buffer {guest_id} could not finish its destroyed-surface use"
         ));
     }
@@ -1313,8 +1318,8 @@ struct ShmBufferRequest {
 ///
 /// # Returns
 ///
-/// `None` after queueing the creation error when no storage is available.
-fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<ShmBacking> {
+/// The rejection the handler returns when no storage is available.
+fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Result<ShmBacking, Action> {
     let ShmBufferRequest {
         pool_id,
         width,
@@ -1371,12 +1376,11 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
                     "Failed to allocate VirtWayland shared-memory buffer: {}",
                     error
                 );
-                queue_buffer_creation_error(
+                return Err(reject_buffer_creation(
                     ctx,
                     pool_id,
                     "unable to allocate wl_shm buffer backing",
-                );
-                return None;
+                ));
             }
         };
         debug!(
@@ -1405,12 +1409,11 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
             }
             Err(error) => {
                 error!("Failed to allocate GBM dma-buf: {}", error);
-                queue_buffer_creation_error(
+                return Err(reject_buffer_creation(
                     ctx,
                     pool_id,
                     "unable to allocate wl_shm buffer backing",
-                );
-                return None;
+                ));
             }
         }
     } else {
@@ -1426,16 +1429,15 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
             }
             Err(error) => {
                 error!("Failed to allocate local shared memory: {}", error);
-                queue_buffer_creation_error(
+                return Err(reject_buffer_creation(
                     ctx,
                     pool_id,
                     "unable to allocate wl_shm buffer backing",
-                );
-                return None;
+                ));
             }
         }
     };
-    Some(backing)
+    Ok(backing)
 }
 
 /// A memfd of `size` bytes, the host storage for a guest SHM buffer when the
@@ -1451,7 +1453,11 @@ fn local_shared_memory(size: u32) -> io::Result<OwnedFd> {
 
 /// Create a guest SHM buffer backed by shared memory ([`ShmBacking::Shared`]),
 /// which the host imports as a temporary `wl_shm` pool.
-fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd: OwnedFd) {
+fn create_shared_buffer(
+    ctx: &mut Context,
+    request: ShmBufferRequest,
+    shared_fd: OwnedFd,
+) -> Action {
     let ShmBufferRequest {
         pool_id,
         ref pool_file,
@@ -1468,15 +1474,17 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
     // no BufferState owner.
     let Some(host_wl_shm_id) = ctx.host_shm_id else {
         error!("wl_shm not available on host");
-        queue_buffer_creation_error(ctx, pool_id, "host wl_shm is unavailable");
-        return;
+        return reject_buffer_creation(ctx, pool_id, "host wl_shm is unavailable");
     };
     let fd_to_send = match shared_fd.try_clone() {
         Ok(fd) => fd,
         Err(e) => {
             error!("Failed to dup FD: {}", e);
-            queue_buffer_creation_error(ctx, pool_id, "unable to duplicate wl_shm buffer backing");
-            return;
+            return reject_buffer_creation(
+                ctx,
+                pool_id,
+                "unable to duplicate wl_shm buffer backing",
+            );
         }
     };
     debug!(
@@ -1503,8 +1511,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
             "Failed to mmap shared SHM buffer: {:?}",
             std::io::Error::last_os_error()
         );
-        queue_buffer_creation_error(ctx, pool_id, "unable to map wl_shm buffer backing");
-        return;
+        return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm buffer backing");
     }
 
     // The temporary host wl_shm_pool remains live until the queued
@@ -1572,7 +1579,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         host_buffer_id,
         state,
         "unable to register wl_shm buffer",
-    );
+    )
 }
 
 /// Create a guest SHM buffer backed by a dma-buf, which the host imports
@@ -1582,7 +1589,7 @@ fn create_dmabuf_buffer(
     request: ShmBufferRequest,
     host_dmabuf_id: u32,
     allocation: DmabufAllocation,
-) {
+) -> Action {
     let ShmBufferRequest {
         pool_id,
         ref pool_file,
@@ -1608,8 +1615,11 @@ fn create_dmabuf_buffer(
         Ok(fd) => fd,
         Err(error) => {
             error!("Failed to duplicate VirtWL dma-buf fd: {}", error);
-            queue_buffer_creation_error(ctx, pool_id, "unable to duplicate wl_shm dma-buf backing");
-            return;
+            return reject_buffer_creation(
+                ctx,
+                pool_id,
+                "unable to duplicate wl_shm dma-buf backing",
+            );
         }
     };
     let plane1_add = if let Some(plane1) = layout.plane1() {
@@ -1617,12 +1627,11 @@ fn create_dmabuf_buffer(
             Ok(fd) => Some((plane1, fd)),
             Err(error) => {
                 error!("Failed to duplicate NV12 dma-buf fd: {}", error);
-                queue_buffer_creation_error(
+                return reject_buffer_creation(
                     ctx,
                     pool_id,
                     "unable to duplicate wl_shm dma-buf plane",
                 );
-                return;
             }
         }
     } else {
@@ -1636,8 +1645,7 @@ fn create_dmabuf_buffer(
                 layout.plane0().offset,
                 layout.span()
             );
-            queue_buffer_creation_error(ctx, pool_id, "unable to map wl_shm dma-buf backing");
-            return;
+            return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
         };
         (ptr, size)
     } else if format == wl_shm::FORMAT_NV12 {
@@ -1648,8 +1656,7 @@ fn create_dmabuf_buffer(
         // commit defer forever without ever updating UV.
         let Some(mapped) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
             error!("GBM NV12 dma-buf cannot be safely mmaped");
-            queue_buffer_creation_error(ctx, pool_id, "unable to map wl_shm dma-buf backing");
-            return;
+            return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
         };
         mapped
     } else {
@@ -1733,7 +1740,7 @@ fn create_dmabuf_buffer(
         host_buffer_id,
         state,
         "unable to register wl_shm dma-buf buffer",
-    );
+    )
 }
 
 /// Register the storage of the guest `wl_buffer` paired with host buffer
@@ -1744,11 +1751,12 @@ fn register_shm_buffer(
     host_buffer_id: u32,
     state: BufferState,
     failure: &'static str,
-) {
+) -> Action {
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
         error!("Duplicate render buffer host ID {}", host_buffer_id);
-        queue_buffer_creation_error(ctx, request.pool_id, failure);
+        return reject_buffer_creation(ctx, request.pool_id, failure);
     }
+    Action::Drop
 }
 
 impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
@@ -1823,14 +1831,13 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             size: buffer_size,
         };
         match select_shm_backing(ctx, &request) {
-            Some(ShmBacking::Shared(shared_fd)) => create_shared_buffer(ctx, request, shared_fd),
-            Some(ShmBacking::Dmabuf {
+            Ok(ShmBacking::Shared(shared_fd)) => create_shared_buffer(ctx, request, shared_fd),
+            Ok(ShmBacking::Dmabuf {
                 host_dmabuf_id,
                 allocation,
             }) => create_dmabuf_buffer(ctx, request, host_dmabuf_id, allocation),
-            None => {}
+            Err(action) => action,
         }
-        Action::Drop
     }
 
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
