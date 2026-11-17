@@ -152,14 +152,57 @@ async fn main() {
     .await;
 }
 
+/// Raise the soft open-file limit to the hard limit.
+///
+/// Every client holds the proxy's descriptors for its two connections, its
+/// buffers and its pending SCM_RIGHTS (up to `MAX_PENDING_FDS` each), all in
+/// one process. The usual soft limit of 1024 would let a few busy clients
+/// exhaust the table for everyone, while the hard limit is the bound the
+/// system intends. The proxy waits on descriptors with epoll, never
+/// `select`, so descriptors above 1024 are safe. A failure is logged and
+/// not fatal: the proxy runs with the limit it has.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "Cannot read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let soft = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        log::warn!(
+            "Keeping the open-file limit at {soft}; raising it to {} failed: {}",
+            limit.rlim_max,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    log::info!(
+        "Raised the open-file limit from {soft} to {}",
+        limit.rlim_max
+    );
+}
+
 /// Prepare the process to serve, before anything slow happens.
 ///
-/// Installs the `SIGHUP` reload handler in every configuration: from here
-/// on a `SIGHUP` reloads the shortcut configuration (a logged no-op when
-/// there is none) instead of taking the default action, which would end
-/// the proxy and every Linux GUI app with it.
+/// First installs the `SIGHUP` reload handler in every configuration: from
+/// here on a `SIGHUP` reloads the shortcut configuration (a logged no-op
+/// when there is none) instead of taking the default action, which would
+/// end the proxy and every Linux GUI app with it. Then raises the
+/// open-file limit.
 fn prepare_process() -> Option<tokio::signal::unix::Signal> {
-    proxy::install_reload_signal()
+    let reload_signal = proxy::install_reload_signal();
+    raise_open_file_limit();
+    reload_signal
 }
 
 #[cfg(test)]
