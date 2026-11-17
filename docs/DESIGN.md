@@ -230,7 +230,9 @@ against that output queues the part that goes first before it calls the
 wrapper (`wl_surface.destroy` releases the surface's Aura objects first).
 In tests, `Context::assert_no_orphans` checks every per-object key, and
 every object such state names, against the table; `proxy::fuzz` runs it
-after every batch.
+after every batch. A seat reference is the exception: it outlives its
+seat ([Object lifetimes](INVARIANTS.md#object-lifetimes)), so only its
+copies are checked, against their keyboard's.
 
 ### Message effects
 

@@ -830,12 +830,15 @@ impl KeyGenerationRegistry {
             )
     }
 
-    /// Every guest wl_surface a peek watermark is for.
+    /// Every peek watermark's guest seat, guest wl_surface and host
+    /// keyboard.
     #[cfg(test)]
-    pub(super) fn peek_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn peek_watermarks_for_test(
+        &self,
+    ) -> impl Iterator<Item = (u32, Option<u32>, HostId)> + '_ {
         self.latest_peek_sequences
-            .keys()
-            .filter_map(|&(_, surface)| surface)
+            .iter()
+            .map(|(&(seat, surface), watermark)| (seat, surface, watermark.keyboard))
     }
 
     pub(crate) fn clear_keyboard(&mut self, keyboard: HostId) {

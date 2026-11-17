@@ -181,7 +181,8 @@ impl Context {
     /// host object must be paired with one, or, if only the proxy uses it,
     /// be live itself. A render buffer, which the host may still show after
     /// its guest object ends, only needs its host ID to be in use, retired
-    /// included.
+    /// included. A seat reference outlives its seat, so only its copies
+    /// are checked, against their keyboard's.
     pub(crate) fn assert_no_orphans(&self) {
         let table = &self.shadow_table;
         let guest = |what: &str, id: u32, interface: &str| {
@@ -283,12 +284,38 @@ impl Context {
         for keyboard in host_keyboards {
             host("keyboard state", keyboard.0, "wl_keyboard");
         }
+        // A seat reference names the guest wl_seat that its keyboard or
+        // text input was created from, and outlives that seat, whose ID the
+        // guest may then reuse for any object (INVARIANTS "Object
+        // lifetimes"). So `keyboard_to_seat` and a text input's seat are
+        // not checked against the table, and every copy of a keyboard's
+        // seat must name it.
+        let keyboard_seat = |keyboard: HostId| {
+            table
+                .get_guest_id(keyboard.0)
+                .and_then(|keyboard| self.keyboard_to_seat.get(&keyboard))
+                .copied()
+        };
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
             host("keyboard focus", keyboard.0, "wl_keyboard");
             guest("keyboard focus", focus.guest_surface, "wl_surface");
+            assert_eq!(
+                keyboard_seat(keyboard),
+                Some(focus.guest_seat),
+                "keyboard focus names a seat other than keyboard {}'s",
+                keyboard.0
+            );
         }
-        for surface in self.key_generations.peek_surfaces_for_test() {
-            guest("peek watermark", surface, "wl_surface");
+        for (seat, surface, keyboard) in self.key_generations.peek_watermarks_for_test() {
+            if let Some(surface) = surface {
+                guest("peek watermark", surface, "wl_surface");
+            }
+            assert_eq!(
+                keyboard_seat(keyboard),
+                Some(seat),
+                "peek watermark names a seat other than keyboard {}'s",
+                keyboard.0
+            );
         }
         for (&text_input, state) in &self.text_inputs {
             guest("text input state", text_input, "zwp_text_input_v3");
