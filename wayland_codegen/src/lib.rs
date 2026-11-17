@@ -275,6 +275,42 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_typed_encoders() {
+        let wayland = generate_compact("wayland.xml");
+        assert!(
+            wayland
+                .contains("pubfncreate_pool(sender_id:u32,id:u32,fd:OwnedFd,size:i32)->Outgoing{"),
+            "an encoder takes the XML arguments in order, and owns its descriptors"
+        );
+        assert!(
+            wayland.contains(
+                "#[must_use=\"amessagethatisnotqueuedleaksitsdescriptors\"]pubfncreate_pool("
+            ),
+            "an unused encoder result is a warning"
+        );
+        assert!(
+            wayland
+                .contains("pubfnattach(sender_id:u32,buffer:Option<u32>,x:i32,y:i32)->Outgoing{"),
+            "a nullable object is optional"
+        );
+        assert!(
+            wayland.contains(
+                "pubfnbind(sender_id:u32,name:u32,interface:&str,version:u32,id:u32)->Result<Outgoing,ProtocolError>{"
+            ),
+            "an untyped new_id names its interface and version, and a string makes the encoder fallible"
+        );
+        assert!(
+            wayland.contains(
+                "Ok((builder.try_build_message(sender_id,super::REQ_RECEIVE)?,vec![fd.into_raw_fd()]))"
+            ),
+            "a descriptor becomes raw only after its message is built"
+        );
+        let request_encoders = wayland.find("pubmodreq{").expect("request encoders");
+        let event_encoders = wayland.find("pubmodevt{").expect("event encoders");
+        assert!(request_encoders < event_encoders);
+    }
+
+    #[test]
     #[should_panic(expected = "thing generates the constant REQ_PING twice")]
     fn test_generate_rejects_colliding_constant_names() {
         let xml = r#"

@@ -21,6 +21,12 @@ use std::os::unix::io::RawFd;
 /// The object ID of the `wl_display` singleton on every connection.
 pub const WL_DISPLAY_ID: u32 = 1;
 
+/// One encoded message and the descriptors it carries, in argument order.
+///
+/// The generated `req::` and `evt::` encoders return it, and the proxy's
+/// send queues hold it until the message is sent.
+pub type Outgoing = (Vec<u8>, Vec<RawFd>);
+
 /// The header that starts every Wayland wire message.
 ///
 /// Wire layout (Wayland specification, "Wire Format"), both words
@@ -451,8 +457,16 @@ impl MessageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{Framing, MessageBuilder, MessageHeader, ProtocolError, WireMessage};
-    use crate::test_support::Rng;
+    use super::{Framing, MessageBuilder, MessageHeader, Outgoing, ProtocolError, WireMessage};
+    use crate::protocols::aura_shell::zaura_surface;
+    use crate::protocols::linux_dmabuf_v1::{
+        zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
+    };
+    use crate::protocols::viewporter::wp_viewport;
+    use crate::protocols::wayland::{wl_data_offer, wl_registry, wl_shm, wl_surface};
+    use crate::protocols::xdg_shell::xdg_toplevel;
+    use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file, Rng};
+    use std::os::fd::{AsRawFd, OwnedFd};
 
     /// Decoding holds for arbitrary bytes: a frame never claims more bytes
     /// than the stream has, no read moves past the payload or the
@@ -525,6 +539,226 @@ mod tests {
         ] {
             assert!(count > 1000, "only {count} {framing} frames");
         }
+    }
+
+    /// The message `write` builds by hand, the way the proxy built every
+    /// message before the generated encoders. Opcodes are literals, read
+    /// off the XML, so these goldens do not trust the generated constants.
+    fn hand_built(sender_id: u32, opcode: u16, write: impl FnOnce(&mut MessageBuilder)) -> Vec<u8> {
+        let mut builder = MessageBuilder::new();
+        write(&mut builder);
+        builder.build_message(sender_id, opcode)
+    }
+
+    /// A descriptor with an identity no other open descriptor shares.
+    fn descriptor() -> OwnedFd {
+        shm_pool_file(&[]).into()
+    }
+
+    #[test]
+    fn encoders_match_hand_built_scalar_messages() {
+        assert_eq!(
+            wl_surface::req::damage(3, -1, 2, 30, 40),
+            (
+                hand_built(3, 2, |b| {
+                    b.write_i32(-1);
+                    b.write_i32(2);
+                    b.write_i32(30);
+                    b.write_i32(40);
+                }),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            wl_surface::req::commit(3),
+            (hand_built(3, 6, |_| {}), Vec::new())
+        );
+        // wl_fixed_t keeps its raw 24.8 bits.
+        assert_eq!(
+            wp_viewport::req::set_source(4, -256, 0x0100_0001, 512, i32::MAX),
+            (
+                hand_built(4, 1, |b| {
+                    b.write_fixed(-256);
+                    b.write_fixed(0x0100_0001);
+                    b.write_fixed(512);
+                    b.write_fixed(i32::MAX);
+                }),
+                Vec::new()
+            )
+        );
+        // A nullable object encodes null as 0.
+        for (buffer, raw) in [(None, 0), (Some(9), 9)] {
+            assert_eq!(
+                wl_surface::req::attach(3, buffer, 0, 0),
+                (
+                    hand_built(3, 1, |b| {
+                        b.write_u32(raw);
+                        b.write_i32(0);
+                        b.write_i32(0);
+                    }),
+                    Vec::new()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn encoders_match_hand_built_string_and_array_messages() {
+        // Strings that need 1, 0, 2 and 3 bytes of padding after their NUL.
+        // These goldens share MessageBuilder's primitives; the round-trip
+        // test below is what checks the layout against the decoder.
+        for interface in ["wl_shm", "wl_seat", "wl_output", "abcd"] {
+            assert_eq!(
+                wl_registry::req::bind(2, 7, interface, 3, 12),
+                Ok((
+                    hand_built(2, 0, |b| {
+                        b.write_u32(7);
+                        b.write_string(interface);
+                        b.write_u32(3);
+                        b.write_u32(12);
+                    }),
+                    Vec::new()
+                ))
+            );
+        }
+        for startup_id in [None, Some(""), Some("token")] {
+            assert_eq!(
+                zaura_surface::req::set_startup_id(5, startup_id),
+                Ok((
+                    hand_built(5, 3, |b| b.write_nullable_string(startup_id)),
+                    Vec::new()
+                ))
+            );
+        }
+        let states = [1u32, 4].map(u32::to_ne_bytes).concat();
+        assert_eq!(
+            xdg_toplevel::evt::configure(6, 800, 600, &states),
+            Ok((
+                hand_built(6, 0, |b| {
+                    b.write_i32(800);
+                    b.write_i32(600);
+                    b.write_array(&states);
+                }),
+                Vec::new()
+            ))
+        );
+        // Two bytes of indices need two bytes of padding.
+        assert_eq!(
+            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(6, &[1, 0]),
+            Ok((hand_built(6, 5, |b| b.write_array(&[1, 0])), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn encoders_carry_descriptors_outside_the_payload_in_order() {
+        let pool = descriptor();
+        let raw_pool = pool.as_raw_fd();
+        assert_eq!(
+            wl_shm::req::create_pool(8, 20, pool, 4096),
+            (
+                hand_built(8, 0, |b| {
+                    b.write_u32(20);
+                    b.write_i32(4096);
+                }),
+                vec![raw_pool]
+            )
+        );
+        let plane = descriptor();
+        let raw_plane = plane.as_raw_fd();
+        assert_eq!(
+            zwp_linux_buffer_params_v1::req::add(9, plane, 1, 64, 256, 0, 1),
+            (
+                hand_built(9, 1, |b| {
+                    for value in [1, 64, 256, 0, 1] {
+                        b.write_u32(value);
+                    }
+                }),
+                vec![raw_plane]
+            )
+        );
+        let pipe_end = descriptor();
+        let raw_pipe = pipe_end.as_raw_fd();
+        assert_eq!(
+            wl_data_offer::req::receive(10, "text/plain", pipe_end),
+            Ok((
+                hand_built(10, 1, |b| b.write_string("text/plain")),
+                vec![raw_pipe]
+            ))
+        );
+        for raw in [raw_pool, raw_plane, raw_pipe] {
+            // The caller owns the raw descriptors once they are encoded.
+            nix::unistd::close(raw).expect("close an encoded descriptor");
+        }
+    }
+
+    /// Decode `outgoing` with `decode`, checking that its header frames the
+    /// whole message and that the decoder consumes the whole payload.
+    fn round_trip<T>(
+        (message, fds): &Outgoing,
+        decode: impl FnOnce(&mut WireMessage) -> Result<T, ProtocolError>,
+    ) -> T {
+        let header = MessageHeader::parse(message).expect("header");
+        assert_eq!(header.len, message.len());
+        let payload = &message[MessageHeader::LEN..];
+        let mut wire = WireMessage::new(header.sender_id, header.opcode, payload, fds);
+        let decoded = decode(&mut wire).expect("decode");
+        assert!(wire.is_payload_consumed());
+        decoded
+    }
+
+    #[test]
+    fn encoded_messages_decode_to_the_same_arguments() {
+        let bind = wl_registry::req::bind(2, 7, "wl_seat", 5, 12).unwrap();
+        let wl_registry::Request::Bind { name, id } =
+            round_trip(&bind, wl_registry::Request::from_wire);
+        assert_eq!((name, id), (7, ("wl_seat".to_string(), 5, 12)));
+
+        let states = [2u32].map(u32::to_ne_bytes).concat();
+        let configure = xdg_toplevel::evt::configure(6, -1, 0, &states).unwrap();
+        let xdg_toplevel::Event::Configure {
+            width,
+            height,
+            states: decoded_states,
+        } = round_trip(&configure, xdg_toplevel::Event::from_wire)
+        else {
+            panic!("configure decodes as another event");
+        };
+        assert_eq!((width, height, decoded_states), (-1, 0, states));
+
+        let startup_id = zaura_surface::req::set_startup_id(5, None).unwrap();
+        let zaura_surface::Request::SetStartupId { startup_id } =
+            round_trip(&startup_id, zaura_surface::Request::from_wire)
+        else {
+            panic!("set_startup_id decodes as another request");
+        };
+        assert_eq!(startup_id, None);
+
+        let table = descriptor();
+        let raw_table = table.as_raw_fd();
+        let format_table = zwp_linux_dmabuf_feedback_v1::evt::format_table(6, table, 32);
+        let zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } = round_trip(
+            &format_table,
+            zwp_linux_dmabuf_feedback_v1::Event::from_wire,
+        ) else {
+            panic!("format_table decodes as another event");
+        };
+        assert_eq!((fd, size), (raw_table, 32));
+        nix::unistd::close(raw_table).expect("close the encoded table");
+    }
+
+    #[test]
+    fn an_encoder_that_cannot_build_its_message_closes_its_descriptors() {
+        let pipe_end = descriptor();
+        let identity = fd_identity(pipe_end.as_raw_fd());
+        let mime_type = "x".repeat(u16::MAX.into());
+        assert!(matches!(
+            wl_data_offer::req::receive(10, &mime_type, pipe_end),
+            Err(ProtocolError::MessageTooLarge(_))
+        ));
+        assert!(
+            !any_fd_has_identity(identity),
+            "a message that is never sent must not leak its descriptor"
+        );
     }
 
     #[test]

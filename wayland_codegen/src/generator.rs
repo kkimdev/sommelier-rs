@@ -67,8 +67,8 @@ pub fn generate(protocol: &Protocol) -> String {
             #![allow(clippy::single_match)]
             #![allow(clippy::collapsible_match)]
 
-            use std::os::unix::io::RawFd;
-            use crate::wire::{WireMessage, MessageBuilder, Action, ProtocolError};
+            use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+            use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
             use crate::state::Context;
 
             pub const ALLOWED_INTERFACES: &[&str] = &[
@@ -86,7 +86,7 @@ pub fn generate(protocol: &Protocol) -> String {
                 msg: &mut WireMessage,
                 handler: &mut H,
                 ctx: &mut Context,
-            ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            ) -> Result<Option<Outgoing>, ProtocolError> {
                 ctx.last_sender_id = msg.sender_id;
                 match interface {
                     #(#dispatch_request_cases)*
@@ -99,7 +99,7 @@ pub fn generate(protocol: &Protocol) -> String {
                 msg: &mut WireMessage,
                 handler: &mut H,
                 ctx: &mut Context,
-            ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            ) -> Result<Option<Outgoing>, ProtocolError> {
                 ctx.last_sender_id = msg.sender_id;
                 match interface {
                     #(#dispatch_event_cases)*
@@ -196,10 +196,8 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     }
 
     let expanded = quote! {
-        use std::os::unix::io::RawFd;
-
         use crate::state::Context;
-        use crate::wire::{ProtocolError, WireMessage};
+        use crate::wire::{Outgoing, ProtocolError, WireMessage};
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum ProtocolFamily {
@@ -222,28 +220,26 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             }
         }
 
-        #[allow(clippy::type_complexity)]
         pub fn dispatch_request<H: AllProtocolHandlers + ?Sized>(
             family: ProtocolFamily,
             interface: &str,
             msg: &mut WireMessage,
             handler: &mut H,
             ctx: &mut Context,
-        ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+        ) -> Result<Option<Outgoing>, ProtocolError> {
             match family {
                 #(#dispatch_request_arms)*
                 #(#special_request_arms)*
             }
         }
 
-        #[allow(clippy::type_complexity)]
         pub fn dispatch_event<H: AllProtocolHandlers + ?Sized>(
             family: ProtocolFamily,
             interface: &str,
             msg: &mut WireMessage,
             handler: &mut H,
             ctx: &mut Context,
-        ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+        ) -> Result<Option<Outgoing>, ProtocolError> {
             match family {
                 #(#dispatch_event_arms)*
                 #(#special_event_arms)*
@@ -367,6 +363,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
     let mut dispatch_event_arms = Vec::new();
 
     let mut enums = Vec::new();
+    let mut request_encoders = Vec::new();
+    let mut event_encoders = Vec::new();
 
     let mut req_idx = 0u16;
     let mut evt_idx = 0u16;
@@ -378,6 +376,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 constant_names.claim_opcode(&opcode_name);
                 request_opcodes.push(quote! { pub const #opcode_name: u16 = #req_idx; });
                 request_opcodes.push(generate_since_constant(&opcode_name, req.since));
+                request_encoders.push(generate_encoder(&interface.name, req, &opcode_name));
 
                 let var_name = format_ident!("{}", snake_to_camel(&req.name));
                 let fields = generate_fields(&req.items);
@@ -574,6 +573,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 constant_names.claim_opcode(&opcode_name);
                 event_opcodes.push(quote! { pub const #opcode_name: u16 = #evt_idx; });
                 event_opcodes.push(generate_since_constant(&opcode_name, evt.since));
+                event_encoders.push(generate_encoder(&interface.name, evt, &opcode_name));
 
                 let var_name = format_ident!("{}", snake_to_camel(&evt.name));
                 let fields = generate_fields(&evt.items);
@@ -749,6 +749,18 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
             #(#event_opcodes)*
             #(#enums)*
 
+            /// Encoders of the requests a client sends to this interface.
+            pub mod req {
+                use super::*;
+                #(#request_encoders)*
+            }
+
+            /// Encoders of the events a compositor sends from this interface.
+            pub mod evt {
+                use super::*;
+                #(#event_encoders)*
+            }
+
             #[derive(Debug)]
             pub enum Request {
                 #(#request_variants),*
@@ -801,7 +813,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 msg: &mut WireMessage,
                 handler: &mut H,
                 ctx: &mut Context,
-            ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            ) -> Result<Option<Outgoing>, ProtocolError> {
                 // The sender comes first, as in libwayland-server: a request
                 // from an object that is gone is reported as such, whatever
                 // its opcode and arguments.
@@ -824,7 +836,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 msg: &mut WireMessage,
                 handler: &mut H,
                 ctx: &mut Context,
-            ) -> Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError> {
+            ) -> Result<Option<Outgoing>, ProtocolError> {
                 if !ctx.shadow_table.is_event_sender_known(msg.sender_id) {
                     log::debug!(
                         "Dropping event from untracked host sender {}",
@@ -934,6 +946,115 @@ fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStre
     let since_name = format_ident!("{}_SINCE", opcode_name);
     let since = since.unwrap_or(1);
     quote! { pub const #since_name: u32 = #since; }
+}
+
+/// Generate the encoder of one message: `req::<name>` or `evt::<name>`.
+///
+/// The encoder takes the sender's ID and then the message's arguments in
+/// XML order, so the compiler checks the opcode, argument order and
+/// argument types of every message the proxy builds itself. A message that
+/// carries a string or an array can exceed the wire's 16-bit length and
+/// returns a `Result`; any other cannot and returns the message directly.
+/// Descriptors are `OwnedFd`s that become raw only once the message is
+/// built, so a failed build closes them.
+fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> TokenStream {
+    let name = sanitize_ident(&message.name);
+    let mut params = Vec::new();
+    let mut writes = Vec::new();
+    let mut fds = Vec::new();
+    let mut fallible = false;
+    for arg in args(&message.items) {
+        let arg_name = sanitize_ident(&arg.name);
+        let nullable = arg.allow_null.unwrap_or(false);
+        // Encoders are for messages the proxy builds itself, whose IDs it
+        // chose, so a null required object is a proxy bug. Host data is not
+        // checked here: forwarding translates and validates it on its own
+        // path, and must not pass it through an encoder unchecked.
+        if matches!(arg.typ.as_str(), "object" | "new_id") && !nullable {
+            let null = format!("{}.{}: {} is null", interface, message.name, arg.name);
+            writes.push(quote! { debug_assert_ne!(#arg_name, 0, #null); });
+        }
+        match arg.typ.as_str() {
+            "int" | "fixed" => {
+                params.push(quote! { #arg_name: i32 });
+                writes.push(quote! { builder.write_i32(#arg_name); });
+            }
+            "uint" => {
+                params.push(quote! { #arg_name: u32 });
+                writes.push(quote! { builder.write_u32(#arg_name); });
+            }
+            "object" | "new_id" if nullable => {
+                params.push(quote! { #arg_name: Option<u32> });
+                writes.push(quote! { builder.write_u32(#arg_name.unwrap_or(0)); });
+            }
+            // `wl_registry.bind` names the interface and version of the
+            // object it creates.
+            "new_id" if arg.interface.is_none() => {
+                fallible = true;
+                params.push(quote! { interface: &str, version: u32, #arg_name: u32 });
+                writes.push(quote! {
+                    builder.write_string(interface);
+                    builder.write_u32(version);
+                    builder.write_u32(#arg_name);
+                });
+            }
+            "object" | "new_id" => {
+                params.push(quote! { #arg_name: u32 });
+                writes.push(quote! { builder.write_u32(#arg_name); });
+            }
+            "string" if nullable => {
+                fallible = true;
+                params.push(quote! { #arg_name: Option<&str> });
+                writes.push(quote! { builder.write_nullable_string(#arg_name); });
+            }
+            "string" => {
+                fallible = true;
+                params.push(quote! { #arg_name: &str });
+                writes.push(quote! { builder.write_string(#arg_name); });
+            }
+            "array" => {
+                fallible = true;
+                params.push(quote! { #arg_name: &[u8] });
+                writes.push(quote! { builder.write_array(#arg_name); });
+            }
+            "fd" => {
+                params.push(quote! { #arg_name: OwnedFd });
+                fds.push(quote! { #arg_name.into_raw_fd() });
+            }
+            other => panic!(
+                "{}.{}: unknown argument type {}",
+                interface, message.name, other
+            ),
+        }
+    }
+    let fds = if fds.is_empty() {
+        quote! { Vec::new() }
+    } else {
+        quote! { vec![#(#fds),*] }
+    };
+    let (output, message) = if fallible {
+        (
+            quote! { Result<Outgoing, ProtocolError> },
+            quote! { Ok((builder.try_build_message(sender_id, super::#opcode)?, #fds)) },
+        )
+    } else {
+        (
+            quote! { Outgoing },
+            quote! { (builder.build_message(sender_id, super::#opcode), #fds) },
+        )
+    };
+    // A dropped encoder result loses the message without a trace and leaks
+    // its descriptors, which are raw once it is built. The reason keeps
+    // Clippy from calling the attribute redundant on a `Result`.
+    quote! {
+        #[must_use = "a message that is not queued leaks its descriptors"]
+        pub fn #name(sender_id: u32, #(#params),*) -> #output {
+            #[allow(unused_mut)]
+            let mut builder = MessageBuilder::new();
+            #(#writes)*
+            #message
+        }
+    }
 }
 
 /// The flat constant names of one interface module.
