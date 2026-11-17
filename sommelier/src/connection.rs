@@ -32,6 +32,18 @@ use tokio::io::unix::AsyncFd;
 // truncation defensively for malformed or non-Linux transports.
 const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
 
+/// The most received descriptors a connection holds before messages
+/// consume them.
+///
+/// Descriptors travel apart from the bytes, so a peer can attach them to
+/// messages that take none and make the proxy hold them indefinitely; with
+/// no bound, one client could exhaust the descriptor table that every
+/// client shares. libwayland buffers a connection's incoming descriptors in
+/// a 4096-byte ring, 1024 descriptors, and disconnects a peer that
+/// overflows it. Using the same bound refuses no peer that a libwayland
+/// compositor would accept.
+const MAX_PENDING_FDS: usize = 1024;
+
 pub struct WaylandConnection {
     transport: ConnectionTransport,
     pub read_buf: Vec<u8>,
@@ -268,6 +280,29 @@ impl WaylandConnection {
         }
     }
 
+    /// Append one receive to the ordered byte and descriptor buffers.
+    ///
+    /// Fails once more than [`MAX_PENDING_FDS`] descriptors are pending; the
+    /// caller then closes the connection, which closes them.
+    fn append_received(
+        &mut self,
+        data: &[u8],
+        fds: impl IntoIterator<Item = RawFd>,
+    ) -> io::Result<()> {
+        self.read_buf.extend_from_slice(data);
+        self.read_fds.extend(fds);
+        if self.read_fds.len() > MAX_PENDING_FDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer has {} unconsumed file descriptors; the limit is {MAX_PENDING_FDS}",
+                    self.read_fds.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Return whether the buffered byte stream contains a complete Wayland
     /// message.
     ///
@@ -358,8 +393,7 @@ impl WaylandConnection {
 
                     match result {
                         Ok(Ok((bytes, fds))) => {
-                            self.read_buf.extend_from_slice(&buf[..bytes]);
-                            self.read_fds.extend(fds);
+                            self.append_received(&buf[..bytes], fds)?;
                             return Ok(bytes);
                         }
                         Ok(Err(e)) => return Err(e),
@@ -369,11 +403,8 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => {
                 let (data, fds) = channel.recv().await?;
-                let len = data.len();
-                self.read_buf.extend(data);
-                self.read_fds
-                    .extend(fds.into_iter().map(|fd| fd.into_raw_fd()));
-                Ok(len)
+                self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                Ok(data.len())
             }
         }
     }
@@ -390,8 +421,7 @@ impl WaylandConnection {
                 let mut cmsg_space = nix::cmsg_space!([RawFd; UNIX_MAX_SCM_RIGHTS_FDS]);
                 match recv_unix_message(fd.as_raw_fd(), &mut buf, &mut cmsg_space) {
                     Ok((bytes, fds)) => {
-                        self.read_buf.extend_from_slice(&buf[..bytes]);
-                        self.read_fds.extend(fds);
+                        self.append_received(&buf[..bytes], fds)?;
                         Ok(Some(bytes))
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
@@ -400,11 +430,8 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => match channel.try_recv()? {
                 Some((data, fds)) => {
-                    let len = data.len();
-                    self.read_buf.extend(data);
-                    self.read_fds
-                        .extend(fds.into_iter().map(|fd| fd.into_raw_fd()));
-                    Ok(Some(len))
+                    self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                    Ok(Some(data.len()))
                 }
                 None => Ok(None),
             },
@@ -434,7 +461,10 @@ impl Drop for WaylandConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection};
+    use super::{
+        decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection,
+        MAX_PENDING_FDS,
+    };
     use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
@@ -443,7 +473,7 @@ mod tests {
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -472,6 +502,54 @@ mod tests {
         );
         assert_eq!(connection.read_buf, message);
         assert!(connection.read_fds.is_empty());
+    }
+
+    /// Send one byte with `fd` attached, as a message that takes no
+    /// descriptor would carry it.
+    fn send_with_fd(peer: &UnixStream, fd: RawFd) {
+        use std::os::fd::AsRawFd;
+        let sent = sendmsg::<()>(
+            peer.as_raw_fd(),
+            &[IoSlice::new(b"x")],
+            &[ControlMessage::ScmRights(&[fd])],
+            MsgFlags::empty(),
+            None,
+        )
+        .expect("send a descriptor");
+        assert_eq!(sent, 1);
+    }
+
+    #[tokio::test]
+    async fn too_many_unconsumed_fds_end_the_connection() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        // Stand-ins for descriptors already pending; negative entries are
+        // never closed, so the test does not need a thousand real ones.
+        connection.read_fds.resize(MAX_PENDING_FDS - 1, -1);
+
+        let name = CString::new("sommelier-pending-fd-limit").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let identity = fd_identity(memfd.as_raw_fd());
+        send_with_fd(&peer, memfd.as_raw_fd());
+        send_with_fd(&peer, memfd.as_raw_fd());
+        drop(memfd);
+
+        assert_eq!(
+            connection
+                .recv()
+                .await
+                .expect("the limit itself is allowed"),
+            1
+        );
+        assert!(
+            connection.recv().await.is_err(),
+            "one descriptor past the limit must end the connection"
+        );
+        drop(connection);
+        assert!(
+            !any_fd_has_identity(identity),
+            "closing the connection must close every pending descriptor"
+        );
     }
 
     #[tokio::test]
