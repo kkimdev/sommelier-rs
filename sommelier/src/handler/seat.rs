@@ -49,6 +49,7 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
     use crate::protocols::wayland::wl_seat::WlSeatHandler;
     use crate::state::{Context, GuestKeyOwner, HostId, TextInputState};
+    use crate::wire::WireMessage;
 
     #[test]
     fn release_keeps_child_keyboard_routing_state() {
@@ -125,6 +126,56 @@ mod tests {
             Some(guest_surface)
         );
         assert!(ctx.keyboard_to_seat.contains_key(&guest_keyboard));
+    }
+
+    #[test]
+    fn children_keep_an_ended_seat_whose_id_the_guest_reuses() {
+        // A focused keyboard and a text input outlive their seat, which the
+        // guest releases and whose ID it then reuses for a surface.
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let (guest_seat, host_seat) = (10, 11);
+        let (guest_keyboard, host_keyboard) = (20, 21);
+        let (guest_surface, host_surface) = (40, 41);
+        let (guest_text_input, host_text_input) = (50, 51);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
+        ctx.shadow_table
+            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
+        ctx.shadow_table
+            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
+        ctx.shadow_table.insert_bridged_for_test(
+            guest_text_input,
+            host_text_input,
+            "zwp_text_input_v3",
+            "zwp_text_input_v1",
+        );
+        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
+        ctx.keyboard_focus.set_for_test(
+            HostId(host_keyboard),
+            guest_seat,
+            guest_surface,
+            host_surface,
+        );
+        ctx.text_inputs.insert(
+            guest_text_input,
+            TextInputState::new(host_text_input, None, guest_seat, Some(guest_surface)),
+        );
+
+        ctx.last_sender_id = guest_seat;
+        let mut release = WireMessage::new(guest_seat, wl_seat::REQ_RELEASE, &[]);
+        wl_seat::dispatch_request(&mut release, &mut SeatHandler, &mut ctx)
+            .expect("wl_seat.release decodes");
+        ctx.release_deleted_host_id(host_seat);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_seat, 12, "wl_surface");
+
+        ctx.assert_no_orphans();
+        assert_eq!(ctx.keyboard_to_seat[&guest_keyboard], guest_seat);
+        assert_eq!(ctx.text_inputs[&guest_text_input].guest_seat, guest_seat);
+        assert_eq!(
+            ctx.keyboard_focus.surface_for_seat(guest_seat),
+            Some(guest_surface)
+        );
     }
 
     #[test]

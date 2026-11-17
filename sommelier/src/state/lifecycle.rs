@@ -132,7 +132,10 @@ impl Context {
 /// Forget the state of guest object `guest`, of `interface`, at its first
 /// end, through the owner of each interface's state. `host` is its host
 /// object; a local object has none. `host_deleted` says the host deleted
-/// that object, so nothing may be sent to it.
+/// that object, so nothing may be sent to it. Only the text-input arm reads
+/// it, since only a text input sends to its own host object as it ends (a
+/// `deactivate`); the other arms send only to other objects, such as Aura
+/// children or an extended keyboard, which the host's delete leaves live.
 ///
 /// Every interface with per-object state has an arm. A `wl_buffer`'s state
 /// is its render buffer, keyed by host ID ([`forget_host_id`]), and an
@@ -181,7 +184,8 @@ impl Context {
     /// host object must be paired with one, or, if only the proxy uses it,
     /// be live itself. A render buffer, which the host may still show after
     /// its guest object ends, only needs its host ID to be in use, retired
-    /// included.
+    /// included. A seat reference outlives its seat, so only its copies
+    /// are checked, against their keyboard's.
     pub(crate) fn assert_no_orphans(&self) {
         let table = &self.shadow_table;
         let guest = |what: &str, id: u32, interface: &str| {
@@ -283,12 +287,38 @@ impl Context {
         for keyboard in host_keyboards {
             host("keyboard state", keyboard.0, "wl_keyboard");
         }
+        // A seat reference names the guest wl_seat that its keyboard or
+        // text input was created from, and outlives that seat, whose ID the
+        // guest may then reuse for any object (INVARIANTS "Object
+        // lifetimes"). So `keyboard_to_seat` and a text input's seat are
+        // not checked against the table, and every copy of a keyboard's
+        // seat must name it.
+        let keyboard_seat = |keyboard: HostId| {
+            table
+                .get_guest_id(keyboard.0)
+                .and_then(|keyboard| self.keyboard_to_seat.get(&keyboard))
+                .copied()
+        };
         for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
             host("keyboard focus", keyboard.0, "wl_keyboard");
             guest("keyboard focus", focus.guest_surface, "wl_surface");
+            assert_eq!(
+                keyboard_seat(keyboard),
+                Some(focus.guest_seat),
+                "keyboard focus names a seat other than keyboard {}'s",
+                keyboard.0
+            );
         }
-        for surface in self.key_generations.peek_surfaces_for_test() {
-            guest("peek watermark", surface, "wl_surface");
+        for (seat, surface, keyboard) in self.key_generations.peek_watermarks_for_test() {
+            if let Some(surface) = surface {
+                guest("peek watermark", surface, "wl_surface");
+            }
+            assert_eq!(
+                keyboard_seat(keyboard),
+                Some(seat),
+                "peek watermark names a seat other than keyboard {}'s",
+                keyboard.0
+            );
         }
         for (&text_input, state) in &self.text_inputs {
             guest("text input state", text_input, "zwp_text_input_v3");
@@ -353,6 +383,20 @@ impl Context {
             );
         for &registry in registries {
             host("registry globals", registry, "wl_registry");
+        }
+        // A removal on record is of the global's current generation, and
+        // waits for a registry that still lists it; a global the proxy
+        // drops is in neither `host_globals` nor `hidden_host_globals`.
+        for (&name, &generation) in &self.removed_global_generations {
+            assert_eq!(
+                self.global_generations.get(&name),
+                Some(&generation),
+                "removal of global {name} outlived its generation {generation}"
+            );
+            assert!(
+                registry::global_still_seen(self, name, Some(generation)),
+                "removal of global {name} outlived every registry that lists it"
+            );
         }
     }
 }

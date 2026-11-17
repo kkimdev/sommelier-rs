@@ -176,7 +176,7 @@ fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) ->
 
 /// Whether a registry still lists global `name` at `generation`: it has not
 /// seen that advertisement's `global_remove` yet.
-fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64>) -> bool {
+pub(crate) fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64>) -> bool {
     ctx.registry_global_names.iter().any(|(registry, names)| {
         names.contains(&name)
             && ctx
@@ -2474,8 +2474,35 @@ mod tests {
             ctx.host_globals.contains_key(&7),
             "registry 11 has not seen the removal yet"
         );
+        ctx.assert_no_orphans();
         ctx.last_sender_id = 1;
         ctx
+    }
+
+    /// The removal of a global the proxy neither advertises nor binds is
+    /// on record too, and waits for every registry that lists it.
+    #[test]
+    fn the_removal_of_a_dropped_global_waits_for_every_registry() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let unknown = "zz_unknown_v1".to_string();
+        for (guest, host) in [(10, 100), (11, 101)] {
+            ctx.shadow_table
+                .insert_paired_for_test(guest, host, "wl_registry");
+            ctx.last_sender_id = host;
+            assert_eq!(
+                RegistryHandler.on_global(&mut ctx, 7, &unknown, 1),
+                Action::Drop
+            );
+        }
+        ctx.last_sender_id = 100;
+        assert_eq!(RegistryHandler.on_global_remove(&mut ctx, 7), Action::Drop);
+        assert!(ctx.removed_global_generations.contains_key(&7));
+        ctx.assert_no_orphans();
+
+        ctx.last_sender_id = 1;
+        RegistryHandler.on_destroy_registry(&mut ctx, 11);
+        assert!(ctx.removed_global_generations.is_empty());
+        ctx.assert_no_orphans();
     }
 
     /// O3: a global removed from one registry waits for every registry that
@@ -2564,6 +2591,7 @@ mod tests {
             !ctx.removed_host_globals.contains(&7),
             "an old registry remove must not invalidate the replacement"
         );
+        ctx.assert_no_orphans();
 
         ctx.last_sender_id = 10;
         let bind = (seat, 5, 20);

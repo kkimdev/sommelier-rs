@@ -213,10 +213,10 @@ pub enum ActivationStep {
     /// No live seat can carry a `deactivate`: the generation ends locally.
     /// Exo keeps the input method attached until its own focus moves or the
     /// surface goes, and its `leave` then usually arrives while inactive and
-    /// is ignored. If the guest first reuses the seat ID and the text input
-    /// activates again, Exo's `activate` does nothing on the surface it
-    /// still has; on another surface it detaches first, and that `leave`
-    /// arrives while active: the proxy ends the new generation and
+    /// is ignored. If the guest first binds a new seat under the seat ID and
+    /// the text input activates again, Exo's `activate` does nothing on the
+    /// surface it still has; on another surface it detaches first, and that
+    /// `leave` arrives while active: the proxy ends the new generation and
     /// activates once more, which Exo ignores for the surface it now has.
     /// That costs one redundant `activate` and content type.
     Abandon,
@@ -289,6 +289,9 @@ pub struct TextInputState {
     pub pending_cursor_position: Option<(i32, i32)>,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
+    /// Whether the proxy warned that the guest seat cannot carry an
+    /// activation, which every later reconcile would repeat.
+    pub(crate) warned_seat_missing: bool,
 }
 
 /// What a v3 commit asks of the host beyond its committed state.
@@ -355,6 +358,7 @@ impl TextInputState {
             pending_deletes: Vec::new(),
             pending_cursor_position: None,
             host: HostApplied::default(),
+            warned_seat_missing: false,
         }
     }
 
@@ -830,12 +834,15 @@ impl KeyGenerationRegistry {
             )
     }
 
-    /// Every guest wl_surface a peek watermark is for.
+    /// Every peek watermark's guest seat, guest wl_surface and host
+    /// keyboard.
     #[cfg(test)]
-    pub(super) fn peek_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+    pub(super) fn peek_watermarks_for_test(
+        &self,
+    ) -> impl Iterator<Item = (u32, Option<u32>, HostId)> + '_ {
         self.latest_peek_sequences
-            .keys()
-            .filter_map(|&(_, surface)| surface)
+            .iter()
+            .map(|(&(seat, surface), watermark)| (seat, surface, watermark.keyboard))
     }
 
     pub(crate) fn clear_keyboard(&mut self, keyboard: HostId) {
