@@ -71,9 +71,12 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `WaylandConnection::send_messages` is the only way to send, and splits a
   batch only between messages, so each message's descriptors travel with
   its bytes and the receiver never meets a message whose descriptors have
-  not arrived. No single message carries more than 28.
+  not arrived. No Wayland message has more than 28 descriptor arguments;
+  `send_messages` refuses one that carries more, in every build, and the
+  session ends.
   Tests: `batches_send_at_most_the_transport_descriptor_limit_at_once`,
-  `send_messages_splits_only_between_messages`.
+  `send_messages_splits_only_between_messages`,
+  `a_message_with_more_descriptors_than_a_submission_is_not_sent`.
 - **VirtWL ioctl errors still own their descriptors.** Every descriptor
   returned in a transaction buffer belongs to the proxy, even when the
   ioctl reports an error after partially writing the buffer. Error paths
