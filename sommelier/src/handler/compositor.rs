@@ -2886,25 +2886,11 @@ mod tests {
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)],
             "translated damage must be queued before the replacement commit"
         );
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_sender(message), 200);
-        assert_eq!(msg_opcode(message), REQ_DAMAGE);
-        assert_eq!(
-            &message[8..],
-            &[
-                3i32.to_ne_bytes(),
-                4i32.to_ne_bytes(),
-                8i32.to_ne_bytes(),
-                9i32.to_ne_bytes()
-            ]
-            .concat()
-        );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), 200);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(host_damage(&ctx), [(3, 4, 8, 9)]);
     }
 
     #[test]
@@ -2926,15 +2912,11 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
+        );
+        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
     }
 
     #[test]
@@ -3055,15 +3037,11 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
+        );
+        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
     }
 
     #[test]
@@ -3076,12 +3054,7 @@ mod tests {
         assert_eq!(handler.on_damage(&mut ctx, 10, 20, 1, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = &ctx.client_to_host_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 9);
-        assert_eq!(wire.read_i32().unwrap(), 19);
-        assert_eq!(wire.read_i32().unwrap(), 3);
-        assert_eq!(wire.read_i32().unwrap(), 3);
+        assert_eq!(host_damage(&ctx), [(9, 19, 3, 3)]);
     }
 
     /// The rectangles of the host `wl_surface.damage` requests queued so far.
@@ -3206,13 +3179,7 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(wire.read_i32().unwrap(), 8);
+        assert_eq!(host_damage(&ctx), [(0, 0, 6, 8)]);
     }
 
     #[test]
@@ -3281,16 +3248,11 @@ mod tests {
         assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("offset plus explicit damage must include complete host damage");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage.0[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
+        assert_eq!(
+            host_damage(&ctx),
+            [(0, 0, 8, 6)],
+            "offset plus explicit damage must include complete host damage"
+        );
     }
 
     #[test]
@@ -3305,16 +3267,7 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("damage request");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..]);
-        assert_eq!(wire.read_i32().unwrap(), i32::MIN / 10);
-        assert_eq!(wire.read_i32().unwrap(), -1);
-        assert_eq!(wire.read_i32().unwrap(), 214_748_364);
-        assert_eq!(wire.read_i32().unwrap(), 3);
+        assert_eq!(host_damage(&ctx), [(i32::MIN / 10, -1, 214_748_364, 3)]);
     }
 
     #[test]
