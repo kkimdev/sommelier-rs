@@ -376,18 +376,92 @@ impl ShadowTable {
     /// When either ID is already in use.
     #[cfg(test)]
     pub(crate) fn insert_paired_for_test(&mut self, guest_id: u32, host_id: u32, interface: &str) {
+        self.insert_paired_with_version_for_test(
+            guest_id,
+            host_id,
+            interface,
+            Self::UNKNOWN_OBJECT_VERSION,
+        );
+    }
+
+    /// Like [`Self::insert_paired_for_test`], with `version` on both sides.
+    #[cfg(test)]
+    pub(crate) fn insert_paired_with_version_for_test(
+        &mut self,
+        guest_id: u32,
+        host_id: u32,
+        interface: &str,
+        version: u32,
+    ) {
         assert!(
-            self.get_host_id(guest_id).is_none()
-                && self.get_interface(guest_id).is_none()
+            !self.guests.contains_key(&GuestId(guest_id))
                 && self.guest_server_ids.reserve(guest_id),
             "fixture guest ID {guest_id} is in use"
         );
+        self.reserve_host_id_for_test(host_id);
+        let interface = || Interface {
+            name: interface.to_string(),
+            version,
+        };
+        self.insert_pair(GuestId(guest_id), interface(), HostId(host_id), interface());
+    }
+
+    /// Like [`Self::insert_paired_for_test`], for a guest object of
+    /// `interface` backed by a host object of `host_interface`.
+    #[cfg(test)]
+    pub(crate) fn insert_bridged_for_test(
+        &mut self,
+        guest_id: u32,
+        host_id: u32,
+        interface: &str,
+        host_interface: &str,
+    ) {
+        self.insert_paired_for_test(guest_id, host_id, interface);
+        if let Some(HostObject::Paired { interface, .. }) = self.hosts.get_mut(&HostId(host_id)) {
+            *interface = Some(host_interface.to_string());
+        }
+    }
+
+    /// Change the negotiated version of guest object `guest_id`, for a test
+    /// of version-dependent behavior on an object a fixture created.
+    #[cfg(test)]
+    pub(crate) fn set_guest_version_for_test(&mut self, guest_id: u32, version: u32) {
+        let object = self.guests.get_mut(&GuestId(guest_id));
+        let interface = match object {
+            Some(GuestObject::Local(interface)) => Some(interface),
+            Some(GuestObject::Paired { interface, .. }) => interface.as_mut(),
+            None => None,
+        };
+        interface.expect("a guest object with an interface").version = version;
+    }
+
+    /// Create a host-only object under the hard-coded ID of a test fixture,
+    /// and keep the allocator from handing it out.
+    ///
+    /// # Panics
+    ///
+    /// When the ID is already in use.
+    #[cfg(test)]
+    pub(crate) fn insert_host_only_for_test(
+        &mut self,
+        host_id: u32,
+        interface: &str,
+        version: u32,
+    ) {
+        self.reserve_host_id_for_test(host_id);
+        let object = HostObject::HostOnly {
+            interface: interface.to_string(),
+            version: Some(version),
+        };
+        self.hosts.insert(HostId(host_id), object);
+    }
+
+    #[cfg(test)]
+    fn reserve_host_id_for_test(&mut self, host_id: u32) {
         assert!(
-            self.is_host_id_available(host_id) && self.host_ids.reserve(host_id),
+            !self.hosts.contains_key(&HostId(host_id)) && self.host_ids.reserve(host_id),
             "fixture host ID {host_id} is in use"
         );
-        self.map_id(guest_id, host_id);
-        self.track_interface(guest_id, interface.to_string());
     }
 
     /// Pair guest object `guest_id` with host object `host_id`, creating

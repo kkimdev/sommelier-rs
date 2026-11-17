@@ -144,9 +144,8 @@ mod tests {
     fn host_data_offer_gets_a_guest_server_id_mapping() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // Host wl_data_device object 80 is represented by guest object 10.
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface(10, "wl_data_device".to_string());
+            .insert_paired_for_test(10, 80, "wl_data_device");
 
         // wl_data_device.data_offer(new_id wl_data_offer) is a host-generated
         // object event. The host chooses its ID, which must not be forwarded
@@ -185,12 +184,11 @@ mod tests {
     #[test]
     fn host_data_offer_rejects_reused_host_object_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface(10, "wl_data_device".to_string());
+            .insert_paired_for_test(10, 80, "wl_data_device");
         let host_surface = 0xff00_0123;
         ctx.shadow_table
-            .track_host_interface(host_surface, "wl_surface".to_string());
+            .insert_host_only_for_test(host_surface, "wl_surface", 6);
 
         let payload = host_surface.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
@@ -213,9 +211,8 @@ mod tests {
     #[test]
     fn host_data_offer_rejects_a_client_range_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface(10, "wl_data_device".to_string());
+            .insert_paired_for_test(10, 80, "wl_data_device");
 
         let payload = 123u32.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
@@ -233,7 +230,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // The data device object exists, but this host ID was never mapped.
         ctx.shadow_table
-            .track_host_interface(81, "wl_data_device".to_string());
+            .insert_host_only_for_test(81, "wl_data_device", 3);
         let host_offer: u32 = 0xff00_0001;
         let payload = host_offer.to_ne_bytes();
         let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
@@ -260,9 +257,8 @@ mod tests {
     #[test]
     fn cycled_data_offers_keep_their_guest_id_small() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
         let mut handler = DataDeviceHandler;
         let mut first_guest_offer = None;
 
@@ -298,9 +294,8 @@ mod tests {
     #[test]
     fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
         let host_offer_id = 0xff00_0000u32;
         let mut handler = DataDeviceHandler;
 

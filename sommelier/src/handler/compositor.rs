@@ -1306,11 +1306,18 @@ mod tests {
         let xdg_toplevel_id = 400u32;
         let xdg_surface_id = 500u32;
 
-        ctx.shadow_table.map_id(wl_surface_guest, wl_surface_host);
         ctx.shadow_table
-            .map_id(xdg_surface_id, xdg_surface_id + 100);
-        ctx.shadow_table
-            .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
+            .insert_paired_for_test(wl_surface_guest, wl_surface_host, "wl_surface");
+        ctx.shadow_table.insert_paired_for_test(
+            xdg_surface_id,
+            xdg_surface_id + 100,
+            "xdg_surface",
+        );
+        ctx.shadow_table.insert_paired_for_test(
+            xdg_toplevel_id,
+            xdg_toplevel_id + 100,
+            "xdg_toplevel",
+        );
         ctx.bind_aura_shell_for_test(zaura_shell_host);
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
@@ -1325,11 +1332,13 @@ mod tests {
         use crate::protocols::xdg_shell::xdg_toplevel::{dispatch_request, REQ_SET_FULLSCREEN};
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let (toplevel_guest, toplevel_host, inert_output) = (400, 500, 10);
-        ctx.shadow_table.map_id(toplevel_guest, toplevel_host);
-        ctx.shadow_table
-            .track_interface_with_version(toplevel_guest, "xdg_toplevel".into(), 3);
-        ctx.shadow_table
-            .track_interface_with_version(inert_output, "wl_output".into(), 3);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            toplevel_guest,
+            toplevel_host,
+            "xdg_toplevel",
+            3,
+        );
+        ctx.shadow_table.create_local(inert_output, "wl_output", 3);
 
         ctx.last_sender_id = toplevel_guest;
         let payload = inert_output.to_ne_bytes();
@@ -1375,14 +1384,20 @@ mod tests {
         use crate::protocols::wayland::wl_surface::{dispatch_event, EVT_ENTER, EVT_LEAVE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let (surface_guest, surface_host, output_guest, output_host) = (100, 200, 10, 20);
-        ctx.shadow_table.map_id(surface_guest, surface_host);
-        ctx.shadow_table
-            .track_interface_with_version(surface_guest, "wl_surface".into(), 4);
-        ctx.shadow_table.map_id(output_guest, output_host);
-        ctx.shadow_table
-            .track_interface_with_version(output_guest, "wl_output".into(), 3);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            surface_guest,
+            surface_host,
+            "wl_surface",
+            4,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            output_guest,
+            output_host,
+            "wl_output",
+            3,
+        );
         ctx.outputs.bind_for_test(output_host, Default::default());
-        ctx.shadow_table.mark_pending_destroy(output_guest);
+        ctx.shadow_table.guest_destroyed(output_guest);
 
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
@@ -1496,10 +1511,8 @@ mod tests {
     fn register_test_local(ctx: &mut Context, guest_id: u32, backing: BufferState) {
         let host_id = ctx.shadow_table.get_host_id(guest_id).unwrap_or_else(|| {
             let host_id = guest_id + 1;
-            ctx.shadow_table.map_id(guest_id, host_id);
             ctx.shadow_table
-                .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
-            ctx.shadow_table.set_host_version(host_id, 1);
+                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
             host_id
         });
         assert!(ctx.register_local_buffer(guest_id, host_id, backing));
@@ -1517,10 +1530,8 @@ mod tests {
     ) {
         let host_id = ctx.shadow_table.get_host_id(guest_id).unwrap_or_else(|| {
             let host_id = guest_id + 1;
-            ctx.shadow_table.map_id(guest_id, host_id);
             ctx.shadow_table
-                .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
-            ctx.shadow_table.set_host_version(host_id, 1);
+                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
             host_id
         });
         assert!(ctx.register_native_buffer(host_id, size, sync_fds));
@@ -1782,10 +1793,10 @@ mod tests {
         ctx.shadow_table.guest_destroyed_in_use(guest_id);
     }
 
-    /// An object that never reached the host is usable only if the proxy
-    /// implements its interface; see `local_only_guest_objects_are_explicitly_allowlisted`.
+    /// Only a paired or local object can send a request or be named in one:
+    /// an ID that names neither is rejected before any handler runs.
     #[test]
-    fn an_unmapped_object_that_is_not_local_is_rejected() {
+    fn an_id_that_names_no_object_is_rejected() {
         use crate::protocols::wayland::wl_surface;
         use crate::wire::ProtocolError;
         let dispatch = |ctx: &mut Context, (request, _): crate::wire::Outgoing| {
@@ -1802,12 +1813,7 @@ mod tests {
         };
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
-            .track_interface(20, "wl_surface".to_string());
-        ctx.shadow_table
-            .track_interface(21, "wl_buffer".to_string());
-        ctx.shadow_table.map_id(22, 32);
-        ctx.shadow_table
-            .track_interface(22, "wl_surface".to_string());
+            .insert_paired_for_test(22, 32, "wl_surface");
 
         assert_eq!(
             dispatch(&mut ctx, wl_surface::req::commit(20)),
@@ -1856,11 +1862,8 @@ mod tests {
         // An Aura surface created earlier, tracked the way
         // ensure_host_zaura_surface records it.
         let zaura_surface_host = 99u32;
-        ctx.shadow_table.track_host_interface_with_version(
-            zaura_surface_host,
-            "zaura_surface".to_string(),
-            38,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(zaura_surface_host, "zaura_surface", 38);
         ctx.aura_surfaces
             .remember(wl_surface_host, zaura_surface_host);
 
@@ -2145,10 +2148,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, buffer_id, (1, 1));
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
@@ -2191,10 +2196,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, buffer_id, (1, 1));
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         assert!(ctx.mark_buffer_submitted(buffer_id));
@@ -2233,10 +2240,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             buffer_id,
@@ -2289,10 +2298,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, buffer_id, (1, 1));
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
@@ -2336,10 +2347,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             buffer_id,
@@ -2398,10 +2411,12 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, buffer_id, (1, 1));
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
@@ -2455,10 +2470,12 @@ mod tests {
         let old_buffer = 42;
         let old_host_buffer = 43;
         let new_buffer = 44;
-        ctx.shadow_table.map_id(old_buffer, old_host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(old_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(old_host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            old_buffer,
+            old_host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, old_buffer, (1, 1));
 
         let mut compositor = CompositorHandler;
@@ -2505,10 +2522,12 @@ mod tests {
         let old_buffer = 42;
         let old_host_buffer = 43;
         let new_buffer = 44;
-        ctx.shadow_table.map_id(old_buffer, old_host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(old_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(old_host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            old_buffer,
+            old_host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             old_buffer,
@@ -2553,10 +2572,12 @@ mod tests {
         let surface_id = 100;
         let guest_buffer = 42;
         let host_buffer = 43;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,
@@ -2706,7 +2727,8 @@ mod tests {
         // Its host copy relates to the contents of one surface only.
         let (mut ctx, ..) = setup_ctx();
         let other_surface = 101;
-        ctx.shadow_table.map_id(other_surface, 201);
+        ctx.shadow_table
+            .insert_paired_for_test(other_surface, 201, "wl_surface");
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         for surface in [other_surface, TEST_SURFACE] {
             draw_test_frame(&ctx, 42, 0x22);
@@ -2919,12 +2941,13 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 5);
-        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
-        ctx.shadow_table
-            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer_id,
+            host_buffer_id,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             buffer_id,
@@ -3011,8 +3034,7 @@ mod tests {
     fn v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 5);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3029,8 +3051,7 @@ mod tests {
 
         ctx.host_to_client_queue.clear();
         ctx.clear_protocol_error_for_test();
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 4);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
         assert_eq!(
             ctx.surfaces
@@ -3044,8 +3065,7 @@ mod tests {
     fn v5_zero_attach_does_not_create_an_attach_offset() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 5);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3074,8 +3094,7 @@ mod tests {
     fn offset_request_wins_over_legacy_attach_offset_at_commit() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 4);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3102,8 +3121,7 @@ mod tests {
     fn consumed_attach_offset_is_not_reapplied_on_later_commit() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
-        ctx.shadow_table
-            .track_interface_with_version(surface_id, "wl_surface".to_string(), 4);
+        ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
@@ -3228,7 +3246,7 @@ mod tests {
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
         let pending = ctx.surfaces.get(&surface_id).unwrap().clone();
-        ctx.shadow_table.remove_id(surface_id);
+        ctx.shadow_table.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
@@ -3739,10 +3757,12 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 60u32;
 
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, guest_buffer, (1, 1));
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
@@ -3783,14 +3803,18 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 60u32;
 
-        ctx.shadow_table.map_id(second_surface, second_surface_host);
-        ctx.shadow_table
-            .track_interface_with_version(second_surface, "wl_surface".to_string(), 5);
-        ctx.shadow_table.set_host_version(second_surface_host, 5);
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            second_surface,
+            second_surface_host,
+            "wl_surface",
+            5,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, guest_buffer, (1, 1));
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
@@ -3839,14 +3863,18 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 60u32;
 
-        ctx.shadow_table.map_id(second_surface, second_surface_host);
-        ctx.shadow_table
-            .track_interface_with_version(second_surface, "wl_surface".to_string(), 5);
-        ctx.shadow_table.set_host_version(second_surface_host, 5);
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            second_surface,
+            second_surface_host,
+            "wl_surface",
+            5,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, guest_buffer, (1, 1));
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         assert!(ctx.mark_buffer_submitted(guest_buffer));
@@ -3897,10 +3925,12 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,
@@ -3943,10 +3973,12 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,
@@ -3992,10 +4024,12 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,
@@ -4032,14 +4066,18 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.map_id(second_surface, second_surface_host);
-        ctx.shadow_table
-            .track_interface_with_version(second_surface, "wl_surface".to_string(), 5);
-        ctx.shadow_table.set_host_version(second_surface_host, 5);
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            second_surface,
+            second_surface_host,
+            "wl_surface",
+            5,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         if native {
             register_test_native(&mut ctx, guest_buffer, (1, 1));
         } else {
@@ -4139,10 +4177,12 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         if native {
             register_test_native(&mut ctx, guest_buffer, (1, 1));
         } else {
@@ -4343,14 +4383,11 @@ mod tests {
         let guest_keyboard = 800;
         let host_keyboard = 900;
 
-        ctx.shadow_table.map_id(1, 2);
-        ctx.shadow_table.track_interface(1, "wl_seat".to_string());
-        ctx.shadow_table.map_id(text_input, 701);
+        ctx.shadow_table.insert_paired_for_test(1, 2, "wl_seat");
         ctx.shadow_table
-            .track_interface(text_input, "zwp_text_input_v3".to_string());
-        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            .insert_paired_for_test(text_input, 701, "zwp_text_input_v3");
         ctx.shadow_table
-            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard, 1);
         ctx.keyboard_focus.set_for_test(
             crate::state::HostId(host_keyboard),
@@ -4402,16 +4439,15 @@ mod tests {
         let keyboards = [(800, 900), (801, 901), (802, 902)];
         let text_inputs = [(700, 701, 702), (710, 711, 712), (720, 721, 722)];
 
-        ctx.shadow_table.map_id(live_surface, live_host_surface);
+        ctx.shadow_table
+            .insert_paired_for_test(live_surface, live_host_surface, "wl_surface");
         for (guest_seat, host_seat) in seats {
-            ctx.shadow_table.map_id(guest_seat, host_seat);
             ctx.shadow_table
-                .track_interface(guest_seat, "wl_seat".to_string());
+                .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         }
         for ((guest_keyboard, host_keyboard), (guest_seat, _)) in keyboards.into_iter().zip(seats) {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
             ctx.shadow_table
-                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         }
         for (((guest_text_input, host_object, host_v1), (guest_seat, _)), active_surface) in
@@ -4421,9 +4457,11 @@ mod tests {
                 live_surface,
             ])
         {
-            ctx.shadow_table.map_id(guest_text_input, host_object);
-            ctx.shadow_table
-                .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
+            ctx.shadow_table.insert_paired_for_test(
+                guest_text_input,
+                host_object,
+                "zwp_text_input_v3",
+            );
             ctx.text_inputs.insert(
                 guest_text_input,
                 active_text_input_state(host_v1, guest_seat, active_surface),
@@ -4536,12 +4574,14 @@ mod tests {
         let stale_without_owner = 720;
 
         for (guest_seat, host_seat) in [(seat_with_replacement, 2), (seat_without_owner, 4)] {
-            ctx.shadow_table.map_id(guest_seat, host_seat);
             ctx.shadow_table
-                .track_interface(guest_seat, "wl_seat".to_string());
+                .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         }
-        ctx.shadow_table
-            .map_id(replacement_surface, replacement_host_surface);
+        ctx.shadow_table.insert_paired_for_test(
+            replacement_surface,
+            replacement_host_surface,
+            "wl_surface",
+        );
         ctx.keyboard_focus.set_for_test(
             crate::state::HostId(900),
             seat_with_replacement,
@@ -4565,9 +4605,11 @@ mod tests {
                 active_text_input_state(722, seat_without_owner, destroyed_surface),
             ),
         ] {
-            ctx.shadow_table.map_id(guest_text_input, host_object);
-            ctx.shadow_table
-                .track_interface(guest_text_input, "zwp_text_input_v3".to_string());
+            ctx.shadow_table.insert_paired_for_test(
+                guest_text_input,
+                host_object,
+                "zwp_text_input_v3",
+            );
             ctx.text_inputs.insert(guest_text_input, state);
         }
         ctx.key_generations.record_latest_peek(

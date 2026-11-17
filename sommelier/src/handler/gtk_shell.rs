@@ -189,21 +189,17 @@ mod tests {
     /// [`setup_ctx`] with an explicit placement configuration.
     fn setup_ctx_with(placement: crate::placement_config::PlacementConfig) -> Context {
         let mut ctx = Context::with_placement_for_test(placement);
-        ctx.shadow_table
-            .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
+        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
         ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
-        ctx.shadow_table.map_id(WL_SURFACE_GUEST, WL_SURFACE_HOST);
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
             WL_SURFACE_GUEST,
-            "wl_surface".to_string(),
+            WL_SURFACE_HOST,
+            "wl_surface",
             4,
         );
         ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
-        ctx.shadow_table.track_host_interface_with_version(
-            ZAURA_SHELL_HOST,
-            "zaura_shell".to_string(),
-            38,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(ZAURA_SHELL_HOST, "zaura_shell", 38);
         ctx
     }
 
@@ -233,7 +229,7 @@ mod tests {
         let startup_id = &ctx.client_to_host_queue[1].0;
         assert_eq!(msg_opcode(startup_id), zaura_surface::REQ_SET_STARTUP_ID);
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
-        assert!(ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE));
+        assert!(ctx.shadow_table.request_sender(GTK_SURFACE) == Some(crate::state::Link::Local));
         assert_eq!(
             ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id,
             WL_SURFACE_GUEST
@@ -246,11 +242,8 @@ mod tests {
         // Every vendored gtk-shell interface is v1, so an artificial shell
         // version shows where the surface's version comes from.
         let shell_version = 7;
-        ctx.shadow_table.track_interface_with_version(
-            GTK_SHELL,
-            "gtk_shell1".to_string(),
-            shell_version,
-        );
+        ctx.shadow_table
+            .set_guest_version_for_test(GTK_SHELL, shell_version);
         ctx.last_sender_id = GTK_SHELL;
         GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
         assert_eq!(
@@ -334,9 +327,8 @@ mod tests {
         const SHELL_NAME: u32 = 7;
         let mut ctx = setup_ctx();
         ctx.host_zaura_shell = None;
-        ctx.shadow_table.map_id(REGISTRY, REGISTRY);
         ctx.shadow_table
-            .track_interface(REGISTRY, "wl_registry".to_string());
+            .insert_paired_for_test(REGISTRY, REGISTRY, "wl_registry");
         let shell = "zaura_shell".to_string();
         let mut handler = GtkShellHandler;
         let set_application_id = |ctx: &mut Context| {
@@ -453,7 +445,7 @@ mod tests {
         assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
         assert!(!ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
         assert!(
-            ctx.shadow_table.is_local_only_guest_object(GTK_SURFACE),
+            ctx.shadow_table.request_sender(GTK_SURFACE) == Some(crate::state::Link::Local),
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
         );
         assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));

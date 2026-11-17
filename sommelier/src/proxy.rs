@@ -788,16 +788,11 @@ mod tests {
             UnixStream::pair().expect("guest unix socket pair should be created");
         let (host_peer, host_socket) =
             UnixStream::pair().expect("host unix socket pair should be created");
-        let mut client = Client::new(
+        let client = Client::new(
             WaylandConnection::new(client_socket.into()).expect("register test socket"),
             WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
-        client.ctx.shadow_table.map_id(1, 1);
-        client
-            .ctx
-            .shadow_table
-            .track_interface(1, "wl_display".to_string());
         (client, guest_peer, host_peer)
     }
 
@@ -953,10 +948,8 @@ mod tests {
         const HOST: u32 = 30;
         let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
         let ctx = &mut client.ctx;
-        ctx.shadow_table.map_id(GUEST, HOST);
         ctx.shadow_table
-            .track_interface_with_version(GUEST, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(HOST, 1);
+            .insert_paired_with_version_for_test(GUEST, HOST, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(HOST, (1, 1), Vec::new()));
         assert!(ctx.mark_buffer_submitted(GUEST));
 
@@ -1128,11 +1121,10 @@ mod tests {
         const HOST_OFFER: u32 = 31;
         const RECEIVES: usize = MAX_FDS_PER_SEND + 2;
         let (mut client, guest_peer, host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.map_id(GUEST_OFFER, HOST_OFFER);
         client
             .ctx
             .shadow_table
-            .track_interface(GUEST_OFFER, "wl_data_offer".to_string());
+            .insert_paired_for_test(GUEST_OFFER, HOST_OFFER, "wl_data_offer");
 
         // The guest asks for the selection once per descriptor, in one write
         // the proxy dispatches as one batch.
@@ -1304,22 +1296,17 @@ mod tests {
             (STALE_GUEST_KEYBOARD, STALE_HOST_KEYBOARD),
             (LIVE_GUEST_KEYBOARD, LIVE_HOST_KEYBOARD),
         ] {
-            client.ctx.shadow_table.map_id(guest_id, host_id);
-            client.ctx.shadow_table.track_interface_with_version(
+            client.ctx.shadow_table.insert_paired_with_version_for_test(
                 guest_id,
-                "wl_keyboard".to_string(),
-                10,
-            );
-            client.ctx.shadow_table.track_host_interface_with_version(
                 host_id,
-                "wl_keyboard".to_string(),
+                "wl_keyboard",
                 10,
             );
         }
         client
             .ctx
             .shadow_table
-            .mark_pending_destroy(STALE_GUEST_KEYBOARD);
+            .guest_destroyed(STALE_GUEST_KEYBOARD);
         client.ctx.keyboard_repeatable_keys.insert(
             crate::state::HostId(STALE_HOST_KEYBOARD),
             std::collections::HashSet::from([57]),
@@ -1579,7 +1566,7 @@ mod tests {
         client
             .ctx
             .shadow_table
-            .track_host_interface(88, "wl_display".to_string());
+            .insert_host_only_for_test(88, "wl_display", 1);
         assert!(
             !client.handle_msgs(Direction::HostToClient).await,
             "descriptor ambiguity must remain fatal across receive calls"
@@ -1627,7 +1614,7 @@ mod tests {
         client
             .ctx
             .shadow_table
-            .track_host_interface(88, "wl_display".to_string());
+            .insert_host_only_for_test(88, "wl_display", 1);
 
         assert!(
             !client.handle_msgs(Direction::HostToClient).await,
@@ -1730,14 +1717,10 @@ mod tests {
     ) {
         let (mut client, guest_peer, host_peer) = client_with_socket_peers();
         let host_surface = 6;
-        client.ctx.shadow_table.map_id(SURFACE, host_surface);
-        client
-            .ctx
-            .shadow_table
-            .track_interface_with_version(SURFACE, "wl_surface".to_string(), 4);
-        client.ctx.shadow_table.track_host_interface_with_version(
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            SURFACE,
             host_surface,
-            "wl_surface".to_string(),
+            "wl_surface",
             4,
         );
         (client, guest_peer, host_peer)
@@ -1792,7 +1775,7 @@ mod tests {
     #[tokio::test]
     async fn a_destroyed_sender_is_an_invalid_object_whatever_it_sends() {
         let errors = surface_request_errors(
-            |client| client.ctx.shadow_table.mark_pending_destroy(SURFACE),
+            |client| client.ctx.shadow_table.guest_destroyed(SURFACE),
             99,
             &[],
         )
@@ -1911,11 +1894,14 @@ mod tests {
         );
         let ctx = &mut client.ctx;
         ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
-        ctx.shadow_table.map_id(XDG_SURFACE, XDG_SURFACE_HOST);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            XDG_SURFACE,
+            XDG_SURFACE_HOST,
+            "xdg_surface",
+            6,
+        );
         ctx.shadow_table
-            .track_interface_with_version(XDG_SURFACE, "xdg_surface".to_string(), 6);
-        ctx.shadow_table.set_host_version(XDG_SURFACE_HOST, 6);
-        ctx.shadow_table.map_id(WL_SURFACE, 22);
+            .insert_paired_for_test(WL_SURFACE, 22, "wl_surface");
         ctx.xdg_roles.add_xdg_surface(XDG_SURFACE, WL_SURFACE);
         (client, guest_peer, host_peer)
     }
@@ -1937,7 +1923,7 @@ mod tests {
     #[tokio::test]
     async fn failed_get_toplevel_does_not_create_internal_aura_object() {
         let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        client.ctx.shadow_table.mark_pending_destroy(XDG_SURFACE);
+        client.ctx.shadow_table.guest_destroyed(XDG_SURFACE);
         let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
@@ -2036,11 +2022,10 @@ mod tests {
 
         // Register one advertised global under the host-side registry ID so
         // the bind reaches the registry handler's validation path.
-        client.ctx.shadow_table.map_id(10, 20);
         client
             .ctx
             .shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 20, "wl_registry");
         client.ctx.host_globals.insert(
             7,
             crate::state::HostGlobal {
@@ -2148,22 +2133,14 @@ mod tests {
             (guest_surface, host_surface),
             (replacement_guest_surface, replacement_host_surface),
         ] {
-            ctx.shadow_table.map_id(guest, host);
             ctx.shadow_table
-                .track_interface_with_version(guest, "wl_surface".to_string(), 1);
-            ctx.shadow_table
-                .track_host_interface_with_version(host, "wl_surface".to_string(), 1);
+                .insert_paired_with_version_for_test(guest, host, "wl_surface", 1);
         }
         for (guest_keyboard, host_keyboard) in [keyboard_a, keyboard_b] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
-            ctx.shadow_table.track_interface_with_version(
+            ctx.shadow_table.insert_paired_with_version_for_test(
                 guest_keyboard,
-                "wl_keyboard".to_string(),
-                10,
-            );
-            ctx.shadow_table.track_host_interface_with_version(
                 host_keyboard,
-                "wl_keyboard".to_string(),
+                "wl_keyboard",
                 10,
             );
             ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
@@ -2336,17 +2313,13 @@ mod tests {
         const AURA_SHELL: u32 = 240;
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
+        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
         ctx.gtk_shells
             .insert(GTK_SHELL, crate::state::GtkShellState::default());
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
         ctx.bind_aura_shell_for_test(AURA_SHELL);
-        ctx.shadow_table.track_host_interface_with_version(
-            AURA_SHELL,
-            "zaura_shell".to_string(),
-            38,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(AURA_SHELL, "zaura_shell", 38);
         let mut request = MessageBuilder::new();
         request.write_u32(GTK_SURFACE);
         request.write_u32(GUEST_SURFACE);
@@ -2374,12 +2347,10 @@ mod tests {
     }
 
     fn register_raw_surface(ctx: &mut Context, guest_surface: u32, host_surface: u32) {
-        ctx.shadow_table.map_id(guest_surface, host_surface);
-        ctx.shadow_table
-            .track_interface_with_version(guest_surface, "wl_surface".to_string(), 1);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_surface,
             host_surface,
-            "wl_surface".to_string(),
+            "wl_surface",
             1,
         );
     }
@@ -2468,23 +2439,19 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
-            .track_host_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(GUEST_SEAT, HOST_SEAT);
+            .insert_host_only_for_test(1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(GUEST_SEAT, "wl_seat".to_string(), 1);
-        ctx.shadow_table
-            .track_host_interface_with_version(HOST_SEAT, "wl_seat".to_string(), 1);
+            .insert_paired_with_version_for_test(GUEST_SEAT, HOST_SEAT, "wl_seat", 1);
 
-        ctx.shadow_table.map_id(GUEST_KEYBOARD, HOST_KEYBOARD);
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
             GUEST_KEYBOARD,
-            "wl_keyboard".to_string(),
+            HOST_KEYBOARD,
+            "wl_keyboard",
             10,
         );
-        ctx.shadow_table.set_host_version(HOST_KEYBOARD, 10);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_EXTENDED_KEYBOARD,
-            "zcr_extended_keyboard_v1".to_string(),
+            "zcr_extended_keyboard_v1",
             2,
         );
         ctx.keyboard_to_seat.insert(GUEST_KEYBOARD, GUEST_SEAT);
@@ -2502,40 +2469,30 @@ mod tests {
             GUEST_SURFACE,
             HOST_SURFACE,
         );
-        ctx.shadow_table.map_id(GUEST_SURFACE, HOST_SURFACE);
-        ctx.shadow_table
-            .track_interface_with_version(GUEST_SURFACE, "wl_surface".to_string(), 1);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            GUEST_SURFACE,
             HOST_SURFACE,
-            "wl_surface".to_string(),
+            "wl_surface",
             1,
         );
         ctx.host_text_input_manager_v1_id = Some(HOST_TEXT_INPUT_MANAGER);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_TEXT_INPUT_MANAGER,
-            "zwp_text_input_manager_v1".to_string(),
+            "zwp_text_input_manager_v1",
             1,
         );
-        ctx.shadow_table.track_interface_with_version(
-            GUEST_TEXT_INPUT_MANAGER,
-            "zwp_text_input_manager_v3".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .create_local(GUEST_TEXT_INPUT_MANAGER, "zwp_text_input_manager_v3", 1);
 
-        ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.insert_bridged_for_test(
             GUEST_TEXT_INPUT,
-            "zwp_text_input_v3".to_string(),
-            1,
-        );
-        ctx.shadow_table.track_host_interface_with_version(
             HOST_TEXT_INPUT,
-            "zwp_text_input_v1".to_string(),
-            1,
+            "zwp_text_input_v3",
+            "zwp_text_input_v1",
         );
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_EXTENDED_TEXT_INPUT,
-            "zcr_extended_text_input_v1".to_string(),
+            "zcr_extended_text_input_v1",
             11,
         );
         ctx.text_inputs.insert(GUEST_TEXT_INPUT, {
@@ -3883,11 +3840,8 @@ mod tests {
     fn synthetic_manager_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 20;
-        ctx.shadow_table.track_interface_with_version(
-            guest_id,
-            "zwp_text_input_manager_v3".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .create_local(guest_id, "zwp_text_input_manager_v3", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(
@@ -3938,8 +3892,7 @@ mod tests {
     fn synthetic_shm_pool_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 21;
-        ctx.shadow_table
-            .track_interface_with_version(guest_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(guest_id, "wl_shm_pool", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy =
@@ -4017,11 +3970,11 @@ mod tests {
     #[test]
     fn translated_sender_survives_destructor_mapping_removal() {
         let mut shadow_table = ShadowTable::new();
-        shadow_table.map_id(47, 68);
+        shadow_table.insert_paired_for_test(47, 68, "wl_surface");
 
         let client_to_host = translated_sender_id(&shadow_table, Direction::ClientToHost, 47);
         let host_to_client = translated_sender_id(&shadow_table, Direction::HostToClient, 68);
-        shadow_table.remove_id(47);
+        shadow_table.release_deleted_host_id(68);
 
         assert_eq!(client_to_host, Some(68));
         assert_eq!(host_to_client, Some(47));
@@ -4032,12 +3985,10 @@ mod tests {
     #[test]
     fn destructor_mapping_survives_until_host_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
-            .track_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(10, 20);
+            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_region".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
@@ -4079,15 +4030,12 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_forwards_host_id_until_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
-            .track_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(5, 15);
+            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(5, "wl_fixes".to_string(), 1);
-        ctx.shadow_table.map_id(10, 20);
+            .insert_paired_with_version_for_test(5, 15, "wl_fixes", 1);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_registry", 1);
         let mut handler = SommelierHandler::new();
 
         let payload = 10u32.to_ne_bytes();
@@ -4142,15 +4090,13 @@ mod tests {
     #[test]
     fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_region".to_string(), 1);
-        ctx.shadow_table.mark_pending_destroy(10);
+            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
+        ctx.shadow_table.guest_destroyed(10);
         assert!(pending_host_event_is_stale(&ctx, 20, 0, Some(10)));
 
-        ctx.shadow_table.map_id(11, 21);
         ctx.shadow_table
-            .track_interface_with_version(11, "wl_buffer".to_string(), 1);
+            .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
         assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
         assert!(ctx.mark_buffer_guest_destroyed(11));
         ctx.shadow_table.guest_destroyed_in_use(11);
@@ -4161,9 +4107,8 @@ mod tests {
             Some(11)
         ));
 
-        ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table
-            .track_interface_with_version(12, "wl_buffer".to_string(), 1);
+            .insert_paired_with_version_for_test(12, 22, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(22, (1, 1), Vec::new()));
         // Match the production native-buffer destroy path: the guest
         // interface is retired while the host-side interface remains
@@ -4186,9 +4131,8 @@ mod tests {
         // The wl_output handlers rely on this filter instead of checking for
         // a pending destructor themselves.
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 20, "wl_output", 3);
         ctx.last_sender_id = 10;
         WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
         for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
@@ -4267,10 +4211,7 @@ mod tests {
     #[test]
     fn created_surface_keeps_separate_guest_and_host_versions() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
-        ctx.shadow_table
-            .track_interface_with_version(10, "wl_compositor".to_string(), 4);
-        ctx.shadow_table.set_host_version(20, 3);
+        let host_compositor = ctx.shadow_table.create_paired(10, "wl_compositor", 4, 3);
         let mut handler = SommelierHandler::new();
         let payload = 30u32.to_ne_bytes();
         let mut msg = WireMessage::new(
@@ -4283,7 +4224,7 @@ mod tests {
                 .expect("create_surface dispatch")
                 .expect("create_surface forwarded");
         assert!(fds.is_empty());
-        assert_eq!(crate::test_support::msg_sender(&forwarded), 20);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), host_compositor);
         let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
         assert_eq!(
             u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
@@ -4296,9 +4237,8 @@ mod tests {
     #[test]
     fn request_since_guard_rejects_a_newer_opcode_for_an_old_guest_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "xdg_positioner".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "xdg_positioner", 1);
 
         let payload = [];
         let mut msg = WireMessage::new(
@@ -4335,16 +4275,21 @@ mod tests {
         let host_parent = 41;
         let new_subsurface: u32 = 50;
 
-        ctx.shadow_table.map_id(sender, host_sender);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            sender,
+            host_sender,
+            "wl_subcompositor",
+            1,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            surface,
+            host_surface,
+            "wl_surface",
+            1,
+        );
         ctx.shadow_table
-            .track_interface_with_version(sender, "wl_subcompositor".to_string(), 1);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table
-            .track_interface_with_version(surface, "wl_surface".to_string(), 1);
-        ctx.shadow_table.map_id(parent, host_parent);
-        ctx.shadow_table
-            .track_interface_with_version(parent, "wl_surface".to_string(), 1);
-        ctx.shadow_table.mark_pending_destroy(surface);
+            .insert_paired_with_version_for_test(parent, host_parent, "wl_surface", 1);
+        ctx.shadow_table.guest_destroyed(surface);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&new_subsurface.to_ne_bytes());
@@ -4376,8 +4321,8 @@ mod tests {
     #[test]
     fn event_since_guard_rejects_a_newer_event_for_an_old_host_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
-        ctx.shadow_table.set_host_version(20, 3);
+        ctx.shadow_table
+            .insert_paired_with_version_for_test(10, 20, "xdg_toplevel", 3);
 
         let payload = [0u8; 8];
         let mut msg = WireMessage::new(
@@ -4402,9 +4347,8 @@ mod tests {
     #[test]
     fn generated_forwarding_rejects_messages_that_exceed_wire_length() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_source".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_data_source", 1);
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(65_520));

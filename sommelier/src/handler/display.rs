@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn oversized_host_error_is_dropped_before_wire_encoding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(7, 77);
+        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
         let mut handler = DisplayHandler;
 
         assert_eq!(
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn an_unforwardable_host_error_leaves_the_implementation_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(7, 77);
+        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
         DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520));
         queue_error_if_none_queued(&mut ctx);

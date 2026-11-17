@@ -1310,9 +1310,8 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.registry_global_names.entry(100).or_default().insert(7);
         ctx.registry_global_generations
             .entry(100)
@@ -1347,12 +1346,10 @@ mod tests {
     #[test]
     fn synthetic_shm_global_is_sent_to_each_guest_registry() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
-        ctx.shadow_table.map_id(11, 101);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.shadow_table
-            .track_interface(11, "wl_registry".to_string());
+            .insert_paired_for_test(11, 101, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -1382,12 +1379,10 @@ mod tests {
     #[test]
     fn aura_global_exposes_local_gtk_shell_to_every_registry() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
-        ctx.shadow_table.map_id(11, 101);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 100, "wl_registry", 1);
         ctx.shadow_table
-            .track_interface_with_version(11, "wl_registry".to_string(), 1);
+            .insert_paired_with_version_for_test(11, 101, "wl_registry", 1);
         let mut handler = RegistryHandler;
         let aura = "zaura_shell".to_string();
 
@@ -1416,7 +1411,7 @@ mod tests {
             handler.on_bind(&mut ctx, 7, &("gtk_shell1".to_string(), 1, 50)),
             Action::Drop
         );
-        assert!(ctx.shadow_table.is_local_only_guest_object(50));
+        assert!(ctx.shadow_table.request_sender(50) == Some(crate::state::Link::Local));
         assert!(ctx.gtk_shells.contains_key(&50));
         assert!(ctx.host_to_client_queue.is_empty());
         let callback_id = ctx
@@ -1452,12 +1447,10 @@ mod tests {
     #[test]
     fn re_advertised_synthetic_shm_global_remains_bindable() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
-        ctx.shadow_table.map_id(11, 101);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.shadow_table
-            .track_interface(11, "wl_registry".to_string());
+            .insert_paired_for_test(11, 101, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -1492,9 +1485,8 @@ mod tests {
     #[test]
     fn invalid_bind_queues_a_display_protocol_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.host_globals.insert(
             7,
             HostGlobal {
@@ -1525,9 +1517,7 @@ mod tests {
     fn internal_bindings_are_capped_to_generated_protocol_versions() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
 
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
@@ -1553,9 +1543,7 @@ mod tests {
     fn internal_dmabuf_binding_uses_capability_version_three() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -1585,9 +1573,7 @@ mod tests {
     fn gpu_without_allocator_exposes_host_v3_without_feedback_barrier() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -1620,9 +1606,7 @@ mod tests {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -1656,9 +1640,7 @@ mod tests {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -1710,9 +1692,7 @@ mod tests {
             crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
         );
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let output = "wl_output".to_string();
         assert_eq!(
@@ -1745,9 +1725,7 @@ mod tests {
     fn output_bind_through_an_unmapped_registry_registers_no_output() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let output = "wl_output".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
@@ -1766,9 +1744,7 @@ mod tests {
     fn bind_without_an_advertisement_generation_is_refused() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         // Reachable only through a proxy bookkeeping bug, not a guest error:
         // a name in `host_globals` whose advertisement generation was never
         // recorded. It is rejected like an unadvertised global.
@@ -1794,9 +1770,7 @@ mod tests {
             crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
         );
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let output = "wl_output".to_string();
 
@@ -1837,11 +1811,11 @@ mod tests {
             ),
         );
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
-        ctx.shadow_table.map_id(12, 22);
-        ctx.shadow_table.map_id(13, 23);
+            .insert_paired_for_test(12, 22, "wl_surface");
+        ctx.shadow_table
+            .insert_paired_for_test(13, 23, "xdg_toplevel");
         ctx.xdg_roles.add_toplevel_role_for_test(13 + 1000, 12, 13);
 
         let shell = "zaura_shell".to_string();
@@ -1879,9 +1853,7 @@ mod tests {
     fn internally_bound_objects_are_reserved_from_host_id_reuse() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
 
         for (name, (interface, version)) in [
@@ -1925,11 +1897,8 @@ mod tests {
         // on_global records a generation for every advertised name.
         ctx.global_generations.insert(7, 1);
         ctx.host_shm_id = Some(2);
-        ctx.shadow_table
-            .track_host_interface(2, "wl_shm".to_string());
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_host_only_for_test(2, "wl_shm", 1);
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         ctx.last_sender_id = 1;
 
         let mut handler = RegistryHandler;
@@ -1966,7 +1935,7 @@ mod tests {
         ctx.global_generations.insert(9, 1);
         ctx.host_text_input_manager_v1_id = Some(2);
         ctx.shadow_table
-            .track_host_interface(2, "zwp_text_input_manager_v1".to_string());
+            .insert_host_only_for_test(2, "zwp_text_input_manager_v1", 1);
 
         let mut handler = RegistryHandler;
         for guest_id in [20, 21] {
@@ -2008,9 +1977,7 @@ mod tests {
     fn duplicate_interfaces_keep_each_global_name_bindable() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
 
         let seat = "wl_seat".to_string();
@@ -2029,9 +1996,7 @@ mod tests {
     fn duplicate_internal_singletons_do_not_overwrite_the_first_binding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -2052,9 +2017,7 @@ mod tests {
     fn removed_text_input_globals_keep_bound_manager_usable() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut registry = RegistryHandler;
 
         let manager = "zwp_text_input_manager_v1".to_string();
@@ -2107,9 +2070,7 @@ mod tests {
     fn global_remove_releases_bound_internal_singleton() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -2141,9 +2102,7 @@ mod tests {
     fn keyboard_extension_global_remove_keeps_existing_children_alive() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let keyboard = "zcr_keyboard_extension_v1".to_string();
 
@@ -2196,9 +2155,7 @@ mod tests {
     fn global_remove_releases_internal_singleton_for_re_advertisement() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -2234,9 +2191,7 @@ mod tests {
     fn removing_shm_global_keeps_old_host_proxy_id_reserved() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -2254,9 +2209,7 @@ mod tests {
     fn removing_legacy_aura_global_keeps_shell_and_surface_ids_reserved() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shell = "zaura_shell".to_string();
 
@@ -2265,9 +2218,7 @@ mod tests {
             .host_zaura_shell
             .map(|shell| shell.id)
             .expect("legacy aura shell");
-        let surface_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table
-            .track_host_interface(surface_id, "zaura_surface".to_string());
+        let surface_id = ctx.shadow_table.create_host_only("zaura_surface", 38);
         ctx.aura_surfaces.remember(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
@@ -2296,9 +2247,7 @@ mod tests {
     fn global_remove_keeps_aura_children_until_surface_destroy() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let shell = "zaura_shell".to_string();
 
@@ -2307,9 +2256,7 @@ mod tests {
             .host_zaura_shell
             .map(|shell| shell.id)
             .expect("aura shell binding");
-        let surface_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table
-            .track_host_interface(surface_id, "zaura_surface".to_string());
+        let surface_id = ctx.shadow_table.create_host_only("zaura_surface", 38);
         ctx.aura_surfaces.remember(50, surface_id);
 
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
@@ -2348,9 +2295,7 @@ mod tests {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.synthetic_feedback_available_for_test = true;
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -2381,9 +2326,7 @@ mod tests {
     fn hidden_global_cannot_be_bound_when_gpu_is_disabled() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let dmabuf = "zwp_linux_dmabuf_v1".to_string();
 
@@ -2422,9 +2365,8 @@ mod tests {
     fn bind_crossing_an_output_removal_creates_an_inert_output() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         for registry in [1, 2] {
-            ctx.shadow_table.map_id(registry, registry);
             ctx.shadow_table
-                .track_interface(registry, "wl_registry".to_string());
+                .insert_paired_for_test(registry, registry, "wl_registry");
         }
         let mut handler = RegistryHandler;
         let output = "wl_output".to_string();
@@ -2444,7 +2386,7 @@ mod tests {
             "nothing reaches the host"
         );
         assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx.shadow_table.guest_object_matches(20, "wl_output"));
+        assert!(ctx.shadow_table.request_object(20, "wl_output").is_some());
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(3));
         assert!(ctx.outputs.is_empty_for_test());
 
@@ -2460,12 +2402,10 @@ mod tests {
     #[test]
     fn stale_remove_cannot_invalidate_a_re_advertised_global_generation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
-        ctx.shadow_table.map_id(11, 101);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.shadow_table
-            .track_interface(11, "wl_registry".to_string());
+            .insert_paired_for_test(11, 101, "wl_registry");
         let mut handler = RegistryHandler;
         let seat = "wl_seat".to_string();
 
@@ -2573,12 +2513,10 @@ mod tests {
     #[test]
     fn delayed_remove_does_not_reset_replacement_internal_binding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, 100);
-        ctx.shadow_table.map_id(11, 101);
         ctx.shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 100, "wl_registry");
         ctx.shadow_table
-            .track_interface(11, "wl_registry".to_string());
+            .insert_paired_for_test(11, 101, "wl_registry");
         let mut handler = RegistryHandler;
         let keyboard_extension = "zcr_keyboard_extension_v1".to_string();
 
@@ -2644,9 +2582,7 @@ mod tests {
         for (host_version, guest_version) in [(1, 1), (2, 2), (3, 4), (4, 4), (6, 4)] {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             ctx.last_sender_id = 1;
-            ctx.shadow_table.map_id(1, 1);
-            ctx.shadow_table
-                .track_interface(1, "wl_registry".to_string());
+            ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
             let mut handler = RegistryHandler;
             let compositor = "wl_compositor".to_string();
             let action = handler.on_global(&mut ctx, 7, &compositor, host_version);
@@ -2703,9 +2639,7 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut handler = RegistryHandler;
         let xdg_output_manager = "zxdg_output_manager_v1".to_string();
         assert_eq!(

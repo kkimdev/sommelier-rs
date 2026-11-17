@@ -2022,13 +2022,13 @@ mod tests {
         let host_ext_id = 30u32;
         // Keep the fixture's historical guest seat ID (0), but provide the
         // real host mapping that production activation requests require.
-        ctx.shadow_table.map_id(0, 2);
-        ctx.shadow_table.track_interface(0, "wl_seat".to_string());
-        ctx.shadow_table.map_id(guest_id, host_v1_id);
-        ctx.shadow_table
-            .track_interface(guest_id, "zwp_text_input_v3".to_string());
-        ctx.shadow_table
-            .track_host_interface(host_v1_id, "zwp_text_input_v1".to_string());
+        ctx.shadow_table.insert_paired_for_test(0, 2, "wl_seat");
+        ctx.shadow_table.insert_bridged_for_test(
+            guest_id,
+            host_v1_id,
+            "zwp_text_input_v3",
+            "zwp_text_input_v1",
+        );
         ctx.text_inputs.insert(guest_id, {
             // Most unit tests exercise the v3 transaction bridge without
             // modelling a keyboard enter. Use a stable synthetic focus
@@ -2079,8 +2079,11 @@ mod tests {
         guest_text_input: u32,
     ) {
         let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
-        ctx.shadow_table
-            .map_id(guest_keyboard_id, host_keyboard_id.0);
+        ctx.shadow_table.insert_paired_for_test(
+            guest_keyboard_id,
+            host_keyboard_id.0,
+            "wl_keyboard",
+        );
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.key_generations
             .observe_physical_state(host_keyboard_id, backspace, 1);
@@ -2094,7 +2097,8 @@ mod tests {
         let (mut ctx, _, _) = setup_v1_ctx();
         let backspace = crate::handler::keyboard::EVDEV_KEY_BACKSPACE;
         for (guest_keyboard, host_keyboard) in [(40, 41), (42, 43)] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            ctx.shadow_table
+                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
             ctx.key_generations
                 .observe_physical_state(HostId(host_keyboard), backspace, 1);
@@ -2117,11 +2121,8 @@ mod tests {
     fn extension_opcodes_for_version(version: Option<u32>) -> Vec<u16> {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         if let Some(version) = version {
-            ctx.shadow_table.track_host_interface_with_version(
-                30,
-                "zcr_extended_text_input_v1".to_string(),
-                version,
-            );
+            ctx.shadow_table
+                .insert_host_only_for_test(30, "zcr_extended_text_input_v1", version);
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
@@ -2720,7 +2721,8 @@ mod tests {
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         let host_keyboard_id = 41;
-        ctx.shadow_table.map_id(40, host_keyboard_id);
+        ctx.shadow_table
+            .insert_paired_for_test(40, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(40, 0);
         hold_repeatable_peek_key(
             &mut ctx,
@@ -2780,8 +2782,11 @@ mod tests {
             let (mut ctx, _, guest_id) = setup_v1_ctx();
             let guest_keyboard_id = 40;
             let host_keyboard_id = HostId(41);
-            ctx.shadow_table
-                .map_id(guest_keyboard_id, host_keyboard_id.0);
+            ctx.shadow_table.insert_paired_for_test(
+                guest_keyboard_id,
+                host_keyboard_id.0,
+                "wl_keyboard",
+            );
             ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
             hold_repeatable_peek_key(&mut ctx, host_keyboard_id, key, 700, 100);
             ctx.last_sender_id = 30;
@@ -2814,7 +2819,8 @@ mod tests {
     fn empty_confirmation_does_not_fall_back_from_newest_ineligible_key() {
         let (mut ctx, _, _) = setup_v1_ctx();
         let host_keyboard_id = HostId(41);
-        ctx.shadow_table.map_id(40, host_keyboard_id.0);
+        ctx.shadow_table
+            .insert_paired_for_test(40, host_keyboard_id.0, "wl_keyboard");
         ctx.keyboard_to_seat.insert(40, 0);
         hold_repeatable_peek_key(&mut ctx, host_keyboard_id, 57, 700, 100);
 
@@ -2851,7 +2857,8 @@ mod tests {
         for (guest_keyboard, host_keyboard) in
             [(40, focused_host_keyboard), (50, stale_host_keyboard)]
         {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard.0);
+            ctx.shadow_table
+                .insert_paired_for_test(guest_keyboard, host_keyboard.0, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
         set_test_focus(&mut ctx, focused_host_keyboard, 0, 900);
@@ -2875,7 +2882,8 @@ mod tests {
     fn empty_confirmation_never_uses_a_stale_unfocused_keyboard() {
         let (mut ctx, _, _) = setup_v1_ctx();
         let stale_host_keyboard = HostId(41);
-        ctx.shadow_table.map_id(40, stale_host_keyboard.0);
+        ctx.shadow_table
+            .insert_paired_for_test(40, stale_host_keyboard.0, "wl_keyboard");
         ctx.keyboard_to_seat.insert(40, 0);
         set_test_focus(&mut ctx, HostId(99), 0, 900);
         hold_repeatable_peek_key(&mut ctx, stale_host_keyboard, 57, 700, 100);
@@ -2895,7 +2903,8 @@ mod tests {
     fn emptied_preedit_enables_held_backspace_fallback_for_committed_text() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 40;
-        ctx.shadow_table.map_id(guest_keyboard_id, 41);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_keyboard_id, 41, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         hold_repeatable_peek_key(
             &mut ctx,
@@ -2964,7 +2973,8 @@ mod tests {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 40;
         let host_keyboard_id = 41;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         hold_repeatable_peek_key(
             &mut ctx,
@@ -3069,7 +3079,8 @@ mod tests {
     fn enable_is_not_activated_until_commit() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         let guest_surface = 40;
-        ctx.shadow_table.map_id(guest_surface, 41);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_surface, 41, "wl_surface");
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.active_surface = Some(guest_surface);
@@ -3094,9 +3105,8 @@ mod tests {
     fn focus_generation_barrier_drops_old_events_before_reactivation() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let next_surface = 901;
-        ctx.shadow_table.map_id(next_surface, 902);
         ctx.shadow_table
-            .track_interface(next_surface, "wl_surface".to_string());
+            .insert_paired_for_test(next_surface, 902, "wl_surface");
 
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
@@ -3166,9 +3176,8 @@ mod tests {
     fn activation_barrier_orders_new_editor_transaction_before_activate() {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let next_surface = 901;
-        ctx.shadow_table.map_id(next_surface, 902);
         ctx.shadow_table
-            .track_interface(next_surface, "wl_surface".to_string());
+            .insert_paired_for_test(next_surface, 902, "wl_surface");
 
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
@@ -3230,9 +3239,8 @@ mod tests {
     fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
         let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
         for (guest_surface, host_surface) in [(901, 902), (903, 904)] {
-            ctx.shadow_table.map_id(guest_surface, host_surface);
             ctx.shadow_table
-                .track_interface(guest_surface, "wl_surface".to_string());
+                .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
         }
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
@@ -3280,7 +3288,8 @@ mod tests {
         replacement.committed_enabled = true;
         replacement.active_surface = Some(901);
         replacement.host_activation = HostActivationState::Inactive;
-        ctx.shadow_table.map_id(901, 902);
+        ctx.shadow_table
+            .insert_paired_for_test(901, 902, "wl_surface");
         ctx.text_inputs.insert(guest_id, replacement);
         ctx.client_to_host_queue.clear();
 
@@ -3297,7 +3306,8 @@ mod tests {
     fn second_text_input_enable_on_same_seat_is_ignored() {
         let (mut ctx, _, first_id) = setup_v1_ctx();
         let surface = 40;
-        ctx.shadow_table.map_id(surface, 41);
+        ctx.shadow_table
+            .insert_paired_for_test(surface, 41, "wl_surface");
         {
             let state = ctx.text_inputs.get_mut(&first_id).unwrap();
             state.active_surface = Some(surface);
@@ -3306,7 +3316,8 @@ mod tests {
             state.host_activation = HostActivationState::Inactive;
         }
         let second_id = 21;
-        ctx.shadow_table.map_id(second_id, 11);
+        ctx.shadow_table
+            .insert_paired_for_test(second_id, 11, "zwp_text_input_v3");
         ctx.text_inputs.insert(
             second_id,
             crate::state::TextInputState::new(11, None, 0, Some(surface)),
@@ -3316,7 +3327,7 @@ mod tests {
         ctx.last_sender_id = first_id;
         handler.on_enable(&mut ctx);
         handler.on_commit(&mut ctx);
-        arm_backspace_repeat_for_test(&mut ctx, 40, HostId(41), first_id);
+        arm_backspace_repeat_for_test(&mut ctx, 44, HostId(45), first_id);
         ctx.last_sender_id = second_id;
         handler.on_enable(&mut ctx);
         handler.on_commit(&mut ctx);
@@ -3327,7 +3338,7 @@ mod tests {
         assert!(!ctx.text_inputs[&second_id].host_is_active());
         assert_eq!(
             ctx.key_generations
-                .ime_repeat_owner(HostId(41), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+                .ime_repeat_owner(HostId(45), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
             Some(first_id),
             "a rejected sibling enable must not cancel the active input's repeat lease"
         );
@@ -3599,21 +3610,12 @@ mod tests {
         ctx.host_text_input_extension_v1_id = Some(3);
         // Both text-input protocols are v1, so artificial manager versions
         // show where each child's version comes from.
-        ctx.shadow_table.track_host_interface_with_version(
-            2,
-            "zwp_text_input_manager_v1".to_string(),
-            4,
-        );
-        ctx.shadow_table.track_host_interface_with_version(
-            3,
-            "zcr_text_input_extension_v1".to_string(),
-            7,
-        );
-        ctx.shadow_table.track_interface_with_version(
-            40,
-            "zwp_text_input_manager_v3".to_string(),
-            5,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(2, "zwp_text_input_manager_v1", 4);
+        ctx.shadow_table
+            .insert_host_only_for_test(3, "zcr_text_input_extension_v1", 7);
+        ctx.shadow_table
+            .create_local(40, "zwp_text_input_manager_v3", 5);
         ctx.last_sender_id = 40;
 
         let mut handler = TextInputManagerV3Handler;
@@ -3669,7 +3671,7 @@ mod tests {
     fn destroy_drops_v3_request_and_cleans_host_extension_routing() {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         ctx.shadow_table
-            .track_host_interface(30, "zcr_extended_text_input_v1".to_string());
+            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
 
@@ -3723,7 +3725,8 @@ mod tests {
     fn destroying_inactive_sibling_preserves_active_repeat_lease() {
         let (mut ctx, _, active_id) = setup_v1_ctx();
         let sibling_id = 21;
-        ctx.shadow_table.map_id(sibling_id, 11);
+        ctx.shadow_table
+            .insert_paired_for_test(sibling_id, 11, "zwp_text_input_v3");
         ctx.text_inputs.insert(
             sibling_id,
             crate::state::TextInputState::new(11, None, 0, Some(900)),
@@ -3745,13 +3748,11 @@ mod tests {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let guest_seat = 7;
         let host_seat = 70;
-        ctx.shadow_table.map_id(guest_seat, host_seat);
         ctx.shadow_table
-            .track_interface_with_version(guest_seat, "wl_seat".to_string(), 5);
-        ctx.shadow_table.set_host_version(host_seat, 5);
+            .insert_paired_with_version_for_test(guest_seat, host_seat, "wl_seat", 5);
         ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = guest_seat;
         ctx.shadow_table
-            .track_host_interface(30, "zcr_extended_text_input_v1".to_string());
+            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
         ctx.last_sender_id = guest_seat;
         let mut release = WireMessage::new(
             guest_seat,
@@ -3794,7 +3795,7 @@ mod tests {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
         ctx.shadow_table
-            .track_host_interface(30, "zcr_extended_text_input_v1".to_string());
+            .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 11);
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
 
@@ -3865,9 +3866,8 @@ mod tests {
 
         // Register a guest wl_keyboard ID to capture the forwarded key
         let guest_keyboard_id = 999u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, 888);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
 
         let mut handler = TextInputV1Handler;
@@ -3902,9 +3902,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.key_generations.observe_physical_state(
             HostId(host_keyboard_id),
@@ -3956,9 +3955,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         let keycode = keysym_to_evdev_keycode(xkbcommon::xkb::keysyms::KEY_a)
             .expect("fallback keymap must contain KEY_a");
@@ -4001,9 +3999,8 @@ mod tests {
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
         let host_extended_id = 777u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4075,9 +4072,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.last_sender_id = host_v1_id;
         let mut handler = TextInputV1Handler;
@@ -4149,9 +4145,8 @@ mod tests {
     fn keysym_serial_wrap_opens_the_next_generation() {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, 888);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.last_sender_id = host_v1_id;
         let mut handler = TextInputV1Handler;
@@ -4185,9 +4180,8 @@ mod tests {
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
         let host_extended_id = 777u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4268,9 +4262,8 @@ mod tests {
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
         let host_extended_id = 777u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4369,9 +4362,8 @@ mod tests {
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
         let host_extended_id = 777u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4453,9 +4445,8 @@ mod tests {
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
         let host_extended_id = 777u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.keyboard_to_extended_keyboard
             .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4543,9 +4534,11 @@ mod tests {
             let guest_keyboard_id = 999u32;
             let host_keyboard_id = 888u32;
             let host_extended_id = 777u32;
-            ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
-            ctx.shadow_table
-                .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            ctx.shadow_table.insert_paired_for_test(
+                guest_keyboard_id,
+                host_keyboard_id,
+                "wl_keyboard",
+            );
             ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
             ctx.keyboard_to_extended_keyboard
                 .insert(HostId(host_keyboard_id), HostId(host_extended_id));
@@ -4651,9 +4644,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.last_sender_id = host_v1_id;
 
@@ -4680,9 +4672,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.key_generations.observe_physical_state(
             HostId(host_keyboard_id),
@@ -4732,9 +4723,8 @@ mod tests {
             (first_guest_keyboard, first_host_keyboard),
             (second_guest_keyboard, second_host_keyboard),
         ] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
             ctx.shadow_table
-                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
         ctx.key_generations.observe_physical_state(
@@ -4778,9 +4768,8 @@ mod tests {
             (stale_guest_keyboard, stale_host_keyboard),
             (focused_guest_keyboard, focused_host_keyboard),
         ] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
             ctx.shadow_table
-                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
         set_test_focus(&mut ctx, HostId(focused_host_keyboard), 0, current_surface);
@@ -4811,9 +4800,8 @@ mod tests {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
         let host_keyboard_id = 888u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.key_generations.observe_physical_state(
             HostId(host_keyboard_id),
@@ -4863,9 +4851,8 @@ mod tests {
     fn on_keysym_release_closes_synthetic_keyboard_pair() {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         let guest_keyboard_id = 999u32;
-        ctx.shadow_table.map_id(guest_keyboard_id, 888);
         ctx.shadow_table
-            .track_interface(guest_keyboard_id, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard_id, 888, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, 0);
         ctx.last_sender_id = host_v1_id;
 
@@ -4957,9 +4944,8 @@ mod tests {
     fn on_keysym_selects_guest_keyboard_deterministically() {
         let (mut ctx, host_v1_id, _guest_id) = setup_v1_ctx();
         for (guest_keyboard, host_keyboard) in [(999, 888), (100, 777)] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
             ctx.shadow_table
-                .track_interface(guest_keyboard, "wl_keyboard".to_string());
+                .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
             ctx.keyboard_to_seat.insert(guest_keyboard, 0);
         }
         ctx.last_sender_id = host_v1_id;
@@ -5045,7 +5031,8 @@ mod tests {
         // 2. Keyboard enter is received from host. Set active_surface to a mock guest surface ID (1234).
         let guest_surface = 1234u32;
         let host_surface = 5678u32;
-        ctx.shadow_table.map_id(guest_surface, host_surface);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.active_surface = Some(guest_surface);
@@ -5159,9 +5146,8 @@ mod tests {
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
         let first_surface = ctx.text_inputs[&guest_id].active_surface;
         let next_surface = 901;
-        ctx.shadow_table.map_id(next_surface, 902);
         ctx.shadow_table
-            .track_interface(next_surface, "wl_surface".to_string());
+            .insert_paired_for_test(next_surface, 902, "wl_surface");
         let guest_seat = ctx.text_inputs[&guest_id].guest_seat;
         let mut v3 = TextInputV3Handler;
 

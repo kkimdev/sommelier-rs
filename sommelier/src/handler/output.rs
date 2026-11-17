@@ -267,9 +267,8 @@ pub(crate) mod fixture {
             crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
         );
         for registry in [1, 2] {
-            ctx.shadow_table.map_id(registry, registry);
             ctx.shadow_table
-                .track_interface(registry, "wl_registry".to_string());
+                .insert_paired_for_test(registry, registry, "wl_registry");
         }
         ctx.last_sender_id = 1;
         let shell = "zaura_shell".to_string();
@@ -361,6 +360,16 @@ mod tests {
         version: u32,
         committed: crate::state::OutputState,
     ) {
+        bind_output_with_aura_version(ctx, version, committed, 38);
+    }
+
+    /// Like [`bind_output_with_aura`], with an Aura output of `aura_version`.
+    fn bind_output_with_aura_version(
+        ctx: &mut Context,
+        version: u32,
+        committed: crate::state::OutputState,
+        aura_version: u32,
+    ) {
         ctx.outputs.bind(
             OUTPUT_HOST,
             version,
@@ -373,11 +382,8 @@ mod tests {
         ctx.outputs.commit(OUTPUT_HOST);
         ctx.outputs
             .remember_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
-        ctx.shadow_table.track_host_interface_with_version(
-            AURA_OUTPUT_HOST,
-            "zaura_output".into(),
-            38,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(AURA_OUTPUT_HOST, "zaura_output", aura_version);
     }
 
     fn committed_work_area(ctx: &Context) -> Option<Rect> {
@@ -664,9 +670,12 @@ mod tests {
     fn releasing_output_removes_it_from_placement_selection() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_guest = 10;
-        ctx.shadow_table.map_id(output_guest, OUTPUT_HOST);
-        ctx.shadow_table
-            .track_interface_with_version(output_guest, "wl_output".into(), 3);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            output_guest,
+            OUTPUT_HOST,
+            "wl_output",
+            3,
+        );
         bind_output_with_aura(
             &mut ctx,
             3,
@@ -712,13 +721,16 @@ mod tests {
     fn aura_output_without_release_is_retired_silently() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let output_guest = 10;
-        ctx.shadow_table.map_id(output_guest, OUTPUT_HOST);
-        ctx.shadow_table
-            .track_interface_with_version(output_guest, "wl_output".into(), 3);
-        bind_output_with_aura(&mut ctx, 3, Default::default());
-        ctx.shadow_table.track_host_interface_with_version(
-            AURA_OUTPUT_HOST,
-            "zaura_output".into(),
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            output_guest,
+            OUTPUT_HOST,
+            "wl_output",
+            3,
+        );
+        bind_output_with_aura_version(
+            &mut ctx,
+            3,
+            Default::default(),
             REQ_RELEASE_AURA_OUTPUT_SINCE - 1,
         );
         ctx.last_sender_id = output_guest;
@@ -741,9 +753,12 @@ mod tests {
         let mut handler = OutputHandler;
         // Output 20 lost its global before release; output 30 did not.
         for (output_guest, output_host) in [(10, 20), (11, 30)] {
-            ctx.shadow_table.map_id(output_guest, output_host);
-            ctx.shadow_table
-                .track_interface_with_version(output_guest, "wl_output".into(), 3);
+            ctx.shadow_table.insert_paired_with_version_for_test(
+                output_guest,
+                output_host,
+                "wl_output",
+                3,
+            );
             ctx.outputs.bind_for_test(output_host, Default::default());
         }
         let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
@@ -770,9 +785,8 @@ mod tests {
     fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
         use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(10, OUTPUT_HOST);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".into(), 3);
+            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
         ctx.outputs.bind_for_test(OUTPUT_HOST, Default::default());
 
         ctx.last_sender_id = 10;
@@ -794,8 +808,7 @@ mod tests {
         use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
         use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".into(), 3);
+        ctx.shadow_table.create_local(10, "wl_output", 3);
 
         let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
         let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
@@ -819,10 +832,12 @@ mod tests {
 
     /// Guest `zxdg_output_manager_v1` 30 on host 31 at `version`.
     fn bind_xdg_output_manager(ctx: &mut Context, version: u32) {
-        ctx.shadow_table.map_id(30, 31);
-        ctx.shadow_table
-            .track_interface_with_version(30, "zxdg_output_manager_v1".into(), version);
-        ctx.shadow_table.set_host_version(31, version);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            30,
+            31,
+            "zxdg_output_manager_v1",
+            version,
+        );
     }
 
     /// Dispatch `get_xdg_output(40, output_guest)` from manager 30.
@@ -848,9 +863,8 @@ mod tests {
         };
         let mut ctx = Context::new_for_test(false, false, vec![]);
         bind_xdg_output_manager(&mut ctx, 1);
-        ctx.shadow_table.map_id(10, OUTPUT_HOST);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".into(), 3);
+            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
 
         let request = get_xdg_output(&mut ctx, 10).expect("forwarded");
         let host_xdg_output = ctx.shadow_table.get_host_id(40).expect("host object");
@@ -890,12 +904,14 @@ mod tests {
         };
         let mut ctx = Context::new_for_test(false, false, vec![]);
         bind_xdg_output_manager(&mut ctx, 3);
-        ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".into(), 3);
+        ctx.shadow_table.create_local(10, "wl_output", 3);
 
         assert_eq!(get_xdg_output(&mut ctx, 10), None);
         assert_eq!(ctx.shadow_table.get_host_id(40), None);
-        assert!(ctx.shadow_table.guest_object_matches(40, "zxdg_output_v1"));
+        assert!(ctx
+            .shadow_table
+            .request_object(40, "zxdg_output_v1")
+            .is_some());
         assert_eq!(ctx.shadow_table.guest_object_version(40), Some(3));
 
         let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[]);

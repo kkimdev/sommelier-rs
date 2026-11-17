@@ -1074,9 +1074,7 @@ mod tests {
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table
-            .track_host_interface(host_id, "wl_shm_pool".to_string());
+        let host_id = ctx.shadow_table.create_host_only("wl_shm_pool", 1);
         ctx.retire_destroyed_host_object(host_id);
         assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
         assert!(!ctx.is_fatal());
@@ -1397,7 +1395,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
@@ -1445,7 +1444,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1458,7 +1458,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1482,7 +1483,8 @@ mod tests {
         let new = 21;
         let new_host = 41;
         for (guest, host) in [(old, old_host), (new, new_host)] {
-            ctx.shadow_table.map_id(guest, host);
+            ctx.shadow_table
+                .insert_paired_for_test(guest, host, "wl_buffer");
             assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
         }
         assert!(ctx.mark_buffer_submitted(old));
@@ -1604,7 +1606,8 @@ mod tests {
             (next_guest, next_host),
             (unregistered_guest, unregistered_host),
         ] {
-            ctx.shadow_table.map_id(guest, host);
+            ctx.shadow_table
+                .insert_paired_for_test(guest, host, "wl_buffer");
         }
         assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
         assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));

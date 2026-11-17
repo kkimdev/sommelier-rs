@@ -143,11 +143,8 @@ mod tests {
         let callback_id = 40;
         let generation = 7;
         let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.shadow_table.track_host_interface_with_version(
-            callback_id,
-            "wl_callback".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(callback_id, "wl_callback", 1);
         ctx.dmabuf_capabilities.entry(generation).or_default();
         ctx.host_dmabuf_generation = Some(generation);
         ctx.internal_callbacks.register(
@@ -168,9 +165,8 @@ mod tests {
         let guest_id = 20;
         let host_id = 40;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(guest_id, host_id);
         ctx.shadow_table
-            .track_interface_with_version(guest_id, "wl_callback".to_string(), 1);
+            .insert_paired_with_version_for_test(guest_id, host_id, "wl_callback", 1);
         ctx.last_sender_id = host_id;
 
         let mut handler = CallbackHandler;
@@ -197,11 +193,8 @@ mod tests {
         let zaura_toplevel_id = 77;
         let callback_id = 40;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.track_host_interface_with_version(
-            callback_id,
-            "wl_callback".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(callback_id, "wl_callback", 1);
         register_window_bounds_barrier_for_test(&mut ctx, callback_id, zaura_toplevel_id);
         ctx.last_sender_id = callback_id;
 
@@ -227,11 +220,8 @@ mod tests {
         let new_callback_id = 41;
         let mut ctx = Context::new_for_test(false, false, vec![]);
         for callback_id in [old_callback_id, new_callback_id] {
-            ctx.shadow_table.track_host_interface_with_version(
-                callback_id,
-                "wl_callback".to_string(),
-                1,
-            );
+            ctx.shadow_table
+                .insert_host_only_for_test(callback_id, "wl_callback", 1);
         }
         register_window_bounds_barrier_for_test(&mut ctx, old_callback_id, zaura_toplevel_id);
         register_window_bounds_barrier_for_test(&mut ctx, new_callback_id, zaura_toplevel_id);
