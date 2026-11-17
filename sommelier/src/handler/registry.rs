@@ -1265,6 +1265,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
+        if interface == "wl_seat" {
+            // A text input whose seat had no host object can activate now.
+            crate::handler::text_input::reconcile_seat(ctx, *guest_new_id);
+        }
 
         Action::Drop
     }

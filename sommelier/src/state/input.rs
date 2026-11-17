@@ -62,8 +62,8 @@ impl V3Pending {
     }
 }
 
-/// The text-input-v3 state a guest has committed. The cursor rectangle is
-/// not kept: only the host needs it, in the commit that states it.
+/// The text-input-v3 state a guest has committed, but the cursor
+/// rectangle, which only the host keeps.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct V3Committed {
     pub enabled: bool,
@@ -74,7 +74,6 @@ pub struct V3Committed {
 /// A content type as the host applies it: the v3 content type, and the
 /// surrounding-text support told with it, or `None` if the host's
 /// extension cannot be told one.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostContentType {
     pub content_type: ContentType,
@@ -82,27 +81,25 @@ pub struct HostContentType {
 }
 
 /// What a host `zwp_text_input_v1` has effectively applied, by Exo's rules
-/// (Chromium `components/exo/text_input.cc` and
-/// `components/exo/wayland/zwp_text_input_manager.cc`):
+/// (Chromium `components/exo/text_input.cc`, `TextInput`, and the request
+/// handlers in `components/exo/wayland/zwp_text_input_manager.cc`):
 ///
-/// - `activate` attaches the input method when the seat's focus is on the
-///   surface, which the proxy's text input follows, and
+/// - `Activate` attaches the input method if the seat's focus is on the
+///   surface, as it is on the surface of the proxy's keyboard focus, and
 ///   `AttachInputMethod` resets the type and mode to text: the content
-///   type is unknown until it is sent again.
-/// - `deactivate` detaches it, and `SetTypeModeFlags` drops a content type
-///   while none is attached: the host has a content type only while active.
-/// - `set_surrounding_text_support` applies to the next content type and
-///   then resets to supported, so it is sent right before one and is part
-///   of it.
-/// - Surrounding text and the cursor rectangle are kept with or without an
-///   input method, and Exo edits its copy of the surrounding text as the
-///   input method commits, so they are not modelled: each commit forwards
-///   the ones it states.
+///   type is unknown until sent again.
+/// - `Deactivate` detaches it (`DetachInputMethod`), and `SetTypeModeFlags`
+///   drops a content type while none is attached.
+/// - `set_input_type` takes the pending `set_surrounding_text_support` and
+///   resets it to supported, so the support is sent right before it.
+/// - `SetSurroundingText` and `SetCaretBounds` keep their value with or
+///   without an input method, and Exo edits its copy of the surrounding
+///   text as the input method commits, so neither is modelled: each guest
+///   commit forwards the ones it states.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HostApplied {
     pub(crate) activation: HostActivationState,
-    /// The content type the attached input method applied, `None` while
-    /// unknown and whenever none is attached.
+    /// The content type the attached input method applied, if known.
     content_type: Option<HostContentType>,
 }
 
@@ -151,7 +148,6 @@ impl HostApplied {
     }
 
     /// A content type reached the host, which applies it only while active.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
     pub fn apply_content_type(&mut self, content_type: HostContentType) {
         if self.activation == HostActivationState::Active {
             self.content_type = Some(content_type);
@@ -159,7 +155,6 @@ impl HostApplied {
     }
 
     /// The guest enabled or disabled the field, which resets it: what the
-    #[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
     /// host applied belongs to the old field, so it is told again, which
     /// also ends Exo's composition in it.
     pub fn new_field(&mut self) {
@@ -169,7 +164,6 @@ impl HostApplied {
 
 /// The host state a text input should have, from its committed v3 state,
 /// its focus and what the host can be told.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostTarget {
     /// The guest committed an enable, on a focused surface the host knows.
@@ -180,7 +174,6 @@ pub struct HostTarget {
 }
 
 /// How a host text input's activation changes.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActivationStep {
     /// `zwp_text_input_v1.activate`.
@@ -192,7 +185,6 @@ pub enum ActivationStep {
 }
 
 /// The host requests that bring a text input to its target, in order.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HostSteps {
     pub activation: Option<ActivationStep>,
@@ -201,12 +193,8 @@ pub struct HostSteps {
 
 /// The requests that make what the host applied equal `target`, and no
 /// others: a content type the host would drop or already has is not sent,
-/// because a resend can reset Exo's composition.
-///
-/// A draining host is not reactivated: its barrier's completion reconciles
-/// again. A content type committed while the host could not apply it is
-/// therefore sent once it can, after the `activate`.
-#[cfg_attr(not(test), allow(dead_code))] // Wired into the handler next.
+/// since a resend can reset Exo's composition. A draining host waits for
+/// its barrier, whose completion reconciles again.
 pub fn reconcile(target: &HostTarget, applied: &HostApplied) -> HostSteps {
     use HostActivationState::{Active, Inactive};
     let activation = match (target.active, applied.activation) {
@@ -240,14 +228,6 @@ pub struct TextInputState {
     pub pending: V3Pending,
     /// State the v3 commits applied.
     pub committed: V3Committed,
-    /// The content type last sent to the host, or `None` if none was sent
-    /// since the focus changed.
-    pub(crate) host_content_type: Option<ContentType>,
-    /// Whether the host was last told, with the committed content type,
-    /// that the field has surrounding text, or `None` if it was not told.
-    /// Exo applies `set_surrounding_text_support` only with a content type,
-    /// so a change resends the content type.
-    host_surrounding_text_support: Option<bool>,
     pub current_preedit: String,
     /// Number of v3 commit requests received from this guest object.
     ///
@@ -271,18 +251,11 @@ pub struct TextInputState {
     pub(crate) host: HostApplied,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GuestCommitPlan {
-    pub host_v1_id: u32,
-    pub host_ext_id: Option<u32>,
-    pub guest_seat: u32,
-    pub serial: u32,
-    pub enabled: bool,
-    pub enable_conflict: bool,
-    pub resets_composition: bool,
-    pub surrounding_text: Option<Option<SurroundingText>>,
-    pub has_surrounding_text: bool,
-    pub content_type: Option<ContentType>,
+/// What a v3 commit asks of the host beyond its committed state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V3Commit {
+    /// The commit enabled or disabled the field, which resets it.
+    pub new_field: bool,
     pub cursor_rect: Option<CursorRect>,
 }
 
@@ -335,8 +308,6 @@ impl TextInputState {
             active_surface,
             pending: V3Pending::default(),
             committed: V3Committed::default(),
-            host_content_type: None,
-            host_surrounding_text_support: None,
             current_preedit: String::new(),
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
@@ -364,14 +335,11 @@ impl TextInputState {
     /// Apply a keyboard-focus generation boundary.
     ///
     /// text-input-v3 requires the client to resend enable and editor state
-    /// after every enter. The guest commit serial and host activation marker
-    /// deliberately survive so the bridge can deactivate the previous host
-    /// generation with the correct transaction ordering.
+    /// after every enter. The guest commit serial and what the host applied
+    /// survive, so reconciling deactivates the previous host generation.
     pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
         self.pending = V3Pending::default();
         self.committed = V3Committed::default();
-        self.host_content_type = None;
-        self.host_surrounding_text_support = None;
         self.clear_host_composition();
         std::mem::replace(&mut self.active_surface, active_surface)
     }
@@ -404,72 +372,24 @@ impl TextInputState {
         self.guest_commit_serial = commits;
     }
 
-    /// Snapshot the commit just counted by [`Self::count_guest_commit`]
-    /// without mutating committed state.
-    ///
-    /// The handler owns this plan while encoding every host message. Dropping
-    /// the plan on an encoding failure leaves the state byte-for-byte
-    /// unchanged; only [`Self::finish_guest_commit`] advances the transaction.
-    pub(crate) fn prepare_guest_commit(&self, enable_conflict: bool) -> GuestCommitPlan {
-        let pending = &self.pending;
-        let resets_composition = pending.enabled.is_some();
-        let enabled = match pending.enabled {
-            Some(enabled) if !enable_conflict => enabled,
-            _ => self.committed.enabled,
-        };
-        let has_surrounding_text = match &pending.surrounding_text {
-            Some(surrounding_text) => surrounding_text.is_some(),
-            None => self.committed.surrounding_text.is_some(),
-        };
-        let content_type = pending.content_type.unwrap_or(self.committed.content_type);
-        // Resend an unchanged content type only when the support the host
-        // was told no longer holds: a resend can reset Exo's composition.
-        let support_changed = self
-            .host_surrounding_text_support
-            .is_some_and(|supported| supported != has_surrounding_text);
-        let content_type_changed = pending.content_type.is_some()
-            && (resets_composition || self.host_content_type != Some(content_type));
-        GuestCommitPlan {
-            host_v1_id: self.host_v1_id,
-            host_ext_id: self.host_ext_id,
-            guest_seat: self.guest_seat,
-            serial: self.guest_commit_serial,
-            enabled,
-            enable_conflict,
-            resets_composition,
-            surrounding_text: pending.surrounding_text.clone(),
-            has_surrounding_text,
-            content_type: (content_type_changed || support_changed).then_some(content_type),
-            cursor_rect: pending.cursor_rect,
-        }
-    }
-
-    /// Publish a previously encoded guest commit plan.
-    ///
-    /// `surrounding_text_support` is the support the encoded transaction
-    /// told the host with the plan's content type, if it told any: only a
-    /// host extension with `set_surrounding_text_support` is told.
-    pub(crate) fn finish_guest_commit(
-        &mut self,
-        plan: GuestCommitPlan,
-        surrounding_text_support: Option<bool>,
-    ) {
-        debug_assert_eq!(plan.host_v1_id, self.host_v1_id);
-        debug_assert_eq!(plan.host_ext_id, self.host_ext_id);
-        debug_assert_eq!(plan.guest_seat, self.guest_seat);
-        debug_assert_eq!(
-            plan.serial, self.guest_commit_serial,
-            "a guest commit plan is finished for the commit that prepared it"
-        );
+    /// Apply the pending state, as the v3 commit just counted by
+    /// [`Self::count_guest_commit`] does, except an enable that
+    /// `enable_conflict` rejects because another text input on the seat is
+    /// enabled. Returns the cursor rectangle it states, which only the host
+    /// keeps, and whether it started a new field.
+    pub(crate) fn commit(&mut self, enable_conflict: bool) -> V3Commit {
         let V3Pending {
             enabled,
             surrounding_text,
             content_type,
-            cursor_rect: _,
+            cursor_rect,
         } = std::mem::take(&mut self.pending);
-        if enabled.is_some() {
-            self.committed.enabled = plan.enabled;
+        if let Some(enabled) = enabled {
+            if !enable_conflict {
+                self.committed.enabled = enabled;
+            }
             self.clear_host_composition();
+            self.host.new_field();
         }
         if let Some(surrounding_text) = surrounding_text {
             self.committed.surrounding_text = surrounding_text;
@@ -477,16 +397,10 @@ impl TextInputState {
         if let Some(content_type) = content_type {
             self.committed.content_type = content_type;
         }
-        if let Some(content_type) = plan.content_type {
-            self.host_content_type = Some(content_type);
-            self.record_surrounding_text_support(surrounding_text_support);
+        V3Commit {
+            new_field: enabled.is_some(),
+            cursor_rect,
         }
-    }
-
-    /// Record the surrounding-text support the host was told with the
-    /// committed content type, or `None` if it was told none.
-    pub(crate) fn record_surrounding_text_support(&mut self, support: Option<bool>) {
-        self.host_surrounding_text_support = support;
     }
 
     pub fn record_preedit_selection(&mut self, index: u32, length: u32) {
@@ -2266,7 +2180,6 @@ mod tests {
             surrounding_text: Some(("committed".to_string(), 9, 9)),
             content_type: (5, 6),
         };
-        state.host_content_type = Some((5, 6));
         state.current_preedit = "조합".to_string();
         state.set_guest_commits(17);
         state.pending_preedit_cursor = Some(3);
@@ -2284,34 +2197,14 @@ mod tests {
     }
 
     #[test]
-    fn preparing_guest_commit_is_non_mutating_until_finish() {
+    fn commit_applies_every_pending_field_and_starts_a_new_field() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.host_content_type = Some((1, 2));
-        state.pending = V3Pending {
-            surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
-            content_type: Some((3, 4)),
-            cursor_rect: Some((1, 2, 3, 4)),
-            ..V3Pending::reset(true)
+        assert!(state.host.activate());
+        let content_type = HostContentType {
+            content_type: (3, 4),
+            surrounding_text_support: Some(true),
         };
-        assert_eq!(state.count_guest_commit(), 1);
-        let before = state.clone();
-
-        let plan = state.prepare_guest_commit(false);
-
-        assert_eq!(state, before);
-        assert_eq!(plan.serial, 1);
-        assert!(plan.enabled);
-        assert_eq!(
-            plan.surrounding_text,
-            Some(Some(("가나다".to_string(), 9, 9)))
-        );
-        assert_eq!(plan.content_type, Some((3, 4)));
-        assert_eq!(plan.cursor_rect, Some((1, 2, 3, 4)));
-    }
-
-    #[test]
-    fn finishing_guest_commit_applies_exact_owned_snapshot() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.host.apply_content_type(content_type);
         state.current_preedit = "이전".to_string();
         state.pending_preedit_cursor = Some(3);
         state.pending_deletes.push((3, 0));
@@ -2321,11 +2214,15 @@ mod tests {
             cursor_rect: Some((1, 2, 3, 4)),
             ..V3Pending::reset(true)
         };
-
         state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        state.finish_guest_commit(plan, None);
 
+        assert_eq!(
+            state.commit(false),
+            V3Commit {
+                new_field: true,
+                cursor_rect: Some((1, 2, 3, 4)),
+            }
+        );
         assert_eq!(state.guest_commit_serial(), 1);
         assert_eq!(state.pending, V3Pending::default());
         assert_eq!(
@@ -2336,79 +2233,36 @@ mod tests {
                 content_type: (3, 4),
             }
         );
-        assert_eq!(state.host_content_type, Some((3, 4)));
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_preedit_cursor.is_none());
         assert!(state.pending_deletes.is_empty());
-    }
-
-    #[test]
-    fn a_change_of_the_told_surrounding_text_support_resends_the_content_type() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.pending = V3Pending {
-            content_type: Some((3, 4)),
-            ..V3Pending::reset(true)
+        // The new field is told its content type even though it is the old
+        // field's.
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
         };
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        assert!(!plan.has_surrounding_text);
-        state.finish_guest_commit(plan, Some(false));
+        assert_eq!(
+            reconcile(&target, &state.host).content_type,
+            Some(content_type)
+        );
 
-        // Unchanged support: nothing to resend.
+        // A commit without enable or disable keeps the field.
         state.pending.content_type = Some((3, 4));
-        state.count_guest_commit();
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // The field gains surrounding text: the host was told otherwise.
-        state.pending.surrounding_text = Some(Some(("abc".to_string(), 3, 3)));
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(false);
-        assert!(plan.has_surrounding_text);
-        assert_eq!(plan.content_type, Some((3, 4)));
-        state.finish_guest_commit(plan, Some(true));
-        state.count_guest_commit();
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // Only a host that was told a support can be told wrong.
-        state.record_surrounding_text_support(Some(false));
-        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
-        state.record_surrounding_text_support(None);
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        // A focus change forgets what the host was told, with the rest of
-        // the editor state.
-        state.record_surrounding_text_support(Some(true));
-        state.apply_focus(Some(14));
-        assert!(!state.prepare_guest_commit(false).has_surrounding_text);
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
+        state.host.apply_content_type(content_type);
+        assert!(!state.commit(false).new_field);
+        assert_eq!(reconcile(&target, &state.host), HostSteps::default());
     }
 
     #[test]
-    fn enable_replays_same_content_type_but_ordinary_repeat_is_clean() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.host_content_type = Some((3, 4));
-
-        state.pending.content_type = Some((3, 4));
-        assert_eq!(state.prepare_guest_commit(false).content_type, None);
-
-        state.pending = V3Pending::reset(true);
-        state.pending.content_type = Some((3, 4));
-        assert_eq!(state.prepare_guest_commit(false).content_type, Some((3, 4)));
-    }
-
-    #[test]
-    fn rejected_enable_advances_serial_and_closes_composition() {
+    fn rejected_enable_closes_composition_but_stays_disabled() {
         let mut state = TextInputState::new(10, Some(11), 12, Some(13));
         state.current_preedit = "가".to_string();
         state.pending_deletes.push((3, 0));
         state.pending = V3Pending::reset(true);
 
-        state.count_guest_commit();
-        let plan = state.prepare_guest_commit(true);
-        assert!(!plan.enabled);
-        state.finish_guest_commit(plan, None);
-
-        assert_eq!(state.guest_commit_serial(), 1);
+        assert!(state.commit(true).new_field);
         assert_eq!(state.pending, V3Pending::default());
         assert!(!state.committed.enabled);
         assert!(state.current_preedit.is_empty());
@@ -2421,9 +2275,7 @@ mod tests {
         state.set_guest_commits(u32::MAX);
 
         assert_eq!(state.count_guest_commit(), 0);
-        let plan = state.prepare_guest_commit(false);
-        assert_eq!(plan.serial, 0);
-        state.finish_guest_commit(plan, None);
+        state.commit(false);
         assert_eq!(state.guest_commit_serial(), 0);
     }
 
@@ -2610,28 +2462,17 @@ mod tests {
                     Step::Commit if next.active_surface.is_some() => {
                         let previous_serial = next.guest_commit_serial();
                         next.count_guest_commit();
-                        let plan = next.prepare_guest_commit(false);
-                        let resets_composition = plan.resets_composition;
-                        next.finish_guest_commit(plan, None);
+                        let new_field = next.commit(false).new_field;
                         assert_eq!(next.guest_commit_serial(), previous_serial.wrapping_add(1));
                         assert_eq!(next.pending, V3Pending::default());
-                        if resets_composition {
+                        if new_field {
                             assert!(next.current_preedit.is_empty());
                             assert!(next.pending_deletes.is_empty());
                         }
                     }
-                    Step::FailedCommit if next.active_surface.is_some() => {
-                        next.count_guest_commit();
-                        let before = next.clone();
-                        let _unencodable_plan = next.prepare_guest_commit(false);
-                        assert_eq!(
-                            next, before,
-                            "dropping an unencoded plan must advance only the commit count"
-                        );
-                    }
                     Step::Commit | Step::FailedCommit => {
-                        // An unfocused commit is counted but changes nothing
-                        // else.
+                        // An unfocused commit, or one the handler cannot
+                        // encode, is counted but changes nothing else.
                         let mut expected = next.clone();
                         expected.count_guest_commit();
                         next.count_guest_commit();

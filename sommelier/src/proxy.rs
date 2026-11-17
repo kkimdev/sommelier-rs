@@ -4174,7 +4174,7 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
+        crate::handler::text_input::reconcile_host(&mut ctx, GUEST_TEXT_INPUT, None);
         let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
             .draining_callback()
             .expect("deactivation must install a callback barrier");
@@ -4410,7 +4410,7 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        crate::handler::text_input::update_host_activation(&mut ctx, GUEST_TEXT_INPUT);
+        crate::handler::text_input::reconcile_host(&mut ctx, GUEST_TEXT_INPUT, None);
         let callback_id = ctx.text_inputs[&GUEST_TEXT_INPUT]
             .draining_callback()
             .expect("deactivation must install the old generation callback");

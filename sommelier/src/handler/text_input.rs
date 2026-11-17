@@ -25,8 +25,9 @@ use crate::protocols::wayland::wl_keyboard;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId, InternalCallback,
-    SeatFocusChange,
+    reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent,
+    HostActivationState, HostContentType, HostId, HostTarget, InternalCallback, SeatFocusChange,
+    TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, Outgoing};
 
@@ -1298,56 +1299,26 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 }
 
-/// Deactivate a reused host text-input-v1 object behind a drain barrier
-/// ([`InternalCallback::TextInputDrained`]).
-///
-/// The ordered host stream is the proof: deactivate first, then sync.
-/// Draining rejects stale host events until the callback's `done`. Nothing
-/// is queued when the guest object is gone, or, as a fatal error, when its
-/// host object is not active.
-fn queue_host_deactivation_barrier(
-    ctx: &mut Context,
-    guest_id: u32,
-    host_v1_id: u32,
-    host_seat: u32,
-) {
-    let Some(state) = ctx.text_inputs.get(&guest_id) else {
-        return;
-    };
-    if !state.host_is_active() {
-        // Deep in a text-input focus change: the session ends, and the
-        // loop drops this message's effects whatever its handler returns.
-        let _ = ctx.fail(format_args!(
-            "Text-input {guest_id} was not active when its drain barrier was installed"
-        ));
-        return;
-    }
-    ctx.client_to_host_queue
-        .push(zwp_text_input_v1::req::deactivate(host_v1_id, host_seat));
-    let callback = queue_internal_sync(
-        ctx,
-        InternalCallback::TextInputDrained {
-            text_input: guest_id,
-            host_text_input: host_v1_id,
-        },
-    );
-    let draining = ctx
-        .text_inputs
-        .get_mut(&guest_id)
-        .is_some_and(|state| state.host.begin_draining(callback));
-    debug_assert!(draining, "the host object was checked to be active above");
+/// Whether the extension `host_ext_id` takes `set_surrounding_text_support`.
+fn host_takes_surrounding_text_support(ctx: &Context, host_ext_id: Option<u32>) -> bool {
+    host_ext_id.is_some_and(|host_ext_id| {
+        extension_version_allows(
+            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
+            zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
+        )
+    })
 }
 
-/// Push the host requests that set the v3 content type `(hint, purpose)`
-/// of the text input on `(host_v1_id, host_ext_id)`, and return the
-/// surrounding-text support they told the host, if they told any.
+/// Push the host requests that set `content_type` on the text input
+/// `(host_v1_id, host_ext_id)`, with its surrounding-text support if it has
+/// one.
 fn push_content_type(
     transaction: &mut Vec<Outgoing>,
     ctx: &Context,
     (host_v1_id, host_ext_id): (u32, Option<u32>),
-    (hint, purpose): (u32, u32),
-    has_surrounding_text: bool,
-) -> Option<bool> {
+    content_type: HostContentType,
+) {
+    let (hint, purpose) = content_type.content_type;
     let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
         map_v3_content_type(hint, purpose);
     let host_ext = host_ext_id.map(|host_ext_id| {
@@ -1368,12 +1339,7 @@ fn push_content_type(
                 zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
             ) =>
         {
-            let support = extension_version_allows(
-                version,
-                zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-            )
-            .then_some(has_surrounding_text);
-            if let Some(supported) = support {
+            if let Some(supported) = content_type.surrounding_text_support {
                 transaction.push(
                     zcr_extended_text_input_v1::req::set_surrounding_text_support(
                         host_ext_id,
@@ -1394,12 +1360,12 @@ fn push_content_type(
                 learning_mode,
                 zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
             ));
-            support
         }
         // Before v8 the XML replaces nothing, so the four-argument request
         // follows v1 set_content_type; v8's set_input_type would be a
         // protocol error on v1-v7.
         host_ext => {
+            debug_assert_eq!(content_type.surrounding_text_support, None);
             transaction.push(zwp_text_input_v1::req::set_content_type(
                 host_v1_id, v1_hint, v1_purpose,
             ));
@@ -1417,45 +1383,152 @@ fn push_content_type(
                     learning_mode,
                 ));
             }
-            None
         }
     }
 }
 
-/// Resend the committed content type after an activation that a drain
-/// barrier deferred.
+/// The host state the text input `state` should have.
+fn host_target(ctx: &Context, state: &TextInputState) -> HostTarget {
+    let surface_known = state
+        .active_surface
+        .and_then(|surface| ctx.shadow_table.get_host_id(surface))
+        .is_some();
+    // A guest wl_seat can be pending destruction while its text inputs
+    // live on: its host ID stays reserved for delete_id, but it is no
+    // longer an object an activate or deactivate may carry, and neither is
+    // a seat with no host object (ID 0 is a protocol error).
+    let seat_live = ctx.shadow_table.get_host_id(state.guest_seat).is_some()
+        && !ctx.shadow_table.is_pending_destroy_guest(state.guest_seat);
+    HostTarget {
+        active: state.committed.enabled && surface_known,
+        seat_live,
+        content_type: HostContentType {
+            content_type: state.committed.content_type,
+            surrounding_text_support: host_takes_surrounding_text_support(ctx, state.host_ext_id)
+                .then_some(state.committed.surrounding_text.is_some()),
+        },
+    }
+}
+
+/// What a guest commit sends the host besides its reconciled state: the
+/// surrounding text, already encoded, and the cursor rectangle it states.
+/// Exo keeps both with or without an input method and edits its copy of
+/// the surrounding text as the input method commits, so each statement is
+/// forwarded rather than reconciled.
+#[derive(Default)]
+pub(crate) struct GuestCommit {
+    surrounding_text: Option<Outgoing>,
+    cursor_rect: Option<CursorRect>,
+}
+
+/// Queue the host requests that bring the text input `guest_id` to the
+/// state its guest committed ([`reconcile`]), and record what the host
+/// applies.
 ///
-/// The commit that enabled the text input reached Exo before this
-/// activation, while the host object had no input method. Exo drops a
-/// content type then (`SetTypeModeFlags` returns early), and attaching the
-/// input method resets the type and mode to text but keeps the previous
-/// field's flags, learning mode and surrounding-text support: a password
-/// field would be treated as text the IME may learn. Exo keeps surrounding
-/// text and the cursor rectangle without an input method, so they need no
-/// replay.
-fn replay_committed_content_type(ctx: &mut Context, guest_id: u32) {
+/// Called wherever that state or the host's ability to apply it changes: a
+/// guest commit, which passes its own requests in `commit`, a focus change,
+/// a drain barrier's completion, a seat's bind and the object's destroy. The
+/// requests go in one order: the activation step, the surrounding text,
+/// the content type, the cursor rectangle and, after a guest commit or a
+/// content type, `commit_state` with the guest's commit count.
+pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<GuestCommit>) {
     let Some(state) = ctx.text_inputs.get(&guest_id) else {
         return;
     };
-    let Some(content_type) = state.host_content_type else {
-        return;
-    };
+    let target = host_target(ctx, state);
+    let steps = reconcile(&target, &state.host);
     let host_ids = (state.host_v1_id, state.host_ext_id);
     let serial = state.guest_commit_serial();
-    let has_surrounding_text = state.committed.surrounding_text.is_some();
-    let mut transaction = Vec::new();
-    let support = push_content_type(
-        &mut transaction,
-        ctx,
-        host_ids,
-        content_type,
-        has_surrounding_text,
-    );
-    transaction.push(zwp_text_input_v1::req::commit_state(host_ids.0, serial));
-    ctx.client_to_host_queue.extend(transaction);
-    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-        state.record_surrounding_text_support(support);
+    let host_seat = ctx.shadow_table.get_host_id(state.guest_seat);
+    let host_surface = state
+        .active_surface
+        .and_then(|surface| ctx.shadow_table.get_host_id(surface));
+    if target.active && !target.seat_live && state.host.activation == HostActivationState::Inactive
+    {
+        log::warn!(
+            "Cannot activate text input {guest_id}: guest seat {} has no live host seat",
+            state.guest_seat
+        );
+    } else if target.active && matches!(state.host.activation, HostActivationState::Draining { .. })
+    {
+        log::debug!(
+            "Deferring text input {guest_id} activation until the previous generation drains"
+        );
     }
+
+    match steps.activation {
+        Some(ActivationStep::Activate) => {
+            let (Some(host_seat), Some(host_surface)) = (host_seat, host_surface) else {
+                unreachable!("an activation target has a live seat and a known surface");
+            };
+            log::info!(
+                "Activating text input {guest_id} (host {}) on host surface {host_surface}",
+                host_ids.0
+            );
+            ctx.client_to_host_queue
+                .push(zwp_text_input_v1::req::activate(
+                    host_ids.0,
+                    host_seat,
+                    host_surface,
+                ));
+            let activated = ctx
+                .text_inputs
+                .get_mut(&guest_id)
+                .is_some_and(|state| state.host.activate());
+            debug_assert!(activated, "reconcile activates only an inactive host");
+        }
+        // Deactivate behind a drain barrier
+        // ([`InternalCallback::TextInputDrained`]). The ordered host stream
+        // is the proof: deactivate first, then sync. Draining rejects stale
+        // host events until the callback's `done`.
+        Some(ActivationStep::Deactivate) => {
+            let host_seat = host_seat.expect("a deactivation target has a live seat");
+            log::info!("Deactivating text input {guest_id} (host {})", host_ids.0);
+            ctx.client_to_host_queue
+                .push(zwp_text_input_v1::req::deactivate(host_ids.0, host_seat));
+            let callback = queue_internal_sync(
+                ctx,
+                InternalCallback::TextInputDrained {
+                    text_input: guest_id,
+                    host_text_input: host_ids.0,
+                },
+            );
+            let draining = ctx
+                .text_inputs
+                .get_mut(&guest_id)
+                .is_some_and(|state| state.host.begin_draining(callback));
+            debug_assert!(draining, "reconcile deactivates only an active host");
+        }
+        Some(ActivationStep::Abandon) => {
+            log::debug!("Text input {guest_id} lost its host seat while active");
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.host.deactivate_without_barrier();
+            }
+        }
+        None => {}
+    }
+
+    let guest_commit = commit.is_some();
+    let GuestCommit {
+        surrounding_text,
+        cursor_rect,
+    } = commit.unwrap_or_default();
+    let mut transaction = Vec::from_iter(surrounding_text);
+    if let Some(content_type) = steps.content_type {
+        push_content_type(&mut transaction, ctx, host_ids, content_type);
+        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+            state.host.apply_content_type(content_type);
+        }
+    }
+    if let Some((x, y, width, height)) = cursor_rect {
+        transaction.push(zwp_text_input_v1::req::set_cursor_rectangle(
+            host_ids.0, x, y, width, height,
+        ));
+    }
+    if guest_commit || steps.content_type.is_some() {
+        transaction.push(zwp_text_input_v1::req::commit_state(host_ids.0, serial));
+    }
+    ctx.client_to_host_queue.extend(transaction);
 }
 
 /// Complete one host activation barrier
@@ -1471,110 +1544,20 @@ pub(crate) fn complete_host_activation_barrier(
         state.host_v1_id == host_v1_id && state.host.complete_draining(callback_id)
     });
     if completed {
-        update_host_activation(ctx, guest_id);
-        if ctx
-            .text_inputs
-            .get(&guest_id)
-            .is_some_and(|state| state.host_is_active())
-        {
-            replay_committed_content_type(ctx, guest_id);
-        }
+        reconcile_host(ctx, guest_id, None);
     }
 }
 
-/// Reconcile the host-side activation state of a reused text-input-v1 object.
-///
-/// Deactivation opens an internal sync barrier. Reactivation is deferred until
-/// callback.done proves that events from the previous focus generation have
-/// already been dispatched and dropped.
-pub(crate) fn update_host_activation(ctx: &mut Context, guest_id: u32) {
-    let Some(state) = ctx.text_inputs.get(&guest_id) else {
-        return;
-    };
-    let host_seat = ctx.shadow_table.get_host_id(state.guest_seat);
-    let host_surface = state
-        .active_surface
-        .and_then(|surface| ctx.shadow_table.get_host_id(surface));
-    let target_activated = state.committed.enabled && host_surface.is_some();
-
-    match (target_activated, state.host.activation) {
-        (true, HostActivationState::Inactive) | (false, HostActivationState::Active) => {}
-        (true, HostActivationState::Draining { .. }) => {
-            log::debug!(
-                "Deferring text input {} activation until the previous generation drains",
-                guest_id
-            );
-            return;
-        }
-        (false, HostActivationState::Draining { .. })
-        | (true, HostActivationState::Active)
-        | (false, HostActivationState::Inactive) => return,
-    }
-
-    // A guest wl_seat can be pending destruction while child keyboards and
-    // text-input objects are still completing their own lifetimes. The
-    // numeric host ID remains reserved for delete_id bookkeeping, but the
-    // host proxy is no longer a valid object for a v1 deactivate request.
-    // Reconcile local state without queueing traffic against that dead seat.
-    if ctx.shadow_table.is_pending_destroy_guest(state.guest_seat) {
-        log::debug!(
-            "Cannot update text input {} activation: guest seat {} is pending destruction",
-            guest_id,
-            state.guest_seat
-        );
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.host.deactivate_without_barrier();
-        }
-        return;
-    }
-
-    // A host v1 activate/deactivate request must carry a real wl_seat object.
-    // Queueing it with ID 0 turns a transient mapping race into a compositor
-    // protocol error. Activation remains pending until focus/mapping is valid;
-    // deactivation can safely clear the local marker when the seat has already
-    // disappeared.
-    if host_seat.is_none() {
-        log::warn!(
-            "Cannot update text input {} activation: guest seat {} has no host mapping",
-            guest_id,
-            state.guest_seat
-        );
-        if !target_activated {
-            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-                state.host.deactivate_without_barrier();
-            }
-        }
-        return;
-    }
-
-    let host_seat = host_seat.expect("checked above");
-    let host_v1_id = state.host_v1_id;
-    let host_surface = host_surface.unwrap_or(0);
-
-    if target_activated {
-        log::info!(
-                "update_host_activation: activating text input v1 (guest_id={}, host_v1_id={}, host_surface={})",
-                guest_id,
-                host_v1_id,
-                host_surface,
-            );
-        ctx.client_to_host_queue
-            .push(zwp_text_input_v1::req::activate(
-                host_v1_id,
-                host_seat,
-                host_surface,
-            ));
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            let activated = state.host.activate();
-            debug_assert!(activated, "activation state was checked above");
-        }
-    } else {
-        log::info!(
-            "update_host_activation: deactivating text input v1 (guest_id={}, host_v1_id={})",
-            guest_id,
-            host_v1_id
-        );
-        queue_host_deactivation_barrier(ctx, guest_id, host_v1_id, host_seat);
+/// Reconcile the text inputs of the guest seat `guest_seat`, which a bind
+/// just gave a host seat.
+pub(crate) fn reconcile_seat(ctx: &mut Context, guest_seat: u32) {
+    let text_inputs = ctx
+        .text_inputs
+        .iter()
+        .filter_map(|(&guest_id, state)| (state.guest_seat == guest_seat).then_some(guest_id))
+        .collect::<Vec<_>>();
+    for guest_id in text_inputs {
+        reconcile_host(ctx, guest_id, None);
     }
 }
 
@@ -1655,7 +1638,7 @@ fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32
 
     ctx.host_to_client_queue.extend(events);
     for guest_text_input_id in text_inputs_to_update {
-        update_host_activation(ctx, guest_text_input_id);
+        reconcile_host(ctx, guest_text_input_id, None);
     }
 }
 
@@ -1730,7 +1713,7 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
     }
     if !host_deleted {
-        update_host_activation(ctx, guest_id);
+        reconcile_host(ctx, guest_id, None);
     } else if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
         state.host.deactivate_without_barrier();
     }
@@ -1883,127 +1866,70 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         let Some(state) = ctx.text_inputs.get_mut(&guest_id) else {
             return Action::Drop;
         };
-        state.count_guest_commit();
+        let serial = state.count_guest_commit();
         if !v3_is_focused(ctx, guest_id) {
             return Action::Drop;
         }
-        let enable_conflict = ctx.text_inputs.get(&guest_id).is_some_and(|state| {
-            state.pending.enabled == Some(true)
-                && ctx.text_inputs.iter().any(|(&other_id, other)| {
-                    other_id != guest_id
-                        && other.guest_seat == state.guest_seat
-                        && other.committed.enabled
-                })
-        });
-        let Some(plan) = ctx
-            .text_inputs
-            .get(&guest_id)
-            .map(|state| state.prepare_guest_commit(enable_conflict))
-        else {
-            return Action::Drop;
-        };
+        let state = &ctx.text_inputs[&guest_id];
+        let enable_conflict = state.pending.enabled == Some(true)
+            && ctx.text_inputs.iter().any(|(&other_id, other)| {
+                other_id != guest_id
+                    && other.guest_seat == state.guest_seat
+                    && other.committed.enabled
+            });
         log::trace!(
-            ">>> v3 on_commit: guest_id={}, serial={}, enabled={}, host_v1_id={}",
-            guest_id,
-            plan.serial,
-            plan.enabled,
-            plan.host_v1_id
+            ">>> v3 on_commit: guest_id={guest_id}, serial={serial}, host_v1_id={}",
+            state.host_v1_id
         );
 
-        // Construct the complete v1 transaction before publishing any part of
-        // it or advancing the double-buffered state. This prevents an
-        // unencodable variable-size field from leaving Exo and the bridge on
-        // different committed editor states.
-        let mut transaction = Vec::new();
-        if let Some(surrounding_text) = &plan.surrounding_text {
-            if let Some((text, cursor, anchor)) = surrounding_text {
-                log::debug!(
-                    "  -> sending v1 set_surrounding_text({:?}, cursor={}, anchor={})",
+        // Encode the one request that can fail before changing any state,
+        // so a commit that cannot reach the host changes nothing but the
+        // commit count, and Exo and the bridge keep the same field. v3
+        // enable and disable clear the surrounding text, and the clear
+        // reaches the host too, or Exo would keep the old field's text.
+        let mut surrounding_text = Vec::new();
+        if let Some(text) = &state.pending.surrounding_text {
+            let (text, cursor, anchor) =
+                text.as_ref().map_or(("", 0, 0), |(text, cursor, anchor)| {
+                    (text.as_str(), *cursor, *anchor)
+                });
+            if !queue_or_drop(
+                &mut surrounding_text,
+                zwp_text_input_v1::req::set_surrounding_text(
+                    state.host_v1_id,
                     text,
-                    cursor,
-                    anchor
-                );
-                if !queue_or_drop(
-                    &mut transaction,
-                    zwp_text_input_v1::req::set_surrounding_text(
-                        plan.host_v1_id,
-                        text,
-                        *cursor as u32,
-                        *anchor as u32,
-                    ),
-                    format_args!("the surrounding text of text input {guest_id}"),
-                ) {
-                    return Action::Drop;
-                }
-            } else {
-                // v3 enable/disable double-buffers surrounding text. Clearing
-                // the guest value must be mirrored to v1; otherwise Exo keeps
-                // the previous surrounding string and can make a later IME
-                // transaction operate on stale private/editor contents.
-                log::debug!("  -> clearing v1 surrounding text for guest {}", guest_id);
-                if !queue_or_drop(
-                    &mut transaction,
-                    zwp_text_input_v1::req::set_surrounding_text(plan.host_v1_id, "", 0, 0),
-                    format_args!("the surrounding text of text input {guest_id}"),
-                ) {
-                    return Action::Drop;
-                }
+                    cursor as u32,
+                    anchor as u32,
+                ),
+                format_args!("the surrounding text of text input {guest_id}"),
+            ) {
+                return Action::Drop;
             }
         }
 
-        let surrounding_text_support = plan.content_type.and_then(|content_type| {
-            push_content_type(
-                &mut transaction,
-                ctx,
-                (plan.host_v1_id, plan.host_ext_id),
-                content_type,
-                plan.has_surrounding_text,
-            )
-        });
-
-        if let Some((x, y, w, h)) = plan.cursor_rect {
-            log::debug!(
-                "  -> sending v1 set_cursor_rectangle({}, {}, {}, {})",
-                x,
-                y,
-                w,
-                h
-            );
-            transaction.push(zwp_text_input_v1::req::set_cursor_rectangle(
-                plan.host_v1_id,
-                x,
-                y,
-                w,
-                h,
-            ));
-        }
-
-        log::debug!("  -> sending v1 commit_state(serial={})", plan.serial);
-        transaction.push(zwp_text_input_v1::req::commit_state(
-            plan.host_v1_id,
-            plan.serial,
-        ));
-
-        if plan.enable_conflict {
+        if enable_conflict {
             log::warn!(
-                "Ignoring text-input enable for guest {}: another input is enabled on seat {}",
-                guest_id,
-                plan.guest_seat
+                "Ignoring text-input enable for guest {guest_id}: another input is enabled on seat {}",
+                state.guest_seat
             );
         }
-        let state = ctx
+        let guest_seat = state.guest_seat;
+        let commit = ctx
             .text_inputs
             .get_mut(&guest_id)
-            .expect("focused text input disappeared while committing state");
-        let end_repeat = plan.resets_composition;
-        let guest_seat = plan.guest_seat;
-        state.finish_guest_commit(plan, surrounding_text_support);
-        if end_repeat {
+            .expect("the focused text input was found above")
+            .commit(enable_conflict);
+        if commit.new_field {
             end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         }
-
-        update_host_activation(ctx, guest_id);
-        ctx.client_to_host_queue.extend(transaction);
+        reconcile_host(
+            ctx,
+            guest_id,
+            Some(GuestCommit {
+                surrounding_text: surrounding_text.pop(),
+                cursor_rect: commit.cursor_rect,
+            }),
+        );
         Action::Drop
     }
 }
@@ -2091,6 +2017,9 @@ mod tests {
         // Keep the fixture's historical guest seat ID (0), but provide the
         // real host mapping that production activation requests require.
         ctx.shadow_table.insert_paired_for_test(0, 2, "wl_seat");
+        // The focused surface the host text input is active on.
+        ctx.shadow_table
+            .insert_paired_for_test(900, 901, "wl_surface");
         ctx.shadow_table.insert_bridged_for_test(
             guest_id,
             host_v1_id,
@@ -2195,8 +2124,6 @@ mod tests {
                 .insert_host_only_for_test(30, "zcr_extended_text_input_v1", version);
         }
         // Map the focused surface, so the commit keeps the host activation.
-        ctx.shadow_table
-            .insert_paired_for_test(900, 901, "wl_surface");
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
         handler.on_set_content_type(&mut ctx, 0, 9);
@@ -3190,7 +3117,7 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
 
         assert!(!ctx.text_inputs[&guest_id].host_is_active());
         assert_eq!(ctx.client_to_host_queue.len(), 2);
@@ -3224,7 +3151,7 @@ mod tests {
             state.committed.enabled = true;
             state.active_surface = Some(next_surface);
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
         assert_eq!(
             ctx.client_to_host_queue.len(),
             2,
@@ -3235,9 +3162,14 @@ mod tests {
         assert_eq!(CallbackHandler.on_done(&mut ctx, 0), Action::Drop);
         assert!(ctx.text_inputs[&guest_id].host_is_active());
         assert!(ctx.shadow_table.is_retired_host(callback_id.0));
-        assert_eq!(ctx.client_to_host_queue.len(), 3);
+        // The activation, then the committed content type it reset.
+        assert_eq!(ctx.client_to_host_queue.len(), 6);
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 2), host_v1_id);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 2), 0);
+        assert_eq!(
+            msg_opcode(&ctx.client_to_host_queue, 5),
+            zwp_text_input_v1::REQ_COMMIT_STATE
+        );
 
         // Once the ordered barrier completes, events belong to the new focus
         // generation and may be translated normally.
@@ -3261,7 +3193,7 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
         let callback_id = ctx.text_inputs[&guest_id]
             .draining_callback()
             .expect("deactivation must open a barrier");
@@ -3320,8 +3252,6 @@ mod tests {
         };
         use zwp_text_input_v1::{REQ_ACTIVATE, REQ_COMMIT_STATE};
         let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
-        ctx.shadow_table
-            .insert_paired_for_test(900, 901, "wl_surface");
         ctx.last_sender_id = guest_id;
         let mut v3 = TextInputV3Handler;
 
@@ -3380,6 +3310,117 @@ mod tests {
         );
     }
 
+    /// The host requests queued since the last call, as (sender, opcode).
+    fn take_requests(ctx: &mut Context) -> Vec<(u32, u16)> {
+        let queue = std::mem::take(&mut ctx.client_to_host_queue);
+        (0..queue.len())
+            .map(|index| (msg_sender(&queue, index), msg_opcode(&queue, index)))
+            .collect()
+    }
+
+    #[test]
+    fn a_content_type_waits_for_the_host_to_attach() {
+        use zcr_extended_text_input_v1::{REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT};
+        use zwp_text_input_v1::{
+            REQ_ACTIVATE, REQ_COMMIT_STATE, REQ_DEACTIVATE, REQ_SET_CURSOR_RECTANGLE,
+            REQ_SET_SURROUNDING_TEXT,
+        };
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+
+        // Exo drops a content type after deactivate, so the disable sends
+        // none, and neither does an enable while the deactivation drains.
+        v3.on_disable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        let callback_id = ctx.text_inputs[&guest_id]
+            .draining_callback()
+            .expect("deactivation opens a barrier");
+        v3.on_enable(&mut ctx);
+        v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+        v3.on_commit(&mut ctx);
+        let edits = [
+            (host_v1_id, REQ_SET_SURROUNDING_TEXT),
+            (host_v1_id, REQ_SET_CURSOR_RECTANGLE),
+            (host_v1_id, REQ_COMMIT_STATE),
+        ];
+        let mut expected = vec![(host_v1_id, REQ_DEACTIVATE), (1, wl_display::REQ_SYNC)];
+        expected.extend(edits);
+        expected.extend(edits);
+        assert_eq!(take_requests(&mut ctx), expected);
+
+        // Once it attaches, the host gets the content type once.
+        ctx.last_sender_id = callback_id.0;
+        CallbackHandler.on_done(&mut ctx, 0);
+        assert_eq!(
+            take_requests(&mut ctx),
+            [
+                (host_v1_id, REQ_ACTIVATE),
+                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
+                (30, REQ_SET_INPUT_TYPE),
+                (host_v1_id, REQ_COMMIT_STATE),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_activation_deferred_for_an_unmapped_seat_sends_the_content_type() {
+        use zcr_extended_text_input_v1::{REQ_SET_INPUT_TYPE, REQ_SET_SURROUNDING_TEXT_SUPPORT};
+        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_COMMIT_STATE};
+        // The seat gains a host object through a bind, or a commit follows.
+        for through_bind in [true, false] {
+            let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+            {
+                let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
+                state.guest_seat = 7;
+                state.committed.enabled = false;
+                state.host.activation = HostActivationState::Inactive;
+            }
+            ctx.last_sender_id = guest_id;
+            let mut v3 = TextInputV3Handler;
+
+            // The seat has no host object yet: nothing can activate.
+            v3.on_enable(&mut ctx);
+            v3.on_set_content_type(&mut ctx, 0, zwp_text_input_v3::CONTENT_PURPOSE_PASSWORD);
+            v3.on_commit(&mut ctx);
+            assert!(!ctx.text_inputs[&guest_id].host_is_active());
+            assert!(!take_requests(&mut ctx)
+                .iter()
+                .any(|&(_, opcode)| opcode == REQ_ACTIVATE));
+
+            // Once it has one, the text input activates, and its content
+            // type follows the activation.
+            let mut expected = Vec::new();
+            if through_bind {
+                // The guest binds a seat under the text input's seat ID.
+                use crate::protocols::wayland::wl_registry::{self, WlRegistryHandler};
+                ctx.shadow_table
+                    .insert_paired_for_test(50, 500, "wl_registry");
+                ctx.last_sender_id = 50;
+                let seat = "wl_seat".to_string();
+                crate::handler::registry::RegistryHandler.on_global(&mut ctx, 3, &seat, 5);
+                let bind = (seat, 5, 7);
+                crate::handler::registry::RegistryHandler.on_bind(&mut ctx, 3, &bind);
+                expected.push((500, wl_registry::REQ_BIND));
+            } else {
+                ctx.shadow_table.insert_paired_for_test(7, 70, "wl_seat");
+                v3.on_commit(&mut ctx);
+            }
+            expected.extend([
+                (host_v1_id, REQ_ACTIVATE),
+                (30, REQ_SET_SURROUNDING_TEXT_SUPPORT),
+                (30, REQ_SET_INPUT_TYPE),
+                (host_v1_id, REQ_COMMIT_STATE),
+            ]);
+            assert_eq!(
+                take_requests(&mut ctx),
+                expected,
+                "through a bind: {through_bind}"
+            );
+            assert!(ctx.text_inputs[&guest_id].host_is_active());
+        }
+    }
+
     #[test]
     fn activation_barrier_coalesces_changes_and_honors_final_disabled_target() {
         let (mut ctx, _host_v1_id, guest_id) = setup_v1_ctx();
@@ -3392,14 +3433,14 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
         let callback_id = ctx.text_inputs[&guest_id].draining_callback().unwrap();
 
         for (enabled, surface) in [(true, Some(901)), (true, Some(903)), (false, Some(903))] {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
             state.committed.enabled = enabled;
             state.active_surface = surface;
-            update_host_activation(&mut ctx, guest_id);
+            reconcile_host(&mut ctx, guest_id, None);
         }
         assert_eq!(
             ctx.client_to_host_queue.len(),
@@ -3425,7 +3466,7 @@ mod tests {
             state.committed.enabled = false;
             state.active_surface = None;
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
         let callback_id = ctx.text_inputs[&guest_id].draining_callback().unwrap();
 
         let mut replacement = ctx.text_inputs.remove(&guest_id).unwrap();
@@ -3651,7 +3692,18 @@ mod tests {
 
         handler.on_set_content_type(&mut ctx, 0, 13);
         handler.on_commit(&mut ctx);
-        ctx.client_to_host_queue.clear();
+        // The focused, active host takes the first content type.
+        assert_eq!(
+            take_requests(&mut ctx),
+            [
+                (
+                    30,
+                    zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT
+                ),
+                (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
+                (10, zwp_text_input_v1::REQ_COMMIT_STATE),
+            ]
+        );
 
         // GTK resends the unchanged terminal content type after IME events.
         // Replaying set_content_type/set_input_type into Exo at that point
@@ -3672,7 +3724,18 @@ mod tests {
 
         handler.on_set_content_type(&mut ctx, 0, 13);
         handler.on_commit(&mut ctx);
-        ctx.client_to_host_queue.clear();
+        // The focused, active host takes the first content type.
+        assert_eq!(
+            take_requests(&mut ctx),
+            [
+                (
+                    30,
+                    zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT
+                ),
+                (30, zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE),
+                (10, zwp_text_input_v1::REQ_COMMIT_STATE),
+            ]
+        );
 
         handler.on_set_content_type(&mut ctx, 0, 9);
         handler.on_set_content_type(&mut ctx, 0, 13);
@@ -3707,8 +3770,6 @@ mod tests {
         };
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         // Map the focused surface, so commits keep the host activation.
-        ctx.shadow_table
-            .insert_paired_for_test(900, 901, "wl_surface");
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
         let input_type = map_v3_content_type(0, 0).2;
@@ -3774,8 +3835,6 @@ mod tests {
         // v8 has set_input_type but not set_surrounding_text_support.
         ctx.shadow_table
             .insert_host_only_for_test(30, "zcr_extended_text_input_v1", 8);
-        ctx.shadow_table
-            .insert_paired_for_test(900, 901, "wl_surface");
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
 
@@ -5272,7 +5331,7 @@ mod tests {
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.active_surface = Some(guest_surface);
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
 
         // Now it should have sent activate (opcode 0) with surface host_surface (5678).
         let mut found_activate = false;
@@ -5296,7 +5355,7 @@ mod tests {
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.active_surface = None;
         }
-        update_host_activation(&mut ctx, guest_id);
+        reconcile_host(&mut ctx, guest_id, None);
 
         // Now it should have sent deactivate (opcode 1).
         let mut found_deactivate = false;
