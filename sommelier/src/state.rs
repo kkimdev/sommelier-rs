@@ -62,24 +62,22 @@ pub(crate) use self::window_placement::{
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
 
-/// A Wayland object ID allocated by the **guest** (client) side.
+/// A Wayland object ID allocated by the **guest** (client) side, as
+/// [`ShadowTable`] keys guest objects.
 ///
-/// [`ShadowTable`] keys guest objects by it. Passing a `GuestId` where a
-/// `HostId` is expected (or vice versa) is a **compile error**.
-///
-/// The inner field is intentionally `pub(crate)` so that arbitrary `GuestId(host_id)`
-/// constructions cannot be made from outside this crate, preserving the type invariant.
+/// Within the table, and in state keyed by it, a guest ID cannot stand in
+/// for a [`HostId`]. Handlers and the table's query methods pass raw `u32`
+/// IDs, so at those call sites the direction is a naming convention
+/// (`guest_*`, `host_*`), not a type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuestId(pub(crate) u32);
 
-/// A Wayland object ID allocated by the **host** compositor side.
+/// A Wayland object ID on the **host** connection.
 ///
-/// Event handlers (host→client) receive host IDs. Use [`ShadowTable::get_guest_id`]
-/// to translate to the corresponding guest ID. Passing a `HostId` where a `GuestId`
-/// is expected (or vice versa) is a **compile error**.
-///
-/// The inner field is intentionally `pub(crate)` so that arbitrary `HostId(guest_id)`
-/// constructions cannot be made from outside this crate, preserving the type invariant.
+/// State keyed by host objects (keyboard focus, key generations, render
+/// buffers) uses it, so a guest ID cannot be passed there. Event handlers
+/// receive the raw sender as `ctx.last_sender_id`; [`HostId::from_event_sender`]
+/// wraps it, and [`ShadowTable::get_guest_id`] translates a host ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostId(pub(crate) u32);
 

@@ -677,7 +677,8 @@ impl WlSurfaceHandler for CompositorHandler {
 
     fn on_attach(&mut self, ctx: &mut Context, buffer: u32, x: i32, y: i32) -> Action {
         let surface_id = ctx.last_sender_id;
-        // Objects of unknown version keep the permissive pre-offset rules.
+        // Objects of unknown version keep the permissive pre-offset rules
+        // (see INVARIANTS); in practice only test fixtures have one.
         let version = ctx.shadow_table.guest_object_version_or_unknown(surface_id);
         let has_offset_request =
             !ShadowTable::is_unknown_version(version) && version >= REQ_OFFSET_SINCE;

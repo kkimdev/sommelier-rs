@@ -172,8 +172,11 @@ impl ShadowTable {
     /// [`Self::GUEST_SERVER_ID_START`]) up to `WL_MAP_MAX_OBJECTS` inclusive.
     const SERVER_IDS: std::ops::Range<u32> =
         Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
-    /// The version of an object created without a negotiated version: a
-    /// test fixture, or a child of one. It passes every version check.
+    /// The version of an object created without a negotiated version. In
+    /// practice only test fixtures, and children created from them, have
+    /// it. It passes every version check; the permissive `wl_surface.attach`
+    /// rule for it is pinned by `.agent/rules/sommelier-rs-standards.md` and
+    /// INVARIANTS "Surfaces, damage and SHM".
     const UNKNOWN_OBJECT_VERSION: u32 = u32::MAX;
 
     pub fn new() -> Self {
