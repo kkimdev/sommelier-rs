@@ -1662,12 +1662,14 @@ fn compositor(
 /// Interfaces of objects that the compositor of a case that lets it
 /// destroys on its own, one interface per case, as a host may (see
 /// INVARIANTS "Object lifetimes"): the proxy pairs each with a guest object
-/// ([`guest_interface`]) and keeps per-object state for it. Only a
+/// ([`guest_interface`]) and keeps per-object state for it, or, for a
+/// `wl_seat`, its keyboards and text inputs name it. Only a
 /// `zwp_text_input_v1` can be an object only the proxy uses, once the guest
 /// has destroyed its v3 text input; its `delete_id` then changes nothing.
-const HOST_DESTROYED: [&str; 8] = [
+const HOST_DESTROYED: [&str; 9] = [
     "wl_registry",
     "wl_output",
+    "wl_seat",
     "wl_keyboard",
     "wl_surface",
     "wp_viewport",
