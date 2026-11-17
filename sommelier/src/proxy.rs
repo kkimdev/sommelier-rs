@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::connection::WaylandConnection;
+use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::state::{Context, PostDispatch, ShadowTable};
@@ -64,7 +64,7 @@ fn translated_sender_id(
     }
 }
 
-fn close_pending_output_fds(out_fds: &mut Vec<RawFd>, still_owned_fds: &[RawFd]) {
+fn close_pending_output_fds(out: &mut OutgoingMessages, still_owned_fds: &[RawFd]) {
     // FDs decoded from an incoming message remain owned by the connection
     // until the read buffer is drained (or the connection is dropped). A
     // handler can also queue newly-created descriptors that are not present in
@@ -73,7 +73,7 @@ fn close_pending_output_fds(out_fds: &mut Vec<RawFd>, still_owned_fds: &[RawFd])
     // turn the connection drop into a double-close.
     let protected: std::collections::HashSet<_> = still_owned_fds.iter().copied().collect();
     let mut closed = std::collections::HashSet::new();
-    for fd in out_fds.drain(..) {
+    for fd in out.take_fds() {
         if fd >= 0 && !protected.contains(&fd) && closed.insert(fd) {
             let _ = nix::unistd::close(fd);
         }
@@ -377,8 +377,7 @@ impl Client {
         // messages; Wayland associates received descriptors by order, not by
         // an independently addressable byte offset. VirtWL's send path keeps
         // that same order when it chunks a large byte stream.
-        let mut out_buffer = Vec::new();
-        let mut out_fds = Vec::new();
+        let mut out = OutgoingMessages::default();
         let mut offset: usize = 0;
         let mut fd_offset: usize = 0;
         let mut processed_messages = 0;
@@ -397,7 +396,7 @@ impl Client {
                 Framing::Partial => break,
                 Framing::Invalid(header) => {
                     log::error!("Invalid message length: {}", header.len);
-                    close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                    close_pending_output_fds(&mut out, &conn.read_fds);
                     return false;
                 }
                 Framing::Complete(header) => header,
@@ -409,7 +408,7 @@ impl Client {
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             }
 
@@ -502,7 +501,7 @@ impl Client {
                         // request makes the client believe the request was
                         // accepted and can desynchronize protocol state.
                         log::error!("Rejecting client request from unknown sender {}", sender_id);
-                        close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                        close_pending_output_fds(&mut out, &conn.read_fds);
                         return false;
                     }
                 } else {
@@ -548,8 +547,7 @@ impl Client {
                         }
                     }
 
-                    out_buffer.extend_from_slice(&data);
-                    out_fds.extend(fds);
+                    out.push(&data, &fds);
                     for effect in post_dispatch {
                         apply_post_dispatch(&mut self.ctx, effect);
                     }
@@ -566,7 +564,7 @@ impl Client {
                         .and_then(|gid| self.ctx.shadow_table.get_interface(gid).cloned())
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
-                    close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                    close_pending_output_fds(&mut out, &conn.read_fds);
                     return false;
                 }
             }
@@ -577,7 +575,7 @@ impl Client {
                     fd_offset,
                     consumed_fds
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             };
             if new_fd_offset > conn.read_fds.len() {
@@ -586,7 +584,7 @@ impl Client {
                     new_fd_offset,
                     conn.read_fds.len()
                 );
-                close_pending_output_fds(&mut out_fds, &conn.read_fds);
+                close_pending_output_fds(&mut out, &conn.read_fds);
                 return false;
             }
             fd_offset = new_fd_offset;
@@ -602,8 +600,7 @@ impl Client {
                     p_data.len(),
                     p_fds.len()
                 );
-                out_buffer.extend_from_slice(&p_data);
-                out_fds.extend(p_fds);
+                out.push(&p_data, &p_fds);
             }
 
             offset = message_end;
@@ -623,13 +620,13 @@ impl Client {
         self.ctx.synthetic_feedback_refresh_pending.clear();
 
         let mut success = true;
-        if !out_buffer.is_empty() && other_conn.send(&out_buffer, &out_fds).await.is_err() {
+        if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
             success = false;
         }
 
         let mut fds_to_close: std::collections::HashSet<std::os::unix::io::RawFd> =
             std::collections::HashSet::new();
-        fds_to_close.extend(out_fds.iter().copied());
+        fds_to_close.extend(out.fds().iter().copied());
 
         // Bidirectional queue: when processing events in one direction, the
         // handler may queue messages for the OPPOSITE direction. For example,
@@ -646,20 +643,16 @@ impl Client {
             Direction::ClientToHost => &mut self.ctx.host_to_client_queue,
             Direction::HostToClient => &mut self.ctx.client_to_host_queue,
         };
-        let mut reverse_out_buf = Vec::new();
-        let mut reverse_out_fds = Vec::new();
+        let mut reverse_out = OutgoingMessages::default();
         for (p_data, p_fds) in reverse_queue.drain(..) {
             log::debug!(
                 "  -> adding reverse queued message ({} bytes, {} fds)",
                 p_data.len(),
                 p_fds.len()
             );
-            reverse_out_buf.extend_from_slice(&p_data);
-            reverse_out_fds.extend(p_fds);
+            reverse_out.push(&p_data, &p_fds);
         }
-        if !reverse_out_buf.is_empty()
-            && conn.send(&reverse_out_buf, &reverse_out_fds).await.is_err()
-        {
+        if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
             // client connection. We still close every original below.
             success = false;
@@ -669,7 +662,7 @@ impl Client {
         // sendmsg(SCM_RIGHTS) succeeds it duplicates FDs into the kernel
         // cmsg buffer; the originals are still ours to close. When the send
         // fails or the buffer was empty, we obviously retain ownership.
-        fds_to_close.extend(reverse_out_fds.iter().copied());
+        fds_to_close.extend(reverse_out.fds().iter().copied());
 
         fds_to_close.extend(conn.read_fds.iter().take(fd_offset));
 
@@ -1022,6 +1015,98 @@ mod tests {
                 .await
                 .is_err(),
             "the proxy keeps serving after the logged no-op reload"
+        );
+    }
+
+    /// A VirtWL transaction carries at most 28 descriptors, so a batch that
+    /// forwards more must be split, between messages.
+    #[tokio::test]
+    async fn batches_send_at_most_the_transport_descriptor_limit_at_once() {
+        use crate::connection::MAX_FDS_PER_SEND;
+        use std::os::fd::AsRawFd;
+
+        const GUEST_OFFER: u32 = 30;
+        const HOST_OFFER: u32 = 31;
+        const RECEIVES: usize = MAX_FDS_PER_SEND + 2;
+        let (mut client, guest_peer, host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.map_id(GUEST_OFFER, HOST_OFFER);
+        client
+            .ctx
+            .shadow_table
+            .track_interface(GUEST_OFFER, "wl_data_offer".to_string());
+
+        // The guest asks for the selection once per descriptor, in one write
+        // the proxy dispatches as one batch.
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let mut receive = MessageBuilder::new();
+        receive.write_string("text/plain");
+        let receive =
+            receive.build_message(GUEST_OFFER, protocols::wayland::wl_data_offer::REQ_RECEIVE);
+        let requests = receive.repeat(RECEIVES);
+        let fds = [pipe[1]; RECEIVES];
+        let sent = nix::sys::socket::sendmsg::<()>(
+            guest_peer.as_raw_fd(),
+            &[std::io::IoSlice::new(&requests)],
+            &[nix::sys::socket::ControlMessage::ScmRights(&fds)],
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        )
+        .expect("send the guest requests");
+        assert_eq!(sent, requests.len());
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(
+            client
+                .client_conn
+                .recv()
+                .await
+                .expect("receive the requests"),
+            requests.len()
+        );
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+
+        // Read the host side one submission at a time.
+        let mut received_bytes = 0;
+        let mut per_submission = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let mut control = nix::cmsg_space!([RawFd; 253]);
+            let mut iov = [std::io::IoSliceMut::new(&mut data)];
+            let message = nix::sys::socket::recvmsg::<()>(
+                host_peer.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                nix::sys::socket::MsgFlags::empty(),
+            )
+            .expect("receive from the proxy");
+            if message.bytes == 0 {
+                break;
+            }
+            received_bytes += message.bytes;
+            let mut fds = Vec::new();
+            for cmsg in message.cmsgs().expect("control messages") {
+                if let nix::sys::socket::ControlMessageOwned::ScmRights(received) = cmsg {
+                    fds.extend(received);
+                }
+            }
+            for &fd in &fds {
+                unsafe { libc::close(fd) };
+            }
+            per_submission.push(fds.len());
+        }
+        drop(guest_peer);
+
+        assert_eq!(received_bytes, requests.len());
+        assert_eq!(per_submission.iter().sum::<usize>(), RECEIVES);
+        assert!(
+            per_submission
+                .iter()
+                .all(|&count| count <= MAX_FDS_PER_SEND),
+            "descriptors per submission: {per_submission:?}"
         );
     }
 
@@ -3540,7 +3625,8 @@ mod tests {
             .expect("memfd_create")
             .into_raw_fd();
         let incoming_identity = fd_identity(incoming_fd);
-        let mut output = vec![incoming_fd];
+        let mut output = OutgoingMessages::default();
+        output.push(&[], &[incoming_fd]);
         close_pending_output_fds(&mut output, &[incoming_fd]);
 
         // The incoming connection still owns this descriptor; the cleanup
@@ -3556,7 +3642,8 @@ mod tests {
             .expect("memfd_create")
             .into_raw_fd();
         let output_identity = fd_identity(fd);
-        let mut output = vec![fd];
+        let mut output = OutgoingMessages::default();
+        output.push(&[], &[fd]);
         close_pending_output_fds(&mut output, &[]);
         assert!(
             !any_fd_has_identity(output_identity),

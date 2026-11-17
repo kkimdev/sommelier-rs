@@ -44,6 +44,57 @@ const UNIX_MAX_SCM_RIGHTS_FDS: usize = 253;
 /// compositor would accept.
 const MAX_PENDING_FDS: usize = 1024;
 
+/// The most descriptors one transport submission carries.
+///
+/// A VirtWL transaction has room for `VIRTWL_SEND_MAX_ALLOCS` (28), the
+/// same number libwayland sends per `sendmsg` (`MAX_FDS_OUT`). Both
+/// transports split batches at this bound, so the behavior tested over Unix
+/// sockets is the behavior on the device.
+pub(crate) const MAX_FDS_PER_SEND: usize = crate::virtwl::VIRTWL_SEND_MAX_ALLOCS;
+
+/// An ordered run of outgoing Wayland messages and their descriptors.
+///
+/// Sent by [`WaylandConnection::send_messages`], which coalesces messages
+/// into as few submissions as [`MAX_FDS_PER_SEND`] allows.
+#[derive(Debug, Default)]
+pub(crate) struct OutgoingMessages {
+    bytes: Vec<u8>,
+    fds: Vec<RawFd>,
+    /// Where each message ends in `bytes` and in `fds`.
+    ends: Vec<(usize, usize)>,
+}
+
+impl OutgoingMessages {
+    pub(crate) fn push(&mut self, message: &[u8], fds: &[RawFd]) {
+        // No Wayland message has that many descriptor arguments; one that
+        // did could not be sent in a single submission.
+        debug_assert!(
+            fds.len() <= MAX_FDS_PER_SEND,
+            "a message carries {} descriptors",
+            fds.len()
+        );
+        self.bytes.extend_from_slice(message);
+        self.fds.extend_from_slice(fds);
+        self.ends.push((self.bytes.len(), self.fds.len()));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The descriptors of every message, which the caller still owns.
+    pub(crate) fn fds(&self) -> &[RawFd] {
+        &self.fds
+    }
+
+    /// Discard the messages, returning their descriptors.
+    pub(crate) fn take_fds(&mut self) -> Vec<RawFd> {
+        self.bytes.clear();
+        self.ends.clear();
+        std::mem::take(&mut self.fds)
+    }
+}
+
 pub struct WaylandConnection {
     transport: ConnectionTransport,
     pub read_buf: Vec<u8>,
@@ -314,7 +365,10 @@ impl WaylandConnection {
         !matches!(MessageHeader::frame(&self.read_buf), Framing::Partial)
     }
 
-    pub async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    /// Send one transport submission. Private: everything outgoing goes
+    /// through [`Self::send_messages`], which keeps each submission within
+    /// [`MAX_FDS_PER_SEND`].
+    async fn send(&mut self, data: &[u8], fds: &[RawFd]) -> io::Result<()> {
         if data.is_empty() && fds.is_empty() {
             return Ok(());
         }
@@ -370,6 +424,33 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => channel.send(data, fds).await,
         }
+    }
+
+    /// Send `messages` in order, in as few submissions as
+    /// [`MAX_FDS_PER_SEND`] allows.
+    ///
+    /// A submission ends only between messages, so every message's
+    /// descriptors travel with its bytes: a receiver must never meet a
+    /// message whose descriptors have not arrived yet.
+    pub(crate) async fn send_messages(&mut self, messages: &OutgoingMessages) -> io::Result<()> {
+        let mut start = (0, 0);
+        let mut end = start;
+        for &message_end in &messages.ends {
+            if message_end.1 - start.1 > MAX_FDS_PER_SEND {
+                self.send(
+                    &messages.bytes[start.0..end.0],
+                    &messages.fds[start.1..end.1],
+                )
+                .await?;
+                start = end;
+            }
+            end = message_end;
+        }
+        self.send(
+            &messages.bytes[start.0..end.0],
+            &messages.fds[start.1..end.1],
+        )
+        .await
     }
 
     pub async fn recv(&mut self) -> io::Result<usize> {
@@ -456,8 +537,8 @@ impl Drop for WaylandConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_unix_control_fds, recv_unix_message, unix_send_flags, WaylandConnection,
-        MAX_PENDING_FDS,
+        decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
+        WaylandConnection, MAX_PENDING_FDS,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::MessageBuilder;
@@ -519,6 +600,43 @@ mod tests {
         )
         .expect("send a descriptor");
         assert_eq!(sent, 1);
+    }
+
+    #[tokio::test]
+    async fn send_messages_splits_only_between_messages() {
+        let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
+        let name = CString::new("sommelier-split-batch").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let fd = memfd.as_raw_fd();
+
+        // (bytes, descriptors) per message: the second message would take
+        // the first submission past the limit, so it starts the next one.
+        let mut messages = OutgoingMessages::default();
+        for (len, fds) in [(8, 20), (12, 10), (16, 0), (20, 5)] {
+            messages.push(&vec![0; len], &vec![fd; fds]);
+        }
+        connection
+            .send_messages(&messages)
+            .await
+            .expect("send the batch");
+        drop(connection);
+
+        let mut submissions = Vec::new();
+        loop {
+            let mut data = [0u8; 4096];
+            let mut control = vec![0u8; 4096];
+            let (bytes, fds) =
+                recv_unix_message(peer.as_raw_fd(), &mut data, &mut control).expect("receive");
+            if bytes == 0 {
+                break;
+            }
+            for &received in &fds {
+                unsafe { libc::close(received) };
+            }
+            submissions.push((bytes, fds.len()));
+        }
+        assert_eq!(submissions, vec![(8, 20), (48, 15)]);
     }
 
     #[tokio::test]
