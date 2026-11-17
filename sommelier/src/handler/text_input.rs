@@ -1682,7 +1682,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             let destroy = MessageBuilder::new()
                 .build_message(host_ext_id, zcr_extended_text_input_v1::REQ_DESTROY);
             ctx.client_to_host_queue.push((destroy, Vec::new()));
-            ctx.shadow_table.mark_pending_destroy_host(host_ext_id);
+            ctx.retire_destroyed_host_object(host_ext_id);
         }
         // The v3 object is guest-facing but backed by a v1 host object whose
         // protocol has no destructor. Complete the guest-only lifecycle

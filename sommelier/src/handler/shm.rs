@@ -1060,9 +1060,7 @@ fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
     }
     queue_host_buffer_destroy(ctx, host_id);
     ctx.shadow_table.remove_guest_mapping(guest_id);
-    if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
-        ctx.fatal_protocol_error = true;
-    }
+    ctx.retire_destroyed_host_object(host_id);
 }
 
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
@@ -1072,7 +1070,7 @@ fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
     // Keep the numeric ID reserved until the host's wl_display.delete_id
     // acknowledgement arrives. The destroy request is ordered after all
     // already-queued params requests.
-    ctx.shadow_table.mark_pending_destroy_host(params_id);
+    ctx.retire_destroyed_host_object(params_id);
 }
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
@@ -1580,7 +1578,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 // host will process the destroy before the later request.
                 // Keeping the registration forever would leak one host ID per
                 // SHM buffer.
-                ctx.shadow_table.mark_pending_destroy_host(host_pool_id);
+                ctx.retire_destroyed_host_object(host_pool_id);
 
                 ctx.shadow_table.map_id(id, host_buffer_id);
                 ctx.shadow_table

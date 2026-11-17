@@ -34,7 +34,7 @@ use self::render::RenderBufferRegistry;
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
-use log::warn;
+use log::{error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -400,7 +400,10 @@ impl ShadowTable {
     /// The dispatch metadata is removed immediately so stale events cannot
     /// reach a handler, but the numeric ID remains reserved until the host
     /// acknowledges the destructor with `wl_display.delete_id`.
-    pub fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
+    ///
+    /// Handlers go through [`Context::retire_destroyed_host_object`], which
+    /// owns what a refusal means.
+    fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
         if self.host_to_guest.contains_key(&host_id) || !self.host_interfaces.contains_key(&host_id)
         {
             return false;
@@ -605,21 +608,6 @@ impl ShadowTable {
                 entry.insert(interface);
             }
         }
-    }
-
-    /// Complete a server-destroyed paired object while reserving its host ID.
-    ///
-    /// Some event-only objects, notably `wl_callback`, cease to exist when the
-    /// host sends their terminal event. The guest mapping must disappear
-    /// immediately, but the host numeric ID remains unavailable until the
-    /// compositor's later `wl_display.delete_id`. Combining both transitions
-    /// prevents callers from accidentally opening an ID-reuse window between
-    /// removing the pair and installing the host-only reservation.
-    pub fn retire_server_destroyed_object(&mut self, guest_id: u32) -> Option<HostId> {
-        let host_id = *self.guest_to_host.get(&guest_id)?;
-        self.remove_guest_mapping(guest_id);
-        self.mark_pending_destroy_host(host_id)
-            .then_some(HostId(host_id))
     }
 
     /// Mark a guest object as destroyed while retaining both sides of its
@@ -1159,6 +1147,23 @@ impl Context {
         self.render_buffers.mark_guest_destroyed(host_id)
     }
 
+    /// Retire a host-only object that is being destroyed, by a destructor
+    /// just queued or by the host's terminal event, until its
+    /// `wl_display.delete_id` (see [`ShadowTable::mark_pending_destroy_host`]).
+    ///
+    /// Every caller tracked the object as host-only and has not retired it,
+    /// so a refusal means the proxy's ID bookkeeping diverged, which ends the
+    /// session.
+    pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
+        if !self.shadow_table.mark_pending_destroy_host(host_id) {
+            error!(
+                "Host object {} was not a live host-only object when it was retired",
+                host_id
+            );
+            self.fatal_protocol_error = true;
+        }
+    }
+
     pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
         self.render_buffers.remove(HostId(host_buffer_id))
     }
@@ -1514,6 +1519,21 @@ mod tests {
         ));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(!ctx.window_placement.uses_arc_bounds());
+    }
+
+    #[test]
+    fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let host_id = ctx.shadow_table.allocate_host_id();
+        ctx.shadow_table
+            .track_host_interface(host_id, "wl_shm_pool".to_string());
+        ctx.retire_destroyed_host_object(host_id);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(!ctx.fatal_protocol_error);
+
+        // A second retirement means the bookkeeping diverged.
+        ctx.retire_destroyed_host_object(host_id);
+        assert!(ctx.fatal_protocol_error);
     }
 
     #[test]

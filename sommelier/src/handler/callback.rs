@@ -52,13 +52,7 @@ impl WlCallbackHandler for CallbackHandler {
             // wl_callback.done destroys the host callback resource. Reserve
             // its numeric ID until wl_display.delete_id arrives, while making
             // any duplicate event undispatchable immediately.
-            if !ctx.shadow_table.mark_pending_destroy_host(host_id) {
-                log::warn!(
-                    "internal callback {} ({:?}) was not tracked as host-only",
-                    host_id,
-                    waits_for
-                );
-            }
+            ctx.retire_destroyed_host_object(host_id);
             match waits_for {
                 InternalCallback::DmabufCapabilities { generation } => {
                     crate::handler::linux_dmabuf::LinuxDmabufHandler::complete_capability_discovery(
@@ -112,18 +106,11 @@ impl WlCallbackHandler for CallbackHandler {
             ctx.host_to_client_queue.push((delete_id, Vec::new()));
 
             // The terminal event destroys the callback on both sides, but the
-            // host numeric ID cannot be reused until its later delete_id.
-            if ctx
-                .shadow_table
-                .retire_server_destroyed_object(guest_id)
-                .is_none()
-            {
-                log::warn!(
-                    "wl_callback {} could not retain host ID {} until delete_id",
-                    guest_id,
-                    host_id
-                );
-            }
+            // host numeric ID cannot be reused until its later delete_id. The
+            // guest mapping goes now; removing it keeps the host ID reserved
+            // as a host-only object, which is then retired.
+            ctx.shadow_table.remove_guest_mapping(guest_id);
+            ctx.retire_destroyed_host_object(host_id);
         }
         Action::Drop
     }

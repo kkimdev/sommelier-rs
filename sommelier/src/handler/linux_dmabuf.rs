@@ -1177,7 +1177,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 version,
             );
             crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
-            ctx.shadow_table.mark_pending_destroy_host(buffer);
+            ctx.retire_destroyed_host_object(buffer);
             ctx.orphaned_dmabuf_params.remove(&host_params_id);
             ctx.pending_native_creates.remove(&HostId(host_params_id));
             // If delete_id for params arrived first, the host params interface
@@ -1214,7 +1214,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                     version,
                 );
                 crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
-                ctx.shadow_table.mark_pending_destroy_host(buffer);
+                ctx.retire_destroyed_host_object(buffer);
                 ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;

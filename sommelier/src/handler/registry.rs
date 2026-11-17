@@ -374,7 +374,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
             // the host does not retain a proxy until connection teardown.
             let message = MessageBuilder::new().build_message(host_id, DMABUF_DESTROY);
             ctx.client_to_host_queue.push((message, Vec::new()));
-            ctx.shadow_table.mark_pending_destroy_host(host_id);
+            ctx.retire_destroyed_host_object(host_id);
         }
         ctx.host_dmabuf_global_name = None;
         ctx.supported_formats.clear();

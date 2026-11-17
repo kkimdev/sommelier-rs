@@ -1029,8 +1029,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             ctx.client_to_host_queue.push((msg, Vec::new()));
             // Unregister from the host dispatch table so stale peek_key events
             // (version ≥ 2) sent after destroy cannot be dispatched to a dead object.
-            ctx.shadow_table
-                .mark_pending_destroy_host(host_extended_id.0);
+            ctx.retire_destroyed_host_object(host_extended_id.0);
             log::debug!(
                 "Destroyed extended keyboard: host_extended_id={} for host_keyboard_id={}",
                 host_extended_id.0,

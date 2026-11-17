@@ -154,7 +154,7 @@ fn release_host_only(
     if version >= release_since {
         let message = MessageBuilder::new().build_message(host_id, release_opcode);
         ctx.client_to_host_queue.push((message, Vec::new()));
-        ctx.shadow_table.mark_pending_destroy_host(host_id);
+        ctx.retire_destroyed_host_object(host_id);
     } else {
         ctx.shadow_table.retire_host_interface(host_id);
     }
