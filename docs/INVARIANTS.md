@@ -411,6 +411,18 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `damage_only_commit_copies_the_mutated_current_shm_buffer`,
   `damage_only_commit_does_not_read_a_released_shm_buffer`,
   `commit_without_damage_on_a_held_buffer_skips_the_copy`.
+- **Surface damage copies the pixels it touches.** Guests see
+  `wl_compositor` v3, so most damage arrives in surface units, and the
+  copy maps it back to buffer pixels: exactly under an integer buffer
+  scale, and through a viewport by inverting the buffer damage mapping
+  below, grown by one buffer pixel and rounded outward, so no pixel whose
+  image meets the damage is left out. Only a transformed buffer, or an
+  attach offset, copies in full; copying a 4K buffer in full every frame
+  costs about 2 GB/s.
+  Tests: `surface_damage_maps_to_every_buffer_pixel_it_meets`,
+  `destination_only_viewport_copies_only_the_damaged_pixels`,
+  `surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels`,
+  `surface_damage_under_a_buffer_transform_copies_the_whole_buffer`.
 - **Each host copy tracks the pixels it lacks.** Damage is relative to the
   surface's current contents, so a client alternating buffers A, B, A
   damages only what changed since B, while each guest SHM buffer has its

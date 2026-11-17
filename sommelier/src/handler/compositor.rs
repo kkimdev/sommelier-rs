@@ -1465,6 +1465,30 @@ mod tests {
     }
 
     #[test]
+    fn destination_only_viewport_copies_only_the_damaged_pixels() {
+        // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
+        // so a surface unit is half a buffer pixel. It has no damage_buffer
+        // (the host offers wl_compositor v3) and damages surface units.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Action::Forward
+        );
+        ctx.last_sender_id = 700;
+        assert_eq!(handler.on_set_destination(&mut ctx, 8, 8), Action::Forward);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        draw_test_frame(&ctx, 42, 0x22);
+        assert_eq!(handler.on_damage(&mut ctx, 0, 0, 2, 2), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        // Surface units 0..2 are pixels 0..1, grown by a pixel.
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(0, 0, 2, 2));
+    }
+
+    #[test]
     fn commit_without_damage_copies_nothing() {
         let (mut ctx, ..) = setup_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);

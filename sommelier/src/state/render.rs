@@ -259,10 +259,19 @@ impl SurfaceRect {
     /// buffer, which lies inside that range, so the clamp drops nothing it
     /// would copy.
     fn scaled(self, factor: i32) -> BufferRect {
-        let scale = |edge: f64| (edge * f64::from(factor)).clamp(0.0, f64::from(i32::MAX)) as i32;
+        let factor = f64::from(factor);
         let (x0, y0, x1, y1) = self.edges();
-        let (left, top) = (scale(x0), scale(y0));
-        BufferRect::new(left, top, scale(x1) - left, scale(y1) - top)
+        BufferRect::covering(x0 * factor, y0 * factor, x1 * factor, y1 * factor)
+    }
+}
+
+impl BufferRect {
+    /// The pixels covering the edges `x0..x1` by `y0..y1`, rounded outward
+    /// and clamped to non-negative i32 coordinates.
+    fn covering(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+        let pixel = |edge: f64| edge.clamp(0.0, f64::from(i32::MAX)) as i32;
+        let (left, top) = (pixel(x0.floor()), pixel(y0.floor()));
+        Self::new(left, top, pixel(x1.ceil()) - left, pixel(y1.ceil()) - top)
     }
 }
 
@@ -378,11 +387,34 @@ impl SurfaceMapping {
         SurfaceRect::enclosing(x(x0 - 1.0), y(y0 - 1.0), x(x1 + 1.0), y(y1 + 1.0))
     }
 
-    /// Surface damage `rect` in buffer pixels, or `None` when a transform
-    /// or a viewport makes the mapping more than an integer scale, which
-    /// is all the SHM bridge maps exactly.
+    /// Surface damage `rect` in buffer pixels, or `None` under a transform,
+    /// which the SHM bridge does not invert.
+    ///
+    /// An integer buffer scale (HiDPI clients) maps exactly. Through a
+    /// viewport (fractional-scale clients), surface unit `u` lands at buffer
+    /// pixel `(source + u * source size / destination) * scale`, the
+    /// inverse of [`Self::to_surface`]; the result grows by one buffer pixel
+    /// and rounds outward, so f64 rounding never leaves out a pixel whose
+    /// image meets `rect`. The copy clips the result to the buffer.
     pub fn to_buffer(&self, rect: SurfaceRect) -> Option<BufferRect> {
-        self.integer_scale().map(|scale| rect.scaled(scale))
+        if let Some(scale) = self.integer_scale() {
+            return Some(rect.scaled(scale));
+        }
+        if self.transform != wl_output::TRANSFORM_NORMAL {
+            return None;
+        }
+        let ((source_x, source_y, source_width, source_height), (width, height)) =
+            self.crop_and_scale();
+        let scale = f64::from(self.scale);
+        let x = |unit: f64| (source_x + unit * source_width / width) * scale;
+        let y = |unit: f64| (source_y + unit * source_height / height) * scale;
+        let (x0, y0, x1, y1) = rect.edges();
+        Some(BufferRect::covering(
+            x(x0) - 1.0,
+            y(y0) - 1.0,
+            x(x1) + 1.0,
+            y(y1) + 1.0,
+        ))
     }
 
     /// Whether a buffer pixel is a surface unit.
@@ -564,9 +596,9 @@ pub struct SurfaceState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SurfacePending {
     pub attachment: SurfaceAttachment,
-    /// Damage expressed in surface-local coordinates. It can only be copied
-    /// directly when the current buffer has the default transform and no
-    /// viewport; otherwise the compositor falls back to a complete copy.
+    /// Damage expressed in surface-local coordinates. The copy maps it to
+    /// buffer pixels unless the buffer is transformed or the commit attaches
+    /// it at an offset; then the compositor falls back to a complete copy.
     pub surface_damage: DamageRegion<SurfaceSpace>,
     /// Damage expressed in buffer pixel coordinates.
     pub buffer_damage: DamageRegion<BufferSpace>,
@@ -644,8 +676,8 @@ impl SurfaceCommit {
     /// the pixels the SHM bridge copies to the host.
     ///
     /// Buffer damage is already in buffer pixels. Surface damage maps to them
-    /// exactly under an integer buffer scale (HiDPI clients); any other
-    /// mapping, or an attach offset, falls back to the whole buffer.
+    /// through `mapping` (see [`SurfaceMapping::to_buffer`]); a transform,
+    /// or an attach offset, falls back to the whole buffer.
     pub fn buffer_copy_damage(&self, mapping: &SurfaceMapping) -> DamageRegion<BufferSpace> {
         if self.has_full_damage() {
             return DamageRegion::Full;
@@ -1338,5 +1370,104 @@ mod tests {
         // Without a buffer the source has nothing to leave.
         let huge = (0, 0, 100 * ONE, 100 * ONE);
         assert!(viewed(None, 2, 0, huge).source_fits_buffer());
+    }
+
+    /// Whether buffer pixel `pixel`'s image along one axis meets the surface
+    /// interval `start..end`, computed exactly. A pixel spans
+    /// `(p / scale - origin) * destination / size` from `p = pixel` to
+    /// `pixel + 1`, with `origin`, `size` and `destination` as fractions.
+    fn pixel_meets(
+        pixel: i128,
+        scale: i128,
+        (origin, origin_den): (i128, i128),
+        (size, size_den): (i128, i128),
+        (destination, destination_den): (i128, i128),
+        (start, end): (i128, i128),
+    ) -> bool {
+        let at = |p: i128| (p * origin_den - scale * origin) * destination * size_den;
+        let den = scale * origin_den * destination_den * size;
+        at(pixel) < end * den && at(pixel + 1) > start * den
+    }
+
+    #[test]
+    fn surface_damage_maps_to_every_buffer_pixel_it_meets() {
+        // A small xorshift keeps the cases reproducible without a crate.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut below = |n: i32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as i32
+        };
+        for _ in 0..20_000 {
+            let scale = 1 + below(4);
+            let buffer = (1 + below(48), 1 + below(48));
+            // Any source and destination: the mapping does not need them to
+            // fit the buffer or keep its proportions.
+            let (width, height) = (buffer.0 * 256, buffer.1 * 256);
+            let source = (below(2) == 0).then(|| {
+                (
+                    below(width),
+                    below(height),
+                    1 + below(width),
+                    1 + below(height),
+                )
+            });
+            let destination = (below(2) == 0).then(|| (1 + below(200), 1 + below(200)));
+            let damage = SurfaceRect::new(
+                below(110) - 10,
+                below(110) - 10,
+                1 + below(100),
+                1 + below(100),
+            );
+            let surface = SurfaceState {
+                current_buffer_scale: scale,
+                viewport: Some(ViewportState {
+                    source,
+                    destination,
+                }),
+                ..SurfaceState::default()
+            };
+            let copied = surface.mapping(Some(buffer)).to_buffer(damage).unwrap();
+            let s = i128::from(scale);
+            let axes = [
+                (
+                    buffer.0,
+                    source.map(|v| (v.0, v.2)),
+                    destination.map(|v| v.0),
+                    damage.x,
+                    damage.width,
+                    copied.x,
+                    copied.width,
+                ),
+                (
+                    buffer.1,
+                    source.map(|v| (v.1, v.3)),
+                    destination.map(|v| v.1),
+                    damage.y,
+                    damage.height,
+                    copied.y,
+                    copied.height,
+                ),
+            ];
+            for (extent, source, destination, start, length, left, width) in axes {
+                let (origin, size) = match source {
+                    Some((origin, size)) => ((i128::from(origin), 256), (i128::from(size), 256)),
+                    None => ((0, 1), (i128::from(extent), s)),
+                };
+                let destination = destination.map_or(size, |d| (i128::from(d), 1));
+                let interval = (i128::from(start), i128::from(start) + i128::from(length));
+                for pixel in 0..extent {
+                    if pixel_meets(i128::from(pixel), s, origin, size, destination, interval) {
+                        assert!(
+                            (left..left + width).contains(&pixel),
+                            "pixel {pixel} missing from {copied:?} for {damage:?}, \
+                             scale {scale}, buffer {buffer:?}, source {source:?}, \
+                             destination {destination:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
