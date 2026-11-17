@@ -395,6 +395,27 @@ fn queue_internal_bind(
     )
 }
 
+/// Bind host global `name` as `host_id` for the proxy's own use.
+///
+/// # Returns
+///
+/// The session's end if the bind cannot be encoded, which a static
+/// interface name never causes.
+fn bind_internally(
+    ctx: &mut Context,
+    registry_host_id: u32,
+    name: u32,
+    interface: &str,
+    version: u32,
+    host_id: u32,
+) -> Result<(), Action> {
+    if queue_internal_bind(ctx, registry_host_id, name, interface, version, host_id) {
+        Ok(())
+    } else {
+        Err(ctx.fail(format_args!("Failed to bind host {interface} internally")))
+    }
+}
+
 fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
     ctx.host_dmabuf_global_name == Some(name)
         || ctx.host_shm_global_name == Some(name)
@@ -814,16 +835,15 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
-            let bound = queue_internal_bind(
+            if let Err(end) = bind_internally(
                 ctx,
                 registry_host_id,
                 name,
                 interface,
                 host_bind_version,
                 host_id,
-            );
-            if !bound {
-                return ctx.fail(format_args!("Failed to bind host {interface} internally"));
+            ) {
+                return end;
             }
             if can_synthesize_feedback {
                 queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
@@ -847,14 +867,16 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            if let Err(end) = bind_internally(
                 ctx,
                 registry_host_id,
                 name,
                 interface,
                 bound_version,
                 host_id,
-            );
+            ) {
+                return end;
+            }
 
             return Action::Drop;
         } else if interface == "zcr_text_input_extension_v1" {
@@ -872,14 +894,16 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             // 2. Bind internally
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            if let Err(end) = bind_internally(
                 ctx,
                 registry_host_id,
                 name,
                 interface,
                 bound_version,
                 host_id,
-            );
+            ) {
+                return end;
+            }
 
             return Action::Drop;
         } else if interface == "zcr_keyboard_extension_v1" {
@@ -902,14 +926,16 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.host_keyboard_extension_global_name = Some(name);
 
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(
+            if let Err(end) = bind_internally(
                 ctx,
                 registry_host_id,
                 name,
                 interface,
                 bound_version,
                 host_id,
-            );
+            ) {
+                return end;
+            }
             log::debug!(
                 "Bound zcr_keyboard_extension_v1 v{} (host_id={})",
                 bound_version,
@@ -959,15 +985,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             record_registry_global_visibility(ctx, name, visible);
 
             let registry_host_id = ctx.last_sender_id;
-            let bound = queue_internal_bind(
+            if let Err(end) = bind_internally(
                 ctx,
                 registry_host_id,
                 name,
                 interface,
                 bound_version,
                 host_id,
-            );
-            if bound && ctx.window_placement.uses_arc_bounds() {
+            ) {
+                return end;
+            }
+            if ctx.window_placement.uses_arc_bounds() {
                 // A guest may bind an output before the host registry has
                 // delivered zaura_shell. Retry every already-live output now
                 // that the shell object and its version are available; the
@@ -1012,7 +1040,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
             // Bind to wl_shm
             let registry_host_id = ctx.last_sender_id;
-            queue_internal_bind(ctx, registry_host_id, name, interface, 1, host_id);
+            if let Err(end) = bind_internally(ctx, registry_host_id, name, interface, 1, host_id) {
+                return end;
+            }
 
             // The SHM implementation is a v1 compatibility shim. Advertise
             // the capped version explicitly instead of forwarding a host v2
