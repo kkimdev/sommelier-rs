@@ -69,7 +69,7 @@ pub fn generate(protocol: &Protocol) -> String {
 
             use std::os::fd::OwnedFd;
             use crate::wire::{WireMessage, MessageBuilder, Action, Outgoing, ProtocolError};
-            use crate::state::Context;
+            use crate::state::{Context, Link};
 
             pub const ALLOWED_INTERFACES: &[&str] = &[
                 #(#interface_names),*
@@ -421,34 +421,23 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         }
 
                         match arg.typ.as_str() {
+                            // The pre-handler validation translated the
+                            // object (see `generate_request_validations`).
                             "object" => {
-                                let is_nullable = arg.allow_null.unwrap_or(false);
-                                if is_nullable {
-                                    // A local-only object, such as an inert
-                                    // output, has no host counterpart; the
-                                    // host gets null, as for no object.
+                                let host = translated_object_ident(arg);
+                                if arg.allow_null.unwrap_or(false) {
                                     mapping_and_writing.push(quote! {
-                                        let host_id = match ctx.shadow_table.get_host_id(#name) {
-                                            Some(id) => id,
-                                            None if #name == 0
-                                                || ctx.shadow_table.is_local_only_guest_object(#name) => 0,
-                                            None => {
-                                                log::debug!(
-                                                    "Dropping request due to missing mapping for nullable argument {}",
-                                                    #arg_name_str
-                                                );
-                                                return Ok(None);
-                                            }
-                                        };
-                                        builder.write_u32(host_id);
+                                        builder.write_u32(#host);
                                     });
                                 } else {
                                     let req_name_str = &req.name;
                                     mapping_and_writing.push(quote! {
-                                        let host_id = if let Some(id) = ctx.shadow_table.get_host_id(#name) {
-                                            id
-                                        } else {
-                                            log::debug!("Dropping request {} due to missing mapping for non-nullable argument {}", #req_name_str, #arg_name_str);
+                                        let Link::Host(host_id) = #host else {
+                                            log::debug!(
+                                                "Dropping request {} naming a local object as non-nullable argument {}",
+                                                #req_name_str,
+                                                #arg_name_str
+                                            );
                                             return Ok(None);
                                         };
                                         builder.write_u32(host_id);
@@ -457,39 +446,25 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             }
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
+                                    // A child object takes its parent's
+                                    // version on each side. No local is
+                                    // bound, so none can shadow a later
+                                    // argument.
                                     mapping_and_writing.push(quote! {
-                                        let object_version = ctx
-                                            .shadow_table
-                                            .guest_object_version_or_unknown(msg.sender_id);
-                                        let host_object_version = ctx
-                                            .shadow_table
-                                            .get_host_id(msg.sender_id)
-                                            .and_then(|parent| ctx.shadow_table.host_object_version(parent))
-                                            .unwrap_or(object_version);
-                                        let host_id = ctx.shadow_table.allocate_host_id();
-                                        ctx.shadow_table.map_id(#name, host_id);
-                                        ctx.shadow_table.track_interface_with_version(
+                                        builder.write_u32(ctx.shadow_table.create_paired(
                                             #name,
-                                            #interface_name.to_string(),
-                                            object_version,
-                                        );
-                                        ctx.shadow_table.set_host_version(host_id, host_object_version);
-                                        builder.write_u32(host_id);
+                                            #interface_name,
+                                            ctx.shadow_table.guest_object_version_or_unknown(msg.sender_id),
+                                            ctx.shadow_table.host_object_version_or_unknown(host_sender_id),
+                                        ));
                                     });
                                 } else {
                                     mapping_and_writing.push(quote! {
-                                        let (ref interface_name, version, id) = #name;
-                                        builder.write_string(interface_name);
-                                        builder.write_u32(version);
-                                        let host_id = ctx.shadow_table.allocate_host_id();
-                                        ctx.shadow_table.map_id(id, host_id);
-                                        ctx.shadow_table.track_interface_with_version(
-                                            id,
-                                            interface_name.clone(),
-                                            version,
+                                        builder.write_string(&#name.0);
+                                        builder.write_u32(#name.1);
+                                        builder.write_u32(
+                                            ctx.shadow_table.create_paired(#name.2, &#name.0, #name.1, #name.1),
                                         );
-                                        ctx.shadow_table.set_host_version(host_id, version);
-                                        builder.write_u32(host_id);
                                     });
                                 }
                             }
@@ -501,48 +476,34 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                     }
                 }
 
-                let is_destructor = req.msg_type.as_deref() == Some("destructor");
-                let destructor_cleanup = if is_destructor {
-                    quote! {
-                        if ctx.shadow_table.is_guest_server_id(msg.sender_id) {
-                            // Server-created objects do not receive
-                            // wl_display.delete_id when the client destroys
-                            // them. The forwarded request already captured the
-                            // host sender ID, so release the translation now
-                            // and allow the host to reuse its ID in a later
-                            // ordered event.
-                            ctx.shadow_table.remove_id(msg.sender_id);
-                        } else {
-                            ctx.shadow_table.mark_pending_destroy(msg.sender_id);
-                        }
-                    }
-                } else {
-                    quote! {}
-                };
-                let local_destructor_cleanup = if is_destructor {
-                    quote! {
-                        if is_local_only {
-                            crate::handler::display::queue_local_delete_id(ctx, msg.sender_id);
-                        }
-                    }
-                } else {
-                    quote! {}
-                };
+                // A local object's destructor completes in the proxy, whether
+                // its handler forwards or drops the request.
+                let (destructor_cleanup, local_destructor_cleanup, dropped_destructor_cleanup) =
+                    if req.msg_type.as_deref() == Some("destructor") {
+                        (
+                            quote! { ctx.shadow_table.guest_destroyed(msg.sender_id); },
+                            quote! { crate::handler::display::queue_local_delete_id(ctx, msg.sender_id); },
+                            quote! {
+                                if sender == Link::Local {
+                                    crate::handler::display::queue_local_delete_id(ctx, msg.sender_id);
+                                }
+                            },
+                        )
+                    } else {
+                        (quote! {}, quote! {}, quote! {})
+                    };
 
                 dispatch_request_arms.push(quote! {
                     Request::#var_name { #(#field_names_list),* } => {
                         #request_version_validation
                         #(#request_validations)*
-                        let host_sender_id = ctx.shadow_table.get_host_id(msg.sender_id);
-                        let is_local_only = host_sender_id.is_none()
-                            && ctx.shadow_table.is_local_only_guest_object(msg.sender_id);
                         let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
                         if handler_action == Action::Forward {
                             // Check the sender before mapping any new_id: a
                             // dropped request must not consume or map an ID.
-                            let Some(host_sender_id) = host_sender_id else {
+                            let Link::Host(host_sender_id) = sender else {
                                 log::debug!(
-                                    "Dropping request from unmapped sender {}",
+                                    "Dropping request from local object {}",
                                     msg.sender_id
                                 );
                                 #local_destructor_cleanup
@@ -555,7 +516,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             #destructor_cleanup
                             return Ok(Some(outgoing));
                         }
-                        #local_destructor_cleanup
+                        #dropped_destructor_cleanup
                     }
                 });
 
@@ -604,7 +565,6 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 for arg_item in &evt.items {
                     if let MessageItem::Arg(arg) = arg_item {
                         let name = sanitize_ident(&arg.name);
-                        let arg_name_str = &arg.name;
                         field_names_list.push(name.clone());
 
                         if arg.typ == "string"
@@ -619,51 +579,45 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         }
 
                         match arg.typ.as_str() {
+                            // The pre-handler validation translated the
+                            // object (see `generate_event_validations`).
+                            "object" if arg.interface.is_some() => {
+                                let guest = translated_object_ident(arg);
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#guest);
+                                });
+                            }
                             "object" => {
-                                let is_nullable = arg.allow_null.unwrap_or(false);
-                                if is_nullable {
-                                    mapping_and_writing.push(quote! {
-                                        let guest_id = if #name == 0 {
-                                            0
-                                        } else if let Some(id) = ctx.shadow_table.get_guest_id(#name) {
-                                            id
-                                        } else {
-                                            log::debug!(
-                                                "Dropping event due to missing mapping for nullable argument {}",
-                                                #arg_name_str
-                                            );
-                                            return Ok(None);
-                                        };
-                                        builder.write_u32(guest_id);
-                                    });
-                                } else {
-                                    let evt_name_str = &evt.name;
-                                    mapping_and_writing.push(quote! {
-                                        let guest_id = if let Some(id) = ctx.shadow_table.get_guest_id(#name) {
-                                            id
-                                        } else {
-                                            log::debug!("Dropping event {} due to missing mapping for non-nullable argument {}", #evt_name_str, #arg_name_str);
-                                            return Ok(None);
-                                        };
-                                        builder.write_u32(guest_id);
-                                    });
-                                }
+                                assert!(
+                                    !arg.allow_null.unwrap_or(false),
+                                    "event argument {} names a nullable object of no interface, which no vendored protocol has",
+                                    arg.name
+                                );
+                                let evt_name_str = &evt.name;
+                                let arg_name_str = &arg.name;
+                                mapping_and_writing.push(quote! {
+                                    let Some(guest_id) = ctx.shadow_table.get_guest_id(#name) else {
+                                        log::debug!(
+                                            "Dropping event {} naming an object with no guest counterpart as argument {}",
+                                            #evt_name_str,
+                                            #arg_name_str
+                                        );
+                                        return Ok(None);
+                                    };
+                                    builder.write_u32(guest_id);
+                                });
                             }
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
+                                    // A child object takes its parent's
+                                    // version, bound to no local that could
+                                    // shadow a later argument.
                                     mapping_and_writing.push(quote! {
-                                        let object_version = ctx
-                                            .shadow_table
-                                            .host_object_version_or_unknown(msg.sender_id);
-                                        let guest_id = ctx.shadow_table.allocate_guest_server_id();
-                                        ctx.shadow_table.map_id(guest_id, #name);
-                                        ctx.shadow_table.track_interface_with_version(
-                                            guest_id,
-                                            #interface_name.to_string(),
-                                            object_version,
-                                        );
-                                        ctx.shadow_table.set_host_version(#name, object_version);
-                                        builder.write_u32(guest_id);
+                                        builder.write_u32(ctx.shadow_table.adopt_host_created(
+                                            #name,
+                                            #interface_name,
+                                            ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
+                                        ));
                                     });
                                 } else {
                                     mapping_and_writing.push(quote! {
@@ -682,7 +636,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let is_destructor = evt.msg_type.as_deref() == Some("destructor");
                 let destructor_cleanup = if is_destructor {
                     quote! {
-                        ctx.shadow_table.remove_id(guest_sender_id);
+                        ctx.shadow_table.guest_destroyed(guest_sender_id);
                     }
                 } else {
                     quote! {}
@@ -811,12 +765,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 // The sender comes first, as in libwayland-server: a request
                 // from an object that is gone is reported as such, whatever
                 // its opcode and arguments.
-                if ctx.shadow_table.is_pending_destroy_guest(msg.sender_id)
-                    || (ctx.shadow_table.get_host_id(msg.sender_id).is_none()
-                        && !ctx.shadow_table.is_local_only_guest_object(msg.sender_id))
-                {
+                let Some(sender) = ctx.shadow_table.request_sender(msg.sender_id) else {
                     return Err(ProtocolError::InvalidSender(msg.sender_id));
-                }
+                };
                 let req = Request::from_wire(msg)?;
                 match req {
                     #(#dispatch_request_arms)*
@@ -831,13 +782,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
-                if !ctx.shadow_table.is_event_sender_known(msg.sender_id) {
-                    log::debug!(
-                        "Dropping event from untracked host sender {}",
-                        msg.sender_id
-                    );
-                    return Ok(None);
-                }
+                // The proxy dispatches an event by its sender's interface
+                // (`ShadowTable::get_host_interface`), so the sender is a
+                // live host object.
                 let evt = Event::from_wire(msg)?;
                 match evt {
                     #(#dispatch_event_arms)*
@@ -1228,14 +1175,12 @@ fn generate_version_validation(since: Option<u32>, host_to_guest: bool) -> Token
 ///
 /// Wayland clients own the IDs in requests. A repeated, null, or
 /// server-reserved ID is a protocol error and must not be allowed to overwrite
-/// an existing shadow-table entry. Object arguments are checked here as well so
-/// an unknown non-null object cannot later be silently translated to 0.
+/// an existing shadow-table entry. Each object argument is validated and
+/// translated in one lookup, bound to [`translated_object_ident`]: a nullable
+/// one to the host ID to send, else to its [`Link`].
 fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
-    for item in items {
-        let MessageItem::Arg(arg) = item else {
-            continue;
-        };
+    for arg in args(items) {
         let name = sanitize_ident(&arg.name);
         match arg.typ.as_str() {
             "new_id" => {
@@ -1251,48 +1196,35 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                 });
             }
             "object" => {
-                let is_nullable = arg.allow_null.unwrap_or(false);
-                if let Some(interface) = &arg.interface {
-                    if is_nullable {
-                        validations.push(quote! {
-                            if #name != 0
-                                && (ctx.shadow_table.is_pending_destroy_guest(#name)
-                                    || !ctx.shadow_table.guest_object_matches(#name, #interface)
-                                    || (ctx.shadow_table.get_host_id(#name).is_none()
-                                        && !ctx.shadow_table.is_local_only_guest_object(#name)))
-                            {
-                                return Err(ProtocolError::InvalidObjectId(#name));
+                let Some(interface) = &arg.interface else {
+                    panic!(
+                        "request argument {} names an object of no interface, which no vendored protocol has",
+                        arg.name
+                    );
+                };
+                let host = translated_object_ident(arg);
+                let link = quote! {
+                    ctx.shadow_table
+                        .request_object(#name, #interface)
+                        .ok_or(ProtocolError::InvalidObjectId(#name))?
+                };
+                validations.push(if arg.allow_null.unwrap_or(false) {
+                    quote! {
+                        let #host = if #name == 0 {
+                            0
+                        } else {
+                            match #link {
+                                Link::Host(host_id) => host_id,
+                                // A local object, such as an inert output,
+                                // has no host counterpart: the host gets
+                                // null, as for no object.
+                                Link::Local => 0,
                             }
-                        });
-                    } else {
-                        validations.push(quote! {
-                            if ctx.shadow_table.is_pending_destroy_guest(#name)
-                                || !ctx.shadow_table.guest_object_matches(#name, #interface)
-                                || (ctx.shadow_table.get_host_id(#name).is_none()
-                                    && !ctx.shadow_table.is_local_only_guest_object(#name))
-                            {
-                                return Err(ProtocolError::InvalidObjectId(#name));
-                            }
-                        });
+                        };
                     }
-                } else if is_nullable {
-                    validations.push(quote! {
-                        if #name != 0
-                            && (ctx.shadow_table.is_pending_destroy_guest(#name)
-                                || ctx.shadow_table.get_host_id(#name).is_none())
-                        {
-                            return Err(ProtocolError::InvalidObjectId(#name));
-                        }
-                    });
                 } else {
-                    validations.push(quote! {
-                        if ctx.shadow_table.is_pending_destroy_guest(#name)
-                            || ctx.shadow_table.get_host_id(#name).is_none()
-                        {
-                            return Err(ProtocolError::InvalidObjectId(#name));
-                        }
-                    });
-                }
+                    quote! { let #host = #link; }
+                });
             }
             _ => {}
         }
@@ -1301,64 +1233,62 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
 }
 
 /// Generate validation for IDs carried by a host event. A host-generated
-/// object is handled by the event mapping code below, while object arguments
-/// must already refer to a known host object before the handler runs.
+/// object must have a fresh server ID. Each object argument of an interface
+/// must name a live object with a guest counterpart, or the event is
+/// dropped; it is validated and translated to the guest ID in one lookup,
+/// bound to [`translated_object_ident`]. An object of no interface is
+/// resolved only when the event is forwarded.
 fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
-    for item in items {
-        let MessageItem::Arg(arg) = item else {
-            continue;
-        };
+    for arg in args(items) {
         let name = sanitize_ident(&arg.name);
         match arg.typ.as_str() {
             "new_id" if arg.interface.is_some() => {
                 validations.push(quote! {
-                    if !ctx.shadow_table.is_host_id_available(#name) {
+                    if !ctx.shadow_table.accepts_host_new_id(#name) {
                         return Err(ProtocolError::InvalidObjectId(#name));
                     }
                 });
             }
+            // An object of no interface (`wl_display.error`'s object) may
+            // name any object, including one only the proxy uses, so its
+            // handler must see the event; only forwarding resolves it.
             "object" => {
-                let is_nullable = arg.allow_null.unwrap_or(false);
-                if let Some(interface) = &arg.interface {
-                    if is_nullable {
-                        validations.push(quote! {
-                            if #name != 0
-                                && (ctx.shadow_table.is_pending_destroy_host(#name)
-                                    || !ctx.shadow_table.host_object_matches(#name, #interface)
-                                    || ctx.shadow_table.get_guest_id(#name).is_none())
-                            {
+                let Some(interface) = &arg.interface else {
+                    continue;
+                };
+                let guest = translated_object_ident(arg);
+                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface) };
+                validations.push(if arg.allow_null.unwrap_or(false) {
+                    quote! {
+                        let #guest = if #name == 0 {
+                            0
+                        } else {
+                            let Some(guest_id) = #lookup else {
                                 return Ok(None);
-                            }
-                        });
-                    } else {
-                        validations.push(quote! {
-                            if ctx.shadow_table.is_pending_destroy_host(#name)
-                                || !ctx.shadow_table.host_object_matches(#name, #interface)
-                                || ctx.shadow_table.get_guest_id(#name).is_none()
-                            {
-                                return Ok(None);
-                            }
-                        });
+                            };
+                            guest_id
+                        };
                     }
-                } else if is_nullable {
-                    validations.push(quote! {
-                        if #name != 0 && ctx.shadow_table.get_guest_id(#name).is_none() {
-                            return Ok(None);
-                        }
-                    });
                 } else {
-                    validations.push(quote! {
-                        if ctx.shadow_table.get_guest_id(#name).is_none() {
+                    quote! {
+                        let Some(#guest) = #lookup else {
                             return Ok(None);
-                        }
-                    });
-                }
+                        };
+                    }
+                });
             }
             _ => {}
         }
     }
     validations
+}
+
+/// The binding that holds an object argument translated by its message's
+/// validation (see [`generate_request_validations`] and
+/// [`generate_event_validations`]).
+fn translated_object_ident(arg: &Arg) -> Ident {
+    format_ident!("translated_{}", arg.name)
 }
 
 fn generate_field_names(items: &[MessageItem]) -> TokenStream {

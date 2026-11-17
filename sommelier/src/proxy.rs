@@ -66,17 +66,9 @@ fn translated_sender_id(
     }
 }
 
-fn pending_host_event_is_stale(
-    ctx: &Context,
-    sender_id: u32,
-    opcode: u16,
-    guest_id: Option<u32>,
-) -> bool {
-    let host_interface = ctx.shadow_table.get_host_interface(sender_id);
-    let guest_interface = guest_id.and_then(|gid| ctx.shadow_table.get_interface(gid));
-    let allows_deferred_buffer_release = host_interface
-        .or(guest_interface)
-        .is_some_and(|name| name == "wl_buffer")
+fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bool {
+    let interface = ctx.shadow_table.get_host_interface(sender_id);
+    let allows_deferred_buffer_release = interface.is_some_and(|name| name == "wl_buffer")
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
         && ctx.host_buffer_is_guest_destroyed(sender_id);
     // An asynchronous linux-dmabuf create can legally be followed by
@@ -86,8 +78,7 @@ fn pending_host_event_is_stale(
     // and destroys it. Dropping `created` here would leak the host buffer
     // because generated new_id mapping only runs when the event is
     // forwarded.
-    let allows_orphan_dmabuf_result = host_interface
-        .or(guest_interface)
+    let allows_orphan_dmabuf_result = interface
         .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
         && (opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
             || opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED);
@@ -159,7 +150,8 @@ struct Client {
 }
 
 impl Client {
-    fn new(client_conn: WaylandConnection, host_conn: WaylandConnection, ctx: Context) -> Self {
+    fn new(client_conn: WaylandConnection, host_conn: WaylandConnection, mut ctx: Context) -> Self {
+        ctx.shadow_table.create_display();
         Self {
             client_conn,
             host_conn,
@@ -169,11 +161,6 @@ impl Client {
     }
 
     async fn run(mut self) {
-        self.ctx.shadow_table.map_id(1, 1);
-        self.ctx
-            .shadow_table
-            .track_interface(1, "wl_display".to_string());
-
         // When both streams already have complete messages buffered, alternate
         // directions. This gives host input (keyboard/IME) a bounded wait even
         // while a large client render burst is being drained.
@@ -385,9 +372,10 @@ impl Client {
                             &mut self.ctx,
                             &ProtocolError::InvalidMessageLength(header.len),
                         );
-                        break;
+                    } else {
+                        self.ctx.fail_session();
                     }
-                    return false;
+                    break;
                 }
                 Framing::Complete(header) => header,
             };
@@ -398,7 +386,11 @@ impl Client {
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                return false;
+                // Only host events can be untracked: a guest request from an
+                // unknown sender is an error. The events before this one were
+                // valid and reach the guest ahead of its one error.
+                self.ctx.fail_session();
+                break;
             }
 
             let packet = &conn.read_buf[offset..message_end];
@@ -419,17 +411,21 @@ impl Client {
                 "deferred work belongs to the message that deferred it"
             );
             let suppress_host_event = matches!(direction, Direction::HostToClient)
-                && pending_host_event_is_stale(&self.ctx, sender_id, opcode, guest_id);
+                && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
-                Direction::ClientToHost => self.ctx.shadow_table.get_interface(sender_id).cloned(),
-                Direction::HostToClient => {
-                    let host_interface = self.ctx.shadow_table.get_host_interface(sender_id);
-                    let guest_interface =
-                        guest_id.and_then(|gid| self.ctx.shadow_table.get_interface(gid));
-                    host_interface.or(guest_interface).cloned()
-                }
+                Direction::ClientToHost => self
+                    .ctx
+                    .shadow_table
+                    .get_interface(sender_id)
+                    .map(str::to_string),
+                Direction::HostToClient => self
+                    .ctx
+                    .shadow_table
+                    .get_host_interface(sender_id)
+                    .map(str::to_string),
             };
 
+            let output_mark = self.ctx.output_mark();
             let result = if let Some(interface) = interface {
                 // The message takes its descriptors from the front of the
                 // queue; dropping it unforwarded closes them.
@@ -542,17 +538,26 @@ impl Client {
                         Direction::HostToClient => self.ctx.shadow_table.get_guest_id(sender_id),
                     };
                     let interface = guest_id_for_log
-                        .and_then(|gid| self.ctx.shadow_table.get_interface(gid).cloned())
+                        .and_then(|gid| {
+                            self.ctx.shadow_table.get_interface(gid).map(str::to_string)
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
+                    // A rejected message sends nothing, even what its
+                    // handler queued before the rejection.
+                    self.ctx.discard_output_since(output_mark);
                     if matches!(direction, Direction::ClientToHost) {
                         // Tell the guest why before closing, as
                         // libwayland-server does. The requests before this
                         // one were valid, so they are forwarded as usual.
                         crate::handler::display::queue_request_error(&mut self.ctx, &e);
-                        break;
+                    } else {
+                        // The host broke the protocol, so the session ends;
+                        // the events before this one were valid and reach
+                        // the guest ahead of its one error.
+                        self.ctx.fail_session();
                     }
-                    return false;
+                    break;
                 }
             }
 
@@ -792,16 +797,11 @@ mod tests {
             UnixStream::pair().expect("guest unix socket pair should be created");
         let (host_peer, host_socket) =
             UnixStream::pair().expect("host unix socket pair should be created");
-        let mut client = Client::new(
+        let client = Client::new(
             WaylandConnection::new(client_socket.into()).expect("register test socket"),
             WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
-        client.ctx.shadow_table.map_id(1, 1);
-        client
-            .ctx
-            .shadow_table
-            .track_interface(1, "wl_display".to_string());
         (client, guest_peer, host_peer)
     }
 
@@ -927,7 +927,7 @@ mod tests {
         host_events(&mut client, &[delete_id(host_callback)]).await;
         assert_eq!(client.ctx.shadow_table.get_host_id(CALLBACK), None);
         assert_eq!(
-            client.ctx.shadow_table.allocate_host_id(),
+            client.ctx.shadow_table.create_host_only("wl_callback", 1),
             host_callback,
             "the deleted callback's host ID is reused first"
         );
@@ -947,8 +947,8 @@ mod tests {
     }
 
     /// A guest may destroy a buffer the host still holds. Its guest object
-    /// is gone, but the host's `release` must still reach the handler, which
-    /// then destroys the host buffer.
+    /// takes no more requests, but the host's `release` must still reach the
+    /// handler, which then destroys the host buffer.
     #[tokio::test]
     async fn a_retired_buffer_still_routes_its_release() {
         use crate::protocols::wayland::wl_buffer;
@@ -957,17 +957,15 @@ mod tests {
         const HOST: u32 = 30;
         let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
         let ctx = &mut client.ctx;
-        ctx.shadow_table.map_id(GUEST, HOST);
         ctx.shadow_table
-            .track_interface_with_version(GUEST, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(HOST, 1);
+            .insert_paired_with_version_for_test(GUEST, HOST, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(HOST, (1, 1), Vec::new()));
         assert!(ctx.mark_buffer_submitted(GUEST));
 
         let (destroy, _) = wl_buffer::req::destroy(GUEST);
         client.client_conn.read_buf.extend_from_slice(&destroy);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
-        assert_eq!(client.ctx.shadow_table.get_interface(GUEST), None);
+        assert_eq!(client.ctx.shadow_table.request_sender(GUEST), None);
         assert!(client.ctx.shadow_table.is_pending_destroy_guest(GUEST));
 
         let (release, _) = wl_buffer::evt::release(HOST);
@@ -1132,11 +1130,10 @@ mod tests {
         const HOST_OFFER: u32 = 31;
         const RECEIVES: usize = MAX_FDS_PER_SEND + 2;
         let (mut client, guest_peer, host_peer) = client_with_socket_peers();
-        client.ctx.shadow_table.map_id(GUEST_OFFER, HOST_OFFER);
         client
             .ctx
             .shadow_table
-            .track_interface(GUEST_OFFER, "wl_data_offer".to_string());
+            .insert_paired_for_test(GUEST_OFFER, HOST_OFFER, "wl_data_offer");
 
         // The guest asks for the selection once per descriptor, in one write
         // the proxy dispatches as one batch.
@@ -1308,22 +1305,17 @@ mod tests {
             (STALE_GUEST_KEYBOARD, STALE_HOST_KEYBOARD),
             (LIVE_GUEST_KEYBOARD, LIVE_HOST_KEYBOARD),
         ] {
-            client.ctx.shadow_table.map_id(guest_id, host_id);
-            client.ctx.shadow_table.track_interface_with_version(
+            client.ctx.shadow_table.insert_paired_with_version_for_test(
                 guest_id,
-                "wl_keyboard".to_string(),
-                10,
-            );
-            client.ctx.shadow_table.track_host_interface_with_version(
                 host_id,
-                "wl_keyboard".to_string(),
+                "wl_keyboard",
                 10,
             );
         }
         client
             .ctx
             .shadow_table
-            .mark_pending_destroy(STALE_GUEST_KEYBOARD);
+            .guest_destroyed(STALE_GUEST_KEYBOARD);
         client.ctx.keyboard_repeatable_keys.insert(
             crate::state::HostId(STALE_HOST_KEYBOARD),
             std::collections::HashSet::from([57]),
@@ -1583,7 +1575,7 @@ mod tests {
         client
             .ctx
             .shadow_table
-            .track_host_interface(88, "wl_display".to_string());
+            .insert_host_only_for_test(88, "wl_display", 1);
         assert!(
             !client.handle_msgs(Direction::HostToClient).await,
             "descriptor ambiguity must remain fatal across receive calls"
@@ -1631,7 +1623,7 @@ mod tests {
         client
             .ctx
             .shadow_table
-            .track_host_interface(88, "wl_display".to_string());
+            .insert_host_only_for_test(88, "wl_display", 1);
 
         assert!(
             !client.handle_msgs(Direction::HostToClient).await,
@@ -1642,6 +1634,120 @@ mod tests {
         assert_fd_released(pending_fd, &pending_target);
     }
 
+    /// Descriptor ambiguity ends the session like any host protocol error:
+    /// the valid events before it reach the guest, then one error.
+    #[tokio::test]
+    async fn descriptor_ambiguity_is_reported_after_the_valid_events() {
+        use protocols::wayland::{wl_data_device, wl_display};
+        const DATA_DEVICE: u32 = 10;
+        const HOST_DATA_DEVICE: u32 = 80;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            DATA_DEVICE,
+            HOST_DATA_DEVICE,
+            "wl_data_device",
+            3,
+        );
+        let (pending, _) = std::os::unix::net::UnixStream::pair().expect("a descriptor");
+        let mut offer = MessageBuilder::new();
+        offer.write_u32(0xff00_0001);
+        let offer = offer.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER);
+        // An untracked message with a descriptor it may or may not own, then
+        // a complete follow-up the descriptor might belong to.
+        let stale_event = MessageBuilder::new().build_message(77, 0);
+        let follow_up = MessageBuilder::new().build_message(HOST_DATA_DEVICE, 0);
+        for event in [offer, stale_event, follow_up] {
+            client.host_conn.read_buf.extend_from_slice(&event);
+        }
+        client.host_conn.read_fds.push_back(pending.into());
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER),
+                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR),
+            ]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A rejected host event sends nothing its handler queued: a
+    /// `wl_callback.done` with trailing bytes must not reach the guest as a
+    /// done and a delete_id ahead of the error.
+    #[tokio::test]
+    async fn a_rejected_host_event_sends_nothing_of_its_own() {
+        use protocols::wayland::wl_display;
+        const CALLBACK: u32 = 3;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        let host_callback = guest_sync(&mut client, CALLBACK).await;
+        let mut done = MessageBuilder::new();
+        done.write_u32(0);
+        done.write_u32(0xdead);
+        client
+            .host_conn
+            .read_buf
+            .extend(done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A rejected guest request sends nothing its handler queued: a local
+    /// `wl_shm_pool.destroy` with trailing bytes must not reach the guest as
+    /// a delete_id ahead of the error.
+    #[tokio::test]
+    async fn a_rejected_request_sends_nothing_of_its_own() {
+        use protocols::wayland::{wl_display, wl_shm_pool};
+        const POOL: u32 = 21;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
+        let mut destroy = MessageBuilder::new();
+        destroy.write_u32(0xdead);
+        client
+            .client_conn
+            .read_buf
+            .extend(destroy.build_message(POOL, wl_shm_pool::REQ_DESTROY));
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)]
+        );
+    }
+
     /// The object and code of each `wl_display.error` the guest received
     /// before the proxy closed the connection.
     fn display_errors(guest_peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u32)> {
@@ -1650,7 +1756,12 @@ mod tests {
         guest_peer
             .read_to_end(&mut events)
             .expect("read the guest's events");
-        crate::test_support::frames(&events)
+        display_errors_in(&events)
+    }
+
+    /// The object and code of each `wl_display.error` in `events`.
+    fn display_errors_in(events: &[u8]) -> Vec<(u32, u32)> {
+        crate::test_support::frames(events)
             .filter(|(header, _)| {
                 (header.sender_id, header.opcode)
                     == (
@@ -1734,14 +1845,10 @@ mod tests {
     ) {
         let (mut client, guest_peer, host_peer) = client_with_socket_peers();
         let host_surface = 6;
-        client.ctx.shadow_table.map_id(SURFACE, host_surface);
-        client
-            .ctx
-            .shadow_table
-            .track_interface_with_version(SURFACE, "wl_surface".to_string(), 4);
-        client.ctx.shadow_table.track_host_interface_with_version(
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            SURFACE,
             host_surface,
-            "wl_surface".to_string(),
+            "wl_surface",
             4,
         );
         (client, guest_peer, host_peer)
@@ -1796,7 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn a_destroyed_sender_is_an_invalid_object_whatever_it_sends() {
         let errors = surface_request_errors(
-            |client| client.ctx.shadow_table.mark_pending_destroy(SURFACE),
+            |client| client.ctx.shadow_table.guest_destroyed(SURFACE),
             99,
             &[],
         )
@@ -1869,6 +1976,93 @@ mod tests {
         assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
     }
 
+    /// The host may report an error on an object only the proxy uses, such
+    /// as an Aura child or a temporary pool. The guest cannot be told which
+    /// object failed, but the session still ends with one error.
+    #[tokio::test]
+    async fn a_host_error_on_a_host_only_object_ends_the_session() {
+        const HOST_POOL: u32 = 77;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client
+            .ctx
+            .shadow_table
+            .insert_host_only_for_test(HOST_POOL, "wl_shm_pool", 1);
+        let mut error = MessageBuilder::new();
+        error.write_u32(HOST_POOL);
+        error.write_u32(2);
+        error.write_string("host failure");
+        client.host_conn.read_buf.extend(error.build_message(
+            crate::wire::WL_DISPLAY_ID,
+            protocols::wayland::wl_display::EVT_ERROR,
+        ));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.ctx.is_fatal());
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
+            )]
+        );
+    }
+
+    /// A host event that breaks the protocol ends the session like a guest
+    /// request does: the events before it still reach the guest, followed
+    /// by one error.
+    #[tokio::test]
+    async fn an_invalid_host_event_is_reported_after_the_valid_ones() {
+        use protocols::wayland::{wl_data_device, wl_display};
+        const DATA_DEVICE: u32 = 10;
+        const HOST_DATA_DEVICE: u32 = 80;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.insert_paired_with_version_for_test(
+            DATA_DEVICE,
+            HOST_DATA_DEVICE,
+            "wl_data_device",
+            3,
+        );
+        // A server-range offer, then one from the client range, which only
+        // the proxy allocates from.
+        for offer in [0xff00_0001u32, 123] {
+            let mut event = MessageBuilder::new();
+            event.write_u32(offer);
+            client
+                .host_conn
+                .read_buf
+                .extend(event.build_message(HOST_DATA_DEVICE, wl_data_device::EVT_DATA_OFFER));
+        }
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let received: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, payload)| {
+                let first = WireMessage::new(header.sender_id, header.opcode, payload)
+                    .read_u32()
+                    .unwrap();
+                (header.sender_id, header.opcode, first)
+            })
+            .collect();
+        assert_eq!(
+            received,
+            [
+                (DATA_DEVICE, wl_data_device::EVT_DATA_OFFER, 0xff00_0000),
+                (
+                    crate::wire::WL_DISPLAY_ID,
+                    wl_display::EVT_ERROR,
+                    crate::wire::WL_DISPLAY_ID
+                ),
+            ]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
     #[tokio::test]
     async fn an_invalid_message_length_is_reported_before_closing() {
         let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
@@ -1915,11 +2109,14 @@ mod tests {
         );
         let ctx = &mut client.ctx;
         ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
-        ctx.shadow_table.map_id(XDG_SURFACE, XDG_SURFACE_HOST);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            XDG_SURFACE,
+            XDG_SURFACE_HOST,
+            "xdg_surface",
+            6,
+        );
         ctx.shadow_table
-            .track_interface_with_version(XDG_SURFACE, "xdg_surface".to_string(), 6);
-        ctx.shadow_table.set_host_version(XDG_SURFACE_HOST, 6);
-        ctx.shadow_table.map_id(WL_SURFACE, 22);
+            .insert_paired_for_test(WL_SURFACE, 22, "wl_surface");
         ctx.xdg_roles.add_xdg_surface(XDG_SURFACE, WL_SURFACE);
         (client, guest_peer, host_peer)
     }
@@ -1941,7 +2138,7 @@ mod tests {
     #[tokio::test]
     async fn failed_get_toplevel_does_not_create_internal_aura_object() {
         let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        client.ctx.shadow_table.mark_pending_destroy(XDG_SURFACE);
+        client.ctx.shadow_table.guest_destroyed(XDG_SURFACE);
         let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
@@ -2040,11 +2237,10 @@ mod tests {
 
         // Register one advertised global under the host-side registry ID so
         // the bind reaches the registry handler's validation path.
-        client.ctx.shadow_table.map_id(10, 20);
         client
             .ctx
             .shadow_table
-            .track_interface(10, "wl_registry".to_string());
+            .insert_paired_for_test(10, 20, "wl_registry");
         client.ctx.host_globals.insert(
             7,
             crate::state::HostGlobal {
@@ -2152,22 +2348,14 @@ mod tests {
             (guest_surface, host_surface),
             (replacement_guest_surface, replacement_host_surface),
         ] {
-            ctx.shadow_table.map_id(guest, host);
             ctx.shadow_table
-                .track_interface_with_version(guest, "wl_surface".to_string(), 1);
-            ctx.shadow_table
-                .track_host_interface_with_version(host, "wl_surface".to_string(), 1);
+                .insert_paired_with_version_for_test(guest, host, "wl_surface", 1);
         }
         for (guest_keyboard, host_keyboard) in [keyboard_a, keyboard_b] {
-            ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
-            ctx.shadow_table.track_interface_with_version(
+            ctx.shadow_table.insert_paired_with_version_for_test(
                 guest_keyboard,
-                "wl_keyboard".to_string(),
-                10,
-            );
-            ctx.shadow_table.track_host_interface_with_version(
                 host_keyboard,
-                "wl_keyboard".to_string(),
+                "wl_keyboard",
                 10,
             );
             ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
@@ -2340,17 +2528,13 @@ mod tests {
         const AURA_SHELL: u32 = 240;
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .track_interface_with_version(GTK_SHELL, "gtk_shell1".to_string(), 1);
+        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
         ctx.gtk_shells
             .insert(GTK_SHELL, crate::state::GtkShellState::default());
         register_raw_surface(&mut ctx, GUEST_SURFACE, HOST_SURFACE);
         ctx.bind_aura_shell_for_test(AURA_SHELL);
-        ctx.shadow_table.track_host_interface_with_version(
-            AURA_SHELL,
-            "zaura_shell".to_string(),
-            38,
-        );
+        ctx.shadow_table
+            .insert_host_only_for_test(AURA_SHELL, "zaura_shell", 38);
         let mut request = MessageBuilder::new();
         request.write_u32(GTK_SURFACE);
         request.write_u32(GUEST_SURFACE);
@@ -2378,12 +2562,10 @@ mod tests {
     }
 
     fn register_raw_surface(ctx: &mut Context, guest_surface: u32, host_surface: u32) {
-        ctx.shadow_table.map_id(guest_surface, host_surface);
-        ctx.shadow_table
-            .track_interface_with_version(guest_surface, "wl_surface".to_string(), 1);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_surface,
             host_surface,
-            "wl_surface".to_string(),
+            "wl_surface",
             1,
         );
     }
@@ -2472,23 +2654,19 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
-            .track_host_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(GUEST_SEAT, HOST_SEAT);
+            .insert_host_only_for_test(1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(GUEST_SEAT, "wl_seat".to_string(), 1);
-        ctx.shadow_table
-            .track_host_interface_with_version(HOST_SEAT, "wl_seat".to_string(), 1);
+            .insert_paired_with_version_for_test(GUEST_SEAT, HOST_SEAT, "wl_seat", 1);
 
-        ctx.shadow_table.map_id(GUEST_KEYBOARD, HOST_KEYBOARD);
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
             GUEST_KEYBOARD,
-            "wl_keyboard".to_string(),
+            HOST_KEYBOARD,
+            "wl_keyboard",
             10,
         );
-        ctx.shadow_table.set_host_version(HOST_KEYBOARD, 10);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_EXTENDED_KEYBOARD,
-            "zcr_extended_keyboard_v1".to_string(),
+            "zcr_extended_keyboard_v1",
             2,
         );
         ctx.keyboard_to_seat.insert(GUEST_KEYBOARD, GUEST_SEAT);
@@ -2506,40 +2684,30 @@ mod tests {
             GUEST_SURFACE,
             HOST_SURFACE,
         );
-        ctx.shadow_table.map_id(GUEST_SURFACE, HOST_SURFACE);
-        ctx.shadow_table
-            .track_interface_with_version(GUEST_SURFACE, "wl_surface".to_string(), 1);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            GUEST_SURFACE,
             HOST_SURFACE,
-            "wl_surface".to_string(),
+            "wl_surface",
             1,
         );
         ctx.host_text_input_manager_v1_id = Some(HOST_TEXT_INPUT_MANAGER);
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_TEXT_INPUT_MANAGER,
-            "zwp_text_input_manager_v1".to_string(),
+            "zwp_text_input_manager_v1",
             1,
         );
-        ctx.shadow_table.track_interface_with_version(
-            GUEST_TEXT_INPUT_MANAGER,
-            "zwp_text_input_manager_v3".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .create_local(GUEST_TEXT_INPUT_MANAGER, "zwp_text_input_manager_v3", 1);
 
-        ctx.shadow_table.map_id(GUEST_TEXT_INPUT, HOST_TEXT_INPUT);
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.insert_bridged_for_test(
             GUEST_TEXT_INPUT,
-            "zwp_text_input_v3".to_string(),
-            1,
-        );
-        ctx.shadow_table.track_host_interface_with_version(
             HOST_TEXT_INPUT,
-            "zwp_text_input_v1".to_string(),
-            1,
+            "zwp_text_input_v3",
+            "zwp_text_input_v1",
         );
-        ctx.shadow_table.track_host_interface_with_version(
+        ctx.shadow_table.insert_host_only_for_test(
             HOST_EXTENDED_TEXT_INPUT,
-            "zcr_extended_text_input_v1".to_string(),
+            "zcr_extended_text_input_v1",
             11,
         );
         ctx.text_inputs.insert(GUEST_TEXT_INPUT, {
@@ -3329,7 +3497,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the activation barrier"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert_eq!(
             ctx.host_to_client_queue.len(),
             initial_guest_events + 1,
@@ -3344,7 +3512,7 @@ mod tests {
             "wl_display",
             delete_id.build_message(1, wl_display::EVT_DELETE_ID),
         );
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(!ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(ctx.shadow_table.is_host_id_available(callback_id.0));
         assert_eq!(
             ctx.host_to_client_queue.len(),
@@ -3479,7 +3647,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "the old callback must be consumed even after guest ID reuse"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
         dispatch_raw_event(
             &mut handler,
@@ -3637,7 +3805,7 @@ mod tests {
             ctx.internal_callbacks.get(callback_id).is_none(),
             "callback.done must consume the old focus barrier"
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(callback_id.0));
+        assert!(ctx.shadow_table.is_retired_host(callback_id.0));
         assert!(!ctx.text_inputs[&GUEST_TEXT_INPUT].host_is_active());
 
         ctx.client_to_host_queue.clear();
@@ -3887,11 +4055,8 @@ mod tests {
     fn synthetic_manager_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 20;
-        ctx.shadow_table.track_interface_with_version(
-            guest_id,
-            "zwp_text_input_manager_v3".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .create_local(guest_id, "zwp_text_input_manager_v3", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(
@@ -3942,8 +4107,7 @@ mod tests {
     fn synthetic_shm_pool_destroy_emits_one_guest_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let guest_id = 21;
-        ctx.shadow_table
-            .track_interface_with_version(guest_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(guest_id, "wl_shm_pool", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy =
@@ -4001,31 +4165,48 @@ mod tests {
         );
         assert!(
             !any_fd_has_identity(forwarded_identity),
-            "a translated message that is never sent must close its descriptor"
+            "the proxy closes a forwarded descriptor once it is sent"
         );
         assert!(
             any_fd_has_identity(pending_identity),
             "the connection still owns the descriptor no message took"
         );
-        let mut nothing = [0u8; 1];
-        let read_error = std::io::Read::read(&mut guest_peer, &mut nothing)
-            .expect_err("a batch that ends early sends nothing");
-        assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
         drop(client);
         assert!(
             !any_fd_has_identity(pending_identity),
             "closing the connection must close every pending descriptor"
+        );
+        // The fixture's peer is non-blocking; block until the connection's
+        // close reaches it, which a process forked meanwhile may delay.
+        guest_peer
+            .set_nonblocking(false)
+            .expect("guest peer should become blocking");
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        let headers: Vec<_> = crate::test_support::frames(&events)
+            .map(|(header, _)| (header.sender_id, header.opcode))
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                (LIVE_GUEST_KEYBOARD, wl_keyboard::EVT_KEYMAP),
+                (
+                    crate::wire::WL_DISPLAY_ID,
+                    crate::protocols::wayland::wl_display::EVT_ERROR
+                ),
+            ],
+            "the valid event reaches the guest ahead of the session's error"
         );
     }
 
     #[test]
     fn translated_sender_survives_destructor_mapping_removal() {
         let mut shadow_table = ShadowTable::new();
-        shadow_table.map_id(47, 68);
+        shadow_table.insert_paired_for_test(47, 68, "wl_surface");
 
         let client_to_host = translated_sender_id(&shadow_table, Direction::ClientToHost, 47);
         let host_to_client = translated_sender_id(&shadow_table, Direction::HostToClient, 68);
-        shadow_table.remove_id(47);
+        shadow_table.release_deleted_host_id(68);
 
         assert_eq!(client_to_host, Some(68));
         assert_eq!(host_to_client, Some(47));
@@ -4036,12 +4217,10 @@ mod tests {
     #[test]
     fn destructor_mapping_survives_until_host_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
-            .track_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(10, 20);
+            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_region".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
         let mut handler = SommelierHandler::new();
 
         let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
@@ -4083,15 +4262,12 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_forwards_host_id_until_delete_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
-            .track_interface_with_version(1, "wl_display".to_string(), 1);
-        ctx.shadow_table.map_id(5, 15);
+            .insert_paired_with_version_for_test(1, 1, "wl_display", 1);
         ctx.shadow_table
-            .track_interface_with_version(5, "wl_fixes".to_string(), 1);
-        ctx.shadow_table.map_id(10, 20);
+            .insert_paired_with_version_for_test(5, 15, "wl_fixes", 1);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_registry".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_registry", 1);
         let mut handler = SommelierHandler::new();
 
         let payload = 10u32.to_ne_bytes();
@@ -4146,39 +4322,33 @@ mod tests {
     #[test]
     fn pending_destructor_host_events_are_suppressed_except_deferred_buffer_release() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_region".to_string(), 1);
-        ctx.shadow_table.mark_pending_destroy(10);
-        assert!(pending_host_event_is_stale(&ctx, 20, 0, Some(10)));
+            .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
+        ctx.shadow_table.guest_destroyed(10);
+        assert!(pending_host_event_is_stale(&ctx, 20, 0));
 
-        ctx.shadow_table.map_id(11, 21);
         ctx.shadow_table
-            .track_interface_with_version(11, "wl_buffer".to_string(), 1);
+            .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
         assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
         assert!(ctx.mark_buffer_guest_destroyed(11));
-        ctx.shadow_table.retire_guest_object(11);
+        ctx.shadow_table.guest_destroyed_in_use(11);
         assert!(!pending_host_event_is_stale(
             &ctx,
             21,
             protocols::wayland::wl_buffer::EVT_RELEASE,
-            Some(11)
         ));
 
-        ctx.shadow_table.map_id(12, 22);
         ctx.shadow_table
-            .track_interface_with_version(12, "wl_buffer".to_string(), 1);
+            .insert_paired_with_version_for_test(12, 22, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(22, (1, 1), Vec::new()));
-        // Match the production native-buffer destroy path: the guest
-        // interface is retired while the host-side interface remains
-        // available long enough to dispatch wl_buffer.release.
+        // Match the production native-buffer destroy path: the host
+        // object still dispatches wl_buffer.release.
         assert!(ctx.mark_buffer_guest_destroyed(12));
-        ctx.shadow_table.retire_guest_object(12);
+        ctx.shadow_table.guest_destroyed_in_use(12);
         assert!(!pending_host_event_is_stale(
             &ctx,
             22,
             protocols::wayland::wl_buffer::EVT_RELEASE,
-            Some(12)
         ));
     }
 
@@ -4190,14 +4360,13 @@ mod tests {
         // The wl_output handlers rely on this filter instead of checking for
         // a pending destructor themselves.
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_output".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 20, "wl_output", 3);
         ctx.last_sender_id = 10;
         WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
         for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
             assert!(
-                pending_host_event_is_stale(&ctx, 20, opcode, Some(10)),
+                pending_host_event_is_stale(&ctx, 20, opcode),
                 "opcode {opcode}"
             );
         }
@@ -4225,56 +4394,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn untracked_host_event_is_dropped_before_handler_state_mutation() {
-        struct Probe {
-            called: bool,
-        }
-
-        impl protocols::wayland::wl_registry::WlRegistryHandler for Probe {
-            fn on_global(
-                &mut self,
-                _ctx: &mut Context,
-                _name: u32,
-                _interface: &String,
-                _version: u32,
-            ) -> crate::wire::Action {
-                self.called = true;
-                crate::wire::Action::Drop
-            }
-        }
-
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+    /// The proxy dispatches a host event by its sender's interface, so an
+    /// event from a sender it does not track never reaches a handler.
+    #[tokio::test]
+    async fn untracked_host_event_is_dropped_before_handler_state_mutation() {
+        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
         let mut builder = MessageBuilder::new();
         builder.write_u32(7);
         builder.write_string("wl_seat");
         builder.write_u32(1);
-        let payload = builder.build_message(77, protocols::wayland::wl_registry::EVT_GLOBAL);
-        let mut msg = WireMessage::new(
-            77,
-            protocols::wayland::wl_registry::EVT_GLOBAL,
-            &payload[8..],
-        );
-        let mut probe = Probe { called: false };
+        let global = builder.build_message(77, protocols::wayland::wl_registry::EVT_GLOBAL);
 
-        let result =
-            protocols::wayland::wl_registry::dispatch_event(&mut msg, &mut probe, &mut ctx);
-
-        assert_eq!(raw_dispatch(result), Ok(None));
+        host_events(&mut client, &[global]).await;
         assert!(
-            !probe.called,
+            client.ctx.host_globals.is_empty(),
             "an untracked host event must not reach a stateful handler"
         );
-        assert!(ctx.host_globals.is_empty());
     }
 
     #[test]
     fn created_surface_keeps_separate_guest_and_host_versions() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
-        ctx.shadow_table
-            .track_interface_with_version(10, "wl_compositor".to_string(), 4);
-        ctx.shadow_table.set_host_version(20, 3);
+        let host_compositor = ctx.shadow_table.create_paired(10, "wl_compositor", 4, 3);
         let mut handler = SommelierHandler::new();
         let payload = 30u32.to_ne_bytes();
         let mut msg = WireMessage::new(
@@ -4287,7 +4428,7 @@ mod tests {
                 .expect("create_surface dispatch")
                 .expect("create_surface forwarded");
         assert!(fds.is_empty());
-        assert_eq!(crate::test_support::msg_sender(&forwarded), 20);
+        assert_eq!(crate::test_support::msg_sender(&forwarded), host_compositor);
         let host_surface = ctx.shadow_table.get_host_id(30).expect("host surface");
         assert_eq!(
             u32::from_ne_bytes(forwarded[8..12].try_into().unwrap()),
@@ -4300,9 +4441,8 @@ mod tests {
     #[test]
     fn request_since_guard_rejects_a_newer_opcode_for_an_old_guest_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "xdg_positioner".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "xdg_positioner", 1);
 
         let payload = [];
         let mut msg = WireMessage::new(
@@ -4339,16 +4479,21 @@ mod tests {
         let host_parent = 41;
         let new_subsurface: u32 = 50;
 
-        ctx.shadow_table.map_id(sender, host_sender);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            sender,
+            host_sender,
+            "wl_subcompositor",
+            1,
+        );
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            surface,
+            host_surface,
+            "wl_surface",
+            1,
+        );
         ctx.shadow_table
-            .track_interface_with_version(sender, "wl_subcompositor".to_string(), 1);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table
-            .track_interface_with_version(surface, "wl_surface".to_string(), 1);
-        ctx.shadow_table.map_id(parent, host_parent);
-        ctx.shadow_table
-            .track_interface_with_version(parent, "wl_surface".to_string(), 1);
-        ctx.shadow_table.mark_pending_destroy(surface);
+            .insert_paired_with_version_for_test(parent, host_parent, "wl_surface", 1);
+        ctx.shadow_table.guest_destroyed(surface);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&new_subsurface.to_ne_bytes());
@@ -4380,8 +4525,8 @@ mod tests {
     #[test]
     fn event_since_guard_rejects_a_newer_event_for_an_old_host_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
-        ctx.shadow_table.set_host_version(20, 3);
+        ctx.shadow_table
+            .insert_paired_with_version_for_test(10, 20, "xdg_toplevel", 3);
 
         let payload = [0u8; 8];
         let mut msg = WireMessage::new(
@@ -4406,9 +4551,8 @@ mod tests {
     #[test]
     fn generated_forwarding_rejects_messages_that_exceed_wire_length() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 20);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_source".to_string(), 1);
+            .insert_paired_with_version_for_test(10, 20, "wl_data_source", 1);
 
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(65_520));

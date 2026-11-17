@@ -94,12 +94,9 @@ pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u3
 /// `None`, queueing nothing, when no `zaura_shell` is bound.
 pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -> Option<u32> {
     let shell = ctx.host_zaura_shell?;
-    let child_host_id = ctx.shadow_table.allocate_host_id();
-    ctx.shadow_table.track_host_interface_with_version(
-        child_host_id,
-        child.interface.to_string(),
-        shell.version,
-    );
+    let child_host_id = ctx
+        .shadow_table
+        .create_host_only(child.interface, shell.version);
     ctx.client_to_host_queue
         .push((child.get)(shell.id, child_host_id, parent_host_id));
     Some(child_host_id)
@@ -152,7 +149,7 @@ fn release_host_only(
         ctx.client_to_host_queue.push(release(host_id));
         ctx.retire_destroyed_host_object(host_id);
     } else {
-        ctx.shadow_table.retire_host_interface(host_id);
+        ctx.shadow_table.retire_host(host_id);
     }
 }
 
@@ -255,7 +252,7 @@ mod tests {
                 [id.to_ne_bytes(), PARENT_HOST.to_ne_bytes()].concat()
             );
             assert_eq!(
-                ctx.shadow_table.get_host_interface(id).map(String::as_str),
+                ctx.shadow_table.get_host_interface(id),
                 Some(child.interface)
             );
             assert_eq!(aura_object_version(&ctx, id), version);
@@ -281,7 +278,7 @@ mod tests {
                 queued_headers(&ctx.client_to_host_queue),
                 vec![(id, release_opcode)]
             );
-            assert!(ctx.shadow_table.is_pending_destroy_host_only(id));
+            assert!(ctx.shadow_table.is_retired_host(id));
 
             let mut ctx = ctx_with_shell(since - 1);
             let id = create(&mut ctx, child, PARENT_HOST).expect("Aura child");
@@ -292,7 +289,7 @@ mod tests {
                 "{child:?} has no destructor"
             );
             assert_eq!(ctx.shadow_table.get_host_interface(id), None);
-            assert!(!ctx.shadow_table.is_pending_destroy_host_only(id));
+            assert!(ctx.shadow_table.is_retired_host(id));
             assert!(!ctx.shadow_table.is_host_id_available(id));
         }
     }

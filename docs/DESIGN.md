@@ -97,10 +97,11 @@ build time (`sommelier/build.rs`). For each protocol it generates:
 - Typed decoders and a `ProtocolHandler` trait with one `on_*` method per
   message. A handler returns `Action::Forward` or `Action::Drop`; the
   default forwards.
-- Pre-dispatch validation: object and `new_id` arguments are checked
-  against the shadow table, so a repeated, null or reserved ID cannot
-  overwrite a mapping, and each message is checked against the version
-  that introduced it.
+- Pre-dispatch validation: the sender, object and `new_id` arguments are
+  resolved through the shadow table before the handler runs, so a
+  repeated, null or reserved ID cannot overwrite an entry, and each
+  message is checked against the version that introduced it (see
+  [Object translation](#object-translation)).
 - An encoder per message, `req::<request>` and `evt::<event>`, for every
   message the proxy builds itself (see
   [Wire messages](INVARIANTS.md#wire-messages)).
@@ -130,10 +131,28 @@ side knows it by:
   [Synthetic objects](#synthetic-objects)) or paired with a host object,
   live or destroyed by the guest and awaiting its host's `delete_id`.
 - A host ID is in use exactly while it has an entry: a paired object, a
-  host-only object the proxy uses itself, or a reservation that outlived
-  its object, until its `delete_id` or for the rest of the connection.
-- A pairing is recorded in both entries: every change updates both, and
-  debug builds check that they match.
+  host-only object the proxy uses itself, or a retired object whose ID
+  is kept until its `delete_id` or for the rest of the connection.
+- A pairing is recorded in both entries.
+
+The table's API keeps those entries consistent by construction:
+
+- **Constructors** create an object with all its facts, under IDs that
+  nothing holds: `create_paired` (and `create_bridged`, for a v3 text
+  input backed by a v1 host object), `adopt_host_created` for an object a
+  host event created, `create_local`, `create_host_only` and
+  `create_display`.
+- **Transitions** are named after what happened and change both sides at
+  once: `guest_destroyed`, `guest_destroyed_in_use`,
+  `guest_ended_host_kept`, `guest_ended_host_destroyed`,
+  `local_destroyed`, `abandon` (for an object that never reached the
+  host), `host_destroy_queued`, `retire_host` and
+  `release_deleted_host_id`.
+- **Generated dispatch** resolves each sender and object argument once,
+  before the handler runs, which validates and translates it together:
+  `request_sender` and `request_object` return a `Link` (a host ID, or
+  local), and `event_object` returns the guest ID. A host-created object
+  must have a fresh server ID (`accepts_host_new_id`).
 
 Guest and host ID spaces are independent: the proxy allocates host IDs
 itself, and host-created objects get guest IDs in the server range
@@ -142,7 +161,7 @@ like libwayland's object map, reuses the last freed ID before a fresh one,
 so a long session never outgrows the peer's map.
 
 Destruction is asymmetric. A guest destructor request is forwarded, but the
-mapping survives until the host's `wl_display.delete_id` arrives, so late
+pairing survives until the host's `wl_display.delete_id` arrives, so late
 host events can still be translated (and are filtered) and the `delete_id`
 itself can be forwarded. Host-only objects the proxy created keep their ID
 reserved the same way; `Context::retire_destroyed_host_object` is the one

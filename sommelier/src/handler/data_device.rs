@@ -144,14 +144,13 @@ mod tests {
     fn host_data_offer_gets_a_guest_server_id_mapping() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // Host wl_data_device object 80 is represented by guest object 10.
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface(10, "wl_data_device".to_string());
+            .insert_paired_for_test(10, 80, "wl_data_device");
 
         // wl_data_device.data_offer(new_id wl_data_offer) is a host-generated
-        // object event. The host is free to choose any ID; it must not be
-        // forwarded verbatim into the guest namespace.
-        let host_offer_id: u32 = 123;
+        // object event. The host chooses its ID, which must not be forwarded
+        // verbatim into the guest namespace.
+        let host_offer_id: u32 = 0xff00_0123;
         let payload = host_offer_id.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
@@ -178,32 +177,52 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_interface(guest_offer_id),
-            Some(&"wl_data_offer".to_string())
+            Some("wl_data_offer")
         );
     }
 
     #[test]
     fn host_data_offer_rejects_reused_host_object_id() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface(10, "wl_data_device".to_string());
+            .insert_paired_for_test(10, 80, "wl_data_device");
+        let host_surface = 0xff00_0123;
         ctx.shadow_table
-            .track_host_interface(123, "wl_surface".to_string());
+            .insert_host_only_for_test(host_surface, "wl_surface", 6);
 
-        let payload = 123u32.to_ne_bytes();
+        let payload = host_surface.to_ne_bytes();
         let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
         let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx);
 
         assert_eq!(
             raw_dispatch(result),
-            Err(crate::wire::ProtocolError::InvalidObjectId(123))
+            Err(crate::wire::ProtocolError::InvalidObjectId(host_surface))
         );
         assert!(
-            ctx.shadow_table.get_guest_id(123).is_none(),
+            ctx.shadow_table.get_guest_id(host_surface).is_none(),
             "a colliding host ID must not overwrite an existing mapping"
         );
+    }
+
+    /// libwayland-server creates objects only with server IDs. One from the
+    /// client range is the proxy's to allocate, so taking it would let the
+    /// proxy's next object collide with it.
+    #[test]
+    fn host_data_offer_rejects_a_client_range_id() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table
+            .insert_paired_for_test(10, 80, "wl_data_device");
+
+        let payload = 123u32.to_ne_bytes();
+        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
+        let result = wl_data_device::dispatch_event(&mut msg, &mut DataDeviceHandler, &mut ctx);
+
+        assert_eq!(
+            raw_dispatch(result),
+            Err(crate::wire::ProtocolError::InvalidObjectId(123))
+        );
+        assert!(ctx.shadow_table.is_host_id_available(123));
     }
 
     #[test]
@@ -211,7 +230,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // The data device object exists, but this host ID was never mapped.
         ctx.shadow_table
-            .track_host_interface(81, "wl_data_device".to_string());
+            .insert_host_only_for_test(81, "wl_data_device", 3);
         let host_offer: u32 = 0xff00_0001;
         let payload = host_offer.to_ne_bytes();
         let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
@@ -226,7 +245,8 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_guest_id(host_offer), None);
         assert_eq!(
-            ctx.shadow_table.allocate_guest_server_id(),
+            ctx.shadow_table
+                .adopt_host_created(0xff00_0009, "wl_data_offer", 3),
             0xff00_0000,
             "a dropped event must not consume a guest server ID"
         );
@@ -238,9 +258,8 @@ mod tests {
     #[test]
     fn cycled_data_offers_keep_their_guest_id_small() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
         let mut handler = DataDeviceHandler;
         let mut first_guest_offer = None;
 
@@ -276,9 +295,8 @@ mod tests {
     #[test]
     fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.shadow_table.map_id(10, 80);
         ctx.shadow_table
-            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+            .insert_paired_with_version_for_test(10, 80, "wl_data_device", 3);
         let host_offer_id = 0xff00_0000u32;
         let mut handler = DataDeviceHandler;
 

@@ -145,7 +145,7 @@ struct FocusedToplevel {
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
 fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
-    let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id)?.0;
+    let guest_keyboard_id = ctx.shadow_table.get_guest_id(host_keyboard_id.0)?;
     let guest_seat_id = *ctx.keyboard_to_seat.get(&guest_keyboard_id)?;
     let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx
@@ -777,7 +777,8 @@ mod tests {
         host_keyboard_id: u32,
         guest_seat: u32,
     ) {
-        ctx.shadow_table.map_id(guest_keyboard_id, host_keyboard_id);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_keyboard_id, host_keyboard_id, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard_id, guest_seat);
     }
 
@@ -824,11 +825,18 @@ mod tests {
         let xdg_toplevel_id = 400u32;
         let xdg_surface_id = 500u32;
 
-        ctx.shadow_table.map_id(wl_surface_guest, wl_surface_host);
         ctx.shadow_table
-            .map_id(xdg_surface_id, xdg_surface_id + 100);
-        ctx.shadow_table
-            .map_id(xdg_toplevel_id, xdg_toplevel_id + 100);
+            .insert_paired_for_test(wl_surface_guest, wl_surface_host, "wl_surface");
+        ctx.shadow_table.insert_paired_for_test(
+            xdg_surface_id,
+            xdg_surface_id + 100,
+            "xdg_surface",
+        );
+        ctx.shadow_table.insert_paired_for_test(
+            xdg_toplevel_id,
+            xdg_toplevel_id + 100,
+            "xdg_toplevel",
+        );
         ctx.bind_aura_shell_for_test(zaura_shell_host);
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
@@ -934,8 +942,10 @@ mod tests {
         let xdg_toplevel = 13u32;
         let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
         map_keyboard(&mut ctx, 10, host_keyboard, 11);
-        ctx.shadow_table.map_id(12, 22);
-        ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.shadow_table
+            .insert_paired_for_test(12, 22, "wl_surface");
+        ctx.shadow_table
+            .insert_paired_for_test(xdg_toplevel, 23, "xdg_toplevel");
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, 12);
@@ -1017,9 +1027,9 @@ mod tests {
         ] {
             let (mut ctx, host_keyboard, xdg_toplevel) = focused_toplevel_ctx();
             let aura_surface = 0x7000;
-            ctx.shadow_table.track_host_interface_with_version(
+            ctx.shadow_table.insert_host_only_for_test(
                 aura_surface,
-                "zaura_surface".to_string(),
+                "zaura_surface",
                 surface_version,
             );
             ctx.aura_surfaces.remember(22, aura_surface);
@@ -1062,8 +1072,10 @@ mod tests {
         let (host_keyboard, host_surface, xdg_toplevel) = (5, 22, 13);
         let mut ctx = context();
         map_keyboard(&mut ctx, 10, host_keyboard, 11);
-        ctx.shadow_table.map_id(12, host_surface);
-        ctx.shadow_table.map_id(xdg_toplevel, 23);
+        ctx.shadow_table
+            .insert_paired_for_test(12, host_surface, "wl_surface");
+        ctx.shadow_table
+            .insert_paired_for_test(xdg_toplevel, 23, "xdg_toplevel");
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
         focus_keyboard(&mut ctx, host_keyboard, 11, 12);
@@ -1246,17 +1258,14 @@ mod tests {
     #[test]
     fn bounds_barrier_holds_configure_until_done() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let aura_toplevel_host = 600;
-        let callback_host = 601;
+        let aura_toplevel_host = 650;
+        let callback_host = 651;
         ctx.window_placement
             .remember_aura_toplevel(xdg_toplevel_id, aura_toplevel_host);
-        ctx.shadow_table.track_host_interface_with_version(
-            aura_toplevel_host,
-            "zaura_toplevel".into(),
-            38,
-        );
         ctx.shadow_table
-            .track_host_interface_with_version(callback_host, "wl_callback".into(), 1);
+            .insert_host_only_for_test(aura_toplevel_host, "zaura_toplevel", 38);
+        ctx.shadow_table
+            .insert_host_only_for_test(callback_host, "wl_callback", 1);
         register_window_bounds_barrier_for_test(&mut ctx, callback_host, aura_toplevel_host);
         let mut handler = CompositorHandler;
         ctx.last_sender_id = aura_toplevel_host;
@@ -1292,13 +1301,10 @@ mod tests {
         let xdg_surface_host = 600;
         ctx.window_placement
             .remember_aura_toplevel(xdg_toplevel_id, aura_toplevel_host);
-        ctx.shadow_table.track_host_interface_with_version(
-            aura_toplevel_host,
-            "zaura_toplevel".into(),
-            38,
-        );
         ctx.shadow_table
-            .track_host_interface_with_version(callback_host, "wl_callback".into(), 1);
+            .insert_host_only_for_test(aura_toplevel_host, "zaura_toplevel", 38);
+        ctx.shadow_table
+            .insert_host_only_for_test(callback_host, "wl_callback", 1);
         register_window_bounds_barrier_for_test(&mut ctx, callback_host, aura_toplevel_host);
         ctx.last_sender_id = xdg_surface_host;
         assert_eq!(
@@ -1398,7 +1404,7 @@ mod tests {
             None
         );
         assert_eq!(ctx.shadow_table.get_host_interface(aura_id), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(ctx.shadow_table.is_retired_host(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
     }
 
@@ -1431,8 +1437,10 @@ mod tests {
         let (mut ctx, first_toplevel, _zaura_shell_host, _wl_surface_host) =
             setup_ctx_with(PlacementConfig::arc_bounds_for_test(""));
         let (first_xdg_surface, second_xdg_surface, second_toplevel) = (500, 520, 420);
-        ctx.shadow_table.map_id(second_xdg_surface, 620);
-        ctx.shadow_table.map_id(second_toplevel, 720);
+        ctx.shadow_table
+            .insert_paired_for_test(second_xdg_surface, 620, "xdg_surface");
+        ctx.shadow_table
+            .insert_paired_for_test(second_toplevel, 720, "xdg_toplevel");
         ctx.xdg_roles
             .add_toplevel_role_for_test(second_xdg_surface, 100, second_toplevel);
         let first_aura = ensure_zaura_toplevel(&mut ctx, first_toplevel).expect("toplevel");
@@ -1516,12 +1524,12 @@ mod tests {
                 (xdg_toplevel_id + 100, REQ_DESTROY_XDG_TOPLEVEL),
             ]
         );
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(ctx.shadow_table.is_retired_host(aura_id));
         assert!(!ctx.shadow_table.is_host_id_available(aura_id));
 
         ctx.last_sender_id = 1;
         assert_eq!(DisplayHandler.on_delete_id(&mut ctx, aura_id), Action::Drop);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(aura_id));
+        assert!(!ctx.shadow_table.is_retired_host(aura_id));
         assert!(ctx.shadow_table.is_host_id_available(aura_id));
     }
 
@@ -1552,7 +1560,7 @@ mod tests {
         );
         assert_eq!(
             ctx.shadow_table.get_host_interface(callback_id),
-            Some(&"wl_callback".to_string())
+            Some("wl_callback")
         );
     }
 
@@ -1562,12 +1570,9 @@ mod tests {
         ctx.window_placement
             .remember_aura_toplevel(xdg_toplevel_id, 77);
         ctx.shadow_table
-            .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
-        ctx.shadow_table.track_interface_with_version(
-            xdg_toplevel_id,
-            "xdg_toplevel".to_string(),
-            6,
-        );
+            .insert_host_only_for_test(77, "zaura_toplevel", 38);
+        ctx.shadow_table
+            .set_guest_version_for_test(xdg_toplevel_id, 6);
         ctx.last_sender_id = 77;
 
         let states = encode_states(&[1, 2, 3, 4]);
@@ -1617,15 +1622,12 @@ mod tests {
 
     fn translated_states(guest_version: u32, states: &[u32]) -> Vec<u32> {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.shadow_table.track_interface_with_version(
-            xdg_toplevel_id,
-            "xdg_toplevel".to_string(),
-            guest_version,
-        );
+        ctx.shadow_table
+            .set_guest_version_for_test(xdg_toplevel_id, guest_version);
         ctx.window_placement
             .remember_aura_toplevel(xdg_toplevel_id, 77);
         ctx.shadow_table
-            .track_host_interface_with_version(77, "zaura_toplevel".to_string(), 38);
+            .insert_host_only_for_test(77, "zaura_toplevel", 38);
         ctx.last_sender_id = 77;
         let action =
             crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler::on_configure(
@@ -1671,11 +1673,8 @@ mod tests {
     #[test]
     fn held_aura_configure_is_filtered_when_barrier_completes() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.shadow_table.track_interface_with_version(
-            xdg_toplevel_id,
-            "xdg_toplevel".to_string(),
-            1,
-        );
+        ctx.shadow_table
+            .set_guest_version_for_test(xdg_toplevel_id, 1);
         let aura_id = ensure_zaura_toplevel(&mut ctx, xdg_toplevel_id).expect("aura toplevel");
         queue_window_bounds_barrier(&mut ctx, aura_id);
         let callback_id = ctx

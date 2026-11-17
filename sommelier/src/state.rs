@@ -45,7 +45,7 @@ pub(crate) use self::input::{
     PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub use self::objects::{DeletedHostId, ShadowTable};
+pub use self::objects::{DeletedHostId, Link, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
@@ -62,34 +62,22 @@ pub(crate) use self::window_placement::{
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
 
-/// A Wayland object ID allocated by the **guest** (client) side.
+/// A Wayland object ID allocated by the **guest** (client) side, as
+/// [`ShadowTable`] keys guest objects.
 ///
-/// Request handlers (client→host) receive guest IDs. Use [`ShadowTable::host_id_of`]
-/// to translate to the corresponding host ID. Passing a `GuestId` where a `HostId`
-/// is expected (or vice versa) is a **compile error**.
-///
-/// The inner field is intentionally `pub(crate)` so that arbitrary `GuestId(host_id)`
-/// constructions cannot be made from outside this crate, preserving the type invariant.
+/// Within the table, and in state keyed by it, a guest ID cannot stand in
+/// for a [`HostId`]. Handlers and the table's query methods pass raw `u32`
+/// IDs, so at those call sites the direction is a naming convention
+/// (`guest_*`, `host_*`), not a type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuestId(pub(crate) u32);
 
-impl GuestId {
-    /// Wrap the raw sender ID from a **client→host request** handler.
-    /// Only call this in handlers where `ctx.last_sender_id` is a guest ID.
-    #[inline]
-    pub(crate) fn from_request_sender(ctx: &Context) -> Self {
-        Self(ctx.last_sender_id)
-    }
-}
-
-/// A Wayland object ID allocated by the **host** compositor side.
+/// A Wayland object ID on the **host** connection.
 ///
-/// Event handlers (host→client) receive host IDs. Use [`ShadowTable::guest_id_of`]
-/// to translate to the corresponding guest ID. Passing a `HostId` where a `GuestId`
-/// is expected (or vice versa) is a **compile error**.
-///
-/// The inner field is intentionally `pub(crate)` so that arbitrary `HostId(guest_id)`
-/// constructions cannot be made from outside this crate, preserving the type invariant.
+/// State keyed by host objects (keyboard focus, key generations, render
+/// buffers) uses it, so a guest ID cannot be passed there. Event handlers
+/// receive the raw sender as `ctx.last_sender_id`; [`HostId::from_event_sender`]
+/// wraps it, and [`ShadowTable::get_guest_id`] translates a host ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HostId(pub(crate) u32);
 
@@ -106,16 +94,24 @@ impl HostId {
     pub(crate) fn from_event_sender(ctx: &Context) -> Self {
         Self(ctx.last_sender_id)
     }
+}
 
-    /// Wrap an ID freshly returned by [`ShadowTable::allocate_host_id`].
-    ///
-    /// Using this constructor (rather than the bare `HostId(raw)` tuple syntax)
-    /// makes allocation sites auditable: a code search for `from_allocated` finds
-    /// every place a new host-side object is created.
-    #[inline]
-    pub(crate) fn from_allocated(id: u32) -> Self {
-        Self(id)
-    }
+/// Whether `message` is a `wl_display.error` event.
+fn is_display_error(message: &[u8]) -> bool {
+    crate::wire::MessageHeader::parse(message).is_some_and(|header| {
+        (header.sender_id, header.opcode)
+            == (
+                crate::wire::WL_DISPLAY_ID,
+                crate::protocols::wayland::wl_display::EVT_ERROR,
+            )
+    })
+}
+
+/// Where the output queues stood before a message was dispatched
+/// ([`Context::output_mark`]).
+pub(crate) struct OutputMark {
+    to_client: usize,
+    to_host: usize,
 }
 
 /// Metadata for one global advertised by the host compositor.
@@ -461,6 +457,29 @@ impl Context {
         !std::mem::replace(&mut self.protocol_error_queued, true)
     }
 
+    /// Mark where the output queues stand before a message is dispatched
+    /// (see [`Self::discard_output_since`]).
+    pub(crate) fn output_mark(&self) -> OutputMark {
+        OutputMark {
+            to_client: self.host_to_client_queue.len(),
+            to_host: self.client_to_host_queue.len(),
+        }
+    }
+
+    /// Discard the messages queued since `mark`, which a message that is
+    /// then rejected must not send: only the messages before it are valid.
+    /// A protocol error its handler queued stays, as the session's one
+    /// error. Dropping the messages closes their descriptors.
+    pub(crate) fn discard_output_since(&mut self, mark: OutputMark) {
+        self.client_to_host_queue.truncate(mark.to_host);
+        let rejected = self.host_to_client_queue.split_off(mark.to_client);
+        self.host_to_client_queue.extend(
+            rejected
+                .into_iter()
+                .filter(|(message, _)| is_display_error(message)),
+        );
+    }
+
     /// Forget a fatal error, so a test can go on with the same context.
     #[cfg(test)]
     pub(crate) fn clear_protocol_error_for_test(&mut self) {
@@ -673,13 +692,13 @@ impl Context {
 
     /// Retire a host-only object that is being destroyed, by a destructor
     /// just queued or by the host's terminal event, until its
-    /// `wl_display.delete_id` (see [`ShadowTable::mark_pending_destroy_host`]).
+    /// `wl_display.delete_id` (see [`ShadowTable::host_destroy_queued`]).
     ///
     /// Every caller tracked the object as host-only and has not retired it,
     /// so a refusal means the proxy's ID bookkeeping diverged, which ends the
     /// session.
     pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
-        if !self.shadow_table.mark_pending_destroy_host(host_id) {
+        if !self.shadow_table.host_destroy_queued(host_id) {
             error!(
                 "Host object {} was not a live host-only object when it was retired",
                 host_id
@@ -708,20 +727,16 @@ impl Context {
             return false;
         }
 
-        if self.shadow_table.is_guest_server_id(guest_buffer_id) {
-            if !self.render_buffers.remove(host_buffer_id) {
-                return false;
-            }
-            self.shadow_table.remove_id(guest_buffer_id);
+        let render_buffer_ended = if self.shadow_table.is_guest_server_id(guest_buffer_id) {
+            self.render_buffers.remove(host_buffer_id)
         } else {
-            if self.render_buffers.contains(host_buffer_id)
-                && !self.render_buffers.mark_host_destroy_queued(host_buffer_id)
-            {
-                return false;
-            }
-            self.shadow_table.mark_pending_destroy(guest_buffer_id);
+            !self.render_buffers.contains(host_buffer_id)
+                || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
+        };
+        if render_buffer_ended {
+            self.shadow_table.guest_destroyed(guest_buffer_id);
         }
-        true
+        render_buffer_ended
     }
 
     pub(crate) fn buffer_is_submitted(&self, guest_buffer_id: u32) -> bool {
@@ -1078,11 +1093,9 @@ mod tests {
     #[test]
     fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let host_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table
-            .track_host_interface(host_id, "wl_shm_pool".to_string());
+        let host_id = ctx.shadow_table.create_host_only("wl_shm_pool", 1);
         ctx.retire_destroyed_host_object(host_id);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_retired_host(host_id));
         assert!(!ctx.is_fatal());
 
         // A second retirement means the bookkeeping diverged.
@@ -1146,14 +1159,9 @@ mod tests {
     }
 
     #[test]
-    fn guest_id_and_host_id_raw_round_trip() {
-        // Verify the typed constructors round-trip through the same inner u32.
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let mut ctx = ctx;
-        ctx.last_sender_id = 42;
-        let gid = GuestId::from_request_sender(&ctx);
-        assert_eq!(gid.0, 42);
-
+    fn host_id_raw_round_trip() {
+        // Verify the typed constructor round-trips through the same inner u32.
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 99;
         let hid = HostId::from_event_sender(&ctx);
         assert_eq!(hid.0, 99);
@@ -1401,7 +1409,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert_eq!(
@@ -1449,7 +1458,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1462,7 +1472,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         let buffer = 20;
         let host_buffer = 40;
-        ctx.shadow_table.map_id(buffer, host_buffer);
+        ctx.shadow_table
+            .insert_paired_for_test(buffer, host_buffer, "wl_buffer");
         assert!(ctx.register_native_buffer(host_buffer, (1, 1), Vec::new()));
 
         assert!(ctx.finalize_surface_attachment(None, Some(buffer)));
@@ -1486,7 +1497,8 @@ mod tests {
         let new = 21;
         let new_host = 41;
         for (guest, host) in [(old, old_host), (new, new_host)] {
-            ctx.shadow_table.map_id(guest, host);
+            ctx.shadow_table
+                .insert_paired_for_test(guest, host, "wl_buffer");
             assert!(ctx.register_native_buffer(host, (1, 1), Vec::new()));
         }
         assert!(ctx.mark_buffer_submitted(old));
@@ -1608,7 +1620,8 @@ mod tests {
             (next_guest, next_host),
             (unregistered_guest, unregistered_host),
         ] {
-            ctx.shadow_table.map_id(guest, host);
+            ctx.shadow_table
+                .insert_paired_for_test(guest, host, "wl_buffer");
         }
         assert!(ctx.register_native_buffer(previous_host, (1, 1), Vec::new()));
         assert!(ctx.register_native_buffer(next_host, (1, 1), Vec::new()));

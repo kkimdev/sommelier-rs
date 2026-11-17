@@ -1090,8 +1090,7 @@ fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
         return;
     }
     queue_host_buffer_destroy(ctx, host_id);
-    ctx.shadow_table.remove_guest_mapping(guest_id);
-    ctx.retire_destroyed_host_object(host_id);
+    ctx.shadow_table.guest_ended_host_destroyed(guest_id);
 }
 
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
@@ -1308,8 +1307,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
         };
 
         ctx.pools.insert(pool_id, pool);
-        ctx.shadow_table
-            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
 
         Action::Drop
     }
@@ -1538,21 +1536,20 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         return;
     }
 
-    let host_pool_id = ctx.shadow_table.allocate_host_id();
     // The temporary host wl_shm_pool remains live until the queued
-    // destroy request is processed by the compositor. Reserve its
-    // ID even though it has no guest-side object or event
-    // callbacks. A new object takes its parent's version.
+    // destroy request is processed by the compositor, although it has no
+    // guest-side object or event callbacks. A new object takes its
+    // parent's version.
     let pool_version = ctx
         .shadow_table
         .host_object_version_or_unknown(host_wl_shm_id);
-    ctx.shadow_table.track_host_interface_with_version(
-        host_pool_id,
-        "wl_shm_pool".to_string(),
-        pool_version,
-    );
+    let host_pool_id = ctx
+        .shadow_table
+        .create_host_only("wl_shm_pool", pool_version);
 
-    let host_buffer_id = ctx.shadow_table.allocate_host_id();
+    let host_buffer_id = ctx
+        .shadow_table
+        .create_paired(request.id, "wl_buffer", 1, 1);
     ctx.client_to_host_queue.extend([
         wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
         // The buffer starts the pool, and keeps its SHM (not DRM) format.
@@ -1688,16 +1685,13 @@ fn create_dmabuf_buffer(
         (std::ptr::null_mut(), 0)
     };
 
-    let params_id = ctx.shadow_table.allocate_host_id();
     // A new object takes its parent's version.
     let params_version = ctx
         .shadow_table
         .host_object_version_or_unknown(host_dmabuf_id);
-    ctx.shadow_table.track_host_interface_with_version(
-        params_id,
-        "zwp_linux_buffer_params_v1".to_string(),
-        params_version,
-    );
+    let params_id = ctx
+        .shadow_table
+        .create_host_only("zwp_linux_buffer_params_v1", params_version);
     ctx.client_to_host_queue
         .push(zwp_linux_dmabuf_v1::req::create_params(
             host_dmabuf_id,
@@ -1728,7 +1722,9 @@ fn create_dmabuf_buffer(
             ));
     }
 
-    let host_buffer_id = ctx.shadow_table.allocate_host_id();
+    let host_buffer_id = ctx
+        .shadow_table
+        .create_paired(request.id, "wl_buffer", 1, 1);
     ctx.client_to_host_queue
         .push(zwp_linux_buffer_params_v1::req::create_immed(
             params_id,
@@ -1769,8 +1765,9 @@ fn create_dmabuf_buffer(
     );
 }
 
-/// Map the guest `wl_buffer` to its host buffer and register its storage. A
-/// duplicate host generation rolls the buffer back and reports `failure`.
+/// Register the storage of the guest `wl_buffer` paired with host buffer
+/// `host_buffer_id`. A duplicate host generation rolls the buffer back and
+/// reports `failure`.
 fn register_shm_buffer(
     ctx: &mut Context,
     request: &ShmBufferRequest,
@@ -1778,10 +1775,6 @@ fn register_shm_buffer(
     state: BufferState,
     failure: &'static str,
 ) {
-    ctx.shadow_table.map_id(request.id, host_buffer_id);
-    ctx.shadow_table
-        .track_interface_with_version(request.id, "wl_buffer".to_string(), 1);
-    ctx.shadow_table.set_host_version(host_buffer_id, 1);
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
         error!("Duplicate render buffer host ID {}", host_buffer_id);
         rollback_registered_buffer(ctx, request.id, host_buffer_id);
@@ -1966,7 +1959,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                 );
                 ctx.fail_session();
             }
-            ctx.shadow_table.retire_guest_object(guest_id);
+            ctx.shadow_table.guest_destroyed_in_use(guest_id);
             return Action::Drop;
         }
 
@@ -2058,18 +2051,14 @@ mod tests {
     }
 
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
-        let guest_id = ctx.shadow_table.allocate_guest_server_id();
-        ctx.shadow_table.map_id(guest_id, host_id);
-        ctx.shadow_table
-            .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_id, 1);
+        let guest_id = ctx.shadow_table.adopt_host_created(host_id, "wl_buffer", 1);
         register_test_native(ctx, host_id);
         guest_id
     }
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.retire_guest_object(guest_id);
+        ctx.shadow_table.guest_destroyed_in_use(guest_id);
     }
 
     fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {
@@ -2647,8 +2636,7 @@ mod tests {
         let guest_shm = 20;
         let optional_format = 0x3631_4752;
         ctx.host_shm_formats.insert(optional_format);
-        ctx.shadow_table
-            .track_interface_with_version(guest_shm, "wl_shm".to_string(), 2);
+        ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
         register_guest_shm(&mut ctx, guest_shm);
         ctx.host_to_client_queue.clear();
         ctx.stale_shm_guest_objects.insert(guest_shm);
@@ -2678,8 +2666,7 @@ mod tests {
         );
 
         // Reusing the same guest ID must behave like a fresh synthetic object.
-        ctx.shadow_table
-            .track_interface_with_version(guest_shm, "wl_shm".to_string(), 2);
+        ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
         register_guest_shm(&mut ctx, guest_shm);
         ctx.host_to_client_queue.clear();
         record_host_shm_format(&mut ctx, optional_format);
@@ -2788,7 +2775,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.host_shm_id = Some(HOST_SHM);
         ctx.shadow_table
-            .track_host_interface(HOST_SHM, "wl_shm".to_string());
+            .insert_host_only_for_test(HOST_SHM, "wl_shm", 1);
         ctx.pools.insert(
             pool_id,
             ShmPool {
@@ -2796,8 +2783,7 @@ mod tests {
                 size: 4096,
             },
         );
-        ctx.shadow_table
-            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
         ctx.last_sender_id = pool_id;
 
         assert_eq!(
@@ -2859,8 +2845,7 @@ mod tests {
                 size: 4096,
             },
         );
-        ctx.shadow_table
-            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
         ctx.last_sender_id = pool_id;
 
         let mut handler = ShmHandler;
@@ -2897,10 +2882,8 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_id = 30;
         let host_id = 40;
-        ctx.shadow_table.map_id(guest_id, host_id);
         ctx.shadow_table
-            .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_id, 1);
+            .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
 
         rollback_registered_buffer(&mut ctx, guest_id, host_id);
 
@@ -2908,7 +2891,7 @@ mod tests {
         assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
         assert!(ctx.shadow_table.is_guest_id_available(guest_id));
         assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
-        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(ctx.shadow_table.is_retired_host(host_id));
         assert_eq!(ctx.client_to_host_queue.len(), 1);
         assert_eq!(
             crate::test_support::msg_opcode(&ctx.client_to_host_queue[0].0),
@@ -2924,12 +2907,9 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_shm = 20;
-        ctx.shadow_table
-            .track_interface_with_version(guest_shm, "wl_shm".to_string(), 1);
+        ctx.shadow_table.create_local(guest_shm, "wl_shm", 1);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut registry_handler = RegistryHandler;
         assert_eq!(
             registry_handler.on_global(&mut ctx, 10, &"wl_shm".to_string(), 1),
@@ -2976,9 +2956,7 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut registry_handler = RegistryHandler;
         let shm = "wl_shm".to_string();
 
@@ -3027,9 +3005,7 @@ mod tests {
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
-        ctx.shadow_table.map_id(1, 1);
-        ctx.shadow_table
-            .track_interface(1, "wl_registry".to_string());
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
         let mut registry_handler = RegistryHandler;
         let shm = "wl_shm".to_string();
         assert_eq!(
@@ -3110,10 +3086,12 @@ mod tests {
         let guest_buffer = 20;
         let host_buffer = 30;
         let surface = 40;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         let mut surface_state = crate::state::SurfaceState::default();
         surface_state.set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
         ctx.surfaces.insert(surface, surface_state);
@@ -3196,10 +3174,12 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,
@@ -3248,10 +3228,12 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
 
@@ -3284,10 +3266,12 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
 
@@ -3318,7 +3302,7 @@ mod tests {
     #[test]
     fn destroying_idle_server_created_buffer_ends_without_delete_id() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         let mut handler = ShmHandler;
 
@@ -3326,7 +3310,7 @@ mod tests {
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());
@@ -3350,7 +3334,7 @@ mod tests {
     #[test]
     fn destroying_submitted_server_created_buffer_retires_after_release() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         let mut handler = ShmHandler;
@@ -3372,7 +3356,7 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());
@@ -3381,7 +3365,7 @@ mod tests {
     #[test]
     fn released_server_created_buffer_retires_on_later_guest_destroy() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_buffer = 30;
+        let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         let mut handler = ShmHandler;
@@ -3396,7 +3380,7 @@ mod tests {
         ctx.last_sender_id = guest_buffer;
         assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
-        assert!(!ctx.shadow_table.is_pending_destroy_host_only(host_buffer));
+        assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
         assert!(ctx.shadow_table.is_host_id_available(host_buffer));
         assert!(ctx.host_to_client_queue.is_empty());
@@ -3411,10 +3395,8 @@ mod tests {
         let native_host = 31;
 
         for (guest_id, host_id) in [(local_buffer, local_host), (native_buffer, native_host)] {
-            ctx.shadow_table.map_id(guest_id, host_id);
             ctx.shadow_table
-                .track_interface_with_version(guest_id, "wl_buffer".to_string(), 1);
-            ctx.shadow_table.set_host_version(host_id, 1);
+                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
         }
         register_test_local(
             &mut ctx,
@@ -3481,10 +3463,12 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
-        ctx.shadow_table.map_id(guest_buffer, host_buffer);
-        ctx.shadow_table
-            .track_interface_with_version(guest_buffer, "wl_buffer".to_string(), 1);
-        ctx.shadow_table.set_host_version(host_buffer, 1);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            guest_buffer,
+            host_buffer,
+            "wl_buffer",
+            1,
+        );
         register_test_local(
             &mut ctx,
             guest_buffer,

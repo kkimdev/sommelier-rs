@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::protocols::wayland::wl_display;
+use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
 use crate::state::{Context, DeletedHostId, HostId};
 use crate::wire::{queue_or_drop, Action, ProtocolError, WL_DISPLAY_ID};
 use log::error;
@@ -92,51 +92,31 @@ pub(crate) fn queue_protocol_error(
     );
 }
 
-/// Queue a local `wl_display.delete_id` event for a guest object.
-///
-/// Proxy-local objects such as the v3 text-input manager do not have a host
-/// object that can acknowledge their destructor. Their handlers call the
-/// local wrapper below after cleaning local state so the guest observes the
-/// same lifecycle as it would for a compositor-owned object.
-///
-/// # Returns
-///
-/// `false`, queueing nothing, only when `guest_id` is not a known guest
-/// object.
-pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
-    if ctx.shadow_table.get_interface(guest_id).is_none() {
-        return false;
-    }
-    queue_delete_id(ctx, guest_id);
-    true
-}
-
-fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
+/// Queue the `wl_display.delete_id` that ends guest object `guest_id`, for
+/// an object whose host object cannot send it: one the proxy implements, or
+/// one backed by a host object without a destructor. The caller ends the
+/// object in the [`crate::state::ShadowTable`] first.
+pub(crate) fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
     ctx.host_to_client_queue
         .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
 }
 
-/// Retire a synthetic guest object and queue its local delete acknowledgement.
-///
-/// The object must not have a host mapping. Mapped guest objects backed by a
-/// host protocol without a destructor use [`queue_guest_delete_id`] followed
-/// by `ShadowTable::remove_guest_mapping` so the host-side reservation remains
-/// alive for stale-event suppression.
+/// End local guest object `guest_id` and queue its `delete_id`, as its host
+/// would for a host object. Nothing happens unless it is a local object.
 pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
-    if ctx.shadow_table.get_interface(guest_id).is_some()
-        && ctx.shadow_table.get_host_id(guest_id).is_none()
-        && queue_guest_delete_id(ctx, guest_id)
-    {
-        ctx.shadow_table.remove_id(guest_id);
+    if ctx.shadow_table.local_destroyed(guest_id) {
+        queue_delete_id(ctx, guest_id);
     }
 }
 
 impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
-        let host_registry_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table.map_id(registry, host_registry_id);
-        ctx.shadow_table
-            .track_interface(registry, "wl_registry".to_string());
+        let host_registry_id = ctx.shadow_table.create_paired(
+            registry,
+            "wl_registry",
+            wl_registry::VERSION,
+            wl_registry::VERSION,
+        );
 
         ctx.client_to_host_queue.push(wl_display::req::get_registry(
             WL_DISPLAY_ID,
@@ -147,10 +127,12 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
     }
 
     fn on_sync(&mut self, ctx: &mut Context, callback: u32) -> Action {
-        let host_callback_id = ctx.shadow_table.allocate_host_id();
-        ctx.shadow_table.map_id(callback, host_callback_id);
-        ctx.shadow_table
-            .track_interface(callback, "wl_callback".to_string());
+        let host_callback_id = ctx.shadow_table.create_paired(
+            callback,
+            "wl_callback",
+            wl_callback::VERSION,
+            wl_callback::VERSION,
+        );
 
         ctx.client_to_host_queue
             .push(wl_display::req::sync(WL_DISPLAY_ID, host_callback_id));
@@ -194,8 +176,8 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // can trigger a secondary protocol error in its display parser.
             // The session still ends with an `implementation` error.
             error!(
-                "Dropping host display error for unmapped object_id={} (code={})",
-                object_id, code
+                "Dropping host display error for unmapped object_id={} (code={}): {}",
+                object_id, code, message
             );
             return Action::Drop;
         };
@@ -292,7 +274,7 @@ mod tests {
     #[test]
     fn oversized_host_error_is_dropped_before_wire_encoding() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(7, 77);
+        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
         let mut handler = DisplayHandler;
 
         assert_eq!(
@@ -310,7 +292,7 @@ mod tests {
     #[test]
     fn an_unforwardable_host_error_leaves_the_implementation_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.map_id(7, 77);
+        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
         DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(65_520));
         queue_error_if_none_queued(&mut ctx);

@@ -24,8 +24,6 @@ impl wl_seat::WlSeatHandler for SeatHandler {
     fn on_get_keyboard(&mut self, ctx: &mut Context, id: u32) -> Action {
         let guest_seat_id = ctx.last_sender_id;
         ctx.keyboard_to_seat.insert(id, guest_seat_id);
-        ctx.shadow_table
-            .track_interface(id, "wl_keyboard".to_string());
         // zcr_keyboard_extension_v1.get_extended_keyboard is sent from
         // KeyboardHandler::on_enter (the first host→client event for this
         // keyboard), because we need the *host* keyboard ID which is only
@@ -58,12 +56,10 @@ mod tests {
         let guest_seat = 10;
         let guest_keyboard = 20;
         let host_keyboard = 30;
-        ctx.shadow_table.map_id(guest_seat, 11);
         ctx.shadow_table
-            .track_interface(guest_seat, "wl_seat".to_string());
-        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            .insert_paired_for_test(guest_seat, 11, "wl_seat");
         ctx.shadow_table
-            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         ctx.keyboard_focus
             .set_for_test(HostId(host_keyboard), guest_seat, 40, 41);
@@ -95,19 +91,16 @@ mod tests {
         let guest_text_input = 50;
         let host_text_input = 51;
 
-        ctx.shadow_table.map_id(guest_seat, host_seat);
         ctx.shadow_table
-            .track_interface(guest_seat, "wl_seat".to_string());
-        ctx.shadow_table.map_id(guest_surface, host_surface);
+            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         ctx.shadow_table
-            .track_interface(guest_surface, "wl_surface".to_string());
-        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
         ctx.shadow_table
-            .track_interface(guest_keyboard, "wl_keyboard".to_string());
-        ctx.shadow_table.map_id(guest_text_input, host_text_input);
-        ctx.shadow_table.track_interface_with_version(
+            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
+        ctx.shadow_table.insert_paired_with_version_for_test(
             guest_text_input,
-            "zwp_text_input_v3".to_string(),
+            host_text_input,
+            "zwp_text_input_v3",
             1,
         );
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
@@ -148,12 +141,10 @@ mod tests {
         let host_keyboard = 30;
         let key = 30;
 
-        ctx.shadow_table.map_id(guest_seat, host_seat);
         ctx.shadow_table
-            .track_interface(guest_seat, "wl_seat".to_string());
-        ctx.shadow_table.map_id(guest_keyboard, host_keyboard);
+            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
         ctx.shadow_table
-            .track_interface(guest_keyboard, "wl_keyboard".to_string());
+            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
 
         // The child press was forwarded while the seat was live. Its release

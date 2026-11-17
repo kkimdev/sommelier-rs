@@ -136,11 +136,14 @@ always consumed; a configuration problem never stops the proxy) is owned by
   error, like a libwayland client (`wl_resource_post_error_vargs`):
   `queue_protocol_error` queues only the first, so a handler's error is
   not followed by a decoding one, and a host's forwarded error counts as
-  the one. A session an internal failure ended without an error of its
-  own (a failed dma-buf sync during a commit, say, or a host error too
-  long to forward) gets `implementation` on `wl_display` when its batch
-  ends. The requests before the rejected
-  one in the same batch were valid and are forwarded.
+  the one. A session an internal failure or the host ended without an
+  error of its own (a failed dma-buf sync during a commit, say, a host
+  error too long to forward or naming an object only the proxy uses, or
+  a host event the proxy rejects or whose descriptors are ambiguous) gets
+  `implementation` on `wl_display` when its batch ends. The messages
+  before the rejected one in the same batch were valid and are forwarded
+  first; nothing the rejected message's handler queued is sent, except
+  an error of its own.
   Tests: `unknown_client_sender_is_a_protocol_error`,
   `undecodable_request_is_reported_after_forwarding_earlier_requests`,
   `rejected_requests_report_invalid_method_on_the_display`,
@@ -149,6 +152,11 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `an_internal_failure_ends_the_session_with_an_implementation_error`,
   `a_host_error_is_the_sessions_only_error`,
   `an_unforwardable_host_error_leaves_the_implementation_error`,
+  `a_host_error_on_a_host_only_object_ends_the_session`,
+  `an_invalid_host_event_is_reported_after_the_valid_ones`,
+  `descriptor_ambiguity_is_reported_after_the_valid_events`,
+  `a_rejected_host_event_sends_nothing_of_its_own`,
+  `a_rejected_request_sends_nothing_of_its_own`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors
@@ -174,12 +182,13 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 ## Object lifetimes
 
 - **Destructors wait for `delete_id`.** A generated destructor request keeps
-  its guest/host mapping until the host sends the matching
-  `wl_display.delete_id`. Meanwhile the guest object rejects new requests
-  and stale host events do not reach its handler, but the host ID stays
-  resolvable so the `delete_id` can be translated and forwarded. Handlers
-  that synthesize `delete_id` themselves (such as `wl_callback.done`) may
-  retire their mapping when they queue it.
+  its guest/host pairing until the host sends the matching
+  `wl_display.delete_id` (`ShadowTable::guest_destroyed`). Meanwhile the
+  guest object rejects new requests and stale host events do not reach its
+  handler, but the host ID stays resolvable so the `delete_id` can be
+  translated and forwarded. Handlers that synthesize `delete_id` themselves
+  (such as `wl_callback.done`) may end their guest object when they queue
+  it.
   Test: `destructor_mapping_survives_until_host_delete_id`.
 - **An ID is reused only once the peer has forgotten it.** An ID the
   proxy allocated on the host connection becomes reusable only through
@@ -192,14 +201,17 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   callback, host-only params) is one the host never destroys on its own: a
   `delete_id` for one, or for an ID the proxy does not track, changes
   nothing, so a misbehaving host cannot hand a live object's ID to a new
-  one. An ID the host allocated (from `0xff000000`) gets no
-  `delete_id`; it stops being reserved as soon as the proxy destroys the
-  object. A guest ID from the server range returns, through
-  `ShadowTable::forget_guest_object`, when its guest object ends. Generated
-  dispatchers map a `new_id` only when its message's sender is mapped, so a
-  message dropped for an unmapped sender consumes no ID; one dropped later,
-  for a local-only object in a non-nullable argument, still does (a
-  nullable one is sent as null). Freed IDs are reused first, so the ID
+  one. A host ID whose object never reached the host returns at once
+  (`ShadowTable::abandon`). An ID the host allocated (from `0xff000000`)
+  gets no `delete_id`; it stops being reserved as soon as the proxy
+  destroys the object. The host creates objects only with server IDs: a
+  host `new_id` from the client range, which the proxy allocates from,
+  ends the connection like a reused one. A guest ID from the server range
+  returns when its guest object ends. Generated dispatchers create a
+  `new_id`'s object only when its message's sender is paired, so a message
+  dropped for a local sender consumes no ID; one dropped later, for a
+  local object in a non-nullable argument, still does (a nullable one is
+  sent as null). Freed IDs are reused first, so the ID
   spaces stay as dense as the live objects, and each stays within
   libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
   inclusive, the ID itself on the client side and its offset from
@@ -214,6 +226,8 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `delete_id_for_an_untracked_host_id_changes_nothing`,
   `a_host_destroyed_frame_callback_reaches_the_guest`,
   `a_delete_id_for_a_live_host_only_object_changes_nothing`,
+  `an_abandoned_object_frees_both_ids`,
+  `host_data_offer_rejects_a_client_range_id`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **Host-only objects keep their ID reservation.** A host-only proxy object
@@ -224,7 +238,7 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `Context::retire_destroyed_host_object` is the one way to retire such
   an object after its destructor is queued, and a refused retirement is
   fatal. An object with no wire destructor stays reserved for the
-  connection, but `ShadowTable::retire_host_interface` retires its dispatch
+  connection, but `ShadowTable::retire_host` retires its dispatch
   metadata as soon as its guest object or global is gone.
   Tests: `host_only_destructor_reservation_survives_until_delete_id`,
   `retiring_a_destroyed_host_object_requires_a_live_host_only_object`,
