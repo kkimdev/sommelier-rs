@@ -4911,7 +4911,7 @@ pub async fn run(
         vm_identifier,
         placement,
     };
-    // KeyboardHandler owns xkb state, which is intentionally !Send. Keep each
+    // Each client's Context holds xkb state, which is !Send. Keep each
     // client task on this executor's thread instead of using `tokio::spawn`
     // (whose Send bound would require an unsound manual Send implementation).
     // `LocalSet::run_until` also makes the ownership requirement visible in

@@ -40,8 +40,8 @@ handler intercepts the ones whose meaning changes across the boundary.
 - `proxy::run` claims the socket through its lock file, then `serve`
   accepts guest clients and gives each a `Client` with its own guest
   connection, host connection and `Context`. All clients run on one
-  current-thread Tokio runtime inside a `LocalSet`. The keyboard handler
-  owns xkb state, which is `!Send`; keeping every task on one thread avoids
+  current-thread Tokio runtime inside a `LocalSet`. Each `Context` holds
+  xkb state, which is `!Send`; keeping every task on one thread avoids
   locks and makes that requirement part of the future's type. `SIGHUP`
   reloads run in a task of their own on the same thread, so a reload never
   races a key event and never waits for an accept. One thread also means

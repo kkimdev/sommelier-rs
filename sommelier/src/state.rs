@@ -39,6 +39,7 @@ use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
+use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -382,6 +383,17 @@ pub struct Context {
     pub key_generations: KeyGenerationRegistry,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
     pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
+    /// Parsed keymap for each host keyboard. Keymap updates and failures are
+    /// scoped to their sender so one seat cannot invalidate another seat.
+    pub(crate) keyboard_keymaps: HashMap<HostId, xkb::Keymap>,
+    /// XKB state for each host keyboard. A client can bind keyboards from
+    /// multiple seats, whose modifier and layout-group state must not leak.
+    /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
+    /// interior mutation, so a connection stays on its one thread.
+    pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
+    /// Current modifier bitmask for each host keyboard (using accelerator.rs
+    /// conventions).
+    pub(crate) keyboard_modifiers: HashMap<HostId, u32>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
@@ -961,6 +973,9 @@ impl Context {
             extended_keyboard_to_keyboard: HashMap::new(),
             key_generations: KeyGenerationRegistry::default(),
             keyboard_repeatable_keys: HashMap::new(),
+            keyboard_keymaps: HashMap::new(),
+            keyboard_xkb_states: HashMap::new(),
+            keyboard_modifiers: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             placement,
             supported_formats: HashSet::new(),
