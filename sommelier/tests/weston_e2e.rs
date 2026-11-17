@@ -93,6 +93,7 @@ fn real_clients_run_through_the_proxy_against_headless_weston() {
         "simple-shm",
         dir.command(simple_shm).env("WAYLAND_DISPLAY", "proxy"),
     );
+    #[allow(clippy::disallowed_methods)] // A plain thread, no event loop.
     std::thread::sleep(DRAW_TIME);
     assert!(
         client.0.try_wait().expect("poll simple-shm").is_none(),
@@ -195,6 +196,7 @@ impl RuntimeDir {
                 socket.display(),
                 self.log(name)
             );
+            #[allow(clippy::disallowed_methods)] // A plain thread, no event loop.
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -228,6 +230,7 @@ fn wait(child: &mut Child) -> ExitStatus {
             let _ = child.kill();
             panic!("a child process did not exit: {:?}", child.wait());
         }
+        #[allow(clippy::disallowed_methods)] // A plain thread, no event loop.
         std::thread::sleep(Duration::from_millis(10));
     }
 }

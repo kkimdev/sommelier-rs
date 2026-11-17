@@ -7,6 +7,17 @@
 # and device boundaries handle raw descriptors (the recvmsg decoder, the
 # VirtWL channel and the GPU allocator), and each allows that itself, as do
 # test modules that build descriptors by hand.
+#
+# Every client shares the event loop's one thread, so nothing on it may
+# wait on a client or on host data; see "Process" in docs/INVARIANTS.md.
+# The entries after the descriptor ones are the blocking calls Clippy can
+# name. It cannot tell a blocking read or ioctl from a non-blocking one, so
+# those stay a review matter.
+#
+# One lint, clippy::disallowed_methods, enforces all three rules, so an
+# allow for one of them lifts the others too. Allow it on the narrowest
+# item that needs it: a module-wide allow (the generated protocols, the
+# fuzzer, test modules) also lets blocking calls through.
 disallowed-methods = [
     { path = "sommelier::wire::MessageBuilder::new", reason = "build messages with the generated req:: and evt:: encoders" },
     { path = "libc::close", reason = "an OwnedFd closes its descriptor when it drops" },
@@ -22,4 +33,15 @@ disallowed-methods = [
     { path = "nix::unistd::dup2_stdin", reason = "a duplicate over stdin closes whatever owned it" },
     { path = "nix::unistd::dup2_stdout", reason = "a duplicate over stdout closes whatever owned it" },
     { path = "nix::unistd::dup2_stderr", reason = "a duplicate over stderr closes whatever owned it" },
+    { path = "tokio::fs::File::from_std", reason = "tokio::fs blocks a pool thread on every call; wait on a non-blocking descriptor with AsyncFd" },
+    { path = "tokio::task::spawn_blocking", reason = "a blocking call parks a pool thread that an abort cannot reclaim; wait with AsyncFd" },
+    { path = "std::io::copy", reason = "a blocking copy stalls every client; copy through AsyncFd, as data_device::pump does" },
+    { path = "std::thread::sleep", reason = "sleeping stalls every client; use tokio::time::sleep" },
+    { path = "libc::poll", reason = "a blocking wait stalls every client; wait on an AsyncFd" },
+    { path = "nix::poll::poll", reason = "a blocking wait stalls every client; wait on an AsyncFd" },
+    { path = "tokio::task::block_in_place", reason = "the runtime has one thread, which every client shares; await instead" },
+    { path = "tokio::runtime::Handle::block_on", reason = "blocking on a future stalls every client; await it" },
+    { path = "std::process::Command::output", reason = "waiting for a child process stalls every client; use tokio::process" },
+    { path = "std::process::Command::status", reason = "waiting for a child process stalls every client; use tokio::process" },
+    { path = "std::thread::JoinHandle::join", reason = "waiting for a thread stalls every client" },
 ]

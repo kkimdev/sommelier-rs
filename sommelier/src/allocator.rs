@@ -206,6 +206,10 @@ fn ioctl_getparam(fd: RawFd, getparam: &mut DrmVirtGpuGetParam) -> io::Result<()
     }
 }
 
+// A blocking wait on the event loop, bounded to a second per plane.
+// TODO(fence re-dispatch): park the client's requests and re-dispatch the
+// commit once the fence signals, instead of waiting here.
+#[allow(clippy::disallowed_methods)]
 fn wait_sync_file(fd: RawFd) -> io::Result<()> {
     let mut pollfd = libc::pollfd {
         fd,

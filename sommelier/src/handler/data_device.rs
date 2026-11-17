@@ -389,6 +389,13 @@ mod tests {
         })
     }
 
+    /// Wait for a peer thread, once the pump it feeds or drains has ended.
+    // The test's own thread waits here, not the event loop.
+    #[allow(clippy::disallowed_methods)]
+    fn join<T>(thread: thread::JoinHandle<T>) -> T {
+        thread.join().expect("the peer thread does not panic")
+    }
+
     /// A transfer many times the size of a pipe and of the pump's buffer
     /// arrives whole and in order, and the pump ends at the source's EOF.
     #[tokio::test]
@@ -401,11 +408,8 @@ mod tests {
 
         pump(src.into(), dst.into()).await.unwrap();
 
-        writer.join().unwrap();
-        assert!(
-            reader.join().unwrap() == data,
-            "the transfer must arrive intact"
-        );
+        join(writer);
+        assert!(join(reader) == data, "the transfer must arrive intact");
     }
 
     /// A guest that reads slowly parks the pump while the event loop goes
@@ -426,11 +430,8 @@ mod tests {
         let reader = read_on_a_thread(dst_reader, 4096);
         pump.await.unwrap().unwrap();
 
-        writer.join().unwrap();
-        assert!(
-            reader.join().unwrap() == data,
-            "the transfer must arrive intact"
-        );
+        join(writer);
+        assert!(join(reader) == data, "the transfer must arrive intact");
     }
 
     /// Two pumps may write into one pipe, as when a client passes the same
@@ -464,9 +465,9 @@ mod tests {
         assert_eq!(flags(&guest_pipe), original);
         drop(guest_pipe);
         for writer in writers {
-            writer.join().unwrap();
+            join(writer);
         }
-        assert_eq!(reader.join().unwrap().len(), b"first".len() + (1 << 20));
+        assert_eq!(join(reader).len(), b"first".len() + (1 << 20));
     }
 
     /// A pipe the proxy may not open again, such as one from a client running
@@ -492,11 +493,8 @@ mod tests {
 
         pump(src.into(), dst.into()).await.unwrap();
 
-        writer.join().unwrap();
-        assert!(
-            reader.join().unwrap() == data,
-            "the transfer must arrive intact"
-        );
+        join(writer);
+        assert!(join(reader) == data, "the transfer must arrive intact");
     }
 
     /// A named FIFO refuses `RWF_NOWAIT`, so the pump reopens it and writes
@@ -522,8 +520,8 @@ mod tests {
 
         pump(src.into(), fifo.into()).await.unwrap();
 
-        writer.join().unwrap();
-        assert_eq!(reader.join().unwrap(), b"through a named FIFO");
+        join(writer);
+        assert_eq!(join(reader), b"through a named FIFO");
     }
 
     /// The fallback for kernels whose pipes refuse `RWF_NOWAIT` writes a
@@ -654,7 +652,7 @@ mod tests {
             .await
             .unwrap();
 
-        writer.join().unwrap();
+        join(writer);
         let mut received = Vec::new();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_to_end(&mut received).unwrap();
