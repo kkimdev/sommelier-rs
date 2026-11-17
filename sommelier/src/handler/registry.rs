@@ -131,6 +131,19 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
     host_version.min(cap)
 }
 
+/// Whether the proxy forwards a host global of `interface` to the guest.
+/// The globals it binds internally or replaces are handled before this.
+fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
+    WL_ALLOWED.contains(&interface)
+        || XDG_ALLOWED.contains(&interface)
+        || DMABUF_ALLOWED.contains(&interface)
+        || VIEWPORTER_ALLOWED.contains(&interface)
+        || TEXT_INPUT_ALLOWED.contains(&interface)
+        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
+        || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
+        || interface == "wl_data_device_manager"
+}
+
 fn keyboard_extension_version(host_version: u32) -> u32 {
     host_version.min(KEYBOARD_EXTENSION_VERSION)
 }
@@ -525,16 +538,9 @@ fn admit_guest_bind(
     interface: &str,
     requested_version: u32,
 ) -> Option<BindAdmission> {
-    let interface_is_supported = WL_ALLOWED.contains(&interface)
-        || XDG_ALLOWED.contains(&interface)
-        || DMABUF_ALLOWED.contains(&interface)
-        || VIEWPORTER_ALLOWED.contains(&interface)
-        || TEXT_INPUT_ALLOWED.contains(&interface)
-        || GTK_ALLOWED.contains(&interface)
-        || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
-        || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
-        || interface == "wl_data_device_manager";
-    if !interface_is_supported {
+    // gtk_shell1 is never a host global: the proxy advertises it for the
+    // host zaura_shell.
+    if !forwards_host_global(ctx, interface) && !GTK_ALLOWED.contains(&interface) {
         return None;
     }
 
@@ -1009,16 +1015,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             return Action::Drop;
         }
 
-        let is_allowed = WL_ALLOWED.contains(&interface.as_str())
-            || XDG_ALLOWED.contains(&interface.as_str())
-            || DMABUF_ALLOWED.contains(&interface.as_str())
-            || VIEWPORTER_ALLOWED.contains(&interface.as_str())
-            || TEXT_INPUT_ALLOWED.contains(&interface.as_str())
-            || (XDG_DECORATION_ALLOWED.contains(&interface.as_str()) && ctx.xdg_decoration)
-            || FRACTIONAL_SCALE_ALLOWED.contains(&interface.as_str())
-            || interface == "wl_data_device_manager";
-
-        if !is_allowed {
+        if !forwards_host_global(ctx, interface) {
             record_registry_global_visibility(ctx, name, false);
             return Action::Drop;
         }
