@@ -15,82 +15,84 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
-use crate::state::{Context, DeletedHostId, HostId};
-use crate::wire::{queue_or_drop, Action, ProtocolError, WL_DISPLAY_ID};
+use crate::state::{Context, DeletedHostId, HostId, SessionEnd};
+use crate::wire::{Action, Outgoing, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
 
-/// End a fatal session with an `implementation` error if nothing has told
-/// the guest why yet: internal failures (a dma-buf sync that fails during
-/// a commit, say) mark the session fatal without an error of their own,
-/// and every session closed for a protocol reason gets exactly one.
-pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
-    if ctx.is_fatal() {
-        // A no-op when an error is already queued.
-        queue_protocol_error(
-            ctx,
-            WL_DISPLAY_ID,
-            wl_display::ERROR_IMPLEMENTATION,
-            "the proxy failed to handle a request",
-        );
-    }
-}
-
-/// Report a guest request the proxy cannot decode or dispatch, as
-/// libwayland-server's `wl_client_connection_data` reports one: always on
-/// `wl_display`, as `invalid_object` when the sender is not a usable object
-/// ([`ProtocolError::InvalidSender`]), and as `invalid_method` for anything
-/// else (an unknown opcode, a request too new for its object, arguments
-/// that do not decode, or an object or `new_id` argument that cannot be
-/// used, even one that names the sender).
-pub(crate) fn queue_request_error(ctx: &mut Context, error: &ProtocolError) {
+/// How a guest request the proxy cannot decode or dispatch ends the
+/// session, as libwayland-server's `wl_client_connection_data` reports one:
+/// always on `wl_display`, as `invalid_object` when the sender is not a
+/// usable object ([`ProtocolError::InvalidSender`]), and as `invalid_method`
+/// for anything else (an unknown opcode, a request too new for its object,
+/// arguments that do not decode, or an object or `new_id` argument that
+/// cannot be used, even one that names the sender).
+pub(crate) fn request_error(error: &ProtocolError) -> SessionEnd {
     let code = match error {
         ProtocolError::InvalidSender(_) => wl_display::ERROR_INVALID_OBJECT,
         _ => wl_display::ERROR_INVALID_METHOD,
     };
-    queue_protocol_error(ctx, WL_DISPLAY_ID, code, error.to_string());
+    SessionEnd::Protocol {
+        object: WL_DISPLAY_ID,
+        code,
+        message: error.to_string(),
+    }
 }
 
-/// Report a fatal protocol error against a guest object.
-///
-/// Wayland errors are fatal for the client session: this marks the context
-/// fatal, and the proxy flushes the queued event before closing the session
-/// so the client receives the diagnostic. Like libwayland-server, which
-/// posts one error per client, only the first call queues an event.
+/// Report a fatal protocol error against a guest object (see
+/// [`Context::end_session`]).
 pub(crate) fn queue_protocol_error(
     ctx: &mut Context,
     object_id: u32,
     code: u32,
     message: impl AsRef<str>,
 ) {
-    // Whether or not the diagnostic itself fits in the Wayland wire limit,
-    // the malformed request is fatal and must terminate the session.
-    ctx.fail_session();
-    if !ctx.note_protocol_error() {
-        return;
-    }
-    // The error event itself is subject to the wire's message-length limit
-    // (`MessageHeader::MAX_LEN`). A client-controlled interface name or
-    // diagnostic can otherwise make the proxy drop the diagnostic while
-    // still tearing down the connection. Keep a useful bounded prefix and
-    // preserve UTF-8 validity.
-    const MAX_DIAGNOSTIC_BYTES: usize = 1024;
-    let message = message.as_ref();
-    let diagnostic = if message.len() <= MAX_DIAGNOSTIC_BYTES {
-        message
-    } else {
-        let mut end = MAX_DIAGNOSTIC_BYTES;
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        &message[..end]
+    ctx.end_session(SessionEnd::Protocol {
+        object: object_id,
+        code,
+        message: message.as_ref().to_string(),
+    });
+}
+
+/// The one `wl_display.error` that tells the guest its session ended.
+pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
+    let error = match end {
+        SessionEnd::Protocol {
+            object,
+            code,
+            message,
+        } => wl_display::evt::error(WL_DISPLAY_ID, *object, *code, bounded(message)),
+        SessionEnd::HostError {
+            object,
+            code,
+            message,
+        } => wl_display::evt::error(WL_DISPLAY_ID, *object, *code, message),
+        SessionEnd::Internal => wl_display::evt::error(
+            WL_DISPLAY_ID,
+            WL_DISPLAY_ID,
+            wl_display::ERROR_IMPLEMENTATION,
+            "the proxy failed to handle a request",
+        ),
     };
-    queue_or_drop(
-        &mut ctx.host_to_client_queue,
-        wl_display::evt::error(WL_DISPLAY_ID, object_id, code, diagnostic),
-        format_args!("the protocol error on object {object_id}"),
-    );
+    error.unwrap_or_else(|error| {
+        // Only the host's message is not bounded. Too long to forward, it
+        // leaves the guest the `implementation` error.
+        log::warn!("Dropping the host error: {error}");
+        session_error(&SessionEnd::Internal)
+    })
+}
+
+/// A prefix of the proxy's own diagnostic `message` that fits in an error
+/// event. A client-controlled interface name could otherwise make the
+/// event exceed the wire's message length limit (`MessageHeader::MAX_LEN`).
+fn bounded(message: &str) -> &str {
+    const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+    let mut end = message.len().min(MAX_DIAGNOSTIC_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 /// Queue the `wl_display.delete_id` that ends guest object `guest_id`, for
@@ -167,9 +169,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         message: &String,
     ) -> Action {
         // The host ends the connection after its error, so the session is
-        // over, and its error is the guest's one error unless the guest
-        // already has one.
-        ctx.fail_session();
+        // over, and its error is the guest's one error.
         let Some(guest_id) = ctx.shadow_table.get_guest_id(object_id) else {
             // wl_display.error.object_id is a non-null object argument. An
             // internal host-only object has no valid guest ID; forwarding 0
@@ -180,24 +180,18 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
                 "Dropping host display error for unmapped object_id={} (code={}): {}",
                 object_id, code, message
             );
+            ctx.fail_session();
             return Action::Drop;
         };
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
         );
-        // Only an error the guest receives takes the session's one error. A
-        // message too long to forward leaves the slot to the
-        // `implementation` error every fatal session ends with
-        // ([`queue_error_if_none_queued`]).
-        match wl_display::evt::error(WL_DISPLAY_ID, guest_id, code, message) {
-            Ok(event) => {
-                if ctx.note_protocol_error() {
-                    ctx.host_to_client_queue.push(event);
-                }
-            }
-            Err(error) => log::warn!("Dropping the host error on object {guest_id}: {error}"),
-        }
+        ctx.end_session(SessionEnd::HostError {
+            object: guest_id,
+            code,
+            message: message.clone(),
+        });
         Action::Drop
     }
 }
@@ -207,7 +201,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
-    use crate::test_support::{protocol_error_code, raw_dispatch};
+    use crate::test_support::{protocol_error, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
@@ -266,29 +260,14 @@ mod tests {
             handler.on_error(&mut ctx, 77, 3, &"internal error".to_string()),
             Action::Drop
         );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "an unmapped host-only object must not produce wl_display.error"
-        );
-    }
-
-    #[test]
-    fn oversized_host_error_is_dropped_before_wire_encoding() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
-        let mut handler = DisplayHandler;
-
         assert_eq!(
-            handler.on_error(&mut ctx, 77, 3, &"x".repeat(4_084)),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "a host-supplied error string must not exceed the wire length"
+            ctx.session_end(),
+            Some(&SessionEnd::Internal),
+            "an unmapped host-only object must not name the guest's object 0"
         );
     }
 
-    /// A host error too long to forward does not use up the session's one
+    /// A host error too long to forward does not take the session's one
     /// error: the guest still learns why it ends.
     #[test]
     fn an_unforwardable_host_error_leaves_the_implementation_error() {
@@ -296,16 +275,11 @@ mod tests {
         ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
         DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(4_084));
-        queue_error_if_none_queued(&mut ctx);
 
-        assert_eq!(ctx.host_to_client_queue.len(), 1, "exactly one error");
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            WL_DISPLAY_ID,
-            "the error names the display"
+            protocol_error(&ctx),
+            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
         );
-        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
     }
 
     #[test]
@@ -313,15 +287,11 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         queue_protocol_error(&mut ctx, 7, 3, "x".repeat(4_084));
 
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
-            "fatal validation must still deliver a display.error event"
-        );
+        let (error, _) = session_error(ctx.session_end().expect("the session ends"));
         assert!(
-            ctx.host_to_client_queue[0].0.len() <= crate::wire::MessageHeader::MAX_LEN,
-            "the bounded diagnostic must fit in a Wayland message"
+            error.len() <= crate::wire::MessageHeader::MAX_LEN,
+            "the bounded diagnostic must fit Wayland's message length field"
         );
+        assert_eq!(protocol_error(&ctx), (7, 3));
     }
 }

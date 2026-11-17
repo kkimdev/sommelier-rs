@@ -17,7 +17,7 @@ limitations under the License.
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
-use crate::state::{Context, PostDispatch, ShadowTable};
+use crate::state::{Context, PostDispatch, SessionEnd, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
@@ -85,6 +85,17 @@ fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bo
     ctx.shadow_table.is_pending_destroy_host(sender_id)
         && !allows_deferred_buffer_release
         && !allows_orphan_dmabuf_result
+}
+
+/// How a message the proxy cannot frame, decode or dispatch ends the
+/// session.
+fn rejection(direction: Direction, error: &ProtocolError) -> SessionEnd {
+    match direction {
+        // Tell the guest why, as libwayland-server does.
+        Direction::ClientToHost => crate::handler::display::request_error(error),
+        // The host broke the protocol; the guest did nothing wrong.
+        Direction::HostToClient => SessionEnd::Internal,
+    }
 }
 
 /// Apply the work a handler deferred until its message was forwarded (see
@@ -346,6 +357,11 @@ impl Client {
         // an independently addressable byte offset. VirtWL's send path keeps
         // that same order when it chunks a large byte stream.
         let mut out = OutgoingMessages::default();
+        // What the messages send back toward their source: host requests
+        // while events are handled (an ack_key, say), guest events while
+        // requests are.
+        let mut reverse_out = OutgoingMessages::default();
+        let mut end = None;
         let mut offset: usize = 0;
         let mut processed_messages = 0;
         // A complete untracked message cannot tell us whether descriptors
@@ -363,18 +379,13 @@ impl Client {
                 Framing::Partial => break,
                 Framing::Invalid(header) => {
                     log::error!("Invalid message length: {}", header.len);
-                    if matches!(direction, Direction::ClientToHost) {
-                        // libwayland-server reports a length under 8 or
-                        // over 4096 the same way (the alignment check is
-                        // the proxy's own); the stream cannot be framed
-                        // past it, so the session ends.
-                        crate::handler::display::queue_request_error(
-                            &mut self.ctx,
-                            &ProtocolError::InvalidMessageLength(header.len),
-                        );
-                    } else {
-                        self.ctx.fail_session();
-                    }
+                    // libwayland-server reports a length under 8 or over
+                    // 4096 the same way (the alignment check is the proxy's
+                    // own); the stream cannot be framed past it.
+                    end = Some(rejection(
+                        direction,
+                        &ProtocolError::InvalidMessageLength(header.len),
+                    ));
                     break;
                 }
                 Framing::Complete(header) => header,
@@ -389,7 +400,7 @@ impl Client {
                 // Only host events can be untracked: a guest request from an
                 // unknown sender is an error. The events before this one were
                 // valid and reach the guest ahead of its one error.
-                self.ctx.fail_session();
+                end = Some(SessionEnd::Internal);
                 break;
             }
 
@@ -406,10 +417,6 @@ impl Client {
             let target_sender_id =
                 translated_sender_id(&self.ctx.shadow_table, direction, sender_id);
 
-            debug_assert!(
-                !self.ctx.has_post_dispatch(),
-                "deferred work belongs to the message that deferred it"
-            );
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
             let interface = match direction {
@@ -425,7 +432,6 @@ impl Client {
                     .map(str::to_string),
             };
 
-            let output_mark = self.ctx.output_mark();
             let result = if let Some(interface) = interface {
                 // The message takes its descriptors from the front of the
                 // queue; dropping it unforwarded closes them.
@@ -505,33 +511,8 @@ impl Client {
                 Ok(None)
             };
 
-            // Deferred work belongs to this message alone: it is applied
-            // only if the message is forwarded, and discarded otherwise.
-            let post_dispatch = self.ctx.take_post_dispatch();
-            match result {
-                Ok(Some((mut data, fds))) => {
-                    log::debug!("  -> translated ({} bytes, {} fds)", data.len(), fds.len());
-
-                    // Patch ID in the forwarded message
-                    if let Some(gid) = guest_id {
-                        if let Some(tid) = target_sender_id {
-                            MessageHeader::set_sender(&mut data, tid);
-                        } else {
-                            // If we can't map the ID, it might be a new object or error.
-                            // For ClientToHost, it's usually sender which should be mapped.
-                            // We log a warning but send anyway (might fail on host).
-                            log::warn!("Could not map sender ID {} to host ID", gid);
-                        }
-                    }
-
-                    out.push((data, fds));
-                    for effect in post_dispatch {
-                        apply_post_dispatch(&mut self.ctx, effect);
-                    }
-                }
-                Ok(None) => {
-                    log::debug!("  -> dropped (unhandled)");
-                }
+            let forward = match result {
+                Ok(forward) => forward,
                 Err(e) => {
                     let guest_id_for_log = match direction {
                         Direction::ClientToHost => Some(sender_id),
@@ -543,56 +524,68 @@ impl Client {
                         })
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
-                    // A rejected message sends nothing, even what its
-                    // handler queued before the rejection.
-                    self.ctx.discard_output_since(output_mark);
-                    if matches!(direction, Direction::ClientToHost) {
-                        // Tell the guest why before closing, as
-                        // libwayland-server does. The requests before this
-                        // one were valid, so they are forwarded as usual.
-                        crate::handler::display::queue_request_error(&mut self.ctx, &e);
-                    } else {
-                        // The host broke the protocol, so the session ends;
-                        // the events before this one were valid and reach
-                        // the guest ahead of its one error.
-                        self.ctx.fail_session();
-                    }
-                    break;
+                    self.ctx.end_session(rejection(direction, &e));
+                    None
+                }
+            };
+            // Work deferred until the message is forwarded runs only if it is.
+            let after_forward = self.ctx.take_post_dispatch();
+            if forward.is_some() {
+                for effect in after_forward {
+                    apply_post_dispatch(&mut self.ctx, effect);
                 }
             }
+            // A message's effects are committed whole or not at all: one
+            // that ends the session sends nothing, and dropping its forward
+            // and effects closes their descriptors. The messages before it
+            // were valid and are sent as usual.
+            let effects = self.ctx.take_effects();
+            if let Some(session_end) = effects.end {
+                end = Some(session_end);
+                break;
+            }
+            if let Some((mut data, fds)) = forward {
+                log::debug!("  -> translated ({} bytes, {} fds)", data.len(), fds.len());
 
-            // Add pending messages from context
-            let queue = match direction {
-                Direction::ClientToHost => &mut self.ctx.client_to_host_queue,
-                Direction::HostToClient => &mut self.ctx.host_to_client_queue,
+                // Patch ID in the forwarded message
+                if let Some(gid) = guest_id {
+                    if let Some(tid) = target_sender_id {
+                        MessageHeader::set_sender(&mut data, tid);
+                    } else {
+                        // If we can't map the ID, it might be a new object or error.
+                        // For ClientToHost, it's usually sender which should be mapped.
+                        // We log a warning but send anyway (might fail on host).
+                        log::warn!("Could not map sender ID {} to host ID", gid);
+                    }
+                }
+
+                out.push((data, fds));
+            }
+            let (onward, back) = match direction {
+                Direction::ClientToHost => (effects.to_host, effects.to_guest),
+                Direction::HostToClient => (effects.to_guest, effects.to_host),
             };
-            for message in queue.drain(..) {
-                log::debug!(
-                    "  -> adding queued message ({} bytes, {} fds)",
-                    message.0.len(),
-                    message.1.len()
-                );
+            for message in onward {
                 out.push(message);
+            }
+            for message in back {
+                reverse_out.push(message);
             }
 
             offset = message_end;
             processed_messages += 1;
-            if self.ctx.is_fatal() {
-                break;
-            }
             if processed_messages >= MAX_MESSAGES_PER_BATCH {
                 break;
             }
         }
 
-        // A session ending here gets its one error even when the cause did
-        // not queue one. Toward the guest it goes with the forwarded events;
-        // otherwise it is in the reverse queue sent below.
-        crate::handler::display::queue_error_if_none_queued(&mut self.ctx);
-        if self.ctx.is_fatal() && matches!(direction, Direction::HostToClient) {
-            for message in self.ctx.host_to_client_queue.drain(..) {
-                out.push(message);
-            }
+        // A session that ends gets its one error after the valid messages.
+        if let Some(end) = &end {
+            let to_guest = match direction {
+                Direction::ClientToHost => &mut reverse_out,
+                Direction::HostToClient => &mut out,
+            };
+            to_guest.push(crate::handler::display::session_error(end));
         }
 
         // Host linux-dmabuf capability discovery emits one format event and
@@ -604,35 +597,17 @@ impl Client {
         // A send passes the peer copies of the descriptors. `out` and
         // `reverse_out` still own them and close them when the batch ends,
         // whether or not their send succeeded, as on any early return.
-        let mut success = true;
+        let mut success = end.is_none();
         if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
             success = false;
         }
 
-        // Bidirectional queue: when processing events in one direction, the
-        // handler may queue messages for the OPPOSITE direction. For example,
-        // processing a host→client wl_keyboard.key event queues an ack_key
-        // message back to the host via client_to_host_queue. Flush that queue
-        // now by sending it back through the source connection.
-        //
-        // Ordering note: the forwarded wl_keyboard.key arrives at the guest
-        // *before* the ack_key reaches the host, because forwarded messages are sent
-        // first (above). This is intentional and safe: Exo holds the key in
-        // pending_key_acks_ with a 1000 ms TTL, so the ack always arrives well
-        // within the window. The C sommelier exhibits the same ordering.
-        let reverse_queue = match direction {
-            Direction::ClientToHost => &mut self.ctx.host_to_client_queue,
-            Direction::HostToClient => &mut self.ctx.client_to_host_queue,
-        };
-        let mut reverse_out = OutgoingMessages::default();
-        for message in reverse_queue.drain(..) {
-            log::debug!(
-                "  -> adding reverse queued message ({} bytes, {} fds)",
-                message.0.len(),
-                message.1.len()
-            );
-            reverse_out.push(message);
-        }
+        // The reverse output goes back through the source connection after
+        // the forwarded messages. A forwarded wl_keyboard.key therefore
+        // reaches the guest *before* its ack_key reaches the host. This is
+        // intentional and safe: Exo holds the key in pending_key_acks_ with a
+        // 1000 ms TTL, so the ack always arrives well within the window. The
+        // C sommelier exhibits the same ordering.
         if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
             // client connection.
@@ -640,12 +615,6 @@ impl Client {
         }
 
         conn.read_buf.drain(..offset);
-
-        if self.ctx.is_fatal() {
-            // A wl_display.error is fatal, but the queued diagnostic must
-            // reach the guest before the proxy tears down this session.
-            success = false;
-        }
         success
     }
 }
@@ -1752,7 +1721,6 @@ mod tests {
     /// it returns to be forwarded: a `created` whose buffer the proxy cannot
     /// track must not hand the guest a buffer.
     #[tokio::test]
-    #[ignore = "a handler's session end does not yet drop its message"]
     async fn a_failed_handler_forwards_nothing() {
         use crate::state::{HostId, PendingNativeCreate};
         use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -1799,7 +1767,6 @@ mod tests {
     /// either: a `global_remove` whose internal `zaura_shell` the proxy
     /// cannot retire must not release the shell on the host.
     #[tokio::test]
-    #[ignore = "a handler's session end does not yet drop its reverse output"]
     async fn a_rejected_message_sends_no_reverse_output() {
         use protocols::wayland::{wl_display, wl_registry};
         const REGISTRY: u32 = 10;
@@ -1841,7 +1808,6 @@ mod tests {
     /// before the failure: a dma-buf `create` whose host params generation
     /// is already pending must not send its plane and create to the host.
     #[tokio::test]
-    #[ignore = "a handler's session end does not yet drop its earlier output"]
     async fn a_handler_error_discards_its_earlier_output() {
         use crate::state::{HostId, PendingNativeCreate, PendingParam};
         use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
@@ -2095,7 +2061,7 @@ mod tests {
         );
     }
 
-    /// The host's error is the guest's one error: a malformed request that
+    /// The host's error is the guest's one error: a malformed event that
     /// follows it gets none of its own.
     #[tokio::test]
     async fn a_host_error_is_the_sessions_only_error() {
@@ -2109,12 +2075,11 @@ mod tests {
             crate::wire::WL_DISPLAY_ID,
             protocols::wayland::wl_display::EVT_ERROR,
         ));
-        assert!(!client.handle_msgs(Direction::HostToClient).await);
         client
-            .client_conn
+            .host_conn
             .read_buf
-            .extend(MessageBuilder::new().build_message(SURFACE, 99));
-        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+            .extend(MessageBuilder::new().build_message(host_surface, 99));
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
         drop(client);
         assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
     }
@@ -2140,7 +2105,6 @@ mod tests {
         ));
 
         assert!(!client.handle_msgs(Direction::HostToClient).await);
-        assert!(client.ctx.is_fatal());
         drop(client);
         assert_eq!(
             display_errors(&mut guest_peer),
@@ -2365,7 +2329,6 @@ mod tests {
             .window_placement
             .aura_toplevel_for_xdg_toplevel(XDG_TOPLEVEL)
             .expect("placement Aura toplevel");
-        assert!(!client.ctx.has_post_dispatch());
         drop(client);
 
         assert_eq!(
@@ -2402,7 +2365,6 @@ mod tests {
             None
         );
         assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
-        assert!(!client.ctx.has_post_dispatch());
     }
 
     #[tokio::test]

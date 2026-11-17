@@ -969,7 +969,9 @@ mod tests {
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
     use crate::protocols::wayland::wl_shm;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-    use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
+    use crate::test_support::{
+        any_fd_has_identity, fd_identity, protocol_error, protocol_error_code,
+    };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
@@ -1115,14 +1117,10 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.is_fatal());
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            WL_DISPLAY_ID,
-            "the error names the display"
+            protocol_error(&ctx),
+            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
         );
-        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
     }
 
     /// Feedback the proxy cannot allocate (here, without a GBM device to
@@ -1139,14 +1137,10 @@ mod tests {
             ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
             Action::Drop
         );
-        assert!(ctx.is_fatal());
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            WL_DISPLAY_ID,
-            "the error names the display"
+            protocol_error(&ctx),
+            (WL_DISPLAY_ID, wl_display::ERROR_NO_MEMORY)
         );
-        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_NO_MEMORY);
     }
 
     #[test]
@@ -1344,10 +1338,7 @@ mod tests {
         assert!(ctx.is_fatal());
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            0
-        );
+        assert_eq!(protocol_error_code(&ctx), 0);
     }
 
     #[test]
@@ -1372,10 +1363,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            1
-        );
+        assert_eq!(protocol_error_code(&ctx), 1);
         unsafe {
             libc::close(pipe_fds[0]);
             libc::close(pipe_fds[1]);
@@ -1412,10 +1400,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            2
-        );
+        assert_eq!(protocol_error_code(&ctx), 2);
         // The context owns the first plane's descriptor and closes it; a
         // second close here would close whatever a parallel test had just
         // opened under that number.
@@ -1450,10 +1435,7 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            5
-        );
+        assert_eq!(protocol_error_code(&ctx), 5);
         unsafe {
             libc::close(pipe_fds[0]);
         }

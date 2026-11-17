@@ -1261,7 +1261,7 @@ mod tests {
     use crate::state::ARC_APPLICATION_ID_PREFIX;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::{
-        msg_opcode, msg_sender, protocol_error_code, queued_headers, shm_pool_file,
+        msg_opcode, msg_sender, protocol_error, protocol_error_code, queued_headers, shm_pool_file,
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
@@ -2615,12 +2615,9 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert!(ctx.is_fatal());
-        assert_eq!(protocol_error_code(&ctx), wl_shm::ERROR_INVALID_FD);
-        let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
-            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
-            buffer_id,
+            protocol_error(&ctx),
+            (buffer_id, wl_shm::ERROR_INVALID_FD),
             "the error names the buffer whose pool failed, as libwayland does"
         );
         assert!(
@@ -2987,8 +2984,6 @@ mod tests {
             ctx.host_to_client_queue.clear();
             ctx.clear_protocol_error_for_test();
             assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
-            assert!(ctx.is_fatal());
-            assert_eq!(ctx.host_to_client_queue.len(), 1);
             assert_eq!(protocol_error_code(&ctx), code);
         };
         // wl_surface.invalid_scale for 0 and negative scales, and

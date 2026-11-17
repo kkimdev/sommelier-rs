@@ -98,22 +98,35 @@ impl HostId {
     }
 }
 
-/// Whether `message` is a `wl_display.error` event.
-fn is_display_error(message: &[u8]) -> bool {
-    crate::wire::MessageHeader::parse(message).is_some_and(|header| {
-        (header.sender_id, header.opcode)
-            == (
-                crate::wire::WL_DISPLAY_ID,
-                crate::protocols::wayland::wl_display::EVT_ERROR,
-            )
-    })
+/// Why a session ends ([`Context::end_session`]). The guest is told in
+/// one `wl_display.error` (`handler::display::session_error`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    /// The guest broke the protocol: error `code` on guest object `object`.
+    Protocol {
+        object: u32,
+        code: u32,
+        message: String,
+    },
+    /// The host's error, on guest object `object`, which becomes the
+    /// guest's own.
+    HostError {
+        object: u32,
+        code: u32,
+        message: String,
+    },
+    /// The proxy failed, or the host ended the session in a way the guest
+    /// cannot be told about: `implementation` on the display.
+    Internal,
 }
 
-/// Where the output queues stood before a message was dispatched
-/// ([`Context::output_mark`]).
-pub(crate) struct OutputMark {
-    to_client: usize,
-    to_host: usize,
+/// What dispatching one message produced besides its forward
+/// ([`Context::take_effects`]). The proxy commits it whole, or, when the
+/// message ends the session, sends none of it.
+pub(crate) struct Effects {
+    pub(crate) to_host: Vec<Outgoing>,
+    pub(crate) to_guest: Vec<Outgoing>,
+    pub(crate) end: Option<SessionEnd>,
 }
 
 /// Metadata for one global advertised by the host compositor.
@@ -241,16 +254,15 @@ pub struct Context {
     pub keyboard_to_seat: HashMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub last_sender_id: u32,
-    /// Pending messages to send from client→host (e.g. ack_key, bind requests).
+    /// Requests the message being dispatched sends the host besides its
+    /// forward (an ack_key or a bind, say); part of its [`Effects`].
     pub client_to_host_queue: Vec<Outgoing>,
-    /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
+    /// Events the message being dispatched sends the guest besides its
+    /// forward (a synthetic wl_shm.format, say); part of its [`Effects`].
     pub host_to_client_queue: Vec<Outgoing>,
-    /// Whether the session ends after this batch; see
-    /// [`Self::fail_session`].
-    fatal_protocol_error: bool,
-    /// Whether a `wl_display.error` has been queued for the guest; see
-    /// [`Self::note_protocol_error`].
-    protocol_error_queued: bool,
+    /// Why the message being dispatched ends the session, if it does; see
+    /// [`Self::end_session`].
+    session_end: Option<SessionEnd>,
     /// Work deferred by the handler of the message being dispatched; see
     /// [`PostDispatch`].
     post_dispatch: Vec<PostDispatch>,
@@ -438,59 +450,50 @@ impl Context {
         self.post_dispatch.push(effect);
     }
 
-    /// End the session once the current batch is handled: the proxy
-    /// flushes the queued events, the guest's `wl_display.error` among
-    /// them, and then closes it. A session never recovers.
-    pub(crate) fn fail_session(&mut self) {
-        self.fatal_protocol_error = true;
-    }
-
-    /// Whether [`Self::fail_session`] has ended the session.
-    pub(crate) fn is_fatal(&self) -> bool {
-        self.fatal_protocol_error
-    }
-
-    /// Record that a `wl_display.error` is being queued for the guest, and
-    /// return whether it is the first. libwayland-server posts one error per
-    /// client and ignores later ones (`wl_resource_post_error_vargs`), so
-    /// only the first is sent.
-    pub(crate) fn note_protocol_error(&mut self) -> bool {
-        !std::mem::replace(&mut self.protocol_error_queued, true)
-    }
-
-    /// Mark where the output queues stand before a message is dispatched
-    /// (see [`Self::discard_output_since`]).
-    pub(crate) fn output_mark(&self) -> OutputMark {
-        OutputMark {
-            to_client: self.host_to_client_queue.len(),
-            to_host: self.client_to_host_queue.len(),
+    /// End the session with the message being dispatched, which then sends
+    /// nothing but the guest's one `wl_display.error` (see [`Effects`]). A
+    /// session never recovers.
+    ///
+    /// libwayland-server posts one error per client and ignores later ones
+    /// (`wl_resource_post_error_vargs`), so the first error the guest can be
+    /// given wins, and [`SessionEnd::Internal`] only ends a session that has
+    /// none.
+    pub(crate) fn end_session(&mut self, end: SessionEnd) {
+        if matches!(self.session_end, None | Some(SessionEnd::Internal)) {
+            self.session_end = Some(end);
         }
     }
 
-    /// Discard the messages queued since `mark`, which a message that is
-    /// then rejected must not send: only the messages before it are valid.
-    /// A protocol error its handler queued stays, as the session's one
-    /// error. Dropping the messages closes their descriptors.
-    pub(crate) fn discard_output_since(&mut self, mark: OutputMark) {
-        self.client_to_host_queue.truncate(mark.to_host);
-        let rejected = self.host_to_client_queue.split_off(mark.to_client);
-        self.host_to_client_queue.extend(
-            rejected
-                .into_iter()
-                .filter(|(message, _)| is_display_error(message)),
-        );
+    /// End the session because the proxy failed (see [`Self::end_session`]).
+    pub(crate) fn fail_session(&mut self) {
+        self.end_session(SessionEnd::Internal);
     }
 
-    /// Forget a fatal error, so a test can go on with the same context.
+    /// Take what the message just dispatched produced (see [`Effects`]).
+    pub(crate) fn take_effects(&mut self) -> Effects {
+        Effects {
+            to_host: std::mem::take(&mut self.client_to_host_queue),
+            to_guest: std::mem::take(&mut self.host_to_client_queue),
+            end: self.session_end.take(),
+        }
+    }
+
+    /// Why the message being dispatched ends the session, if it does.
+    #[cfg(test)]
+    pub(crate) fn session_end(&self) -> Option<&SessionEnd> {
+        self.session_end.as_ref()
+    }
+
+    /// Whether the message being dispatched ends the session.
+    #[cfg(test)]
+    pub(crate) fn is_fatal(&self) -> bool {
+        self.session_end.is_some()
+    }
+
+    /// Forget a session end, so a test can go on with the same context.
     #[cfg(test)]
     pub(crate) fn clear_protocol_error_for_test(&mut self) {
-        self.fatal_protocol_error = false;
-        self.protocol_error_queued = false;
-    }
-
-    /// Whether work deferred by a dispatched message has not been taken.
-    pub(crate) fn has_post_dispatch(&self) -> bool {
-        !self.post_dispatch.is_empty()
+        self.session_end = None;
     }
 
     /// Bind host object `id` as the internal `zaura_shell` at the vendored
@@ -861,8 +864,7 @@ impl Context {
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
-            fatal_protocol_error: false,
-            protocol_error_queued: false,
+            session_end: None,
             post_dispatch: Vec::new(),
             synthetic_keyboard_serial: 0,
             allocator,

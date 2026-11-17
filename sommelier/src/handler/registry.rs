@@ -1523,11 +1523,13 @@ mod tests {
         let bind = ("wl_seat".to_string(), 1, 20);
         assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
         assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
+            crate::test_support::protocol_error(&ctx),
+            (
+                10,
+                crate::protocols::wayland::wl_display::ERROR_INVALID_OBJECT
+            ),
             "invalid wl_registry.bind must report a fatal wl_display.error"
         );
-        assert!(ctx.is_fatal());
     }
 
     #[test]

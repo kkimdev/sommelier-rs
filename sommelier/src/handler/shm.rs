@@ -2033,7 +2033,9 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
-    use crate::test_support::{msg_sender, queued_headers, raw_dispatch, shm_pool_file};
+    use crate::test_support::{
+        msg_sender, protocol_error_code, queued_headers, raw_dispatch, shm_pool_file,
+    };
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd};
@@ -2088,9 +2090,8 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            protocol_error_code(&ctx),
             1,
             "invalid pool size must use wl_shm.invalid_stride"
         );
@@ -2132,9 +2133,8 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            protocol_error_code(&ctx),
             0,
             "unsupported format must use wl_shm.invalid_format"
         );
@@ -2162,9 +2162,8 @@ mod tests {
             Action::Drop
         );
         assert!(ctx.is_fatal());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            protocol_error_code(&ctx),
             wl_shm::ERROR_INVALID_FD,
             "a resize past the file's end must use wl_shm.invalid_fd"
         );
@@ -2209,9 +2208,8 @@ mod tests {
 
         assert_eq!(resize(&mut ctx, 2048), Action::Drop);
         assert!(ctx.is_fatal());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            protocol_error_code(&ctx),
             wl_shm::ERROR_INVALID_FD,
             "shrinking a pool is wl_shm.invalid_fd, as in libwayland"
         );
@@ -2861,9 +2859,8 @@ mod tests {
         );
 
         assert!(ctx.is_fatal());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
+            protocol_error_code(&ctx),
             wl_shm::ERROR_INVALID_FD,
             "a buffer whose storage fails reports wl_shm.invalid_fd"
         );
