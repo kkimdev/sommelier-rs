@@ -220,6 +220,134 @@ impl ZxdgOutputManagerV1Handler for OutputHandler {
     }
 }
 
+/// A multi-monitor fixture for tests: displays docked, described and
+/// removed through the real registry and output handlers, in the order
+/// Exo sends their events.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::*;
+    use crate::handler::registry::RegistryHandler;
+    use crate::protocols::wayland::wl_output::WlOutputHandler;
+    use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+    use crate::protocols::wayland::wl_surface::WlSurfaceHandler;
+
+    /// What Exo reports for one display.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Display {
+        /// `wl_output.geometry` position in logical screen coordinates.
+        pub(crate) origin: (i32, i32),
+        /// `wl_output.mode`: native panel pixels.
+        pub(crate) mode: (i32, i32),
+        /// `wl_output.geometry` panel transform.
+        pub(crate) transform: i32,
+        /// `zaura_output.device_scale_factor`, in thousandths.
+        pub(crate) device_scale: u32,
+        /// The bottom `zaura_output.insets`: the shelf.
+        pub(crate) shelf: i32,
+    }
+
+    /// The built-in 2560x1600 panel at 2x, with a 48 DIP shelf: a
+    /// 1280x752 work area at the origin.
+    pub(crate) const PANEL: Display = Display {
+        origin: (0, 0),
+        mode: (2560, 1600),
+        transform: 0,
+        device_scale: 2000,
+        shelf: 48,
+    };
+
+    /// A 1920x1080 external monitor at 1x, left of the panel: its work
+    /// area starts at x = -1920.
+    pub(crate) const EXTERNAL: Display = Display {
+        origin: (-1920, 0),
+        mode: (1920, 1080),
+        transform: 0,
+        device_scale: 1000,
+        shelf: 0,
+    };
+
+    /// A context with the ARC bounds policy, guest registries 1 and 2
+    /// (hosts 1 and 2), and a v38 host `zaura_shell`, so every output gets
+    /// a `zaura_output`.
+    pub(crate) fn context() -> Context {
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        );
+        for registry in [1, 2] {
+            ctx.shadow_table.map_id(registry, registry);
+            ctx.shadow_table
+                .track_interface(registry, "wl_registry".to_string());
+        }
+        ctx.last_sender_id = 1;
+        let shell = "zaura_shell".to_string();
+        assert_eq!(
+            RegistryHandler.on_global(&mut ctx, 99, &shell, 38),
+            Action::Drop
+        );
+        ctx
+    }
+
+    /// Advertise `display` as `wl_output` global `name` on `registry`, bind
+    /// it there as guest output `guest_output`, and send its metrics.
+    ///
+    /// # Returns
+    ///
+    /// The host `wl_output`.
+    pub(crate) fn dock(
+        ctx: &mut Context,
+        registry: u32,
+        name: u32,
+        guest_output: u32,
+        display: Display,
+    ) -> u32 {
+        ctx.last_sender_id = registry;
+        let output = "wl_output".to_string();
+        RegistryHandler.on_global(ctx, name, &output, 3);
+        let bind = (output, 3, guest_output);
+        assert_eq!(RegistryHandler.on_bind(ctx, name, &bind), Action::Drop);
+        let host_output = ctx.shadow_table.get_host_id(guest_output).expect("bound");
+        send_metrics(ctx, host_output, display);
+        host_output
+    }
+
+    /// Send one Exo display-metrics group for `host_output`.
+    pub(crate) fn send_metrics(ctx: &mut Context, host_output: u32, display: Display) {
+        let mut handler = OutputHandler;
+        let no_name = String::new();
+        ctx.last_sender_id = host_output;
+        let (x, y) = display.origin;
+        let (width, height) = display.mode;
+        handler.on_geometry(ctx, x, y, 0, 0, 0, &no_name, &no_name, display.transform);
+        handler.on_mode(ctx, WL_OUTPUT_MODE_CURRENT, width, height, 60);
+        ctx.last_sender_id = ctx.outputs.aura_output(host_output).expect("Aura output");
+        let current = ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT;
+        ZauraOutputHandler::on_scale(&mut handler, ctx, current, 1000);
+        handler.on_device_scale_factor(ctx, display.device_scale);
+        handler.on_insets(ctx, 0, 0, display.shelf, 0);
+        ctx.last_sender_id = host_output;
+        WlOutputHandler::on_done(&mut handler, ctx);
+    }
+
+    /// Exo moving `host_surface` to `to`: `leave(from)`, then `enter(to)`.
+    pub(crate) fn move_surface(ctx: &mut Context, host_surface: u32, from: Option<u32>, to: u32) {
+        let mut handler = crate::handler::compositor::CompositorHandler;
+        ctx.last_sender_id = host_surface;
+        if let Some(from) = from {
+            WlSurfaceHandler::on_leave(&mut handler, ctx, from);
+        }
+        WlSurfaceHandler::on_enter(&mut handler, ctx, to);
+    }
+
+    /// The work area placement would use for `host_surface`.
+    pub(crate) fn placement_area(
+        ctx: &Context,
+        host_surface: u32,
+    ) -> Option<(u32, crate::window_layout::Rect)> {
+        let (output, state) = ctx.outputs.for_surface(host_surface)?;
+        Some((output, state.work_area()?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,5 +915,98 @@ mod tests {
             queued_headers(&ctx.host_to_client_queue),
             [(1, EVT_DELETE_ID)]
         );
+    }
+
+    /// Dock the panel and an external monitor, move a window onto the
+    /// external one, undock it, and redock it under a new global name, as
+    /// Exo does when a dock is unplugged and plugged back in.
+    #[test]
+    fn hotplug_moves_placement_between_outputs() {
+        use super::fixture::{context, dock, move_surface, placement_area, EXTERNAL, PANEL};
+        use crate::handler::registry::RegistryHandler;
+        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+        let surface = 500;
+        let mut ctx = context();
+        let panel = dock(&mut ctx, 1, 10, 30, PANEL);
+        let external = dock(&mut ctx, 1, 11, 31, EXTERNAL);
+        let panel_area = Rect::new(0, 0, 1280, 752);
+        let external_area = Rect::new(-1920, 0, 1920, 1080);
+        assert_eq!(placement_area(&ctx, surface), Some((panel, panel_area)));
+        move_surface(&mut ctx, surface, None, external);
+        assert_eq!(
+            placement_area(&ctx, surface),
+            Some((external, external_area))
+        );
+
+        // Undock: Exo moves the window back, then removes the global.
+        let external_aura = ctx.outputs.aura_output(external).expect("Aura output");
+        move_surface(&mut ctx, surface, Some(external), panel);
+        ctx.client_to_host_queue.clear();
+        ctx.last_sender_id = 1;
+        assert_eq!(
+            RegistryHandler.on_global_remove(&mut ctx, 11),
+            Action::Forward
+        );
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(external_aura, REQ_RELEASE_AURA_OUTPUT)]
+        );
+        assert_eq!(ctx.outputs.live_outputs(), [panel]);
+        assert_eq!(placement_area(&ctx, surface), Some((panel, panel_area)));
+
+        // Redock under a new name: a new binding, metadata and placement.
+        let redocked = dock(&mut ctx, 1, 12, 32, EXTERNAL);
+        assert_ne!(redocked, external);
+        move_surface(&mut ctx, surface, Some(panel), redocked);
+        assert_eq!(
+            placement_area(&ctx, surface),
+            Some((redocked, external_area))
+        );
+    }
+
+    /// One output bound through two registries is two host objects, each
+    /// with its own metadata; its removal forgets both at once.
+    #[test]
+    fn an_output_bound_through_two_registries_is_two_outputs() {
+        use super::fixture::{context, dock, send_metrics, EXTERNAL, PANEL};
+        use crate::handler::registry::RegistryHandler;
+        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+        let mut ctx = context();
+        let first = dock(&mut ctx, 1, 10, 30, PANEL);
+        let second = dock(&mut ctx, 2, 10, 31, PANEL);
+        assert_ne!(first, second);
+        let aura_outputs = [first, second].map(|output| ctx.outputs.aura_output(output));
+        assert!(aura_outputs[0].is_some() && aura_outputs[0] != aura_outputs[1]);
+
+        send_metrics(&mut ctx, second, EXTERNAL);
+        let work_area = |ctx: &Context, output| {
+            ctx.outputs
+                .committed_for_test(output)
+                .and_then(|state| state.work_area())
+        };
+        assert_eq!(work_area(&ctx, first), Some(Rect::new(0, 0, 1280, 752)));
+        assert_eq!(
+            work_area(&ctx, second),
+            Some(Rect::new(-1920, 0, 1920, 1080))
+        );
+
+        ctx.client_to_host_queue.clear();
+        ctx.last_sender_id = 1;
+        assert_eq!(
+            RegistryHandler.on_global_remove(&mut ctx, 10),
+            Action::Forward
+        );
+        assert!(ctx.outputs.live_outputs().is_empty());
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            aura_outputs.map(|aura| (aura.unwrap(), REQ_RELEASE_AURA_OUTPUT))
+        );
+        ctx.client_to_host_queue.clear();
+        ctx.last_sender_id = 2;
+        assert_eq!(
+            RegistryHandler.on_global_remove(&mut ctx, 10),
+            Action::Forward
+        );
+        assert!(ctx.client_to_host_queue.is_empty(), "already released");
     }
 }

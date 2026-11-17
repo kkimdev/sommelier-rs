@@ -1084,84 +1084,69 @@ mod tests {
         }
     }
 
+    /// Placement maps into the work area of the output the focused surface
+    /// entered, with that output's own origin, scale and rotation: a 2x
+    /// panel, a 1x external monitor left of it (negative coordinates), and
+    /// that monitor rotated.
     #[test]
-    fn placement_uses_the_focused_surfaces_entered_output() {
-        let keyboard = 10u32;
-        let host_keyboard = 5u32;
-        let seat = 11u32;
-        let surface = 12u32;
-        let host_surface = 22u32;
-        let xdg_toplevel = 13u32;
-        let host_xdg_toplevel = 23u32;
-        let primary_output = 25u32;
-        let secondary_output = 26u32;
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(""));
-        map_keyboard(&mut ctx, keyboard, host_keyboard, seat);
-        ctx.shadow_table.map_id(surface, host_surface);
-        ctx.shadow_table.map_id(xdg_toplevel, host_xdg_toplevel);
+    fn placement_uses_the_entered_outputs_own_geometry() {
+        use crate::handler::output::fixture::{
+            context, dock, move_surface, send_metrics, Display, EXTERNAL, PANEL,
+        };
+        let (host_keyboard, host_surface, xdg_toplevel) = (5, 22, 13);
+        let mut ctx = context();
+        map_keyboard(&mut ctx, 10, host_keyboard, 11);
+        ctx.shadow_table.map_id(12, host_surface);
+        ctx.shadow_table.map_id(xdg_toplevel, 23);
         ctx.xdg_roles
-            .add_toplevel_role_for_test(xdg_toplevel + 1000, surface, xdg_toplevel);
-        focus_keyboard(&mut ctx, host_keyboard, seat, surface);
-        ctx.bind_aura_shell_for_test(24);
-        ctx.outputs.bind_for_test(
-            primary_output,
-            crate::state::OutputState {
-                mode_width: 1920,
-                mode_height: 1080,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-        ctx.outputs.bind_for_test(
-            secondary_output,
-            crate::state::OutputState {
-                origin_x: 1920,
-                mode_width: 1920,
-                mode_height: 1080,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            },
-        );
-        ctx.outputs.surface_entered(host_surface, secondary_output);
+            .add_toplevel_role_for_test(xdg_toplevel + 1000, 12, xdg_toplevel);
+        focus_keyboard(&mut ctx, host_keyboard, 11, 12);
+        let panel = dock(&mut ctx, 1, 10, 30, PANEL);
+        let external = dock(&mut ctx, 1, 11, 31, EXTERNAL);
+        // The right half; `set_window_bounds` is (x, y, width, height, output).
+        let place_right = |ctx: &mut Context| {
+            ctx.client_to_host_queue.clear();
+            let placed = place_focused(ctx, HostId(host_keyboard), WindowLayoutAction::Right);
+            assert_eq!(placed, Ok(()));
+            let aura_toplevel = ctx
+                .window_placement
+                .aura_toplevel_for_xdg_toplevel(xdg_toplevel);
+            let (bounds, _) = ctx
+                .client_to_host_queue
+                .iter()
+                .find(|message| {
+                    Some(message_sender(message)) == aura_toplevel
+                        && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
+                })
+                .expect("window bounds request");
+            let field = |index: usize| {
+                let start = 8 + 4 * index;
+                i32::from_ne_bytes(bounds[start..start + 4].try_into().unwrap())
+            };
+            let output = u32::try_from(field(4)).unwrap();
+            (Rect::new(field(0), field(1), field(2), field(3)), output)
+        };
 
+        move_surface(&mut ctx, host_surface, None, external);
         assert_eq!(
-            place_focused(
-                &mut ctx,
-                HostId(host_keyboard),
-                WindowLayoutAction::Fullscreen,
-            ),
-            Ok(())
+            place_right(&mut ctx),
+            (Rect::new(-960, 0, 960, 1080), external)
         );
-        let aura_toplevel = ctx
-            .window_placement
-            .aura_toplevel_for_xdg_toplevel(xdg_toplevel)
-            .expect("Aura toplevel mapping");
-        let bounds = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|message| {
-                message_sender(message) == aura_toplevel
-                    && message_opcode(message) == REQ_SET_WINDOW_BOUNDS
-            })
-            .expect("window bounds request");
+        move_surface(&mut ctx, host_surface, Some(external), panel);
+        assert_eq!(place_right(&mut ctx), (Rect::new(640, 0, 640, 752), panel));
+
+        // Rotated to portrait (Exo's ROTATE_90 is `transform.270`), the
+        // monitor's left edge moves to x = -1080.
+        let rotated = Display {
+            origin: (-1080, 0),
+            transform: 3,
+            ..EXTERNAL
+        };
+        send_metrics(&mut ctx, external, rotated);
+        move_surface(&mut ctx, host_surface, Some(panel), external);
         assert_eq!(
-            i32::from_ne_bytes(bounds.0[8..12].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(i32::from_ne_bytes(bounds.0[12..16].try_into().unwrap()), 0);
-        assert_eq!(
-            i32::from_ne_bytes(bounds.0[16..20].try_into().unwrap()),
-            1920
-        );
-        assert_eq!(
-            i32::from_ne_bytes(bounds.0[20..24].try_into().unwrap()),
-            1080
-        );
-        assert_eq!(
-            u32::from_ne_bytes(bounds.0[24..28].try_into().unwrap()),
-            secondary_output
+            place_right(&mut ctx),
+            (Rect::new(-540, 0, 540, 1920), external)
         );
     }
 
