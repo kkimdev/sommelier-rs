@@ -17,8 +17,10 @@ usage() {
 Usage: scripts/sommelier-gui-smoke.sh
 
 Environment:
-  SOMMELIER_BIN              Proxy executable (auto-detected under target/).
-  SOMMELIER_TEST_GUI_BIN     GUI executable (auto-detected under target/).
+  SOMMELIER_BIN              Proxy executable; defaults to the newest build
+                             under target/.
+  SOMMELIER_TEST_GUI_BIN     GUI executable; defaults to the newest build
+                             under target/.
   SOMMELIER_GUI_SMOKE_VIRTWL VirtWL device, default /dev/wl0.
   SOMMELIER_GUI_SMOKE_COMPOSITOR
                              Local compositor socket instead of VirtWL.
@@ -60,6 +62,9 @@ proxy_pid=""
 keep_logs="${SOMMELIER_GUI_SMOKE_KEEP_LOGS:-0}"
 gui_timeout="${SOMMELIER_GUI_SMOKE_TIMEOUT:-15}"
 
+# Print the override if one is given, otherwise the most recently built
+# executable among the candidates, so a stale release build never shadows a
+# fresh debug build (or the reverse).
 find_binary() {
     local override="$1"
     shift
@@ -68,29 +73,30 @@ find_binary() {
         return 0
     fi
 
-    local candidate
+    local candidate newest=""
     for candidate in "$@"; do
-        if [[ -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
+        if [[ -x "$candidate" && ( -z "$newest" || "$candidate" -nt "$newest" ) ]]; then
+            newest="$candidate"
         fi
     done
-    return 1
+    [[ -n "$newest" ]] || return 1
+    printf '%s\n' "$newest"
 }
 
+host_target="$(uname -m)-unknown-linux-gnu"
 proxy_bin="$(find_binary "${SOMMELIER_BIN:-}" \
     "${repo_root}/target/release/sommelier" \
-    "${repo_root}/target/x86_64-unknown-linux-gnu/release/sommelier" \
+    "${repo_root}/target/${host_target}/release/sommelier" \
     "${repo_root}/target/debug/sommelier" \
-    "${repo_root}/target/x86_64-unknown-linux-gnu/debug/sommelier")" || {
+    "${repo_root}/target/${host_target}/debug/sommelier")" || {
     echo "error: sommelier binary not found; build -p sommelier first" >&2
     exit 1
 }
 gui_bin="$(find_binary "${SOMMELIER_TEST_GUI_BIN:-}" \
     "${repo_root}/target/release/sommelier-test-gui" \
-    "${repo_root}/target/x86_64-unknown-linux-gnu/release/sommelier-test-gui" \
+    "${repo_root}/target/${host_target}/release/sommelier-test-gui" \
     "${repo_root}/target/debug/sommelier-test-gui" \
-    "${repo_root}/target/x86_64-unknown-linux-gnu/debug/sommelier-test-gui")" || {
+    "${repo_root}/target/${host_target}/debug/sommelier-test-gui")" || {
     echo "error: sommelier-test-gui binary not found; build -p sommelier-test-gui first" >&2
     exit 1
 }

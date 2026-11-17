@@ -183,14 +183,15 @@ WAYLAND_DISPLAY=wayland-2 cargo run -p sommelier-test-gui
 If the system font is not sufficient for Korean text, set
 `SOMMELIER_TEST_GUI_FONT` to a font file with Korean/CJK coverage.
 
-For a repeatable runtime check, build both binaries and run the ignored GUI
-smoke test. It starts a temporary `sommelier --gpu-accel` socket, launches the
-sample GUI with `--auto-exit`, and verifies the connection, text-input/keymap
-handshake, clean exit, and selected buffer transport:
+For a repeatable runtime check, build the sample GUI and run the ignored GUI
+smoke test. It starts the proxy that Cargo built for the test on a temporary
+`--gpu-accel` socket, launches the newest local build of the sample GUI with
+`--auto-exit`, and verifies the connection, text-input/keymap handshake,
+clean exit, and selected buffer transport:
 
 ```bash
-cargo build --release -p sommelier -p sommelier-test-gui
-cargo test -p sommelier --test gui_smoke -- --ignored --nocapture
+cargo build --release -p sommelier-test-gui
+cargo test --release -p sommelier --test gui_smoke -- --ignored --nocapture
 ```
 
 The test accepts the validated SHM fallback when the current kernel reports
