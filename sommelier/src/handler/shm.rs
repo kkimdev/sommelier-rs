@@ -1536,11 +1536,14 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 // The temporary host wl_shm_pool remains live until the queued
                 // destroy request is processed by the compositor. Reserve its
                 // ID even though it has no guest-side object or event
-                // callbacks.
+                // callbacks. A new object takes its parent's version.
+                let pool_version = ctx
+                    .shadow_table
+                    .host_object_version_or_unknown(host_wl_shm_id);
                 ctx.shadow_table.track_host_interface_with_version(
                     host_pool_id,
                     "wl_shm_pool".to_string(),
-                    1,
+                    pool_version,
                 );
 
                 // wl_shm.create_pool(new_id, fd, size)
@@ -1731,10 +1734,14 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         };
 
         let params_id = ctx.shadow_table.allocate_host_id();
+        // A new object takes its parent's version.
+        let params_version = ctx
+            .shadow_table
+            .host_object_version_or_unknown(host_dmabuf_id);
         ctx.shadow_table.track_host_interface_with_version(
             params_id,
             "zwp_linux_buffer_params_v1".to_string(),
-            2,
+            params_version,
         );
         let mut builder = MessageBuilder::new();
         builder.write_u32(params_id);
