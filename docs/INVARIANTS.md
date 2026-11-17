@@ -202,6 +202,16 @@ Tests: `invalid_shm_requests_are_protocol_errors`,
 `invalid_bind_queues_a_display_protocol_error`,
 `fatal_protocol_error_keeps_a_bounded_diagnostic`.
 
+Deliberately left unenforced, matching Exo: `wl_surface.invalid_size`, a
+buffer that is not a multiple of its scale, and `wp_viewport.out_of_buffer`,
+a viewport source outside a non-NULL buffer. Exo accepts both, so
+enforcing either would end the session of Crostini apps that work today,
+with nothing on screen to explain why. The proxy forwards such a commit
+unchanged and logs the first source outside the buffer on each surface,
+with the source, buffer size, scale and transform.
+Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
+`viewport_source_outside_the_buffer_is_logged_and_forwarded`.
+
 ## Object lifetimes
 
 - **Destructors wait for `delete_id`.** A generated destructor request keeps
@@ -430,11 +440,30 @@ Tests: `invalid_shm_requests_are_protocol_errors`,
   non-zero, so such a commit MUST send complete host surface damage, even
   when the guest sent a partial rectangle.
   Test: `nonzero_surface_offset_with_explicit_damage_forces_full_host_damage`.
-- **Damage is clamped** to ChromiumOS' `INT_MIN / 10` to `INT_MAX / 10`
-  headroom before it is encoded for the host, and 90/270-degree transforms
-  swap full-damage extents for non-square buffers.
+- **Buffer damage reaches the host in surface coordinates.** Exo offers
+  `wl_compositor` v3, which has no `damage_buffer`, and reads
+  `wl_surface.damage` after the buffer scale and the viewport. The proxy
+  forwards both unchanged, so it maps buffer damage in the order of
+  `viewporter.xml`: the buffer transform, then the buffer scale, then the
+  viewport crop and scale, keeping the source's 24.8 fraction. Each
+  rectangle first grows by one buffer pixel, and its mapped edges round
+  outward. A transformed buffer damages the whole surface, whose extent
+  swaps under a 90 or 270 degree rotation, because the bridge does not
+  rotate damage. Mapping in another order puts the damage where nothing
+  changed, and the host shows stale pixels.
+  Tests: `buffer_damage_maps_through_buffer_scale_before_the_viewport`,
+  `whole_buffer_damage_covers_the_whole_destination`,
+  `buffer_damage_subtracts_the_source_offset_in_surface_units`,
+  `source_only_viewport_maps_buffer_damage`,
+  `viewport_damage_uses_committed_crop_and_destination`,
+  `rotated_buffer_damage_covers_the_transformed_surface`.
+- **Damage is clamped.** Every edge of every rectangle, full damage
+  included, lies within ChromiumOS' `INT_MIN / 10` to `INT_MAX / 10`
+  headroom before it is encoded for the host, so the host's `x + width`
+  cannot overflow. A rectangle stays at least 1x1, so one pushed past the
+  end shrinks to the headroom's last unit.
   Tests: `extreme_surface_damage_is_clamped_before_host_encoding`,
-  `rotated_non_square_buffer_full_damage_swaps_extent`.
+  `host_damage_is_clamped_on_both_edges`.
 
 ## Dma-buf
 
