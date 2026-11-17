@@ -2348,6 +2348,22 @@ mod tests {
     }
 
     #[test]
+    fn surface_damage_under_an_integer_buffer_scale_copies_its_scaled_pixels() {
+        // A HiDPI client: buffer scale 2, transform 0, no viewport. Its
+        // surface damage maps exactly to buffer pixels, so a small update
+        // must not copy the whole buffer every frame.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_buffer_scale(&mut ctx, 2);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage(&mut ctx, 1, 0, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(2, 0, 2, 2));
+    }
+
+    #[test]
     fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
         let (mut ctx, ..) = setup_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);

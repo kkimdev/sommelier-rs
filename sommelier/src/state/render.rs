@@ -203,6 +203,23 @@ impl DamageRect {
             height,
         }
     }
+
+    /// This rectangle scaled by `factor`, clamped to non-negative i32
+    /// coordinates. The copy clips damage to the buffer, which lies inside
+    /// that range, so the clamp drops nothing it would copy.
+    fn scaled(self, factor: i32) -> Self {
+        let scale = |value: i64| {
+            let scaled = value.saturating_mul(i64::from(factor));
+            scaled.clamp(0, i64::from(i32::MAX)) as i32
+        };
+        let edges = |start: i32, length: i32| {
+            let start = i64::from(start);
+            (scale(start), scale(start + i64::from(length)))
+        };
+        let (x0, x1) = edges(self.x, self.width);
+        let (y0, y1) = edges(self.y, self.height);
+        Self::new(x0, y0, x1 - x0, y1 - y0)
+    }
 }
 
 pub(super) const MAX_PENDING_DAMAGE_RECTS: usize = 256;
@@ -418,30 +435,40 @@ impl SurfaceCommit {
     }
 
     pub fn uses_full_mapping(&self) -> bool {
-        self.state.current_buffer_scale != 1
-            || self.state.current_buffer_transform != 0
-            || (self.has_buffer_attach() && self.buffer_offset != (0, 0))
-            || self
-                .state
-                .viewport
-                .is_some_and(|viewport| !viewport.is_identity())
+        self.surface_to_buffer_scale() != Some(1)
+    }
+
+    /// The integer factor from surface coordinates to buffer pixels, or
+    /// `None` when a transform, a viewport or an attach offset makes the
+    /// mapping more than a scale.
+    fn surface_to_buffer_scale(&self) -> Option<i32> {
+        let state = &self.state;
+        let only_scaled = state.current_buffer_transform == 0
+            && !(self.has_buffer_attach() && self.buffer_offset != (0, 0))
+            && state.viewport.is_none_or(ViewportState::is_identity);
+        only_scaled.then_some(state.current_buffer_scale)
     }
 
     /// This commit's damage in the pixel coordinates of the surface's
     /// buffer: the pixels the SHM bridge copies to the host.
     ///
-    /// Buffer damage is already in buffer pixels. Surface damage is too while
-    /// the mapping is the identity; any other mapping falls back to the whole
-    /// buffer.
+    /// Buffer damage is already in buffer pixels. Surface damage maps to them
+    /// exactly under an integer buffer scale (HiDPI clients); any other
+    /// mapping falls back to the whole buffer.
     pub fn buffer_copy_damage(&self) -> DamageRegion {
-        if self.has_full_damage()
-            || (self.uses_full_mapping() && !self.surface_damage.rects().is_empty())
-        {
+        if self.has_full_damage() {
             return DamageRegion::Full;
         }
+        let surface_rects = self.surface_damage.rects();
         let mut damage = self.buffer_damage.clone();
-        for &rect in self.surface_damage.rects() {
-            damage.push(rect);
+        if surface_rects.is_empty() {
+            return damage;
+        }
+        let Some(scale) = self.surface_to_buffer_scale() else {
+            return DamageRegion::Full;
+        };
+        for &rect in surface_rects {
+            damage.push(rect.scaled(scale));
         }
         damage
     }
@@ -1029,5 +1056,33 @@ impl RenderBufferRegistry {
         }
         *buffer = RenderBuffer::HostDestroyQueued;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DamageRect;
+
+    #[test]
+    fn scaling_damage_clamps_to_non_negative_i32_edges() {
+        assert_eq!(
+            DamageRect::new(1, 2, 3, 4).scaled(2),
+            DamageRect::new(2, 4, 6, 8)
+        );
+        // A rectangle reaching left of the buffer keeps its visible part.
+        assert_eq!(
+            DamageRect::new(-1, -1, 3, 2).scaled(2),
+            DamageRect::new(0, 0, 4, 2)
+        );
+        // Huge edges saturate instead of wrapping, so the copy still covers
+        // the whole buffer.
+        assert_eq!(
+            DamageRect::new(-(1 << 30), 0, i32::MAX, 1).scaled(2),
+            DamageRect::new(0, 0, i32::MAX - 1, 2)
+        );
+        assert_eq!(
+            DamageRect::new(0, 0, i32::MAX, i32::MAX).scaled(i32::MAX),
+            DamageRect::new(0, 0, i32::MAX, i32::MAX)
+        );
     }
 }
