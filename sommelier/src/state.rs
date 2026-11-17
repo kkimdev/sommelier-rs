@@ -34,6 +34,7 @@ use self::render::RenderBufferRegistry;
 use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
+use crate::wire::Outgoing;
 use log::{error, warn};
 
 #[allow(unused_imports)]
@@ -808,9 +809,9 @@ pub struct Context {
     pub keyboard_focus: KeyboardFocusRegistry,
     pub last_sender_id: u32,
     /// Pending messages to send from client→host (e.g. ack_key, bind requests).
-    pub client_to_host_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
+    pub client_to_host_queue: Vec<Outgoing>,
     /// Pending messages to send from host→client (e.g. synthetic wl_shm.format).
-    pub host_to_client_queue: Vec<(Vec<u8>, Vec<RawFd>)>,
+    pub host_to_client_queue: Vec<Outgoing>,
     /// A queued `wl_display.error` must be flushed before the client session
     /// is torn down. This is set by fatal protocol validation paths.
     pub fatal_protocol_error: bool,

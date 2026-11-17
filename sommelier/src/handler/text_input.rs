@@ -28,108 +28,40 @@ use crate::state::{
     Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
     InternalCallback, SeatFocusChange, ShadowTable,
 };
-use crate::wire::{queue_or_drop, Action, MessageBuilder};
-use std::os::unix::io::RawFd;
+use crate::wire::{queue_or_drop, Action, Outgoing};
 
-/// Push a wire message built by `builder` onto `queue`, binding it to
-/// `sender_id` / `opcode`. Centralizes the (header + payload) assembly that
-/// used to be open-coded with `extend_from_slice` + `(len << 16) | opcode`.
-fn push_msg(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    sender_id: u32,
-    opcode: u16,
-    builder: MessageBuilder,
-) -> bool {
-    match builder.try_build_message(sender_id, opcode) {
-        Ok(message) => {
-            queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            // Host-originated text is untrusted. A malformedly large commit
-            // or preedit must be dropped, not allowed to panic the proxy while
-            // encoding Wayland's 16-bit message length.
-            log::warn!(
-                "Dropping oversized text-input message sender={} opcode={}: {}",
-                sender_id,
-                opcode,
-                error
-            );
-            false
-        }
-    }
-}
-
-fn push_done_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, serial: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(serial);
-    let done = builder.build_message(guest_id, zwp_text_input_v3::EVT_DONE);
-    queue.push((done, Vec::new()));
-}
-
-fn push_enter_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, surface: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(surface);
-    let enter = builder.build_message(guest_id, zwp_text_input_v3::EVT_ENTER);
-    queue.push((enter, Vec::new()));
-}
-
-fn push_leave_to(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>, guest_id: u32, surface: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(surface);
-    let leave = builder.build_message(guest_id, zwp_text_input_v3::EVT_LEAVE);
-    queue.push((leave, Vec::new()));
-}
-
+/// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
+/// fit a message (see [`queue_or_drop`]).
+///
+/// # Returns
+///
+/// Whether the event was queued.
 fn push_preedit_string_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
+    queue: &mut Vec<Outgoing>,
     guest_id: u32,
     text: &str,
     cursor_begin: i32,
     cursor_end: i32,
 ) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_string(text);
-    builder.write_i32(cursor_begin);
-    builder.write_i32(cursor_end);
-    push_msg(
+    queue_or_drop(
         queue,
-        guest_id,
-        zwp_text_input_v3::EVT_PREEDIT_STRING,
-        builder,
+        zwp_text_input_v3::evt::preedit_string(guest_id, Some(text), cursor_begin, cursor_end),
+        format_args!("the preedit of text input {guest_id}"),
     )
 }
 
-fn push_commit_string_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    guest_id: u32,
-    text: &str,
-) -> bool {
-    let mut builder = MessageBuilder::new();
-    builder.write_string(text);
-    push_msg(
+/// Queue `zwp_text_input_v3.commit_string`, or drop host text that does not
+/// fit a message (see [`queue_or_drop`]).
+///
+/// # Returns
+///
+/// Whether the event was queued.
+fn push_commit_string_to(queue: &mut Vec<Outgoing>, guest_id: u32, text: &str) -> bool {
+    queue_or_drop(
         queue,
-        guest_id,
-        zwp_text_input_v3::EVT_COMMIT_STRING,
-        builder,
+        zwp_text_input_v3::evt::commit_string(guest_id, Some(text)),
+        format_args!("the commit of text input {guest_id}"),
     )
-}
-
-fn push_delete_surrounding_text_to(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    guest_id: u32,
-    before_length: u32,
-    after_length: u32,
-) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(before_length);
-    builder.write_u32(after_length);
-    let delete = builder.build_message(guest_id, zwp_text_input_v3::EVT_DELETE_SURROUNDING_TEXT);
-    queue.push((delete, Vec::new()));
-}
-
-fn push_done(ctx: &mut Context, guest_id: u32, serial: u32) {
-    push_done_to(&mut ctx.host_to_client_queue, guest_id, serial);
 }
 
 fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> {
@@ -532,13 +464,13 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
     }
     for state in [1, 0] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(ctx.synthetic_keyboard_serial);
-        builder.write_u32(held.time);
-        builder.write_u32(held.key);
-        builder.write_u32(state);
-        let key = builder.build_message(held.guest_keyboard_id, wl_keyboard::EVT_KEY);
-        ctx.host_to_client_queue.push((key, Vec::new()));
+        ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+            held.guest_keyboard_id,
+            ctx.synthetic_keyboard_serial,
+            held.time,
+            held.key,
+            state,
+        ));
     }
     true
 }
@@ -690,7 +622,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -760,13 +692,15 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         // applied as part of the following commit_string. Preserve that
         // transaction boundary when translating to v3.
         for &(before, after) in &plan.deletes {
-            push_delete_surrounding_text_to(&mut transaction, guest_id, before, after);
+            transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+                guest_id, before, after,
+            ));
         }
 
         if !push_commit_string_to(&mut transaction, guest_id, text) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -888,13 +822,13 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                     "  -> forwarding wl_keyboard.key: keyboard_id={}, serial={}, time={}, keycode={}, state={}",
                     keyboard_id, wayland_serial, timestamp_millis, keycode, state
                 );
-                let mut builder = MessageBuilder::new();
-                builder.write_u32(wayland_serial); // serial
-                builder.write_u32(timestamp_millis); // time
-                builder.write_u32(keycode); // key
-                builder.write_u32(state); // state (0: released, 1: pressed)
-                let key = builder.build_message(keyboard_id, wl_keyboard::EVT_KEY);
-                ctx.host_to_client_queue.push((key, Vec::new()));
+                ctx.host_to_client_queue.push(wl_keyboard::evt::key(
+                    keyboard_id,
+                    wayland_serial,
+                    timestamp_millis,
+                    keycode,
+                    state,
+                ));
             } else {
                 log::warn!(
                     "  -> could not find keycode for sym=0x{:x} ({:?})",
@@ -1109,7 +1043,11 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
         let mut transaction = Vec::new();
-        push_delete_surrounding_text_to(&mut transaction, guest_id, before_length, after_length);
+        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+            guest_id,
+            before_length,
+            after_length,
+        ));
         if !push_preedit_string_to(
             &mut transaction,
             guest_id,
@@ -1119,7 +1057,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         ) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -1226,7 +1164,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 // before applying a key that passed through the active IME.
                 // A v1 confirm with no preedit has no text mutation, so its v3
                 // equivalent is an empty done.
-                push_done(ctx, guest_id, plan.done_serial);
+                ctx.host_to_client_queue
+                    .push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
                 return Action::Drop;
             }
             end_backspace_repeat_for_text_input(ctx, plan.guest_seat, guest_id);
@@ -1254,7 +1193,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         if !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text) {
             return Action::Drop;
         }
-        push_done_to(&mut transaction, guest_id, plan.done_serial);
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
             .text_inputs
@@ -1350,7 +1289,8 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
         // still needs the current enter event; otherwise the client may wait
         // indefinitely for a focus transition before enabling IME.
         if let Some(surface) = active_surface {
-            push_enter_to(&mut ctx.host_to_client_queue, id, surface);
+            ctx.host_to_client_queue
+                .push(zwp_text_input_v3::evt::enter(id, surface));
         }
 
         Action::Drop
@@ -1576,10 +1516,10 @@ fn apply_text_input_focus_updates(ctx: &mut Context, updates: &[(u32, Option<u32
         // duplicate guest leave/enter events in that case.
         if previous_surface != current_surface {
             if let Some(surface) = previous_surface {
-                push_leave_to(&mut events, guest_text_input_id, surface);
+                events.push(zwp_text_input_v3::evt::leave(guest_text_input_id, surface));
             }
             if let Some(surface) = current_surface {
-                push_enter_to(&mut events, guest_text_input_id, surface);
+                events.push(zwp_text_input_v3::evt::enter(guest_text_input_id, surface));
             }
         }
         text_inputs_to_update.push(guest_text_input_id);
@@ -2041,10 +1981,7 @@ mod tests {
     #[test]
     fn oversized_host_text_is_dropped_without_panicking() {
         let mut queue = Vec::new();
-        let mut builder = MessageBuilder::new();
-        builder.write_string(&"x".repeat(65_528));
-
-        assert!(!push_msg(&mut queue, 7, 2, builder));
+        assert!(!push_commit_string_to(&mut queue, 7, &"x".repeat(65_528)));
         assert!(queue.is_empty());
     }
 

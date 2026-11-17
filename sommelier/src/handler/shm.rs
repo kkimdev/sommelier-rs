@@ -20,7 +20,7 @@ use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
 use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool, StalePixels};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::Action;
 use log::{debug, error, warn};
 use std::collections::HashSet;
 use std::fs::File;
@@ -121,10 +121,8 @@ pub(crate) fn record_host_shm_format(ctx: &mut Context, format: u32) {
             .get_mut(&guest_id)
             .is_some_and(|advertised| advertised.insert(format));
         if should_send {
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(format);
-            let msg = builder.build_message(guest_id, protocols::wayland::wl_shm::EVT_FORMAT);
-            ctx.host_to_client_queue.push((msg, Vec::new()));
+            ctx.host_to_client_queue
+                .push(wl_shm::evt::format(guest_id, format));
         }
     }
 }
@@ -177,10 +175,8 @@ pub(crate) fn register_guest_shm(ctx: &mut Context, guest_id: u32) {
     ctx.shm_guest_formats.insert(guest_id, advertised);
 
     for format in formats {
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(format);
-        let msg = builder.build_message(guest_id, protocols::wayland::wl_shm::EVT_FORMAT);
-        ctx.host_to_client_queue.push((msg, Vec::new()));
+        ctx.host_to_client_queue
+            .push(wl_shm::evt::format(guest_id, format));
     }
 }
 

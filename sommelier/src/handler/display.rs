@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_display;
 use crate::state::{Context, DeletedHostId, HostId};
-use crate::wire::{Action, MessageBuilder, ProtocolError, WL_DISPLAY_ID};
+use crate::wire::{queue_or_drop, Action, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
@@ -93,15 +93,10 @@ pub(crate) fn queue_protocol_error(
         }
         &message[..end]
     };
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(object_id);
-    builder.write_u32(code);
-    builder.write_string(diagnostic);
-    let _ = queue_message(
+    queue_or_drop(
         &mut ctx.host_to_client_queue,
-        WL_DISPLAY_ID,
-        wl_display::EVT_ERROR,
-        builder,
+        wl_display::evt::error(WL_DISPLAY_ID, object_id, code, diagnostic),
+        format_args!("the protocol error on object {object_id}"),
     );
 }
 
@@ -125,10 +120,8 @@ pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
 }
 
 fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(guest_id);
-    let delete_id = builder.build_message(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID);
-    ctx.host_to_client_queue.push((delete_id, Vec::new()));
+    ctx.host_to_client_queue
+        .push(wl_display::evt::delete_id(WL_DISPLAY_ID, guest_id));
 }
 
 /// Retire a synthetic guest object and queue its local delete acknowledgement.
@@ -143,27 +136,6 @@ pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
         && queue_guest_delete_id(ctx, guest_id)
     {
         ctx.shadow_table.remove_id(guest_id);
-    }
-}
-
-fn queue_message(
-    queue: &mut Vec<(Vec<u8>, Vec<std::os::unix::io::RawFd>)>,
-    sender_id: u32,
-    opcode: u16,
-    builder: MessageBuilder,
-) -> bool {
-    match builder.try_build_message(sender_id, opcode) {
-        Ok(message) => {
-            queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            error!(
-                "Dropping display message sender={} opcode={}: {}",
-                sender_id, opcode, error
-            );
-            false
-        }
     }
 }
 
@@ -243,16 +215,10 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             object_id, guest_id, code, message
         );
 
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(guest_id);
-        builder.write_u32(code);
-        builder.write_string(message);
-
-        queue_message(
+        queue_or_drop(
             &mut ctx.host_to_client_queue,
-            WL_DISPLAY_ID,
-            wl_display::EVT_ERROR,
-            builder,
+            wl_display::evt::error(WL_DISPLAY_ID, guest_id, code, message),
+            format_args!("the host error on object {guest_id}"),
         );
 
         Action::Drop

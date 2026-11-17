@@ -32,7 +32,7 @@ use crate::state::{
     PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{queue_or_drop, Action};
+use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::trace;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -399,7 +399,7 @@ fn build_surface_commit_messages(
     buffer_damage: &[DamageRect],
     surface_state: &SurfaceState,
     force_full_damage: bool,
-) -> Option<Vec<(Vec<u8>, Vec<RawFd>)>> {
+) -> Option<Vec<Outgoing>> {
     let host_surface_id = ctx.shadow_table.get_host_id(surface_id)?;
     let (buffer_width, buffer_height) = surface_state
         .current_buffer_id()

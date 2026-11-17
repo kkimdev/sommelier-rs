@@ -53,10 +53,10 @@ use crate::protocols::aura_shell::zaura_surface::{self, REQ_UNSET_SNAP_SINCE};
 use crate::protocols::aura_shell::zaura_toplevel::{
     self, REQ_SET_SUPPORTS_SCREEN_COORDINATES_SINCE, REQ_SET_WINDOW_BOUNDS_SINCE,
 };
-use crate::protocols::xdg_shell::xdg_toplevel;
+use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
 use crate::state::{Context, HostId, InternalCallback};
 use crate::window_layout::{Rect, WindowLayoutAction};
-use crate::wire::{queue_or_drop, MessageBuilder};
+use crate::wire::queue_or_drop;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The `zaura_shell` version placement needs.
@@ -573,34 +573,19 @@ fn queue_guest_xdg_configure(
         .guest_object_version(guest_xdg_toplevel_id)
         .unwrap_or(1);
     let states = guest_xdg_toplevel_states(states, guest_version);
-    let mut builder = MessageBuilder::new();
-    builder.write_i32(width);
-    builder.write_i32(height);
-    builder.write_array(&states);
-    // The states array is host data, so it goes through the fallible
-    // builder. It is a filtered copy of an array that already fit in the
-    // host's message, so a failure means corrupted state and is only logged.
-    match builder.try_build_message(
-        guest_xdg_toplevel_id,
-        crate::protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE,
-    ) {
-        Ok(message) => ctx.host_to_client_queue.push((message, Vec::new())),
-        Err(error) => log::warn!(
-            "Dropping xdg_toplevel {} configure: {}",
-            guest_xdg_toplevel_id,
-            error
-        ),
-    }
+    // The states array is host data, so its encoder is fallible. It is a
+    // filtered copy of an array that already fit in the host's message, so
+    // a failure means corrupted state and is only logged.
+    queue_or_drop(
+        &mut ctx.host_to_client_queue,
+        xdg_toplevel::evt::configure(guest_xdg_toplevel_id, width, height, &states),
+        format_args!("the configure of xdg_toplevel {guest_xdg_toplevel_id}"),
+    );
 }
 
 fn queue_guest_xdg_surface_configure(ctx: &mut Context, guest_xdg_surface_id: u32, serial: u32) {
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(serial);
-    let message = builder.build_message(
-        guest_xdg_surface_id,
-        crate::protocols::xdg_shell::xdg_surface::EVT_CONFIGURE,
-    );
-    ctx.host_to_client_queue.push((message, Vec::new()));
+    ctx.host_to_client_queue
+        .push(xdg_surface::evt::configure(guest_xdg_surface_id, serial));
 }
 
 /// Handle `wl_callback.done` for a bounds barrier

@@ -18,10 +18,10 @@ use crate::handler::aura_objects::ensure_host_zaura_surface;
 use crate::handler::compositor::native_wayland_app_id;
 use crate::handler::window_placement::set_aura_application_id;
 use crate::protocols::aura_shell::zaura_surface;
-use crate::protocols::gtk::gtk_shell1::GtkShell1Handler;
+use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
 use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
 use crate::state::{Context, GtkSurfaceState};
-use crate::wire::{queue_or_drop, Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action};
 
 pub struct GtkShellHandler;
 
@@ -50,13 +50,10 @@ pub(crate) fn announce_capabilities(ctx: &mut Context, gtk_shell_id: u32) {
     {
         return;
     }
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(GTK_SHELL_CAPABILITIES);
-    let message = builder.build_message(
+    ctx.host_to_client_queue.push(gtk_shell1::evt::capabilities(
         gtk_shell_id,
-        crate::protocols::gtk::gtk_shell1::EVT_CAPABILITIES,
-    );
-    ctx.host_to_client_queue.push((message, Vec::new()));
+        GTK_SHELL_CAPABILITIES,
+    ));
 }
 
 impl GtkShell1Handler for GtkShellHandler {

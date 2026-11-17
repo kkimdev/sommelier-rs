@@ -40,7 +40,7 @@ use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
     PendingDmabufGlobal, INERT_BIND_INTERFACE,
 };
-use crate::wire::{queue_or_drop, Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action};
 use log::error;
 
 /// The newest `zwp_linux_dmabuf_v1` the proxy binds on the host. This is a
@@ -230,25 +230,11 @@ fn queue_synthetic_global_for_registry(
         .shadow_table
         .get_guest_id(registry_host_id)
         .unwrap_or(registry_host_id);
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(name);
-    builder.write_string(interface);
-    builder.write_u32(version);
-    match builder.try_build_message(registry_guest_id, wl_registry::EVT_GLOBAL) {
-        Ok(message) => {
-            ctx.host_to_client_queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Dropping oversized synthetic global {}:{}: {}",
-                name,
-                interface,
-                error
-            );
-            false
-        }
-    }
+    queue_or_drop(
+        &mut ctx.host_to_client_queue,
+        wl_registry::evt::global(registry_guest_id, name, interface, version),
+        format_args!("synthetic global {name}:{interface}"),
+    )
 }
 
 fn defer_synthetic_dmabuf_global(
@@ -2051,6 +2037,8 @@ mod tests {
     #[test]
     fn bind_rejects_unadvertised_interfaces_without_mapping() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let id = ("zcr_text_input_extension_v1".to_string(), 1, 20);
 
@@ -2457,6 +2445,8 @@ mod tests {
     #[test]
     fn global_remove_forwards_only_visible_globals_and_invalidates_bind() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let seat = "wl_seat".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &seat, 5), Action::Forward);
@@ -2684,6 +2674,8 @@ mod tests {
     #[test]
     fn bind_rejects_version_above_advertised_global() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
+        // The registry the bind arrives on, which its protocol error names.
+        ctx.last_sender_id = 1;
         let mut handler = RegistryHandler;
         let seat = "wl_seat".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &seat, 3), Action::Forward);

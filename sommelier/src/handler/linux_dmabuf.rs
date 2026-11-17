@@ -20,7 +20,7 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-use crate::wire::{Action, MessageBuilder};
+use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::{debug, error};
 use std::fs::File;
 use std::io::{self, Write};
@@ -43,29 +43,6 @@ const MAX_FEEDBACK_FORMATS: usize = u16::MAX as usize + 1;
 const MAX_TRANCHE_INDICES_PER_EVENT: usize = (65_532 - 8 - 4) / 2;
 
 pub struct LinuxDmabufHandler;
-
-fn queue_message(
-    queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-    sender_id: u32,
-    opcode: u16,
-    builder: MessageBuilder,
-) -> bool {
-    match builder.try_build_message(sender_id, opcode) {
-        Ok(message) => {
-            queue.push((message, Vec::new()));
-            true
-        }
-        Err(error) => {
-            log::warn!(
-                "Dropping oversized linux-dmabuf message sender={} opcode={}: {}",
-                sender_id,
-                opcode,
-                error
-            );
-            false
-        }
-    }
-}
 
 fn is_supported_drm_format(format: u32) -> bool {
     // Keep this list in sync with ChromiumOS
@@ -209,7 +186,7 @@ pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation:
     }
 }
 
-fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(RawFd, u32)> {
+fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u32)> {
     if pairs.is_empty() || pairs.len() > MAX_FEEDBACK_FORMATS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -245,107 +222,58 @@ fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(RawFd, u32)
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((file.into_raw_fd(), size as u32))
-}
-
-fn close_queued_fds(queue: &mut Vec<(Vec<u8>, Vec<RawFd>)>) {
-    for (_, fds) in queue.drain(..) {
-        for fd in fds {
-            if fd >= 0 {
-                let _ = nix::unistd::close(fd);
-            }
-        }
-    }
+    Ok((file.into(), size as u32))
 }
 
 fn build_synthetic_feedback_messages(
     guest_id: u32,
     pairs: &[(u32, u64)],
     device: &[u8],
-) -> io::Result<Vec<(Vec<u8>, Vec<RawFd>)>> {
-    let (table_fd, table_size) = create_feedback_format_table(pairs)?;
-    let mut pending = Vec::new();
-    // Only the array-carrying events can exceed the wire limit.
-    let queue = |pending: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
-                 opcode: u16,
-                 builder: MessageBuilder|
-     -> io::Result<()> {
-        if queue_message(pending, guest_id, opcode, builder) {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "synthetic dmabuf feedback event exceeds Wayland wire limits",
-            ))
-        }
+) -> io::Result<Vec<Outgoing>> {
+    let (table, table_size) = create_feedback_format_table(pairs)?;
+    // Only the array-carrying events can exceed the wire limit. They are
+    // built before the table's event takes its descriptor, so a failure
+    // closes the table with nothing queued.
+    let too_large = |_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "synthetic dmabuf feedback event exceeds Wayland wire limits",
+        )
     };
+    let main_device =
+        zwp_linux_dmabuf_feedback_v1::evt::main_device(guest_id, device).map_err(too_large)?;
+    let tranche_device = zwp_linux_dmabuf_feedback_v1::evt::tranche_target_device(guest_id, device)
+        .map_err(too_large)?;
+    let tranche_formats = (0..pairs.len())
+        .step_by(MAX_TRANCHE_INDICES_PER_EVENT)
+        .map(|start| {
+            let end = pairs
+                .len()
+                .min(start.saturating_add(MAX_TRANCHE_INDICES_PER_EVENT));
+            let mut bytes = Vec::with_capacity((end - start) * 2);
+            for index in start..end {
+                bytes.extend_from_slice(&(index as u16).to_ne_bytes());
+            }
+            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(guest_id, &bytes)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(too_large)?;
 
     // The table is sent before the parameter sequence, matching existing
     // compositors and allowing every following tranche index to refer to it.
-    let mut format_table = MessageBuilder::new();
-    format_table.write_u32(table_size);
-    let format_table =
-        format_table.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE);
-    pending.push((format_table, vec![table_fd]));
-
-    let mut main_device = MessageBuilder::new();
-    main_device.write_array(device);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
+    let mut pending = vec![
+        zwp_linux_dmabuf_feedback_v1::evt::format_table(guest_id, table, table_size),
         main_device,
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
-
-    let mut tranche_device = MessageBuilder::new();
-    tranche_device.write_array(device);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
         tranche_device,
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
-
-    // No direct-scanout preference is known for a guest-side render node; a
-    // zero flag is the conservative default tranche.
-    let mut tranche_flags = MessageBuilder::new();
-    tranche_flags.write_u32(0);
-    let tranche_flags =
-        tranche_flags.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS);
-    pending.push((tranche_flags, Vec::new()));
-
-    for start in (0..pairs.len()).step_by(MAX_TRANCHE_INDICES_PER_EVENT) {
-        let end = pairs
-            .len()
-            .min(start.saturating_add(MAX_TRANCHE_INDICES_PER_EVENT));
-        let mut bytes = Vec::with_capacity((end - start) * 2);
-        for index in start..end {
-            bytes.extend_from_slice(&(index as u16).to_ne_bytes());
-        }
-        let mut tranche_formats = MessageBuilder::new();
-        tranche_formats.write_array(&bytes);
-        if let Err(error) = queue(
-            &mut pending,
-            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
-            tranche_formats,
-        ) {
-            close_queued_fds(&mut pending);
-            return Err(error);
-        }
-    }
-
-    for opcode in [
-        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
-        zwp_linux_dmabuf_feedback_v1::EVT_DONE,
-    ] {
-        let done = MessageBuilder::new().build_message(guest_id, opcode);
-        pending.push((done, Vec::new()));
-    }
-
+        // No direct-scanout preference is known for a guest-side render
+        // node; a zero flag is the conservative default tranche.
+        zwp_linux_dmabuf_feedback_v1::evt::tranche_flags(guest_id, 0),
+    ];
+    pending.extend(tranche_formats);
+    pending.extend([
+        zwp_linux_dmabuf_feedback_v1::evt::tranche_done(guest_id),
+        zwp_linux_dmabuf_feedback_v1::evt::done(guest_id),
+    ]);
     Ok(pending)
 }
 
@@ -796,14 +724,10 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             return Action::Drop;
         };
 
-        let mut builder = MessageBuilder::new();
-        builder.write_array(&dev_id_bytes);
-
-        queue_message(
+        queue_or_drop(
             &mut ctx.host_to_client_queue,
-            guest_id,
-            zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
-            builder,
+            zwp_linux_dmabuf_feedback_v1::evt::main_device(guest_id, &dev_id_bytes),
+            format_args!("the main device of dmabuf feedback {guest_id}"),
         );
         Action::Drop
     }
@@ -818,14 +742,10 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             return Action::Drop;
         };
 
-        let mut builder = MessageBuilder::new();
-        builder.write_array(&dev_id_bytes);
-
-        queue_message(
+        queue_or_drop(
             &mut ctx.host_to_client_queue,
-            guest_id,
-            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
-            builder,
+            zwp_linux_dmabuf_feedback_v1::evt::tranche_target_device(guest_id, &dev_id_bytes),
+            format_args!("the tranche device of dmabuf feedback {guest_id}"),
         );
         Action::Drop
     }
@@ -910,7 +830,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             libc::munmap(host_ptr, size as usize);
         }
         let new_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
-            Ok(fd) => fd.into_raw_fd(),
+            Ok(fd) => fd,
             Err(error) => {
                 log::warn!(
                     "Failed to duplicate dmabuf format table fd {}: {}",
@@ -920,15 +840,11 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
                 return Action::Drop;
             }
         };
-        let new_size = size;
-
-        let mut builder = MessageBuilder::new();
-        builder.write_u32(new_size);
-
         ctx.feedback_index_maps.insert(guest_id, index_map);
-        let format_table =
-            builder.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE);
-        ctx.host_to_client_queue.push((format_table, vec![new_fd]));
+        ctx.host_to_client_queue
+            .push(zwp_linux_dmabuf_feedback_v1::evt::format_table(
+                guest_id, new_fd, size,
+            ));
 
         Action::Drop
     }
@@ -960,14 +876,10 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             }
         }
 
-        let mut builder = MessageBuilder::new();
-        builder.write_array(&new_indices);
-
-        queue_message(
+        queue_or_drop(
             &mut ctx.host_to_client_queue,
-            guest_id,
-            zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
-            builder,
+            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(guest_id, &new_indices),
+            format_args!("the tranche formats of dmabuf feedback {guest_id}"),
         );
 
         Action::Drop
