@@ -1748,6 +1748,149 @@ mod tests {
         );
     }
 
+    /// A handler that ends the session sends nothing, not even the message
+    /// it returns to be forwarded: a `created` whose buffer the proxy cannot
+    /// track must not hand the guest a buffer.
+    #[tokio::test]
+    #[ignore = "a handler's session end does not yet drop its message"]
+    async fn a_failed_handler_forwards_nothing() {
+        use crate::state::{HostId, PendingNativeCreate};
+        use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+        use protocols::wayland::wl_display;
+        const PARAMS: u32 = 10;
+        const HOST_PARAMS: u32 = 80;
+        const HOST_BUFFER: u32 = 0xff00_0001;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        let ctx = &mut client.ctx;
+        ctx.shadow_table
+            .insert_paired_for_test(PARAMS, HOST_PARAMS, "zwp_linux_buffer_params_v1");
+        ctx.pending_native_creates.insert(
+            HostId(HOST_PARAMS),
+            PendingNativeCreate {
+                guest_params_id: PARAMS,
+                dimensions: (16, 8),
+                sync_fds: Vec::new(),
+            },
+        );
+        // The proxy already tracks a buffer under the ID the host creates.
+        assert!(ctx.register_native_buffer(HOST_BUFFER, (16, 8), Vec::new()));
+        let mut created = MessageBuilder::new();
+        created.write_u32(HOST_BUFFER);
+        client
+            .host_conn
+            .read_buf
+            .extend(created.build_message(HOST_PARAMS, zwp_linux_buffer_params_v1::EVT_CREATED));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        assert_eq!(
+            stream_headers(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR)]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A message that ends the session sends nothing back to its source
+    /// either: a `global_remove` whose internal `zaura_shell` the proxy
+    /// cannot retire must not release the shell on the host.
+    #[tokio::test]
+    #[ignore = "a handler's session end does not yet drop its reverse output"]
+    async fn a_rejected_message_sends_no_reverse_output() {
+        use protocols::wayland::{wl_display, wl_registry};
+        const REGISTRY: u32 = 10;
+        const HOST_REGISTRY: u32 = 20;
+        // The shell's ID, which is also its global's name. The object table
+        // does not track it, so retiring it fails.
+        const SHELL: u32 = 40;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+        let ctx = &mut client.ctx;
+        ctx.shadow_table
+            .insert_paired_for_test(REGISTRY, HOST_REGISTRY, "wl_registry");
+        ctx.bind_aura_shell_for_test(SHELL);
+        ctx.registry_global_names
+            .entry(HOST_REGISTRY)
+            .or_default()
+            .insert(SHELL);
+        ctx.global_generations.insert(SHELL, 1);
+        ctx.registry_global_generations
+            .entry(HOST_REGISTRY)
+            .or_default()
+            .insert(SHELL, 1);
+        let mut remove = MessageBuilder::new();
+        remove.write_u32(SHELL);
+        client
+            .host_conn
+            .read_buf
+            .extend(remove.build_message(HOST_REGISTRY, wl_registry::EVT_GLOBAL_REMOVE));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        drop(client);
+        assert_eq!(sent_messages(&mut host_peer), Vec::new());
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
+    /// A message that ends the session discards what its handler queued
+    /// before the failure: a dma-buf `create` whose host params generation
+    /// is already pending must not send its plane and create to the host.
+    #[tokio::test]
+    #[ignore = "a handler's session end does not yet drop its earlier output"]
+    async fn a_handler_error_discards_its_earlier_output() {
+        use crate::state::{HostId, PendingNativeCreate, PendingParam};
+        use protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+        use protocols::wayland::wl_display;
+        const PARAMS: u32 = 10;
+        const HOST_PARAMS: u32 = 80;
+        const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+        let ctx = &mut client.ctx;
+        ctx.shadow_table
+            .insert_paired_for_test(PARAMS, HOST_PARAMS, "zwp_linux_buffer_params_v1");
+        let (plane, _) = std::os::unix::net::UnixStream::pair().expect("a descriptor");
+        ctx.pending_params.insert(
+            PARAMS,
+            vec![PendingParam {
+                fd: plane.into(),
+                plane_idx: 0,
+                offset: 0,
+                stride: 64,
+                modifier_hi: 0,
+                modifier_lo: 0,
+            }],
+        );
+        ctx.pending_native_creates.insert(
+            HostId(HOST_PARAMS),
+            PendingNativeCreate {
+                guest_params_id: PARAMS,
+                dimensions: (16, 8),
+                sync_fds: Vec::new(),
+            },
+        );
+        let mut create = MessageBuilder::new();
+        for word in [16, 8, DRM_FORMAT_ARGB8888, 0] {
+            create.write_u32(word);
+        }
+        client
+            .client_conn
+            .read_buf
+            .extend(create.build_message(PARAMS, zwp_linux_buffer_params_v1::REQ_CREATE));
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        assert_eq!(sent_messages(&mut host_peer), Vec::new());
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+    }
+
     /// The object and code of each `wl_display.error` the guest received
     /// before the proxy closed the connection.
     fn display_errors(guest_peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u32)> {
