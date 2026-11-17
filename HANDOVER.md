@@ -40,6 +40,9 @@
   keyboard leave for a pending surface, and two keyboards on one seat (the
   IME Backspace fallback picks a seat-level keyboard while keysyms prefer
   the focused one, and one chord can issue a redundant placement batch).
+- The `zxdg_output_manager_v1` passthrough has not been checked on a host.
+  That Exo advertises the global is inferred from ChromiumOS Sommelier,
+  whose direct-scale mode binds it and assumes it is present.
 - Placement's unverified cases are listed under
   [Output and work area](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#output-and-work-area);
   popups on a toplevel repaired through a late `zaura_shell` bind were also

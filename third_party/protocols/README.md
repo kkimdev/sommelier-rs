@@ -16,6 +16,7 @@ the listed commit of this repository.
 | `viewporter.xml` | wayland-protocols `stable/viewporter/` | wayland-protocols 1.45 | `16463fc` |
 | `fractional-scale-v1.xml` | wayland-protocols `staging/fractional-scale/` | wayland-protocols 1.45 | `16463fc` |
 | `xdg-decoration-unstable-v1.xml` | wayland-protocols `unstable/xdg-decoration/` | wayland-protocols 1.45 | `16463fc` |
+| `xdg-output-unstable-v1.xml` | wayland-protocols `unstable/xdg-output/` | wayland-protocols 1.45, unchanged through 1.49 (`zxdg_output_manager_v1` v3) | The `zxdg_output_manager_v1` passthrough |
 | `text-input-unstable-v3.xml` | wayland-protocols `unstable/text-input/` | wayland-protocols 1.45 | `16463fc` |
 | `text-input-unstable-v1.xml` | wayland-protocols `unstable/text-input/` | Unknown (predates the `bitfield` and `enum` attributes) | `16463fc` |
 | `keyboard-extension-unstable-v1.xml` | Chromium Exo (`zcr_keyboard_extension_v1`) | Unknown (v2) | `16463fc` |

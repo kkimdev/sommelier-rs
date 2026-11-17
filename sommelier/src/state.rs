@@ -46,7 +46,7 @@ pub(crate) use self::input::{
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
-    is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
+    is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
 };
 pub(crate) use self::render::{
     BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
@@ -332,16 +332,20 @@ impl ShadowTable {
     }
 
     /// Synthetic guest objects are intentionally not paired with a host
-    /// object. Their handlers consume requests locally (currently the SHM
-    /// shim and the v3 text-input manager), so the generated dispatcher must
-    /// let those requests reach the handler while rejecting every other
-    /// unmapped sender before it can mutate state.
+    /// object. Their handlers consume requests locally (such as the SHM shim,
+    /// the v3 text-input manager, and an inert `wl_output` whose bind crossed
+    /// its global's removal, with its `zxdg_output_v1`), so the generated dispatcher must let those
+    /// requests reach the handler while rejecting every other unmapped
+    /// sender before it can mutate state.
     pub fn is_local_only_guest_object(&self, guest_id: u32) -> bool {
         matches!(
             self.interfaces.get(&guest_id).map(String::as_str),
             Some(
                 "wl_shm"
                     | "wl_shm_pool"
+                    // An inert output and the xdg_output created for it.
+                    | INERT_BIND_INTERFACE
+                    | "zxdg_output_v1"
                     | "zwp_text_input_manager_v3"
                     | "zwp_linux_dmabuf_feedback_v1"
                     | "gtk_shell1"
@@ -463,14 +467,6 @@ impl ShadowTable {
 
     pub fn is_pending_destroy_guest(&self, guest_id: u32) -> bool {
         self.pending_destroy_guest_ids.contains(&guest_id)
-    }
-
-    /// Undo [`Self::mark_pending_destroy`], for tests that stage one object's
-    /// destructor after another's. Production clears the marker only through
-    /// the host's `delete_id`.
-    #[cfg(test)]
-    pub fn clear_pending_destroy_guest(&mut self, guest_id: u32) {
-        self.pending_destroy_guest_ids.remove(&guest_id);
     }
 
     pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
@@ -909,8 +905,11 @@ pub struct Context {
     /// connection-wide set keyed only by global name.
     pub registry_global_names: HashMap<u32, HashSet<u32>>,
     /// Names removed from each registry. A subsequent global event for a
-    /// removed name represents a new advertisement generation.
-    pub registry_global_removed: HashMap<u32, HashSet<u32>>,
+    /// removed name represents a new advertisement generation; a bind of a
+    /// removed name crossed its removal on the wire. Each name keeps the
+    /// version the guest saw if it can be bound inert (see
+    /// `INERT_BIND_INTERFACE`), and `None` otherwise.
+    pub registry_global_removed: HashMap<u32, HashMap<u32, Option<u32>>>,
     pub registry_global_generations: HashMap<u32, HashMap<u32, u64>>,
     /// Whether each registry's current advertisement for a name was visible
     /// to the guest. This is kept per registry/generation so a delayed
@@ -1863,12 +1862,16 @@ mod tests {
         table.track_interface(21, "zwp_text_input_manager_v3".to_string());
         table.track_interface(22, "wl_shm_pool".to_string());
         table.track_interface(23, "wl_surface".to_string());
+        table.track_interface(25, INERT_BIND_INTERFACE.to_string());
+        table.track_interface(26, "zxdg_output_v1".to_string());
 
         assert!(table.is_local_only_guest_object(20));
         assert!(table.is_local_only_guest_object(21));
         assert!(table.is_local_only_guest_object(22));
         assert!(!table.is_local_only_guest_object(23));
         assert!(!table.is_local_only_guest_object(24));
+        assert!(table.is_local_only_guest_object(25), "an inert output");
+        assert!(table.is_local_only_guest_object(26), "its xdg_output");
     }
 
     #[test]

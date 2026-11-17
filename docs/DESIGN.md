@@ -121,7 +121,7 @@ encode wire bytes ad hoc.
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` | clipboard pumps in `Context` |
-| Outputs | `registry.rs`, `compositor.rs` | `outputs.rs` (`OutputRegistry`) |
+| Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs`, `window_placement.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, `window_placement.rs` |
 
 Two mechanisms let a handler act outside its own message:
@@ -136,9 +136,12 @@ Two mechanisms let a handler act outside its own message:
 ### Synthetic objects
 
 Some guest objects have no host counterpart and are implemented inside the
-proxy: `wl_shm` and its pools, and `zwp_text_input_manager_v3` and its
-children. They follow the guest lifecycle locally, including the
-`delete_id` a real compositor would send.
+proxy: `wl_shm` and its pools, `zwp_text_input_manager_v3` and its
+children, and an inert `wl_output` whose bind crossed its global's removal,
+with any `zxdg_output_v1` created for it (see
+[Registry globals](INVARIANTS.md#registry-globals)). They follow the
+guest lifecycle locally, including the `delete_id` a real compositor would
+send.
 
 ## Buffers
 
@@ -203,9 +206,14 @@ keysyms back to keycodes and to classify chords; chords listed in
 - **Aura objects.** `aura_objects.rs` creates, versions and releases every
   host-only Aura child (`zaura_surface`, `zaura_toplevel`, `zaura_output`)
   from one table. The guest never sees them.
-- **Outputs.** `OutputRegistry` owns bound outputs and their Aura metadata.
+- **Outputs.** `OutputRegistry` owns live outputs and their Aura metadata.
   The work area follows the `wl_output` geometry (panel) transform, not
-  `zaura_output.logical_transform`, as ChromiumOS Sommelier does.
+  `zaura_output.logical_transform`, as ChromiumOS Sommelier does. The
+  guest sees each `wl_output` unchanged, and the host's
+  `zxdg_output_manager_v1` passes through: on a fractionally scaled
+  display, `wl_output.scale` is rounded up, so only `zxdg_output_v1` gives
+  toolkits the logical monitor size (a 2560x1600 panel at 1.6x is
+  1600x1000, not 1280x800).
 
 ## Testing
 

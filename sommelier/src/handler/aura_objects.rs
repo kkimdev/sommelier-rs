@@ -294,16 +294,17 @@ mod tests {
         assert_eq!(ctx.client_to_host_queue.len(), 1, "an output gets one");
         assert_eq!(ctx.outputs.aura_output(PARENT_HOST), Some(aura_output));
 
-        let inactive = PARENT_HOST + 1;
+        let removed = PARENT_HOST + 1;
         ctx.outputs
-            .bind_for_test(inactive, crate::state::OutputState::default());
-        ctx.outputs.deactivate(crate::state::GlobalBinding {
-            name: inactive,
+            .bind_for_test(removed, crate::state::OutputState::default());
+        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
+            name: removed,
             generation: 1,
         });
+        assert!(removed_aura_outputs.is_empty());
         ctx.client_to_host_queue.clear();
-        ensure_zaura_output(&mut ctx, inactive);
+        ensure_zaura_output(&mut ctx, removed);
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.outputs.aura_output(inactive), None);
+        assert_eq!(ctx.outputs.aura_output(removed), None);
     }
 }

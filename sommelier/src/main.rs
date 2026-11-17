@@ -64,6 +64,10 @@ mod protocols {
     include!(concat!(env!("OUT_DIR"), "/fractional_scale_v1_protocol.rs"));
     include!(concat!(
         env!("OUT_DIR"),
+        "/xdg_output_unstable_v1_protocol.rs"
+    ));
+    include!(concat!(
+        env!("OUT_DIR"),
         "/keyboard_extension_unstable_v1_protocol.rs"
     ));
     include!(concat!(env!("OUT_DIR"), "/gtk_shell_protocol.rs"));

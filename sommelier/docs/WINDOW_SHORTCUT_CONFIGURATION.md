@@ -199,12 +199,14 @@ Both statements have unit tests in `sommelier/src/window_layout.rs`.
 
 ## Output and work area
 
-A placement uses an output that the focused surface has entered, so a window
-never jumps to another monitor; only a surface currently on no output (before
-its first enter, or after all its outputs went away) uses the first usable
-output. `OutputRegistry::for_surface` in
-`sommelier/src/state/outputs.rs` owns the exact rule, including which output
-wins when the surface spans several and when an output counts as usable.
+A placement uses the output that the focused surface entered last, so a
+window never jumps to another monitor; only a surface currently on no output
+(before its first enter, or after its output went away) uses the first
+usable output. `OutputRegistry::for_surface` in
+`sommelier/src/state/outputs.rs` owns the exact rule, including when an
+output counts as usable. The proxy learns an output only from the guest's
+own `wl_output` bind, so a client that never binds one cannot be placed:
+each chord is skipped as having no usable output.
 
 The work area is the output's logical screen area minus Aura's insets (the
 shelf and other reserved margins), in the coordinates that
@@ -213,7 +215,11 @@ file owns how it is measured from the output's metadata, including why the
 `wl_output.geometry` panel transform is used rather than
 `zaura_output.logical_transform`. Placement waits until Aura has sent both
 its current output scale and its device scale factor; the rounded
-`wl_output.scale` cannot describe fractional display scaling.
+`wl_output.scale` cannot describe fractional display scaling. It also needs
+a `zaura_shell` new enough to send `zaura_output.insets`, without which the
+work area would include the shelf. With an older shell the proxy warns
+once and creates no Aura toplevel, so every chord is skipped
+(`PLACEMENT_SHELL_SINCE` in `sommelier/src/handler/window_placement.rs`).
 
 Known limits:
 
@@ -313,7 +319,7 @@ that task ends, an error says reloads have stopped.
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
 | `sommelier/src/state/internal_callbacks.rs` | `InternalCallbacks`: what each proxy-issued `wl_display.sync` waits for, including the placement barrier. |
-| `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
+| `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
 | `sommelier/src/handler/window_placement.rs` | Placement mechanics: the focused toplevel and its output, the ARC identity (`set_aura_application_id` chooses it or the guest's ID for XDG and GTK), `set_window_bounds` and its barrier, and the configures held behind it. Protocol handlers call one entry point per event (listed in its module docs). |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |

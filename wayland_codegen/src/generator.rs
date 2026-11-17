@@ -424,17 +424,21 @@ fn generate_interface(interface: &Interface) -> TokenStream {
                             "object" => {
                                 let is_nullable = arg.allow_null.unwrap_or(false);
                                 if is_nullable {
+                                    // A local-only object, such as an inert
+                                    // output, has no host counterpart; the
+                                    // host gets null, as for no object.
                                     mapping_and_writing.push(quote! {
-                                        let host_id = if #name == 0 {
-                                            0
-                                        } else if let Some(id) = ctx.shadow_table.get_host_id(#name) {
-                                            id
-                                        } else {
-                                            log::debug!(
-                                                "Dropping request due to missing mapping for nullable argument {}",
-                                                #arg_name_str
-                                            );
-                                            return Ok(None);
+                                        let host_id = match ctx.shadow_table.get_host_id(#name) {
+                                            Some(id) => id,
+                                            None if #name == 0
+                                                || ctx.shadow_table.is_local_only_guest_object(#name) => 0,
+                                            None => {
+                                                log::debug!(
+                                                    "Dropping request due to missing mapping for nullable argument {}",
+                                                    #arg_name_str
+                                                );
+                                                return Ok(None);
+                                            }
                                         };
                                         builder.write_u32(host_id);
                                     });

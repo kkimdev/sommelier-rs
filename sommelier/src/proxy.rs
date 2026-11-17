@@ -125,6 +125,7 @@ struct SommelierHandler {
     display: crate::handler::display::DisplayHandler,
     registry: crate::handler::registry::RegistryHandler,
     compositor: crate::handler::compositor::CompositorHandler,
+    output: crate::handler::output::OutputHandler,
     gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
     callback: crate::handler::callback::CallbackHandler,
     shm: crate::handler::shm::ShmHandler,
@@ -146,6 +147,7 @@ impl SommelierHandler {
             display: crate::handler::display::DisplayHandler,
             registry: crate::handler::registry::RegistryHandler,
             compositor: crate::handler::compositor::CompositorHandler,
+            output: crate::handler::output::OutputHandler,
             gtk_shell: crate::handler::gtk_shell::GtkShellHandler,
             callback: crate::handler::callback::CallbackHandler,
             shm: crate::handler::shm::ShmHandler,
@@ -329,7 +331,7 @@ impl Client {
             if interface == "zaura_output" {
                 return protocols::aura_shell::zaura_output::dispatch_event(
                     msg,
-                    &mut handler.compositor,
+                    &mut handler.output,
                     ctx,
                 );
             }
@@ -3912,7 +3914,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(10, "wl_output".to_string(), 3);
         ctx.last_sender_id = 10;
-        WlOutputHandler::on_release(&mut crate::handler::compositor::CompositorHandler, &mut ctx);
+        WlOutputHandler::on_release(&mut crate::handler::output::OutputHandler, &mut ctx);
         for opcode in [EVT_GEOMETRY, EVT_MODE, EVT_DONE, EVT_SCALE] {
             assert!(
                 pending_host_event_is_stale(&ctx, 20, opcode, Some(10)),
@@ -4171,7 +4173,7 @@ protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
     wl_data_offer: data_device,
     wl_keyboard: keyboard,
     wl_seat: seat,
-    wl_output: compositor,
+    wl_output: output,
     wl_fixes: registry
 });
 impl protocols::wayland::ProtocolHandler for SommelierHandler {}
@@ -4227,6 +4229,12 @@ impl protocols::xdg_decoration_unstable_v1::ProtocolHandler for SommelierHandler
 // Fractional Scale Protocol
 protocols::fractional_scale_v1::impl_sommelier_delegates!(SommelierHandler, {});
 impl protocols::fractional_scale_v1::ProtocolHandler for SommelierHandler {}
+
+// XDG Output Protocol
+protocols::xdg_output_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {
+    zxdg_output_manager_v1: output
+});
+impl protocols::xdg_output_unstable_v1::ProtocolHandler for SommelierHandler {}
 
 // Keyboard Extension Protocol (ChromeOS-specific)
 protocols::keyboard_extension_unstable_v1::impl_sommelier_delegates!(SommelierHandler, {

@@ -16,11 +16,11 @@ limitations under the License.
 
 //! Host output state: one owner for every bound `wl_output`.
 //!
-//! [`OutputRegistry`] keeps one record per bound host output: the global it
-//! was bound from, whether it is still live, its committed and pending
-//! [`OutputState`], and its host-only `zaura_output`. It also owns which
-//! outputs each surface has entered, and it alone decides which output
-//! placement may use. Handlers translate wire events into its methods.
+//! [`OutputRegistry`] keeps one record per live host output: the global it
+//! was bound from, its committed and pending [`OutputState`], and its
+//! host-only `zaura_output`. It also owns the output each surface has
+//! entered, and it alone decides which output placement may use. Handlers
+//! translate wire events into its methods.
 //!
 //! [`OutputState::work_area`] turns one output's metadata into logical
 //! screen coordinates. [`is_valid_transform`] and [`transformed_extent`] are
@@ -29,7 +29,7 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_output;
 use crate::window_layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// `wl_output.transform.normal`, the lowest enum value.
 const TRANSFORM_NORMAL: i32 = 0;
@@ -54,6 +54,12 @@ pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i3
         (width, height)
     }
 }
+
+/// The one interface whose bind may cross its global's removal, as when a
+/// dock flaps (see `handler::registry::admit_guest_bind`). A `wl_output` up
+/// to the advertised v3 has no request that creates objects, so an inert
+/// one, a local-only guest object, needs nothing but its own destructor.
+pub(crate) const INERT_BIND_INTERFACE: &str = "wl_output";
 
 /// Units per 1.0 of an Aura scale factor: `zaura_output` sends both scale
 /// factors in thousandths.
@@ -150,50 +156,56 @@ pub(crate) struct GlobalBinding {
     pub(crate) generation: u64,
 }
 
-/// Whether an output may still feed compositor-owned placement.
-#[derive(Debug)]
-enum Liveness {
-    /// Bound from a global that is still advertised.
-    Live {
-        /// Metadata published by the last complete event group.
-        committed: OutputState,
-        /// Metadata collected since then, published by `wl_output.done`.
-        pending: Option<OutputState>,
-    },
-    /// Its global disappeared. The Wayland object stays valid until the
-    /// guest releases it, but its metadata is gone and never used again.
-    Inactive,
-}
-
-/// One bound host `wl_output`.
+/// One live host `wl_output`.
 #[derive(Debug)]
 struct OutputRecord {
+    /// The host `wl_output` ID.
+    output: u32,
     global: GlobalBinding,
     /// Outputs with `wl_output.done` batch events until it arrives. Older
     /// outputs have no event group barrier, so each event applies at once.
     batches_until_done: bool,
     /// Host-only `zaura_output` extending this output, once created.
     aura_output: Option<u32>,
-    liveness: Liveness,
+    /// Metadata published by the last complete event group.
+    committed: OutputState,
+    /// Metadata collected since then, published by `wl_output.done`.
+    pending: Option<OutputState>,
+}
+
+impl OutputRecord {
+    fn publish(&mut self) {
+        if let Some(state) = self.pending.take() {
+            self.committed = state;
+        }
+    }
+
+    /// The output and its committed metadata if placement may use them:
+    /// its work area is known.
+    fn usable(&self) -> Option<(u32, OutputState)> {
+        self.committed
+            .work_area()
+            .map(|_| (self.output, self.committed))
+    }
 }
 
 /// Single owner of the connection's host output state. All IDs are host IDs.
 ///
-/// A record exists from the guest's bind until its release; an output that
-/// was released, or never bound, is unknown and therefore never live. Its
-/// global's removal makes a record inactive without removing it, because the
-/// object and its `zaura_output` live until release.
+/// A record exists from the guest's bind until its release or its global's
+/// removal, whichever comes first; any other output is unknown and never
+/// live. The guest's `wl_output` outlives a removed global until the guest
+/// releases it, but nothing about it is needed again: its events change
+/// nothing, and its release forwards just the `wl_output` destructor.
 #[derive(Debug, Default)]
 pub(crate) struct OutputRegistry {
-    /// Bound outputs in bind order. Placement scans this order so that its
-    /// choice is deterministic when several outputs qualify.
-    order: Vec<u32>,
-    records: HashMap<u32, OutputRecord>,
-    /// Host `zaura_output` → the host `wl_output` it extends.
-    aura_outputs: HashMap<u32, u32>,
-    /// Host `wl_surface` → live outputs it has entered. A surface can span
-    /// outputs; an entry is removed once its set would be empty.
-    surface_outputs: HashMap<u32, HashSet<u32>>,
+    /// Live outputs in bind order, so placement's choice is deterministic
+    /// when several outputs qualify. A connection has a handful of outputs,
+    /// so lookups scan.
+    records: Vec<OutputRecord>,
+    /// Host `wl_surface` → the live output it entered last. Exo shows each
+    /// surface on one display, and moving it sends `leave` for the old
+    /// display before `enter` for the new one.
+    surface_outputs: HashMap<u32, u32>,
 }
 
 impl OutputRegistry {
@@ -208,25 +220,20 @@ impl OutputRegistry {
     pub(crate) fn bind(&mut self, output: u32, version: u32, global: GlobalBinding) {
         // Host IDs are not reused before the release that removes the
         // record, so a second bind is a bookkeeping bug. Release builds keep
-        // the existing record rather than listing the output twice in `order`.
-        let already_bound = self.records.contains_key(&output);
+        // the existing record rather than listing the output twice.
+        let already_bound = self.is_live(output);
         debug_assert!(!already_bound, "host output {output} is bound twice");
         if already_bound {
             return;
         }
-        self.order.push(output);
-        self.records.insert(
+        self.records.push(OutputRecord {
             output,
-            OutputRecord {
-                global,
-                batches_until_done: version >= wl_output::EVT_DONE_SINCE,
-                aura_output: None,
-                liveness: Liveness::Live {
-                    committed: OutputState::default(),
-                    pending: None,
-                },
-            },
-        );
+            global,
+            batches_until_done: version >= wl_output::EVT_DONE_SINCE,
+            aura_output: None,
+            committed: OutputState::default(),
+            pending: None,
+        });
     }
 
     /// Forget an output that the guest released.
@@ -236,58 +243,67 @@ impl OutputRegistry {
     /// The output's `zaura_output`, which the caller must tear down before
     /// the `wl_output` itself.
     pub(crate) fn release(&mut self, output: u32) -> Option<u32> {
-        let record = self.records.remove(&output)?;
-        self.order.retain(|&candidate| candidate != output);
-        self.forget_surface_associations(output);
-        let aura_output = record.aura_output?;
-        self.aura_outputs.remove(&aura_output);
-        Some(aura_output)
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.output == output)?;
+        let record = self.records.remove(index);
+        self.surface_outputs.retain(|_, entered| *entered != output);
+        record.aura_output
     }
 
-    /// Make every output bound from `global` inactive after its
+    /// Forget every output bound from `global` after its
     /// `wl_registry.global_remove`.
-    pub(crate) fn deactivate(&mut self, global: GlobalBinding) {
-        let mut retired = Vec::new();
-        for (&output, record) in &mut self.records {
-            if record.global == global {
-                record.liveness = Liveness::Inactive;
-                retired.push(output);
-            }
-        }
-        for output in retired {
-            self.forget_surface_associations(output);
-        }
+    ///
+    /// # Returns
+    ///
+    /// Their `zaura_output`s, which the caller must release now: nothing
+    /// reads them again, and a `wl_output` older than version 3 has no
+    /// release request that could free them later.
+    pub(crate) fn remove_global(&mut self, global: GlobalBinding) -> Vec<u32> {
+        let removed: Vec<u32> = self
+            .records
+            .iter()
+            .filter(|record| record.global == global)
+            .map(|record| record.output)
+            .collect();
+        removed
+            .into_iter()
+            .filter_map(|output| self.release(output))
+            .collect()
+    }
+
+    fn record(&self, output: u32) -> Option<&OutputRecord> {
+        self.records.iter().find(|record| record.output == output)
+    }
+
+    fn record_mut(&mut self, output: u32) -> Option<&mut OutputRecord> {
+        self.records
+            .iter_mut()
+            .find(|record| record.output == output)
     }
 
     /// Whether `output` is bound, unreleased, and still advertised.
     pub(crate) fn is_live(&self, output: u32) -> bool {
-        self.records
-            .get(&output)
-            .is_some_and(|record| matches!(record.liveness, Liveness::Live { .. }))
+        self.record(output).is_some()
     }
 
     /// Live outputs, in bind order.
     pub(crate) fn live_outputs(&self) -> Vec<u32> {
-        self.order
-            .iter()
-            .copied()
-            .filter(|&output| self.is_live(output))
-            .collect()
+        self.records.iter().map(|record| record.output).collect()
     }
 
-    /// The `zaura_output` created for `output`, if any. An inactive output
-    /// keeps its own, because its release still has to tear it down.
+    /// The `zaura_output` created for `output`, if any.
     pub(crate) fn aura_output(&self, output: u32) -> Option<u32> {
-        self.records.get(&output)?.aura_output
+        self.record(output)?.aura_output
     }
 
     /// Record the `zaura_output` created for a live output that had none.
     /// Only a live output may get one (see [`Self::is_live`]).
     pub(crate) fn remember_aura_output(&mut self, output: u32, aura_output: u32) {
         debug_assert!(self.is_live(output) && self.aura_output(output).is_none());
-        if let Some(record) = self.records.get_mut(&output) {
+        if let Some(record) = self.record_mut(output) {
             record.aura_output = Some(aura_output);
-            self.aura_outputs.insert(aura_output, output);
         }
     }
 
@@ -298,8 +314,10 @@ impl OutputRegistry {
     /// `None` for an unknown `zaura_output` or one whose output is no longer
     /// live: its event is stale and must not change placement metadata.
     pub(crate) fn aura_event_target(&self, aura_output: u32) -> Option<u32> {
-        let output = *self.aura_outputs.get(&aura_output)?;
-        self.is_live(output).then_some(output)
+        self.records
+            .iter()
+            .find(|record| record.aura_output == Some(aura_output))
+            .map(|record| record.output)
     }
 
     /// Apply one metadata event to a live output and publish it unless the
@@ -309,71 +327,39 @@ impl OutputRegistry {
     ///
     /// Whether `output` is live; events for other outputs change nothing.
     pub(crate) fn update(&mut self, output: u32, apply: impl FnOnce(&mut OutputState)) -> bool {
-        let Some(record) = self.records.get_mut(&output) else {
+        let Some(record) = self.record_mut(output) else {
             return false;
         };
-        let Liveness::Live { committed, pending } = &mut record.liveness else {
-            return false;
-        };
-        apply(pending.get_or_insert(*committed));
+        apply(record.pending.get_or_insert(record.committed));
         if !record.batches_until_done {
-            Self::publish(committed, pending);
+            record.publish();
         }
         true
     }
 
     /// Publish the metadata collected for `output` at `wl_output.done`.
     pub(crate) fn commit(&mut self, output: u32) {
-        if let Some(OutputRecord {
-            liveness: Liveness::Live { committed, pending },
-            ..
-        }) = self.records.get_mut(&output)
-        {
-            Self::publish(committed, pending);
-        }
-    }
-
-    fn publish(committed: &mut OutputState, pending: &mut Option<OutputState>) {
-        if let Some(state) = pending.take() {
-            *committed = state;
-        }
-    }
-
-    /// The committed metadata of `output` if placement may use it: the
-    /// output is live and its work area is known.
-    fn usable(&self, output: u32) -> Option<OutputState> {
-        match self.records.get(&output)?.liveness {
-            Liveness::Live { committed, .. } => committed.work_area().map(|_| committed),
-            Liveness::Inactive => None,
+        if let Some(record) = self.record_mut(output) {
+            record.publish();
         }
     }
 
     /// The first usable output, in bind order.
     pub(crate) fn primary(&self) -> Option<(u32, OutputState)> {
-        self.first_usable(|_| true)
+        self.records.iter().find_map(OutputRecord::usable)
     }
 
-    /// The output to use for placing `surface`.
+    /// The output to use for placing `surface`: the one it entered last.
     ///
-    /// The first usable output, in bind order, among those the surface has
-    /// entered. Only a surface with no output association (created before
-    /// its first enter event, or whose outputs all went away) falls back to
-    /// [`Self::primary`]. If the surface has entered outputs but none is
-    /// usable yet, this returns `None`: another output would move the window
-    /// to a different monitor.
+    /// Only a surface on no output (before its first enter event, or after
+    /// its output went away) falls back to [`Self::primary`]. If the
+    /// surface's output is not usable yet, this returns `None`: another
+    /// output would move the window to a different monitor.
     pub(crate) fn for_surface(&self, surface: u32) -> Option<(u32, OutputState)> {
         match self.surface_outputs.get(&surface) {
-            Some(entered) => self.first_usable(|output| entered.contains(&output)),
+            Some(&output) => self.record(output)?.usable(),
             None => self.primary(),
         }
-    }
-
-    fn first_usable(&self, eligible: impl Fn(u32) -> bool) -> Option<(u32, OutputState)> {
-        self.order
-            .iter()
-            .copied()
-            .filter(|&output| eligible(output))
-            .find_map(|output| self.usable(output).map(|state| (output, state)))
     }
 
     /// Record `wl_surface.enter`. An output that is not live is ignored: its
@@ -381,34 +367,22 @@ impl OutputRegistry {
     /// and must not steer placement.
     pub(crate) fn surface_entered(&mut self, surface: u32, output: u32) {
         if self.is_live(output) {
-            self.surface_outputs
-                .entry(surface)
-                .or_default()
-                .insert(output);
+            self.surface_outputs.insert(surface, output);
         }
     }
 
-    /// Record `wl_surface.leave`.
+    /// Record `wl_surface.leave`. A leave for an output other than the one
+    /// the surface entered last changes nothing, whichever order the two
+    /// events arrive in.
     pub(crate) fn surface_left(&mut self, surface: u32, output: u32) {
-        let Some(outputs) = self.surface_outputs.get_mut(&surface) else {
-            return;
-        };
-        outputs.remove(&output);
-        if outputs.is_empty() {
+        if self.surface_outputs.get(&surface) == Some(&output) {
             self.surface_outputs.remove(&surface);
         }
     }
 
-    /// Forget a destroyed surface's output associations.
+    /// Forget a destroyed surface's output association.
     pub(crate) fn surface_destroyed(&mut self, surface: u32) {
         self.surface_outputs.remove(&surface);
-    }
-
-    fn forget_surface_associations(&mut self, output: u32) {
-        self.surface_outputs.retain(|_, outputs| {
-            outputs.remove(&output);
-            !outputs.is_empty()
-        });
     }
 }
 
@@ -433,36 +407,22 @@ impl OutputRegistry {
 
     /// The committed metadata of a live output, usable or not.
     pub(crate) fn committed_for_test(&self, output: u32) -> Option<OutputState> {
-        match self.records.get(&output)?.liveness {
-            Liveness::Live { committed, .. } => Some(committed),
-            Liveness::Inactive => None,
-        }
+        Some(self.record(output)?.committed)
     }
 
     /// Whether any output has uncommitted metadata.
     pub(crate) fn has_pending_for_test(&self) -> bool {
-        self.records.values().any(|record| {
-            matches!(
-                record.liveness,
-                Liveness::Live {
-                    pending: Some(_),
-                    ..
-                }
-            )
-        })
+        self.records.iter().any(|record| record.pending.is_some())
     }
 
-    /// The outputs `surface` has entered.
-    pub(crate) fn entered_for_test(&self, surface: u32) -> Option<&HashSet<u32>> {
-        self.surface_outputs.get(&surface)
+    /// The output `surface` entered last.
+    pub(crate) fn entered_for_test(&self, surface: u32) -> Option<u32> {
+        self.surface_outputs.get(&surface).copied()
     }
 
-    /// Whether the registry holds no output, Aura output or surface entry.
+    /// Whether the registry holds no output or surface entry.
     pub(crate) fn is_empty_for_test(&self) -> bool {
-        self.order.is_empty()
-            && self.records.is_empty()
-            && self.aura_outputs.is_empty()
-            && self.surface_outputs.is_empty()
+        self.records.is_empty() && self.surface_outputs.is_empty()
     }
 }
 
@@ -636,17 +596,17 @@ mod tests {
             outputs.bind(20, version, global);
             assert!(outputs.update(20, |state| *state = usable_state()));
             assert_eq!(
-                outputs.usable(20).is_some(),
+                outputs.primary().is_some(),
                 published_at_once,
                 "version {version}"
             );
             outputs.commit(20);
-            assert_eq!(outputs.usable(20), Some(usable_state()));
+            assert_eq!(outputs.primary(), Some((20, usable_state())));
         }
     }
 
     #[test]
-    fn deactivation_matches_the_exact_global_generation() {
+    fn removal_matches_the_exact_global_generation() {
         let mut outputs = OutputRegistry::default();
         let old = GlobalBinding {
             name: 7,
@@ -659,21 +619,19 @@ mod tests {
         outputs.bind(20, 3, old);
         outputs.bind(30, 3, replacement);
         outputs.surface_entered(100, 20);
-        outputs.surface_entered(100, 30);
+        outputs.surface_entered(101, 30);
 
-        outputs.deactivate(old);
+        assert!(outputs.remove_global(old).is_empty(), "no Aura output");
         assert!(!outputs.is_live(20));
         assert!(
             outputs.is_live(30),
             "a delayed remove must spare the replacement"
         );
-        assert_eq!(
-            outputs.entered_for_test(100),
-            Some(&[30].into_iter().collect())
-        );
+        assert_eq!(outputs.entered_for_test(100), None);
+        assert_eq!(outputs.entered_for_test(101), Some(30));
         assert!(!outputs.update(20, |state| state.mode_width = 1));
-        outputs.surface_entered(101, 20);
-        assert_eq!(outputs.entered_for_test(101), None);
+        outputs.surface_entered(102, 20);
+        assert_eq!(outputs.entered_for_test(102), None);
     }
 
     #[test]
@@ -687,13 +645,14 @@ mod tests {
         assert_eq!(outputs.aura_event_target(21), Some(20));
         assert_eq!(outputs.aura_event_target(22), None);
 
-        outputs.deactivate(GlobalBinding {
+        let global = GlobalBinding {
             name: 20,
             generation: 1,
-        });
+        };
+        assert_eq!(outputs.remove_global(global), [21]);
         assert_eq!(outputs.aura_event_target(21), None);
-        assert_eq!(outputs.aura_output(20), Some(21), "release still needs it");
-        assert!(!outputs.is_live(20), "an inactive output gets no new one");
+        assert_eq!(outputs.aura_output(20), None);
+        assert!(!outputs.is_live(20), "a removed output gets no new one");
     }
 
     #[test]
