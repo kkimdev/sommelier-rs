@@ -27,6 +27,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
@@ -142,14 +143,26 @@ impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {}
 /// How many bytes a clipboard pump reads at a time.
 const PUMP_BUFFER_LEN: usize = 64 * 1024;
 
+/// How long a clipboard transfer may go without moving a byte, the first
+/// one included, before its pump ends it. A host that never finishes
+/// writing, or a guest that never reads, would otherwise keep one of the
+/// connection's pump slots, and any host data left unread in VirtWL's
+/// shared receive queue, until the connection ends.
+///
+/// The guest's pipe then closes as it does after a whole transfer: a pipe
+/// has no way to report an error, so the guest cannot tell a paste cut off
+/// here from a complete one.
+const PUMP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Copy `src`, the proxy's VirtWL pipe, into `dst`, the guest's
 /// descriptor, until `src` ends or `dst`'s reader goes away.
 ///
 /// Every client shares one thread, so the pump waits on the event loop: a
-/// peer that stalls parks only this pump, and aborting the pump closes
-/// both descriptors without waiting on either peer. Tokio's pipe types
-/// would take only a FIFO, and a VirtWL pipe is not one, but `virtio_wl.c`
-/// implements `poll` for it and returns `EAGAIN` under `O_NONBLOCK`.
+/// peer that stalls parks only this pump until [`PUMP_IDLE_TIMEOUT`] ends
+/// it, and aborting the pump closes both descriptors without waiting on
+/// either peer. Tokio's pipe types would take only a FIFO, and a VirtWL
+/// pipe is not one, but `virtio_wl.c` implements `poll` for it and returns
+/// `EAGAIN` under `O_NONBLOCK`.
 pub(crate) async fn pump(src: OwnedFd, dst: OwnedFd) -> io::Result<()> {
     match copy(src, dst).await {
         // The guest closed its end and wants no more. Rust ignores SIGPIPE,
@@ -301,14 +314,22 @@ fn reopen(pipe: &File) -> io::Result<File> {
 }
 
 /// Run `op` on `fd` once it is ready for `interest`, and again whenever it
-/// would block or a signal interrupts it.
+/// would block or a signal interrupts it, for up to [`PUMP_IDLE_TIMEOUT`].
 async fn wait_io<R>(
     fd: &AsyncFd<File>,
     interest: Interest,
     mut op: impl FnMut(&File) -> io::Result<R>,
 ) -> io::Result<R> {
-    fd.async_io(interest, |file| retry_interrupted(|| op(file)))
+    let ready = fd.async_io(interest, |file| retry_interrupted(|| op(file)));
+    tokio::time::timeout(PUMP_IDLE_TIMEOUT, ready)
         .await
+        .map_err(|_elapsed| {
+            let idle = PUMP_IDLE_TIMEOUT.as_secs();
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no data moved for {idle} s"),
+            )
+        })?
 }
 
 /// Run `op` until a signal does not interrupt it.
@@ -323,7 +344,7 @@ fn retry_interrupted<R>(mut op: impl FnMut() -> io::Result<R>) -> io::Result<R> 
 
 #[cfg(test)]
 mod tests {
-    use super::{pump, reopen, write_nowait, DataDeviceHandler};
+    use super::{pump, reopen, write_nowait, DataDeviceHandler, PUMP_IDLE_TIMEOUT};
     use crate::protocols::wayland::wl_data_device;
     use crate::state::Context;
     use crate::test_support::{raw_dispatch, Rng};
@@ -558,6 +579,52 @@ mod tests {
         let error = pump(src.into(), null.into()).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// A transfer that moves no data for `PUMP_IDLE_TIMEOUT` ends and closes
+    /// both pipes; every byte that moves restarts the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_the_host_stalls_ends_after_the_idle_timeout() {
+        let (src, mut src_writer) = io::pipe().unwrap();
+        let (mut dst_reader, dst) = io::pipe().unwrap();
+        let start = tokio::time::Instant::now();
+        let pump = tokio::spawn(pump(src.into(), dst.into()));
+
+        src_writer.write_all(b"a").unwrap();
+        tokio::time::sleep(PUMP_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        src_writer.write_all(b"b").unwrap();
+        let error = pump.await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= PUMP_IDLE_TIMEOUT * 2 - Duration::from_secs(1));
+        let mut received = Vec::new();
+        dst_reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"ab", "the guest reads what moved, then EOF");
+        assert_eq!(
+            src_writer.write(b"c").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "the pump must have closed the host's pipe"
+        );
+    }
+
+    /// So does a transfer whose guest stops reading while its pipe is full.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_the_guest_stalls_ends_after_the_idle_timeout() {
+        use nix::fcntl::{fcntl, FcntlArg};
+        let (src, mut src_writer) = io::pipe().unwrap();
+        let (mut dst_reader, dst) = io::pipe().unwrap();
+        // A one-page pipe fills long before the pump's buffer empties.
+        let capacity = fcntl(&dst, FcntlArg::F_SETPIPE_SZ(4096)).unwrap();
+        src_writer.write_all(&[0; 8192]).unwrap();
+        let start = tokio::time::Instant::now();
+
+        let error = pump(src.into(), dst.into()).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= PUMP_IDLE_TIMEOUT);
+        let mut received = Vec::new();
+        dst_reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received.len(), capacity as usize, "the guest reads EOF");
     }
 
     #[test]
