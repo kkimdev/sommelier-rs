@@ -53,7 +53,7 @@ jobs:
         env:
           # Fail, rather than skip, if weston or a client is missing.
           SOMMELIER_E2E_REQUIRED: ${{ matrix.e2e && '1' || '0' }}
-        run: cargo test --locked --workspace --all-targets --verbose -- --test-threads=1
+        run: cargo test --locked --workspace --all-targets --verbose
 
       - name: Prepare CI artifact
         if: github.event_name == 'push'

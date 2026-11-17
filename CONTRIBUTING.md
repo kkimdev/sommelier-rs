@@ -24,11 +24,13 @@ run the checks CI runs, plus `git diff --check`, from the repository root:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo test --locked --workspace --all-targets
 git diff --check
 ```
 
-Tests must run serially (`--test-threads=1`).
+Tests run in parallel, so a test must not assume which descriptor
+numbers or global state another test leaves alone; see
+[Testing](docs/DESIGN.md#testing).
 
 - Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before changing transport,
   object lifetimes, SHM or dma-buf, keyboard and IME, or application-ID
