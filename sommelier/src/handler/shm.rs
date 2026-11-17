@@ -18,6 +18,7 @@ use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+use crate::protocols::wayland::{wl_shm, wl_shm_pool};
 use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool, StalePixels};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
@@ -26,7 +27,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
 use std::sync::Arc;
 
@@ -1110,9 +1111,8 @@ fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
 }
 
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
-    let destroy =
-        MessageBuilder::new().build_message(params_id, zwp_linux_buffer_params_v1::REQ_DESTROY);
-    ctx.client_to_host_queue.push((destroy, Vec::new()));
+    ctx.client_to_host_queue
+        .push(zwp_linux_buffer_params_v1::req::destroy(params_id));
     // Keep the numeric ID reserved until the host's wl_display.delete_id
     // acknowledgement arrives. The destroy request is ordered after all
     // already-queued params requests.
@@ -1121,9 +1121,8 @@ fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
 pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
-    let destroy =
-        MessageBuilder::new().build_message(host_id, protocols::wayland::wl_buffer::REQ_DESTROY);
-    ctx.client_to_host_queue.push((destroy, Vec::new()));
+    ctx.client_to_host_queue
+        .push(protocols::wayland::wl_buffer::req::destroy(host_id));
 }
 
 fn clear_surface_buffer_references(ctx: &mut Context, guest_id: u32) {
@@ -1569,33 +1568,21 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         pool_version,
     );
 
-    // wl_shm.create_pool(new_id, fd, size)
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(host_pool_id);
-    builder.write_i32(buffer_size);
-    let create_pool =
-        builder.build_message(host_wl_shm_id, protocols::wayland::wl_shm::REQ_CREATE_POOL);
-    ctx.client_to_host_queue
-        .push((create_pool, vec![fd_to_send.into_raw_fd()]));
-
-    // wl_shm_pool.create_buffer(new_id, offset, width, height, stride, format)
     let host_buffer_id = ctx.shadow_table.allocate_host_id();
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(host_buffer_id);
-    builder.write_i32(0); // offset
-    builder.write_i32(width);
-    builder.write_i32(height);
-    builder.write_i32(stride);
-    builder.write_u32(format); // SHM format, not DRM format
-    let create_buffer = builder.build_message(
-        host_pool_id,
-        protocols::wayland::wl_shm_pool::REQ_CREATE_BUFFER,
-    );
-    ctx.client_to_host_queue.push((create_buffer, Vec::new()));
-
-    let pool_destroy = MessageBuilder::new()
-        .build_message(host_pool_id, protocols::wayland::wl_shm_pool::REQ_DESTROY);
-    ctx.client_to_host_queue.push((pool_destroy, Vec::new()));
+    ctx.client_to_host_queue.extend([
+        wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
+        // The buffer starts the pool, and keeps its SHM (not DRM) format.
+        wl_shm_pool::req::create_buffer(
+            host_pool_id,
+            host_buffer_id,
+            0,
+            width,
+            height,
+            stride,
+            format,
+        ),
+        wl_shm_pool::req::destroy(host_pool_id),
+    ]);
 
     // The three requests are emitted in one ordered stream:
     // create_pool, create_buffer, destroy. Once queued, a later
@@ -1727,42 +1714,46 @@ fn create_dmabuf_buffer(
         "zwp_linux_buffer_params_v1".to_string(),
         params_version,
     );
-    let mut builder = MessageBuilder::new();
-    builder.write_u32(params_id);
-    let create_params =
-        builder.build_message(host_dmabuf_id, zwp_linux_dmabuf_v1::REQ_CREATE_PARAMS);
-    ctx.client_to_host_queue.push((create_params, Vec::new()));
-
-    let mut add = MessageBuilder::new();
-    add.write_u32(0); // plane index
-    add.write_u32(layout.plane0().offset);
-    add.write_u32(layout.plane0().stride);
-    add.write_u32((modifier >> 32) as u32);
-    add.write_u32(modifier as u32);
-    let add = add.build_message(params_id, zwp_linux_buffer_params_v1::REQ_ADD);
     ctx.client_to_host_queue
-        .push((add, vec![fd_to_send.into_raw_fd()]));
+        .push(zwp_linux_dmabuf_v1::req::create_params(
+            host_dmabuf_id,
+            params_id,
+        ));
+    let (modifier_hi, modifier_lo) = ((modifier >> 32) as u32, modifier as u32);
+    let plane0 = layout.plane0();
+    ctx.client_to_host_queue
+        .push(zwp_linux_buffer_params_v1::req::add(
+            params_id,
+            fd_to_send,
+            0,
+            plane0.offset,
+            plane0.stride,
+            modifier_hi,
+            modifier_lo,
+        ));
     if let Some((plane1, plane1_fd)) = plane1_add {
-        let mut add_plane1 = MessageBuilder::new();
-        add_plane1.write_u32(1);
-        add_plane1.write_u32(plane1.offset);
-        add_plane1.write_u32(plane1.stride);
-        add_plane1.write_u32((modifier >> 32) as u32);
-        add_plane1.write_u32(modifier as u32);
-        let add_plane1 = add_plane1.build_message(params_id, zwp_linux_buffer_params_v1::REQ_ADD);
         ctx.client_to_host_queue
-            .push((add_plane1, vec![plane1_fd.into_raw_fd()]));
+            .push(zwp_linux_buffer_params_v1::req::add(
+                params_id,
+                plane1_fd,
+                1,
+                plane1.offset,
+                plane1.stride,
+                modifier_hi,
+                modifier_lo,
+            ));
     }
 
     let host_buffer_id = ctx.shadow_table.allocate_host_id();
-    let mut create = MessageBuilder::new();
-    create.write_u32(host_buffer_id);
-    create.write_i32(width);
-    create.write_i32(height);
-    create.write_u32(ShmHandler::wl_shm_format_to_drm_format(format));
-    create.write_u32(0);
-    let create = create.build_message(params_id, zwp_linux_buffer_params_v1::REQ_CREATE_IMMED);
-    ctx.client_to_host_queue.push((create, Vec::new()));
+    ctx.client_to_host_queue
+        .push(zwp_linux_buffer_params_v1::req::create_immed(
+            params_id,
+            host_buffer_id,
+            width,
+            height,
+            ShmHandler::wl_shm_format_to_drm_format(format),
+            0,
+        ));
     // create_immed is processed before this destructor in the ordered
     // host stream. Reserve the params ID until wl_display.delete_id
     // acknowledges its destruction.

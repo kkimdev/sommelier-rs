@@ -568,17 +568,20 @@ impl LinuxDmabufHandler {
         // Send the ADDs, each handing its descriptor to the queue. The caller
         // queues its CREATE right after.
         for param in params {
-            let mut builder = MessageBuilder::new();
-
+            // SAFETY: a pending param owns the duplicate `on_add` made, and
+            // its ADD takes the duplicate over.
+            let fd = unsafe { OwnedFd::from_raw_fd(param.fd) };
             // PASS THE GUEST'S EXACT METADATA. NO MINIGBM OVERRIDES.
-            builder.write_u32(param.plane_idx);
-            builder.write_u32(param.offset);
-            builder.write_u32(param.stride);
-            builder.write_u32(param.modifier_hi);
-            builder.write_u32(param.modifier_lo);
-
-            let add = builder.build_message(host_id, zwp_linux_buffer_params_v1::REQ_ADD);
-            ctx.client_to_host_queue.push((add, vec![param.fd]));
+            ctx.client_to_host_queue
+                .push(zwp_linux_buffer_params_v1::req::add(
+                    host_id,
+                    fd,
+                    param.plane_idx,
+                    param.offset,
+                    param.stride,
+                    param.modifier_hi,
+                    param.modifier_lo,
+                ));
         }
         ctx.used_dmabuf_params.insert(params_id);
         Some((HostId(host_id), sync_fds))
@@ -1123,14 +1126,14 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // unlike the guest numeric ID, it uniquely identifies this async
         // generation even after guest-side delete_id and ID reuse.
         if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
-            let mut builder = MessageBuilder::new();
-            builder.write_i32(width);
-            builder.write_i32(height);
-            builder.write_u32(format);
-            builder.write_u32(flags);
-            let create =
-                builder.build_message(host_params_id.0, zwp_linux_buffer_params_v1::REQ_CREATE);
-            ctx.client_to_host_queue.push((create, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zwp_linux_buffer_params_v1::req::create(
+                    host_params_id.0,
+                    width,
+                    height,
+                    format,
+                    flags,
+                ));
             let pending = PendingNativeCreate {
                 guest_params_id: params_id,
                 dimensions: (width, height),
@@ -1282,17 +1285,15 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         ctx.shadow_table
             .set_host_version(host_buffer_id, buffer_version);
         if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(host_buffer_id);
-            builder.write_i32(width);
-            builder.write_i32(height);
-            builder.write_u32(format);
-            builder.write_u32(flags);
-            let create_immed = builder.build_message(
-                host_params_id.0,
-                zwp_linux_buffer_params_v1::REQ_CREATE_IMMED,
-            );
-            ctx.client_to_host_queue.push((create_immed, Vec::new()));
+            ctx.client_to_host_queue
+                .push(zwp_linux_buffer_params_v1::req::create_immed(
+                    host_params_id.0,
+                    host_buffer_id,
+                    width,
+                    height,
+                    format,
+                    flags,
+                ));
             if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
                 ctx.fatal_protocol_error = true;
