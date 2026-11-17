@@ -417,6 +417,17 @@ mod tests {
         assert!(code.contains("fn classify_interface"));
         assert!(code.contains("fn interface_version"));
         assert!(code.contains("fn consume_event"));
+        let code = without_whitespace(&code);
+        assert!(
+            code.contains(
+                "\"wl_surface\"=>wayland::wl_surface::Event::from_wire(msg).map(Self::WlSurface),"
+            ),
+            "a test decodes an event of any interface by its sender's interface"
+        );
+        assert!(
+            code.contains("implFrom<xdg_shell::xdg_toplevel::Request>forAnyRequest"),
+            "a test names a message of any interface by its own type"
+        );
     }
 
     /// `new_object` reports the one object a message creates.

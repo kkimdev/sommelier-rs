@@ -33,6 +33,8 @@ use tokio::time::Instant;
 
 #[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod harness;
 
 type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 
@@ -766,6 +768,7 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    use super::harness::Session;
     use super::*;
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
@@ -949,65 +952,75 @@ mod tests {
         done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE)
     }
 
-    /// Discard what the proxy forwarded to `peer`, so a long exchange does
-    /// not fill the socket buffer.
-    fn drain(peer: &mut std::os::unix::net::UnixStream) {
-        use std::io::Read;
-        peer.set_nonblocking(true).expect("non-blocking peer");
-        let mut sink = [0u8; 4096];
-        loop {
-            match peer.read(&mut sink) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("drain peer: {error}"),
-            }
-        }
-    }
-
-    fn delete_id(host_id: u32) -> Vec<u8> {
-        let mut delete_id = MessageBuilder::new();
-        delete_id.write_u32(host_id);
-        delete_id.build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
-    }
-
     /// libwayland-server rejects client object IDs past its map limit, so a
     /// host ID that grew with every object ever created would end the
     /// session after enough frame callbacks.
     #[tokio::test]
     async fn host_ids_are_recycled_through_delete_id() {
-        const GUEST_CALLBACK: u32 = 3;
-        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
-
-        let first = guest_sync(&mut client, GUEST_CALLBACK).await;
-        host_events(&mut client, &[callback_done(first), delete_id(first)]).await;
-        for _ in 0..1000 {
-            let host_callback = guest_sync(&mut client, GUEST_CALLBACK).await;
-            assert_eq!(host_callback, first, "a deleted host ID must be reused");
-            host_events(
-                &mut client,
-                &[callback_done(host_callback), delete_id(host_callback)],
-            )
+        use protocols::wayland::{wl_callback, wl_display};
+        let mut s = Session::new();
+        let callback = s.new_id();
+        let first = s
+            .create(wl_display::req::sync(WL_DISPLAY_ID, callback))
             .await;
-            drain(&mut guest_peer);
-            drain(&mut host_peer);
+        for _ in 0..1000 {
+            s.host([
+                wl_callback::evt::done(first, 0),
+                wl_display::evt::delete_id(WL_DISPLAY_ID, first),
+            ])
+            .await;
+            assert_eq!(
+                s.guest_received(),
+                [
+                    (
+                        callback,
+                        wl_callback::Event::Done { callback_data: 0 }.into()
+                    ),
+                    (
+                        WL_DISPLAY_ID,
+                        wl_display::Event::DeleteId { id: callback }.into()
+                    ),
+                ]
+            );
+            assert_eq!(
+                s.create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+                    .await,
+                first,
+                "a deleted host ID must be reused"
+            );
         }
     }
 
     #[tokio::test]
     async fn host_ids_are_not_reused_before_delete_id() {
-        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
+        use protocols::wayland::{wl_callback, wl_display};
+        let mut s = Session::new();
+        let (callback, later_callback) = (s.new_id(), s.new_id());
+        let sync = |callback| wl_display::req::sync(WL_DISPLAY_ID, callback);
 
         // `done` destroys the callback on both sides and sends the guest its
         // delete_id, so the guest may reuse its ID at once; the host ID must
         // wait for the host's own delete_id.
-        let first = guest_sync(&mut client, 3).await;
-        host_events(&mut client, &[callback_done(first)]).await;
-        let second = guest_sync(&mut client, 3).await;
-        assert_ne!(second, first);
+        let first = s.create(sync(callback)).await;
+        s.host([wl_callback::evt::done(first, 0)]).await;
+        assert_eq!(
+            s.guest_received(),
+            [
+                (
+                    callback,
+                    wl_callback::Event::Done { callback_data: 0 }.into()
+                ),
+                (
+                    WL_DISPLAY_ID,
+                    wl_display::Event::DeleteId { id: callback }.into()
+                ),
+            ]
+        );
+        assert_ne!(s.create(sync(callback)).await, first);
 
-        host_events(&mut client, &[delete_id(first)]).await;
-        assert_eq!(guest_sync(&mut client, 4).await, first);
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, first)])
+            .await;
+        assert_eq!(s.create(sync(later_callback)).await, first);
     }
 
     /// A compositor destroys the pending frame callbacks of a destroyed
@@ -1017,47 +1030,32 @@ mod tests {
     #[tokio::test]
     async fn a_host_destroyed_frame_callback_reaches_the_guest() {
         use crate::protocols::wayland::{wl_display, wl_surface};
-        use std::io::Read;
-        const SURFACE: u32 = 20;
-        const CALLBACK: u32 = 21;
-        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
-        client
-            .ctx
-            .shadow_table
-            .insert_paired_for_test(SURFACE, 30, "wl_surface");
-        for (request, _) in [
-            wl_surface::req::frame(SURFACE, CALLBACK),
-            wl_surface::req::destroy(SURFACE),
-        ] {
-            client.client_conn.read_buf.extend_from_slice(&request);
-        }
-        assert!(client.handle_msgs(Direction::ClientToHost).await);
-        let host_callback = client
-            .ctx
-            .shadow_table
-            .get_host_id(CALLBACK)
-            .expect("the frame callback reaches the host");
-
-        host_events(&mut client, &[delete_id(host_callback)]).await;
-        assert_eq!(client.ctx.shadow_table.get_host_id(CALLBACK), None);
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let callback = s.new_id();
+        let host_callback = s.create(wl_surface::req::frame(surface.id, callback)).await;
+        s.guest([wl_surface::req::destroy(surface.id)]).await;
         assert_eq!(
-            client.ctx.shadow_table.create_host_only("wl_callback", 1),
-            host_callback,
-            "the deleted callback's host ID is reused first"
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Destroy {}.into())]
         );
-        drop(client);
-        let mut events = Vec::new();
-        guest_peer
-            .read_to_end(&mut events)
-            .expect("read the guest's events");
-        let deleted: Vec<u32> = crate::test_support::frames(&events)
-            .filter(|(header, _)| {
-                (header.sender_id, header.opcode)
-                    == (crate::wire::WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)
-            })
-            .map(|(_, payload)| u32::from_ne_bytes(payload[..4].try_into().unwrap()))
-            .collect();
-        assert_eq!(deleted, vec![CALLBACK]);
+
+        s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, host_callback)])
+            .await;
+        assert_eq!(
+            s.guest_received(),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: callback }.into()
+            )]
+        );
+        // Both IDs are free again: the guest reuses its own, and the proxy
+        // the callback's host ID first.
+        assert_eq!(
+            s.create(wl_display::req::sync(WL_DISPLAY_ID, callback))
+                .await,
+            host_callback
+        );
     }
 
     /// A guest may destroy a buffer the host still holds. Its guest object

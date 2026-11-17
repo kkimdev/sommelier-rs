@@ -146,6 +146,7 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
     let mut special_event_arms = Vec::new();
     let mut consume_event_arms = Vec::new();
     let mut version_arms = Vec::new();
+    let mut any_variants = Vec::new();
     // The proxy routes and versions an object by its interface name alone.
     let mut routed_interfaces = HashSet::new();
 
@@ -205,9 +206,24 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
             version_arms.push(quote! {
                 #name => Some(#protocol_name::#interface::VERSION),
             });
+            any_variants.push((
+                name.clone(),
+                format_ident!("{}", snake_to_camel(name)),
+                quote! { #protocol_name::#interface },
+            ));
         }
     }
 
+    let any_request = generate_any_message(
+        &format_ident!("AnyRequest"),
+        &format_ident!("Request"),
+        &any_variants,
+    );
+    let any_event = generate_any_message(
+        &format_ident!("AnyEvent"),
+        &format_ident!("Event"),
+        &any_variants,
+    );
     let expanded = quote! {
         use crate::state::Context;
         use crate::wire::{Outgoing, ProtocolError, WireMessage};
@@ -278,9 +294,69 @@ pub fn generate_routing(protocols: &[Protocol]) -> String {
                 #(#consume_event_arms)*
             }
         }
+
+        #any_request
+        #any_event
     };
 
     expanded.to_string()
+}
+
+/// Generate `AnyRequest` or `AnyEvent` for tests: a message of any
+/// interface, which a test peer decodes by the interface of its sender, so
+/// that one assertion covers everything the proxy sent that peer, in order.
+fn generate_any_message(
+    any_name: &Ident,
+    message_type: &Ident,
+    interfaces: &[(String, Ident, TokenStream)],
+) -> TokenStream {
+    let variants = interfaces
+        .iter()
+        .map(|(_, variant, module)| quote! { #variant(#module::#message_type) });
+    let decode_arms = interfaces.iter().map(|(name, variant, module)| {
+        quote! { #name => #module::#message_type::from_wire(msg).map(Self::#variant), }
+    });
+    let new_object_arms = interfaces.iter().map(|(_, variant, _)| {
+        quote! { Self::#variant(message) => message.new_object(), }
+    });
+    let conversions = interfaces.iter().map(|(_, variant, module)| {
+        quote! {
+            #[cfg(test)]
+            impl From<#module::#message_type> for #any_name {
+                fn from(message: #module::#message_type) -> Self {
+                    Self::#variant(message)
+                }
+            }
+        }
+    });
+    quote! {
+        #[cfg(test)]
+        #[derive(Debug, PartialEq)]
+        pub enum #any_name {
+            #(#variants),*
+        }
+
+        #[cfg(test)]
+        impl #any_name {
+            /// Decode `msg`, sent by an object of `interface`. An interface
+            /// no vendored protocol defines is an invalid sender.
+            pub fn from_wire(interface: &str, msg: &mut WireMessage) -> Result<Self, ProtocolError> {
+                match interface {
+                    #(#decode_arms)*
+                    _ => Err(ProtocolError::InvalidSender(msg.sender_id)),
+                }
+            }
+
+            /// The ID and interface of the object this message creates.
+            pub fn new_object(&self) -> Option<(u32, &str)> {
+                match self {
+                    #(#new_object_arms)*
+                }
+            }
+        }
+
+        #(#conversions)*
+    }
 }
 
 fn map_type(arg: &Arg) -> TokenStream {
