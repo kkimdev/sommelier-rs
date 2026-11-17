@@ -48,6 +48,10 @@ use log::error;
 /// available since v2 and explicit modifier events since v3, so bind at v3
 /// when the host supports it.
 const LINUX_DMABUF_CAPABILITY_VERSION: u32 = zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE;
+// The host binding has no feedback requests, so no host feedback object
+// exists (see `ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler`).
+const _: () =
+    assert!(LINUX_DMABUF_CAPABILITY_VERSION < zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE);
 /// The newest host `zwp_text_input_manager_v1` the proxy binds: the vendored
 /// XML's. The generated code knows no message added after it, so a newer
 /// binding could deliver events whose unknown opcodes end the session.

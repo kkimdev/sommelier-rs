@@ -367,7 +367,6 @@ pub struct Context {
     /// add/create requests can report `already_used` instead of being
     /// confused with an object that was never tracked.
     pub used_dmabuf_params: HashSet<u32>,
-    pub feedback_index_maps: HashMap<u32, HashMap<u16, u16>>,
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
     /// generation keeps an object created from an old, still-bound factory
@@ -904,7 +903,6 @@ impl Context {
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
             used_dmabuf_params: HashSet::new(),
-            feedback_index_maps: HashMap::new(),
             synthetic_feedback_objects: HashMap::new(),
             synthetic_feedback_refresh_pending: HashSet::new(),
             dmabuf_capabilities: HashMap::new(),

@@ -21,7 +21,7 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
 use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-use crate::wire::{queue_or_drop, Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
+use crate::wire::{Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
 use nix::sys::memfd::MFdFlags;
 use std::fs::File;
@@ -59,62 +59,6 @@ fn is_supported_drm_format(format: u32) -> bool {
             | 0x3432_4258 // DRM_FORMAT_XBGR8888
             | 0x3432_4241 // DRM_FORMAT_ABGR8888
     )
-}
-
-fn guest_device_bytes(ctx: &Context, host_device: &[u8]) -> Option<Vec<u8>> {
-    let dev_t_size = std::mem::size_of::<libc::dev_t>();
-    if host_device.len() != dev_t_size {
-        log::warn!(
-            "Rejecting malformed dmabuf device ID: {} bytes (expected {})",
-            host_device.len(),
-            dev_t_size
-        );
-        return None;
-    }
-
-    // ChromiumOS rewrites the host dev_t to the device backing the local GBM
-    // allocator. A fixed renderD128 dev_t breaks on systems where the render
-    // node has a different minor number, so derive it from the actual fd.
-    let Some(allocator) = ctx.allocator.as_ref() else {
-        return Some(host_device.to_vec());
-    };
-
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    let fd = allocator.device.as_fd().as_raw_fd();
-    if unsafe { libc::fstat(fd, &mut stat) } == 0 {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&stat.st_rdev as *const libc::dev_t).cast::<u8>(),
-                std::mem::size_of::<libc::dev_t>(),
-            )
-        };
-        return Some(bytes.to_vec());
-    }
-
-    log::warn!(
-        "Failed to stat GBM device fd {}: {}; dropping device feedback",
-        fd,
-        std::io::Error::last_os_error()
-    );
-    None
-}
-
-fn format_table_fd_can_map(fd: BorrowedFd<'_>, size: usize) -> bool {
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
-        return false;
-    }
-
-    // memfd and regular files expose a useful length that can be checked
-    // before mmap. virtwl and other shared-memory providers are not regular
-    // files and commonly report st_size=0 (or no meaningful size at all);
-    // mmap is the authoritative validation for those descriptors.
-    let is_regular = (stat.st_mode as libc::mode_t) & libc::S_IFMT == libc::S_IFREG;
-    !is_regular
-        || (stat.st_size >= 0
-            && u64::try_from(stat.st_size)
-                .ok()
-                .is_some_and(|file_size| file_size >= size as u64))
 }
 
 fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
@@ -684,187 +628,21 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     }
 }
 
+/// The proxy never creates a host `zwp_linux_dmabuf_feedback_v1`: it binds
+/// the host's linux-dmabuf below the feedback version
+/// (`LINUX_DMABUF_CAPABILITY_VERSION`) and serves every guest feedback
+/// object itself ([`LinuxDmabufHandler::create_synthetic_feedback`]). No
+/// host event of the interface can therefore arrive, and only the guest's
+/// destructor needs handling.
 impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler {
-    fn on_main_device(&mut self, ctx: &mut Context, _device: &[u8]) -> Action {
-        let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
-            Some(id) => id,
-            None => return Action::Drop,
-        };
-
-        let Some(dev_id_bytes) = guest_device_bytes(ctx, _device) else {
-            return Action::Drop;
-        };
-
-        queue_or_drop(
-            &mut ctx.host_to_client_queue,
-            zwp_linux_dmabuf_feedback_v1::evt::main_device(guest_id, &dev_id_bytes),
-            format_args!("the main device of dmabuf feedback {guest_id}"),
-        );
-        Action::Drop
-    }
-
-    fn on_tranche_target_device(&mut self, ctx: &mut Context, _device: &[u8]) -> Action {
-        let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
-            Some(id) => id,
-            None => return Action::Drop,
-        };
-
-        let Some(dev_id_bytes) = guest_device_bytes(ctx, _device) else {
-            return Action::Drop;
-        };
-
-        queue_or_drop(
-            &mut ctx.host_to_client_queue,
-            zwp_linux_dmabuf_feedback_v1::evt::tranche_target_device(guest_id, &dev_id_bytes),
-            format_args!("the tranche device of dmabuf feedback {guest_id}"),
-        );
-        Action::Drop
-    }
-
-    fn on_format_table(&mut self, ctx: &mut Context, fd: BorrowedFd<'_>, size: u32) -> Action {
-        let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
-            Some(id) => id,
-            None => return Action::Drop,
-        };
-        // A feedback object may resend its table. Do not let tranche events
-        // from the new sequence use indices from an older table if rewriting
-        // this one fails.
-        ctx.feedback_index_maps.remove(&guest_id);
-
-        if size == 0 || !size.is_multiple_of(16) {
-            log::warn!("Rejecting malformed dmabuf format table size {}", size);
-            return Action::Drop;
-        }
-
-        let entry_count = (size / 16) as usize;
-        // Tranche indices are uint16 values. Refuse a table whose entries
-        // cannot be represented without wrapping an index during rewriting.
-        if entry_count > usize::from(u16::MAX) + 1 {
-            log::warn!(
-                "Rejecting dmabuf format table with too many entries: {}",
-                entry_count
-            );
-            return Action::Drop;
-        }
-
-        if !format_table_fd_can_map(fd, size as usize) {
-            log::warn!(
-                "Rejecting dmabuf format table fd {} that cannot provide {} bytes",
-                fd.as_raw_fd(),
-                size
-            );
-            return Action::Drop;
-        }
-
-        // The protocol requires clients to map the table read-only/private.
-        // Keep the host table byte-for-byte intact: duplicate entries are
-        // meaningful because tranche indices can use them to express
-        // different preferences. Only the tranche index stream is filtered
-        // below, just like ChromiumOS Sommelier.
-        let host_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size as usize,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-
-        if host_ptr == libc::MAP_FAILED {
-            return Action::Drop;
-        }
-
-        let host_entries =
-            unsafe { std::slice::from_raw_parts(host_ptr as *const u32, entry_count * 4) };
-
-        let mut index_map = std::collections::HashMap::new();
-
-        for i in 0..entry_count {
-            let format = host_entries[i * 4];
-
-            if !is_supported_drm_format(format) {
-                continue;
-            }
-            // Preserve the host's original index, including duplicate
-            // format+modifier entries. Re-indexing or deduplicating changes
-            // the preference semantics of a tranche.
-            index_map.insert(i as u16, i as u16);
-        }
-        unsafe {
-            libc::munmap(host_ptr, size as usize);
-        }
-        let new_fd = match fd.try_clone_to_owned() {
-            Ok(fd) => fd,
-            Err(error) => {
-                log::warn!(
-                    "Failed to duplicate dmabuf format table fd {}: {}",
-                    fd.as_raw_fd(),
-                    error
-                );
-                return Action::Drop;
-            }
-        };
-        ctx.feedback_index_maps.insert(guest_id, index_map);
-        ctx.host_to_client_queue
-            .push(zwp_linux_dmabuf_feedback_v1::evt::format_table(
-                guest_id, new_fd, size,
-            ));
-
-        Action::Drop
-    }
-
-    fn on_tranche_formats(&mut self, ctx: &mut Context, indices: &[u8]) -> Action {
-        let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
-            Some(id) => id,
-            None => return Action::Drop,
-        };
-
-        let index_map = match ctx.feedback_index_maps.get(&guest_id) {
-            Some(map) => map,
-            None => return Action::Drop,
-        };
-
-        if !indices.len().is_multiple_of(2) {
-            log::warn!(
-                "Rejecting malformed dmabuf tranche format indices with odd length {}",
-                indices.len()
-            );
-            return Action::Drop;
-        }
-
-        let mut new_indices = Vec::new();
-        for i in 0..(indices.len() / 2) {
-            let idx = u16::from_ne_bytes([indices[i * 2], indices[i * 2 + 1]]);
-            if let Some(&new_idx) = index_map.get(&idx) {
-                new_indices.extend_from_slice(&new_idx.to_ne_bytes());
-            }
-        }
-
-        queue_or_drop(
-            &mut ctx.host_to_client_queue,
-            zwp_linux_dmabuf_feedback_v1::evt::tranche_formats(guest_id, &new_indices),
-            format_args!("the tranche formats of dmabuf feedback {guest_id}"),
-        );
-
-        Action::Drop
-    }
-
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        // This is a client→host request, so last_sender_id is the guest
-        // feedback ID. Looking it up as a host ID leaves the index map alive
-        // until the connection is torn down and can corrupt a later feedback
-        // object that reuses the ID.
+        // The generated dispatcher completes the local object's destructor.
         let guest_id = ctx.last_sender_id;
         if let Some(generation) = ctx.synthetic_feedback_objects.remove(&guest_id) {
-            ctx.feedback_index_maps.remove(&guest_id);
             ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
             maybe_reclaim_capability_generation(ctx, generation);
-            return Action::Drop;
         }
-        ctx.feedback_index_maps.remove(&guest_id);
-        Action::Forward
+        Action::Drop
     }
 }
 
@@ -1178,15 +956,14 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        build_synthetic_feedback_messages, feedback_pairs, format_table_fd_can_map,
-        guest_device_bytes, is_supported_drm_format, maybe_reclaim_capability_generation,
-        LinuxDmabufHandler, DRM_FORMAT_MOD_INVALID, MAX_FEEDBACK_FORMATS,
+        build_synthetic_feedback_messages, feedback_pairs, is_supported_drm_format,
+        maybe_reclaim_capability_generation, LinuxDmabufHandler, DRM_FORMAT_MOD_INVALID,
+        MAX_FEEDBACK_FORMATS,
     };
     use crate::handler::display::DisplayHandler;
     use crate::handler::shm::ShmHandler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
-    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
@@ -1393,6 +1170,35 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_feedback_destroy_completes_locally() {
+        use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::{
+            dispatch_request, REQ_DESTROY,
+        };
+        let mut ctx = Context::new_for_test(true, false, vec![]);
+        ctx.dmabuf_guest_generations.insert(7, 42);
+        ctx.dmabuf_capabilities.entry(42).or_default();
+        ctx.last_sender_id = 7;
+        let mut handler = LinuxDmabufHandler;
+        ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut handler, &mut ctx, 90);
+        // With its factory gone, the feedback holds the last reference to
+        // the capability snapshot.
+        ctx.dmabuf_guest_generations.remove(&7);
+
+        ctx.last_sender_id = 90;
+        let mut destroy = WireMessage::new(90, REQ_DESTROY, &[]);
+        let dispatched = dispatch_request(&mut destroy, &mut handler, &mut ctx);
+        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            message_opcode(&ctx.host_to_client_queue[0].0),
+            wl_display::EVT_DELETE_ID
+        );
+        assert!(!ctx.synthetic_feedback_objects.contains_key(&90));
+        assert!(!ctx.dmabuf_capabilities.contains_key(&42));
+    }
+
+    #[test]
     fn capability_snapshots_remain_isolated_by_global_generation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.dmabuf_capabilities
@@ -1431,33 +1237,6 @@ mod tests {
         assert_eq!(
             handler.on_modifier(&mut ctx, 0x3432_5258, 0, 0),
             Action::Forward
-        );
-    }
-
-    #[test]
-    fn forwards_device_id_when_no_local_allocator_exists() {
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let host_device = vec![1; std::mem::size_of::<libc::dev_t>()];
-        assert_eq!(guest_device_bytes(&ctx, &host_device), Some(host_device));
-    }
-
-    #[test]
-    fn rejects_malformed_device_id_before_forwarding() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let host_device = vec![1; std::mem::size_of::<libc::dev_t>() - 1];
-        assert_eq!(guest_device_bytes(&ctx, &host_device), None);
-
-        ctx.shadow_table
-            .insert_paired_for_test(10, 20, "zwp_linux_dmabuf_feedback_v1");
-        ctx.last_sender_id = 20;
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            ZwpLinuxDmabufFeedbackV1Handler::on_main_device(&mut handler, &mut ctx, &host_device,),
-            Action::Drop
-        );
-        assert!(
-            ctx.host_to_client_queue.is_empty(),
-            "malformed device IDs must not produce a guest event"
         );
     }
 
@@ -1569,25 +1348,6 @@ mod tests {
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
             0
         );
-    }
-
-    #[test]
-    fn feedback_destroy_removes_format_index_mapping() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 20, "zwp_linux_dmabuf_feedback_v1");
-        ctx.feedback_index_maps
-            .insert(10, std::collections::HashMap::new());
-        // destroy is a guest request, therefore last_sender_id is the guest
-        // ID rather than the host ID.
-        ctx.last_sender_id = 10;
-
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            ZwpLinuxDmabufFeedbackV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        assert!(!ctx.feedback_index_maps.contains_key(&10));
     }
 
     #[test]
@@ -2308,114 +2068,5 @@ mod tests {
         unsafe {
             libc::close(pipe_fds[0]);
         }
-    }
-
-    #[test]
-    fn odd_tranche_index_array_is_rejected() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 20, "zwp_linux_dmabuf_feedback_v1");
-        ctx.feedback_index_maps
-            .insert(10, std::collections::HashMap::new());
-        ctx.last_sender_id = 20;
-
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(handler.on_tranche_formats(&mut ctx, &[0]), Action::Drop);
-        assert!(ctx.host_to_client_queue.is_empty());
-    }
-
-    #[test]
-    fn non_regular_format_table_fds_are_validated_by_mmap() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-
-        // virtwl-backed descriptors do not expose a regular-file size. They
-        // must reach mmap rather than being rejected solely because st_size is
-        // zero. A pipe cannot actually be mapped, but this helper deliberately
-        // leaves that final check to mmap.
-        assert!(format_table_fd_can_map(
-            unsafe { BorrowedFd::borrow_raw(pipe_fds[0]) },
-            4096
-        ));
-
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-    }
-
-    #[test]
-    fn format_table_rewrite_keeps_wayland_entry_width_and_modifier() {
-        let name = std::ffi::CString::new("sommelier-format-table-input").unwrap();
-        let input_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(input_fd >= 0);
-
-        // Each linux-dmabuf feedback entry is exactly four native-endian
-        // u32 words: format, padding, modifier_hi, modifier_lo. Include an
-        // unsupported entry and a duplicate supported entry to exercise both
-        // filtering and index de-duplication.
-        let entries = [
-            0x3432_5258u32,
-            0,
-            0x1122_3344,
-            0x5566_7788,
-            0xdead_beefu32,
-            0,
-            0,
-            0,
-            0x3432_5258u32,
-            0,
-            0x1122_3344,
-            0x5566_7788,
-        ];
-        let bytes: Vec<u8> = entries.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        assert_eq!(unsafe { libc::ftruncate(input_fd, bytes.len() as i64) }, 0);
-        assert_eq!(
-            unsafe { libc::pwrite(input_fd, bytes.as_ptr().cast(), bytes.len(), 0,) },
-            bytes.len() as isize
-        );
-
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 20, "zwp_linux_dmabuf_feedback_v1");
-        ctx.last_sender_id = 20;
-        let mut handler = LinuxDmabufHandler;
-
-        assert_eq!(
-            handler.on_format_table(
-                &mut ctx,
-                unsafe { BorrowedFd::borrow_raw(input_fd) },
-                bytes.len() as u32
-            ),
-            Action::Drop
-        );
-        unsafe {
-            libc::close(input_fd);
-        }
-
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        let rewritten_fd = ctx.host_to_client_queue[0].1[0].as_raw_fd();
-        let mut rewritten = [0u8; 48];
-        assert_eq!(
-            unsafe {
-                libc::pread(
-                    rewritten_fd,
-                    rewritten.as_mut_ptr().cast(),
-                    rewritten.len(),
-                    0,
-                )
-            },
-            rewritten.len() as isize
-        );
-        let (chunks, remainder) = rewritten.as_chunks::<4>();
-        assert!(remainder.is_empty());
-        let words: Vec<u32> = chunks
-            .iter()
-            .map(|chunk| u32::from_ne_bytes(*chunk))
-            .collect();
-        assert_eq!(words, entries);
-        assert_eq!(ctx.feedback_index_maps[&10].get(&0), Some(&0));
-        assert_eq!(ctx.feedback_index_maps[&10].get(&2), Some(&2));
-        assert!(!ctx.feedback_index_maps[&10].contains_key(&1));
     }
 }
