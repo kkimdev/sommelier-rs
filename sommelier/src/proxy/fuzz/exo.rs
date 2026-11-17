@@ -145,6 +145,9 @@ struct TextInput {
     field: Field,
     /// The delegate's `pending_surrounding_text_supported_`.
     pending_support: bool,
+    /// The events not yet sent: `enter` with its surface when an input
+    /// method attaches, `leave` (`None`) when it detaches.
+    events: Vec<Option<u32>>,
 }
 
 impl TextInput {
@@ -166,6 +169,7 @@ impl TextInput {
                 cursor_rectangle: (0, 0, 0, 0),
             },
             pending_support: true,
+            events: Vec::new(),
         }
     }
 
@@ -191,15 +195,21 @@ impl TextInput {
 
     /// `AttachInputMethod` resets the type and mode to text, and keeps the
     /// flags, learning and surrounding-text support of the previous field.
+    /// Its delegate's `Activated` sends `enter` with the surface of the
+    /// last `activate` (`zwp_text_input_manager.cc:127`).
     fn attach(&mut self) {
+        self.events.push(self.surface);
         self.field.attached = true;
         self.field.content_type.input_type = extended::INPUT_TYPE_TEXT;
         self.field.content_type.input_mode = extended::INPUT_MODE_TEXT;
     }
 
     /// `DetachInputMethod`, which does nothing without an input method.
+    /// Its delegate's `Deactivated` sends `leave`
+    /// (`zwp_text_input_manager.cc:132`).
     fn detach(&mut self) {
         if self.field.attached {
+            self.events.push(None);
             self.field.attached = false;
             self.field.content_type.input_type = extended::INPUT_TYPE_NONE;
             self.field.content_type.input_mode = extended::INPUT_MODE_DEFAULT;
@@ -345,6 +355,34 @@ impl Exo {
             }
             _ => {}
         }
+    }
+
+    /// The input method goes away, as when its process restarts:
+    /// `TextInput::OnInputMethodDestroyed` deactivates each text input it
+    /// was attached to, and nothing attaches it again until the next
+    /// `activate`. Returns whether one was attached.
+    pub(super) fn destroy_input_method(&mut self) -> bool {
+        let mut detached = false;
+        for text_input in self.text_inputs.values_mut() {
+            if text_input.field.attached {
+                text_input.deactivate();
+                detached = true;
+            }
+        }
+        detached
+    }
+
+    /// The `enter` (with its surface) and `leave` (`None`) events Exo sent
+    /// since the last call, with the host text input of each.
+    pub(super) fn take_events(&mut self) -> Vec<(u32, Option<u32>)> {
+        self.text_inputs
+            .iter_mut()
+            .flat_map(|(&id, text_input)| {
+                std::mem::take(&mut text_input.events)
+                    .into_iter()
+                    .map(move |event| (id, event))
+            })
+            .collect()
     }
 
     /// The fields of the text inputs active on the focused surface.

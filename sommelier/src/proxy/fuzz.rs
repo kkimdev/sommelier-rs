@@ -158,6 +158,8 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let host_destroyed = LIVE_OBJECTS_HOST_DESTROYED.load(Ordering::Relaxed);
         let fields = FIELDS_CHECKED.load(Ordering::Relaxed);
         let deferred = DEFERRED_ACTIVATIONS.load(Ordering::Relaxed);
+        let leaves = TEXT_INPUT_LEAVES.load(Ordering::Relaxed);
+        let restarts = INPUT_METHOD_RESTARTS.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
                 reused > 0,
@@ -187,7 +189,8 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         println!(
             "{cases} cases from seed {first_seed} passed: {outcomes:?}, {reused} host IDs reused, \
              {server_objects} guest server objects checked, {cancelled} frame callbacks cancelled, \
-             {fields} text fields checked, {deferred} activations deferred"
+             {fields} text fields checked, {deferred} activations deferred, \
+             {leaves} text-input leaves sent, {restarts} input methods restarted"
         );
     });
 }
@@ -453,7 +456,7 @@ fn discover_globals(protocols: &Arc<Protocols>, config: Config) -> Vec<Global> {
         bytes: sync_request(callback).encode(),
         ..Submission::default()
     };
-    let (events, _) = exchange(protocols, config, vec![sync], true, callback, None)
+    let (events, _) = exchange(protocols, config, 0, vec![sync], true, callback, None)
         .expect("the proxy answers a lone sync in time");
     frames(&events)
         .filter(|(header, _)| {
@@ -1013,6 +1016,7 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
     let (events, host) = exchange(
         protocols,
         config,
+        seed,
         case.sends,
         framed,
         case.callback,
@@ -1173,8 +1177,9 @@ fn check_guest_events(
     );
 }
 
-/// Serve a guest that makes `sends` from one `Client` and return the events
-/// it received and what Exo would hold once the proxy closed the host
+/// Serve a guest that makes `sends` from one `Client`, behind a compositor
+/// whose random choices follow from `seed`, and return the events it
+/// received and what Exo would hold once the proxy closed the host
 /// connection, or `None` if the proxy neither answered the guest's closing
 /// sync (`callback`) nor closed the connection within [`CASE_TIMEOUT`].
 /// With `host_destroys`, the compositor destroys live objects of that
@@ -1185,6 +1190,7 @@ fn check_guest_events(
 fn exchange(
     protocols: &Arc<Protocols>,
     config: Config,
+    seed: u64,
     sends: Vec<Submission>,
     framed: bool,
     callback: u32,
@@ -1210,7 +1216,7 @@ fn exchange(
     });
     let compositor = {
         let protocols = Arc::clone(protocols);
-        std::thread::spawn(move || compositor(host, &protocols, host_destroys))
+        std::thread::spawn(move || compositor(host, &protocols, host_destroys, Rng::new(seed)))
     };
     let (callbacks_done, done_callbacks) = std::sync::mpsc::channel();
     let writer = {
@@ -1423,7 +1429,12 @@ impl ServerIds {
 /// still in use, or an object argument naming an object the host does not
 /// have or one of the wrong interface. Proxy-side ID translation bugs show
 /// up here.
-fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&str>) -> Exo {
+fn compositor(
+    host: UnixStream,
+    protocols: &Protocols,
+    host_destroys: Option<&str>,
+    mut rng: Rng,
+) -> Exo {
     let mut objects = BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())]);
     // Objects destroyed on their own, until their ID is reused (see
     // `destroy_live_objects`).
@@ -1530,6 +1541,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                 ("wl_surface", wl_surface::REQ_COMMIT)
                     if !zombie && exo.focus() != Some(sender) =>
                 {
+                    let keyboard_events = reply.len();
                     let keyboards = objects
                         .iter()
                         .filter(|&(_, interface)| interface == "wl_keyboard")
@@ -1543,6 +1555,14 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                         reply.push(keyboard_enter(keyboard, serial, sender));
                     }
                     exo.set_focus(Some(sender));
+                    // Which of Exo's seat observers hears of the focus first,
+                    // its keyboards or its text inputs, is not modelled.
+                    let text_input_events = text_input_events(exo.take_events());
+                    if rng.one_in(2) {
+                        reply.splice(keyboard_events..keyboard_events, text_input_events);
+                    } else {
+                        reply.extend(text_input_events);
+                    }
                 }
                 // A new keyboard learns the seat's focus at once.
                 ("wl_seat", wl_seat::REQ_GET_KEYBOARD) => {
@@ -1591,6 +1611,9 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                         &mut deleted,
                     ));
                 }
+                if RESTART_INPUT_METHODS && rng.one_in(8) && exo.destroy_input_method() {
+                    INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                }
                 let callback = WireMessage::new(sender, opcode, payload)
                     .read_u32()
                     .expect("a callback ID");
@@ -1611,6 +1634,7 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             }
             // A destroyed surface loses the focus without a `leave`.
             exo.forget(|id| objects.contains_key(&id));
+            reply.extend(text_input_events(exo.take_events()));
             let release = !hold && !reply.is_empty();
             held.append(&mut reply);
             if release {
@@ -1704,6 +1728,33 @@ fn destroy_live_objects(
             zombies.insert(id, interface);
             deleted.insert(id);
             delete_id(id)
+        })
+        .collect()
+}
+
+/// Whether the compositor's input method now and then goes away as it
+/// answers a sync, as when its process restarts. Off for now: the proxy
+/// does not yet activate again a text input Exo deactivated on its own.
+const RESTART_INPUT_METHODS: bool = false;
+
+/// Input methods that went away while attached ([`RESTART_INPUT_METHODS`]),
+/// across all cases.
+static INPUT_METHOD_RESTARTS: AtomicU64 = AtomicU64::new(0);
+
+/// `zwp_text_input_v1.leave` events the compositor sent, across all cases.
+static TEXT_INPUT_LEAVES: AtomicU64 = AtomicU64::new(0);
+
+/// The `zwp_text_input_v1.enter` (with its surface) and `leave` events of
+/// the host text inputs in `events`.
+fn text_input_events(events: Vec<(u32, Option<u32>)>) -> Vec<Vec<u8>> {
+    events
+        .into_iter()
+        .map(|(text_input, surface)| match surface {
+            Some(surface) => zwp_text_input_v1::evt::enter(text_input, surface).0,
+            None => {
+                TEXT_INPUT_LEAVES.fetch_add(1, Ordering::Relaxed);
+                zwp_text_input_v1::evt::leave(text_input).0
+            }
         })
         .collect()
 }
