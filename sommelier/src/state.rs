@@ -50,14 +50,14 @@ pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
-    is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
+    is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
 };
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
     BufferRect, BufferSpace, BufferState, DamageRegion, Rect, RenderBufferLifecycle,
-    RenderBufferUse, ShmPool, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceRect,
-    SurfaceState, ViewportState,
+    RenderBufferUse, ShmPool, StalePixels, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
+    SurfaceRect, SurfaceState, ViewportState,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
@@ -655,9 +655,15 @@ impl Context {
         self.surfaces.entry(surface).or_default()
     }
 
-    /// Stale what `commit` of `surface` changed in the host copies of the
-    /// surface's local buffers. See [`StalePixels`].
-    pub(crate) fn stale_surface_pixels(&mut self, surface: u32, commit: &SurfaceCommit) {
+    /// Stale what `commit` of `surface`, which shows its buffer through
+    /// `mapping`, changed in the host copies of the surface's local buffers.
+    /// See [`StalePixels`].
+    pub(crate) fn stale_surface_pixels(
+        &mut self,
+        surface: u32,
+        commit: &SurfaceCommit,
+        mapping: &SurfaceMapping,
+    ) {
         // A buffer attached together with a new mapping was last copied for
         // the old one, while the client's damage is relative to the new one:
         // then no host copy relates to the new contents pixel for pixel.
@@ -670,7 +676,7 @@ impl Context {
         self.render_buffers.stale_surface_pixels(
             surface,
             shown,
-            &commit.buffer_copy_damage(),
+            &commit.buffer_copy_damage(mapping),
             commit.changes_buffer_mapping(),
         );
     }
@@ -1321,7 +1327,7 @@ mod tests {
         assert_eq!(commit.attachment, SurfaceAttachment::Attach(2));
         assert_eq!(commit.attached_buffer_id(), Some(2));
         assert!(commit.has_buffer_attach());
-        assert!(commit.uses_full_mapping());
+        assert!(commit.moves_buffer());
         assert!(!commit.has_invalid_fractional_viewport());
         assert_eq!(
             commit.surface_damage,

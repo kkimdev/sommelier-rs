@@ -22,6 +22,7 @@ use std::marker::PhantomData;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
+use super::outputs::transformed_extent;
 use super::HostId;
 
 /// A guest `wl_shm_pool`.
@@ -214,25 +215,54 @@ impl<S> Rect<S> {
             space: PhantomData,
         }
     }
+
+    /// The left, top, right and bottom edges, which f64 holds exactly.
+    fn edges(self) -> (f64, f64, f64, f64) {
+        let (x, y) = (f64::from(self.x), f64::from(self.y));
+        (x, y, x + f64::from(self.width), y + f64::from(self.height))
+    }
 }
 
+// ChromiumOS keeps host damage within a tenth of the i32 range, so the
+// host's x + width arithmetic cannot overflow, even after its own scaling.
+const DAMAGE_MIN: f64 = (i32::MIN / 10) as f64;
+const DAMAGE_MAX: f64 = (i32::MAX / 10) as f64;
+
 impl SurfaceRect {
+    /// The smallest rectangle covering the edges `x0..x1` by `y0..y1`:
+    /// rounded outward, at least 1x1, and with every edge inside the host
+    /// damage headroom. Every rectangle the host
+    /// receives is built here.
+    fn enclosing(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+        let start = |edge: f64| edge.floor().clamp(DAMAGE_MIN, DAMAGE_MAX - 1.0);
+        let end = |edge: f64, start: f64| edge.ceil().min(DAMAGE_MAX).max(start + 1.0);
+        let (left, top) = (start(x0), start(y0));
+        let (right, bottom) = (end(x1, left), end(y1, top));
+        Self::new(
+            left as i32,
+            top as i32,
+            (right - left) as i32,
+            (bottom - top) as i32,
+        )
+    }
+
+    /// This damage as the host receives it: grown by one unit on every
+    /// side, as ChromiumOS does, so filtering at its edge never samples an
+    /// undamaged pixel.
+    pub fn outset(self) -> Self {
+        let (x0, y0, x1, y1) = self.edges();
+        Self::enclosing(x0 - 1.0, y0 - 1.0, x1 + 1.0, y1 + 1.0)
+    }
+
     /// This rectangle in the pixels of a buffer of integer scale `factor`,
     /// clamped to non-negative i32 coordinates. The copy clips damage to the
     /// buffer, which lies inside that range, so the clamp drops nothing it
     /// would copy.
     fn scaled(self, factor: i32) -> BufferRect {
-        let scale = |value: i64| {
-            let scaled = value.saturating_mul(i64::from(factor));
-            scaled.clamp(0, i64::from(i32::MAX)) as i32
-        };
-        let edges = |start: i32, length: i32| {
-            let start = i64::from(start);
-            (scale(start), scale(start + i64::from(length)))
-        };
-        let (x0, x1) = edges(self.x, self.width);
-        let (y0, y1) = edges(self.y, self.height);
-        BufferRect::new(x0, y0, x1 - x0, y1 - y0)
+        let scale = |edge: f64| (edge * f64::from(factor)).clamp(0.0, f64::from(i32::MAX)) as i32;
+        let (x0, y0, x1, y1) = self.edges();
+        let (left, top) = (scale(x0), scale(y0));
+        BufferRect::new(left, top, scale(x1) - left, scale(y1) - top)
     }
 }
 
@@ -264,6 +294,106 @@ impl ViewportState {
 impl Default for ViewportState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// `wl_fixed_t`'s 1.0: a viewport source is in 24.8 fixed point.
+const FIXED_ONE: i32 = 256;
+
+/// How a surface shows its buffer, which converts damage between buffer
+/// pixels and surface-local units.
+///
+/// `viewporter.xml` orders the steps from buffer pixels to the surface:
+/// the buffer transform, then the buffer scale, then the viewport's crop
+/// and scale. The viewport source is therefore in surface units after the
+/// buffer scale. The proxy forwards all three unchanged, so this is also
+/// the host's mapping. An attach offset moves the surface, not its pixels,
+/// so it is not part of the mapping.
+#[derive(Debug)]
+pub struct SurfaceMapping {
+    /// The buffer's width and height in pixels, or `None` without a buffer.
+    buffer: Option<(i32, i32)>,
+    transform: i32,
+    scale: i32,
+    viewport: ViewportState,
+}
+
+impl SurfaceMapping {
+    /// The buffer's size after its transform, `(W', H')` in pixels.
+    fn transformed_buffer(&self) -> Option<(i32, i32)> {
+        self.buffer
+            .map(|(width, height)| transformed_extent(self.transform, width, height))
+    }
+
+    /// The viewport source in surface units, and the destination size,
+    /// which is the surface size. The source defaults to the whole buffer
+    /// and the destination to the source size.
+    fn crop_and_scale(&self) -> ((f64, f64, f64, f64), (f64, f64)) {
+        let source = match self.viewport.source {
+            Some((x, y, width, height)) => {
+                let units = |fixed: i32| f64::from(fixed) / f64::from(FIXED_ONE);
+                (units(x), units(y), units(width), units(height))
+            }
+            None => {
+                // A surface without a buffer has no size; its damage maps as
+                // a 1x1 buffer's.
+                let (width, height) = self.transformed_buffer().unwrap_or((1, 1));
+                let units = |pixels: i32| f64::from(pixels) / f64::from(self.scale);
+                (0.0, 0.0, units(width), units(height))
+            }
+        };
+        let destination = self
+            .viewport
+            .destination
+            .map_or((source.2, source.3), |(width, height)| {
+                (f64::from(width), f64::from(height))
+            });
+        (source, destination)
+    }
+
+    /// The whole surface: full damage.
+    pub fn surface_rect(&self) -> SurfaceRect {
+        let (_, (width, height)) = self.crop_and_scale();
+        SurfaceRect::enclosing(0.0, 0.0, width, height)
+    }
+
+    /// Buffer damage `rect` in surface units, rounded outward.
+    ///
+    /// Buffer pixel `p` lands at `(p / scale - source) * destination /
+    /// source size`. `rect` first grows by one buffer pixel, as ChromiumOS
+    /// does, so filtering at a fractional edge never samples an undamaged
+    /// pixel. The SHM bridge does not rotate damage, so under a transform
+    /// `rect` damages the whole surface, which over-damages as the protocol
+    /// allows.
+    pub fn to_surface(&self, rect: BufferRect) -> SurfaceRect {
+        if self.transform != wl_output::TRANSFORM_NORMAL {
+            return self.surface_rect();
+        }
+        let ((source_x, source_y, source_width, source_height), (width, height)) =
+            self.crop_and_scale();
+        let scale = f64::from(self.scale);
+        let x = |pixel: f64| (pixel / scale - source_x) * width / source_width;
+        let y = |pixel: f64| (pixel / scale - source_y) * height / source_height;
+        let (x0, y0, x1, y1) = rect.edges();
+        SurfaceRect::enclosing(x(x0 - 1.0), y(y0 - 1.0), x(x1 + 1.0), y(y1 + 1.0))
+    }
+
+    /// Surface damage `rect` in buffer pixels, or `None` when a transform
+    /// or a viewport makes the mapping more than an integer scale, which
+    /// is all the SHM bridge maps exactly.
+    pub fn to_buffer(&self, rect: SurfaceRect) -> Option<BufferRect> {
+        self.integer_scale().map(|scale| rect.scaled(scale))
+    }
+
+    /// Whether a buffer pixel is a surface unit.
+    pub fn is_identity(&self) -> bool {
+        self.integer_scale() == Some(1)
+    }
+
+    fn integer_scale(&self) -> Option<i32> {
+        let only_scaled =
+            self.transform == wl_output::TRANSFORM_NORMAL && self.viewport.is_identity();
+        only_scaled.then_some(self.scale)
     }
 }
 
@@ -483,41 +613,28 @@ impl SurfaceCommit {
         self.surface_damage.is_full() || self.buffer_damage.is_full()
     }
 
-    pub fn uses_full_mapping(&self) -> bool {
-        self.surface_to_buffer_scale() != Some(1)
+    /// Whether an attach offset moves the new buffer against the surface,
+    /// so that surface damage no longer relates to its pixels.
+    pub fn moves_buffer(&self) -> bool {
+        self.has_buffer_attach() && self.buffer_offset != (0, 0)
     }
 
-    /// The integer factor from surface coordinates to buffer pixels, or
-    /// `None` when a transform, a viewport or an attach offset makes the
-    /// mapping more than a scale.
-    fn surface_to_buffer_scale(&self) -> Option<i32> {
-        let state = &self.state;
-        let only_scaled = state.current_buffer_transform == wl_output::TRANSFORM_NORMAL
-            && !(self.has_buffer_attach() && self.buffer_offset != (0, 0))
-            && state.viewport.is_none_or(ViewportState::is_identity);
-        only_scaled.then_some(state.current_buffer_scale)
-    }
-
-    /// This commit's damage in the pixel coordinates of the surface's
-    /// buffer: the pixels the SHM bridge copies to the host.
+    /// This commit's damage in the pixels of the buffer `mapping` shows:
+    /// the pixels the SHM bridge copies to the host.
     ///
     /// Buffer damage is already in buffer pixels. Surface damage maps to them
     /// exactly under an integer buffer scale (HiDPI clients); any other
-    /// mapping falls back to the whole buffer.
-    pub fn buffer_copy_damage(&self) -> DamageRegion<BufferSpace> {
+    /// mapping, or an attach offset, falls back to the whole buffer.
+    pub fn buffer_copy_damage(&self, mapping: &SurfaceMapping) -> DamageRegion<BufferSpace> {
         if self.has_full_damage() {
             return DamageRegion::Full;
         }
-        let surface_rects = self.surface_damage.rects();
         let mut damage = self.buffer_damage.clone();
-        if surface_rects.is_empty() {
-            return damage;
-        }
-        let Some(scale) = self.surface_to_buffer_scale() else {
-            return DamageRegion::Full;
-        };
-        for &rect in surface_rects {
-            damage.push(rect.scaled(scale));
+        for &rect in self.surface_damage.rects() {
+            match mapping.to_buffer(rect).filter(|_| !self.moves_buffer()) {
+                Some(rect) => damage.push(rect),
+                None => return DamageRegion::Full,
+            }
         }
         damage
     }
@@ -529,7 +646,7 @@ impl SurfaceCommit {
         let Some((_, _, width, height)) = viewport.source else {
             return false;
         };
-        viewport.destination.is_none() && (width % 256 != 0 || height % 256 != 0)
+        viewport.destination.is_none() && (width % FIXED_ONE != 0 || height % FIXED_ONE != 0)
     }
 
     pub fn rollback(self, surface: &mut SurfaceState) {
@@ -538,6 +655,16 @@ impl SurfaceCommit {
 }
 
 impl SurfaceState {
+    /// How this surface shows a buffer of `buffer` pixels, or no buffer.
+    pub(crate) fn mapping(&self, buffer: Option<(i32, i32)>) -> SurfaceMapping {
+        SurfaceMapping {
+            buffer,
+            transform: self.current_buffer_transform,
+            scale: self.current_buffer_scale,
+            viewport: self.viewport.unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn current_buffer_id(&self) -> Option<u32> {
         self.current_content
             .as_ref()
