@@ -17,15 +17,15 @@ limitations under the License.
 use crate::allocator::Allocator;
 use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::{
-    copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD,
-};
+use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
+use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
+use crate::protocols::wayland::{wl_output, wl_shm};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
@@ -254,7 +254,7 @@ fn map_buffer_damage(
     // wl_surface transforms are forwarded to the host, but this small SHM
     // bridge does not rotate its linear copy. Damage the complete buffer until
     // a rotated copy path is available.
-    if surface.current_buffer_transform != 0 {
+    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
         if let Some(viewport) = surface.viewport.filter(|viewport| !viewport.is_identity()) {
             if let Some((destination_width, destination_height)) = viewport.destination {
                 return DamageRect::new(0, 0, destination_width, destination_height);
@@ -370,7 +370,7 @@ fn full_surface_damage(
         }
     }
 
-    if surface.current_buffer_transform != 0 {
+    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
         let (width, height) = logical_transformed_extent(
             surface.current_buffer_transform,
             width,
@@ -694,7 +694,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 surface_id,
-                3,
+                wl_surface::ERROR_INVALID_OFFSET,
                 "wl_surface.attach offset is non-zero for version 5+",
             );
             return Action::Drop;
@@ -758,7 +758,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wl_surface::ERROR_INVALID_SCALE,
                 "invalid wl_surface buffer scale",
             );
             return Action::Drop;
@@ -779,7 +779,7 @@ impl WlSurfaceHandler for CompositorHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                1,
+                wl_surface::ERROR_INVALID_TRANSFORM,
                 "invalid wl_surface buffer transform",
             );
             return Action::Drop;
@@ -834,7 +834,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 queue_protocol_error(
                     ctx,
                     viewport_id,
-                    1,
+                    wp_viewport::ERROR_BAD_SIZE,
                     "fractional wp_viewport source requires a destination",
                 );
             }
@@ -890,7 +890,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     ShmCopyError::Source(_) => queue_protocol_error(
                         ctx,
                         buffer_id,
-                        WL_SHM_ERROR_INVALID_FD,
+                        wl_shm::ERROR_INVALID_FD,
                         "error accessing SHM buffer",
                     ),
                     ShmCopyError::Destination => log::warn!(
@@ -983,7 +983,7 @@ impl WlRegionHandler for CompositorHandler {}
 impl WlSubcompositorHandler for CompositorHandler {}
 impl WlSubsurfaceHandler for CompositorHandler {}
 
-impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for CompositorHandler {
+impl wp_viewporter::WpViewporterHandler for CompositorHandler {
     fn on_get_viewport(&mut self, ctx: &mut Context, id: u32, surface: u32) -> Action {
         if ctx
             .viewport_to_wl_surface
@@ -994,7 +994,7 @@ impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for Compos
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wp_viewporter::ERROR_VIEWPORT_EXISTS,
                 "wl_surface already has a wp_viewport",
             );
             return Action::Drop;
@@ -1006,7 +1006,7 @@ impl crate::protocols::viewporter::wp_viewporter::WpViewporterHandler for Compos
     }
 }
 
-impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for CompositorHandler {
+impl wp_viewport::WpViewportHandler for CompositorHandler {
     fn on_set_source(
         &mut self,
         ctx: &mut Context,
@@ -1019,7 +1019,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                3,
+                wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
             return Action::Drop;
@@ -1027,7 +1027,12 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
         let unset = (x, y, width, height) == (-256, -256, -256, -256);
         if !unset && (x < 0 || y < 0 || width <= 0 || height <= 0) {
             log::warn!("Rejecting invalid wp_viewport source rectangle");
-            queue_protocol_error(ctx, ctx.last_sender_id, 0, "invalid wp_viewport source");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                wp_viewport::ERROR_BAD_VALUE,
+                "invalid wp_viewport source",
+            );
             return Action::Drop;
         }
         let surface = ctx.surfaces.entry(surface_id).or_default();
@@ -1046,7 +1051,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                3,
+                wp_viewport::ERROR_NO_SURFACE,
                 "wp_viewport has no associated wl_surface",
             );
             return Action::Drop;
@@ -1061,7 +1066,7 @@ impl crate::protocols::viewporter::wp_viewport::WpViewportHandler for Compositor
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                0,
+                wp_viewport::ERROR_BAD_VALUE,
                 "invalid wp_viewport destination",
             );
             return Action::Drop;
@@ -2577,7 +2582,7 @@ mod tests {
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.fatal_protocol_error);
-        assert_eq!(protocol_error_code(&ctx), WL_SHM_ERROR_INVALID_FD);
+        assert_eq!(protocol_error_code(&ctx), wl_shm::ERROR_INVALID_FD);
         let error = &ctx.host_to_client_queue[0].0;
         assert_eq!(
             u32::from_ne_bytes(error[8..12].try_into().unwrap()),

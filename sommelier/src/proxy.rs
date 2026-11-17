@@ -1642,7 +1642,7 @@ mod tests {
             display_errors(&mut guest_peer),
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
             )],
             "the guest learns why, as libwayland-server reports an unknown sender"
         );
@@ -1666,7 +1666,7 @@ mod tests {
         drop(client);
         assert_eq!(
             display_errors(&mut guest_peer),
-            [(1, crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD)]
+            [(1, protocols::wayland::wl_display::ERROR_INVALID_METHOD)]
         );
         let mut forwarded = Vec::new();
         host_peer
@@ -1728,9 +1728,9 @@ mod tests {
     /// against the interface of the error's object.
     #[tokio::test]
     async fn rejected_requests_report_invalid_method_on_the_display() {
-        use crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD;
+        use protocols::wayland::wl_display::ERROR_INVALID_METHOD;
         use protocols::wayland::wl_surface::REQ_ATTACH;
-        let expected = [(crate::wire::WL_DISPLAY_ID, WL_DISPLAY_ERROR_INVALID_METHOD)];
+        let expected = [(crate::wire::WL_DISPLAY_ID, ERROR_INVALID_METHOD)];
 
         assert_eq!(
             surface_request_errors(|_| {}, REQ_ATTACH, &[0]).await,
@@ -1761,7 +1761,7 @@ mod tests {
             errors,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+                protocols::wayland::wl_display::ERROR_INVALID_OBJECT
             )],
             "the sender is checked before its opcode, as in libwayland-server"
         );
@@ -1787,7 +1787,7 @@ mod tests {
             .await,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+                protocols::wayland::wl_display::ERROR_INVALID_METHOD
             )]
         );
     }
@@ -1806,7 +1806,7 @@ mod tests {
             .await,
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_IMPLEMENTATION
+                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
             )]
         );
     }
@@ -1849,7 +1849,7 @@ mod tests {
             display_errors(&mut guest_peer),
             [(
                 crate::wire::WL_DISPLAY_ID,
-                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+                protocols::wayland::wl_display::ERROR_INVALID_METHOD
             )]
         );
     }

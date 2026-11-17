@@ -30,7 +30,7 @@ use crate::protocols::text_input_unstable_v3::{
 };
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
-use crate::protocols::wayland::{wl_fixes, wl_registry};
+use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_output_unstable_v1::{
     zxdg_output_manager_v1, ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED,
@@ -1167,7 +1167,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 queue_protocol_error(
                     ctx,
                     ctx.last_sender_id,
-                    0,
+                    wl_display::ERROR_INVALID_OBJECT,
                     format!(
                         "invalid bind for global {} (interface {}, version {})",
                         name, interface, version

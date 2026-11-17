@@ -31,14 +31,9 @@ use crate::protocols::wayland::wl_output;
 use crate::window_layout::Rect;
 use std::collections::HashMap;
 
-/// `wl_output.transform.normal`, the lowest enum value.
-const TRANSFORM_NORMAL: i32 = 0;
-/// `wl_output.transform.flipped_270`, the highest enum value.
-const TRANSFORM_FLIPPED_270: i32 = 7;
-
 /// Whether `transform` is a `wl_output.transform` enum value.
 pub(crate) fn is_valid_transform(transform: i32) -> bool {
-    (TRANSFORM_NORMAL..=TRANSFORM_FLIPPED_270).contains(&transform)
+    (wl_output::TRANSFORM_NORMAL..=wl_output::TRANSFORM_FLIPPED_270).contains(&transform)
 }
 
 /// Width and height of a `width` x `height` extent after `transform`.

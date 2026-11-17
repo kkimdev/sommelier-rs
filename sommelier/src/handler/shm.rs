@@ -33,34 +33,19 @@ use std::sync::Arc;
 
 pub struct ShmHandler;
 
-/// FourCC value used by ChromiumOS' wl_shm extension for semi-planar NV12.
-///
-/// wl_shm's original enum uses the same FourCC values as DRM for formats
-/// added after ARGB/XRGB. Keeping the value in one place prevents the SHM and
-/// linux-dmabuf shims from drifting apart.
-pub(crate) const WL_SHM_FORMAT_NV12: u32 = 0x3231_564e;
-
-/// Formats advertised by ChromiumOS Sommelier's wl_shm shim. The first two
-/// values are the Wayland ARGB/XRGB enum values; the remaining FourCC values
-/// are also the wl_shm values for NV12/RGB565/ABGR/XBGR.
+/// Formats advertised by ChromiumOS Sommelier's wl_shm shim. Every format
+/// after ARGB/XRGB has the same FourCC value in wl_shm and DRM, so the
+/// linux-dmabuf shim uses them as DRM formats too.
 pub(crate) const SUPPORTED_SHM_FORMATS: [u32; 6] = [
-    0, // WL_SHM_FORMAT_ARGB8888
-    1, // WL_SHM_FORMAT_XRGB8888
-    WL_SHM_FORMAT_NV12,
-    0x3631_4752, // WL_SHM_FORMAT_RGB565
-    0x3432_4241, // WL_SHM_FORMAT_ABGR8888
-    0x3432_4258, // WL_SHM_FORMAT_XBGR8888
+    wl_shm::FORMAT_ARGB8888,
+    wl_shm::FORMAT_XRGB8888,
+    wl_shm::FORMAT_NV12,
+    wl_shm::FORMAT_RGB565,
+    wl_shm::FORMAT_ABGR8888,
+    wl_shm::FORMAT_XBGR8888,
 ];
 
-/// `wl_shm.error` codes. The generated protocol code has no enum constants.
-const WL_SHM_ERROR_INVALID_FORMAT: u32 = 0;
-const WL_SHM_ERROR_INVALID_STRIDE: u32 = 1;
-pub(crate) const WL_SHM_ERROR_INVALID_FD: u32 = 2;
-
-const MANDATORY_SHM_FORMATS: [u32; 2] = [
-    0, // WL_SHM_FORMAT_ARGB8888
-    1, // WL_SHM_FORMAT_XRGB8888
-];
+const MANDATORY_SHM_FORMATS: [u32; 2] = [wl_shm::FORMAT_ARGB8888, wl_shm::FORMAT_XRGB8888];
 
 fn valid_pool_size(size: i32) -> Option<usize> {
     (size > 0)
@@ -82,9 +67,9 @@ fn shm_format_from_drm(format: u32) -> Option<u32> {
     match format {
         // DRM_FORMAT_ARGB8888/XRGB8888 use FourCC values while wl_shm uses
         // the enum values 0/1 for the same layouts.
-        0x3432_5241 => Some(0),
-        0x3432_5258 => Some(1),
-        WL_SHM_FORMAT_NV12 => Some(WL_SHM_FORMAT_NV12),
+        0x3432_5241 => Some(wl_shm::FORMAT_ARGB8888),
+        0x3432_5258 => Some(wl_shm::FORMAT_XRGB8888),
+        wl_shm::FORMAT_NV12 => Some(wl_shm::FORMAT_NV12),
         format if supported_shm_format(format) => Some(format),
         _ => None,
     }
@@ -96,7 +81,7 @@ fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
     // validates plane metadata and rejects separate dma-buf objects before
     // exposing a buffer to the host compositor.
     (MANDATORY_SHM_FORMATS.contains(&format) || ctx.host_shm_formats.contains(&format))
-        && (format != WL_SHM_FORMAT_NV12
+        && (format != wl_shm::FORMAT_NV12
             || ctx.virtwayland_channel.is_some()
             || (ctx.gpu_accel && ctx.host_dmabuf_id.is_some() && ctx.allocator.is_some()))
 }
@@ -194,14 +179,17 @@ fn valid_shm_stride(format: u32, width: i32, stride: i32) -> bool {
         .checked_mul(bytes_per_pixel)
         .is_some_and(|minimum| stride >= minimum);
     minimum
-        && (format != WL_SHM_FORMAT_NV12 || (width.is_multiple_of(2) && stride.is_multiple_of(2)))
+        && (format != wl_shm::FORMAT_NV12 || (width.is_multiple_of(2) && stride.is_multiple_of(2)))
 }
 
 fn format_bytes_per_pixel(format: u32) -> Option<usize> {
     match format {
-        WL_SHM_FORMAT_NV12 => Some(1),
-        0x3631_4752 => Some(2), // WL_SHM_FORMAT_RGB565
-        0 | 1 | 0x3432_4241 | 0x3432_4258 => Some(4),
+        wl_shm::FORMAT_NV12 => Some(1),
+        wl_shm::FORMAT_RGB565 => Some(2),
+        wl_shm::FORMAT_ARGB8888
+        | wl_shm::FORMAT_XRGB8888
+        | wl_shm::FORMAT_ABGR8888
+        | wl_shm::FORMAT_XBGR8888 => Some(4),
         _ => None,
     }
 }
@@ -248,13 +236,13 @@ fn valid_buffer_layout(
     if offset < 0 || width <= 0 || height <= 0 || stride <= 0 {
         return None;
     }
-    if format == WL_SHM_FORMAT_NV12 && (width % 2 != 0 || height % 2 != 0) {
+    if format == wl_shm::FORMAT_NV12 && (width % 2 != 0 || height % 2 != 0) {
         return None;
     }
     let offset = offset as usize;
     let stride = stride as usize;
     let height = height as usize;
-    let bytes = if format == WL_SHM_FORMAT_NV12 {
+    let bytes = if format == wl_shm::FORMAT_NV12 {
         let chroma_rows = height.checked_div(2)?;
         stride
             .checked_mul(height)?
@@ -273,7 +261,7 @@ fn valid_buffer_layout(
 /// Validated dma-buf layouts. A submodule so that nothing in this file can
 /// build a [`DmabufLayout`] except [`validate_dmabuf_layout`].
 mod dmabuf_layout {
-    use super::WL_SHM_FORMAT_NV12;
+    use crate::protocols::wayland::wl_shm;
 
     /// Where one plane lies in a dma-buf, as `zwp_linux_buffer_params_v1.add`
     /// sends it.
@@ -339,7 +327,7 @@ mod dmabuf_layout {
             return None;
         }
 
-        let (plane0_bpp, plane_count) = if format == WL_SHM_FORMAT_NV12 {
+        let (plane0_bpp, plane_count) = if format == wl_shm::FORMAT_NV12 {
             if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
                 return None;
             }
@@ -578,7 +566,7 @@ fn allocate_gbm_buffer(
     let fd = bo.fd().map_err(io::Error::other)?;
     let plane_count = bo.plane_count().map_err(io::Error::other)?;
     let offset0 = bo.offset(0).map_err(io::Error::other)?;
-    let (plane1_fd, stride1, offset1) = if drm_format == WL_SHM_FORMAT_NV12 {
+    let (plane1_fd, stride1, offset1) = if drm_format == wl_shm::FORMAT_NV12 {
         if plane_count != 2 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -619,7 +607,7 @@ fn allocate_gbm_buffer(
     // query failure as an allocation failure instead of silently labelling an
     // unknown/tiled BO as LINEAR (modifier 0).
     let modifier = bo.modifier().map(u64::from).map_err(io::Error::other)?;
-    if drm_format == WL_SHM_FORMAT_NV12 && modifier != 0 {
+    if drm_format == wl_shm::FORMAT_NV12 && modifier != 0 {
         // The NV12 copy path maps the PRIME descriptor directly because GBM's
         // single-plane map API does not promise that the UV plane is present.
         // A tiled/compressed modifier would make those linear byte offsets
@@ -939,7 +927,7 @@ pub(crate) fn copy_shm_damage(
     }
 
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
-    let plane_count = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 };
+    let plane_count = if format == wl_shm::FORMAT_NV12 { 2 } else { 1 };
     let merged_damage = match damage {
         DamageRegion::Full => vec![DamageRect::new(
             0,
@@ -957,7 +945,7 @@ pub(crate) fn copy_shm_damage(
 
         for plane in 0..plane_count {
             let (plane_bpp, plane_src_offset, plane_dst_offset) =
-                if format == WL_SHM_FORMAT_NV12 && plane == 1 {
+                if format == wl_shm::FORMAT_NV12 && plane == 1 {
                     // Chroma samples cover two horizontal pixels and two
                     // vertical pixels. Expand a partial damage rectangle to
                     // complete samples before copying.
@@ -989,7 +977,7 @@ pub(crate) fn copy_shm_damage(
                 } else {
                     (bytes_per_pixel, offset, 0usize)
                 };
-            let plane_dst_stride = if format == WL_SHM_FORMAT_NV12 && plane == 1 {
+            let plane_dst_stride = if format == wl_shm::FORMAT_NV12 && plane == 1 {
                 if dst_plane1_stride == 0 {
                     dst_stride
                 } else {
@@ -1087,7 +1075,7 @@ pub(crate) fn copy_shm_damage(
 /// proxy has no object to service it.  Wayland errors terminate the connection,
 /// which is the only safe outcome once allocation has failed.
 fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'static str) {
-    queue_protocol_error(ctx, object_id, WL_SHM_ERROR_INVALID_FD, message);
+    queue_protocol_error(ctx, object_id, wl_shm::ERROR_INVALID_FD, message);
 }
 
 /// Undo the guest mapping after a host `wl_buffer` has already been queued.
@@ -1274,7 +1262,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                WL_SHM_ERROR_INVALID_STRIDE,
+                wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm pool size",
             );
             return Action::Drop;
@@ -1295,7 +1283,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
                 queue_protocol_error(
                     ctx,
                     ctx.last_sender_id,
-                    WL_SHM_ERROR_INVALID_FD,
+                    wl_shm::ERROR_INVALID_FD,
                     "invalid wl_shm pool fd",
                 );
                 return Action::Drop;
@@ -1309,7 +1297,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             queue_protocol_error(
                 ctx,
                 ctx.last_sender_id,
-                WL_SHM_ERROR_INVALID_FD,
+                wl_shm::ERROR_INVALID_FD,
                 "invalid wl_shm pool fd",
             );
             return Action::Drop;
@@ -1588,7 +1576,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
     // SHM buffer.
     ctx.retire_destroyed_host_object(host_pool_id);
 
-    let (plane1_offset, plane1_stride) = if format == WL_SHM_FORMAT_NV12 {
+    let (plane1_offset, plane1_stride) = if format == wl_shm::FORMAT_NV12 {
         ((height as usize) * (stride as usize), stride as usize)
     } else {
         (0, 0)
@@ -1684,7 +1672,7 @@ fn create_dmabuf_buffer(
             return;
         };
         (ptr, size)
-    } else if format == WL_SHM_FORMAT_NV12 {
+    } else if format == wl_shm::FORMAT_NV12 {
         // GBM's map API does not guarantee that a multi-plane BO's UV
         // plane is included in the mapped slice. A direct dma-buf
         // mapping is therefore mandatory for NV12: falling back to
@@ -1823,7 +1811,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         }
         let Some(pool) = ctx.pools.get(&pool_id) else {
             warn!("Unknown pool ID: {}", pool_id);
-            queue_protocol_error(ctx, pool_id, WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool");
+            queue_protocol_error(
+                ctx,
+                pool_id,
+                wl_shm::ERROR_INVALID_FD,
+                "invalid wl_shm pool",
+            );
             return Action::Drop;
         };
         let pool_file = Arc::clone(&pool.file);
@@ -1833,7 +1826,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             queue_protocol_error(
                 ctx,
                 pool_id,
-                WL_SHM_ERROR_INVALID_FORMAT,
+                wl_shm::ERROR_INVALID_FORMAT,
                 "invalid wl_shm buffer format",
             );
             return Action::Drop;
@@ -1846,7 +1839,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             queue_protocol_error(
                 ctx,
                 pool_id,
-                WL_SHM_ERROR_INVALID_STRIDE,
+                wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm buffer stride",
             );
             return Action::Drop;
@@ -1862,7 +1855,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             queue_protocol_error(
                 ctx,
                 pool_id,
-                WL_SHM_ERROR_INVALID_STRIDE,
+                wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm buffer layout",
             );
             return Action::Drop;
@@ -1921,14 +1914,14 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     "Rejecting shrinking SHM pool resize from {} to {}",
                     pool.size, size
                 );
-                Some((WL_SHM_ERROR_INVALID_FD, "shrinking pool invalid"))
+                Some((wl_shm::ERROR_INVALID_FD, "shrinking pool invalid"))
             }
             Some(new_size) if !regular_file_has_size(&pool.file, new_size) => {
                 warn!(
                     "Rejecting SHM pool resize to {}: the pool file is too short",
                     new_size
                 );
-                Some((WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool fd"))
+                Some((wl_shm::ERROR_INVALID_FD, "invalid wl_shm pool fd"))
             }
             Some(new_size) => {
                 debug!(
@@ -2023,8 +2016,8 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 impl ShmHandler {
     fn wl_shm_format_to_drm_format(format: u32) -> u32 {
         match format {
-            0 => 0x34325241, // ARGB8888
-            1 => 0x34325258, // XRGB8888
+            wl_shm::FORMAT_ARGB8888 => 0x34325241, // DRM_FORMAT_ARGB8888
+            wl_shm::FORMAT_XRGB8888 => 0x34325258, // DRM_FORMAT_XRGB8888
             _ => format,
         }
     }
@@ -2041,12 +2034,12 @@ mod tests {
         record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
         regular_file_has_size, retire_eligible_buffers, rollback_registered_buffer,
         same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, ShmCopyError, WL_SHM_ERROR_INVALID_FD,
-        WL_SHM_FORMAT_NV12,
+        valid_shm_stride, validate_dmabuf_layout, ShmCopyError,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+    use crate::protocols::wayland::wl_shm;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
@@ -2183,7 +2176,7 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            WL_SHM_ERROR_INVALID_FD,
+            wl_shm::ERROR_INVALID_FD,
             "a resize past the file's end must use wl_shm.invalid_fd"
         );
         assert_eq!(ctx.pools[&pool_id].size, 4096);
@@ -2230,7 +2223,7 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            WL_SHM_ERROR_INVALID_FD,
+            wl_shm::ERROR_INVALID_FD,
             "shrinking a pool is wl_shm.invalid_fd, as in libwayland"
         );
         assert_eq!(ctx.pools[&pool_id].size, 4096);
@@ -2295,8 +2288,8 @@ mod tests {
     fn validates_shm_format_stride() {
         assert!(valid_shm_stride(0, 10, 40));
         assert!(valid_shm_stride(0x3631_4752, 10, 20));
-        assert!(valid_shm_stride(WL_SHM_FORMAT_NV12, 10, 10));
-        assert!(!valid_shm_stride(WL_SHM_FORMAT_NV12, 11, 11));
+        assert!(valid_shm_stride(wl_shm::FORMAT_NV12, 10, 10));
+        assert!(!valid_shm_stride(wl_shm::FORMAT_NV12, 11, 11));
         assert!(!valid_shm_stride(0, 10, 39));
         assert!(!valid_shm_stride(0xdead_beef, 10, 40));
     }
@@ -2316,15 +2309,15 @@ mod tests {
     #[test]
     fn validates_nv12_two_plane_pool_layout() {
         assert_eq!(
-            valid_buffer_layout(24, 0, 4, 4, 4, WL_SHM_FORMAT_NV12),
+            valid_buffer_layout(24, 0, 4, 4, 4, wl_shm::FORMAT_NV12),
             Some(24)
         );
         assert_eq!(
-            valid_buffer_layout(23, 0, 4, 4, 4, WL_SHM_FORMAT_NV12),
+            valid_buffer_layout(23, 0, 4, 4, 4, wl_shm::FORMAT_NV12),
             None
         );
         assert_eq!(
-            valid_buffer_layout(24, 0, 4, 3, 4, WL_SHM_FORMAT_NV12),
+            valid_buffer_layout(24, 0, 4, 3, 4, wl_shm::FORMAT_NV12),
             None,
         );
     }
@@ -2341,7 +2334,7 @@ mod tests {
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
                 dest_size: destination.len(),
-                format: WL_SHM_FORMAT_NV12,
+                format: wl_shm::FORMAT_NV12,
                 offset: 0,
                 width: 4,
                 src_stride: 4,
@@ -2363,7 +2356,7 @@ mod tests {
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
                 dest_size: 23,
-                format: WL_SHM_FORMAT_NV12,
+                format: wl_shm::FORMAT_NV12,
                 offset: 0,
                 width: 4,
                 src_stride: 4,
@@ -2472,7 +2465,7 @@ mod tests {
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
                 dest_size: destination.len(),
-                format: WL_SHM_FORMAT_NV12,
+                format: wl_shm::FORMAT_NV12,
                 offset: 0,
                 width: 4,
                 src_stride: 4,
@@ -2503,7 +2496,7 @@ mod tests {
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
                 dest_size: destination.len(),
-                format: WL_SHM_FORMAT_NV12,
+                format: wl_shm::FORMAT_NV12,
                 offset: 0,
                 width: 4,
                 src_stride: 4,
@@ -2543,7 +2536,7 @@ mod tests {
         assert_eq!(layout.span(), 4096 + 512 * 32);
 
         let nv12 = validate_dmabuf_layout(
-            WL_SHM_FORMAT_NV12,
+            wl_shm::FORMAT_NV12,
             64,
             32,
             [64, 64, 0],
@@ -2559,12 +2552,12 @@ mod tests {
         );
         assert_eq!(nv12.plane1_relative_offset(), 64 * 32 + 4096);
         assert!(
-            validate_dmabuf_layout(WL_SHM_FORMAT_NV12, 64, 32, [64, 64, 0], [4096, 0, 0],)
+            validate_dmabuf_layout(wl_shm::FORMAT_NV12, 64, 32, [64, 64, 0], [4096, 0, 0],)
                 .is_none()
         );
         assert!(
             validate_dmabuf_layout(
-                WL_SHM_FORMAT_NV12,
+                wl_shm::FORMAT_NV12,
                 64,
                 32,
                 [64, 64, 0],
@@ -2623,9 +2616,9 @@ mod tests {
     fn nv12_is_not_advertised_without_a_real_output_allocator() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
         ctx.host_dmabuf_id = Some(7);
-        ctx.host_shm_formats.insert(WL_SHM_FORMAT_NV12);
+        ctx.host_shm_formats.insert(wl_shm::FORMAT_NV12);
         assert!(
-            !guest_shm_format_available(&ctx, WL_SHM_FORMAT_NV12),
+            !guest_shm_format_available(&ctx, wl_shm::FORMAT_NV12),
             "advertising NV12 without VirtWL or GBM would make create_buffer fail"
         );
     }
@@ -2888,7 +2881,7 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            super::WL_SHM_ERROR_INVALID_FD,
+            wl_shm::ERROR_INVALID_FD,
             "a buffer whose storage fails reports wl_shm.invalid_fd"
         );
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);

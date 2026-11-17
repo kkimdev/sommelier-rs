@@ -21,14 +21,6 @@ use log::error;
 
 pub struct DisplayHandler;
 
-/// `wl_display.error` code: the request names an object that does not
-/// exist.
-pub(crate) const WL_DISPLAY_ERROR_INVALID_OBJECT: u32 = 0;
-/// `wl_display.error` code: the request is not valid for its object.
-pub(crate) const WL_DISPLAY_ERROR_INVALID_METHOD: u32 = 1;
-/// `wl_display.error` code: the compositor (here, the proxy) failed.
-pub(crate) const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
-
 /// End a fatal session with an `implementation` error if nothing has told
 /// the guest why yet: internal failures (a dma-buf sync that fails during
 /// a commit, say) mark the session fatal without an error of their own,
@@ -39,7 +31,7 @@ pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
         queue_protocol_error(
             ctx,
             WL_DISPLAY_ID,
-            WL_DISPLAY_ERROR_IMPLEMENTATION,
+            wl_display::ERROR_IMPLEMENTATION,
             "the proxy failed to handle a request",
         );
     }
@@ -54,8 +46,8 @@ pub(crate) fn queue_error_if_none_queued(ctx: &mut Context) {
 /// used, even one that names the sender).
 pub(crate) fn queue_request_error(ctx: &mut Context, error: &ProtocolError) {
     let code = match error {
-        ProtocolError::InvalidSender(_) => WL_DISPLAY_ERROR_INVALID_OBJECT,
-        _ => WL_DISPLAY_ERROR_INVALID_METHOD,
+        ProtocolError::InvalidSender(_) => wl_display::ERROR_INVALID_OBJECT,
+        _ => wl_display::ERROR_INVALID_METHOD,
     };
     queue_protocol_error(ctx, WL_DISPLAY_ID, code, error.to_string());
 }

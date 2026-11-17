@@ -525,18 +525,6 @@ pub(crate) fn register_window_bounds_barrier_for_test(
         .register_barrier(callback_host_id, zaura_toplevel_host_id);
 }
 
-/// Return the `xdg_toplevel` version that introduced `state`, per the
-/// vendored xdg-shell.xml, or `None` for values xdg-shell does not define.
-fn xdg_toplevel_state_since(state: u32) -> Option<u32> {
-    match state {
-        1..=4 => Some(1),   // maximized, fullscreen, resizing, activated
-        5..=8 => Some(2),   // tiled_left/right/top/bottom
-        9 => Some(6),       // suspended
-        10..=13 => Some(7), // constrained_left/right/top/bottom
-        _ => None,
-    }
-}
-
 /// Keep only the XDG states the guest's `xdg_toplevel` version can receive.
 ///
 /// `zaura_toplevel.configure` carries XDG states plus Aura-only supplements
@@ -550,7 +538,7 @@ fn guest_xdg_toplevel_states(states: &[u8], guest_version: u32) -> Vec<u8> {
         .iter()
         .filter(|entry| {
             let state = u32::from_ne_bytes(**entry);
-            xdg_toplevel_state_since(state).is_some_and(|since| since <= guest_version)
+            xdg_toplevel::state_since(state).is_some_and(|since| since <= guest_version)
         })
         .flatten()
         .copied()

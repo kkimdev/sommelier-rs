@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::{record_host_shm_drm_format, WL_SHM_FORMAT_NV12};
+use crate::handler::shm::record_host_shm_drm_format;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
+use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
-use crate::wire::{queue_or_drop, Action, Outgoing};
+use crate::wire::{queue_or_drop, Action, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
 use std::fs::File;
 use std::io::{self, Write};
@@ -51,7 +52,7 @@ fn is_supported_drm_format(format: u32) -> bool {
     // host feedback protocol).
     matches!(
         format,
-        WL_SHM_FORMAT_NV12 // DRM_FORMAT_NV12
+        wl_shm::FORMAT_NV12 // DRM_FORMAT_NV12
             | 0x3631_4752 // DRM_FORMAT_RGB565
             | 0x3432_5258 // DRM_FORMAT_XRGB8888
             | 0x3432_5241 // DRM_FORMAT_ARGB8888
@@ -281,7 +282,7 @@ fn dmabuf_plane_layout(format: u32, plane_idx: u32, width: i32, height: i32) -> 
     let width = u64::try_from(width).ok()?;
     let height = u64::try_from(height).ok()?;
     match format {
-        WL_SHM_FORMAT_NV12 if width % 2 == 0 && height % 2 == 0 && plane_idx < 2 => {
+        wl_shm::FORMAT_NV12 if width % 2 == 0 && height % 2 == 0 && plane_idx < 2 => {
             Some((width, if plane_idx == 0 { height } else { height / 2 }))
         }
         0x3631_4752 if plane_idx == 0 => Some((width.checked_mul(2)?, height)),
@@ -363,7 +364,12 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+                queue_protocol_error(
+                    ctx,
+                    WL_DISPLAY_ID,
+                    wl_display::ERROR_INVALID_METHOD,
+                    "unable to allocate linux-dmabuf feedback",
+                );
             }
         }
         Action::Drop
@@ -398,7 +404,12 @@ impl LinuxDmabufHandler {
                     generation,
                     error
                 );
-                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+                queue_protocol_error(
+                    ctx,
+                    WL_DISPLAY_ID,
+                    wl_display::ERROR_INVALID_METHOD,
+                    "unable to allocate linux-dmabuf feedback",
+                );
                 break;
             }
         }
@@ -438,7 +449,12 @@ impl LinuxDmabufHandler {
                     error
                 );
                 ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
-                queue_protocol_error(ctx, 1, 1, "unable to allocate linux-dmabuf feedback");
+                queue_protocol_error(
+                    ctx,
+                    WL_DISPLAY_ID,
+                    wl_display::ERROR_INVALID_METHOD,
+                    "unable to allocate linux-dmabuf feedback",
+                );
                 break;
             }
         }
@@ -533,7 +549,7 @@ impl LinuxDmabufHandler {
         let Some(params) = ctx.pending_params.get(&params_id) else {
             return false;
         };
-        let expected_planes: u32 = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 }; // DRM_FORMAT_NV12
+        let expected_planes: u32 = if format == wl_shm::FORMAT_NV12 { 2 } else { 1 }; // DRM_FORMAT_NV12
         if params.len() != expected_planes as usize {
             return false;
         }
@@ -555,31 +571,31 @@ impl LinuxDmabufHandler {
         format: u32,
     ) -> u32 {
         if width <= 0 || height <= 0 {
-            return 5; // invalid_dimensions
+            return zwp_linux_buffer_params_v1::ERROR_INVALID_DIMENSIONS;
         }
         if !is_supported_drm_format(format) {
-            return 4; // invalid_format
+            return zwp_linux_buffer_params_v1::ERROR_INVALID_FORMAT;
         }
-        let expected_planes = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 };
+        let expected_planes = if format == wl_shm::FORMAT_NV12 { 2 } else { 1 };
         let Some(params) = ctx.pending_params.get(&params_id) else {
-            return 3; // incomplete
+            return zwp_linux_buffer_params_v1::ERROR_INCOMPLETE;
         };
         if params.len() != expected_planes {
-            return 3; // incomplete
+            return zwp_linux_buffer_params_v1::ERROR_INCOMPLETE;
         }
         let mut seen = std::collections::HashSet::new();
         for param in params {
             if param.plane_idx >= expected_planes as u32 {
-                return 1; // plane_idx
+                return zwp_linux_buffer_params_v1::ERROR_PLANE_IDX;
             }
             if !seen.insert(param.plane_idx) {
-                return 2; // plane_set
+                return zwp_linux_buffer_params_v1::ERROR_PLANE_SET;
             }
             if !valid_dmabuf_plane(param, format, width, height) {
-                return 6; // out_of_bounds
+                return zwp_linux_buffer_params_v1::ERROR_OUT_OF_BOUNDS;
             }
         }
-        3
+        zwp_linux_buffer_params_v1::ERROR_INCOMPLETE
     }
 }
 
@@ -939,11 +955,21 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            queue_protocol_error(
+                ctx,
+                params_id,
+                zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
+                "linux-dmabuf params already used",
+            );
             return Action::Drop;
         }
         if plane_idx > 1 {
-            queue_protocol_error(ctx, params_id, 1, "dmabuf plane index out of bounds");
+            queue_protocol_error(
+                ctx,
+                params_id,
+                zwp_linux_buffer_params_v1::ERROR_PLANE_IDX,
+                "dmabuf plane index out of bounds",
+            );
             return Action::Drop;
         }
         if ctx
@@ -951,7 +977,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             .get(&params_id)
             .is_some_and(|params| params.iter().any(|param| param.plane_idx == plane_idx))
         {
-            queue_protocol_error(ctx, params_id, 2, "dmabuf plane was already set");
+            queue_protocol_error(
+                ctx,
+                params_id,
+                zwp_linux_buffer_params_v1::ERROR_PLANE_SET,
+                "dmabuf plane was already set",
+            );
             return Action::Drop;
         }
 
@@ -1014,7 +1045,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     ) -> Action {
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            queue_protocol_error(
+                ctx,
+                params_id,
+                zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
+                "linux-dmabuf params already used",
+            );
             return Action::Drop;
         }
         if !Self::valid_params(ctx, params_id, width, height, format) {
@@ -1153,7 +1189,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     ) -> Action {
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
-            queue_protocol_error(ctx, params_id, 0, "linux-dmabuf params already used");
+            queue_protocol_error(
+                ctx,
+                params_id,
+                zwp_linux_buffer_params_v1::ERROR_ALREADY_USED,
+                "linux-dmabuf params already used",
+            );
             return Action::Drop;
         }
         // A params object is tracked as soon as create_params is decoded. If
@@ -1226,12 +1267,13 @@ mod tests {
         MAX_TRANCHE_INDICES_PER_EVENT,
     };
     use crate::handler::display::DisplayHandler;
-    use crate::handler::shm::{ShmHandler, WL_SHM_FORMAT_NV12};
+    use crate::handler::shm::ShmHandler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
     use crate::protocols::wayland::wl_display::WlDisplayHandler;
+    use crate::protocols::wayland::wl_shm;
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
     use crate::test_support::{any_fd_has_identity, fd_identity};
     use crate::wire::{Action, WireMessage};
@@ -1456,7 +1498,7 @@ mod tests {
 
     #[test]
     fn supported_formats_match_chromiumos_format_table() {
-        assert!(is_supported_drm_format(WL_SHM_FORMAT_NV12)); // NV12
+        assert!(is_supported_drm_format(wl_shm::FORMAT_NV12)); // NV12
         assert!(is_supported_drm_format(0x3631_4752)); // RGB565
         assert!(is_supported_drm_format(0x3432_5258)); // XRGB8888
         assert!(is_supported_drm_format(0x3432_5241)); // ARGB8888
@@ -1806,7 +1848,7 @@ mod tests {
 
         let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, WL_SHM_FORMAT_NV12, 0),
+            handler.on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
             Action::Drop
         );
         assert_eq!(
@@ -1859,7 +1901,7 @@ mod tests {
 
         let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, WL_SHM_FORMAT_NV12, 0),
+            handler.on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
             Action::Drop
         );
         assert_eq!(

@@ -462,7 +462,10 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         );
         return false;
     }
-    for state in [1, 0] {
+    for state in [
+        wl_keyboard::KEY_STATE_PRESSED,
+        wl_keyboard::KEY_STATE_RELEASED,
+    ] {
         ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
         ctx.host_to_client_queue.push(wl_keyboard::evt::key(
             held.guest_keyboard_id,
@@ -770,9 +773,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         if let Some((keyboard_id, host_keyboard_id)) = keyboard {
             if !matches!(
                 state,
-                crate::handler::keyboard::WL_KEY_PRESSED
-                    | crate::handler::keyboard::WL_KEY_REPEATED
-                    | crate::handler::keyboard::WL_KEY_RELEASED
+                wl_keyboard::KEY_STATE_PRESSED
+                    | wl_keyboard::KEY_STATE_REPEATED
+                    | wl_keyboard::KEY_STATE_RELEASED
             ) {
                 log::warn!(
                     "Ignoring keysym with invalid key state {} for sym=0x{:x}",
@@ -789,11 +792,11 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 .or_else(|| keysym_to_evdev_keycode(sym));
             if let Some(keycode) = keycode {
                 let event = match state {
-                    crate::handler::keyboard::WL_KEY_PRESSED => GuestKeyEvent::TextInputPress {
+                    wl_keyboard::KEY_STATE_PRESSED => GuestKeyEvent::TextInputPress {
                         serial: wayland_serial,
                     },
-                    crate::handler::keyboard::WL_KEY_REPEATED => GuestKeyEvent::TextInputRepeat,
-                    crate::handler::keyboard::WL_KEY_RELEASED => GuestKeyEvent::TextInputRelease {
+                    wl_keyboard::KEY_STATE_REPEATED => GuestKeyEvent::TextInputRepeat,
+                    wl_keyboard::KEY_STATE_RELEASED => GuestKeyEvent::TextInputRelease {
                         serial: wayland_serial,
                     },
                     _ => unreachable!("keysym state validated above"),
@@ -808,8 +811,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                     );
                     return Action::Drop;
                 }
-                if ((state == crate::handler::keyboard::WL_KEY_PRESSED
-                    || state == crate::handler::keyboard::WL_KEY_REPEATED)
+                if ((state == wl_keyboard::KEY_STATE_PRESSED
+                    || state == wl_keyboard::KEY_STATE_REPEATED)
                     && keycode != crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
                     || (decision.ends_repeat
                         && keycode == crate::handler::keyboard::EVDEV_KEY_BACKSPACE)
@@ -2798,8 +2801,8 @@ mod tests {
             );
             assert_eq!(ctx.host_to_client_queue.len(), 3);
             for (message, expected_state) in ctx.host_to_client_queue[..2].iter().zip([
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ]) {
                 assert_eq!(
                     msg_sender(std::slice::from_ref(message), 0),
@@ -3932,7 +3935,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -3981,7 +3984,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_REPEATED,
+                wl_keyboard::KEY_STATE_REPEATED,
                 0,
             ),
             Action::Drop
@@ -3998,7 +4001,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_ne_bytes(payload[12..16].try_into().unwrap()),
-            crate::handler::keyboard::WL_KEY_REPEATED
+            wl_keyboard::KEY_STATE_REPEATED
         );
     }
 
@@ -4028,7 +4031,7 @@ mod tests {
                 10,
                 1,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4036,24 +4039,12 @@ mod tests {
 
         ctx.last_sender_id = host_extended_id;
         assert_eq!(
-            keyboard.on_peek_key(
-                &mut ctx,
-                1,
-                10,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            ),
+            keyboard.on_peek_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
             Action::Drop
         );
         ctx.last_sender_id = host_keyboard_id;
         assert_eq!(
-            keyboard.on_key(
-                &mut ctx,
-                1,
-                10,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            ),
+            keyboard.on_key(&mut ctx, 1, 10, keycode, wl_keyboard::KEY_STATE_PRESSED,),
             Action::Drop,
             "the delayed keyboard channel must not emit a duplicate press"
         );
@@ -4065,7 +4056,7 @@ mod tests {
                 20,
                 2,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
                 0,
             ),
             Action::Drop
@@ -4079,8 +4070,8 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ]
         );
         assert_eq!(
@@ -4102,8 +4093,8 @@ mod tests {
         let mut handler = TextInputV1Handler;
 
         for (serial, state) in [
-            (1, crate::handler::keyboard::WL_KEY_PRESSED),
-            (2, crate::handler::keyboard::WL_KEY_RELEASED),
+            (1, wl_keyboard::KEY_STATE_PRESSED),
+            (2, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4121,7 +4112,7 @@ mod tests {
             10,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4131,8 +4122,8 @@ mod tests {
         );
 
         for (serial, state) in [
-            (3, crate::handler::keyboard::WL_KEY_PRESSED),
-            (4, crate::handler::keyboard::WL_KEY_RELEASED),
+            (3, wl_keyboard::KEY_STATE_PRESSED),
+            (4, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4154,7 +4145,7 @@ mod tests {
             10,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4176,10 +4167,10 @@ mod tests {
         let mut handler = TextInputV1Handler;
 
         for (serial, state) in [
-            (u32::MAX - 1, crate::handler::keyboard::WL_KEY_PRESSED),
-            (u32::MAX, crate::handler::keyboard::WL_KEY_RELEASED),
-            (0, crate::handler::keyboard::WL_KEY_PRESSED),
-            (1, crate::handler::keyboard::WL_KEY_RELEASED),
+            (u32::MAX - 1, wl_keyboard::KEY_STATE_PRESSED),
+            (u32::MAX, wl_keyboard::KEY_STATE_RELEASED),
+            (0, wl_keyboard::KEY_STATE_PRESSED),
+            (1, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             handler.on_keysym(
                 &mut ctx,
@@ -4223,7 +4214,7 @@ mod tests {
             0x8000_0010,
             1000,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4231,7 +4222,7 @@ mod tests {
             1000,
             0x8000_0010,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         text_input.on_keysym(
@@ -4239,7 +4230,7 @@ mod tests {
             1010,
             0x8000_0011,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
@@ -4248,7 +4239,7 @@ mod tests {
             0x8000_0012,
             1020,
             keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
         );
 
         ctx.last_sender_id = host_v1_id;
@@ -4257,7 +4248,7 @@ mod tests {
             1100,
             0x8000_0020,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(ctx.host_to_client_queue.len(), 3);
@@ -4272,7 +4263,7 @@ mod tests {
             0x8000_0020,
             1100,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         assert_eq!(
             ctx.guest_key_owner(HostId(host_keyboard_id), keycode),
@@ -4306,7 +4297,7 @@ mod tests {
             u32::MAX - 3,
             1000,
             keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
         );
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4314,17 +4305,11 @@ mod tests {
             1000,
             u32::MAX - 2,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            0,
-            1010,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
+        keyboard.on_peek_key(&mut ctx, 0, 1010, keycode, wl_keyboard::KEY_STATE_RELEASED);
 
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4332,7 +4317,7 @@ mod tests {
             1005,
             u32::MAX - 1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         assert_eq!(
@@ -4351,7 +4336,7 @@ mod tests {
             1100,
             1,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         text_input.on_keysym(
@@ -4359,7 +4344,7 @@ mod tests {
             1010,
             u32::MAX,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         text_input.on_keysym(
@@ -4367,7 +4352,7 @@ mod tests {
             1110,
             2,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
 
@@ -4379,10 +4364,10 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ],
             "the old and current generations must each retain one balanced key pair"
         );
@@ -4408,37 +4393,19 @@ mod tests {
         let mut keyboard = KeyboardHandler::new();
 
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            10,
-            100,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
             &mut ctx,
             100,
             10,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            11,
-            110,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
-        keyboard.on_peek_key(
-            &mut ctx,
-            20,
-            200,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
+        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
@@ -4446,7 +4413,7 @@ mod tests {
             110,
             11,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         assert!(
@@ -4461,8 +4428,8 @@ mod tests {
         );
 
         for (serial, state) in [
-            (20, crate::handler::keyboard::WL_KEY_PRESSED),
-            (21, crate::handler::keyboard::WL_KEY_RELEASED),
+            (20, wl_keyboard::KEY_STATE_PRESSED),
+            (21, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             text_input.on_keysym(
                 &mut ctx,
@@ -4481,10 +4448,10 @@ mod tests {
         assert_eq!(
             states,
             vec![
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
+                wl_keyboard::KEY_STATE_PRESSED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ],
             "each physical generation must produce one balanced guest pair"
         );
@@ -4510,42 +4477,24 @@ mod tests {
         let mut keyboard = KeyboardHandler::new();
 
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            10,
-            100,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 10, 100, keycode, wl_keyboard::KEY_STATE_PRESSED);
         ctx.last_sender_id = host_v1_id;
         text_input.on_keysym(
             &mut ctx,
             100,
             10,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         ctx.last_sender_id = host_extended_id;
-        keyboard.on_peek_key(
-            &mut ctx,
-            11,
-            110,
-            keycode,
-            crate::handler::keyboard::WL_KEY_RELEASED,
-        );
-        keyboard.on_peek_key(
-            &mut ctx,
-            20,
-            200,
-            keycode,
-            crate::handler::keyboard::WL_KEY_PRESSED,
-        );
+        keyboard.on_peek_key(&mut ctx, 11, 110, keycode, wl_keyboard::KEY_STATE_RELEASED);
+        keyboard.on_peek_key(&mut ctx, 20, 200, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
         ctx.last_sender_id = host_v1_id;
         for (serial, state) in [
-            (20, crate::handler::keyboard::WL_KEY_PRESSED),
-            (21, crate::handler::keyboard::WL_KEY_RELEASED),
+            (20, wl_keyboard::KEY_STATE_PRESSED),
+            (21, wl_keyboard::KEY_STATE_RELEASED),
         ] {
             text_input.on_keysym(
                 &mut ctx,
@@ -4567,7 +4516,7 @@ mod tests {
             110,
             11,
             xkbcommon::xkb::keysyms::KEY_a,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
         assert_eq!(
@@ -4583,14 +4532,14 @@ mod tests {
         assert_eq!(
             states
                 .iter()
-                .filter(|&&state| state == crate::handler::keyboard::WL_KEY_PRESSED)
+                .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
                 .count(),
             2
         );
         assert_eq!(
             states
                 .iter()
-                .filter(|&&state| state == crate::handler::keyboard::WL_KEY_RELEASED)
+                .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
                 .count(),
             2,
             "both guest presses must eventually receive one release"
@@ -4623,7 +4572,7 @@ mod tests {
                 u32::MAX - 3,
                 1000,
                 keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
             );
             ctx.last_sender_id = host_v1_id;
             text_input.on_keysym(
@@ -4631,7 +4580,7 @@ mod tests {
                 1000,
                 u32::MAX - 2,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             );
             ctx.last_sender_id = host_extended_id;
@@ -4640,7 +4589,7 @@ mod tests {
                 u32::MAX - 1,
                 1010,
                 keycode,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
             );
 
             // The next keysym press is the first event of its generation. It
@@ -4652,7 +4601,7 @@ mod tests {
                 1100,
                 0,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             );
             assert_eq!(
@@ -4660,13 +4609,7 @@ mod tests {
                 Some(GuestKeyOwner::TextInputKeysym)
             );
             ctx.last_sender_id = host_extended_id;
-            keyboard.on_peek_key(
-                &mut ctx,
-                1,
-                1100,
-                keycode,
-                crate::handler::keyboard::WL_KEY_PRESSED,
-            );
+            keyboard.on_peek_key(&mut ctx, 1, 1100, keycode, wl_keyboard::KEY_STATE_PRESSED);
 
             ctx.last_sender_id = host_v1_id;
             let releases = if old_release_first {
@@ -4680,7 +4623,7 @@ mod tests {
                     timestamp,
                     serial,
                     xkbcommon::xkb::keysyms::KEY_a,
-                    crate::handler::keyboard::WL_KEY_RELEASED,
+                    wl_keyboard::KEY_STATE_RELEASED,
                     0,
                 );
             }
@@ -4698,14 +4641,14 @@ mod tests {
             assert_eq!(
                 states
                     .iter()
-                    .filter(|&&state| state == crate::handler::keyboard::WL_KEY_PRESSED)
+                    .filter(|&&state| state == wl_keyboard::KEY_STATE_PRESSED)
                     .count(),
                 2
             );
             assert_eq!(
                 states
                     .iter()
-                    .filter(|&&state| state == crate::handler::keyboard::WL_KEY_RELEASED)
+                    .filter(|&&state| state == wl_keyboard::KEY_STATE_RELEASED)
                     .count(),
                 2,
                 "both keysym-first generations must remain balanced"
@@ -4731,7 +4674,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_a,
-                crate::handler::keyboard::WL_KEY_REPEATED,
+                wl_keyboard::KEY_STATE_REPEATED,
                 0,
             ),
             Action::Drop
@@ -4770,7 +4713,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4818,7 +4761,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_A,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4860,7 +4803,7 @@ mod tests {
                 123,
                 456,
                 xkbcommon::xkb::keysyms::KEY_A,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
                 0,
             ),
             Action::Drop
@@ -4901,7 +4844,7 @@ mod tests {
                 124,
                 457,
                 xkbcommon::xkb::keysyms::KEY_BackSpace,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
                 0,
             ),
             Action::Drop
@@ -4942,7 +4885,7 @@ mod tests {
             123,
             456,
             xkbcommon::xkb::keysyms::KEY_BackSpace,
-            crate::handler::keyboard::WL_KEY_PRESSED,
+            wl_keyboard::KEY_STATE_PRESSED,
             0,
         );
         handler.on_keysym(
@@ -4950,7 +4893,7 @@ mod tests {
             124,
             457,
             xkbcommon::xkb::keysyms::KEY_BackSpace,
-            crate::handler::keyboard::WL_KEY_RELEASED,
+            wl_keyboard::KEY_STATE_RELEASED,
             0,
         );
 

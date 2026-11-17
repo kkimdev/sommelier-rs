@@ -48,7 +48,7 @@ impl wl_seat::WlSeatHandler for SeatHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
+    use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
     use crate::protocols::wayland::wl_seat::WlSeatHandler;
     use crate::state::{Context, GuestKeyOwner, HostId, TextInputState};
 
@@ -167,7 +167,7 @@ mod tests {
                 1,
                 100,
                 key,
-                crate::handler::keyboard::WL_KEY_PRESSED,
+                wl_keyboard::KEY_STATE_PRESSED,
             ),
             Action::Forward
         );
@@ -190,7 +190,7 @@ mod tests {
                 2,
                 101,
                 key,
-                crate::handler::keyboard::WL_KEY_RELEASED,
+                wl_keyboard::KEY_STATE_RELEASED,
             ),
             Action::Forward,
             "a live child keyboard must forward the release after seat release"

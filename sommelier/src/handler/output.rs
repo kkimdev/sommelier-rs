@@ -24,18 +24,13 @@ limitations under the License.
 //! integer `wl_output.scale` cannot.
 
 use crate::handler::aura_objects;
-use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
+use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
 pub struct OutputHandler;
-
-/// `wl_output.mode.current` from the vendored protocol.
-const WL_OUTPUT_MODE_CURRENT: u32 = 1;
-/// `zaura_output.scale_property.current` from the vendored protocol.
-const ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT: u32 = 1;
 
 /// Host `wl_output` events feed [`crate::state::OutputRegistry`] and are
 /// forwarded unchanged. Events from a released output never get here: the
@@ -82,7 +77,7 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         _refresh: i32,
     ) -> Action {
         ctx.outputs.update(ctx.last_sender_id, |output| {
-            if flags & WL_OUTPUT_MODE_CURRENT != 0
+            if flags & wl_output::MODE_CURRENT != 0
                 || output.mode_width <= 0
                 || output.mode_height <= 0
             {
@@ -163,7 +158,7 @@ impl ZauraOutputHandler for OutputHandler {
 
     fn on_scale(&mut self, ctx: &mut Context, flags: u32, scale: u32) -> Action {
         // Preferred scales describe choices, not the active DP geometry.
-        if flags & ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT == 0 {
+        if flags & zaura_output::SCALE_PROPERTY_CURRENT == 0 {
             return Action::Drop;
         }
         let Some(wl_output_id) = ctx.outputs.aura_event_target(ctx.last_sender_id) else {
@@ -317,9 +312,9 @@ pub(crate) mod fixture {
         let (x, y) = display.origin;
         let (width, height) = display.mode;
         handler.on_geometry(ctx, x, y, 0, 0, 0, &no_name, &no_name, display.transform);
-        handler.on_mode(ctx, WL_OUTPUT_MODE_CURRENT, width, height, 60);
+        handler.on_mode(ctx, wl_output::MODE_CURRENT, width, height, 60);
         ctx.last_sender_id = ctx.outputs.aura_output(host_output).expect("Aura output");
-        let current = ZAURA_OUTPUT_SCALE_PROPERTY_CURRENT;
+        let current = zaura_output::SCALE_PROPERTY_CURRENT;
         ZauraOutputHandler::on_scale(&mut handler, ctx, current, 1000);
         handler.on_device_scale_factor(ctx, display.device_scale);
         handler.on_insets(ctx, 0, 0, display.shelf, 0);
