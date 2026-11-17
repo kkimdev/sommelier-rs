@@ -257,7 +257,7 @@ mod tests {
     fn unmapped_request_is_rejected_before_handler_state_mutation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let payload = 20u32.to_ne_bytes();
-        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload, &[]);
+        let mut msg = WireMessage::new(999, wl_display::REQ_GET_REGISTRY, &payload);
         let mut handler = ProbeHandler;
 
         assert_eq!(

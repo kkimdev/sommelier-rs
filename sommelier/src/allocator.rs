@@ -545,21 +545,12 @@ impl Allocator {
     /// the metadata supplied by the guest.
     pub fn fixup_dmabuf_plane0(
         &self,
-        fd: RawFd,
+        fd: BorrowedFd<'_>,
         guest_stride: u32,
         guest_modifier: u64,
     ) -> DmabufPlane0Fixup {
-        if fd < 0 {
-            return apply_dmabuf_plane0_fixup(
-                guest_stride,
-                guest_modifier,
-                None,
-                self.drm_has_virtgpu_resource_info_type,
-            );
-        }
-
         let mut prime = DrmPrimeHandle {
-            fd,
+            fd: fd.as_raw_fd(),
             ..DrmPrimeHandle::default()
         };
         let prime_result = unsafe {

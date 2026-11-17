@@ -279,17 +279,9 @@ fn map_type(arg: &Arg) -> TokenStream {
             }
         }
         "array" => quote! { Vec<u8> },
-        "fd" => quote! { RawFd },
+        // A decoded message owns its descriptors; dropping it closes them.
+        "fd" => quote! { std::os::fd::OwnedFd },
         _ => quote! { u32 },
-    }
-}
-
-fn map_type_fq(arg: &Arg) -> TokenStream {
-    match arg.typ.as_str() {
-        "fd" => quote! { std::os::unix::io::RawFd },
-        // For other types, map_type returns primitives or standard library types (String, Vec)
-        // or tuples of them, so it's safe to reuse.
-        _ => map_type(arg),
     }
 }
 
@@ -335,7 +327,7 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
         }
         "string" => quote! { builder.write_string(&#name) },
         "array" => quote! { builder.write_array(&#name) },
-        "fd" => quote! { builder.write_fd(#name) },
+        "fd" => quote! { builder.write_fd(#name.into_raw_fd()) },
         _ => quote! { builder.write_u32(#name) },
     }
 }
@@ -422,6 +414,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             || (arg.typ == "new_id" && arg.interface.is_none())
                         {
                             handler_call_args.push(quote! { &#name });
+                        } else if arg.typ == "fd" {
+                            handler_call_args.push(quote! { std::os::fd::AsFd::as_fd(&#name) });
                         } else {
                             handler_call_args.push(quote! { #name });
                         }
@@ -618,6 +612,8 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             || (arg.typ == "new_id" && arg.interface.is_none())
                         {
                             handler_call_args.push(quote! { &#name });
+                        } else if arg.typ == "fd" {
+                            handler_call_args.push(quote! { std::os::fd::AsFd::as_fd(&#name) });
                         } else {
                             handler_call_args.push(quote! { #name });
                         }
@@ -885,7 +881,7 @@ fn generate_delegation_macro(protocol: &Protocol) -> TokenStream {
                 };
 
                 let method_name = format_ident!("on_{}", name);
-                let sig_args = generate_handler_args_fq(args_items);
+                let sig_args = generate_handler_args(args_items);
                 let call_args = generate_forwarding_call_args(args_items);
 
                 method_impls.push(quote! {
@@ -1387,6 +1383,11 @@ fn generate_fields(items: &[MessageItem]) -> TokenStream {
     quote! { #(#fields),* }
 }
 
+/// The parameters of a handler method. Types are fully qualified, because
+/// the delegation macro expands them in the handler's module.
+///
+/// A handler borrows the message's descriptors: the dispatcher owns them,
+/// forwards them or closes them, and a handler that keeps one clones it.
 fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
     let mut args = Vec::new();
     for item in items {
@@ -1399,26 +1400,8 @@ fn generate_handler_args(items: &[MessageItem]) -> TokenStream {
                 args.push(quote! { #name: &[u8] });
             } else if arg.typ == "new_id" && arg.interface.is_none() {
                 args.push(quote! { #name: &(String, u32, u32) });
-            } else {
-                args.push(quote! { #name: #ty });
-            }
-        }
-    }
-    quote! { #(#args),* }
-}
-
-fn generate_handler_args_fq(items: &[MessageItem]) -> TokenStream {
-    let mut args = Vec::new();
-    for item in items {
-        if let MessageItem::Arg(arg) = item {
-            let name = format_ident!("_{}", sanitize_ident(&arg.name));
-            let ty = map_type_fq(arg);
-            if arg.typ == "string" {
-                args.push(quote! { #name: &#ty });
-            } else if arg.typ == "array" {
-                args.push(quote! { #name: &[u8] });
-            } else if arg.typ == "new_id" && arg.interface.is_none() {
-                args.push(quote! { #name: &(String, u32, u32) });
+            } else if arg.typ == "fd" {
+                args.push(quote! { #name: std::os::fd::BorrowedFd<'_> });
             } else {
                 args.push(quote! { #name: #ty });
             }

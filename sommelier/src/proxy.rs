@@ -19,16 +19,15 @@ use crate::placement_config::PlacementConfig;
 use crate::protocols;
 use crate::state::{Context, PostDispatch, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
+use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
-use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(test)]
 mod fuzz;
 
-type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
+type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,
 // callbacks, and buffer bookkeeping).  Keep one client from processing an
@@ -67,19 +66,12 @@ fn translated_sender_id(
     }
 }
 
-fn close_pending_output_fds(out: &mut OutgoingMessages, still_owned_fds: &[RawFd]) {
-    // FDs decoded from an incoming message remain owned by the connection
-    // until the read buffer is drained (or the connection is dropped). A
-    // handler can also queue newly-created descriptors that are not present in
-    // that list. On an early protocol-error return, close only the latter;
-    // closing a descriptor in both collections would let a later fd reuse
-    // turn the connection drop into a double-close.
-    let protected: std::collections::HashSet<_> = still_owned_fds.iter().copied().collect();
-    let mut closed = std::collections::HashSet::new();
+/// Close the descriptors of messages that will not be sent.
+fn close_pending_output_fds(out: &mut OutgoingMessages) {
+    // Each one is unique: a decoded message takes its descriptors from the
+    // connection's queue, and an encoder takes its own.
     for fd in out.take_fds() {
-        if fd >= 0 && !protected.contains(&fd) && closed.insert(fd) {
-            let _ = nix::unistd::close(fd);
-        }
+        let _ = nix::unistd::close(fd);
     }
 }
 
@@ -377,7 +369,6 @@ impl Client {
         // that same order when it chunks a large byte stream.
         let mut out = OutgoingMessages::default();
         let mut offset: usize = 0;
-        let mut fd_offset: usize = 0;
         let mut processed_messages = 0;
         // A complete untracked message cannot tell us whether descriptors
         // currently queued on the ordered stream belong to it or to a later
@@ -405,7 +396,7 @@ impl Client {
                         );
                         break;
                     }
-                    close_pending_output_fds(&mut out, &conn.read_fds);
+                    close_pending_output_fds(&mut out);
                     return false;
                 }
                 Framing::Complete(header) => header,
@@ -417,7 +408,7 @@ impl Client {
                     "Ambiguous SCM_RIGHTS ordering after a complete untracked message; \
                      terminating connection before assigning descriptors to another message"
                 );
-                close_pending_output_fds(&mut out, &conn.read_fds);
+                close_pending_output_fds(&mut out);
                 return false;
             }
 
@@ -450,14 +441,11 @@ impl Client {
                 }
             };
 
-            let mut consumed_fds = 0;
             let result = if let Some(interface) = interface {
-                let mut msg = WireMessage::new(
-                    sender_id,
-                    opcode,
-                    &packet[MessageHeader::LEN..],
-                    &conn.read_fds[fd_offset..],
-                );
+                // The message takes its descriptors from the front of the
+                // queue; dropping it unforwarded closes them.
+                let mut msg = WireMessage::new(sender_id, opcode, &packet[MessageHeader::LEN..])
+                    .with_fds(&mut conn.read_fds);
 
                 log::trace!("[{:?}] {}:{} (len={})", direction, interface, opcode, len);
 
@@ -481,7 +469,6 @@ impl Client {
                         Self::dispatch_event(&mut self.handler, &mut self.ctx, &interface, &mut msg)
                     }
                 };
-                consumed_fds = msg.fd_offset;
                 if !msg.is_payload_consumed() {
                     log::error!(
                         "Protocol message left {} trailing payload byte(s): interface={}, opcode={}",
@@ -525,9 +512,9 @@ impl Client {
                 // terminate the connection merely because the unknown
                 // message cannot tell us how many descriptors it consumes;
                 // leave the descriptor queued for the next complete message
-                // and let WaylandConnection::Drop close it if the peer goes
+                // and let the connection close it if the peer goes
                 // away before that message arrives.
-                if fd_offset < conn.read_fds.len() {
+                if !conn.read_fds.is_empty() {
                     conn.ambiguous_untracked_fd = true;
                 }
                 Ok(None)
@@ -576,30 +563,10 @@ impl Client {
                         crate::handler::display::queue_request_error(&mut self.ctx, &e);
                         break;
                     }
-                    close_pending_output_fds(&mut out, &conn.read_fds);
+                    close_pending_output_fds(&mut out);
                     return false;
                 }
             }
-
-            let Some(new_fd_offset) = fd_offset.checked_add(consumed_fds) else {
-                log::error!(
-                    "Consumed fd offset overflows usize: offset={}, consumed={}",
-                    fd_offset,
-                    consumed_fds
-                );
-                close_pending_output_fds(&mut out, &conn.read_fds);
-                return false;
-            };
-            if new_fd_offset > conn.read_fds.len() {
-                log::error!(
-                    "Protocol consumed more fds than received: consumed={}, received={}",
-                    new_fd_offset,
-                    conn.read_fds.len()
-                );
-                close_pending_output_fds(&mut out, &conn.read_fds);
-                return false;
-            }
-            fd_offset = new_fd_offset;
 
             // Add pending messages from context
             let queue = match direction {
@@ -645,10 +612,9 @@ impl Client {
         if !out.is_empty() && other_conn.send_messages(&out).await.is_err() {
             success = false;
         }
-
-        let mut fds_to_close: std::collections::HashSet<std::os::unix::io::RawFd> =
-            std::collections::HashSet::new();
-        fds_to_close.extend(out.fds().iter().copied());
+        // A send duplicates the descriptors it carries; the originals are
+        // still ours, whether or not the send succeeded.
+        close_pending_output_fds(&mut out);
 
         // Bidirectional queue: when processing events in one direction, the
         // handler may queue messages for the OPPOSITE direction. For example,
@@ -676,24 +642,11 @@ impl Client {
         }
         if !reverse_out.is_empty() && conn.send_messages(&reverse_out).await.is_err() {
             // success=false signals the caller (handle_msgs) to drop this
-            // client connection. We still close every original below.
+            // client connection.
             success = false;
         }
-        // FDs are closed unconditionally — we own them and must not leak
-        // regardless of whether the send succeeded or was skipped. When
-        // sendmsg(SCM_RIGHTS) succeeds it duplicates FDs into the kernel
-        // cmsg buffer; the originals are still ours to close. When the send
-        // fails or the buffer was empty, we obviously retain ownership.
-        fds_to_close.extend(reverse_out.fds().iter().copied());
+        close_pending_output_fds(&mut reverse_out);
 
-        fds_to_close.extend(conn.read_fds.iter().take(fd_offset));
-
-        for fd in fds_to_close {
-            let _ = nix::unistd::close(fd);
-        }
-
-        // Remove consumed FDs and data
-        conn.read_fds.drain(..fd_offset);
         conn.read_buf.drain(..offset);
 
         if self.ctx.is_fatal() {
@@ -710,14 +663,13 @@ impl Client {
 mod tests {
     use super::*;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, stream_headers,
+        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, shm_pool_file,
+        stream_headers,
     };
     use crate::wire::MessageBuilder;
-    use nix::sys::memfd::{memfd_create, MFdFlags};
-    use std::ffi::CString;
     use std::fs;
     use std::io::Write;
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
     #[test]
     fn generated_classifier_routes_each_protocol_family() {
@@ -1368,7 +1320,10 @@ mod tests {
             .host_conn
             .read_buf
             .extend_from_slice(&live_repeat_info);
-        client.host_conn.read_fds.push(keymap_fd);
+        client
+            .host_conn
+            .read_fds
+            .push_back(unsafe { OwnedFd::from_raw_fd(keymap_fd) });
 
         assert!(
             client.handle_msgs(Direction::HostToClient).await,
@@ -1411,7 +1366,10 @@ mod tests {
             .host_conn
             .read_buf
             .extend_from_slice(&live_repeat_info[..4]);
-        client.host_conn.read_fds.push(keymap_fd);
+        client
+            .host_conn
+            .read_fds
+            .push_back(unsafe { OwnedFd::from_raw_fd(keymap_fd) });
 
         assert!(client.handle_msgs(Direction::HostToClient).await);
         assert_eq!(
@@ -1477,7 +1435,10 @@ mod tests {
         let stale_event = MessageBuilder::new().build_message(77, 0);
         client.host_conn.read_buf.extend_from_slice(&stale_event);
         client.host_conn.read_buf.extend_from_slice(&[0, 0, 0, 0]);
-        client.host_conn.read_fds.push(pending_fd);
+        client
+            .host_conn
+            .read_fds
+            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
 
         assert!(
             client.handle_msgs(Direction::HostToClient).await,
@@ -1488,7 +1449,12 @@ mod tests {
             "only the complete stale message should be consumed"
         );
         assert_eq!(
-            client.host_conn.read_fds,
+            client
+                .host_conn
+                .read_fds
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>(),
             vec![pending_fd],
             "the pending descriptor must remain ordered for the later message"
         );
@@ -1529,7 +1495,10 @@ mod tests {
             .host_conn
             .read_buf
             .extend_from_slice(&known_event[..4]);
-        client.host_conn.read_fds.push(pending_fd);
+        client
+            .host_conn
+            .read_fds
+            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
         assert!(client.handle_msgs(Direction::HostToClient).await);
         assert_eq!(client.host_conn.read_buf.len(), 4);
 
@@ -1584,7 +1553,10 @@ mod tests {
         let known_event = MessageBuilder::new().build_message(88, 0);
         client.host_conn.read_buf.extend_from_slice(&stale_event);
         client.host_conn.read_buf.extend_from_slice(&known_event);
-        client.host_conn.read_fds.push(pending_fd);
+        client
+            .host_conn
+            .read_fds
+            .push_back(unsafe { OwnedFd::from_raw_fd(pending_fd) });
         client
             .ctx
             .shadow_table
@@ -1616,7 +1588,7 @@ mod tests {
                     )
             })
             .map(|(header, payload)| {
-                let mut error = WireMessage::new(header.sender_id, header.opcode, payload, &[]);
+                let mut error = WireMessage::new(header.sender_id, header.opcode, payload);
                 (error.read_u32().unwrap(), error.read_u32().unwrap())
             })
             .collect()
@@ -2064,13 +2036,12 @@ mod tests {
             handler: &mut SommelierHandler,
             ctx: &mut Context,
             message: Vec<u8>,
-        ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+        ) -> Option<crate::wire::Outgoing> {
             let header = msg_header(&message);
             let mut wire = WireMessage::new(
                 header.sender_id,
                 header.opcode,
                 &message[MessageHeader::LEN..],
-                &[],
             );
             let result = Client::dispatch_event(handler, ctx, "wl_keyboard", &mut wire)
                 .expect("raw keyboard event must dispatch");
@@ -2232,13 +2203,12 @@ mod tests {
         ctx: &mut Context,
         interface: &str,
         message: Vec<u8>,
-    ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+    ) -> Option<crate::wire::Outgoing> {
         let header = msg_header(&message);
         let mut wire = WireMessage::new(
             header.sender_id,
             header.opcode,
             &message[MessageHeader::LEN..],
-            &[],
         );
         let result = Client::dispatch_event(handler, ctx, interface, &mut wire)
             .expect("raw host event must dispatch");
@@ -2266,13 +2236,12 @@ mod tests {
         ctx: &mut Context,
         interface: &str,
         message: Vec<u8>,
-    ) -> Option<(Vec<u8>, Vec<std::os::unix::io::RawFd>)> {
+    ) -> Option<crate::wire::Outgoing> {
         let header = msg_header(&message);
         let mut wire = WireMessage::new(
             header.sender_id,
             header.opcode,
             &message[MessageHeader::LEN..],
-            &[],
         );
         let result = Client::dispatch_request(handler, ctx, interface, &mut wire)
             .expect("raw guest request must dispatch");
@@ -2283,11 +2252,11 @@ mod tests {
         result
     }
 
-    fn sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+    fn sender(message: &crate::wire::Outgoing) -> u32 {
         msg_sender(&message.0)
     }
 
-    fn opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+    fn opcode(message: &crate::wire::Outgoing) -> u16 {
         msg_opcode(&message.0)
     }
 
@@ -2647,7 +2616,6 @@ mod tests {
             GUEST_TEXT_INPUT,
             zwp_text_input_v3::EVT_DELETE_SURROUNDING_TEXT,
             &ctx.host_to_client_queue[0].0[8..],
-            &[],
         );
         assert_eq!(delete.read_u32().unwrap(), 3);
         assert_eq!(delete.read_u32().unwrap(), 0);
@@ -2906,7 +2874,6 @@ mod tests {
             GUEST_TEXT_INPUT,
             zwp_text_input_v3::EVT_COMMIT_STRING,
             &initial_commits[0].0[8..],
-            &[],
         );
         assert_eq!(initial_commit.read_string().unwrap(), "가 ");
         assert!(initial_commit.is_payload_consumed());
@@ -2953,7 +2920,7 @@ mod tests {
                 assert_eq!(sender(message), GUEST_KEYBOARD);
                 assert_eq!(opcode(message), wl_keyboard::EVT_KEY);
                 let mut key =
-                    WireMessage::new(GUEST_KEYBOARD, wl_keyboard::EVT_KEY, &message.0[8..], &[]);
+                    WireMessage::new(GUEST_KEYBOARD, wl_keyboard::EVT_KEY, &message.0[8..]);
                 key.read_u32().unwrap();
                 assert_eq!(key.read_u32().unwrap(), 1_234);
                 assert_eq!(key.read_u32().unwrap(), KEY_SPACE);
@@ -3860,7 +3827,6 @@ mod tests {
             guest_id,
             protocols::text_input_unstable_v3::zwp_text_input_manager_v3::REQ_DESTROY,
             &[],
-            &[],
         );
         assert_eq!(
             protocols::text_input_unstable_v3::zwp_text_input_manager_v3::dispatch_request(
@@ -3880,7 +3846,6 @@ mod tests {
         let mut duplicate_destroy = WireMessage::new(
             guest_id,
             protocols::text_input_unstable_v3::zwp_text_input_manager_v3::REQ_DESTROY,
-            &[],
             &[],
         );
         assert_eq!(
@@ -3906,12 +3871,8 @@ mod tests {
             .track_interface_with_version(guest_id, "wl_shm_pool".to_string(), 1);
         let mut handler = SommelierHandler::new();
 
-        let mut destroy = WireMessage::new(
-            guest_id,
-            protocols::wayland::wl_shm_pool::REQ_DESTROY,
-            &[],
-            &[],
-        );
+        let mut destroy =
+            WireMessage::new(guest_id, protocols::wayland::wl_shm_pool::REQ_DESTROY, &[]);
         assert_eq!(
             protocols::wayland::wl_shm_pool::dispatch_request(&mut destroy, &mut handler, &mut ctx,),
             Ok(None)
@@ -3924,39 +3885,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn early_output_cleanup_preserves_incoming_fd_ownership() {
-        // A memfd has a unique inode for this ownership assertion; pipe
-        // read/write ends share an inode and eventfds share an anonymous-inode
-        // inode on Linux.
-        let incoming_name = CString::new("sommelier-proxy-incoming-fd-test").unwrap();
-        let incoming_fd = memfd_create(incoming_name.as_c_str(), MFdFlags::MFD_CLOEXEC)
-            .expect("memfd_create")
-            .into_raw_fd();
-        let incoming_identity = fd_identity(incoming_fd);
-        let mut output = OutgoingMessages::default();
-        output.push(&[], &[incoming_fd]);
-        close_pending_output_fds(&mut output, &[incoming_fd]);
+    /// A batch that ends early sends nothing. The descriptors of the
+    /// messages it translated close with it; the connection keeps the ones
+    /// no message has taken yet until it closes.
+    #[tokio::test]
+    async fn early_output_cleanup_preserves_incoming_fd_ownership() {
+        use crate::protocols::wayland::wl_keyboard;
 
-        // The incoming connection still owns this descriptor; the cleanup
-        // helper must not close it before the connection drains/drops.
+        let (mut client, mut guest_peer, _host_peer) = pending_keyboard_client();
+        // Memfds have identities of their own; pipe ends share one.
+        let forwarded = shm_pool_file(&[]);
+        let pending = shm_pool_file(&[]);
+        let forwarded_identity = fd_identity(forwarded.as_raw_fd());
+        let pending_identity = fd_identity(pending.as_raw_fd());
+
+        // A keymap the proxy forwards, then an event with trailing bytes,
+        // which ends the session. `pending` belongs to a later message.
+        let mut keymap = MessageBuilder::new();
+        keymap.write_u32(wl_keyboard::KEYMAP_FORMAT_NO_KEYMAP);
+        keymap.write_u32(0);
+        let keymap = keymap.build_message(LIVE_HOST_KEYBOARD, wl_keyboard::EVT_KEYMAP);
+        let mut repeat_info = MessageBuilder::new();
+        for word in [25, 400, 0] {
+            repeat_info.write_i32(word);
+        }
+        let repeat_info =
+            repeat_info.build_message(LIVE_HOST_KEYBOARD, wl_keyboard::EVT_REPEAT_INFO);
+        client.host_conn.read_buf.extend_from_slice(&keymap);
+        client.host_conn.read_buf.extend_from_slice(&repeat_info);
+        client.host_conn.read_fds.push_back(forwarded.into());
+        client.host_conn.read_fds.push_back(pending.into());
+
         assert!(
-            any_fd_has_identity(incoming_identity),
-            "protected incoming descriptor must remain open"
+            !client.handle_msgs(Direction::HostToClient).await,
+            "trailing bytes in a host event end the session"
         );
-        assert_eq!(unsafe { libc::close(incoming_fd) }, 0);
-
-        let output_name = CString::new("sommelier-proxy-output-fd-test").unwrap();
-        let fd = memfd_create(output_name.as_c_str(), MFdFlags::MFD_CLOEXEC)
-            .expect("memfd_create")
-            .into_raw_fd();
-        let output_identity = fd_identity(fd);
-        let mut output = OutgoingMessages::default();
-        output.push(&[], &[fd]);
-        close_pending_output_fds(&mut output, &[]);
         assert!(
-            !any_fd_has_identity(output_identity),
-            "unprotected queued descriptor must be closed"
+            !any_fd_has_identity(forwarded_identity),
+            "a translated message that is never sent must close its descriptor"
+        );
+        assert!(
+            any_fd_has_identity(pending_identity),
+            "the connection still owns the descriptor no message took"
+        );
+        let mut nothing = [0u8; 1];
+        let read_error = std::io::Read::read(&mut guest_peer, &mut nothing)
+            .expect_err("a batch that ends early sends nothing");
+        assert_eq!(read_error.kind(), io::ErrorKind::WouldBlock);
+        drop(client);
+        assert!(
+            !any_fd_has_identity(pending_identity),
+            "closing the connection must close every pending descriptor"
         );
     }
 
@@ -3986,8 +3965,7 @@ mod tests {
             .track_interface_with_version(10, "wl_region".to_string(), 1);
         let mut handler = SommelierHandler::new();
 
-        let mut destroy =
-            WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[], &[]);
+        let mut destroy = WireMessage::new(10, protocols::wayland::wl_region::REQ_DESTROY, &[]);
         let forwarded =
             protocols::wayland::dispatch_request("wl_region", &mut destroy, &mut handler, &mut ctx)
                 .expect("destructor request should dispatch");
@@ -4003,12 +3981,8 @@ mod tests {
         );
 
         let payload = 20u32.to_ne_bytes();
-        let mut delete_id = WireMessage::new(
-            1,
-            protocols::wayland::wl_display::EVT_DELETE_ID,
-            &payload,
-            &[],
-        );
+        let mut delete_id =
+            WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
             protocols::wayland::dispatch_event(
                 "wl_display",
@@ -4046,7 +4020,6 @@ mod tests {
             5,
             protocols::wayland::wl_fixes::REQ_DESTROY_REGISTRY,
             &payload,
-            &[],
         );
         let (forwarded, fds) = protocols::wayland::dispatch_request(
             "wl_fixes",
@@ -4071,12 +4044,8 @@ mod tests {
         assert!(ctx.shadow_table.is_pending_destroy_guest(10));
 
         let payload = 20u32.to_ne_bytes();
-        let mut delete_id = WireMessage::new(
-            1,
-            protocols::wayland::wl_display::EVT_DELETE_ID,
-            &payload,
-            &[],
-        );
+        let mut delete_id =
+            WireMessage::new(1, protocols::wayland::wl_display::EVT_DELETE_ID, &payload);
         assert_eq!(
             protocols::wayland::dispatch_event(
                 "wl_display",
@@ -4206,7 +4175,6 @@ mod tests {
             77,
             protocols::wayland::wl_registry::EVT_GLOBAL,
             &payload[8..],
-            &[],
         );
         let mut probe = Probe { called: false };
 
@@ -4234,7 +4202,6 @@ mod tests {
             10,
             protocols::wayland::wl_compositor::REQ_CREATE_SURFACE,
             &payload,
-            &[],
         );
         let (forwarded, fds) =
             protocols::wayland::dispatch_request("wl_compositor", &mut msg, &mut handler, &mut ctx)
@@ -4263,7 +4230,6 @@ mod tests {
             10,
             protocols::xdg_shell::xdg_positioner::REQ_SET_REACTIVE,
             &payload,
-            &[],
         );
         let mut handler = SommelierHandler::new();
         let result = protocols::xdg_shell::dispatch_request(
@@ -4313,7 +4279,6 @@ mod tests {
             sender,
             protocols::wayland::wl_subcompositor::REQ_GET_SUBSURFACE,
             &payload,
-            &[],
         );
         let mut handler = SommelierHandler::new();
 
@@ -4344,7 +4309,6 @@ mod tests {
             20,
             protocols::xdg_shell::xdg_toplevel::EVT_CONFIGURE_BOUNDS,
             &payload,
-            &[],
         );
         let mut handler = SommelierHandler::new();
         let result =
@@ -4370,12 +4334,7 @@ mod tests {
         let mut builder = MessageBuilder::new();
         builder.write_string(&"x".repeat(65_520));
         let payload = builder.into_payload();
-        let mut msg = WireMessage::new(
-            10,
-            protocols::wayland::wl_data_source::REQ_OFFER,
-            &payload,
-            &[],
-        );
+        let mut msg = WireMessage::new(10, protocols::wayland::wl_data_source::REQ_OFFER, &payload);
         let mut handler = SommelierHandler::new();
 
         assert_eq!(

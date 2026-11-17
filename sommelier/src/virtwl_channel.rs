@@ -22,7 +22,7 @@ use crate::virtwl::{
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use tokio::io::unix::AsyncFd;
@@ -275,13 +275,7 @@ impl VirtWaylandChannel {
     /// `DMA_BUF_IOCTL_SYNC`.  A failed begin or end must be surfaced to the
     /// caller; silently copying after a failed begin can race the host
     /// compositor and produce torn frames.
-    pub fn sync(&self, dmabuf_fd: RawFd, flags: u32) -> io::Result<()> {
-        if dmabuf_fd < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid VirtWL dma-buf descriptor",
-            ));
-        }
+    pub fn sync(&self, dmabuf_fd: BorrowedFd<'_>, flags: u32) -> io::Result<()> {
         let valid_flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE | DMA_BUF_SYNC_END;
         if flags & !valid_flags != 0 || flags & (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE) == 0 {
             return Err(io::Error::new(
@@ -290,7 +284,7 @@ impl VirtWaylandChannel {
             ));
         }
         let mut sync = crate::virtwl::virtwl_ioctl_dmabuf_sync { flags };
-        unsafe { virtwl_ioctl_dmabuf_sync(dmabuf_fd, &mut sync) }
+        unsafe { virtwl_ioctl_dmabuf_sync(dmabuf_fd.as_raw_fd(), &mut sync) }
             .map(|_| ())
             .map_err(io::Error::from)
     }

@@ -1976,12 +1976,12 @@ mod tests {
     use crate::wire::WireMessage;
 
     /// The opcode of the message at `idx` in a queue.
-    fn msg_opcode(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u16 {
+    fn msg_opcode(queue: &[crate::wire::Outgoing], idx: usize) -> u16 {
         crate::test_support::msg_opcode(&queue[idx].0)
     }
 
     /// The sender of the message at `idx` in a queue.
-    fn msg_sender(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
+    fn msg_sender(queue: &[crate::wire::Outgoing], idx: usize) -> u32 {
         crate::test_support::msg_sender(&queue[idx].0)
     }
 
@@ -2063,20 +2063,16 @@ mod tests {
         (ctx, host_v1_id, guest_id)
     }
 
-    fn msg_done_serial(queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)], idx: usize) -> u32 {
+    fn msg_done_serial(queue: &[crate::wire::Outgoing], idx: usize) -> u32 {
         let payload = &queue[idx].0[8..];
         u32::from_ne_bytes(payload[0..4].try_into().unwrap())
     }
 
-    fn wire_message(
-        queue: &[(Vec<u8>, Vec<std::os::unix::io::RawFd>)],
-        idx: usize,
-    ) -> WireMessage<'_> {
+    fn wire_message(queue: &[crate::wire::Outgoing], idx: usize) -> WireMessage<'_> {
         WireMessage::new(
             msg_sender(queue, idx),
             msg_opcode(queue, idx),
             &queue[idx].0[8..],
-            &queue[idx].1,
         )
     }
 
@@ -3412,7 +3408,7 @@ mod tests {
                 && msg_opcode(std::slice::from_ref(message), 0) == 5
         });
         let clear_message = clear_message.expect("disable must clear v1 surrounding text");
-        let mut clear_wire = WireMessage::new(10, 5, &clear_message.0[8..], &clear_message.1);
+        let mut clear_wire = WireMessage::new(10, 5, &clear_message.0[8..]);
         assert_eq!(clear_wire.read_string().unwrap(), "");
         assert_eq!(clear_wire.read_u32().unwrap(), 0);
         assert_eq!(clear_wire.read_u32().unwrap(), 0);
@@ -3779,7 +3775,6 @@ mod tests {
         let mut release = WireMessage::new(
             guest_seat,
             crate::protocols::wayland::wl_seat::REQ_RELEASE,
-            &[],
             &[],
         );
         assert!(crate::protocols::wayland::wl_seat::dispatch_request(

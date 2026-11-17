@@ -777,7 +777,7 @@ mod tests {
         ctx.outputs.bind_for_test(OUTPUT_HOST, Default::default());
 
         ctx.last_sender_id = 10;
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[], &[]);
+        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
         let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(
@@ -798,7 +798,7 @@ mod tests {
         ctx.shadow_table
             .track_interface_with_version(10, "wl_output".into(), 3);
 
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[], &[]);
+        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
         let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert!(ctx.client_to_host_queue.is_empty());
@@ -832,7 +832,7 @@ mod tests {
             dispatch_request, REQ_GET_XDG_OUTPUT,
         };
         let payload = [40u32.to_ne_bytes(), output_guest.to_ne_bytes()].concat();
-        let mut request = crate::wire::WireMessage::new(30, REQ_GET_XDG_OUTPUT, &payload, &[]);
+        let mut request = crate::wire::WireMessage::new(30, REQ_GET_XDG_OUTPUT, &payload);
         ctx.last_sender_id = 30;
         let dispatched = dispatch_request(&mut request, &mut OutputHandler, ctx);
         dispatched
@@ -863,8 +863,7 @@ mod tests {
 
         // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
         let size = [1600i32.to_ne_bytes(), 1000i32.to_ne_bytes()].concat();
-        let mut event =
-            crate::wire::WireMessage::new(host_xdg_output, EVT_LOGICAL_SIZE, &size, &[]);
+        let mut event = crate::wire::WireMessage::new(host_xdg_output, EVT_LOGICAL_SIZE, &size);
         let (event, _) = dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx)
             .expect("valid event")
             .expect("forwarded");
@@ -875,7 +874,7 @@ mod tests {
         let (description, _) =
             zxdg_output_v1::evt::description(host_xdg_output, "Built-in display").unwrap();
         let mut event =
-            crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..], &[]);
+            crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..]);
         assert!(matches!(
             dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx),
             Err(crate::wire::ProtocolError::UnsupportedVersion { .. })
@@ -900,7 +899,7 @@ mod tests {
         assert!(ctx.shadow_table.guest_object_matches(40, "zxdg_output_v1"));
         assert_eq!(ctx.shadow_table.guest_object_version(40), Some(3));
 
-        let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[], &[]);
+        let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[]);
         let dispatched = dispatch_request(&mut destroy, &mut ForwardXdgOutput, &mut ctx);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert!(ctx.client_to_host_queue.is_empty());

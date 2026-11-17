@@ -21,19 +21,9 @@ use crate::protocols::wayland::wl_data_source;
 use crate::state::Context;
 use crate::wire::{queue_or_drop, Action};
 use log::{debug, error};
-use std::os::fd::{BorrowedFd, OwnedFd};
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 
 pub struct DataDeviceHandler;
-
-fn duplicate_client_fd(fd: RawFd) -> nix::Result<OwnedFd> {
-    // The caller has already decoded this descriptor from a Wayland message
-    // and owns it until proxy::handle_msgs closes the received copy.
-    if fd < 0 {
-        return Err(nix::errno::Errno::EBADF);
-    }
-    nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) })
-}
 
 impl wl_data_device_manager::WlDataDeviceManagerHandler for DataDeviceHandler {
     fn on_create_data_source(&mut self, _ctx: &mut Context, id: u32) -> Action {
@@ -53,17 +43,21 @@ impl wl_data_device::WlDataDeviceHandler for DataDeviceHandler {
 }
 
 impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
-    fn on_receive(&mut self, ctx: &mut Context, mime_type: &String, fd: i32) -> Action {
-        debug!("wl_data_offer.receive: mime_type={}, fd={}", mime_type, fd);
+    fn on_receive(&mut self, ctx: &mut Context, mime_type: &String, fd: BorrowedFd<'_>) -> Action {
+        debug!(
+            "wl_data_offer.receive: mime_type={}, fd={}",
+            mime_type,
+            fd.as_raw_fd()
+        );
 
         if let Some(virtwl) = &ctx.virtwayland_channel {
             debug!("Using virtwl for clipboard receive");
 
-            // The guest-provided descriptor is consumed by the proxy after
-            // this handler returns. Duplicate it before queueing anything so
-            // a dup failure cannot leave a host request queued while the
-            // original request is also forwarded.
-            let client_fd = match duplicate_client_fd(fd) {
+            // The request closes the guest's descriptor once handled, so the
+            // pump writes into a duplicate. Duplicate it before queueing
+            // anything so a dup failure cannot leave a host request queued
+            // while the original request is also forwarded.
+            let client_fd = match fd.try_clone_to_owned() {
                 Ok(f) => f,
                 Err(e) => {
                     error!("Failed to dup client fd: {}", e);
@@ -140,29 +134,10 @@ impl wl_data_source::WlDataSourceHandler for DataDeviceHandler {}
 
 #[cfg(test)]
 mod tests {
-    use super::{duplicate_client_fd, DataDeviceHandler};
+    use super::DataDeviceHandler;
     use crate::protocols::wayland::wl_data_device;
     use crate::state::Context;
     use crate::wire::WireMessage;
-    use std::os::fd::AsRawFd;
-
-    #[test]
-    fn duplicate_client_fd_rejects_invalid_descriptor() {
-        assert!(duplicate_client_fd(-1).is_err());
-    }
-
-    #[test]
-    fn duplicate_client_fd_returns_an_owned_duplicate() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let duplicate = duplicate_client_fd(pipe_fds[1]).expect("dup should succeed");
-        assert_ne!(duplicate.as_raw_fd(), pipe_fds[1]);
-
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-    }
 
     #[test]
     fn host_data_offer_gets_a_guest_server_id_mapping() {
@@ -177,7 +152,7 @@ mod tests {
         // forwarded verbatim into the guest namespace.
         let host_offer_id: u32 = 123;
         let payload = host_offer_id.to_ne_bytes();
-        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
         let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx)
             .expect("data_offer should decode")
@@ -216,7 +191,7 @@ mod tests {
             .track_host_interface(123, "wl_surface".to_string());
 
         let payload = 123u32.to_ne_bytes();
-        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let mut msg = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let mut handler = DataDeviceHandler;
         let result = wl_data_device::dispatch_event(&mut msg, &mut handler, &mut ctx);
 
@@ -238,7 +213,7 @@ mod tests {
             .track_host_interface(81, "wl_data_device".to_string());
         let host_offer: u32 = 0xff00_0001;
         let payload = host_offer.to_ne_bytes();
-        let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let mut offer = WireMessage::new(81, wl_data_device::EVT_DATA_OFFER, &payload);
 
         assert_eq!(
             wl_data_device::dispatch_event(&mut offer, &mut DataDeviceHandler, &mut ctx),
@@ -268,7 +243,7 @@ mod tests {
             // The host may pick any free server ID for each offer.
             let host_offer = 0xff00_0000 + round % 3;
             let payload = host_offer.to_ne_bytes();
-            let mut offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+            let mut offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
             let (event, _) = wl_data_device::dispatch_event(&mut offer, &mut handler, &mut ctx)
                 .expect("data_offer should decode")
                 .expect("data_offer should be forwarded");
@@ -282,7 +257,6 @@ mod tests {
             let mut destroy = WireMessage::new(
                 guest_offer,
                 crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
-                &[],
                 &[],
             );
             crate::protocols::wayland::wl_data_offer::dispatch_request(
@@ -304,7 +278,7 @@ mod tests {
         let mut handler = DataDeviceHandler;
 
         let payload = host_offer_id.to_ne_bytes();
-        let mut first_offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let mut first_offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let (first_event, _) =
             wl_data_device::dispatch_event(&mut first_offer, &mut handler, &mut ctx)
                 .expect("first data_offer should decode")
@@ -318,7 +292,6 @@ mod tests {
         let mut destroy = WireMessage::new(
             first_guest_id,
             crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
-            &[],
             &[],
         );
         let (destroy_request, _) = crate::protocols::wayland::wl_data_offer::dispatch_request(
@@ -336,7 +309,7 @@ mod tests {
         assert_eq!(ctx.shadow_table.get_guest_id(host_offer_id), None);
         assert!(!ctx.shadow_table.is_pending_destroy_guest(first_guest_id));
 
-        let mut replacement = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+        let mut replacement = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload);
         let (replacement_event, _) =
             wl_data_device::dispatch_event(&mut replacement, &mut handler, &mut ctx)
                 .expect("reused server ID should decode")

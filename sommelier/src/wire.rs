@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::RawFd;
 
 /// The object ID of the `wl_display` singleton on every connection.
@@ -218,20 +220,31 @@ pub struct WireMessage<'a> {
     pub sender_id: u32,
     pub opcode: u16,
     pub payload: &'a [u8],
-    pub fds: &'a [RawFd],
+    /// The connection's received descriptors, in stream order. Decoding an
+    /// `fd` argument takes the next one, so the decoded message owns it.
+    fds: Option<&'a mut VecDeque<OwnedFd>>,
     pub offset: usize,
-    pub fd_offset: usize,
 }
 
 impl<'a> WireMessage<'a> {
-    pub fn new(sender_id: u32, opcode: u16, payload: &'a [u8], fds: &'a [RawFd]) -> Self {
+    /// A message whose `fd` arguments are missing, for decoding messages
+    /// that take none.
+    pub fn new(sender_id: u32, opcode: u16, payload: &'a [u8]) -> Self {
         Self {
             sender_id,
             opcode,
             payload,
-            fds,
+            fds: None,
             offset: 0,
-            fd_offset: 0,
+        }
+    }
+
+    /// Take `fd` arguments from `fds`, the descriptors received with the
+    /// stream the message came from.
+    pub fn with_fds(self, fds: &'a mut VecDeque<OwnedFd>) -> Self {
+        Self {
+            fds: Some(fds),
+            ..self
         }
     }
 
@@ -353,14 +366,11 @@ impl<'a> WireMessage<'a> {
         Ok(bytes)
     }
 
-    pub fn read_fd(&mut self) -> Result<RawFd, ProtocolError> {
-        if self.fd_offset < self.fds.len() {
-            let fd = self.fds[self.fd_offset];
-            self.fd_offset += 1;
-            Ok(fd)
-        } else {
-            Err(ProtocolError::MissingFd)
-        }
+    pub fn read_fd(&mut self) -> Result<OwnedFd, ProtocolError> {
+        self.fds
+            .as_mut()
+            .and_then(|fds| fds.pop_front())
+            .ok_or(ProtocolError::MissingFd)
     }
 
     pub fn is_payload_consumed(&self) -> bool {
@@ -517,14 +527,16 @@ mod tests {
     use crate::protocols::wayland::{wl_data_offer, wl_registry, wl_shm, wl_surface};
     use crate::protocols::xdg_shell::xdg_toplevel;
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file, Rng};
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::collections::VecDeque;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     /// Decoding holds for arbitrary bytes: a frame never claims more bytes
-    /// than the stream has, no read moves past the payload or the
-    /// descriptors, and what `MessageBuilder` writes decodes unchanged.
+    /// than the stream has, no read moves past the payload, and what
+    /// `MessageBuilder` writes decodes unchanged.
     #[test]
     fn arbitrary_bytes_decode_within_bounds_and_written_values_round_trip() {
         let mut rng = Rng::new(0);
+        let file = shm_pool_file(&[]);
         let (mut partial, mut invalid, mut complete) = (0, 0, 0);
         for _ in 0..20_000 {
             let len = rng.below(64);
@@ -551,8 +563,10 @@ mod tests {
                 }
             }
 
-            let fds = [3, 4];
-            let mut message = WireMessage::new(1, 0, &stream, &fds[..rng.below(fds.len() + 1)]);
+            let mut fds: VecDeque<OwnedFd> = (0..rng.below(3))
+                .map(|_| file.try_clone().expect("dup a descriptor").into())
+                .collect();
+            let mut message = WireMessage::new(1, 0, &stream).with_fds(&mut fds);
             for _ in 0..8 {
                 let _ = match rng.below(5) {
                     0 => message.read_u32().map(drop),
@@ -562,7 +576,6 @@ mod tests {
                     _ => message.read_fd().map(drop),
                 };
                 assert!(message.offset <= message.payload.len());
-                assert!(message.fd_offset <= message.fds.len());
             }
 
             let value = rng.next_u32();
@@ -576,7 +589,7 @@ mod tests {
             builder.write_string(&text);
             builder.write_array(&array);
             builder.write_nullable_string(None);
-            let mut message = WireMessage::new(1, 0, &builder.payload, &[]);
+            let mut message = WireMessage::new(1, 0, &builder.payload);
             assert_eq!(message.read_u32(), Ok(value));
             assert_eq!(message.read_string(), Ok(text));
             assert_eq!(message.read_array(), Ok(array));
@@ -751,7 +764,13 @@ mod tests {
         let header = MessageHeader::parse(message).expect("header");
         assert_eq!(header.len, message.len());
         let payload = &message[MessageHeader::LEN..];
-        let mut wire = WireMessage::new(header.sender_id, header.opcode, payload, fds);
+        // SAFETY: the caller owns the descriptors of an encoded message.
+        let mut fds: VecDeque<OwnedFd> = fds
+            .iter()
+            .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
+            .collect();
+        let mut wire =
+            WireMessage::new(header.sender_id, header.opcode, payload).with_fds(&mut fds);
         let decoded = decode(&mut wire).expect("decode");
         assert!(wire.is_payload_consumed());
         decoded
@@ -793,8 +812,7 @@ mod tests {
         ) else {
             panic!("format_table decodes as another event");
         };
-        assert_eq!((fd, size), (raw_table, 32));
-        nix::unistd::close(raw_table).expect("close the encoded table");
+        assert_eq!((fd.as_raw_fd(), size), (raw_table, 32));
     }
 
     #[test]
@@ -885,7 +903,7 @@ mod tests {
 
     #[test]
     fn wire_message_rejects_truncated_scalar() {
-        let mut msg = WireMessage::new(1, 0, &[1, 2, 3], &[]);
+        let mut msg = WireMessage::new(1, 0, &[1, 2, 3]);
         assert_eq!(msg.read_u32(), Err(ProtocolError::InsufficientData));
     }
 
@@ -894,7 +912,7 @@ mod tests {
         // Declared string length is four bytes, but only three bytes (and no
         // complete padded payload) are available.
         let string_length = 4u32.to_ne_bytes();
-        let mut string_msg = WireMessage::new(1, 0, &string_length, &[]);
+        let mut string_msg = WireMessage::new(1, 0, &string_length);
         assert_eq!(
             string_msg.read_string(),
             Err(ProtocolError::InsufficientData)
@@ -903,7 +921,7 @@ mod tests {
         let mut array_payload = Vec::new();
         array_payload.extend_from_slice(&5u32.to_ne_bytes());
         array_payload.extend_from_slice(&[1, 2, 3, 4]);
-        let mut array_msg = WireMessage::new(1, 0, &array_payload, &[]);
+        let mut array_msg = WireMessage::new(1, 0, &array_payload);
         assert_eq!(array_msg.read_array(), Err(ProtocolError::InsufficientData));
     }
 
@@ -913,7 +931,7 @@ mod tests {
         builder.write_string("가");
         builder.write_array(&[1, 2, 3]);
         let message = builder.build_message(7, 3);
-        let mut wire = WireMessage::new(7, 3, &message[8..], &[]);
+        let mut wire = WireMessage::new(7, 3, &message[8..]);
         assert_eq!(wire.read_string().unwrap(), "가");
         assert_eq!(wire.read_array().unwrap(), vec![1, 2, 3]);
         assert_eq!(wire.offset, message.len() - 8);
@@ -924,7 +942,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&4u32.to_ne_bytes());
         payload.extend_from_slice(&[0xff, 0x00, 0x00, 0x00]);
-        let mut wire = WireMessage::new(1, 0, &payload, &[]);
+        let mut wire = WireMessage::new(1, 0, &payload);
         assert_eq!(wire.read_string(), Err(ProtocolError::InvalidString));
     }
 
@@ -936,7 +954,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&4u32.to_ne_bytes());
         payload.extend_from_slice(b"abcd");
-        let mut wire = WireMessage::new(1, 0, &payload, &[]);
+        let mut wire = WireMessage::new(1, 0, &payload);
         assert_eq!(wire.read_string(), Err(ProtocolError::InvalidString));
         assert_eq!(
             wire.offset, 4,
@@ -951,7 +969,7 @@ mod tests {
         builder.write_nullable_string(Some(""));
         builder.write_nullable_string(Some("가"));
         let message = builder.build_message(7, 3);
-        let mut wire = WireMessage::new(7, 3, &message[8..], &[]);
+        let mut wire = WireMessage::new(7, 3, &message[8..]);
 
         assert_eq!(wire.read_nullable_string().unwrap(), None);
         assert_eq!(wire.read_nullable_string().unwrap(), Some(String::new()));
@@ -968,7 +986,7 @@ mod tests {
         incoming.write_i32(raw);
         let packet = incoming.build_message(7, 3);
 
-        let mut wire = WireMessage::new(7, 3, &packet[8..], &[]);
+        let mut wire = WireMessage::new(7, 3, &packet[8..]);
         let decoded = wire.read_fixed().unwrap();
         let mut forwarded = MessageBuilder::new();
         forwarded.write_fixed(decoded);
@@ -978,7 +996,7 @@ mod tests {
 
     #[test]
     fn wire_message_reports_trailing_payload() {
-        let mut wire = WireMessage::new(1, 0, &[7, 0, 0, 0, 0, 0, 0, 0], &[]);
+        let mut wire = WireMessage::new(1, 0, &[7, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(wire.read_u32(), Ok(7));
         assert!(!wire.is_payload_consumed());
         assert_eq!(wire.read_u32(), Ok(0));

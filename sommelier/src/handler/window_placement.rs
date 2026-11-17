@@ -761,11 +761,11 @@ mod tests {
     use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::wire::Action;
 
-    fn message_sender(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u32 {
+    fn message_sender(message: &crate::wire::Outgoing) -> u32 {
         msg_sender(&message.0)
     }
 
-    fn message_opcode(message: &(Vec<u8>, Vec<std::os::unix::io::RawFd>)) -> u16 {
+    fn message_opcode(message: &crate::wire::Outgoing) -> u16 {
         msg_opcode(&message.0)
     }
 

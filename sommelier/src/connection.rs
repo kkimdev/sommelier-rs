@@ -18,9 +18,9 @@ use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader};
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -82,11 +82,6 @@ impl OutgoingMessages {
         self.ends.is_empty()
     }
 
-    /// The descriptors of every message, which the caller still owns.
-    pub(crate) fn fds(&self) -> &[RawFd] {
-        &self.fds
-    }
-
     /// Discard the messages, returning their descriptors.
     pub(crate) fn take_fds(&mut self) -> Vec<RawFd> {
         self.bytes.clear();
@@ -98,11 +93,17 @@ impl OutgoingMessages {
 pub struct WaylandConnection {
     transport: ConnectionTransport,
     pub read_buf: Vec<u8>,
-    pub read_fds: Vec<RawFd>,
+    /// Received descriptors no message has taken yet, in stream order. A
+    /// decoded message takes its own from the front; the rest close with
+    /// the connection.
+    pub read_fds: VecDeque<OwnedFd>,
     /// A complete untracked message was dropped while descriptors remained
     /// queued on the ordered stream. This ambiguity must survive separate
     /// recv/parse calls until a complete follow-up can be rejected.
     pub ambiguous_untracked_fd: bool,
+    /// The most received descriptors held unconsumed: [`MAX_PENDING_FDS`],
+    /// which tests lower so they need not hold a thousand descriptors.
+    max_pending_fds: usize,
 }
 
 enum ConnectionTransport {
@@ -115,15 +116,6 @@ fn unix_send_flags() -> MsgFlags {
     // proxy must observe EPIPE and tear down that connection, not receive a
     // process-wide SIGPIPE and take unrelated GUI clients with it.
     MsgFlags::MSG_NOSIGNAL
-}
-
-fn close_received_fds(fds: &[RawFd]) {
-    let mut unique_fds = HashSet::with_capacity(fds.len());
-    for &fd in fds {
-        if fd >= 0 && unique_fds.insert(fd) {
-            let _ = nix::unistd::close(fd);
-        }
-    }
 }
 
 /// Decode SCM_RIGHTS descriptors from a raw `recvmsg` control buffer.
@@ -316,8 +308,9 @@ impl WaylandConnection {
         Ok(Self {
             transport: ConnectionTransport::Unix(AsyncFd::new(fd)?),
             read_buf: Vec::new(),
-            read_fds: Vec::new(),
+            read_fds: VecDeque::new(),
             ambiguous_untracked_fd: false,
+            max_pending_fds: MAX_PENDING_FDS,
         })
     }
 
@@ -325,8 +318,9 @@ impl WaylandConnection {
         Self {
             transport: ConnectionTransport::VirtWayland(channel),
             read_buf: Vec::new(),
-            read_fds: Vec::new(),
+            read_fds: VecDeque::new(),
             ambiguous_untracked_fd: false,
+            max_pending_fds: MAX_PENDING_FDS,
         }
     }
 
@@ -336,14 +330,14 @@ impl WaylandConnection {
     /// caller then closes the connection, which closes them.
     fn append_received(&mut self, data: &[u8], fds: Vec<OwnedFd>) -> io::Result<()> {
         self.read_buf.extend_from_slice(data);
-        self.read_fds
-            .extend(fds.into_iter().map(IntoRawFd::into_raw_fd));
-        if self.read_fds.len() > MAX_PENDING_FDS {
+        self.read_fds.extend(fds);
+        if self.read_fds.len() > self.max_pending_fds {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "peer has {} unconsumed file descriptors; the limit is {MAX_PENDING_FDS}",
-                    self.read_fds.len()
+                    "peer has {} unconsumed file descriptors; the limit is {}",
+                    self.read_fds.len(),
+                    self.max_pending_fds
                 ),
             ));
         }
@@ -525,25 +519,14 @@ impl AsRawFd for WaylandConnection {
     }
 }
 
-impl Drop for WaylandConnection {
-    fn drop(&mut self) {
-        // FDs received through SCM_RIGHTS are owned by the proxy. Normally
-        // proxy::handle_msgs drains and closes them after forwarding, but a
-        // disconnect or protocol error can drop the connection while a
-        // partial message is still buffered.
-        close_received_fds(&self.read_fds);
-        self.read_fds.clear();
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
-        WaylandConnection, MAX_PENDING_FDS,
+        WaylandConnection,
     };
-    use crate::test_support::{any_fd_has_identity, fd_identity};
+    use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
@@ -643,9 +626,10 @@ mod tests {
     async fn too_many_unconsumed_fds_end_the_connection() {
         let (peer, socket) = UnixStream::pair().expect("unix socket pair");
         let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
-        // Stand-ins for descriptors already pending; negative entries are
-        // never closed, so the test does not need a thousand real ones.
-        connection.read_fds.resize(MAX_PENDING_FDS - 1, -1);
+        // A small limit stands in for MAX_PENDING_FDS, and one descriptor
+        // already pending brings the queue to one below it.
+        connection.max_pending_fds = 2;
+        connection.read_fds.push_back(shm_pool_file(&[]).into());
 
         let name = CString::new("sommelier-pending-fd-limit").unwrap();
         let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
@@ -683,17 +667,16 @@ mod tests {
         // identity is not shared with the connection's pipe peer or another
         // anonymous-inode object. Eventfds all report one inode on Linux.
         let name = CString::new("sommelier-connection-fd-test").unwrap();
-        let pending_fd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC)
-            .expect("memfd_create")
-            .into_raw_fd();
-        let pending_identity = fd_identity(pending_fd);
+        let pending_fd =
+            memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let pending_identity = fd_identity(pending_fd.as_raw_fd());
         unsafe {
             libc::close(pipe_fds[1]);
         }
         let mut connection =
             WaylandConnection::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) })
                 .expect("register test pipe");
-        connection.read_fds.push(pending_fd);
+        connection.read_fds.push_back(pending_fd);
         drop(connection);
 
         // The numeric descriptor can be reused immediately by another test,

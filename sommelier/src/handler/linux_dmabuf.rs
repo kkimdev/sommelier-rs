@@ -26,7 +26,7 @@ use log::{debug, error};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::IntoRawFd;
 
 /// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
@@ -99,13 +99,9 @@ fn guest_device_bytes(ctx: &Context, host_device: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn format_table_fd_can_map(fd: RawFd, size: usize) -> bool {
-    if fd < 0 {
-        return false;
-    }
-
+fn format_table_fd_can_map(fd: BorrowedFd<'_>, size: usize) -> bool {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
         return false;
     }
 
@@ -764,7 +760,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         Action::Drop
     }
 
-    fn on_format_table(&mut self, ctx: &mut Context, fd: RawFd, size: u32) -> Action {
+    fn on_format_table(&mut self, ctx: &mut Context, fd: BorrowedFd<'_>, size: u32) -> Action {
         let guest_id = match ctx.shadow_table.get_guest_id(ctx.last_sender_id) {
             Some(id) => id,
             None => return Action::Drop,
@@ -773,11 +769,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         // from the new sequence use indices from an older table if rewriting
         // this one fails.
         ctx.feedback_index_maps.remove(&guest_id);
-
-        if fd < 0 {
-            log::warn!("Rejecting dmabuf format table with invalid fd {}", fd);
-            return Action::Drop;
-        }
 
         if size == 0 || !size.is_multiple_of(16) {
             log::warn!("Rejecting malformed dmabuf format table size {}", size);
@@ -798,7 +789,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         if !format_table_fd_can_map(fd, size as usize) {
             log::warn!(
                 "Rejecting dmabuf format table fd {} that cannot provide {} bytes",
-                fd,
+                fd.as_raw_fd(),
                 size
             );
             return Action::Drop;
@@ -815,7 +806,7 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
                 size as usize,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
@@ -843,12 +834,12 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         unsafe {
             libc::munmap(host_ptr, size as usize);
         }
-        let new_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
+        let new_fd = match fd.try_clone_to_owned() {
             Ok(fd) => fd,
             Err(error) => {
                 log::warn!(
                     "Failed to duplicate dmabuf format table fd {}: {}",
-                    fd,
+                    fd.as_raw_fd(),
                     error
                 );
                 return Action::Drop;
@@ -939,18 +930,13 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
     fn on_add(
         &mut self,
         ctx: &mut Context,
-        fd: RawFd,
+        fd: BorrowedFd<'_>,
         plane_idx: u32,
         offset: u32,
         stride: u32,
         modifier_hi: u32,
         modifier_lo: u32,
     ) -> Action {
-        if fd < 0 {
-            error!("Ignoring dmabuf add with invalid fd {}", fd);
-            return Action::Drop;
-        }
-
         let params_id = ctx.last_sender_id;
         if ctx.used_dmabuf_params.contains(&params_id) {
             queue_protocol_error(
@@ -984,7 +970,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             return Action::Drop;
         }
 
-        let dup_fd = match nix::unistd::dup(unsafe { BorrowedFd::borrow_raw(fd) }) {
+        let dup_fd = match fd.try_clone_to_owned() {
             Ok(d) => d.into_raw_fd(),
             Err(e) => {
                 error!("Failed to dup FD for add: {}", e);
@@ -1276,7 +1262,7 @@ mod tests {
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
     use crate::test_support::{any_fd_has_identity, fd_identity, protocol_error_code};
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
 
     use crate::test_support::msg_opcode as message_opcode;
 
@@ -1669,17 +1655,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_dmabuf_fd_is_rejected_before_borrowing() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(7, Vec::new());
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-
-        assert_eq!(handler.on_add(&mut ctx, -1, 0, 0, 4, 0, 0), Action::Drop);
-        assert!(ctx.pending_params[&7].is_empty());
-    }
-
-    #[test]
     fn invalid_plane_requests_queue_declared_protocol_errors() {
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
@@ -1689,7 +1664,15 @@ mod tests {
         let mut handler = LinuxDmabufHandler;
 
         assert_eq!(
-            handler.on_add(&mut ctx, pipe_fds[1], 2, 0, 64, 0, 0),
+            handler.on_add(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(pipe_fds[1]) },
+                2,
+                0,
+                64,
+                0,
+                0
+            ),
             Action::Drop
         );
         assert!(ctx.is_fatal());
@@ -1721,7 +1704,15 @@ mod tests {
         ctx.last_sender_id = 7;
         let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_add(&mut ctx, second_pipe[1], 0, 4096, 64, 0, 0),
+            handler.on_add(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(second_pipe[1]) },
+                0,
+                4096,
+                64,
+                0,
+                0
+            ),
             Action::Drop
         );
         assert!(ctx.is_fatal());
@@ -1819,7 +1810,6 @@ mod tests {
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
             &mut message,
@@ -2008,7 +1998,6 @@ mod tests {
             first_host_params,
             zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         assert!(
             zwp_linux_buffer_params_v1::dispatch_event(&mut created, &mut handler, &mut ctx)
@@ -2024,7 +2013,7 @@ mod tests {
 
         let queued_before_destroy = ctx.client_to_host_queue.len();
         ctx.last_sender_id = first_guest_buffer;
-        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[], &[]);
+        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[]);
         assert!(crate::protocols::wayland::wl_buffer::dispatch_request(
             &mut destroy,
             &mut ShmHandler,
@@ -2086,7 +2075,6 @@ mod tests {
             second_host_params,
             zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         assert!(
             zwp_linux_buffer_params_v1::dispatch_event(&mut reused, &mut handler, &mut ctx)
@@ -2144,7 +2132,6 @@ mod tests {
         let mut message = WireMessage::new(
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED,
-            &[],
             &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
@@ -2219,7 +2206,6 @@ mod tests {
             host_params_id,
             crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
             &payload,
-            &[],
         );
         let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
             &mut message,
@@ -2404,7 +2390,10 @@ mod tests {
         // must reach mmap rather than being rejected solely because st_size is
         // zero. A pipe cannot actually be mapped, but this helper deliberately
         // leaves that final check to mmap.
-        assert!(format_table_fd_can_map(pipe_fds[0], 4096));
+        assert!(format_table_fd_can_map(
+            unsafe { BorrowedFd::borrow_raw(pipe_fds[0]) },
+            4096
+        ));
 
         unsafe {
             libc::close(pipe_fds[0]);
@@ -2449,7 +2438,11 @@ mod tests {
         let mut handler = LinuxDmabufHandler;
 
         assert_eq!(
-            handler.on_format_table(&mut ctx, input_fd, bytes.len() as u32),
+            handler.on_format_table(
+                &mut ctx,
+                unsafe { BorrowedFd::borrow_raw(input_fd) },
+                bytes.len() as u32
+            ),
             Action::Drop
         );
         unsafe {

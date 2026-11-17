@@ -48,7 +48,7 @@ pub fn protocol_error_code(ctx: &crate::state::Context) -> u32 {
 }
 
 /// The `(sender, opcode)` of every message in a proxy message queue.
-pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
+pub fn queued_headers(queue: &[crate::wire::Outgoing]) -> Vec<(u32, u16)> {
     queue
         .iter()
         .map(|(message, _)| (msg_sender(message), msg_opcode(message)))
