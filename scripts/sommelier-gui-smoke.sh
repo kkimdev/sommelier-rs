@@ -225,6 +225,8 @@ elif grep -Fq "Using GBM linux-dmabuf allocation" "$proxy_log"; then
 elif grep -Fq "Using VirtWL shared-memory allocation" "$proxy_log" \
     || grep -Fq "Copied damaged SHM buffer" "$proxy_log"; then
     transport="validated-shm-fallback"
+elif grep -Fq "Using local shared-memory allocation" "$proxy_log"; then
+    transport="local-shm"
 fi
 if [[ "$transport" == "unknown" ]]; then
     echo "error: proxy never selected a recognized buffer transport" >&2

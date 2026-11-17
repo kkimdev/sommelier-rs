@@ -402,8 +402,9 @@ use dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
 
 /// The host storage chosen for one guest SHM buffer.
 enum ShmBacking {
-    /// VirtWL shared memory laid out exactly like the guest buffer (offset 0,
-    /// the guest stride and size). The host imports it as a `wl_shm` pool.
+    /// Shared memory (VirtWL, or a memfd for a local compositor) laid out
+    /// exactly like the guest buffer (offset 0, the guest stride and size).
+    /// The host imports it as a `wl_shm` pool.
     Shared(OwnedFd),
     /// A dma-buf the host imports through the internal `zwp_linux_dmabuf_v1`.
     Dmabuf {
@@ -1431,18 +1432,10 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
             width, height, format, buffer_size
         );
         ShmBacking::Shared(fd)
-    } else if let Some(allocator) = &ctx.allocator {
-        // GBM output is valid only for the direct linux-dmabuf path.
-        // Sending a PRIME fd as a wl_shm pool would make the host
-        // compositor mmap an object with the wrong protocol contract.
-        let Some(host_dmabuf_id) = host_dmabuf_id else {
-            error!(
-                "No VirtWL shared-memory channel is available; \
-                 refusing to send a GBM PRIME fd as wl_shm"
-            );
-            queue_buffer_creation_error(ctx, pool_id, "unable to allocate wl_shm buffer backing");
-            return None;
-        };
+    } else if let (Some(allocator), Some(host_dmabuf_id)) = (&ctx.allocator, host_dmabuf_id) {
+        // GBM output is valid only for the direct linux-dmabuf path: a PRIME
+        // fd sent as a wl_shm pool would make the host compositor mmap an
+        // object with the wrong protocol contract.
         match allocate_gbm_buffer(allocator, width, height, format) {
             Ok(allocation) => {
                 debug!(
@@ -1469,15 +1462,43 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Option<S
             }
         }
     } else {
-        error!("No VirtWL or GBM allocator is available");
-        queue_buffer_creation_error(ctx, pool_id, "unable to allocate wl_shm buffer backing");
-        return None;
+        // Without VirtWL the host is a local compositor (`--local-compositor`),
+        // which maps ordinary shared memory as a wl_shm pool.
+        match local_shared_memory(buffer_size.unsigned_abs()) {
+            Ok(fd) => {
+                debug!(
+                    "Using local shared-memory allocation: {}x{} format={:#010x} size={}",
+                    width, height, format, buffer_size
+                );
+                ShmBacking::Shared(fd)
+            }
+            Err(error) => {
+                error!("Failed to allocate local shared memory: {}", error);
+                queue_buffer_creation_error(
+                    ctx,
+                    pool_id,
+                    "unable to allocate wl_shm buffer backing",
+                );
+                return None;
+            }
+        }
     };
     Some(backing)
 }
 
-/// Create a guest SHM buffer backed by VirtWL shared memory, which the host
-/// imports as a temporary `wl_shm` pool.
+/// A memfd of `size` bytes, the host storage for a guest SHM buffer when the
+/// host is a local compositor that maps it directly.
+fn local_shared_memory(size: u32) -> io::Result<OwnedFd> {
+    let fd = nix::sys::memfd::memfd_create(
+        c"sommelier-shm-buffer",
+        nix::sys::memfd::MFdFlags::MFD_CLOEXEC,
+    )?;
+    nix::unistd::ftruncate(&fd, size.into())?;
+    Ok(fd)
+}
+
+/// Create a guest SHM buffer backed by shared memory ([`ShmBacking::Shared`]),
+/// which the host imports as a temporary `wl_shm` pool.
 fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd: OwnedFd) {
     let ShmBufferRequest {
         pool_id,
@@ -1512,8 +1533,8 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
         buffer_size
     );
 
-    // Map the buffer for SHM synchronization. VirtWL allocations
-    // are ordinary shared-memory fds and can be mapped directly.
+    // Map the buffer for SHM synchronization. Both VirtWL allocations
+    // and memfds are ordinary shared-memory fds and can be mapped directly.
     let dest_size = buffer_size.unsigned_abs() as usize;
     let dest_ptr = unsafe {
         libc::mmap(
@@ -1527,7 +1548,7 @@ fn create_shared_buffer(ctx: &mut Context, request: ShmBufferRequest, shared_fd:
     };
     if dest_ptr as *mut libc::c_void == libc::MAP_FAILED {
         error!(
-            "Failed to mmap VirtWL SHM buffer: {:?}",
+            "Failed to mmap shared SHM buffer: {:?}",
             std::io::Error::last_os_error()
         );
         queue_buffer_creation_error(ctx, pool_id, "unable to map wl_shm buffer backing");
@@ -2042,7 +2063,7 @@ mod tests {
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
     use crate::state::{DamageRect, DamageRegion};
-    use crate::test_support::shm_pool_file;
+    use crate::test_support::{msg_sender, queued_headers, shm_pool_file};
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
     use std::os::fd::AsRawFd;
@@ -2773,8 +2794,68 @@ mod tests {
         drop(pipe_write);
     }
 
+    /// Without VirtWL the host is a local compositor (`--local-compositor`),
+    /// which maps a memfd as the buffer's wl_shm pool.
     #[test]
-    fn allocation_failure_is_fatal_without_creating_a_ghost_buffer() {
+    fn without_virtwl_a_buffer_is_backed_by_a_memfd_of_its_size() {
+        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+        const HOST_SHM: u32 = 2;
+        let (pool_id, buffer_id) = (20, 30);
+        let (width, height, stride) = (8, 4, 32);
+
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.host_shm_id = Some(HOST_SHM);
+        ctx.shadow_table
+            .track_host_interface(HOST_SHM, "wl_shm".to_string());
+        ctx.pools.insert(
+            pool_id,
+            ShmPool {
+                file: Arc::new(shm_pool_file(&[0; 4096])),
+                size: 4096,
+            },
+        );
+        ctx.shadow_table
+            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.last_sender_id = pool_id;
+
+        assert_eq!(
+            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(
+                &mut ShmHandler,
+                &mut ctx,
+                buffer_id,
+                0,
+                width,
+                height,
+                stride,
+                0,
+            ),
+            Action::Drop
+        );
+
+        assert!(!ctx.fatal_protocol_error);
+        assert!(ctx.shadow_table.get_host_id(buffer_id).is_some());
+        let host_pool = msg_sender(&ctx.client_to_host_queue[1].0);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [
+                (HOST_SHM, wl_shm::REQ_CREATE_POOL),
+                (host_pool, wl_shm_pool::REQ_CREATE_BUFFER),
+                (host_pool, wl_shm_pool::REQ_DESTROY),
+            ]
+        );
+        let pool_fd =
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(ctx.client_to_host_queue[0].1[0]) };
+        let pool_size = nix::sys::stat::fstat(pool_fd)
+            .expect("fstat the pool")
+            .st_size;
+        assert_eq!(pool_size, i64::from(stride * height));
+    }
+
+    /// Host storage that cannot be set up (here: the host has no wl_shm to
+    /// import the backing into) fails the buffer, which is fatal and leaves
+    /// no trace of the buffer behind.
+    #[test]
+    fn failed_host_storage_is_fatal_without_creating_a_ghost_buffer() {
         use nix::sys::memfd::{memfd_create, MFdFlags};
         use std::ffi::CString;
 
@@ -2820,8 +2901,8 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
-            2,
-            "resource failures must report a no-memory-class fatal error"
+            super::WL_SHM_ERROR_INVALID_FD,
+            "a buffer whose storage fails reports wl_shm.invalid_fd"
         );
         assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
         assert_eq!(ctx.shadow_table.get_interface(buffer_id), None);

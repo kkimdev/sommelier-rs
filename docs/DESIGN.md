@@ -157,6 +157,9 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   like the guest buffer and imported by the host as a `wl_shm` pool, or,
   with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
   a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
+  With `--local-compositor` and no VirtWL, the shared memory is a memfd
+  (or, with `--gpu-accel`, a DRM render node and the host's linux-dmabuf,
+  a GBM dma-buf).
   `ShmBacking` records the choice, so the copy path re-checks nothing.
 - On commit, the damaged region is copied from the guest pool into the host
   storage before the host `wl_surface.commit` is queued, so the host never
