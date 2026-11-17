@@ -181,12 +181,18 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   that synthesize `delete_id` themselves (such as `wl_callback.done`) may
   retire their mapping when they queue it.
   Test: `destructor_mapping_survives_until_host_delete_id`.
-- **An ID returns only when its object is gone on both sides.** An ID the
+- **An ID is reused only once the peer has forgotten it.** An ID the
   proxy allocated on the host connection becomes reusable only through
   `ShadowTable::release_deleted_host_id`, on the host's `delete_id`: the
   host has then forgotten it, so every mapping of it is dropped and no
-  later event can name it. A `delete_id` for an ID the proxy does not track
-  changes nothing. An ID the host allocated (from `0xff000000`) gets no
+  later event can name it. The host may destroy a guest's object on its
+  own, as compositors do with the pending frame callbacks of a destroyed
+  surface, so its `delete_id` ends the object and reaches the guest. A live
+  object only the proxy uses (a binding, an Aura child, an internal
+  callback, host-only params) is one the host never destroys on its own: a
+  `delete_id` for one, or for an ID the proxy does not track, changes
+  nothing, so a misbehaving host cannot hand a live object's ID to a new
+  one. An ID the host allocated (from `0xff000000`) gets no
   `delete_id`; it stops being reserved as soon as the proxy destroys the
   object. A guest ID from the server range returns, through
   `ShadowTable::forget_guest_object`, when its guest object ends. Generated
@@ -206,6 +212,8 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `every_end_of_a_server_created_guest_object_frees_its_id`,
   `cycled_data_offers_keep_their_guest_id_small`,
   `delete_id_for_an_untracked_host_id_changes_nothing`,
+  `a_host_destroyed_frame_callback_reaches_the_guest`,
+  `a_delete_id_for_a_live_host_only_object_changes_nothing`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **Host-only objects keep their ID reservation.** A host-only proxy object

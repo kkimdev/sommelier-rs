@@ -896,6 +896,56 @@ mod tests {
         assert_eq!(guest_sync(&mut client, 4).await, first);
     }
 
+    /// A compositor destroys the pending frame callbacks of a destroyed
+    /// surface without `done`, as Exo, weston and wlroots do, and
+    /// libwayland-server then sends their `delete_id`. The callback's host
+    /// ID must be reusable, and the guest must get its `delete_id`.
+    #[tokio::test]
+    async fn a_host_destroyed_frame_callback_reaches_the_guest() {
+        use crate::protocols::wayland::{wl_display, wl_surface};
+        use std::io::Read;
+        const SURFACE: u32 = 20;
+        const CALLBACK: u32 = 21;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client
+            .ctx
+            .shadow_table
+            .insert_paired_for_test(SURFACE, 30, "wl_surface");
+        for (request, _) in [
+            wl_surface::req::frame(SURFACE, CALLBACK),
+            wl_surface::req::destroy(SURFACE),
+        ] {
+            client.client_conn.read_buf.extend_from_slice(&request);
+        }
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        let host_callback = client
+            .ctx
+            .shadow_table
+            .get_host_id(CALLBACK)
+            .expect("the frame callback reaches the host");
+
+        host_events(&mut client, &[delete_id(host_callback)]).await;
+        assert_eq!(client.ctx.shadow_table.get_host_id(CALLBACK), None);
+        assert_eq!(
+            client.ctx.shadow_table.allocate_host_id(),
+            host_callback,
+            "the deleted callback's host ID is reused first"
+        );
+        drop(client);
+        let mut events = Vec::new();
+        guest_peer
+            .read_to_end(&mut events)
+            .expect("read the guest's events");
+        let deleted: Vec<u32> = crate::test_support::frames(&events)
+            .filter(|(header, _)| {
+                (header.sender_id, header.opcode)
+                    == (crate::wire::WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)
+            })
+            .map(|(_, payload)| u32::from_ne_bytes(payload[..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(deleted, vec![CALLBACK]);
+    }
+
     /// A guest may destroy a buffer the host still holds. Its guest object
     /// is gone, but the host's `release` must still reach the handler, which
     /// then destroys the host buffer.

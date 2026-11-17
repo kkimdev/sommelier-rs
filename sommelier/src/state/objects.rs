@@ -27,8 +27,10 @@ use log::warn;
 /// ([`ShadowTable::release_deleted_host_id`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeletedHostId {
-    /// An ID the proxy does not track; nothing changed.
-    Untracked,
+    /// The host may not delete the ID: the proxy does not track it, or it
+    /// holds a live object only the proxy uses, which the host never
+    /// destroys on its own. Nothing changed.
+    Ignored,
     /// A host-only object; no guest object is owed a `delete_id`.
     HostOnly,
     /// An object paired with this guest object, now owed its `delete_id`.
@@ -633,25 +635,19 @@ impl ShadowTable {
     /// its host-side proxy may still exist after the guest-facing global is
     /// removed.
     ///
-    /// Production retires only host-only objects. A paired object would stay
-    /// reserved through its guest object, so it loses only its own
-    /// interface and version.
+    /// A paired object is not a binding of the proxy's own, so it is left
+    /// alone; the host's `delete_id` cannot give a binding's ID to one (see
+    /// [`Self::release_deleted_host_id`]).
     pub fn retire_host_interface(&mut self, host_id: u32) {
         let host = HostId(host_id);
-        let object = self.hosts.get_mut(&host);
-        debug_assert!(
-            object.as_deref().and_then(HostObject::guest).is_none(),
-            "retiring paired host object {host_id}"
-        );
-        if let Some(HostObject::Paired {
-            interface, version, ..
-        }) = object
-        {
-            *interface = None;
-            *version = None;
-        } else {
-            self.hosts.insert(host, HostObject::ReservedForConnection);
+        if let Some(guest) = self.guest_id_of(host) {
+            warn!(
+                "Not retiring host object {host_id}, which guest object {} uses",
+                guest.0
+            );
+            return;
         }
+        self.hosts.insert(host, HostObject::ReservedForConnection);
     }
 
     pub fn get_interface(&self, guest_id: u32) -> Option<&String> {
@@ -769,21 +765,28 @@ impl ShadowTable {
     /// never reused while its `delete_id` is outstanding, and objects without
     /// a destructor keep theirs for the connection.
     ///
-    /// A `delete_id` for an ID this proxy did not allocate, or no longer
-    /// tracks, changes nothing and returns [`DeletedHostId::Untracked`].
+    /// A server may destroy a client's object on its own, as a compositor
+    /// does with the pending frame callbacks of a destroyed surface, so a
+    /// `delete_id` ends a paired object whether or not the guest destroyed
+    /// it. A live object only the proxy uses (a binding, an Aura child, an
+    /// internal callback, host-only params) is one the host never destroys
+    /// on its own: a `delete_id` for one, or for an ID this proxy did not
+    /// allocate or no longer tracks, changes nothing and returns
+    /// [`DeletedHostId::Ignored`]. Freeing a live object's ID would hand it
+    /// to a new object while the old one still holds it.
     pub fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
         let host = HostId(host_id);
-        let object = if self.host_ids.contains(host_id) {
-            self.hosts.remove(&host)
-        } else {
-            None
+        let deletable = self.hosts.get(&host).filter(|object| {
+            self.host_ids.contains(host_id) && !matches!(object, HostObject::HostOnly { .. })
+        });
+        let Some(object) = deletable else {
+            warn!("Ignoring wl_display.delete_id for host ID {host_id}, which is untracked or a live host-only object");
+            return DeletedHostId::Ignored;
         };
-        let Some(object) = object else {
-            warn!("Ignoring wl_display.delete_id for untracked host ID {host_id}");
-            return DeletedHostId::Untracked;
-        };
+        let guest = object.guest();
+        self.hosts.remove(&host);
         self.host_ids.release(host_id);
-        let Some(guest) = object.guest() else {
+        let Some(guest) = guest else {
             return DeletedHostId::HostOnly;
         };
         let paired = self
@@ -1148,10 +1151,41 @@ mod tests {
         );
         assert_eq!(
             table.release_deleted_host_id(first + 100),
-            DeletedHostId::Untracked,
+            DeletedHostId::Ignored,
             "a delete_id for an ID never allocated changes nothing"
         );
         assert_eq!(table.allocate_host_id(), second + 1);
+    }
+
+    /// The host never destroys a binding of the proxy's own, so a
+    /// `delete_id` for one must not free its ID: the ID would go to a new
+    /// object while the binding still holds it, and the binding's later
+    /// `global_remove` would retire the new object.
+    #[test]
+    fn a_delete_id_for_a_live_host_only_object_changes_nothing() {
+        let mut table = ShadowTable::new();
+        // An internal binding without a destructor, such as the host wl_shm.
+        let binding = table.allocate_host_id();
+        table.track_host_interface_with_version(binding, "wl_shm".to_string(), 1);
+
+        assert_eq!(
+            table.release_deleted_host_id(binding),
+            DeletedHostId::Ignored
+        );
+        assert!(table.is_event_sender_known(binding));
+
+        // The binding's global goes, and with it the binding only.
+        let next = table.allocate_host_id();
+        assert_ne!(next, binding);
+        table.map_id(11, next);
+        table.retire_host_interface(binding);
+        assert!(!table.is_event_sender_known(binding));
+        assert_eq!(table.get_host_id(11), Some(next));
+
+        // Retiring a paired object is refused, not fatal.
+        table.retire_host_interface(next);
+        assert_eq!(table.get_host_id(11), Some(next));
+        assert!(table.is_event_sender_known(next));
     }
 
     #[test]
