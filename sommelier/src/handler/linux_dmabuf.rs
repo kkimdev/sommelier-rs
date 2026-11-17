@@ -1199,6 +1199,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         build_synthetic_feedback_messages, feedback_pairs, format_table_fd_can_map,

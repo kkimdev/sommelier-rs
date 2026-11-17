@@ -235,6 +235,8 @@ fn wait_sync_file(fd: RawFd) -> io::Result<()> {
     }
 }
 
+// The GPU device boundary: the ioctl returns a new raw sync_file.
+#[allow(clippy::disallowed_methods)]
 fn export_dmabuf_read_fence(fd: RawFd) -> io::Result<OwnedFd> {
     let mut sync_file = DmaBufExportSyncFile {
         flags: DMA_BUF_SYNC_READ,
@@ -716,6 +718,8 @@ pub(crate) fn wait_for_dmabuf(
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         apply_dmabuf_plane0_fixup, dmabuf_sync_capability_unavailable, drm_device_candidates,

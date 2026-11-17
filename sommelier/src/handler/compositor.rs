@@ -1267,6 +1267,8 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;

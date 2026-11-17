@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// The VirtWL device boundary: its ioctls return raw descriptors, which this
+// module takes over or closes, even on error paths.
+#![allow(clippy::disallowed_methods)]
+
 use crate::virtwl::{
     virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send,
     virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,

@@ -1553,6 +1553,8 @@ fn resolve_vm_identifier(value: Option<String>) -> String {
 }
 
 #[cfg(test)]
+// Tests build and close raw descriptors to check who owns them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::os::fd::{FromRawFd, OwnedFd};

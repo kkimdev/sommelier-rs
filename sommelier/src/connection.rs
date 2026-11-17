@@ -122,6 +122,8 @@ fn unix_send_flags() -> MsgFlags {
 /// takes ownership of every descriptor that is present as soon as it reads
 /// it, so returning an error whenever truncation or malformed control data
 /// is observed closes them.
+// The kernel boundary: recvmsg installs raw descriptors.
+#[allow(clippy::disallowed_methods)]
 fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
     let mut fds = Vec::new();
     // The kernel never reports a negative descriptor; owning one would be
