@@ -423,19 +423,6 @@ impl ShadowTable {
         host_id >= Self::GUEST_SERVER_ID_START && !self.hosts.contains_key(&HostId(host_id))
     }
 
-    /// Return whether a host event sender belongs to an object that this
-    /// connection is currently tracking: a paired object, or one that
-    /// Sommelier binds internally (for example the host `wl_shm` and
-    /// keyboard-extension objects).
-    ///
-    /// An event from any other sender is stale or malformed and must not
-    /// reach a handler, because handlers may update proxy state before the
-    /// generated forwarding code can discover that the sender has no guest
-    /// representation.
-    pub fn is_event_sender_known(&self, host_id: u32) -> bool {
-        self.get_host_interface(host_id).is_some()
-    }
-
     // Queries.
 
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
@@ -997,16 +984,16 @@ mod tests {
     #[test]
     fn event_sender_is_known_for_paired_and_internal_objects_only() {
         let mut table = ShadowTable::new();
-        assert!(!table.is_event_sender_known(90));
+        assert!(!table.get_host_interface(90).is_some());
 
         let paired = table.create_paired(10, "wl_surface", 1, 1);
-        assert!(table.is_event_sender_known(paired));
-        assert!(!table.is_event_sender_known(10));
+        assert!(table.get_host_interface(paired).is_some());
+        assert!(!table.get_host_interface(10).is_some());
 
         let binding = table.create_host_only("wl_shm", 1);
-        assert!(table.is_event_sender_known(binding));
+        assert!(table.get_host_interface(binding).is_some());
         assert!(table.host_destroy_queued(binding));
-        assert!(!table.is_event_sender_known(binding));
+        assert!(!table.get_host_interface(binding).is_some());
     }
 
     /// Only a live paired or local object can send a request, and an object
@@ -1091,7 +1078,7 @@ mod tests {
         table.guest_ended_host_destroyed(20);
         assert!(table.is_guest_id_available(20));
         assert!(table.is_retired_host(host));
-        assert!(!table.is_event_sender_known(host));
+        assert!(!table.get_host_interface(host).is_some());
         assert_eq!(table.release_deleted_host_id(host), DeletedHostId::HostOnly);
         assert!(table.is_host_id_available(host));
     }
@@ -1108,7 +1095,7 @@ mod tests {
             Some("wl_buffer"),
             "a delayed wl_buffer.release must still be dispatchable after guest destroy"
         );
-        assert!(table.is_event_sender_known(host));
+        assert!(table.get_host_interface(host).is_some());
         assert_eq!(table.host_object_version(host), Some(1));
         assert!(table.is_pending_destroy_guest(20));
         assert_eq!(table.request_sender(20), None);
@@ -1124,7 +1111,7 @@ mod tests {
         // numeric ID remains unavailable for reuse.
         assert!(table.host_destroy_queued(40));
         assert!(table.is_retired_host(40));
-        assert!(!table.is_event_sender_known(40));
+        assert!(!table.get_host_interface(40).is_some());
         assert!(!table.is_host_id_available(40));
         assert!(!table.host_destroy_queued(40), "it is retired once");
 
@@ -1144,7 +1131,7 @@ mod tests {
         table.insert_host_only_for_test(host_buffer, "wl_buffer", 1);
 
         assert!(table.host_destroy_queued(host_buffer));
-        assert!(!table.is_event_sender_known(host_buffer));
+        assert!(!table.get_host_interface(host_buffer).is_some());
         assert!(
             table.accepts_host_new_id(host_buffer),
             "the host's next server-created object may reuse the ID"
@@ -1193,19 +1180,19 @@ mod tests {
             table.release_deleted_host_id(binding),
             DeletedHostId::Ignored
         );
-        assert!(table.is_event_sender_known(binding));
+        assert!(table.get_host_interface(binding).is_some());
 
         // The binding's global goes, and with it the binding only.
         let next = table.create_paired(11, "wl_surface", 1, 1);
         assert_ne!(next, binding);
         table.retire_host(binding);
-        assert!(!table.is_event_sender_known(binding));
+        assert!(!table.get_host_interface(binding).is_some());
         assert_eq!(table.get_host_id(11), Some(next));
 
         // Retiring a paired object is refused, not fatal.
         table.retire_host(next);
         assert_eq!(table.get_host_id(11), Some(next));
-        assert!(table.is_event_sender_known(next));
+        assert!(table.get_host_interface(next).is_some());
     }
 
     /// Retiring an ID that holds no object must not reserve it, or the
@@ -1270,7 +1257,7 @@ mod tests {
         // interface, routes its events and stays reserved.
         assert!(table.guest_ended_host_kept(20));
         assert_eq!(table.get_host_interface(host), Some("zwp_text_input_v1"));
-        assert!(table.is_event_sender_known(host));
+        assert!(table.get_host_interface(host).is_some());
         assert!(!table.is_host_id_available(host));
     }
 
@@ -1282,7 +1269,7 @@ mod tests {
 
         table.retire_host(host_id);
         assert!(table.is_retired_host(host_id));
-        assert!(!table.is_event_sender_known(host_id));
+        assert!(!table.get_host_interface(host_id).is_some());
         assert!(!table.is_host_id_available(host_id));
         assert_ne!(table.allocate_host_id(), HostId(host_id));
 

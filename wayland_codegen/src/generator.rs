@@ -782,13 +782,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 handler: &mut H,
                 ctx: &mut Context,
             ) -> Result<Option<Outgoing>, ProtocolError> {
-                if !ctx.shadow_table.is_event_sender_known(msg.sender_id) {
-                    log::debug!(
-                        "Dropping event from untracked host sender {}",
-                        msg.sender_id
-                    );
-                    return Ok(None);
-                }
+                // The proxy dispatches an event by its sender's interface
+                // (`ShadowTable::get_host_interface`), so the sender is a
+                // live host object.
                 let evt = Event::from_wire(msg)?;
                 match evt {
                     #(#dispatch_event_arms)*

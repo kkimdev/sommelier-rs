@@ -4272,47 +4272,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn untracked_host_event_is_dropped_before_handler_state_mutation() {
-        struct Probe {
-            called: bool,
-        }
-
-        impl protocols::wayland::wl_registry::WlRegistryHandler for Probe {
-            fn on_global(
-                &mut self,
-                _ctx: &mut Context,
-                _name: u32,
-                _interface: &String,
-                _version: u32,
-            ) -> crate::wire::Action {
-                self.called = true;
-                crate::wire::Action::Drop
-            }
-        }
-
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
+    /// The proxy dispatches a host event by its sender's interface, so an
+    /// event from a sender it does not track never reaches a handler.
+    #[tokio::test]
+    async fn untracked_host_event_is_dropped_before_handler_state_mutation() {
+        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
         let mut builder = MessageBuilder::new();
         builder.write_u32(7);
         builder.write_string("wl_seat");
         builder.write_u32(1);
-        let payload = builder.build_message(77, protocols::wayland::wl_registry::EVT_GLOBAL);
-        let mut msg = WireMessage::new(
-            77,
-            protocols::wayland::wl_registry::EVT_GLOBAL,
-            &payload[8..],
-        );
-        let mut probe = Probe { called: false };
+        let global = builder.build_message(77, protocols::wayland::wl_registry::EVT_GLOBAL);
 
-        let result =
-            protocols::wayland::wl_registry::dispatch_event(&mut msg, &mut probe, &mut ctx);
-
-        assert_eq!(raw_dispatch(result), Ok(None));
+        host_events(&mut client, &[global]).await;
         assert!(
-            !probe.called,
+            client.ctx.host_globals.is_empty(),
             "an untracked host event must not reach a stateful handler"
         );
-        assert!(ctx.host_globals.is_empty());
     }
 
     #[test]
