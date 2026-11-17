@@ -1082,8 +1082,9 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
 }
 
 /// Activations the guest's typing deferred
-/// ([`typing::Typed::deferred_activations`]), across the cases whose text
-/// fields were checked.
+/// ([`typing::Typed::deferred_activations`]: counted from the guest's plan,
+/// accurate only while every drain barrier's answer is held), across the
+/// cases whose text fields were checked.
 static DEFERRED_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Enabled text fields whose host state was checked, across all cases.

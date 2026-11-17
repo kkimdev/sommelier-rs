@@ -183,7 +183,10 @@ pub(super) struct Typed {
     /// The field its text input last committed, if it is enabled.
     pub field: Option<V3Field>,
     /// The activations its plan deferred: enables the proxy received while
-    /// it drained the field's previous activation (see [`Plan`]).
+    /// it drained the field's previous activation (see [`Plan`]). The count
+    /// comes from the guest's plan, not from what the proxy did, and is
+    /// accurate only while the compositor holds every drain barrier's
+    /// answer, as it now does.
     pub deferred_activations: u64,
 }
 

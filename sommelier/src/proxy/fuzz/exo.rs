@@ -34,6 +34,9 @@ limitations under the License.
 //! - the fallbacks for unknown types, modes and flags, and for surrounding
 //!   text whose offsets do not convert to UTF-16, none of which the proxy
 //!   sends;
+//! - `zwp_text_input_v1.modifiers_map`, which Exo sends on every
+//!   `activate` (`zwp_text_input_manager.cc` 569-577) and the proxy
+//!   ignores;
 //! - which of several attached text inputs the input method serves, and
 //!   the virtual keyboard, focus reason, grammar and autocorrect state.
 //!
