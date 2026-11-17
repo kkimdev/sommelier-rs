@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn xdg_output_passes_through_with_translated_ids_and_versions() {
         use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
+            self, dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
         };
         let mut ctx = Context::new_for_test(false, false, vec![]);
         bind_xdg_output_manager(&mut ctx, 1);
@@ -872,9 +872,8 @@ mod tests {
         assert_eq!(event[8..], size);
 
         // `description` is a v2 event, which a v1 xdg_output never gets.
-        let mut description = crate::wire::MessageBuilder::new();
-        description.write_string("Built-in display");
-        let description = description.build_message(host_xdg_output, EVT_DESCRIPTION);
+        let (description, _) =
+            zxdg_output_v1::evt::description(host_xdg_output, "Built-in display").unwrap();
         let mut event =
             crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..], &[]);
         assert!(matches!(

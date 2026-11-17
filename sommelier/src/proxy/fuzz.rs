@@ -877,12 +877,8 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             .ctx
             .shadow_table
             .track_interface(WL_DISPLAY_ID, "wl_display".to_string());
-        let mut get_registry = MessageBuilder::new();
-        get_registry.write_u32(REGISTRY);
-        client
-            .client_conn
-            .read_buf
-            .extend(get_registry.build_message(WL_DISPLAY_ID, wl_display::REQ_GET_REGISTRY));
+        let (get_registry, _) = wl_display::req::get_registry(WL_DISPLAY_ID, REGISTRY);
+        client.client_conn.read_buf.extend(get_registry);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
         let host_registry = client
             .ctx
@@ -890,14 +886,10 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             .get_host_id(REGISTRY)
             .expect("the registry reaches the host");
         for (index, (interface, version)) in globals.iter().enumerate() {
-            let mut global = MessageBuilder::new();
-            global.write_u32(index as u32 + 1);
-            global.write_string(interface);
-            global.write_u32(*version);
-            client
-                .host_conn
-                .read_buf
-                .extend(global.build_message(host_registry, wl_registry::EVT_GLOBAL));
+            let (global, _) =
+                wl_registry::evt::global(host_registry, index as u32 + 1, interface, *version)
+                    .expect("a global fits a message");
+            client.host_conn.read_buf.extend(global);
         }
         // An output unplugged before the guest's requests arrive. The guest
         // saw it advertised, so a bind of it crosses its removal and makes
@@ -907,15 +899,12 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             .iter()
             .find(|(interface, _)| interface == "wl_output")
             .expect("wl_output is a global");
-        let mut global = MessageBuilder::new();
-        global.write_u32(unplugged);
-        global.write_string("wl_output");
-        global.write_u32(*output_version);
-        let mut remove = MessageBuilder::new();
-        remove.write_u32(unplugged);
-        for event in [
-            global.build_message(host_registry, wl_registry::EVT_GLOBAL),
-            remove.build_message(host_registry, wl_registry::EVT_GLOBAL_REMOVE),
+        let global =
+            wl_registry::evt::global(host_registry, unplugged, "wl_output", *output_version)
+                .expect("a global fits a message");
+        for (event, _) in [
+            global,
+            wl_registry::evt::global_remove(host_registry, unplugged),
         ] {
             client.host_conn.read_buf.extend(event);
         }
@@ -1068,10 +1057,8 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
                 let callback = WireMessage::new(sender, opcode, payload, &[])
                     .read_u32()
                     .expect("a callback ID");
-                let mut done = MessageBuilder::new();
-                done.write_u32(0);
                 // `done` destroys the callback.
-                reply.push(done.build_message(callback, wl_callback::EVT_DONE));
+                reply.push(wl_callback::evt::done(callback, 0).0);
                 ended.push(callback);
             }
             for id in ended {
@@ -1094,9 +1081,7 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
 
 /// `wl_display.delete_id(id)`.
 fn delete_id(id: u32) -> Vec<u8> {
-    let mut event = MessageBuilder::new();
-    event.write_u32(id);
-    event.build_message(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)
+    wl_display::evt::delete_id(WL_DISPLAY_ID, id).0
 }
 
 /// Receive once from `socket`, appending the bytes to `bytes`; returns the
