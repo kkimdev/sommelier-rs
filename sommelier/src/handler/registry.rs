@@ -1199,21 +1199,17 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         } else {
             *version
         };
-        let host_new_id =
-            ctx.shadow_table
-                .create_paired(*guest_new_id, interface, *version, host_version);
 
         // We need to send the bind request to the host.
         // The sender is the registry object.
         let registry_guest_id = ctx.last_sender_id;
-
         let Some(registry_host_id) = ctx.shadow_table.get_host_id(registry_guest_id) else {
             error!("Registry not mapped! Guest ID: {}", registry_guest_id);
-            // Do not leave a guest→host mapping behind when the registry
-            // itself has already been destroyed or was never mapped.
-            ctx.shadow_table.remove_id(*guest_new_id);
             return Action::Drop;
         };
+        let host_new_id =
+            ctx.shadow_table
+                .create_paired(*guest_new_id, interface, *version, host_version);
         let bind_version = host_version;
         if !queue_internal_bind(
             ctx,
@@ -1223,7 +1219,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
-            ctx.shadow_table.remove_id(*guest_new_id);
+            ctx.shadow_table.abandon(*guest_new_id);
             ctx.fail_session();
             return Action::Drop;
         }

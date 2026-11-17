@@ -598,6 +598,21 @@ impl ShadowTable {
         }
     }
 
+    /// Forget paired guest object `guest_id` and its host object, which
+    /// never reached the host: nothing on either side knows the IDs, so
+    /// both are free at once.
+    pub fn abandon(&mut self, guest_id: u32) {
+        let guest = GuestId(guest_id);
+        let host = self
+            .forget_guest_object(guest)
+            .and_then(|object| object.host());
+        debug_assert!(host.is_some(), "guest {guest_id} is not paired");
+        if let Some(host) = host {
+            self.remove_paired_host(host, guest);
+            self.host_ids.release(host.0);
+        }
+    }
+
     /// Local guest object `guest_id` ended: its destructor completed in the
     /// proxy.
     ///
@@ -1349,6 +1364,19 @@ mod tests {
         table.retire_host(next);
         assert_eq!(table.get_host_id(11), Some(next));
         assert!(table.is_event_sender_known(next));
+    }
+
+    /// An object whose creation never reached the host frees its host ID
+    /// along with its guest ID, so the ID space stays dense.
+    #[test]
+    fn an_abandoned_object_frees_both_ids() {
+        let mut table = ShadowTable::new();
+        let host = table.create_paired(10, "wl_output", 3, 3);
+
+        table.abandon(10);
+        assert!(table.is_guest_id_available(10));
+        assert!(table.is_host_id_available(host));
+        assert_eq!(table.allocate_host_id(), host, "the host ID is reused");
     }
 
     #[test]
