@@ -25,6 +25,9 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(test)]
+mod fuzz;
+
 type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,

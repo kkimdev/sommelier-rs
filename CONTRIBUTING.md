@@ -42,6 +42,30 @@ Tests must run serially (`--test-threads=1`).
 - Never commit transient files; `*.local.*` and `_local/` are ignored for
   them.
 
+## Randomized tests
+
+`proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
+request streams built from the vendored XML, some of them damaged, over
+real sockets. Each case must end without a panic or hang, close every
+descriptor, and either answer the stream's closing `wl_display.sync` or
+send `wl_display.error`. The fake compositor behind the proxy also checks
+that every request it receives comes from a live host object, creates
+only fresh IDs and names live objects of the right interface; it deletes
+destroyed objects at once, so the proxy's host ID reuse is exercised.
+The suite runs 5000 cases from seed 0; run more, from another seed,
+after changing how the proxy reads guest requests:
+
+```bash
+SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
+  cargo test -p sommelier --bins proxy::fuzz
+```
+
+A failure names its seed; rerun that seed alone with
+`SOMMELIER_FUZZ_SEED=<seed> SOMMELIER_FUZZ_CASES=1`, and add `RUST_LOG=debug`
+and `-- --nocapture` to see the proxy's log. The seed fixes the case's
+input, not its timing (how the pieces arrive, which side the proxy serves
+first), so replay a failing seed a few times before concluding it passes.
+
 ## Commit messages
 
 Make small commits, one logical change each, in the form

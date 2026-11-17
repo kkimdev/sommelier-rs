@@ -126,6 +126,51 @@ pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
     file
 }
 
+/// A seeded pseudo-random generator (SplitMix64) for randomized tests.
+///
+/// Small and dependency-free; the same seed always yields the same values,
+/// so a failing case's input reproduces from the seed it reports. A test
+/// whose outcome also depends on timing may need a few replays.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    /// A value in `0..bound`; `bound` must be positive.
+    pub fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+
+    /// True once in `n` calls on average.
+    pub fn one_in(&mut self, n: u64) -> bool {
+        self.next_u64().is_multiple_of(n)
+    }
+
+    /// One element of the non-empty slice `items`.
+    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+
+    /// `len` random bytes.
+    pub fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next_u64() as u8).collect()
+    }
+}
+
 /// A uniquely named scratch directory removed when dropped.
 ///
 /// Tests run in parallel inside one process, so the name combines the process
