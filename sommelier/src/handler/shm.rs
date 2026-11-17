@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_shm_requests_queue_protocol_errors() {
+    fn invalid_shm_requests_are_protocol_errors() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let mut handler = ShmHandler;
 
@@ -2061,7 +2061,7 @@ mod tests {
         );
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         let fd = {
             use nix::sys::memfd::{memfd_create, MFdFlags};
             use std::ffi::CString;
@@ -2081,7 +2081,7 @@ mod tests {
             Action::Drop
         );
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.last_sender_id = 20;
         assert_eq!(
             <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(

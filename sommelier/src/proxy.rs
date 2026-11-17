@@ -1808,7 +1808,7 @@ mod tests {
     /// either: a `global_remove` whose internal `zaura_shell` the proxy
     /// cannot retire must not release the shell on the host.
     #[tokio::test]
-    async fn a_rejected_message_sends_no_reverse_output() {
+    async fn a_failed_message_sends_no_reverse_output() {
         use protocols::wayland::{wl_display, wl_registry};
         const REGISTRY: u32 = 10;
         const HOST_REGISTRY: u32 = 20;

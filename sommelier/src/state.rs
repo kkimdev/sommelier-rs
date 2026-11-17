@@ -504,7 +504,7 @@ impl Context {
 
     /// Forget a session end, so a test can go on with the same context.
     #[cfg(test)]
-    pub(crate) fn clear_protocol_error_for_test(&mut self) {
+    pub(crate) fn clear_session_end_for_test(&mut self) {
         self.session_end = None;
     }
 

@@ -2934,7 +2934,7 @@ mod tests {
         let mut rejected = |reject: &dyn Fn(&mut CompositorHandler, &mut Context) -> Action,
                             code: u32| {
             ctx.host_to_client_queue.clear();
-            ctx.clear_protocol_error_for_test();
+            ctx.clear_session_end_for_test();
             assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
             assert_eq!(protocol_error_code(&ctx), code);
         };
@@ -2971,7 +2971,7 @@ mod tests {
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
         assert_eq!(
@@ -3552,13 +3552,13 @@ mod tests {
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.is_fatal());
 
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
@@ -3577,7 +3577,7 @@ mod tests {
             Action::Forward
         );
         ctx.host_to_client_queue.clear();
-        ctx.clear_protocol_error_for_test();
+        ctx.clear_session_end_for_test();
         ctx.last_sender_id = surface_id;
         assert_eq!(
             handler.on_get_viewport(&mut ctx, 701, surface_id),

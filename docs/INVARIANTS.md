@@ -170,7 +170,7 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `a_rejected_request_sends_nothing_of_its_own`,
   `a_failed_handler_forwards_nothing`,
   `a_handler_error_discards_its_earlier_output`,
-  `a_rejected_message_sends_no_reverse_output`,
+  `a_failed_message_sends_no_reverse_output`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors
@@ -187,7 +187,7 @@ out-of-range or missing planes, invalid dimensions, out-of-bounds
 metadata), each with its interface's declared error code. Diagnostics are
 bounded so the error event itself fits in a message. Tests assert the
 object ID, the error code and that the session ends.
-Tests: `invalid_shm_requests_queue_protocol_errors`,
+Tests: `invalid_shm_requests_are_protocol_errors`,
 `invalid_plane_requests_queue_declared_protocol_errors`,
 `invalid_viewport_values_and_dead_surface_are_fatal`,
 `invalid_bind_queues_a_display_protocol_error`,
