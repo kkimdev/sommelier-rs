@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::allocator::Allocator;
 use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::{ShmCopyError, WL_SHM_ERROR_INVALID_FD};
+use crate::handler::shm::{copy_shm_damage, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD};
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
@@ -31,12 +32,12 @@ use crate::protocols::xdg_shell::xdg_toplevel::{
     REQ_DESTROY as REQ_DESTROY_XDG_TOPLEVEL, REQ_SET_APP_ID,
 };
 use crate::state::{
-    is_valid_transform, transformed_extent, Context, DamageRect, PostDispatch, ShadowTable,
-    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
+    PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
+use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::Action;
 use log::trace;
-use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
@@ -411,54 +412,6 @@ pub(crate) fn record_xdg_toplevel(
     window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_damage_to_ptr(
-    format: u32,
-    offset: i32,
-    width: i32,
-    height: i32,
-    src_stride: u32,
-    needs_full_copy: bool,
-    source: &File,
-    dst_ptr: *mut u8,
-    dest_size: usize,
-    dst_stride: usize,
-    dst_plane1_offset: usize,
-    dst_plane1_stride: usize,
-    surface_damage: &[DamageRect],
-    buffer_damage: &[DamageRect],
-    surface_mapping_requires_full_copy: bool,
-) -> Result<(), ShmCopyError> {
-    let (Ok(offset), Ok(width), Ok(height)) = (
-        usize::try_from(offset),
-        usize::try_from(width),
-        usize::try_from(height),
-    ) else {
-        return Err(ShmCopyError::Destination);
-    };
-    let layout = crate::handler::shm::ShmCopyLayout {
-        dest_size,
-        format,
-        offset,
-        width,
-        src_stride: src_stride as usize,
-        dst_stride,
-        dst_plane1_offset,
-        dst_plane1_stride,
-        height,
-    };
-    let full_damage = [DamageRect::new(0, 0, width as i32, height as i32)];
-    if needs_full_copy || (surface_mapping_requires_full_copy && !surface_damage.is_empty()) {
-        crate::handler::shm::copy_shm_damage(source, dst_ptr, layout, &full_damage)
-    } else {
-        let mut merged = Vec::with_capacity(surface_damage.len() + buffer_damage.len());
-        merged.extend_from_slice(surface_damage);
-        merged.extend_from_slice(buffer_damage);
-        // Keep the temporary vector alive through the copy call.
-        crate::handler::shm::copy_shm_damage(source, dst_ptr, layout, &merged)
-    }
-}
-
 fn saturating_i32(value: f64) -> i32 {
     if value.is_nan() {
         return 0;
@@ -696,92 +649,13 @@ fn copy_surface_buffer(
     let Some(resources) = ctx.local_buffer_copy_resources(host_id) else {
         return Ok(());
     };
-    let allocator = resources.allocator;
-    let virtwayland_channel = resources.channel;
     let buffer = resources.buffer;
-    let full_copy = buffer.needs_full_copy || commit.has_full_damage();
-
-    let mut sync_guard = if buffer.dmabuf_sync {
-        let guard = DmabufWriteSync::begin(
-            virtwayland_channel,
-            buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd),
-        );
-        if guard.is_none() {
-            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
-        }
-        guard
+    let damage = if buffer.needs_full_copy {
+        DamageRegion::Full
     } else {
-        None
+        commit.buffer_copy_damage()
     };
-    let mut result = if buffer.dmabuf_sync && sync_guard.is_none() {
-        Err(ShmCopyError::Destination)
-    } else if !buffer.dest_ptr.is_null() {
-        copy_damage_to_ptr(
-            buffer.format,
-            buffer.offset,
-            buffer.width,
-            buffer.height,
-            buffer.stride,
-            full_copy,
-            &buffer.pool_file,
-            buffer.dest_ptr,
-            buffer.dest_size,
-            buffer.bo_stride as usize,
-            buffer.dmabuf_plane1_offset,
-            buffer.dmabuf_plane1_stride,
-            commit.surface_damage.rects(),
-            commit.buffer_damage.rects(),
-            commit.uses_full_mapping(),
-        )
-    } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
-        match (u32::try_from(buffer.width), u32::try_from(buffer.height)) {
-            (Ok(width), Ok(height)) => {
-                match bo.map_mut(&allocator.device, 0, 0, width, height, |mapped| {
-                    copy_damage_to_ptr(
-                        buffer.format,
-                        buffer.offset,
-                        buffer.width,
-                        buffer.height,
-                        buffer.stride,
-                        full_copy,
-                        &buffer.pool_file,
-                        mapped.buffer_mut().as_mut_ptr(),
-                        mapped.buffer().len(),
-                        mapped.stride() as usize,
-                        buffer.dmabuf_plane1_offset,
-                        buffer.dmabuf_plane1_stride,
-                        commit.surface_damage.rects(),
-                        commit.buffer_damage.rects(),
-                        commit.uses_full_mapping(),
-                    )
-                }) {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        log::warn!("GBM BO map failed: {}", error);
-                        Err(ShmCopyError::Destination)
-                    }
-                    Err(_) => {
-                        log::warn!("GBM BO belongs to a different allocator device");
-                        Err(ShmCopyError::Destination)
-                    }
-                }
-            }
-            _ => {
-                log::warn!("SHM buffer size cannot be represented as u32");
-                Err(ShmCopyError::Destination)
-            }
-        }
-    } else {
-        // No destination mapping is available. This can happen only for a
-        // malformed or unsupported allocation path.
-        Err(ShmCopyError::Destination)
-    };
-    if let Some(guard) = sync_guard.take() {
-        if !guard.end() && result.is_ok() {
-            result = Err(ShmCopyError::Destination);
-        }
-    }
-
+    let result = copy_to_host_storage(buffer, resources.allocator, resources.channel, &damage);
     match &result {
         Ok(()) => {
             buffer.needs_full_copy = false;
@@ -806,6 +680,75 @@ fn copy_surface_buffer(
         }
     }
     result
+}
+
+/// Copy `damage` from `buffer`'s pool into its host storage, inside the
+/// VirtWL dma-buf CPU-write interval when the storage needs one.
+fn copy_to_host_storage(
+    buffer: &mut BufferState,
+    allocator: Option<&Allocator>,
+    channel: Option<&Arc<VirtWaylandChannel>>,
+    damage: &DamageRegion,
+) -> Result<(), ShmCopyError> {
+    let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
+        return Err(ShmCopyError::Destination);
+    };
+    let sync_guard = if buffer.dmabuf_sync {
+        let fd = buffer.dmabuf_fd.as_ref().map(AsRawFd::as_raw_fd);
+        let Some(guard) = DmabufWriteSync::begin(channel, fd) else {
+            log::warn!("VirtWL dma-buf buffer has no channel or backing fd");
+            return Err(ShmCopyError::Destination);
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let result = if !buffer.dest_ptr.is_null() {
+        copy_shm_damage(&buffer.pool_file, buffer.dest_ptr, layout, damage)
+    } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
+        // `layout` holds the buffer's non-negative i32 dimensions, which fit
+        // in u32.
+        match bo.map_mut(
+            &allocator.device,
+            0,
+            0,
+            layout.width as u32,
+            layout.height as u32,
+            |mapped| {
+                let layout = ShmCopyLayout {
+                    dest_size: mapped.buffer().len(),
+                    dst_stride: mapped.stride() as usize,
+                    ..layout
+                };
+                copy_shm_damage(
+                    &buffer.pool_file,
+                    mapped.buffer_mut().as_mut_ptr(),
+                    layout,
+                    damage,
+                )
+            },
+        ) {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                log::warn!("GBM BO map failed: {}", error);
+                Err(ShmCopyError::Destination)
+            }
+            Err(_) => {
+                log::warn!("GBM BO belongs to a different allocator device");
+                Err(ShmCopyError::Destination)
+            }
+        }
+    } else {
+        // No destination mapping is available. This can happen only for a
+        // malformed or unsupported allocation path.
+        Err(ShmCopyError::Destination)
+    };
+    let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
+    result.and(if sync_ended {
+        Ok(())
+    } else {
+        Err(ShmCopyError::Destination)
+    })
 }
 
 impl WlSurfaceHandler for CompositorHandler {
@@ -2162,7 +2105,7 @@ mod tests {
 
     /// The pool file of local-copy buffer `guest_id`, which a test writes
     /// as the client would draw.
-    fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<File> {
+    fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<std::fs::File> {
         Arc::clone(&ctx.local_buffer(guest_id).unwrap().pool_file)
     }
 
@@ -2299,131 +2242,132 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mapped_buffer_damage_copies_only_buffer_pixel_rectangles() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-        let damage = [DamageRect::new(1, 1, 1, 2)];
+    /// The wl_surface that `setup_ctx` maps to a host surface.
+    const TEST_SURFACE: u32 = 100;
+    /// The side of the square ARGB8888 frames of the copy tests.
+    const FRAME_SIDE: usize = 4;
+    const FRAME_STRIDE: usize = FRAME_SIDE * 4;
 
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &damage,
-            true,
-        )
-        .is_ok());
+    /// Register a 4x4 ARGB8888 local-copy buffer and commit it once on
+    /// `surface`, so that its host copy holds a frame and later commits copy
+    /// only what they must.
+    fn commit_test_frame(ctx: &mut Context, surface: u32, buffer: u32) {
+        let side = FRAME_SIDE as i32;
+        register_test_local(
+            ctx,
+            buffer,
+            mapped_test_buffer(buffer, side, side, FRAME_STRIDE as u32, true),
+        );
+        attach_and_commit(ctx, surface, buffer);
+    }
 
-        for index in 0..destination.len() {
-            let row = index / STRIDE;
-            let column = index % STRIDE;
-            let in_damage = (row == 1 || row == 2) && (4..8).contains(&column);
-            assert_eq!(
-                destination[index],
-                if in_damage { source[index] } else { 0xee },
-                "unexpected copy at byte {index}"
-            );
-        }
+    fn attach_and_commit(ctx: &mut Context, surface: u32, buffer: u32) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = surface;
+        assert_eq!(handler.on_attach(ctx, buffer, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+    }
+
+    /// Commit buffer scale `scale` on its own, as a HiDPI client does once,
+    /// so that later frames keep the mapping.
+    fn commit_test_buffer_scale(ctx: &mut Context, scale: i32) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_set_buffer_scale(ctx, scale), Action::Forward);
+        assert_eq!(handler.on_commit(ctx), Action::Drop);
+        assert!(!ctx.fatal_protocol_error);
+    }
+
+    /// Draw the client's next frame into `buffer`: every pool byte becomes
+    /// `pixel`. The host copy is cleared, so `copied_pixels` then shows
+    /// exactly what the next commit copies.
+    fn draw_test_frame(ctx: &Context, buffer: u32, pixel: u8) {
+        let local = ctx.local_buffer(buffer).unwrap();
+        let bytes = vec![pixel; local.dest_size];
+        local.pool_file.write_all_at(&bytes, 0).unwrap();
+        unsafe { std::ptr::write_bytes(local.dest_ptr, 0, local.dest_size) };
+    }
+
+    /// The (x, y) pixels of `buffer`'s host copy that hold `pixel`.
+    fn copied_pixels(ctx: &Context, buffer: u32, pixel: u8) -> Vec<(usize, usize)> {
+        let host_copy = test_destination(ctx, buffer);
+        (0..FRAME_SIDE)
+            .flat_map(|y| (0..FRAME_SIDE).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let start = y * FRAME_STRIDE + x * 4;
+                host_copy[start..start + 4]
+                    .iter()
+                    .all(|&byte| byte == pixel)
+            })
+            .collect()
+    }
+
+    /// The (x, y) pixels of a rectangle, in `copied_pixels` order.
+    fn rect_pixels(x: usize, y: usize, width: usize, height: usize) -> Vec<(usize, usize)> {
+        (y..y + height)
+            .flat_map(|y| (x..x + width).map(move |x| (x, y)))
+            .collect()
     }
 
     #[test]
-    fn mapped_surface_damage_uses_conservative_full_copy() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[DamageRect::new(1, 1, 1, 1)],
-            &[],
-            true,
-        )
-        .is_ok());
-        assert_eq!(destination, source);
+    fn buffer_damage_under_a_buffer_scale_copies_only_its_pixels() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        commit_test_buffer_scale(&mut ctx, 2);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 2), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 1, 1, 2));
     }
 
     #[test]
-    fn initialized_buffer_without_damage_performs_no_copy() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source = [0x11; STRIDE * HEIGHT];
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
-
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &[],
-            true,
-        )
-        .is_ok());
-        assert_eq!(destination, vec![0xee; STRIDE * HEIGHT]);
+    fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        // WL_OUTPUT_TRANSFORM_90: the bridge does not rotate surface damage.
+        assert_eq!(
+            handler.on_set_buffer_transform(&mut ctx, 1),
+            Action::Forward
+        );
+        assert_eq!(handler.on_damage(&mut ctx, 1, 1, 1, 1), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x22),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
     }
 
     #[test]
-    fn collapsed_damage_copies_the_complete_buffer() {
-        const WIDTH: usize = 4;
-        const HEIGHT: usize = 4;
-        const STRIDE: usize = WIDTH * 4;
-        let source: Vec<u8> = (0..STRIDE * HEIGHT).map(|value| value as u8).collect();
-        let mut destination = vec![0xee; STRIDE * HEIGHT];
+    fn commit_without_damage_copies_nothing() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+    }
 
-        assert!(copy_damage_to_ptr(
-            0,
-            0,
-            WIDTH as i32,
-            HEIGHT as i32,
-            STRIDE as u32,
-            false,
-            &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            destination.len(),
-            STRIDE,
-            0,
-            0,
-            &[],
-            &[DamageRect::new(0, 0, i32::MAX, i32::MAX)],
-            false,
-        )
-        .is_ok());
-        assert_eq!(destination, source);
+    #[test]
+    fn damage_beyond_the_buffer_is_clipped_to_it() {
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        draw_test_frame(&ctx, 42, 0x22);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, 0, 0, i32::MAX, i32::MAX),
+            Action::Drop
+        );
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(
+            copied_pixels(&ctx, 42, 0x22),
+            rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
+        );
     }
 
     fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {

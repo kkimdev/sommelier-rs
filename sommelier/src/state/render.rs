@@ -335,6 +335,25 @@ impl SurfaceCommit {
                 .is_some_and(|viewport| !viewport.is_identity())
     }
 
+    /// This commit's damage in the pixel coordinates of the surface's
+    /// buffer: the pixels the SHM bridge copies to the host.
+    ///
+    /// Buffer damage is already in buffer pixels. Surface damage is too while
+    /// the mapping is the identity; any other mapping falls back to the whole
+    /// buffer.
+    pub fn buffer_copy_damage(&self) -> DamageRegion {
+        if self.has_full_damage()
+            || (self.uses_full_mapping() && !self.surface_damage.rects().is_empty())
+        {
+            return DamageRegion::Full;
+        }
+        let mut damage = self.buffer_damage.clone();
+        for &rect in self.surface_damage.rects() {
+            damage.push(rect);
+        }
+        damage
+    }
+
     pub fn has_invalid_fractional_viewport(&self) -> bool {
         let Some(viewport) = self.state.viewport else {
             return false;

@@ -29,7 +29,7 @@ use std::sync::Arc;
 pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
-use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
+use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use log::{error, warn};
@@ -47,8 +47,8 @@ pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry,
 };
 pub(crate) use self::render::{
-    BufferState, DamageRect, RenderBufferLifecycle, RenderBufferUse, ShmPool, SurfaceAttachment,
-    SurfaceCommit, SurfaceState, ViewportState,
+    BufferState, DamageRect, DamageRegion, RenderBufferLifecycle, RenderBufferUse, ShmPool,
+    SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
 };
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;

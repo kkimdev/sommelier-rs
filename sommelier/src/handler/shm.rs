@@ -18,7 +18,7 @@ use crate::allocator::Allocator;
 use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::state::{BufferState, Context, DamageRect, HostId, ShmPool};
+use crate::state::{BufferState, Context, DamageRect, DamageRegion, HostId, ShmPool};
 use crate::wire::{Action, MessageBuilder};
 use log::{debug, error, warn};
 use std::collections::HashSet;
@@ -681,6 +681,23 @@ pub(crate) struct ShmCopyLayout {
     pub(crate) height: usize,
 }
 
+impl ShmCopyLayout {
+    /// The layout that copies `buffer` into its own host mapping.
+    pub(crate) fn for_buffer(buffer: &BufferState) -> Option<Self> {
+        Some(Self {
+            dest_size: buffer.dest_size,
+            format: buffer.format,
+            offset: usize::try_from(buffer.offset).ok()?,
+            width: usize::try_from(buffer.width).ok()?,
+            src_stride: buffer.stride as usize,
+            dst_stride: buffer.bo_stride as usize,
+            dst_plane1_offset: buffer.dmabuf_plane1_offset,
+            dst_plane1_stride: buffer.dmabuf_plane1_stride,
+            height: usize::try_from(buffer.height).ok()?,
+        })
+    }
+}
+
 /// Why copying a SHM buffer to its host storage failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ShmCopyError {
@@ -882,7 +899,7 @@ pub(crate) fn copy_shm_damage(
     source: &File,
     dst_ptr: *mut u8,
     layout: ShmCopyLayout,
-    damage: &[DamageRect],
+    damage: &DamageRegion,
 ) -> Result<(), ShmCopyError> {
     let ShmCopyLayout {
         dest_size,
@@ -906,7 +923,15 @@ pub(crate) fn copy_shm_damage(
 
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
     let plane_count = if format == WL_SHM_FORMAT_NV12 { 2 } else { 1 };
-    let merged_damage = coalesce_damage_rects(damage);
+    let merged_damage = match damage {
+        DamageRegion::Full => vec![DamageRect::new(
+            0,
+            0,
+            i32::try_from(width).unwrap_or(i32::MAX),
+            i32::try_from(height).unwrap_or(i32::MAX),
+        )],
+        DamageRegion::Empty | DamageRegion::Rects(_) => coalesce_damage_rects(damage.rects()),
+    };
     let mut spans = Vec::new();
     for rect in &merged_damage {
         let Some((mut x0, mut y0, mut x1, mut y1)) = clipped_damage(*rect, width, height) else {
@@ -1036,23 +1061,6 @@ pub(crate) fn copy_shm_damage(
         }
     }
     Ok(())
-}
-
-/// Copy a complete SHM image. This remains a separate helper because a newly
-/// allocated host buffer has no valid pixels until its first commit.
-#[cfg(test)]
-pub(crate) fn copy_shm_planes(
-    source: &File,
-    dst_ptr: *mut u8,
-    layout: ShmCopyLayout,
-) -> Result<(), ShmCopyError> {
-    let rect = DamageRect::new(
-        0,
-        0,
-        i32::try_from(layout.width).unwrap_or(i32::MAX),
-        i32::try_from(layout.height).unwrap_or(i32::MAX),
-    );
-    copy_shm_damage(source, dst_ptr, layout, std::slice::from_ref(&rect))
 }
 
 /// Report a resource failure while creating a `wl_buffer`.
@@ -2002,7 +2010,7 @@ mod tests {
     use super::ShmHandler;
     use super::{
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, coalesce_damage_rects,
-        copy_shm_damage, copy_shm_planes, guest_shm_format_available, record_host_shm_drm_format,
+        copy_shm_damage, guest_shm_format_available, record_host_shm_drm_format,
         record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
         regular_file_has_size, retire_eligible_buffers, rollback_registered_buffer,
         same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
@@ -2013,8 +2021,8 @@ mod tests {
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
-    use crate::state::DamageRect;
     use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool};
+    use crate::state::{DamageRect, DamageRegion};
     use crate::test_support::shm_pool_file;
     use crate::wire::{Action, WireMessage};
     use std::fs::File;
@@ -2301,7 +2309,7 @@ mod tests {
         source[16..].fill(0x22);
         let mut destination = [0u8; 24];
 
-        assert!(copy_shm_planes(
+        assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
@@ -2315,6 +2323,7 @@ mod tests {
                 dst_plane1_stride: 0,
                 height: 4,
             },
+            &DamageRegion::Full,
         )
         .is_ok());
         assert_eq!(&destination[..16], &[0x11; 16]);
@@ -2322,7 +2331,7 @@ mod tests {
 
         // The Y plane fits a 23-byte destination, but the UV plane does not.
         destination.fill(0);
-        assert!(copy_shm_planes(
+        assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
@@ -2336,6 +2345,7 @@ mod tests {
                 dst_plane1_stride: 0,
                 height: 4,
             },
+            &DamageRegion::Full,
         )
         .is_err());
         assert!(
@@ -2358,7 +2368,7 @@ mod tests {
             dst_plane1_stride: 0,
             height: 1,
         };
-        let damage = [DamageRect::new(0, 0, 1, 1)];
+        let damage = DamageRegion::from(vec![DamageRect::new(0, 0, 1, 1)]);
         for destination in [std::ptr::null_mut(), libc::MAP_FAILED.cast()] {
             assert!(matches!(
                 copy_shm_damage(&source, destination, layout, &damage),
@@ -2386,7 +2396,7 @@ mod tests {
             height: 2,
         };
         assert!(matches!(
-            copy_shm_planes(&source, destination.as_mut_ptr(), layout),
+            copy_shm_damage(&source, destination.as_mut_ptr(), layout, &DamageRegion::Full),
             Err(ShmCopyError::Source(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
     }
@@ -2418,7 +2428,7 @@ mod tests {
             dst_plane1_stride: 0,
             height: 1,
         };
-        let result = copy_shm_planes(&source, destination.cast(), layout);
+        let result = copy_shm_damage(&source, destination.cast(), layout, &DamageRegion::Full);
         unsafe { libc::munmap(destination, 4096) };
         assert!(matches!(result, Err(ShmCopyError::Destination)));
     }
@@ -2430,7 +2440,7 @@ mod tests {
         source[16..].fill(0x22);
         let mut destination = [0u8; 32];
 
-        assert!(copy_shm_planes(
+        assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
             super::ShmCopyLayout {
@@ -2444,6 +2454,7 @@ mod tests {
                 dst_plane1_stride: 4,
                 height: 4,
             },
+            &DamageRegion::Full,
         )
         .is_ok());
         assert_eq!(&destination[..16], &[0x11; 16]);
@@ -2474,7 +2485,7 @@ mod tests {
                 dst_plane1_stride: 8,
                 height: 4,
             },
-            &[DamageRect::new(0, 2, 4, 2)],
+            &DamageRegion::from(vec![DamageRect::new(0, 2, 4, 2)]),
         )
         .is_ok());
 
