@@ -1844,6 +1844,38 @@ mod tests {
         assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
     }
 
+    /// The host may report an error on an object only the proxy uses, such
+    /// as an Aura child or a temporary pool. The guest cannot be told which
+    /// object failed, but the session still ends with one error.
+    #[tokio::test]
+    async fn a_host_error_on_a_host_only_object_ends_the_session() {
+        const HOST_POOL: u32 = 77;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client
+            .ctx
+            .shadow_table
+            .insert_host_only_for_test(HOST_POOL, "wl_shm_pool", 1);
+        let mut error = MessageBuilder::new();
+        error.write_u32(HOST_POOL);
+        error.write_u32(2);
+        error.write_string("host failure");
+        client.host_conn.read_buf.extend(error.build_message(
+            crate::wire::WL_DISPLAY_ID,
+            protocols::wayland::wl_display::EVT_ERROR,
+        ));
+
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.ctx.is_fatal());
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                protocols::wayland::wl_display::ERROR_IMPLEMENTATION
+            )]
+        );
+    }
+
     #[tokio::test]
     async fn an_invalid_message_length_is_reported_before_closing() {
         let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();

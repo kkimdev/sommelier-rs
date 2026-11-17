@@ -588,10 +588,30 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         match arg.typ.as_str() {
                             // The pre-handler validation translated the
                             // object (see `generate_event_validations`).
-                            "object" => {
+                            "object" if arg.interface.is_some() => {
                                 let guest = translated_object_ident(arg);
                                 mapping_and_writing.push(quote! {
                                     builder.write_u32(#guest);
+                                });
+                            }
+                            "object" => {
+                                assert!(
+                                    !arg.allow_null.unwrap_or(false),
+                                    "event argument {} names a nullable object of no interface, which no vendored protocol has",
+                                    arg.name
+                                );
+                                let evt_name_str = &evt.name;
+                                let arg_name_str = &arg.name;
+                                mapping_and_writing.push(quote! {
+                                    let Some(guest_id) = ctx.shadow_table.get_guest_id(#name) else {
+                                        log::debug!(
+                                            "Dropping event {} naming an object with no guest counterpart as argument {}",
+                                            #evt_name_str,
+                                            #arg_name_str
+                                        );
+                                        return Ok(None);
+                                    };
+                                    builder.write_u32(guest_id);
                                 });
                             }
                             "new_id" => {
@@ -1227,10 +1247,11 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
 }
 
 /// Generate validation for IDs carried by a host event. A host-generated
-/// object must have a fresh server ID. Each object argument must name a live
-/// object with a guest counterpart, or the event is dropped; it is validated
-/// and translated to the guest ID in one lookup, bound to
-/// [`translated_object_ident`].
+/// object must have a fresh server ID. Each object argument of an interface
+/// must name a live object with a guest counterpart, or the event is
+/// dropped; it is validated and translated to the guest ID in one lookup,
+/// bound to [`translated_object_ident`]. An object of no interface is
+/// resolved only when the event is forwarded.
 fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
     for arg in args(items) {
@@ -1243,12 +1264,15 @@ fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                     }
                 });
             }
+            // An object of no interface (`wl_display.error`'s object) may
+            // name any object, including one only the proxy uses, so its
+            // handler must see the event; only forwarding resolves it.
             "object" => {
-                let guest = translated_object_ident(arg);
-                let lookup = match &arg.interface {
-                    Some(interface) => quote! { ctx.shadow_table.event_object(#name, #interface) },
-                    None => quote! { ctx.shadow_table.get_guest_id(#name) },
+                let Some(interface) = &arg.interface else {
+                    continue;
                 };
+                let guest = translated_object_ident(arg);
+                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface) };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
                         let #guest = if #name == 0 {
