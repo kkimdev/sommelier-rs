@@ -450,6 +450,10 @@ pub struct Context {
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
+    /// Every host global the proxy may bind as a singleton, by name, with
+    /// the host's interface and version, while a registry lists it; see
+    /// `handler::registry::Singleton`.
+    pub(crate) singleton_candidates: HashMap<u32, HostGlobal>,
     /// Host globals consumed internally by the proxy and therefore never
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
@@ -1043,6 +1047,7 @@ impl Context {
             placement,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
+            singleton_candidates: HashMap::new(),
             hidden_host_globals: HashMap::new(),
             registry_global_names: HashMap::new(),
             registry_global_removed: HashMap::new(),

@@ -409,6 +409,22 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `re_advertised_name_replaces_visible_metadata_before_hidden_global`,
   `re_advertised_hidden_name_replaces_hidden_metadata_before_visible_global`,
   `stale_remove_cannot_invalidate_a_re_advertised_global_generation`.
+- **A singleton binding moves to its replacement.** The proxy binds
+  `wl_shm`, `zwp_linux_dmabuf_v1`, `zcr_keyboard_extension_v1` and
+  `zaura_shell` once per connection for its own use. A host may advertise
+  one under a new name while the old name is bound; when the old one
+  retires, the proxy binds the lowest other name that a registry still
+  lists and that no registry has seen removed, since a compositor may
+  destroy a global as soon as it removes it. Guest `wl_shm` objects bound
+  before the retirement stay inert, whichever name they were bound from.
+  Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
+  `a_replacement_another_registry_saw_removed_is_not_bound`,
+  `a_replacement_removed_first_is_not_bound`,
+  `destroying_a_registry_can_promote_a_replacement`,
+  `a_promoted_dmabuf_publishes_its_deferred_guest_global`,
+  `the_lowest_candidate_is_bound_through_the_lowest_registry`,
+  `a_bound_name_reused_by_another_interface_hands_the_binding_on`,
+  `a_candidate_name_reused_by_another_interface_is_no_candidate`.
 - **Versions come from the XML or a documented constant.** Since-version
   checks use the generated `*_SINCE` constants, never a copied literal. A
   global's version bound is the generated `VERSION` unless a named
