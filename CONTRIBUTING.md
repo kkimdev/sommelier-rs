@@ -79,9 +79,9 @@ The compositor also models what Exo makes of the text-input requests
 drops a content type while no input method is attached, spends a pending
 surrounding-text support on the next content type, keeps surrounding
 text and the cursor rectangle regardless, and sends `enter` and `leave`
-as an input method attaches and detaches. `RESTART_INPUT_METHODS`, off
-for now, also makes the input method go away now and then, as when its
-process restarts. The seed picks the host's
+as an input method attaches and detaches. Its input method also goes
+away now and then as it answers a sync, as when its process restarts,
+and the proxy must activate the field again. The seed picks the host's
 `zcr_text_input_extension_v1` version, one for each way the proxy sends
 a content type. Whether an enable reaches the proxy before or after the
 previous activation has drained follows from the seed too: the
@@ -95,8 +95,9 @@ type as the proxy maps it, the surrounding text and support for it, and
 the cursor rectangle, or no active text input if the field was disabled.
 The expected content type comes from the proxy's own mapping, so this
 check finds ordering and state bugs, not mapping bugs; unit tests pin
-the mapping. The run reports how many fields it checked and how many
-activations the guest's plan deferred.
+the mapping. The run reports how many fields it checked, how many
+activations the guest's plan deferred and how many input methods
+restarted.
 
 The suite runs 5000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:

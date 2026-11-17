@@ -655,8 +655,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `the_leave_answering_a_deactivate_is_ignored`,
   `an_exo_detach_clears_the_guest_preedit`,
   `an_exo_detach_before_the_keyboard_leave_activates_then_drains`, and
-  the fuzzer's end state against its model of Exo
-  (`guest_streams_cannot_crash_hang_or_leak`; see
+  the fuzzer's end state against its model of Exo, whose input method
+  sometimes restarts (`guest_streams_cannot_crash_hang_or_leak`; see
   [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
 - **One text input on a connection is enabled at a time.** Exo has one
   seat, and its `Activate` gives the input method to the text input that
