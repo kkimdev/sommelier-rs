@@ -3110,7 +3110,14 @@ mod tests {
                 .is_none(),
             "an exact duplicate enter must be suppressed"
         );
-        assert!(ctx.host_to_client_queue.is_empty());
+        assert_eq!(
+            crate::test_support::queued_headers(&ctx.host_to_client_queue),
+            [
+                (keyboard_a.0, wl_keyboard::EVT_MODIFIERS),
+                (keyboard_b.0, wl_keyboard::EVT_MODIFIERS),
+            ],
+            "each forwarded enter is followed by its keyboard's modifiers"
+        );
 
         assert!(dispatch_keyboard_event(
             &mut handler,

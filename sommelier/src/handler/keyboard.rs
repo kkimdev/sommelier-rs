@@ -596,7 +596,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     fn on_enter(
         &mut self,
         ctx: &mut Context,
-        _serial: u32,
+        serial: u32,
         surface: u32, // Host ID
         keys: &[u8],
     ) -> Action {
@@ -678,6 +678,22 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             Self::clear_host_keyboard_state(ctx, *retired_keyboard);
         }
         Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
+        // The protocol requires a modifiers event after every enter, but Exo
+        // sends one before it, and only when the modifiers changed. Send
+        // the guest the keyboard's modifiers after the forwarded enter.
+        let modifiers = ctx
+            .keyboard_modifiers
+            .get(&host_keyboard_id)
+            .copied()
+            .unwrap_or_default();
+        ctx.host_to_client_queue.push(wl_keyboard::evt::modifiers(
+            guest_keyboard_id,
+            serial,
+            modifiers.depressed,
+            modifiers.latched,
+            modifiers.locked,
+            modifiers.group,
+        ));
 
         if focus_update.seat_changes.is_empty() {
             // Another wl_keyboard resource can enter the seat's already
@@ -4617,13 +4633,18 @@ mod tests {
 
         ctx.last_sender_id = 101;
         assert_eq!(handler.on_enter(&mut ctx, 2, 201, &[]), Action::Forward);
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
-        assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 40);
-        assert_eq!(message_opcode(&ctx.host_to_client_queue[0]), 1);
-        assert_eq!(message_first_u32(&ctx.host_to_client_queue[0]), 20);
+        assert_eq!(ctx.host_to_client_queue.len(), 3);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[0]), 11);
+        assert_eq!(
+            message_opcode(&ctx.host_to_client_queue[0]),
+            wl_keyboard::EVT_MODIFIERS
+        );
         assert_eq!(message_sender(&ctx.host_to_client_queue[1]), 40);
-        assert_eq!(message_opcode(&ctx.host_to_client_queue[1]), 0);
-        assert_eq!(message_first_u32(&ctx.host_to_client_queue[1]), 21);
+        assert_eq!(message_opcode(&ctx.host_to_client_queue[1]), 1);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[1]), 20);
+        assert_eq!(message_sender(&ctx.host_to_client_queue[2]), 40);
+        assert_eq!(message_opcode(&ctx.host_to_client_queue[2]), 0);
+        assert_eq!(message_first_u32(&ctx.host_to_client_queue[2]), 21);
         assert_eq!(ctx.text_inputs[&40].active_surface, Some(21));
         assert_eq!(ctx.keyboard_focus.surface_for_seat(1), Some(21));
         assert!(
@@ -5655,6 +5676,38 @@ mod tests {
         assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
         assert_eq!(handler.on_enter(&mut ctx, 4, 31, &[]), Action::Forward);
         assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
+    }
+
+    /// The protocol requires a modifiers event after every enter, which Exo
+    /// sends before it, if at all.
+    #[test]
+    fn every_forwarded_enter_is_followed_by_the_keyboards_modifiers() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        map_keyboard(&mut ctx, 6, 11, 51, 8);
+        ctx.shadow_table
+            .insert_paired_for_test(20, 30, "wl_surface");
+        ctx.last_sender_id = 10;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
+        let alt = 1 << keymap.mod_get_index(xkb::MOD_NAME_ALT);
+
+        assert_eq!(handler.on_enter(&mut ctx, 2, 30, &[]), Action::Forward);
+        ctx.last_sender_id = 11;
+        assert_eq!(handler.on_enter(&mut ctx, 3, 30, &[]), Action::Forward);
+
+        let modifiers: Vec<_> = ctx
+            .host_to_client_queue
+            .iter()
+            .filter(|message| message_opcode(message) == wl_keyboard::EVT_MODIFIERS)
+            .map(|message| (message_sender(message), keyboard_event_payload(message)))
+            .collect();
+        assert_eq!(
+            modifiers,
+            [(5, (2, alt, 0, 0)), (6, (3, 0, 0, 0))],
+            "a keyboard with no modifiers yet holds none"
+        );
     }
 
     // Exo's `Keyboard::OnKeyboardLayoutNameChanged` sends only the keymap.
