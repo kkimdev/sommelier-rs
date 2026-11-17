@@ -822,7 +822,7 @@ impl Context {
                 || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
         };
         if render_buffer_ended {
-            self.shadow_table.guest_destroyed(guest_buffer_id);
+            self.guest_destroyed(guest_buffer_id);
         }
         render_buffer_ended
     }

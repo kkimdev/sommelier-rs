@@ -1425,19 +1425,37 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
 /// Interfaces of objects that the compositor of a case that lets it
 /// destroys on its own, one interface per case, as a host may (see
 /// INVARIANTS "Object lifetimes"): the proxy pairs each with a guest object
-/// and keeps per-object state for it. None is ever an object only the proxy
-/// uses, whose `delete_id` the proxy would ignore.
-const HOST_DESTROYED: [&str; 3] = ["wl_output", "wl_keyboard", "wl_surface"];
+/// ([`guest_interface`]) and keeps per-object state for it. Only a
+/// `zwp_text_input_v1` can be an object only the proxy uses, once the guest
+/// has destroyed its v3 text input; its `delete_id` then changes nothing.
+const HOST_DESTROYED: [&str; 7] = [
+    "wl_output",
+    "wl_keyboard",
+    "wl_surface",
+    "wp_viewport",
+    "xdg_surface",
+    "xdg_toplevel",
+    "zwp_text_input_v1",
+];
+
+/// The interface of the guest object a host object of `host` stands for.
+fn guest_interface(host: &str) -> &str {
+    match host {
+        "zwp_text_input_v1" => "zwp_text_input_v3",
+        _ => host,
+    }
+}
 
 /// Live objects the compositor destroyed on its own, across all cases.
 static LIVE_OBJECTS_HOST_DESTROYED: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a compositor that destroys live objects of `destroyed` on its own
-/// may destroy one of `interface`: one of those, or the frame callback of a
-/// surface it destroyed.
+/// Whether a compositor that destroys live host objects of `destroyed` on
+/// its own may destroy the guest's object of `interface`: one of those, or
+/// the frame callback of a surface it destroyed.
 fn host_may_destroy(destroyed: Option<&str>, interface: &str) -> bool {
     destroyed.is_some_and(|destroyed| {
-        interface == destroyed || (destroyed == "wl_surface" && interface == "wl_callback")
+        interface == guest_interface(destroyed)
+            || (destroyed == "wl_surface" && interface == "wl_callback")
     })
 }
 

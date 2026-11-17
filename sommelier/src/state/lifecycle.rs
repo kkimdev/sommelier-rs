@@ -28,23 +28,62 @@ limitations under the License.
 //!   object was live. A later `delete_id` acknowledging the destructor
 //!   forgets nothing again.
 //! - [`forget_host_id`] runs when the host ID is released, for state that
-//!   outlives the guest object: a render buffer the host still shows, or an
-//!   asynchronous dma-buf create.
+//!   outlives the guest object: a render buffer the host still shows. It
+//!   also drops an asynchronous dma-buf create, as a backstop: forgetting
+//!   its params at their end already did.
 //!
 //! What a hook sends joins the current message's effects. A guest
 //! destructor runs it before the transition, while the table still knows
 //! the object; a `delete_id` runs it after, so a hook gets the object's
 //! interface and IDs and never looks up its own entry.
 
-use super::{Context, DeletedHostId, HostId};
-use crate::handler::{compositor, keyboard, output};
+use super::{Context, DeletedHostId, HostId, Link};
+use crate::handler::{compositor, keyboard, linux_dmabuf, output, registry, shm, text_input};
 
 impl Context {
     /// The guest destroyed guest object `guest_id`; see
     /// [`super::ShadowTable::guest_destroyed`].
     pub(crate) fn guest_destroyed(&mut self, guest_id: u32) {
-        self.forget_live_object(guest_id);
+        self.forget_live_paired(guest_id);
         self.shadow_table.guest_destroyed(guest_id);
+    }
+
+    /// The guest destroyed guest object `guest_id` while the host still uses
+    /// its host object; see [`super::ShadowTable::guest_destroyed_in_use`].
+    pub(crate) fn guest_destroyed_in_use(&mut self, guest_id: u32) {
+        self.forget_live_paired(guest_id);
+        self.shadow_table.guest_destroyed_in_use(guest_id);
+    }
+
+    /// Guest object `guest_id` ended, and its host object stays; see
+    /// [`super::ShadowTable::guest_ended_host_kept`].
+    pub(crate) fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
+        self.forget_live_paired(guest_id);
+        self.shadow_table.guest_ended_host_kept(guest_id)
+    }
+
+    /// Guest object `guest_id` ended with its host object; see
+    /// [`super::ShadowTable::guest_ended_host_destroyed`].
+    pub(crate) fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
+        self.forget_live_paired(guest_id);
+        self.shadow_table.guest_ended_host_destroyed(guest_id);
+    }
+
+    /// Local guest object `guest_id` ended; see
+    /// [`super::ShadowTable::local_destroyed`].
+    pub(crate) fn local_destroyed(&mut self, guest_id: u32) -> bool {
+        if self.shadow_table.request_sender(guest_id) != Some(Link::Local) {
+            return false;
+        }
+        self.forget(guest_id, None);
+        self.shadow_table.local_destroyed(guest_id)
+    }
+
+    /// Guest object `guest_id` never reached the host; see
+    /// [`super::ShadowTable::abandon`].
+    pub(crate) fn abandon(&mut self, guest_id: u32) {
+        self.forget_live_paired(guest_id);
+        self.shadow_table.abandon(guest_id);
     }
 
     /// Apply the host's `wl_display.delete_id` for `host_id`; see
@@ -64,7 +103,7 @@ impl Context {
             Some(interface),
         ) = (deleted, interface)
         {
-            forget_object(self, &interface, guest, Some(host_id));
+            forget_object(self, &interface, guest, Some(host_id), true);
         }
         if deleted != DeletedHostId::Ignored {
             forget_host_id(self, HostId(host_id));
@@ -72,36 +111,60 @@ impl Context {
         deleted
     }
 
-    /// Forget guest object `guest_id` if it is live: local, or paired and
-    /// not destroyed yet.
-    fn forget_live_object(&mut self, guest_id: u32) {
-        let table = &self.shadow_table;
-        let Some(interface) = table
-            .request_sender(guest_id)
-            .and(table.get_interface(guest_id))
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        let host_id = table.get_host_id(guest_id);
-        forget_object(self, &interface, guest_id, host_id);
+    /// Forget guest object `guest_id` if it is live and paired, the only
+    /// objects the paired transitions end: a local object keeps its state
+    /// until it ends itself.
+    fn forget_live_paired(&mut self, guest_id: u32) {
+        if let Some(Link::Host(host_id)) = self.shadow_table.request_sender(guest_id) {
+            self.forget(guest_id, Some(host_id));
+        }
+    }
+
+    /// Forget live guest object `guest_id`, paired with `host_id` or local.
+    fn forget(&mut self, guest_id: u32, host_id: Option<u32>) {
+        if let Some(interface) = self.shadow_table.get_interface(guest_id) {
+            let interface = interface.to_owned();
+            forget_object(self, &interface, guest_id, host_id, false);
+        }
     }
 }
 
 /// Forget the state of guest object `guest`, of `interface`, at its first
 /// end, through the owner of each interface's state. `host` is its host
-/// object, if it has one.
-fn forget_object(ctx: &mut Context, interface: &str, guest: u32, host: Option<u32>) {
+/// object; a local object has none. `host_deleted` says the host deleted
+/// that object, so nothing may be sent to it.
+///
+/// Every interface with per-object state has an arm. A `wl_buffer`'s state
+/// is its render buffer, keyed by host ID ([`forget_host_id`]), and an
+/// inert `wl_output` has none.
+fn forget_object(
+    ctx: &mut Context,
+    interface: &str,
+    guest: u32,
+    host: Option<u32>,
+    host_deleted: bool,
+) {
     match (interface, host) {
+        ("wl_registry", Some(host)) => registry::forget_registry(ctx, host),
         ("wl_output", Some(host)) => output::forget_output(ctx, host),
         ("wl_keyboard", Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
         ("wl_surface", Some(host)) => compositor::forget_surface(ctx, guest, host),
+        ("wp_viewport", _) => compositor::forget_viewport(ctx, guest),
+        ("xdg_surface", _) => compositor::forget_xdg_surface(ctx, guest),
+        ("xdg_toplevel", _) => compositor::forget_xdg_toplevel(ctx, guest),
+        ("wl_shm", _) => shm::forget_shm(ctx, guest),
+        ("wl_shm_pool", _) => shm::forget_pool(ctx, guest),
+        ("zwp_linux_dmabuf_v1", _) => linux_dmabuf::forget_factory(ctx, guest),
+        ("zwp_linux_dmabuf_feedback_v1", _) => linux_dmabuf::forget_feedback(ctx, guest),
+        ("zwp_linux_buffer_params_v1", _) => linux_dmabuf::forget_params(ctx, guest, host),
+        ("zwp_text_input_v3", _) => text_input::forget_text_input(ctx, guest, host_deleted),
         _ => {}
     }
 }
 
 /// Forget the state of host ID `host`, which the host released: what
-/// outlived its guest object.
+/// outlived its guest object, and an asynchronous dma-buf create, which
+/// `forget_params` should have dropped already.
 fn forget_host_id(ctx: &mut Context, host: HostId) {
     ctx.render_buffers.remove(host);
     ctx.pending_native_creates.remove(&host);

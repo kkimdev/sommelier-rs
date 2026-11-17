@@ -1447,11 +1447,7 @@ mod tests {
         let second_aura = ensure_zaura_toplevel(&mut ctx, second_toplevel).expect("toplevel");
         ctx.client_to_host_queue.clear();
 
-        ctx.last_sender_id = first_xdg_surface;
-        assert_eq!(
-            XdgSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
-            Action::Forward
-        );
+        ctx.guest_destroyed(first_xdg_surface);
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue),
             vec![(first_aura, REQ_RELEASE_AURA_TOPLEVEL)]

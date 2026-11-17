@@ -85,7 +85,7 @@ pub(crate) fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
 /// End local guest object `guest_id` and queue its `delete_id`, as its host
 /// would for a host object. Nothing happens unless it is a local object.
 pub(crate) fn queue_local_delete_id(ctx: &mut Context, guest_id: u32) {
-    if ctx.shadow_table.local_destroyed(guest_id) {
+    if ctx.local_destroyed(guest_id) {
         queue_delete_id(ctx, guest_id);
     }
 }
@@ -334,6 +334,46 @@ mod tests {
             queued_headers(&ctx.host_to_client_queue),
             [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
         );
+        ctx.assert_no_orphans();
+    }
+
+    /// The host object of an active text input is gone with its
+    /// `delete_id`, so forgetting the text input deactivates nothing on it;
+    /// its extension is a host object of its own, which it still destroys.
+    #[test]
+    fn a_host_destroyed_text_input_sends_nothing_to_its_host_object() {
+        use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
+        const SEAT: u32 = 10;
+        const TEXT_INPUT: u32 = 20;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.insert_paired_for_test(SEAT, 11, "wl_seat");
+        let host = ctx.shadow_table.create_bridged(
+            TEXT_INPUT,
+            "zwp_text_input_v3",
+            1,
+            "zwp_text_input_v1",
+            1,
+        );
+        let extension = ctx
+            .shadow_table
+            .create_host_only("zcr_extended_text_input_v1", 1);
+        let mut state = crate::state::TextInputState::new(host, Some(extension), SEAT, None);
+        state.committed_enabled = true;
+        assert!(state.activate_host());
+        ctx.text_inputs.insert(TEXT_INPUT, state);
+
+        DisplayHandler.on_delete_id(&mut ctx, host);
+
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(extension, zcr_extended_text_input_v1::REQ_DESTROY)]
+        );
+        assert!(ctx.text_inputs.is_empty());
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
+        );
+        assert!(!ctx.is_fatal());
         ctx.assert_no_orphans();
     }
 

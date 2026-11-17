@@ -1234,7 +1234,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
-            ctx.shadow_table.abandon(*guest_new_id);
+            ctx.abandon(*guest_new_id);
             return ctx.fail(format_args!(
                 "Failed to bind host {interface} for the guest"
             ));
@@ -1262,28 +1262,32 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
     }
 }
 
+/// Forget host registry `registry_host_id`, which ended (see
+/// `crate::state::lifecycle`): what it was advertised, and its hold on
+/// capability generations.
+pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
+    let generations = ctx
+        .registry_global_generations
+        .remove(&registry_host_id)
+        .into_iter()
+        .flat_map(|generations| generations.into_values())
+        .collect::<std::collections::HashSet<_>>();
+    ctx.registry_global_names.remove(&registry_host_id);
+    ctx.registry_global_removed.remove(&registry_host_id);
+    ctx.registry_global_visibility.remove(&registry_host_id);
+    ctx.pending_dmabuf_globals
+        .retain(|pending| pending.registry_host_id != registry_host_id);
+    for generation in generations {
+        crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+    }
+}
+
 impl wl_fixes::WlFixesHandler for RegistryHandler {
     fn on_destroy_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
-        let registry_host_id = ctx.shadow_table.get_host_id(registry).unwrap_or(registry);
-        let generations = ctx
-            .registry_global_generations
-            .remove(&registry_host_id)
-            .into_iter()
-            .flat_map(|generations| generations.into_values())
-            .collect::<std::collections::HashSet<_>>();
-        ctx.registry_global_names.remove(&registry_host_id);
-        ctx.registry_global_removed.remove(&registry_host_id);
-        ctx.registry_global_visibility.remove(&registry_host_id);
-        ctx.pending_dmabuf_globals
-            .retain(|pending| pending.registry_host_id != registry_host_id);
-        for generation in generations {
-            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
-        }
-
         // wl_fixes destroys the registry passed as an object argument rather
         // than its own request sender. Reserve that guest/host mapping until
         // wl_display.delete_id acknowledges the host-side destruction.
-        ctx.shadow_table.guest_destroyed(registry);
+        ctx.guest_destroyed(registry);
         Action::Forward
     }
 }

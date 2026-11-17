@@ -828,15 +828,16 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
             .destination = (!unset).then_some((width, height));
         Action::Forward
     }
+}
 
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let viewport_id = ctx.last_sender_id;
-        if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                surface.pending.viewport = Some(None);
-            }
+/// Forget guest `wp_viewport` `viewport_id`, which ended (see
+/// `crate::state::lifecycle`): its surface's next commit removes the
+/// viewport.
+pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: u32) {
+    if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
+        if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+            surface.pending.viewport = Some(None);
         }
-        Action::Forward
     }
 }
 
@@ -858,20 +859,28 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
     }
 }
 
-impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let xdg_surface_id = ctx.last_sender_id;
-        // Destroying an xdg_surface before its xdg_toplevel is a protocol
-        // error (`xdg_surface.defunct_role_object`) that ends the session,
-        // so the order of the forwarded destructor and the queued Aura
-        // release does not matter. End the role anyway, so the toplevel's
-        // later requests cannot reach an unrelated surface after ID reuse.
-        if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
-            window_placement::release_toplevel(ctx, xdg_toplevel_id);
-        }
-        Action::Forward
+/// Forget guest `xdg_surface` `xdg_surface_id`, which ended (see
+/// `crate::state::lifecycle`), with the role of its toplevel.
+///
+/// Destroying an xdg_surface before its xdg_toplevel is a protocol error
+/// (`xdg_surface.defunct_role_object`) that ends the session, so the order
+/// of the forwarded destructor and the queued Aura release does not matter.
+/// The role ends anyway, so the toplevel's later requests cannot reach an
+/// unrelated surface after ID reuse.
+pub(crate) fn forget_xdg_surface(ctx: &mut Context, xdg_surface_id: u32) {
+    if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
+        window_placement::release_toplevel(ctx, xdg_toplevel_id);
     }
+}
 
+/// Forget guest `xdg_toplevel` `xdg_toplevel_id`, which ended (see
+/// `crate::state::lifecycle`), and release its Aura toplevel.
+pub(crate) fn forget_xdg_toplevel(ctx: &mut Context, xdg_toplevel_id: u32) {
+    window_placement::release_toplevel(ctx, xdg_toplevel_id);
+    ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
+}
+
+impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
     fn on_configure(&mut self, ctx: &mut Context, serial: u32) -> Action {
         let host_xdg_surface_id = ctx.last_sender_id;
         let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
@@ -900,14 +909,13 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 "Unable to destroy xdg_toplevel {xdg_toplevel_id} without its host generation"
             ));
         };
-        // The Aura toplevel goes before the role destructor (see
-        // `aura_objects::release`). Retain the guest ID until the host
+        // Ending the toplevel releases its Aura toplevel (see
+        // `forget_xdg_toplevel`), which goes before the role destructor (see
+        // `aura_objects::release`). The guest ID is retained until the host
         // acknowledges the role destructor.
-        window_placement::release_toplevel(ctx, xdg_toplevel_id);
+        ctx.guest_destroyed(xdg_toplevel_id);
         ctx.client_to_host_queue
             .push(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
-        ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
-        ctx.shadow_table.guest_destroyed(xdg_toplevel_id);
         Action::Drop
     }
 
@@ -1141,7 +1149,7 @@ mod tests {
             3,
         );
         ctx.outputs.bind_for_test(output_host, Default::default());
-        ctx.shadow_table.guest_destroyed(output_guest);
+        ctx.guest_destroyed(output_guest);
 
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
@@ -1550,7 +1558,7 @@ mod tests {
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.guest_destroyed_in_use(guest_id);
+        ctx.guest_destroyed_in_use(guest_id);
     }
 
     /// Only a paired or local object can send a request or be named in one:
@@ -2984,7 +2992,7 @@ mod tests {
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
-        ctx.shadow_table.release_deleted_host_id(200);
+        ctx.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
@@ -3438,6 +3446,9 @@ mod tests {
             handler.on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
+        // The generated dispatcher pairs the forwarded viewport.
+        ctx.shadow_table
+            .insert_paired_for_test(700, 701, "wp_viewport");
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert!(ctx
             .surfaces
@@ -3445,11 +3456,7 @@ mod tests {
             .and_then(|surface| surface.viewport)
             .is_some());
 
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            WpViewportHandler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
+        ctx.guest_destroyed(700);
         assert!(
             ctx.surfaces
                 .get(&surface_id)

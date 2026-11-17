@@ -510,7 +510,9 @@ impl ShadowTable {
     }
 
     // Lifecycle. Each transition is named after what happened and changes
-    // both sides of a pairing at once.
+    // both sides of a pairing at once. Those that end an object are visible
+    // only in `state`: everything else ends one through its `Context`
+    // wrapper (`state::lifecycle`), which forgets the object's state.
 
     /// The guest destroyed paired guest object `guest_id`, and its
     /// destructor went to the host object.
@@ -520,7 +522,7 @@ impl ShadowTable {
     /// `delete_id` reaches the guest. An object the server created gets no
     /// `delete_id`: libwayland frees its ID on both sides as soon as either
     /// side destroys it, so both entries end now.
-    pub fn guest_destroyed(&mut self, guest_id: u32) {
+    pub(super) fn guest_destroyed(&mut self, guest_id: u32) {
         if !self.is_guest_server_id(guest_id) {
             self.guest_destroyed_in_use(guest_id);
             return;
@@ -537,7 +539,7 @@ impl ShadowTable {
     ///
     /// Until then the guest object rejects requests, but stays paired so
     /// the host object's events still reach its handler.
-    pub fn guest_destroyed_in_use(&mut self, guest_id: u32) {
+    pub(super) fn guest_destroyed_in_use(&mut self, guest_id: u32) {
         if let Some(GuestObject::Paired { state, .. }) = self.guests.get_mut(&GuestId(guest_id)) {
             *state = GuestState::DestroyPending;
         }
@@ -551,7 +553,7 @@ impl ShadowTable {
     /// # Returns
     ///
     /// `false`, changing nothing, unless `guest_id` is paired.
-    pub fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
+    pub(super) fn guest_ended_host_kept(&mut self, guest_id: u32) -> bool {
         let Some(host) = self.end_paired_guest(GuestId(guest_id)) else {
             return false;
         };
@@ -565,7 +567,7 @@ impl ShadowTable {
     /// by a terminal event (`wl_callback.done`) or a destructor the proxy
     /// queued. The host ID stays reserved until the host's `delete_id`,
     /// which then reaches no guest object.
-    pub fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
+    pub(super) fn guest_ended_host_destroyed(&mut self, guest_id: u32) {
         let host = self.end_paired_guest(GuestId(guest_id));
         debug_assert!(host.is_some(), "guest {guest_id} is not paired");
         if let Some(host) = host {
@@ -579,7 +581,7 @@ impl ShadowTable {
     /// # Returns
     ///
     /// `false`, changing nothing, unless `guest_id` is a local object.
-    pub fn local_destroyed(&mut self, guest_id: u32) -> bool {
+    pub(super) fn local_destroyed(&mut self, guest_id: u32) -> bool {
         if !self.is_local(guest_id) {
             return false;
         }
@@ -590,7 +592,7 @@ impl ShadowTable {
     /// Forget paired guest object `guest_id` and its host object, which
     /// never reached the host: nothing on either side knows the IDs, so
     /// both are free at once.
-    pub fn abandon(&mut self, guest_id: u32) {
+    pub(super) fn abandon(&mut self, guest_id: u32) {
         let guest = GuestId(guest_id);
         let host = self
             .forget_guest_object(guest)
@@ -666,7 +668,7 @@ impl ShadowTable {
     /// allocate or no longer tracks, changes nothing and returns
     /// [`DeletedHostId::Ignored`]. Freeing a live object's ID would hand it
     /// to a new object while the old one still holds it.
-    pub fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
+    pub(super) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
         let host = HostId(host_id);
         let deletable = self.hosts.get(&host).filter(|object| {
             self.host_ids.contains(host_id) && !matches!(object, HostObject::HostOnly(_))

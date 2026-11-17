@@ -1274,10 +1274,7 @@ mod tests {
                 10,
             );
         }
-        client
-            .ctx
-            .shadow_table
-            .guest_destroyed(STALE_GUEST_KEYBOARD);
+        client.ctx.guest_destroyed(STALE_GUEST_KEYBOARD);
         client.ctx.keyboard_repeatable_keys.insert(
             crate::state::HostId(STALE_HOST_KEYBOARD),
             std::collections::HashSet::from([57]),
@@ -2035,12 +2032,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_destroyed_sender_is_an_invalid_object_whatever_it_sends() {
-        let errors = surface_request_errors(
-            |client| client.ctx.shadow_table.guest_destroyed(SURFACE),
-            99,
-            &[],
-        )
-        .await;
+        let errors =
+            surface_request_errors(|client| client.ctx.guest_destroyed(SURFACE), 99, &[]).await;
         assert_eq!(
             errors,
             [(
@@ -2322,7 +2315,7 @@ mod tests {
     #[tokio::test]
     async fn failed_get_toplevel_does_not_create_internal_aura_object() {
         let (mut client, _guest_peer, _host_peer) = client_with_xdg_surface();
-        client.ctx.shadow_table.guest_destroyed(XDG_SURFACE);
+        client.ctx.guest_destroyed(XDG_SURFACE);
         let request = get_toplevel_request(&[]);
         client.client_conn.read_buf.extend_from_slice(&request);
 
@@ -4509,14 +4502,14 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "wl_region", 1);
-        ctx.shadow_table.guest_destroyed(10);
+        ctx.guest_destroyed(10);
         assert!(pending_host_event_is_stale(&ctx, 20, 0));
 
         ctx.shadow_table
             .insert_paired_with_version_for_test(11, 21, "wl_buffer", 1);
         assert!(ctx.register_local_buffer(11, 21, test_buffer_state()));
         assert!(ctx.mark_buffer_guest_destroyed(11));
-        ctx.shadow_table.guest_destroyed_in_use(11);
+        ctx.guest_destroyed_in_use(11);
         assert!(!pending_host_event_is_stale(
             &ctx,
             21,
@@ -4529,7 +4522,7 @@ mod tests {
         // Match the production native-buffer destroy path: the host
         // object still dispatches wl_buffer.release.
         assert!(ctx.mark_buffer_guest_destroyed(12));
-        ctx.shadow_table.guest_destroyed_in_use(12);
+        ctx.guest_destroyed_in_use(12);
         assert!(!pending_host_event_is_stale(
             &ctx,
             22,
@@ -4678,7 +4671,7 @@ mod tests {
         );
         ctx.shadow_table
             .insert_paired_with_version_for_test(parent, host_parent, "wl_surface", 1);
-        ctx.shadow_table.guest_destroyed(surface);
+        ctx.guest_destroyed(surface);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&new_subsurface.to_ne_bytes());

@@ -5198,7 +5198,7 @@ mod tests {
         });
 
         // Parent seat release has already invalidated the host seat proxy.
-        ctx.shadow_table.guest_destroyed(guest_seat);
+        ctx.guest_destroyed(guest_seat);
         ctx.last_sender_id = guest_keyboard;
         release_keyboard(&mut handler, &mut ctx);
         assert!(
@@ -5590,7 +5590,7 @@ mod tests {
         map_keyboard(&mut ctx, 5, 10, 50, 7);
         ctx.shadow_table
             .insert_paired_for_test(20, 30, "wl_surface");
-        ctx.shadow_table.guest_destroyed(20);
+        ctx.guest_destroyed(20);
         assert!(ctx.shadow_table.is_pending_destroy_guest(20));
 
         ctx.last_sender_id = 10;
