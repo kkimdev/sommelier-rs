@@ -20,7 +20,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::HashSet;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -131,12 +131,15 @@ fn close_received_fds(fds: &[RawFd]) {
 /// `nix::RecvMsg::cmsgs()` intentionally refuses to iterate when
 /// `MSG_CTRUNC` is set. That is normally a useful safety check, but it would
 /// leak descriptors that the kernel did install before truncating the
-/// ancillary buffer. This parser validates each kernel-provided length,
-/// collects every descriptor that is present, and closes those descriptors
-/// before returning an error whenever truncation or malformed control data is
-/// observed.
-fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
+/// ancillary buffer. This parser validates each kernel-provided length and
+/// takes ownership of every descriptor that is present as soon as it reads
+/// it, so returning an error whenever truncation or malformed control data
+/// is observed closes them.
+fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
     let mut fds = Vec::new();
+    // The kernel never reports a negative descriptor; owning one would be
+    // unsound. Skip it, but own the rest before failing, so none leaks.
+    let mut negative_fd = false;
     let control_start = msg.msg_control as usize;
     // `msg_controllen` is `size_t` on glibc and `socklen_t` on musl. Keep
     // pointer arithmetic in usize so this parser is portable across targets.
@@ -161,14 +164,12 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     while !current.is_null() {
         let current_addr = current as usize;
         let Some(current_offset) = current_addr.checked_sub(control_start) else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS header lies outside the control buffer",
             ));
         };
         if current_offset > control_len || control_len - current_offset < header_size {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated SCM_RIGHTS control header",
@@ -177,7 +178,6 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
 
         let cmsg_len = unsafe { (*current).cmsg_len as usize };
         if cmsg_len < header_size || cmsg_len > control_end - current_addr {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid SCM_RIGHTS control length",
@@ -189,35 +189,30 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             && unsafe { (*current).cmsg_type } == libc::SCM_RIGHTS
         {
             if !payload_len.is_multiple_of(std::mem::size_of::<RawFd>()) {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload is not fd-aligned",
                 ));
             }
             let Some(data_addr) = current_addr.checked_add(header_size) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload address overflows",
                 ));
             };
             let Some(data_end) = data_addr.checked_add(payload_len) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload end overflows",
                 ));
             };
             let Some(message_end) = current_addr.checked_add(cmsg_len) else {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS message end overflows",
                 ));
             };
             if data_end > message_end {
-                close_received_fds(&fds);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "SCM_RIGHTS payload exceeds control message",
@@ -225,7 +220,14 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             }
             for index in 0..(payload_len / std::mem::size_of::<RawFd>()) {
                 let fd_addr = data_addr + index * std::mem::size_of::<RawFd>();
-                fds.push(unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) });
+                let fd = unsafe { std::ptr::read_unaligned(fd_addr as *const RawFd) };
+                if fd < 0 {
+                    negative_fd = true;
+                    continue;
+                }
+                // SAFETY: `recvmsg` installed this descriptor for this
+                // receive, once, and nothing else refers to it yet.
+                fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
             }
         }
 
@@ -233,14 +235,12 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
             .checked_add(align - 1)
             .map(|len| len & !(align - 1))
         else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS control alignment overflows",
             ));
         };
         let Some(next_addr) = current_addr.checked_add(aligned_len) else {
-            close_received_fds(&fds);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "SCM_RIGHTS control chain overflows",
@@ -253,10 +253,15 @@ fn decode_unix_control_fds(msg: &libc::msghdr) -> io::Result<Vec<RawFd>> {
     }
 
     if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-        close_received_fds(&fds);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated SCM_RIGHTS ancillary data",
+        ));
+    }
+    if negative_fd {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative SCM_RIGHTS descriptor",
         ));
     }
 
@@ -267,7 +272,7 @@ fn recv_unix_message(
     fd: RawFd,
     data: &mut [u8],
     control: &mut [u8],
-) -> io::Result<(usize, Vec<RawFd>)> {
+) -> io::Result<(usize, Vec<OwnedFd>)> {
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast(),
         iov_len: data.len(),
@@ -329,13 +334,10 @@ impl WaylandConnection {
     ///
     /// Fails once more than [`MAX_PENDING_FDS`] descriptors are pending; the
     /// caller then closes the connection, which closes them.
-    fn append_received(
-        &mut self,
-        data: &[u8],
-        fds: impl IntoIterator<Item = RawFd>,
-    ) -> io::Result<()> {
+    fn append_received(&mut self, data: &[u8], fds: Vec<OwnedFd>) -> io::Result<()> {
         self.read_buf.extend_from_slice(data);
-        self.read_fds.extend(fds);
+        self.read_fds
+            .extend(fds.into_iter().map(IntoRawFd::into_raw_fd));
         if self.read_fds.len() > MAX_PENDING_FDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -478,7 +480,7 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => {
                 let (data, fds) = channel.recv().await?;
-                self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                self.append_received(&data, fds)?;
                 Ok(data.len())
             }
         }
@@ -505,7 +507,7 @@ impl WaylandConnection {
             }
             ConnectionTransport::VirtWayland(channel) => match channel.try_recv()? {
                 Some((data, fds)) => {
-                    self.append_received(&data, fds.into_iter().map(IntoRawFd::into_raw_fd))?;
+                    self.append_received(&data, fds)?;
                     Ok(Some(data.len()))
                 }
                 None => Ok(None),
@@ -632,9 +634,6 @@ mod tests {
             if bytes == 0 {
                 break;
             }
-            for &received in &fds {
-                unsafe { libc::close(received) };
-            }
             submissions.push((bytes, fds.len()));
         }
         assert_eq!(submissions, vec![(8, 20), (48, 15)]);
@@ -741,6 +740,37 @@ mod tests {
                 .as_ref()
                 .map_or(true, |current| current != &received_target),
             "truncated control cleanup must release the received fd"
+        );
+    }
+
+    #[test]
+    fn negative_scm_rights_descriptor_is_invalid_data() {
+        // The kernel never reports one; owning it would be unsound. The
+        // descriptor after it must still be owned, and closed.
+        let name = CString::new("sommelier-after-negative-fd").unwrap();
+        let received = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        let identity = fd_identity(received.as_raw_fd());
+        let payload_len = 2 * std::mem::size_of::<RawFd>() as u32;
+        let control_len = unsafe { libc::CMSG_SPACE(payload_len) } as usize;
+        let mut control = vec![0u8; control_len];
+        let header = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        unsafe {
+            (*header).cmsg_len = libc::CMSG_LEN(payload_len) as _;
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            let data = libc::CMSG_DATA(header).cast::<RawFd>();
+            data.write_unaligned(-1);
+            data.add(1).write_unaligned(received.into_raw_fd());
+        }
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len() as _;
+
+        let error = decode_unix_control_fds(&msg).expect_err("a negative descriptor");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !any_fd_has_identity(identity),
+            "the descriptors after a negative one must be closed"
         );
     }
 
