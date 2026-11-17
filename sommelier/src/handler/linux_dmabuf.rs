@@ -350,10 +350,12 @@ impl LinuxDmabufHandler {
                 "Cannot create synthetic dmabuf feedback for untracked factory {}",
                 factory_id
             );
+            // The factory interface declares no errors, and the client did
+            // nothing wrong: the proxy lost its own bookkeeping.
             queue_protocol_error(
                 ctx,
-                factory_id,
-                0,
+                WL_DISPLAY_ID,
+                wl_display::ERROR_IMPLEMENTATION,
                 "linux-dmabuf factory has no capability generation",
             );
             return Action::Drop;
@@ -1401,6 +1403,28 @@ mod tests {
                 let _ = nix::unistd::close(fd);
             }
         }
+    }
+
+    /// A factory without a capability generation is the proxy's own
+    /// bookkeeping failure. `zwp_linux_dmabuf_v1` declares no errors, so the
+    /// display reports it as an implementation error.
+    #[test]
+    fn feedback_from_an_untracked_factory_is_an_implementation_error() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 7;
+
+        assert_eq!(
+            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
+            Action::Drop
+        );
+        assert!(ctx.fatal_protocol_error);
+        let error = &ctx.host_to_client_queue[0].0;
+        assert_eq!(
+            u32::from_ne_bytes(error[8..12].try_into().unwrap()),
+            WL_DISPLAY_ID,
+            "the error names the display"
+        );
+        assert_eq!(protocol_error_code(&ctx), wl_display::ERROR_IMPLEMENTATION);
     }
 
     /// Feedback the proxy cannot allocate (here, without a GBM device to
