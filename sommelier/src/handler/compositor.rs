@@ -21,14 +21,15 @@ use crate::handler::window_placement;
 use crate::protocols::viewporter::{wp_viewport, wp_viewporter};
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
 use crate::protocols::wayland::wl_region::WlRegionHandler;
+use crate::protocols::wayland::wl_shm;
 use crate::protocols::wayland::wl_subcompositor::WlSubcompositorHandler;
 use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
-use crate::protocols::wayland::{wl_output, wl_shm};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
-    is_valid_transform, transformed_extent, BufferState, Context, DamageRect, DamageRegion,
-    PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceState, ViewportState,
+    is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, PostDispatch,
+    ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect, SurfaceState,
+    ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
@@ -142,54 +143,6 @@ fn wait_for_native_buffer(ctx: &mut Context, guest_buffer_id: u32) -> std::io::R
 
 impl WlCompositorHandler for CompositorHandler {}
 
-// ChromiumOS reserves headroom around the i32 damage range before applying
-// compositor scaling. This keeps the host compositor's x + width arithmetic
-// from overflowing when clients submit extreme but representable damage.
-const DAMAGE_MIN: i64 = i32::MIN as i64 / 10;
-const DAMAGE_MAX: i64 = i32::MAX as i64 / 10;
-
-fn clamp_damage_edge(value: i64) -> i64 {
-    value.clamp(DAMAGE_MIN, DAMAGE_MAX)
-}
-
-fn logical_transformed_extent(
-    transform: i32,
-    width: i32,
-    height: i32,
-    buffer_scale: i32,
-) -> (i32, i32) {
-    let (width, height) = transformed_extent(transform, width, height);
-    let scale = f64::from(buffer_scale.max(1));
-    (
-        (f64::from(width) / scale).ceil().max(1.0) as i32,
-        (f64::from(height) / scale).ceil().max(1.0) as i32,
-    )
-}
-
-fn map_surface_damage(rect: DamageRect) -> DamageRect {
-    if rect.width <= 0 || rect.height <= 0 {
-        return DamageRect::new(0, 0, 0, 0);
-    }
-    let left = clamp_damage_edge(i64::from(rect.x).saturating_sub(1));
-    let top = clamp_damage_edge(i64::from(rect.y).saturating_sub(1));
-    let right = clamp_damage_edge(
-        i64::from(rect.x)
-            .saturating_add(i64::from(rect.width))
-            .saturating_add(1),
-    );
-    let bottom = clamp_damage_edge(
-        i64::from(rect.y)
-            .saturating_add(i64::from(rect.height))
-            .saturating_add(1),
-    );
-    DamageRect::new(
-        left as i32,
-        top as i32,
-        (right - left).max(1) as i32,
-        (bottom - top).max(1) as i32,
-    )
-}
-
 pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
     format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
 }
@@ -220,220 +173,66 @@ pub(crate) fn record_xdg_toplevel(
     window_placement::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
 }
 
-fn saturating_i32(value: f64) -> i32 {
-    if value.is_nan() {
-        return 0;
-    }
-    if value <= f64::from(i32::MIN) {
-        i32::MIN
-    } else if value >= f64::from(i32::MAX) {
-        i32::MAX
-    } else {
-        value as i32
-    }
+/// The size of the buffer `state` shows, which outlives a destroyed
+/// `wl_buffer`, or `None` without one.
+fn shown_buffer_size(ctx: &Context, state: &SurfaceState) -> Option<(i32, i32)> {
+    state
+        .current_buffer_id()
+        .and_then(|buffer_id| ctx.buffer_dimensions(buffer_id))
+        .or(state.current_buffer_dimensions())
 }
 
-/// Convert one buffer-local damage rectangle into surface-local coordinates.
-///
-/// This is deliberately conservative. The viewport protocol describes source
-/// coordinates in post-buffer-scale surface units, while `damage_buffer`
-/// describes pixels. Mapping the two with floating point and then enclosing
-/// the result avoids under-damaging a pixel at either edge. Buffer transforms
-/// and malformed viewport state fall back to the complete surface rectangle;
-/// dropping damage is never safe.
-fn map_buffer_damage(
-    rect: DamageRect,
-    surface: &SurfaceState,
-    buffer_width: i32,
-    buffer_height: i32,
-) -> DamageRect {
-    if rect.width <= 0 || rect.height <= 0 {
-        return DamageRect::new(0, 0, 0, 0);
-    }
-    // wl_surface transforms are forwarded to the host, but this small SHM
-    // bridge does not rotate its linear copy. Damage the complete buffer until
-    // a rotated copy path is available.
-    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
-        if let Some(viewport) = surface.viewport.filter(|viewport| !viewport.is_identity()) {
-            if let Some((destination_width, destination_height)) = viewport.destination {
-                return DamageRect::new(0, 0, destination_width, destination_height);
-            }
-            if let Some((_, _, source_width, source_height)) = viewport.source {
-                return DamageRect::new(
-                    0,
-                    0,
-                    (source_width / 256).max(1),
-                    (source_height / 256).max(1),
-                );
-            }
-        }
-        let (width, height) = logical_transformed_extent(
-            surface.current_buffer_transform,
-            buffer_width.max(1),
-            buffer_height.max(1),
-            surface.current_buffer_scale,
+/// Log, once per surface, `problem`: a viewport rule the proxy leaves
+/// unenforced, as Exo does (see INVARIANTS, "Protocol errors"). Called once
+/// the commit can no longer roll back, which would clear the flag and repeat
+/// the log on every frame.
+fn log_unenforced_viewport_rule(
+    ctx: &mut Context,
+    surface_id: u32,
+    problem: &str,
+    mapping: &SurfaceMapping,
+) {
+    let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+        return;
+    };
+    if !std::mem::replace(&mut surface.logged_viewport_rule, true) {
+        log::warn!(
+            "wl_surface {} has {}, which Exo accepts, so the commit is forwarded: {:?}",
+            surface_id,
+            problem,
+            mapping
         );
-        return DamageRect::new(0, 0, width, height);
     }
-
-    let viewport = surface.viewport.filter(|viewport| !viewport.is_identity());
-    let contents_width = f64::from(buffer_width.max(1));
-    let contents_height = f64::from(buffer_height.max(1));
-    let mut scale_x = f64::from(surface.current_buffer_scale.max(1));
-    let mut scale_y = scale_x;
-    let mut offset_x = 0.0;
-    let mut offset_y = 0.0;
-
-    // Match ChromiumOS' compute_buffer_scale_and_offset(). Source offsets are
-    // in the post-buffer-scale surface coordinate space.
-    if let Some(viewport) = viewport {
-        if let Some((x, y, _, _)) = viewport.source {
-            // ChromiumOS uses wl_fixed_to_int() for the source offset before
-            // converting buffer damage, so retain its truncation semantics for
-            // fractional fixed-point offsets.
-            offset_x = f64::from(x / 256);
-            offset_y = f64::from(y / 256);
-        }
-        if let Some((destination_width, destination_height)) = viewport.destination {
-            if destination_width <= 0 || destination_height <= 0 {
-                return DamageRect::new(0, 0, buffer_width.max(1), buffer_height.max(1));
-            }
-            scale_x *= contents_width / f64::from(destination_width);
-            scale_y *= contents_height / f64::from(destination_height);
-            if let Some((_, _, source_width, source_height)) = viewport.source {
-                let source_width = f64::from(source_width) / 256.0;
-                let source_height = f64::from(source_height) / 256.0;
-                if source_width <= 0.0 || source_height <= 0.0 {
-                    return DamageRect::new(0, 0, buffer_width.max(1), buffer_height.max(1));
-                }
-                scale_x *= source_width / contents_width;
-                scale_y *= source_height / contents_height;
-            }
-        }
-    }
-
-    // ChromiumOS expands both edges by one buffer pixel before applying the
-    // scale/viewport transform. This prevents filtering at a fractional
-    // boundary from reading an undamaged source pixel.
-    let x_start = clamp_damage_edge(i64::from(rect.x).saturating_sub(1));
-    let x_end = clamp_damage_edge(
-        i64::from(rect.x)
-            .saturating_add(i64::from(rect.width))
-            .saturating_add(1),
-    );
-    let y_start = clamp_damage_edge(i64::from(rect.y).saturating_sub(1));
-    let y_end = clamp_damage_edge(
-        i64::from(rect.y)
-            .saturating_add(i64::from(rect.height))
-            .saturating_add(1),
-    );
-
-    let x0 = (x_start as f64 - offset_x) / scale_x;
-    let x1 = (x_end as f64 - offset_x) / scale_x;
-    let y0 = (y_start as f64 - offset_y) / scale_y;
-    let y1 = (y_end as f64 - offset_y) / scale_y;
-
-    // Attach/offset positions the new buffer relative to the previous
-    // surface contents. It does not change the buffer-coordinate damage
-    // mapping; ChromiumOS' implementation likewise omits that offset here.
-    let left = x0.min(x1).trunc().max(DAMAGE_MIN as f64);
-    let top = y0.min(y1).trunc().max(DAMAGE_MIN as f64);
-    let right = x0.max(x1).ceil().min(DAMAGE_MAX as f64);
-    let bottom = y0.max(y1).ceil().min(DAMAGE_MAX as f64);
-    DamageRect::new(
-        saturating_i32(left),
-        saturating_i32(top),
-        saturating_i32((right - left).max(1.0)),
-        saturating_i32((bottom - top).max(1.0)),
-    )
-}
-
-fn full_surface_damage(
-    surface: &SurfaceState,
-    buffer_width: i32,
-    buffer_height: i32,
-) -> DamageRect {
-    let width = buffer_width.max(1);
-    let height = buffer_height.max(1);
-    if let Some(viewport) = surface.viewport.filter(|viewport| !viewport.is_identity()) {
-        if let Some((destination_width, destination_height)) = viewport.destination {
-            return DamageRect::new(0, 0, destination_width, destination_height);
-        }
-        if let Some((_, _, source_width, source_height)) = viewport.source {
-            return DamageRect::new(
-                0,
-                0,
-                (source_width / 256).max(1),
-                (source_height / 256).max(1),
-            );
-        }
-    }
-
-    if surface.current_buffer_transform != wl_output::TRANSFORM_NORMAL {
-        let (width, height) = logical_transformed_extent(
-            surface.current_buffer_transform,
-            width,
-            height,
-            surface.current_buffer_scale,
-        );
-        return DamageRect::new(0, 0, width, height);
-    }
-
-    DamageRect::new(
-        0,
-        0,
-        ((f64::from(width) / f64::from(surface.current_buffer_scale.max(1))).ceil())
-            .min(f64::from(i32::MAX)) as i32,
-        ((f64::from(height) / f64::from(surface.current_buffer_scale.max(1))).ceil())
-            .min(f64::from(i32::MAX)) as i32,
-    )
 }
 
 /// Build the host damage requests and the commit for one guest commit, or
-/// `None` when the surface has no host object.
+/// `None` when the surface has no host object. The host takes surface-local
+/// damage only, so buffer damage goes through `mapping`.
 fn build_surface_commit_messages(
     ctx: &Context,
     surface_id: u32,
-    surface_damage: &[DamageRect],
-    buffer_damage: &[DamageRect],
-    surface_state: &SurfaceState,
+    surface_damage: &[SurfaceRect],
+    buffer_damage: &[BufferRect],
+    mapping: &SurfaceMapping,
     force_full_damage: bool,
 ) -> Option<Vec<Outgoing>> {
     let host_surface_id = ctx.shadow_table.get_host_id(surface_id)?;
-    let (buffer_width, buffer_height) = surface_state
-        .current_buffer_id()
-        .and_then(|buffer_id| ctx.buffer_dimensions(buffer_id))
-        .or(surface_state.current_buffer_dimensions())
-        .unwrap_or((1, 1));
-
-    let full_damage = full_surface_damage(surface_state, buffer_width, buffer_height);
-    let mut mapped = Vec::with_capacity(surface_damage.len() + buffer_damage.len() + 1);
+    let mut damage: Vec<SurfaceRect> = Vec::new();
     if force_full_damage {
-        mapped.push(full_damage);
+        damage.push(mapping.surface_rect());
     }
-    mapped.extend(surface_damage.iter().copied().map(map_surface_damage));
-    mapped.extend(
-        buffer_damage
-            .iter()
-            .map(|rect| map_buffer_damage(*rect, surface_state, buffer_width, buffer_height)),
-    );
+    damage.extend(surface_damage.iter().map(|&rect| rect.outset()));
+    damage.extend(buffer_damage.iter().map(|&rect| mapping.to_surface(rect)));
 
     // The host compositor treats damage as a unioned region. Coalescing here
     // keeps a GTK frame with many overlapping requests from becoming a long
     // sequence of redundant Wayland messages as well as redundant copies.
-    let mut messages = Vec::new();
-    for rect in crate::handler::shm::coalesce_damage_rects(&mapped) {
-        if rect.width <= 0 || rect.height <= 0 {
-            continue;
-        }
-        messages.push(wl_surface::req::damage(
-            host_surface_id,
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-        ));
-    }
+    let mut messages: Vec<Outgoing> = crate::handler::shm::coalesce_damage_rects(&damage)
+        .into_iter()
+        .map(|rect| {
+            wl_surface::req::damage(host_surface_id, rect.x, rect.y, rect.width, rect.height)
+        })
+        .collect();
     messages.push(wl_surface::req::commit(host_surface_id));
     Some(messages)
 }
@@ -517,7 +316,7 @@ fn copy_to_host_storage(
     buffer: &mut BufferState,
     allocator: Option<&Allocator>,
     channel: Option<&Arc<VirtWaylandChannel>>,
-    damage: &DamageRegion,
+    damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {
     let Some(layout) = ShmCopyLayout::for_buffer(buffer) else {
         return Err(ShmCopyError::Destination);
@@ -721,7 +520,7 @@ impl WlSurfaceHandler for CompositorHandler {
         ctx.surface_mut(ctx.last_sender_id)
             .pending
             .surface_damage
-            .push(DamageRect::new(x, y, width, height));
+            .push(SurfaceRect::new(x, y, width, height));
         // The host compositor only understands surface-coordinate damage. Keep
         // this request local so the commit path can preserve ordering and
         // account for a concurrently pending viewport/scale change.
@@ -739,7 +538,7 @@ impl WlSurfaceHandler for CompositorHandler {
         ctx.surface_mut(ctx.last_sender_id)
             .pending
             .buffer_damage
-            .push(DamageRect::new(x, y, width, height));
+            .push(BufferRect::new(x, y, width, height));
         // ChromiumOS Sommelier implements damage_buffer by translating it to
         // wl_surface.damage because the host compositor may only expose v3.
         Action::Drop
@@ -789,7 +588,6 @@ impl WlSurfaceHandler for CompositorHandler {
         );
         let attached_buffer_id = commit.attached_buffer_id();
         let copied_buffer_id = buffer_to_copy(ctx, &commit);
-        let attached_full_mapping = attached_buffer_id.is_some() && commit.uses_full_mapping();
         // A native dma-buf acquire fence belongs to the new contents submitted
         // by an attach.  Re-running the dma-buf wait for a damage-only commit
         // blocks this single-threaded proxy even though the host compositor
@@ -798,33 +596,22 @@ impl WlSurfaceHandler for CompositorHandler {
         // commits non-blocking.
         let wait_for_native_sync = attached_buffer_id.is_some();
 
-        // The viewporter protocol permits fractional source rectangles only
-        // when a destination size is also set. If the source is fractional
-        // and the destination is unset, the compositor must raise
-        // wp_viewport.bad_size when this double-buffered state is applied.
-        // Report it against the viewport object, if it is still present, and
-        // do not forward a commit that would otherwise apply invalid state.
-        if commit.has_invalid_fractional_viewport() {
-            if let Some((&viewport_id, _)) = ctx
-                .viewport_to_wl_surface
-                .iter()
-                .find(|(_, &owner)| owner == surface_id)
-            {
-                return ctx.reject(
-                    viewport_id,
-                    wp_viewport::ERROR_BAD_SIZE,
-                    "fractional wp_viewport source requires a destination",
-                );
-            }
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                commit.rollback(surface);
-            }
-            return Action::Drop;
-        }
-
+        let mapping = commit.state.mapping(shown_buffer_size(ctx, &commit.state));
+        // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
+        // Exo accepts both, so ending the session would break apps that work
+        // today. They are logged instead, once the commit is final.
+        let viewport_problem = if commit.has_invalid_fractional_viewport() {
+            Some("a fractional wp_viewport source without a destination")
+        } else if !mapping.source_fits_buffer() {
+            Some("a wp_viewport source outside its buffer")
+        } else {
+            None
+        };
+        let attached_full_mapping =
+            attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
         let surface_damage = commit.surface_damage.rects();
         let buffer_damage = commit.buffer_damage.rects();
-        ctx.stale_surface_pixels(surface_id, &commit);
+        ctx.stale_surface_pixels(surface_id, &commit, &mapping);
         // A buffer that copies everything shows the host a whole new image.
         let needs_full_damage = copied_buffer_id
             .and_then(|buffer_id| ctx.local_buffer(buffer_id))
@@ -839,7 +626,7 @@ impl WlSurfaceHandler for CompositorHandler {
             surface_id,
             surface_damage,
             buffer_damage,
-            &commit.state,
+            &mapping,
             force_full_damage,
         ) else {
             return ctx.fail(format_args!(
@@ -929,6 +716,9 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
+        if let Some(problem) = viewport_problem {
+            log_unenforced_viewport_rule(ctx, surface_id, problem, &mapping);
+        }
         // Damage and commit were built as one batch before local state was
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
@@ -1672,6 +1462,30 @@ mod tests {
             copied_pixels(&ctx, 42, 0x22),
             rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
         );
+    }
+
+    #[test]
+    fn destination_only_viewport_copies_only_the_damaged_pixels() {
+        // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
+        // so a surface unit is half a buffer pixel. It has no damage_buffer
+        // (the host offers wl_compositor v3) and damages surface units.
+        let (mut ctx, ..) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Action::Forward
+        );
+        ctx.last_sender_id = 700;
+        assert_eq!(handler.on_set_destination(&mut ctx, 8, 8), Action::Forward);
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        draw_test_frame(&ctx, 42, 0x22);
+        assert_eq!(handler.on_damage(&mut ctx, 0, 0, 2, 2), Action::Drop);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        // Surface units 0..2 are pixels 0..1, grown by a pixel.
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(0, 0, 2, 2));
     }
 
     #[test]
@@ -3077,25 +2891,11 @@ mod tests {
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)],
             "translated damage must be queued before the replacement commit"
         );
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_sender(message), 200);
-        assert_eq!(msg_opcode(message), REQ_DAMAGE);
-        assert_eq!(
-            &message[8..],
-            &[
-                3i32.to_ne_bytes(),
-                4i32.to_ne_bytes(),
-                8i32.to_ne_bytes(),
-                9i32.to_ne_bytes()
-            ]
-            .concat()
-        );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), 200);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(host_damage(&ctx), [(3, 4, 8, 9)]);
     }
 
     #[test]
@@ -3117,15 +2917,11 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
+        );
+        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
     }
 
     #[test]
@@ -3246,15 +3042,11 @@ mod tests {
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_COMMIT);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(200, REQ_DAMAGE), (200, REQ_COMMIT)]
+        );
+        assert_eq!(host_damage(&ctx), [(0, 0, 8, 6)]);
     }
 
     #[test]
@@ -3267,12 +3059,94 @@ mod tests {
         assert_eq!(handler.on_damage(&mut ctx, 10, 20, 1, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = &ctx.client_to_host_queue[0].0;
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 9);
-        assert_eq!(wire.read_i32().unwrap(), 19);
-        assert_eq!(wire.read_i32().unwrap(), 3);
-        assert_eq!(wire.read_i32().unwrap(), 3);
+        assert_eq!(host_damage(&ctx), [(9, 19, 3, 3)]);
+    }
+
+    /// The rectangles of the host `wl_surface.damage` requests queued so far.
+    fn host_damage(ctx: &Context) -> Vec<(i32, i32, i32, i32)> {
+        ctx.client_to_host_queue
+            .iter()
+            .filter(|(message, _)| msg_sender(message) == 200 && msg_opcode(message) == REQ_DAMAGE)
+            .map(|(message, _)| {
+                let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message[8..]);
+                let mut next = || wire.read_i32().unwrap();
+                (next(), next(), next(), next())
+            })
+            .collect()
+    }
+
+    /// A surface whose committed state shows its buffer at `scale` through
+    /// a viewport with `source` (in 24.8 fixed point) and `destination`.
+    fn viewed_surface(
+        scale: i32,
+        source: Option<(i32, i32, i32, i32)>,
+        destination: Option<(i32, i32)>,
+    ) -> SurfaceState {
+        let mut surface = SurfaceState::default();
+        surface.current_buffer_scale = scale;
+        surface.viewport = Some(ViewportState {
+            source,
+            destination,
+        });
+        surface
+    }
+
+    /// The host damage of a commit with buffer damage `rect` on `surface`,
+    /// which shows a buffer of `size`.
+    fn host_damage_for(
+        surface: SurfaceState,
+        size: (i32, i32),
+        rect: (i32, i32, i32, i32),
+    ) -> Vec<(i32, i32, i32, i32)> {
+        let (mut ctx, ..) = setup_ctx();
+        ctx.surfaces.insert(TEST_SURFACE, surface);
+        set_test_surface_content(&mut ctx, TEST_SURFACE, None, Some(size));
+        ctx.last_sender_id = TEST_SURFACE;
+        let (x, y, width, height) = rect;
+        let mut handler = CompositorHandler;
+        assert_eq!(
+            handler.on_damage_buffer(&mut ctx, x, y, width, height),
+            Action::Drop
+        );
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        host_damage(&ctx)
+    }
+
+    /// Every host damage rectangle, partial or full, keeps both edges within
+    /// the headroom, however far a viewport stretches the buffer.
+    #[test]
+    fn host_damage_is_clamped_on_both_edges() {
+        const MAX: i32 = i32::MAX / 10;
+        // A 1x1 buffer stretched to 1000x1000 puts damage at buffer pixel
+        // 1000000 past the headroom: it shrinks to the headroom's last unit.
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(1, None, Some((1000, 1000))),
+                (1, 1),
+                (1_000_000, 0, 1, 1)
+            ),
+            [(MAX - 1, -1000, 1, 3000)]
+        );
+        // Stretched to i32::MAX units, the left edge of the last pixel would
+        // leave no room for its width.
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(1, Some((0, 0, 256, 256)), Some((i32::MAX, 256))),
+                (1, 1),
+                (i32::MAX, 0, 1, 1)
+            ),
+            [(MAX - 1, -256, 1, 768)]
+        );
+        // A buffer attached under a viewport without damage damages the
+        // whole destination.
+        let (mut ctx, ..) = setup_ctx();
+        ctx.surfaces.insert(
+            TEST_SURFACE,
+            viewed_surface(1, None, Some((i32::MAX, i32::MAX))),
+        );
+        register_test_native(&mut ctx, 42, (1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(host_damage(&ctx), [(0, 0, MAX, MAX)]);
     }
 
     #[test]
@@ -3280,9 +3154,11 @@ mod tests {
         let mut surface = SurfaceState::default();
         surface.current_buffer_scale = 2;
 
-        let mapped = map_buffer_damage(DamageRect::new(20, 10, 4, 6), &surface, 100, 100);
+        let mapped = surface
+            .mapping(Some((100, 100)))
+            .to_surface(BufferRect::new(20, 10, 4, 6));
 
-        assert_eq!(mapped, DamageRect::new(9, 4, 4, 5));
+        assert_eq!(mapped, SurfaceRect::new(9, 4, 4, 5));
     }
 
     #[test]
@@ -3308,13 +3184,7 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(damage), REQ_DAMAGE);
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 6);
-        assert_eq!(wire.read_i32().unwrap(), 8);
+        assert_eq!(host_damage(&ctx), [(0, 0, 6, 8)]);
     }
 
     #[test]
@@ -3324,11 +3194,14 @@ mod tests {
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_offset, (80, 90));
 
-        let mapped = map_buffer_damage(DamageRect::new(4, 5, 6, 7), &commit.state, 100, 100);
+        let mapped = commit
+            .state
+            .mapping(Some((100, 100)))
+            .to_surface(BufferRect::new(4, 5, 6, 7));
 
         assert_eq!(
             mapped,
-            DamageRect::new(3, 4, 8, 9),
+            SurfaceRect::new(3, 4, 8, 9),
             "wl_surface.attach/offset changes content placement, not buffer damage coordinates"
         );
     }
@@ -3380,16 +3253,11 @@ mod tests {
         assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 1, 1, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("offset plus explicit damage must include complete host damage");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &damage.0[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 8);
-        assert_eq!(wire.read_i32().unwrap(), 6);
+        assert_eq!(
+            host_damage(&ctx),
+            [(0, 0, 8, 6)],
+            "offset plus explicit damage must include complete host damage"
+        );
     }
 
     #[test]
@@ -3404,27 +3272,24 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("damage request");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..]);
-        assert_eq!(wire.read_i32().unwrap(), i32::MIN / 10);
-        assert_eq!(wire.read_i32().unwrap(), -1);
-        assert_eq!(wire.read_i32().unwrap(), 214_748_364);
-        assert_eq!(wire.read_i32().unwrap(), 3);
+        assert_eq!(host_damage(&ctx), [(i32::MIN / 10, -1, 214_748_364, 3)]);
     }
 
     #[test]
-    fn rotated_non_square_buffer_full_damage_swaps_extent() {
+    fn rotated_buffer_damage_covers_the_transformed_surface() {
         let mut surface = SurfaceState::default();
         surface.current_buffer_transform = 1;
+        let mapping = surface.mapping(Some((8, 6)));
 
         assert_eq!(
-            full_surface_damage(&surface, 8, 6),
-            DamageRect::new(0, 0, 6, 8),
+            mapping.surface_rect(),
+            SurfaceRect::new(0, 0, 6, 8),
             "90-degree transforms expose a height-by-width surface extent"
+        );
+        assert_eq!(
+            mapping.to_surface(BufferRect::new(1, 1, 1, 1)),
+            mapping.surface_rect(),
+            "the bridge does not rotate damage, so it damages the whole surface"
         );
     }
 
@@ -3435,8 +3300,8 @@ mod tests {
         surface.current_buffer_transform = 1;
 
         assert_eq!(
-            full_surface_damage(&surface, 8, 6),
-            DamageRect::new(0, 0, 3, 4),
+            surface.mapping(Some((8, 6))).surface_rect(),
+            SurfaceRect::new(0, 0, 3, 4),
             "buffer scale converts the rotated extent to surface coordinates"
         );
     }
@@ -3481,16 +3346,65 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("translated damage request");
-        let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message.0[8..]);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 0);
-        assert_eq!(wire.read_i32().unwrap(), 51);
-        assert_eq!(wire.read_i32().unwrap(), 26);
+        // The damage, grown by a buffer pixel, starts just left of and above
+        // the source, so its mapped edges round outward to -1.
+        assert_eq!(host_damage(&ctx), [(-1, -1, 52, 27)]);
+    }
+
+    #[test]
+    fn buffer_damage_maps_through_buffer_scale_before_the_viewport() {
+        // Scale 2 makes the 100-pixel buffer a 50-unit surface, which the
+        // destination stretches back to 100 units: a pixel is one unit.
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(2, None, Some((100, 100))),
+                (100, 100),
+                (80, 80, 20, 20)
+            ),
+            [(79, 79, 22, 22)]
+        );
+    }
+
+    #[test]
+    fn whole_buffer_damage_covers_the_whole_destination() {
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(2, None, Some((100, 100))),
+                (100, 100),
+                (0, 0, 100, 100)
+            ),
+            [(-1, -1, 102, 102)]
+        );
+    }
+
+    #[test]
+    fn buffer_damage_subtracts_the_source_offset_in_surface_units() {
+        // The source starts 10 units, which are 20 buffer pixels, into the
+        // 200-pixel buffer at scale 2.
+        let source = Some((10 * 256, 10 * 256, 80 * 256, 80 * 256));
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(2, source, Some((80, 80))),
+                (200, 200),
+                (100, 100, 20, 20)
+            ),
+            [(39, 39, 12, 12)]
+        );
+    }
+
+    #[test]
+    fn source_only_viewport_maps_buffer_damage() {
+        // Without a destination the source crops without scaling, and its
+        // origin keeps its fraction: x starts at 10.5 units.
+        let source = Some((10 * 256 + 128, 10 * 256, 80 * 256, 80 * 256));
+        assert_eq!(
+            host_damage_for(
+                viewed_surface(2, source, None),
+                (200, 200),
+                (100, 100, 20, 20)
+            ),
+            [(39, 39, 11, 12)]
+        );
     }
 
     #[test]
@@ -3588,31 +3502,98 @@ mod tests {
     }
 
     #[test]
-    fn fractional_source_without_destination_is_bad_size_on_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
+    fn fractional_source_without_destination_is_logged_and_forwarded() {
+        // Exo takes the fractional source size as the surface size, and the
+        // host damage covers it, rounded up.
+        let (mut ctx, ..) = setup_ctx();
         let mut handler = CompositorHandler;
-
-        ctx.last_sender_id = surface_id;
+        ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            handler.on_get_viewport(&mut ctx, 700, surface_id),
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
             Action::Forward
         );
+        set_test_viewport_source(&mut ctx, (0, 0, 128, 256));
+        register_test_native(&mut ctx, 42, (1, 1));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+        assert_eq!(host_damage(&ctx), [(0, 0, 1, 1)]);
+    }
+
+    /// Set the viewport source of `TEST_SURFACE`, whose viewport is 700.
+    fn set_test_viewport_source(ctx: &mut Context, source: (i32, i32, i32, i32)) {
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = 700;
+        let (x, y, width, height) = source;
+        assert_eq!(
+            handler.on_set_source(ctx, x, y, width, height),
+            Action::Forward
+        );
+        ctx.last_sender_id = TEST_SURFACE;
+    }
+
+    /// Commit a buffer of `size` at scale 2 through a viewport with
+    /// `source` (24.8 fixed point) and a destination, which lets the
+    /// source be fractional.
+    fn commit_viewport_source(size: (i32, i32), source: (i32, i32, i32, i32)) -> Context {
+        let (mut ctx, ..) = setup_ctx();
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(
+            handler.on_get_viewport(&mut ctx, 700, TEST_SURFACE),
+            Action::Forward
+        );
+        assert_eq!(handler.on_set_buffer_scale(&mut ctx, 2), Action::Forward);
+        set_test_viewport_source(&mut ctx, source);
         ctx.last_sender_id = 700;
         assert_eq!(
-            handler.on_set_source(&mut ctx, 0, 0, 128, 256),
+            handler.on_set_destination(&mut ctx, 10, 10),
             Action::Forward
         );
-        ctx.last_sender_id = surface_id;
+        register_test_native(&mut ctx, 42, size);
+        attach_and_commit(&mut ctx, TEST_SURFACE, 42);
+        ctx
+    }
+
+    /// Whether the last commit reached the host without ending the session,
+    /// and whether the surface's source leaving its buffer was logged.
+    fn forwarded_and_logged(ctx: &Context) -> (bool, bool) {
+        let forwarded = !ctx.is_fatal()
+            && queued_headers(&ctx.client_to_host_queue).last() == Some(&(200, REQ_COMMIT));
+        (forwarded, ctx.surfaces[&TEST_SURFACE].logged_viewport_rule)
+    }
+
+    #[test]
+    fn viewport_source_outside_the_buffer_is_logged_and_forwarded() {
+        const ONE: i32 = 256;
+        // At scale 2 an 8x6 buffer is a 4x3 surface, the source's units.
+        let whole = (0, 0, 4 * ONE, 3 * ONE);
+        let ctx = commit_viewport_source((8, 6), whole);
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
+
+        // Half a unit to the right the source leaves the buffer. Exo accepts
+        // that, so the commit is forwarded and only logged.
+        let ctx = commit_viewport_source((8, 6), (ONE / 2, 0, 4 * ONE, 3 * ONE));
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+
+        // A later, smaller buffer under the unchanged viewport.
+        let mut ctx = commit_viewport_source((8, 6), whole);
+        register_test_native(&mut ctx, 43, (6, 6));
+        attach_and_commit(&mut ctx, TEST_SURFACE, 43);
+        assert_eq!(forwarded_and_logged(&ctx), (true, true));
+
+        // Detaching the buffer in the same commit exempts any source.
+        let mut ctx = commit_viewport_source((8, 6), whole);
+        let mut handler = CompositorHandler;
+        assert_eq!(handler.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
+        set_test_viewport_source(&mut ctx, (0, 0, 100 * ONE, 100 * ONE));
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(protocol_error_code(&ctx), 1);
-        assert!(ctx.is_fatal());
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
-            "invalid viewport state must not forward the surface commit"
-        );
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
+
+        // An odd buffer ends at a fractional unit, 3.5x2.5, which the source
+        // may reach exactly.
+        let edge = (0, 0, 3 * ONE + ONE / 2, 2 * ONE + ONE / 2);
+        let ctx = commit_viewport_source((7, 5), edge);
+        assert_eq!(forwarded_and_logged(&ctx), (true, false));
     }
 
     #[test]

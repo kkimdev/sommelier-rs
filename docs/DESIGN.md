@@ -183,7 +183,7 @@ encode wire bytes ad hoc.
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `RenderBufferRegistry`) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
@@ -288,6 +288,11 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
   the commit and forces a full copy next time. This is a copy, not
   zero-copy.
+- Damage carries its coordinate space in its type: `BufferRect` for
+  `damage_buffer` and the copy, `SurfaceRect` for `wl_surface.damage` and
+  the host, which takes nothing else. `SurfaceMapping` (`render.rs`) is
+  the one conversion between them; see
+  [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm).
 - `RenderBufferRegistry` tracks each buffer's use by the host
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
