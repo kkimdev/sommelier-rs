@@ -64,9 +64,12 @@ limitations under the License.
 // which no encoder can do.
 #![allow(clippy::disallowed_methods)]
 
+mod typing;
+
 use super::{Client, Direction};
 use crate::connection::{WaylandConnection, MAX_FDS_PER_SEND};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::{
     wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
     wl_registry, wl_seat, wl_surface,
@@ -82,6 +85,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wayland_codegen::protocol::{EnumItem, Interface, InterfaceItem, MessageItem, ProtocolItem};
@@ -96,7 +100,7 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the proxy may take to finish once it has closed the guest
 /// connection.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
-/// The most requests one case sends before its closing sync.
+/// The most random requests one case sends before its closing sync.
 const MAX_REQUESTS: usize = 64;
 /// The guest's `wl_registry`, bound before each case's requests.
 const REGISTRY: u32 = 2;
@@ -402,16 +406,12 @@ struct Global {
 /// The globals the proxy advertises to a guest under `config`.
 fn discover_globals(protocols: &Arc<Protocols>, config: Config) -> Vec<Global> {
     let callback = REGISTRY + 1;
-    let sync = sync_request(callback).encode();
-    let events = exchange(
-        protocols,
-        config,
-        vec![(sync, Vec::new())],
-        true,
-        callback,
-        None,
-    )
-    .expect("the proxy answers a lone sync in time");
+    let sync = Submission {
+        bytes: sync_request(callback).encode(),
+        ..Submission::default()
+    };
+    let events = exchange(protocols, config, vec![sync], true, callback, None)
+        .expect("the proxy answers a lone sync in time");
     frames(&events)
         .filter(|(header, _)| {
             (header.sender_id, header.opcode) == (REGISTRY, wl_registry::EVT_GLOBAL)
@@ -433,6 +433,9 @@ struct Message {
     opcode: u16,
     payload: Vec<u8>,
     fds: Vec<OwnedFd>,
+    /// For the `wl_display.sync` of a roundtrip, its callback, whose `done`
+    /// the guest waits for before it sends more.
+    roundtrip: Option<u32>,
 }
 
 impl Message {
@@ -452,13 +455,19 @@ impl Message {
 }
 
 fn sync_request(callback: u32) -> Message {
+    request(WL_DISPLAY_ID, wl_display::REQ_SYNC, &[callback])
+}
+
+/// A request of `sender` whose arguments are `words`.
+fn request(sender: u32, opcode: u16, words: &[u32]) -> Message {
     let mut payload = MessageBuilder::new();
-    payload.write_u32(callback);
+    words.iter().for_each(|&word| payload.write_u32(word));
     Message {
-        sender: WL_DISPLAY_ID,
-        opcode: wl_display::REQ_SYNC,
+        sender,
+        opcode,
         payload: payload.into_payload(),
         fds: Vec::new(),
+        roundtrip: None,
     }
 }
 
@@ -550,15 +559,7 @@ impl<'a> Guest<'a> {
             if request.since > version || !request.args.iter().all(|arg| self.can_name(arg)) {
                 continue;
             }
-            let mut message = Message {
-                sender,
-                opcode: opcode as u16,
-                payload: Vec::new(),
-                fds: Vec::new(),
-            };
-            for arg in &request.args {
-                self.write_arg(arg, version, &mut message);
-            }
+            let message = self.message(sender, opcode as u16);
             if (interface, message.opcode) == ("wl_surface", wl_surface::REQ_FRAME) {
                 let callback = WireMessage::new(sender, message.opcode, &message.payload)
                     .read_u32()
@@ -579,6 +580,18 @@ impl<'a> Guest<'a> {
             return message;
         }
         self.bind()
+    }
+
+    /// Request `opcode` of the live object `sender`, with arguments of the
+    /// declared types.
+    fn message(&mut self, sender: u32, opcode: u16) -> Message {
+        let protocols = self.protocols;
+        let (interface, version) = self.objects[&sender];
+        let mut message = request(sender, opcode, &[]);
+        for arg in &protocols.requests[interface][usize::from(opcode)].args {
+            self.write_arg(arg, version, &mut message);
+        }
+        message
     }
 
     /// Whether a live object can fill `arg`.
@@ -611,6 +624,7 @@ impl<'a> Guest<'a> {
             opcode: wl_registry::REQ_BIND,
             payload: payload.into_payload(),
             fds: Vec::new(),
+            roundtrip: None,
         };
         (message, id, version)
     }
@@ -645,16 +659,6 @@ impl<'a> Guest<'a> {
         let toplevel = self.create("xdg_toplevel", wm_base_version);
         let frame = self.create("wl_callback", 1);
         self.frame(surface, frame);
-        let request = |sender: u32, opcode: u16, words: &[u32]| {
-            let mut payload = MessageBuilder::new();
-            words.iter().for_each(|&word| payload.write_u32(word));
-            Message {
-                sender,
-                opcode,
-                payload: payload.into_payload(),
-                fds: Vec::new(),
-            }
-        };
         let mut create_pool = request(shm, wl_shm::REQ_CREATE_POOL, &[pool, 1 << 16]);
         create_pool.fds.push(self.memfd());
         vec![
@@ -675,6 +679,16 @@ impl<'a> Guest<'a> {
             request(surface, wl_surface::REQ_FRAME, &[frame]),
             request(surface, wl_surface::REQ_COMMIT, &[]),
         ]
+    }
+
+    /// A `wl_display.sync` the guest waits for, as `wl_display_roundtrip`
+    /// does.
+    fn roundtrip(&mut self) -> Message {
+        let callback = self.create("wl_callback", 1);
+        Message {
+            roundtrip: Some(callback),
+            ..sync_request(callback)
+        }
     }
 
     /// The untyped `new_id` of a bind: interface, version and ID. Returns
@@ -811,7 +825,7 @@ impl<'a> Guest<'a> {
 
 /// One generated input: the transport submissions the guest makes.
 struct Case {
-    sends: Vec<(Vec<u8>, Vec<OwnedFd>)>,
+    sends: Vec<Submission>,
     /// Whether every message is still whole, so the closing sync is a
     /// message of its own.
     framed: bool,
@@ -823,6 +837,16 @@ struct Case {
     /// The interface whose live objects the compositor destroys on its
     /// own, if any (see [`HOST_DESTROYED`]).
     host_destroys: Option<&'static str>,
+}
+
+/// One transport submission of the guest.
+#[derive(Default)]
+struct Submission {
+    bytes: Vec<u8>,
+    fds: Vec<OwnedFd>,
+    /// The callback of a roundtrip this submission ends, whose `done` the
+    /// guest waits for before its next submission.
+    then_await: Option<u32>,
 }
 
 /// The guest's objects, as its requests created and destroyed them.
@@ -846,6 +870,9 @@ impl Case {
             Vec::new()
         };
         messages.extend((0..count).map(|_| guest.request()));
+        if guest.rng.one_in(2) {
+            messages.extend(guest.type_in_fields());
+        }
         // Half the cases stay valid as far as the guest knows, so they
         // reach deep into the handlers; the rest damage a few requests.
         let mutations = if guest.rng.one_in(2) {
@@ -861,34 +888,42 @@ impl Case {
         messages.push(sync_request(callback));
 
         let rng = &mut guest.rng;
-        let mut sends: Vec<(Vec<u8>, Vec<OwnedFd>)> = Vec::new();
+        let mut sends: Vec<Submission> = Vec::new();
         for message in messages {
             let bytes = message.encode();
-            let full = sends
-                .last()
-                .is_none_or(|(_, fds)| fds.len() + message.fds.len() > MAX_FDS_PER_SEND);
+            let full = sends.last().is_none_or(|send| {
+                send.then_await.is_some() || send.fds.len() + message.fds.len() > MAX_FDS_PER_SEND
+            });
             if full || rng.one_in(3) {
-                sends.push(Default::default());
+                sends.push(Submission::default());
             }
-            let (send_bytes, send_fds) = sends.last_mut().expect("a submission");
-            send_fds.extend(message.fds);
+            let send = sends.last_mut().expect("a submission");
+            send.fds.extend(message.fds);
             // Sometimes the rest of the message arrives in a later receive.
             let split = if bytes.len() > 1 && rng.one_in(4) {
                 1 + rng.below(bytes.len() - 1)
             } else {
                 bytes.len()
             };
-            send_bytes.extend_from_slice(&bytes[..split]);
+            send.bytes.extend_from_slice(&bytes[..split]);
             if split < bytes.len() {
-                sends.push((bytes[split..].to_vec(), Vec::new()));
+                sends.push(Submission {
+                    bytes: bytes[split..].to_vec(),
+                    ..Submission::default()
+                });
+            }
+            // A damaged roundtrip may never be answered.
+            if mutations == 0 {
+                sends.last_mut().expect("a submission").then_await = message.roundtrip;
             }
         }
 
         // Rarely, break the framing itself.
         let framed = !rng.one_in(10);
         if !framed {
+            sends.iter_mut().for_each(|send| send.then_await = None);
             let index = rng.below(sends.len());
-            let bytes = &mut sends[index].0;
+            let bytes = &mut sends[index].bytes;
             let at = rng.below(bytes.len() + 1);
             match rng.below(3) {
                 0 => bytes.truncate(at),
@@ -1071,7 +1106,7 @@ fn check_guest_events(
 fn exchange(
     protocols: &Arc<Protocols>,
     config: Config,
-    sends: Vec<(Vec<u8>, Vec<OwnedFd>)>,
+    sends: Vec<Submission>,
     framed: bool,
     callback: u32,
     host_destroys: Option<&'static str>,
@@ -1091,10 +1126,11 @@ fn exchange(
         let protocols = Arc::clone(protocols);
         std::thread::spawn(move || compositor(host, &protocols, host_destroys))
     };
+    let (callbacks_done, done_callbacks) = std::sync::mpsc::channel();
     let writer = {
         let guest = guest.try_clone().expect("clone the guest socket");
         std::thread::spawn(move || {
-            send_all(&guest, sends);
+            send_all(&guest, sends, &done_callbacks);
             // A broken stream may hold a partial message that the closing
             // sync completes; end it rather than wait for an answer.
             if !framed {
@@ -1103,7 +1139,7 @@ fn exchange(
         })
     };
 
-    let events = read_until_closed(&guest, callback, deadline)?;
+    let events = read_until_closed(&guest, callback, deadline, callbacks_done)?;
     writer.join().expect("the guest writer");
     proxy_finished
         .recv_timeout(EXIT_GRACE)
@@ -1168,9 +1204,16 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
     });
 }
 
-/// Send each submission with its descriptors, until the proxy goes away.
-fn send_all(socket: &UnixStream, sends: Vec<(Vec<u8>, Vec<OwnedFd>)>) {
-    for (bytes, fds) in sends {
+/// Send each submission with its descriptors, waiting after a roundtrip
+/// for its callback among the `done_callbacks` the guest receives, until
+/// the proxy goes away.
+fn send_all(socket: &UnixStream, sends: Vec<Submission>, done_callbacks: &Receiver<u32>) {
+    for Submission {
+        bytes,
+        fds,
+        then_await,
+    } in sends
+    {
         let raw: Vec<RawFd> = fds.iter().map(AsRawFd::as_raw_fd).collect();
         let rights = [ControlMessage::ScmRights(&raw)];
         let cmsgs: &[ControlMessage] = if raw.is_empty() { &[] } else { &rights };
@@ -1190,6 +1233,10 @@ fn send_all(socket: &UnixStream, sends: Vec<(Vec<u8>, Vec<OwnedFd>)>) {
                 Err(_) => return,
             }
         }
+        // The reader hangs up once the proxy has closed the connection.
+        if then_await.is_some_and(|awaited| !done_callbacks.iter().any(|done| done == awaited)) {
+            return;
+        }
     }
 }
 
@@ -1197,9 +1244,17 @@ fn send_all(socket: &UnixStream, sends: Vec<(Vec<u8>, Vec<OwnedFd>)>) {
 /// `None` once `deadline` passes.
 ///
 /// The guest stops sending once the closing sync (`callback`) is answered
-/// or an error arrives, as a client would.
-fn read_until_closed(guest: &UnixStream, callback: u32, deadline: Instant) -> Option<Vec<u8>> {
+/// or an error arrives, as a client would. The sender of each event with
+/// `wl_callback.done`'s opcode goes to `done_callbacks`, for the writer to
+/// find the callback of a roundtrip among them; no other object has its ID.
+fn read_until_closed(
+    guest: &UnixStream,
+    callback: u32,
+    deadline: Instant,
+    done_callbacks: Sender<u32>,
+) -> Option<Vec<u8>> {
     let mut events = Vec::new();
+    let mut parsed = 0;
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
         guest
@@ -1211,12 +1266,17 @@ fn read_until_closed(guest: &UnixStream, callback: u32, deadline: Instant) -> Op
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
             Err(error) => panic!("read guest events: {error}"),
         }
-        let finished = frames(&events).any(|(header, _)| {
-            matches!(
-                (header.sender_id, header.opcode),
-                (id, wl_callback::EVT_DONE) if id == callback
-            ) || (header.sender_id, header.opcode) == (WL_DISPLAY_ID, wl_display::EVT_ERROR)
-        });
+        let mut finished = false;
+        for (header, _) in frames(&events[parsed..]) {
+            parsed += header.len;
+            let event = (header.sender_id, header.opcode);
+            if header.opcode == wl_callback::EVT_DONE {
+                // The writer is gone once it has sent everything.
+                let _ = done_callbacks.send(header.sender_id);
+            }
+            finished |= event == (callback, wl_callback::EVT_DONE)
+                || event == (WL_DISPLAY_ID, wl_display::EVT_ERROR);
+        }
         if finished {
             let _ = guest.shutdown(Shutdown::Write);
         }
@@ -1259,8 +1319,17 @@ impl ServerIds {
 /// destroys a destroyed surface's frame callbacks (it never sends their
 /// `done`), gives the keyboard focus to each surface the proxy commits,
 /// with `host_destroys` destroys live objects of that interface on its own
-/// as it answers a sync ([`destroy_live_objects`]), and does nothing else,
-/// until the proxy closes the connection.
+/// as it answers a sync ([`destroy_live_objects`]), answers a text input's
+/// drain barrier late (see below), and does nothing else, until the proxy
+/// closes the connection.
+///
+/// The proxy deactivates a text input and then syncs, as a drain barrier
+/// that a later activation waits for. Like a slow host, the compositor
+/// holds the answer to that sync until it answers anything else, so a
+/// transaction the guest sends meanwhile reaches the proxy first and the
+/// proxy defers the field's activation. A guest that wants the activation
+/// at once first waits for a roundtrip, whose sync releases the held
+/// answer. Answers stay in order.
 ///
 /// Panics on what a real compositor would refuse: a header the wire cannot
 /// frame, a request from an object the host does not have (never created,
@@ -1280,6 +1349,9 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
     // commit were a click on its window.
     let mut focus = None;
     let mut serial = 0;
+    // Answers held back, and whether the last request was a deactivation.
+    let mut held = Vec::new();
+    let mut after_deactivate = false;
     let mut server_ids = ServerIds {
         next: SERVER_ID_START,
         free: Vec::new(),
@@ -1412,7 +1484,11 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             {
                 ended.push(named[0]);
             }
-            if (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC) {
+            let sync = (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC);
+            let hold = sync && after_deactivate;
+            after_deactivate = (interface.as_str(), opcode)
+                == ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE);
+            if sync {
                 if let Some(interface) = host_destroys {
                     reply.extend(destroy_live_objects(
                         interface,
@@ -1442,8 +1518,13 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
             }
             // A destroyed surface loses the focus without a `leave`.
             focus = focus.filter(|surface| objects.contains_key(surface));
-            // The proxy may already have closed the connection.
-            let _ = (&host).write_all(&reply.concat());
+            let release = !hold && !reply.is_empty();
+            held.append(&mut reply);
+            if release {
+                // The proxy may already have closed the connection.
+                let _ = (&host).write_all(&held.concat());
+                held.clear();
+            }
         }
         assert!(
             !matches!(
