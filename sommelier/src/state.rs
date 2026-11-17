@@ -318,6 +318,16 @@ pub(crate) struct HostAuraShell {
     pub(crate) version: u32,
 }
 
+/// The modifier and group state a host `wl_keyboard.modifiers` event
+/// carries, as XKB masks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyboardModifiers {
+    pub(crate) depressed: u32,
+    pub(crate) latched: u32,
+    pub(crate) locked: u32,
+    pub(crate) group: u32,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, ShmPool>,
@@ -423,9 +433,11 @@ pub struct Context {
     /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
     /// interior mutation, so a connection stays on its one thread.
     pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
-    /// Current modifier bitmask for each host keyboard (using accelerator.rs
-    /// conventions).
-    pub(crate) keyboard_modifiers: HashMap<HostId, u32>,
+    /// The modifiers each host keyboard last sent, kept until the keyboard
+    /// ends. Exo sends them only when they change, before `enter` rather
+    /// than after it, and not again with a new keymap, so focus changes and
+    /// keymaps must not reset them.
+    pub(crate) keyboard_modifiers: HashMap<HostId, KeyboardModifiers>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it

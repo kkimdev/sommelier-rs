@@ -594,6 +594,18 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
   `synthetic_ime_key_uses_the_host_compositor_time_domain`,
   `keysym_prefers_keyboard_with_current_surface_focus`.
+- **Host modifiers last as long as their keyboard.** Exo sends
+  `wl_keyboard.modifiers` only when they change, before `enter` rather than
+  after it, and none with a new keymap. The proxy therefore keeps each host
+  keyboard's last modifiers through focus changes and keymap reloads,
+  applies them to every keymap it compiles, including one that arrives
+  after them, and forgets them only when the keyboard ends. Otherwise a
+  chord pressed with a modifier held across a focus change or a layout
+  switch would be classified without it.
+  Tests: `modifiers_sent_before_enter_survive_it`,
+  `modifiers_survive_a_focus_change`,
+  `modifiers_carry_over_to_a_new_keymap`,
+  `modifiers_sent_before_the_keymap_apply_to_it`.
 - **Content hints come from the v3 XML.** Text-input-v3 `content_hint` bits
   are read from the vendored `text-input-unstable-v3.xml`, not the
   similarly named v1 enum. v3 bit `0x2` is `spellcheck` and maps to

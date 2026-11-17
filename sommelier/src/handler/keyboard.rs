@@ -37,6 +37,7 @@ use crate::protocols::wayland::wl_keyboard::{
 };
 use crate::state::{
     Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
+    KeyboardModifiers,
 };
 use crate::window_layout::WindowLayoutAction;
 use crate::wire::Action;
@@ -170,11 +171,6 @@ impl KeyboardHandler {
         ctx.key_generations.clear_keyboard(host_keyboard_id);
     }
 
-    fn retire_focus_scoped_keyboard_state(ctx: &mut Context, host_keyboard_id: HostId) {
-        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-        Self::reset_host_keyboard_modifiers(ctx, host_keyboard_id);
-    }
-
     fn invalidate_peek_key_press(ctx: &mut Context, host_keyboard_id: HostId, key: u32) {
         ctx.key_generations.invalidate_peek(host_keyboard_id, key);
     }
@@ -249,17 +245,52 @@ impl KeyboardHandler {
         if sym.raw() == xkb::keysyms::KEY_NoSymbol {
             return None;
         }
-        // No wl_keyboard.modifiers event yet means no modifier is held; see
-        // `on_modifiers`.
-        let modifiers = ctx
-            .keyboard_modifiers
-            .get(&host_keyboard_id)
-            .copied()
-            .unwrap_or(0);
         Some(crate::accelerator::Accelerator {
-            modifiers,
+            modifiers: Self::accelerator_modifiers(state),
             symbol: crate::accelerator::keysym_to_lower(sym.raw()),
         })
+    }
+
+    /// The modifiers `state` holds, as `accelerator.rs` masks: Control,
+    /// Alt, Shift and Super, depressed or latched.
+    ///
+    /// A locked modifier does not count, as in C sommelier: an accelerator
+    /// is a chord of held keys. Exo reports every active modifier as
+    /// depressed, locks included, because its `XkbTracker` updates the mask
+    /// with nothing latched or locked; Caps Lock and Num Lock are not among
+    /// the four, so with Exo a lock never changes a chord either way.
+    fn accelerator_modifiers(state: &xkb::State) -> u32 {
+        let components = xkb::STATE_MODS_DEPRESSED | xkb::STATE_MODS_LATCHED;
+        // Use the xkbcommon logical modifier name constants (e.g. MOD_NAME_ALT = "Mod1")
+        // rather than raw X11 modifier group strings. These are the stable canonical names
+        // that match across different keyboard layouts, matching C sommelier's use of
+        // XKB_MOD_NAME_ALT, XKB_MOD_NAME_LOGO, etc.
+        let mut modifiers = 0;
+        if state.mod_name_is_active(xkb::MOD_NAME_CTRL, components) {
+            modifiers |= crate::accelerator::CONTROL_MASK;
+        }
+        if state.mod_name_is_active(xkb::MOD_NAME_ALT, components) {
+            modifiers |= crate::accelerator::ALT_MASK;
+        }
+        if state.mod_name_is_active(xkb::MOD_NAME_SHIFT, components) {
+            modifiers |= crate::accelerator::SHIFT_MASK;
+        }
+        if state.mod_name_is_active(xkb::MOD_NAME_LOGO, components) {
+            modifiers |= crate::accelerator::SUPER_MASK;
+        }
+        modifiers
+    }
+
+    /// Apply the host's `modifiers` to an XKB state.
+    fn apply_modifiers(state: &mut xkb::State, modifiers: KeyboardModifiers) {
+        state.update_mask(
+            modifiers.depressed,
+            modifiers.latched,
+            modifiers.locked,
+            0,
+            0,
+            modifiers.group,
+        );
     }
 
     /// Decide who owns a key from its chord alone.
@@ -290,17 +321,9 @@ impl KeyboardHandler {
         class
     }
 
-    fn reset_host_keyboard_modifiers(ctx: &mut Context, host_keyboard_id: HostId) {
-        ctx.keyboard_modifiers.remove(&host_keyboard_id);
-        if let Some(state) = ctx.keyboard_xkb_states.get_mut(&host_keyboard_id) {
-            state.update_mask(0, 0, 0, 0, 0, 0);
-        }
-    }
-
     fn clear_host_keyboard_keymap(ctx: &mut Context, host_keyboard_id: HostId) {
         ctx.keyboard_keymaps.remove(&host_keyboard_id);
         ctx.keyboard_xkb_states.remove(&host_keyboard_id);
-        ctx.keyboard_modifiers.remove(&host_keyboard_id);
         ctx.keyboard_repeatable_keys.remove(&host_keyboard_id);
     }
 
@@ -531,9 +554,13 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                     ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
                     let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
                     let repeatable_keys = Self::repeatable_evdev_keycodes(&keymap);
-                    ctx.keyboard_xkb_states
-                        .insert(host_keyboard_id, xkb::State::new(&keymap));
-                    ctx.keyboard_modifiers.remove(&host_keyboard_id);
+                    let mut state = xkb::State::new(&keymap);
+                    // Exo sends only the keymap on a layout change, so the
+                    // modifiers held and locked before it still apply.
+                    if let Some(&modifiers) = ctx.keyboard_modifiers.get(&host_keyboard_id) {
+                        Self::apply_modifiers(&mut state, modifiers);
+                    }
+                    ctx.keyboard_xkb_states.insert(host_keyboard_id, state);
                     ctx.keyboard_keymaps.insert(host_keyboard_id, keymap);
                     ctx.keyboard_keysym_to_keycode
                         .insert(host_keyboard_id, keysym_map);
@@ -635,10 +662,9 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
         let focus_update = ctx.keyboard_focus.enter(host_keyboard_id, focus);
         for retired_keyboard in &focus_update.retired_keyboards {
-            Self::retire_focus_scoped_keyboard_state(ctx, *retired_keyboard);
+            Self::clear_host_keyboard_state(ctx, *retired_keyboard);
         }
         Self::initialize_host_keyboard_enter_state(ctx, host_keyboard_id, keys);
-        Self::reset_host_keyboard_modifiers(ctx, host_keyboard_id);
 
         if focus_update.seat_changes.is_empty() {
             // Another wl_keyboard resource can enter the seat's already
@@ -686,7 +712,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             return Action::Drop;
         }
         for retired_keyboard in &focus_update.retired_keyboards {
-            Self::retire_focus_scoped_keyboard_state(ctx, *retired_keyboard);
+            Self::clear_host_keyboard_state(ctx, *retired_keyboard);
         }
         crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
 
@@ -886,15 +912,8 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
 
     /// Track modifier state so on_key can resolve the correct keysym.
     ///
-    /// # Modifier policy: DEPRESSED | LATCHED only (no LOCKED)
-    /// We intentionally exclude `STATE_MODS_LOCKED` (Caps Lock, etc.) from the
-    /// accelerator modifier check. The C sommelier reference makes the same
-    /// choice: host accelerators are defined in terms of actively-pressed keys,
-    /// not persistent lock state. A `<Shift>` accelerator would not match when
-    /// Caps Lock is on but Shift is not held — this is consistent with how
-    /// ChromeOS accelerator keys are documented and tested.
-    /// If locked-modifier accelerators are ever needed, change `components` to
-    /// `xkb::STATE_MODS_EFFECTIVE` (which ORs depressed, latched, and locked).
+    /// The modifiers are kept even before the keyboard has a keymap: Exo
+    /// sends them only when they change, so none may follow the keymap.
     fn on_modifiers(
         &mut self,
         ctx: &mut Context,
@@ -909,41 +928,15 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             _serial, mods_depressed, mods_latched, mods_locked, group
         );
         let host_keyboard_id = HostId::from_event_sender(ctx);
+        let modifiers = KeyboardModifiers {
+            depressed: mods_depressed,
+            latched: mods_latched,
+            locked: mods_locked,
+            group,
+        };
+        ctx.keyboard_modifiers.insert(host_keyboard_id, modifiers);
         if let Some(state) = ctx.keyboard_xkb_states.get_mut(&host_keyboard_id) {
-            state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-
-            let mut modifiers = 0;
-            let components = xkb::STATE_MODS_DEPRESSED | xkb::STATE_MODS_LATCHED;
-            // Use the xkbcommon logical modifier name constants (e.g. MOD_NAME_ALT = "Mod1")
-            // rather than raw X11 modifier group strings. These are the stable canonical names
-            // that match across different keyboard layouts, matching C sommelier's use of
-            // XKB_MOD_NAME_ALT, XKB_MOD_NAME_LOGO, etc.
-            if state.mod_name_is_active(xkb::MOD_NAME_CTRL, components) {
-                modifiers |= crate::accelerator::CONTROL_MASK;
-            }
-            if state.mod_name_is_active(xkb::MOD_NAME_ALT, components) {
-                modifiers |= crate::accelerator::ALT_MASK;
-            }
-            if state.mod_name_is_active(xkb::MOD_NAME_SHIFT, components) {
-                modifiers |= crate::accelerator::SHIFT_MASK;
-            }
-            if state.mod_name_is_active(xkb::MOD_NAME_LOGO, components) {
-                modifiers |= crate::accelerator::SUPER_MASK;
-            }
-            ctx.keyboard_modifiers.insert(host_keyboard_id, modifiers);
-        } else {
-            ctx.keyboard_modifiers.remove(&host_keyboard_id);
-            // XKB state is not yet initialised (keymap not yet received). The
-            // Wayland spec permits modifiers to arrive before the keymap on
-            // reconnect. The modifier bitmask stays at 0 (no modifiers assumed)
-            // until the keymap arrives and on_modifiers is called again.
-            log::debug!(
-                "on_modifiers: XKB state not yet initialised (keymap not received); \
-                 modifier event ignored (depressed={:#x}, latched={:#x}, locked={:#x})",
-                mods_depressed,
-                mods_latched,
-                mods_locked
-            );
+            Self::apply_modifiers(state, modifiers);
         }
         Action::Forward
     }
@@ -964,8 +957,10 @@ pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_ke
     //   cause its release event to be silently swallowed on the new keyboard.
     // modifiers: if the new keyboard receives a key event before the first
     //   wl_keyboard.modifiers, the accelerator check would use stale modifier
-    //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
+    //   bits and could produce wrong NOT_HANDLED/HANDLED decisions. Only the
+    //   keyboard's end clears them; see `Context::keyboard_modifiers`.
     KeyboardHandler::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+    ctx.keyboard_modifiers.remove(&host_keyboard_id);
     if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
         ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
         ctx.client_to_host_queue
@@ -1208,6 +1203,23 @@ mod tests {
         keymap
     }
 
+    /// Send keyboard `ctx.last_sender_id` a `wl_keyboard.modifiers` event
+    /// that holds the named XKB modifiers of `keymap`.
+    fn hold_modifiers(
+        handler: &mut KeyboardHandler,
+        ctx: &mut Context,
+        keymap: &xkb::Keymap,
+        names: &[&str],
+    ) {
+        let depressed = names
+            .iter()
+            .fold(0, |mask, name| mask | 1 << keymap.mod_get_index(name));
+        assert_eq!(
+            handler.on_modifiers(ctx, 1, depressed, 0, 0, 0),
+            Action::Forward
+        );
+    }
+
     /// Find the evdev keycode for a given keysym in the keymap.
     ///
     /// Returns `None` if the keysym is not present. Call sites should use
@@ -1326,8 +1338,7 @@ mod tests {
         ));
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
-        ctx.keyboard_modifiers
-            .insert(HostId(5), crate::accelerator::ALT_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
 
         let expected = [
             (xkb::keysyms::KEY_q, WindowLayoutAction::TopLeft),
@@ -1359,14 +1370,16 @@ mod tests {
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
-        ctx.keyboard_modifiers.insert(HostId(5), 0);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[]);
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(5), key),
             KeyClass::Guest
         );
-        ctx.keyboard_modifiers.insert(
-            HostId(5),
-            crate::accelerator::ALT_MASK | crate::accelerator::SHIFT_MASK,
+        hold_modifiers(
+            &mut handler,
+            &mut ctx,
+            &keymap,
+            &[xkb::MOD_NAME_ALT, xkb::MOD_NAME_SHIFT],
         );
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(5), key),
@@ -1384,8 +1397,7 @@ mod tests {
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
 
-        ctx.keyboard_modifiers
-            .insert(HostId(5), crate::accelerator::CONTROL_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_CTRL]);
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(5), key),
             KeyClass::Placement(WindowLayoutAction::TopLeft)
@@ -1404,8 +1416,7 @@ mod tests {
         ctx.last_sender_id = 5;
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        ctx.keyboard_modifiers
-            .insert(HostId(5), crate::accelerator::ALT_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
 
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(5), key),
@@ -1433,8 +1444,7 @@ mod tests {
         let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
         let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
         let z = find_keycode(&keymap, xkb::keysyms::KEY_z).expect("KEY_z not found");
-        ctx.keyboard_modifiers
-            .insert(HostId(5), crate::accelerator::CONTROL_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_CTRL]);
 
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(5), a),
@@ -1510,8 +1520,7 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        ctx.keyboard_modifiers
-            .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
         assert_eq!(
             KeyboardHandler::classify_key(&ctx, HostId(host_keyboard), key),
             KeyClass::Placement(WindowLayoutAction::TopLeft)
@@ -1616,8 +1625,7 @@ mod tests {
         let mut handler = KeyboardHandler::new();
         let keymap = load_test_keymap(&mut handler, &mut ctx);
         let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        ctx.keyboard_modifiers
-            .insert(HostId(host_keyboard), crate::accelerator::ALT_MASK);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
         (handler, ctx, key)
     }
 
@@ -2168,10 +2176,15 @@ mod tests {
         // swallow the first press after focus returns.
         assert_eq!(handler.on_leave(&mut ctx, 3, 22), Action::Forward);
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
-        assert_eq!(handler.on_enter(&mut ctx, 4, 22, &[]), Action::Forward);
+        // Exo sends the released Alt before the enter.
+        assert_eq!(
+            handler.on_modifiers(&mut ctx, 4, 0, 0, 0, 0),
+            Action::Forward
+        );
+        assert_eq!(handler.on_enter(&mut ctx, 5, 22, &[]), Action::Forward);
 
         assert_eq!(
-            handler.on_key(&mut ctx, 5, 300, key, KEY_STATE_PRESSED),
+            handler.on_key(&mut ctx, 6, 300, key, KEY_STATE_PRESSED),
             Action::Forward,
             "a plain press after focus returns is ordinary guest input"
         );
@@ -2180,7 +2193,7 @@ mod tests {
             Some(GuestKeyOwner::Physical)
         );
         assert_eq!(
-            handler.on_key(&mut ctx, 6, 301, key, KEY_STATE_RELEASED),
+            handler.on_key(&mut ctx, 7, 301, key, KEY_STATE_RELEASED),
             Action::Forward
         );
         assert_eq!(ctx.guest_key_owner(keyboard, key), None);
@@ -2980,7 +2993,11 @@ mod tests {
         );
         assert!(!ctx.keyboard_keymaps.contains_key(&HostId(5)));
         assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_modifiers.contains_key(&HostId(5)));
+        assert_eq!(
+            ctx.keyboard_modifiers[&HostId(5)].depressed,
+            ctrl_mask,
+            "the host's modifiers outlive its keymap"
+        );
         assert!(!ctx
             .key_generations
             .host_accelerator_suppressed(HostId(5), 30));
@@ -4660,7 +4677,6 @@ mod tests {
             .peek(HostId(5), EVDEV_KEY_BACKSPACE)
             .is_none());
         assert!(!ctx.keyboard_repeatable_keys.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_modifiers.contains_key(&HostId(5)));
         assert!(ctx
             .guest_key_owner(HostId(5), EVDEV_KEY_BACKSPACE)
             .is_none());
@@ -4879,21 +4895,13 @@ mod tests {
             "accelerator suppression must be cleared on keymap reload"
         );
 
-        // A keymap replaces the XKB state, so stale modifiers from the previous
-        // keymap must not be reused before the compositor sends new modifiers.
+        // Exo sends no modifiers with a new keymap, so the Control held
+        // before it still forms the chord.
         let action = handler.on_key(&mut ctx, 2, 0, wl_key_a, KEY_STATE_PRESSED);
         assert_eq!(
             action,
-            Action::Forward,
-            "keymap reload must clear stale modifier state"
-        );
-
-        handler.on_modifiers(&mut ctx, 0, ctrl_mask, 0, 0, 0);
-        let action = handler.on_key(&mut ctx, 3, 0, wl_key_a, KEY_STATE_PRESSED);
-        assert_eq!(
-            action,
             Action::Drop,
-            "accelerator must work after fresh modifiers arrive"
+            "the held Control survives the keymap reload"
         );
     }
 
@@ -4944,13 +4952,15 @@ mod tests {
         ctx.shadow_table
             .insert_paired_for_test(5, 10, "wl_keyboard"); // guest 5 <-> host 10
 
-        // Inject a modifier state directly (no XKB state needed for this test).
-        ctx.keyboard_modifiers
-            .insert(HostId(10), crate::accelerator::CONTROL_MASK);
-        assert_ne!(
-            ctx.keyboard_modifiers[&HostId(10)],
-            0,
-            "precondition: modifiers are non-zero"
+        // The host's modifiers need no XKB state to be kept.
+        ctx.last_sender_id = 10;
+        assert_eq!(
+            handler.on_modifiers(&mut ctx, 1, 4, 0, 0, 0),
+            Action::Forward
+        );
+        assert!(
+            ctx.keyboard_modifiers.contains_key(&HostId(10)),
+            "precondition: modifiers are kept without a keymap"
         );
 
         // Release the keyboard (client->host request: last_sender_id = guest ID).
@@ -5478,7 +5488,11 @@ mod tests {
         assert!(ctx.claim_guest_key(HostId(10), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
         ctx.key_generations
             .suppress_host_accelerator(HostId(10), EVDEV_KEY_BACKSPACE);
-        ctx.keyboard_modifiers.insert(HostId(10), 0xdead_beef);
+        let held = KeyboardModifiers {
+            depressed: 0xdead_beef,
+            ..Default::default()
+        };
+        ctx.keyboard_modifiers.insert(HostId(10), held);
 
         // Entering a new surface is the transition that retires the older
         // keyboard generation. The later leave must already be a no-op.
@@ -5521,7 +5535,100 @@ mod tests {
         assert!(!ctx
             .key_generations
             .host_accelerator_suppressed(HostId(10), EVDEV_KEY_BACKSPACE));
-        assert!(!ctx.keyboard_modifiers.contains_key(&HostId(10)));
+        assert_eq!(
+            ctx.keyboard_modifiers.get(&HostId(10)),
+            Some(&held),
+            "Exo resends modifiers only when they change, so focus teardown keeps them"
+        );
+    }
+
+    /// The modifiers of the chord `key` forms on host keyboard 10.
+    fn chord_modifiers(ctx: &Context, key: u32) -> Option<u32> {
+        KeyboardHandler::current_chord(ctx, HostId(10), key).map(|chord| chord.modifiers)
+    }
+
+    // Exo's `Keyboard::SetFocus` sends the seat's modifiers before `enter`,
+    // and `WaylandKeyboardDelegate::OnKeyboardModifiers` sends them only
+    // when they differ from the last ones it sent that keyboard.
+    #[test]
+    fn modifiers_sent_before_enter_survive_it() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        ctx.shadow_table
+            .insert_paired_for_test(20, 30, "wl_surface");
+        ctx.last_sender_id = 10;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
+        assert_eq!(handler.on_enter(&mut ctx, 2, 30, &[]), Action::Forward);
+
+        assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
+    }
+
+    #[test]
+    fn modifiers_survive_a_focus_change() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        map_keyboard(&mut ctx, 5, 10, 50, 7);
+        ctx.shadow_table
+            .insert_paired_for_test(20, 30, "wl_surface");
+        ctx.shadow_table
+            .insert_paired_for_test(21, 31, "wl_surface");
+        ctx.last_sender_id = 10;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        assert_eq!(handler.on_enter(&mut ctx, 1, 30, &[]), Action::Forward);
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
+
+        // Alt stays held, so Exo sends no modifiers with the new focus.
+        assert_eq!(handler.on_leave(&mut ctx, 3, 30), Action::Forward);
+        assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
+        assert_eq!(handler.on_enter(&mut ctx, 4, 31, &[]), Action::Forward);
+        assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
+    }
+
+    // Exo's `Keyboard::OnKeyboardLayoutNameChanged` sends only the keymap.
+    #[test]
+    fn modifiers_carry_over_to_a_new_keymap() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.last_sender_id = 10;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+        let control = 1 << keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        // Exo reports an active Caps Lock as depressed, not locked.
+        let caps_lock = 1 << keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        assert_eq!(
+            handler.on_modifiers(&mut ctx, 1, control | caps_lock, 0, 0, 0),
+            Action::Forward
+        );
+
+        load_test_keymap(&mut handler, &mut ctx);
+
+        assert_eq!(
+            chord_modifiers(&ctx, q),
+            Some(crate::accelerator::CONTROL_MASK)
+        );
+        assert!(ctx.keyboard_xkb_states[&HostId(10)]
+            .mod_name_is_active(xkb::MOD_NAME_CAPS, xkb::STATE_MODS_DEPRESSED));
+    }
+
+    #[test]
+    fn modifiers_sent_before_the_keymap_apply_to_it() {
+        let mut handler = KeyboardHandler::new();
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        // Another keyboard's keymap names the modifier and key indices.
+        ctx.last_sender_id = 11;
+        let keymap = load_test_keymap(&mut handler, &mut ctx);
+        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
+
+        ctx.last_sender_id = 10;
+        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
+        load_test_keymap(&mut handler, &mut ctx);
+
+        assert_eq!(chord_modifiers(&ctx, q), Some(crate::accelerator::ALT_MASK));
     }
 
     #[test]
