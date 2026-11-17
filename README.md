@@ -62,6 +62,13 @@ printf '%s\n' "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}"
 `virtio_wl` is not part of the mainline Linux kernel, so ordinary
 distribution kernels generally cannot use this mode.
 
+The prebuilt binary links against libgbm and libxkbcommon and needs glibc
+2.34 or newer. On Debian-compatible guests:
+
+```bash
+sudo apt-get install --yes libgbm1 libxkbcommon0
+```
+
 ### Download the current prerelease
 
 For x86_64:
@@ -161,18 +168,19 @@ From the repository root:
 
 ```bash
 # Build
-cargo build --release
+cargo build --locked --release -p sommelier
 
 # Test
-cargo test --workspace --all-targets -- --test-threads=1
-
-# Verify formatting and lints
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets -- --test-threads=1
 
 # Run the proxy from the local build
 ./target/release/sommelier --virtio-wl /dev/wl0 --gpu-accel wayland-2
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md#before-you-open-a-pull-request) lists the
+full set of checks CI runs, and
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the Rust toolchain;
+rustup installs it on first use.
 
 The standalone IME GUI is useful for manual input and glyph verification:
 
@@ -183,14 +191,15 @@ WAYLAND_DISPLAY=wayland-2 cargo run -p sommelier-test-gui
 If the system font is not sufficient for Korean text, set
 `SOMMELIER_TEST_GUI_FONT` to a font file with Korean/CJK coverage.
 
-For a repeatable runtime check, build both binaries and run the ignored GUI
-smoke test. It starts a temporary `sommelier --gpu-accel` socket, launches the
-sample GUI with `--auto-exit`, and verifies the connection, text-input/keymap
-handshake, clean exit, and selected buffer transport:
+For a repeatable runtime check, build the sample GUI and run the ignored GUI
+smoke test. It starts the proxy that Cargo built for the test on a temporary
+`--gpu-accel` socket, launches the newest local build of the sample GUI with
+`--auto-exit`, and verifies the connection, text-input/keymap handshake,
+clean exit, and selected buffer transport:
 
 ```bash
-cargo build --release -p sommelier -p sommelier-test-gui
-cargo test -p sommelier --test gui_smoke -- --ignored --nocapture
+cargo build --release -p sommelier-test-gui
+cargo test --release -p sommelier --test gui_smoke -- --ignored --nocapture
 ```
 
 The test accepts the validated SHM fallback when the current kernel reports
@@ -236,13 +245,11 @@ explains the ARC application-ID workaround it relies on.
 
 ## CI and release workflow
 
-The `virtwl` branch CI builds x86_64 and aarch64, runs executable tests on
-x86_64, compiles all test targets for aarch64, and checks formatting and
-Clippy. Successful pushes also upload debug binaries to
-the Actions run and create non-release tags such as
-`virtwl-ci-<run-id>-<attempt>-<sha>`. Those artifacts expire after seven days;
-the cleanup job keeps the ten newest CI build runs by default. Set the
-repository variable `CI_KEEP_COUNT` to change that limit.
+The `virtwl` branch CI builds, tests, and checks formatting and Clippy on
+x86_64 and aarch64, each on a native GitHub-hosted Ubuntu 24.04 runner, with
+the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+Successful pushes also upload the debug `sommelier` binaries to the Actions
+run, where they expire after seven days.
 
 Maintainer releases use tags whose base version matches
 `sommelier/Cargo.toml`. Optional `-rN` suffixes are accepted for rebuilds:
@@ -253,11 +260,12 @@ git tag -a virtwl-v0.2.6 personal/virtwl -m "Release virtwl-v0.2.6"
 git push personal refs/tags/virtwl-v0.2.6
 ```
 
-The release workflow builds both architectures on GitHub-hosted Ubuntu
-24.04 runners, runs the x86_64 regression suite, creates `SHA256SUMS`, and
-uploads all assets while the release is a draft. It publishes the
-prerelease only after both architecture builds succeed.
-The fork currently keeps `virtwl` as its only development branch.
+The release workflow builds both architectures on the same native runners
+and runs the regression suite on each. It then runs each binary it will
+upload with `--version` and rejects one that needs a newer glibc than the
+current baseline. Once both architectures pass, it creates `SHA256SUMS` and
+publishes the prerelease with all assets; `gh release create` keeps the
+release a draft until every upload has finished.
 
 ## Repository layout
 
@@ -267,6 +275,8 @@ The fork currently keeps `virtwl` as its only development branch.
 - `sommelier_test_app/` — standalone GUI/IME test client.
 - `third_party/protocols/` — vendored Wayland and ChromeOS protocol XML.
 - `packaging/systemd/` — user service template for VirtWL instances.
+- `docs/` — [design](docs/DESIGN.md) and the binding
+  [runtime invariants](docs/INVARIANTS.md).
 - `sommelier/docs/` — focused protocol and keyboard design notes.
 
 ## Scope and limitations

@@ -15,220 +15,57 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-24.04
+    name: Build and test ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        # Each architecture builds and runs its tests natively.
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/setup
 
-      - name: Install x86_64 dependencies
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            libdrm-dev \
-            libexpat1-dev \
-            libgbm-dev \
-            libxkbcommon-dev \
-            pkg-config
-
-      - name: Install aarch64 dependencies
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo sed -i 's/Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
-          Types: deb
-          Architectures: arm64
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-security        
-          Components: main universe restricted multiverse
-          EOF
-          sudo apt-get update
-          sudo apt-get install --yes \
-            gcc-aarch64-linux-gnu \
-            libdrm-dev:arm64 \
-            libexpat1-dev:arm64 \
-            libgbm-dev:arm64 \
-            libxkbcommon-dev:arm64 \
-            pkg-config
-
-      - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '1' || '0' }}
-          PKG_CONFIG_LIBDIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' || '/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' }}
-        run: cargo build --verbose --target "${{ matrix.target }}"
-
-      - name: Run tests (x86_64 only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --all-targets --verbose --target "${{ matrix.target }}" -- --test-threads=1
-
-      - name: Compile tests (aarch64 only)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: '1'
-          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
-        run: cargo test --workspace --all-targets --no-run --verbose --target "${{ matrix.target }}"
-
-      - name: Check formatting (x86_64 only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check lints (x86_64 only)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+      - name: Build
+        run: cargo build --locked --workspace --verbose
+
+      - name: Check lints
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets --verbose -- --test-threads=1
 
       - name: Prepare CI artifact
         if: github.event_name == 'push'
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
         run: |
           mkdir -p ci-artifact
-          install -Dm755 \
-            "target/${TARGET}/debug/sommelier" \
-            "ci-artifact/sommelier-${TARGET}"
+          install -Dm755 target/debug/sommelier "ci-artifact/sommelier-${ARCH}"
           {
             printf 'commit=%s\n' "${GITHUB_SHA}"
             printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
             printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
-            printf 'target=%s\n' "${TARGET}"
+            printf 'arch=%s\n' "${ARCH}"
           } > ci-artifact/BUILD-INFO
 
       - name: Upload CI artifact
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: virtwl-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.target }}
+          name: sommelier-debug-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
           path: ci-artifact
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-
-  tag-ci-build:
-    name: Tag successful CI build
-    needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/virtwl'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-
-      - name: Create non-release CI tag
-        shell: bash
-        run: |
-          short_sha="${GITHUB_SHA:0:12}"
-          ci_tag="virtwl-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${short_sha}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate "${ci_tag}" "${GITHUB_SHA}" \
-            --message "Successful Virtwl CI build ${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
-          git push origin "refs/tags/${ci_tag}"
-
-  cleanup-ci-builds:
-    name: Retain recent CI builds
-    needs: tag-ci-build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/virtwl' && needs.tag-ci-build.result == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      actions: write
-      contents: write
-    env:
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ github.token }}
-      KEEP_COUNT: ${{ vars.CI_KEEP_COUNT || 10 }}
-
-    steps:
-      - name: Validate retention count
-        shell: bash
-        run: |
-          if ! [[ "${KEEP_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::CI_KEEP_COUNT must be a positive integer"
-            exit 1
-          fi
-
-      - name: Delete CI artifacts beyond retention count
-        shell: bash
-        run: |
-          mapfile -t artifact_rows < <(
-            gh api --paginate \
-              "repos/${GH_REPO}/actions/artifacts?per_page=100" \
-              --jq '.artifacts[]
-                | select(.name | startswith("virtwl-ci-"))
-                | [.created_at, (.id | tostring), .name]
-                | @tsv' |
-            sort -r
-          )
-
-          declare -A kept_runs=()
-          for row in "${artifact_rows[@]}"; do
-            IFS=$'\t' read -r _created_at artifact_id artifact_name <<< "${row}"
-            if [[ ! "${artifact_name}" =~ ^virtwl-ci-([0-9]+)-([0-9]+)- ]]; then
-              echo "Skipping artifact with unexpected name: ${artifact_name}"
-              continue
-            fi
-
-            run_key="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
-            if [[ -n "${kept_runs[${run_key}]+x}" ]]; then
-              continue
-            fi
-            if (( ${#kept_runs[@]} < KEEP_COUNT )); then
-              kept_runs["${run_key}"]=1
-              continue
-            fi
-
-            echo "Deleting old CI artifact ${artifact_id} (${artifact_name})"
-            gh api --method DELETE \
-              "repos/${GH_REPO}/actions/artifacts/${artifact_id}"
-          done
-
-      - name: Delete CI tags beyond retention count
-        shell: bash
-        run: |
-          mapfile -t ci_tags < <(
-            gh api --paginate \
-              "repos/${GH_REPO}/git/matching-refs/tags/virtwl-ci-" \
-              --jq '.[].ref | sub("^refs/tags/"; "")' |
-            while IFS= read -r tag; do
-              if [[ "${tag}" =~ ^virtwl-ci-([0-9]+)-([0-9]+)- ]]; then
-                printf '%s\t%s\t%s\n' \
-                  "${BASH_REMATCH[1]}" \
-                  "${BASH_REMATCH[2]}" \
-                  "${tag}"
-              fi
-            done |
-            sort -k1,1nr -k2,2nr |
-            cut -f3-
-          )
-
-          kept_tags=0
-          for tag in "${ci_tags[@]}"; do
-            if (( kept_tags < KEEP_COUNT )); then
-              kept_tags=$((kept_tags + 1))
-              continue
-            fi
-
-            echo "Deleting old CI tag ${tag}"
-            gh api --method DELETE \
-              "repos/${GH_REPO}/git/refs/tags/${tag}"
-          done

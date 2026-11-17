@@ -15,7 +15,10 @@ use std::process::Command;
 fn sample_gui_runs_through_gpu_accel_proxy() {
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/sommelier-gui-smoke.sh");
+    // Test the proxy Cargo built for this test run, not whichever build the
+    // script would find under target/.
     let status = Command::new(&script)
+        .env("SOMMELIER_BIN", env!("CARGO_BIN_EXE_sommelier"))
         .env("SOMMELIER_GUI_SMOKE_KEEP_LOGS", "1")
         .status()
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", script.display()));

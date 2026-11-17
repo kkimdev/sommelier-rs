@@ -1,12 +1,17 @@
 [Unit]
 Description=sommelier-rs virtwl proxy for %i
-Documentation=https://github.com/google/sommelier-rs
+Documentation=https://github.com/kkimdev/sommelier-rs/blob/virtwl/README.md
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/sommelier-rs --virtio-wl /dev/wl0 --gpu-accel %i
-Restart=on-failure
+# The proxy is the display for every Wayland app in the container, so any
+# exit is an outage. Restart even after a "clean" exit: on-failure would not
+# restart after SIGHUP or SIGTERM, which systemd counts as success.
+# `systemctl --user stop` still stops the service.
+Restart=always
 RestartSec=5s
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target

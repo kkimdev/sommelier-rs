@@ -1,10 +1,11 @@
 name: Virtwl Release
 
+# A release is cut by pushing a tag; see "CI and release workflow" in the
+# README.
 on:
   push:
     tags:
       - "virtwl-v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,63 +16,37 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Released binaries need at most this glibc symbol version today, so they
+  # run on Debian bookworm (2.36), the Crostini container base. A build that
+  # needs a newer one fails here; raising this is a compatibility decision
+  # that also changes the README's install prerequisites.
+  MAX_GLIBC_VERSION: "2.34"
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        # Native builds on the same Ubuntu release as CI, so each binary is
+        # tested on its own architecture and links the same glibc baseline.
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install x86_64 dependencies
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            libdrm-dev \
-            libexpat1-dev \
-            libgbm-dev \
-            libxkbcommon-dev \
-            pkg-config
-
-      - name: Install aarch64 dependencies
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo sed -i 's/Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
-          Types: deb
-          Architectures: arm64
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-security
-          Components: main universe restricted multiverse
-          EOF
-          sudo apt-get update
-          sudo apt-get install --yes \
-            gcc-aarch64-linux-gnu \
-            libdrm-dev:arm64 \
-            libexpat1-dev:arm64 \
-            libgbm-dev:arm64 \
-            libxkbcommon-dev:arm64 \
-            pkg-config
+      - uses: ./.github/actions/setup
 
       - name: Verify tag matches Cargo.toml
         shell: bash
         run: |
-          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "sommelier") | .version')"
           tag_version="${GITHUB_REF_NAME#virtwl-v}"
           base_tag_version="${tag_version%%-*}"
@@ -82,40 +57,49 @@ jobs:
             echo "::error::Cargo.toml version does not match the release tag"
             exit 1
           }
+          echo "CARGO_VERSION=${cargo_version}" >> "${GITHUB_ENV}"
+
+      - name: Run regression tests
+        run: cargo test --locked --workspace --all-targets -- --test-threads=1
 
       - name: Build release binary
-        shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '1' || '0' }}
-          PKG_CONFIG_LIBDIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' || '/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' }}
-        run: cargo build --release --verbose --target "${{ matrix.target }}"
-
-      - name: Run x86_64 regression tests
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --all-targets -- --test-threads=1
+        run: cargo build --locked --release --package sommelier --verbose
 
       - name: Prepare release artifact
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          case "${TARGET}" in
-            x86_64-unknown-linux-gnu) short_arch=x86_64 ;;
-            aarch64-unknown-linux-gnu) short_arch=aarch64 ;;
-            *) echo "::error::Unsupported target ${TARGET}"; exit 1 ;;
-          esac
+          artifact="dist/sommelier_rs_${GITHUB_REF_NAME}-${ARCH}"
+          install -Dm755 target/release/sommelier "${artifact}"
+          echo "ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
 
-          version="${RELEASE_TAG#virtwl-}"
-          artifact="sommelier_rs_virtwl-${version}-${short_arch}"
-          install -Dm755 "target/${TARGET}/release/sommelier" "${artifact}"
+      - name: Smoke-test the release artifact
+        shell: bash
+        run: |
+          # Run the exact file that will be uploaded. --version exits before
+          # the proxy opens any device or socket.
+          reported="$("./${ARTIFACT}" --version)"
+          echo "${reported}"
+          test "${reported}" = "sommelier ${CARGO_VERSION}" || {
+            echo "::error::${ARTIFACT} reported '${reported}'"
+            exit 1
+          }
+
+          needed_glibc="$(objdump -T "${ARTIFACT}" \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)"
+          echo "Highest glibc symbol version: ${needed_glibc}"
+          newest="$(printf '%s\n' "${needed_glibc}" "${MAX_GLIBC_VERSION}" | sort -V | tail -n 1)"
+          test "${newest}" = "${MAX_GLIBC_VERSION}" || {
+            echo "::error::${ARTIFACT} needs glibc ${needed_glibc}, above ${MAX_GLIBC_VERSION}"
+            exit 1
+          }
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: virtwl-${{ matrix.target }}
-          path: sommelier_rs_virtwl-*
+          name: virtwl-${{ matrix.arch }}
+          path: ${{ env.ARTIFACT }}
           if-no-files-found: error
           retention-days: 7
 
@@ -128,7 +112,7 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: virtwl-*
           path: dist
@@ -138,31 +122,18 @@ jobs:
         working-directory: dist
         run: sha256sum sommelier_rs_virtwl-* > SHA256SUMS
 
-      - name: Create draft release and upload assets
-        uses: softprops/action-gh-release@v2.6.1
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          draft: true
-          prerelease: true
-          generate_release_notes: true
-
-      - name: Publish release
-        shell: bash
+      - name: Publish the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        # With assets, gh creates the release as a draft, uploads every file,
+        # and only then publishes it (or deletes the draft if an upload
+        # fails), so a published release never lacks an asset. A job killed
+        # mid-upload cannot clean up and leaves an orphan draft; delete it
+        # before rerunning.
         run: |
-          release_id="$(
-            gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"${TAG_NAME}\") | .id"
-          )"
-          test -n "${release_id}" || {
-            echo "::error::Draft release for ${TAG_NAME} was not found"
-            exit 1
-          }
-          gh api --method PATCH \
-            "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-            -f draft=false
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

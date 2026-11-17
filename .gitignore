@@ -1,3 +1,6 @@
 /target
 .worktrees
 .venv
+# Transient files and directories are never committed.
+*.local.*
+/_local/
