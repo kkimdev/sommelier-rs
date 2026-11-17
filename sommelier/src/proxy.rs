@@ -829,6 +829,124 @@ mod tests {
             .expect("the proxy loop must end when its peers close");
     }
 
+    /// A proxy whose peers are open sockets, with `wl_display` registered as
+    /// `Client::run` registers it.
+    fn client_with_socket_peers() -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (guest_peer, client_socket) =
+            UnixStream::pair().expect("guest unix socket pair should be created");
+        let (host_peer, host_socket) =
+            UnixStream::pair().expect("host unix socket pair should be created");
+        let mut client = Client::new(
+            WaylandConnection::new(client_socket.into_raw_fd()),
+            WaylandConnection::new(host_socket.into_raw_fd()),
+            Context::new_for_test(false, false, Vec::new()),
+        );
+        client.ctx.shadow_table.map_id(1, 1);
+        client
+            .ctx
+            .shadow_table
+            .track_interface(1, "wl_display".to_string());
+        (client, guest_peer, host_peer)
+    }
+
+    /// The guest sends `wl_display.sync(callback)`; return the host ID the
+    /// proxy allocated for the callback.
+    async fn guest_sync(client: &mut Client, callback: u32) -> u32 {
+        let mut sync = MessageBuilder::new();
+        sync.write_u32(callback);
+        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        client.client_conn.read_buf.extend_from_slice(&sync);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        client
+            .ctx
+            .shadow_table
+            .get_host_id(callback)
+            .expect("the callback is mapped to a host object")
+    }
+
+    /// The host delivers `events` to the proxy.
+    async fn host_events(client: &mut Client, events: &[Vec<u8>]) {
+        for event in events {
+            client.host_conn.read_buf.extend_from_slice(event);
+        }
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.host_conn.read_buf.is_empty());
+    }
+
+    fn callback_done(host_callback: u32) -> Vec<u8> {
+        let mut done = MessageBuilder::new();
+        done.write_u32(0);
+        done.build_message(host_callback, protocols::wayland::wl_callback::EVT_DONE)
+    }
+
+    /// Discard what the proxy forwarded to `peer`, so a long exchange does
+    /// not fill the socket buffer.
+    fn drain(peer: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        peer.set_nonblocking(true).expect("non-blocking peer");
+        let mut sink = [0u8; 4096];
+        loop {
+            match peer.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("drain peer: {error}"),
+            }
+        }
+    }
+
+    fn delete_id(host_id: u32) -> Vec<u8> {
+        let mut delete_id = MessageBuilder::new();
+        delete_id.write_u32(host_id);
+        delete_id.build_message(1, protocols::wayland::wl_display::EVT_DELETE_ID)
+    }
+
+    /// libwayland-server rejects client object IDs past its map limit, so a
+    /// host ID that grew with every object ever created would end the
+    /// session after enough frame callbacks.
+    #[tokio::test]
+    async fn host_ids_are_recycled_through_delete_id() {
+        const GUEST_CALLBACK: u32 = 3;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+
+        let first = guest_sync(&mut client, GUEST_CALLBACK).await;
+        host_events(&mut client, &[callback_done(first), delete_id(first)]).await;
+        for _ in 0..1000 {
+            let host_callback = guest_sync(&mut client, GUEST_CALLBACK).await;
+            assert_eq!(host_callback, first, "a deleted host ID must be reused");
+            host_events(
+                &mut client,
+                &[callback_done(host_callback), delete_id(host_callback)],
+            )
+            .await;
+            drain(&mut guest_peer);
+            drain(&mut host_peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn host_ids_are_not_reused_before_delete_id() {
+        let (mut client, _guest_peer, _host_peer) = client_with_socket_peers();
+
+        // `done` destroys the callback on both sides and sends the guest its
+        // delete_id, so the guest may reuse its ID at once; the host ID must
+        // wait for the host's own delete_id.
+        let first = guest_sync(&mut client, 3).await;
+        host_events(&mut client, &[callback_done(first)]).await;
+        let second = guest_sync(&mut client, 3).await;
+        assert_ne!(second, first);
+
+        host_events(&mut client, &[delete_id(first)]).await;
+        assert_eq!(guest_sync(&mut client, 4).await, first);
+    }
+
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
         use std::os::fd::IntoRawFd;
