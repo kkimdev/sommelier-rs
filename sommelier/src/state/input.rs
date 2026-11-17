@@ -374,9 +374,9 @@ impl TextInputState {
 
     /// Apply the pending state, as the v3 commit just counted by
     /// [`Self::count_guest_commit`] does, except an enable that
-    /// `enable_conflict` rejects because another text input on the seat is
-    /// enabled. Returns the cursor rectangle it states, which only the host
-    /// keeps, and whether it started a new field.
+    /// `enable_conflict` rejects because another text input on the
+    /// connection is enabled. Returns the cursor rectangle it states, which
+    /// only the host keeps, and whether it started a new field.
     pub(crate) fn commit(&mut self, enable_conflict: bool) -> V3Commit {
         let V3Pending {
             enabled,

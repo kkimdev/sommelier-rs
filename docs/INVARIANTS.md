@@ -626,6 +626,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_content_type_waits_for_the_host_to_attach`, and the fuzzer's end
   state against its model of Exo (`guest_streams_cannot_crash_hang_or_leak`;
   see [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
+- **One text input on a connection is enabled at a time.** Exo has one
+  seat, and its `Activate` gives the input method to the text input that
+  activated last without telling the one it replaced. That one keeps its
+  activation but gets no input, and `Activate` on the same surface does
+  nothing, so it would stay deaf until deactivated. A text-input-v3 enable
+  while another text input on the connection is enabled, for any guest
+  `wl_seat`, is therefore ignored: the commit counts, closes the
+  composition and changes nothing else.
+  Test: `second_text_input_enable_on_the_connection_is_ignored`.
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A

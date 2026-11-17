@@ -1871,12 +1871,16 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
             return Action::Drop;
         }
         let state = &ctx.text_inputs[&guest_id];
+        // Exo has one seat and gives its input method to the text input
+        // that activated last, without telling the one it replaced, which
+        // then gets no input until it is deactivated and activated again.
+        // So one text input on the connection is enabled at a time, whatever
+        // guest seat it was created for.
         let enable_conflict = state.pending.enabled == Some(true)
-            && ctx.text_inputs.iter().any(|(&other_id, other)| {
-                other_id != guest_id
-                    && other.guest_seat == state.guest_seat
-                    && other.committed.enabled
-            });
+            && ctx
+                .text_inputs
+                .iter()
+                .any(|(&other_id, other)| other_id != guest_id && other.committed.enabled);
         log::trace!(
             ">>> v3 on_commit: guest_id={guest_id}, serial={serial}, host_v1_id={}",
             state.host_v1_id
@@ -1909,8 +1913,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 
         if enable_conflict {
             log::warn!(
-                "Ignoring text-input enable for guest {guest_id}: another input is enabled on seat {}",
-                state.guest_seat
+                "Ignoring text-input enable for guest {guest_id}: another text input is enabled"
             );
         }
         let guest_seat = state.guest_seat;
@@ -3489,48 +3492,67 @@ mod tests {
     }
 
     #[test]
-    fn second_text_input_enable_on_same_seat_is_ignored() {
-        let (mut ctx, _, first_id) = setup_v1_ctx();
-        let surface = 40;
-        ctx.shadow_table
-            .insert_paired_for_test(surface, 41, "wl_surface");
-        {
-            let state = ctx.text_inputs.get_mut(&first_id).unwrap();
-            state.active_surface = Some(surface);
-            state.committed.enabled = false;
-            state.host.activation = HostActivationState::Inactive;
+    fn second_text_input_enable_on_the_connection_is_ignored() {
+        // Exo has one seat, so a second guest seat is no different.
+        for second_seat in [0, 5] {
+            let (mut ctx, _, first_id) = setup_v1_ctx();
+            ctx.shadow_table.insert_paired_for_test(5, 6, "wl_seat");
+            let surface = 40;
+            ctx.shadow_table
+                .insert_paired_for_test(surface, 41, "wl_surface");
+            {
+                let state = ctx.text_inputs.get_mut(&first_id).unwrap();
+                state.active_surface = Some(surface);
+                state.committed.enabled = false;
+                state.host.activation = HostActivationState::Inactive;
+            }
+            let second_id = 21;
+            ctx.shadow_table
+                .insert_paired_for_test(second_id, 11, "zwp_text_input_v3");
+            ctx.text_inputs.insert(
+                second_id,
+                crate::state::TextInputState::new(11, None, second_seat, Some(surface)),
+            );
+            let mut handler = TextInputV3Handler;
+
+            ctx.last_sender_id = first_id;
+            handler.on_enable(&mut ctx);
+            handler.on_commit(&mut ctx);
+            arm_backspace_repeat_for_test(&mut ctx, 44, HostId(45), first_id);
+            ctx.client_to_host_queue.clear();
+            ctx.last_sender_id = second_id;
+            handler.on_enable(&mut ctx);
+            handler.on_commit(&mut ctx);
+
+            assert!(ctx.text_inputs[&first_id].committed.enabled);
+            assert!(ctx.text_inputs[&first_id].host_is_active());
+            assert!(!ctx.text_inputs[&second_id].committed.enabled);
+            assert!(!ctx.text_inputs[&second_id].host_is_active());
+            // A rejected enable still counts: its `done` numbers the commit.
+            assert_eq!(ctx.text_inputs[&second_id].guest_commit_serial(), 1);
+            assert_eq!(
+                ctx.key_generations
+                    .ime_repeat_owner(HostId(45), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
+                Some(first_id),
+                "a rejected sibling enable must not cancel the active input's repeat lease"
+            );
+            assert!(
+                !take_requests(&mut ctx)
+                    .iter()
+                    .any(|&(sender, opcode)| sender == 11
+                        && opcode == zwp_text_input_v1::REQ_ACTIVATE),
+                "seat {second_seat}"
+            );
+
+            // The second text input's disable takes nothing from the first,
+            // which Exo still gives its input method.
+            handler.on_disable(&mut ctx);
+            handler.on_commit(&mut ctx);
+            assert!(ctx.text_inputs[&first_id].host_is_active());
+            assert!(!take_requests(&mut ctx).iter().any(|&(sender, opcode)| {
+                sender == 11 && opcode == zwp_text_input_v1::REQ_DEACTIVATE || sender == 10
+            }));
         }
-        let second_id = 21;
-        ctx.shadow_table
-            .insert_paired_for_test(second_id, 11, "zwp_text_input_v3");
-        ctx.text_inputs.insert(
-            second_id,
-            crate::state::TextInputState::new(11, None, 0, Some(surface)),
-        );
-        let mut handler = TextInputV3Handler;
-
-        ctx.last_sender_id = first_id;
-        handler.on_enable(&mut ctx);
-        handler.on_commit(&mut ctx);
-        arm_backspace_repeat_for_test(&mut ctx, 44, HostId(45), first_id);
-        ctx.last_sender_id = second_id;
-        handler.on_enable(&mut ctx);
-        handler.on_commit(&mut ctx);
-
-        assert!(ctx.text_inputs[&first_id].committed.enabled);
-        assert!(ctx.text_inputs[&first_id].host_is_active());
-        assert!(!ctx.text_inputs[&second_id].committed.enabled);
-        assert!(!ctx.text_inputs[&second_id].host_is_active());
-        assert_eq!(
-            ctx.key_generations
-                .ime_repeat_owner(HostId(45), crate::handler::keyboard::EVDEV_KEY_BACKSPACE),
-            Some(first_id),
-            "a rejected sibling enable must not cancel the active input's repeat lease"
-        );
-        assert!(!ctx.client_to_host_queue.iter().any(|message| {
-            msg_sender(std::slice::from_ref(message), 0) == 11
-                && msg_opcode(std::slice::from_ref(message), 0) == 0
-        }));
     }
 
     #[test]
