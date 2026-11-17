@@ -40,6 +40,14 @@
   keyboard leave for a pending surface, and two keyboards on one seat (the
   IME Backspace fallback picks a seat-level keyboard while keysyms prefer
   the focused one, and one chord can issue a redundant placement batch).
+- Clipboard pumps rely on a VirtWL pipe supporting `poll` and returning
+  `EAGAIN` under `O_NONBLOCK`. The ChromiumOS `virtio_wl.c` does both, but
+  no transfer has been checked on a device since the pumps stopped
+  blocking.
+- The dma-buf fence wait still waits on the guest GPU on the event loop,
+  the one exception to the
+  [event-loop rule](docs/INVARIANTS.md#process); the fence re-dispatch
+  follow-up named at `wait_sync_file` removes it.
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.

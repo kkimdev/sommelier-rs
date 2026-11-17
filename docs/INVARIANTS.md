@@ -540,6 +540,71 @@ end it.
   succeeds.
   Tests: `unregistrable_descriptor_is_an_error_not_a_panic`,
   `failing_accepts_back_off_instead_of_spinning`.
+- **Nothing waits on a guest client or on host data.** Every client runs
+  on the loop's one thread (see
+  [Process and connections](DESIGN.md#process-and-connections)), so a call
+  that waits for a peer to act stalls them all. The VirtWL device is the
+  exception the proxy cannot avoid. A send goes through the non-blocking
+  context descriptor and awaits room, but every other ioctl
+  (`create_pipe`, `allocate`, `allocate_dmabuf`, `dmabuf_sync`) and every
+  vfd close is a synchronous round trip to the host: it waits up to a
+  second for room in a full queue, then as long as the host takes to
+  answer. A descriptor the proxy waits on is non-blocking and polled
+  through Tokio's `AsyncFd`, as the clipboard pumps do
+  (`data_device::pump`):
+  - A pump watches each end for the one direction it uses. A peer that
+    stalls parks only its pump, except that host data the pump has not
+    read stays in VirtWL's receive queue, which every VirtWL connection
+    shares. So a pump that moves no data for `PUMP_IDLE_TIMEOUT` (60 s)
+    ends. That includes the wait for the first byte, so a host that takes
+    longer to produce its data is cut off. The guest's pipe then closes
+    as after a whole transfer: a pipe cannot carry an error, so the guest
+    cannot tell a cut-off paste from a complete one. This is deliberate.
+    A regular-file destination is the exception: its writes never report
+    "would block", so the timeout does not bound them.
+  - A pump never changes the flags of the guest's open file description,
+    which the client shares, and so may another pump into the same pipe.
+    It writes a socket with `MSG_DONTWAIT`, and an anonymous pipe on
+    Linux 6.5 or later with `pwritev2(RWF_NOWAIT)`. A named FIFO, or any
+    pipe on an older kernel, refuses `RWF_NOWAIT`, so it is reopened
+    through `/proc/self/fd` as a private non-blocking description. That
+    needs write permission on the pipe, so such a pipe from a client
+    running as another user (through `sudo -E`, say) has its transfer
+    refused.
+  - A regular file, such as a memfd, is written directly. A local one
+    never waits on another process, but one on a network or FUSE file
+    system (virtiofs, 9p, NFS) can, and no flag prevents that. Any other
+    destination, such as a device, is refused.
+  - A guest that closes its end (EPIPE, or ECONNRESET on a socket) ends
+    the transfer like EOF.
+  - Stopping the pumps ends them without waiting on any peer, even
+    mid-transfer, and closes their descriptors.
+  - A connection runs at most `MAX_CLIPBOARD_PUMPS` (16) pumps:
+    `ClipboardPumps::slot` gives no room beyond that, which the cap test
+    shows. `on_receive` then drops the `wl_data_offer.receive` before it
+    duplicates anything, and the dropped request closes the guest's
+    descriptor, so the guest reads EOF. The first refusal on a connection
+    warns and later ones log at debug level.
+
+  `sommelier/clippy.toml` rejects the blocking calls Clippy can name, but
+  it cannot tell a blocking `read` or `ioctl` from a non-blocking one, and
+  its lint also guards descriptors, so an allow for either lifts both. The
+  one exception left is the dma-buf fence wait
+  ([native buffers are fenced](#dma-buf)), which blocks a commit until the
+  guest GPU is done; its scoped allow names the follow-up that removes it.
+  Tests: `stop_clipboard_pumps_aborts_and_closes_owned_fds`,
+  `clipboard_pumps_are_capped_per_connection`,
+  `a_transfer_the_host_stalls_ends_after_the_idle_timeout`,
+  `a_transfer_the_guest_stalls_ends_after_the_idle_timeout`,
+  `a_slow_reader_parks_the_pump_without_blocking_the_loop`,
+  `pumps_into_one_pipe_never_change_its_flags`,
+  `pump_writes_into_a_pipe_it_cannot_reopen`,
+  `pump_writes_into_a_named_fifo`,
+  `a_reopened_pipe_is_private_and_non_blocking`,
+  `a_closed_reader_ends_the_pump`,
+  `pump_writes_into_a_regular_file`,
+  `pump_refuses_a_character_device`,
+  `pump_copies_a_large_transfer_whole`.
 - **`SIGHUP` never ends the proxy.** `prepare_process` in `main` installs
   the handler first, in every configuration, before the shortcut file is
   first read. Reloads run in their own task, so they never wait for the
