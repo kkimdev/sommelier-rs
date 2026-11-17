@@ -49,11 +49,10 @@ fn queue_message(
     sender_id: u32,
     opcode: u16,
     builder: MessageBuilder,
-    fds: Vec<RawFd>,
 ) -> bool {
     match builder.try_build_message(sender_id, opcode) {
         Ok(message) => {
-            queue.push((message, fds));
+            queue.push((message, Vec::new()));
             true
         }
         Err(error) => {
@@ -63,11 +62,6 @@ fn queue_message(
                 opcode,
                 error
             );
-            for fd in fds {
-                if fd >= 0 {
-                    let _ = nix::unistd::close(fd);
-                }
-            }
             false
         }
     }
@@ -271,12 +265,12 @@ fn build_synthetic_feedback_messages(
 ) -> io::Result<Vec<(Vec<u8>, Vec<RawFd>)>> {
     let (table_fd, table_size) = create_feedback_format_table(pairs)?;
     let mut pending = Vec::new();
+    // Only the array-carrying events can exceed the wire limit.
     let queue = |pending: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
                  opcode: u16,
-                 builder: MessageBuilder,
-                 fds: Vec<RawFd>|
+                 builder: MessageBuilder|
      -> io::Result<()> {
-        if queue_message(pending, guest_id, opcode, builder, fds) {
+        if queue_message(pending, guest_id, opcode, builder) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -290,15 +284,9 @@ fn build_synthetic_feedback_messages(
     // compositors and allowing every following tranche index to refer to it.
     let mut format_table = MessageBuilder::new();
     format_table.write_u32(table_size);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
-        format_table,
-        vec![table_fd],
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
+    let format_table =
+        format_table.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE);
+    pending.push((format_table, vec![table_fd]));
 
     let mut main_device = MessageBuilder::new();
     main_device.write_array(device);
@@ -306,7 +294,6 @@ fn build_synthetic_feedback_messages(
         &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
         main_device,
-        Vec::new(),
     ) {
         close_queued_fds(&mut pending);
         return Err(error);
@@ -318,7 +305,6 @@ fn build_synthetic_feedback_messages(
         &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
         tranche_device,
-        Vec::new(),
     ) {
         close_queued_fds(&mut pending);
         return Err(error);
@@ -328,15 +314,9 @@ fn build_synthetic_feedback_messages(
     // zero flag is the conservative default tranche.
     let mut tranche_flags = MessageBuilder::new();
     tranche_flags.write_u32(0);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS,
-        tranche_flags,
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
+    let tranche_flags =
+        tranche_flags.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS);
+    pending.push((tranche_flags, Vec::new()));
 
     for start in (0..pairs.len()).step_by(MAX_TRANCHE_INDICES_PER_EVENT) {
         let end = pairs
@@ -352,30 +332,18 @@ fn build_synthetic_feedback_messages(
             &mut pending,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
             tranche_formats,
-            Vec::new(),
         ) {
             close_queued_fds(&mut pending);
             return Err(error);
         }
     }
 
-    if let Err(error) = queue(
-        &mut pending,
+    for opcode in [
         zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
-        MessageBuilder::new(),
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
-    if let Err(error) = queue(
-        &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_DONE,
-        MessageBuilder::new(),
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
+    ] {
+        let done = MessageBuilder::new().build_message(guest_id, opcode);
+        pending.push((done, Vec::new()));
     }
 
     Ok(pending)
@@ -548,12 +516,7 @@ impl LinuxDmabufHandler {
         }
     }
 
-    fn process_params(
-        &self,
-        ctx: &mut Context,
-        params_id: u32,
-        send_create: impl FnOnce(&mut Context, u32) -> bool,
-    ) -> Option<(HostId, Vec<OwnedFd>)> {
+    fn process_params(&self, ctx: &mut Context, params_id: u32) -> Option<(HostId, Vec<OwnedFd>)> {
         let params = ctx.pending_params.remove(&params_id)?;
         let Some(host_id) = ctx.shadow_table.get_host_id(params_id) else {
             error!("Unknown host ID for params {}", params_id);
@@ -570,9 +533,10 @@ impl LinuxDmabufHandler {
 
         // Keep one descriptor for every plane. Multi-plane formats may use
         // separate dma-buf objects, so waiting only plane zero can present
-        // plane-one GPU writes before they complete. Linux anon-inode
-        // metadata cannot reliably prove that two descriptors are the same
-        // dma-buf, while an extra wait on shared backing is harmless.
+        // plane-one GPU writes before they complete. Inode identity proves
+        // two descriptors are the same dma-buf only on some kernels (see
+        // `shm::same_dma_buf_object`), while an extra wait on shared backing
+        // is harmless.
         // The queued ADD owns the original descriptor while these duplicates
         // live with the render-buffer generation through its final destroy.
         let mut sync_fds = Vec::new();
@@ -601,11 +565,9 @@ impl LinuxDmabufHandler {
             return None;
         }
 
-        // Send ADDs. If the wire builder ever rejects one of these fixed-size
-        // messages, close every descriptor that was not handed to the queue
-        // and terminate the connection before a partial CREATE can be sent.
-        let mut params = params.into_iter();
-        while let Some(param) = params.next() {
+        // Send the ADDs, each handing its descriptor to the queue. The caller
+        // queues its CREATE right after.
+        for param in params {
             let mut builder = MessageBuilder::new();
 
             // PASS THE GUEST'S EXACT METADATA. NO MINIGBM OVERRIDES.
@@ -615,25 +577,8 @@ impl LinuxDmabufHandler {
             builder.write_u32(param.modifier_hi);
             builder.write_u32(param.modifier_lo);
 
-            if !queue_message(
-                &mut ctx.client_to_host_queue,
-                host_id,
-                zwp_linux_buffer_params_v1::REQ_ADD,
-                builder,
-                vec![param.fd],
-            ) {
-                for remaining in params {
-                    unsafe { libc::close(remaining.fd) };
-                }
-                ctx.fatal_protocol_error = true;
-                return None;
-            }
-        }
-
-        // Send CREATE only after every ADD was queued successfully.
-        if !send_create(ctx, host_id) {
-            ctx.fatal_protocol_error = true;
-            return None;
+            let add = builder.build_message(host_id, zwp_linux_buffer_params_v1::REQ_ADD);
+            ctx.client_to_host_queue.push((add, vec![param.fd]));
         }
         ctx.used_dmabuf_params.insert(params_id);
         Some((HostId(host_id), sync_fds))
@@ -856,7 +801,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
             builder,
-            Vec::new(),
         );
         Action::Drop
     }
@@ -879,7 +823,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
             builder,
-            Vec::new(),
         );
         Action::Drop
     }
@@ -980,15 +923,9 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
         builder.write_u32(new_size);
 
         ctx.feedback_index_maps.insert(guest_id, index_map);
-        if !queue_message(
-            &mut ctx.host_to_client_queue,
-            guest_id,
-            zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
-            builder,
-            vec![new_fd],
-        ) {
-            ctx.feedback_index_maps.remove(&guest_id);
-        }
+        let format_table =
+            builder.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE);
+        ctx.host_to_client_queue.push((format_table, vec![new_fd]));
 
         Action::Drop
     }
@@ -1028,7 +965,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
             builder,
-            Vec::new(),
         );
 
         Action::Drop
@@ -1192,22 +1128,15 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // later `created` event. Keep all resources under the host params ID:
         // unlike the guest numeric ID, it uniquely identifies this async
         // generation even after guest-side delete_id and ID reuse.
-        let processed = self.process_params(ctx, params_id, |ctx, host_id| {
+        if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
             let mut builder = MessageBuilder::new();
             builder.write_i32(width);
             builder.write_i32(height);
             builder.write_u32(format);
             builder.write_u32(flags);
-
-            queue_message(
-                &mut ctx.client_to_host_queue,
-                host_id,
-                zwp_linux_buffer_params_v1::REQ_CREATE,
-                builder,
-                Vec::new(),
-            )
-        });
-        if let Some((host_params_id, sync_fds)) = processed {
+            let create =
+                builder.build_message(host_params_id.0, zwp_linux_buffer_params_v1::REQ_CREATE);
+            ctx.client_to_host_queue.push((create, Vec::new()));
             let pending = PendingNativeCreate {
                 guest_params_id: params_id,
                 dimensions: (width, height),
@@ -1248,11 +1177,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 "wl_buffer".to_string(),
                 version,
             );
-            if crate::handler::shm::queue_host_buffer_destroy(ctx, buffer) {
-                ctx.shadow_table.mark_pending_destroy_host(buffer);
-            } else {
-                ctx.shadow_table.remove_host_interface(buffer);
-            }
+            crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
+            ctx.retire_destroyed_host_object(buffer);
             ctx.orphaned_dmabuf_params.remove(&host_params_id);
             ctx.pending_native_creates.remove(&HostId(host_params_id));
             // If delete_id for params arrived first, the host params interface
@@ -1288,11 +1214,8 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                     "wl_buffer".to_string(),
                     version,
                 );
-                if crate::handler::shm::queue_host_buffer_destroy(ctx, buffer) {
-                    ctx.shadow_table.mark_pending_destroy_host(buffer);
-                } else {
-                    ctx.shadow_table.remove_host_interface(buffer);
-                }
+                crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
+                ctx.retire_destroyed_host_object(buffer);
                 ctx.orphaned_dmabuf_params.remove(&host_params_id);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
@@ -1376,13 +1299,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             );
             return Action::Drop;
         }
-        if ctx.shadow_table.get_host_id(params_id).is_none() {
-            // Consume and close any duplicated plane FDs, but do not create a
-            // guest buffer mapping when the params object itself has no host
-            // counterpart.
-            let _ = self.process_params(ctx, params_id, |_, _| true);
-            return Action::Drop;
-        }
         if !Self::valid_params(ctx, params_id, width, height, format) {
             error!(
                 "Rejecting invalid dmabuf create_immed: params={}, width={}, height={}, format={:#010x}",
@@ -1412,23 +1328,18 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         );
         ctx.shadow_table
             .set_host_version(host_buffer_id, buffer_version);
-        let processed = self.process_params(ctx, params_id, |ctx, host_id| {
+        if let Some((host_params_id, sync_fds)) = self.process_params(ctx, params_id) {
             let mut builder = MessageBuilder::new();
             builder.write_u32(host_buffer_id);
             builder.write_i32(width);
             builder.write_i32(height);
             builder.write_u32(format);
             builder.write_u32(flags);
-
-            queue_message(
-                &mut ctx.client_to_host_queue,
-                host_id,
+            let create_immed = builder.build_message(
+                host_params_id.0,
                 zwp_linux_buffer_params_v1::REQ_CREATE_IMMED,
-                builder,
-                Vec::new(),
-            )
-        });
-        if let Some((_host_params_id, sync_fds)) = processed {
+            );
+            ctx.client_to_host_queue.push((create_immed, Vec::new()));
             if !ctx.register_native_buffer(host_buffer_id, (width, height), sync_fds) {
                 error!("Duplicate render buffer host ID {}", host_buffer_id);
                 ctx.fatal_protocol_error = true;
@@ -1541,35 +1452,6 @@ mod tests {
             .insert(HostId(replacement_host_params_id), replacement);
 
         (ctx, handler, replacement_sync_fd, replacement_sync_identity)
-    }
-
-    #[test]
-    fn rejected_dmabuf_message_closes_attached_descriptors() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(attached_fd >= 1000);
-        let attached_identity = fd_identity(attached_fd);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_array(&vec![0; u16::MAX as usize]);
-        let mut queue = Vec::new();
-        assert!(!super::queue_message(
-            &mut queue,
-            7,
-            0,
-            builder,
-            vec![attached_fd]
-        ));
-        assert!(queue.is_empty());
-        assert!(
-            !any_fd_has_identity(attached_identity),
-            "rejecting an oversized message must close its descriptors"
-        );
     }
 
     #[test]

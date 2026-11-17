@@ -130,6 +130,7 @@ async fn main() {
     let placement = Arc::new(placement_config::PlacementConfig::from_environment(
         shortcuts_file,
     ));
+    let vm_identifier = state::vm_identifier_from_environment();
 
     if local_compositor.is_none() && virtio_wl.is_none() {
         virtio_wl = Some("/dev/wl0".to_string());
@@ -148,6 +149,7 @@ async fn main() {
         gpu_accel,
         xdg_decoration,
         virtio_wl,
+        vm_identifier,
         placement,
         reload_signal,
     )

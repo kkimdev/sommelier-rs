@@ -633,6 +633,8 @@ fn full_surface_damage(
     )
 }
 
+/// Build the host damage requests and the commit for one guest commit, or
+/// `None` when the surface has no host object.
 fn build_surface_commit_messages(
     ctx: &Context,
     surface_id: u32,
@@ -673,16 +675,11 @@ fn build_surface_commit_messages(
         builder.write_i32(rect.y);
         builder.write_i32(rect.width);
         builder.write_i32(rect.height);
-        let message = builder
-            .try_build_message(host_surface_id, REQ_DAMAGE)
-            .ok()?;
-        messages.push((message, Vec::new()));
+        let damage = builder.build_message(host_surface_id, REQ_DAMAGE);
+        messages.push((damage, Vec::new()));
     }
 
-    let builder = crate::wire::MessageBuilder::new();
-    let commit = builder
-        .try_build_message(host_surface_id, REQ_COMMIT)
-        .ok()?;
+    let commit = crate::wire::MessageBuilder::new().build_message(host_surface_id, REQ_COMMIT);
     messages.push((commit, Vec::new()));
     Some(messages)
 }
@@ -846,15 +843,6 @@ impl WlSurfaceHandler for CompositorHandler {
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         };
-        let builder = crate::wire::MessageBuilder::new();
-        let Ok(surface_destroy) = builder.try_build_message(wl_surface_host_id, REQ_DESTROY) else {
-            log::error!(
-                "Unable to encode wl_surface.destroy for host surface {}",
-                wl_surface_host_id
-            );
-            ctx.fatal_protocol_error = true;
-            return Action::Drop;
-        };
         // Keep the references owned by this surface before removing its
         // state. A submitted buffer may have been detached from another
         // surface and still be waiting for wl_buffer.release; only buffers
@@ -894,6 +882,8 @@ impl WlSurfaceHandler for CompositorHandler {
         // The generated dispatcher cannot express the ordering required by
         // the aura-shell integration: zaura_surface.release must precede the
         // paired wl_surface destructor.
+        let surface_destroy =
+            crate::wire::MessageBuilder::new().build_message(wl_surface_host_id, REQ_DESTROY);
         ctx.client_to_host_queue.push((surface_destroy, Vec::new()));
         ctx.surfaces.remove(&ctx.last_sender_id);
         crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
@@ -1144,7 +1134,7 @@ impl WlSurfaceHandler for CompositorHandler {
             force_full_damage,
         ) else {
             log::error!(
-                "Unable to prepare an atomic host wl_surface.commit for {}",
+                "Cannot commit wl_surface {} without its host object",
                 surface_id
             );
             ctx.fatal_protocol_error = true;
@@ -1200,9 +1190,9 @@ impl WlSurfaceHandler for CompositorHandler {
         }
 
         if let Some((previous_buffer, next_buffer)) = commit.attachment_transition() {
-            // The pending replacement has now passed every copy, fence, and
-            // wire-encoding check. Apply its content snapshot and both buffer
-            // lifecycle edges before appending any host message. The registry
+            // The pending replacement has now passed every copy and fence
+            // check. Apply its content snapshot and both buffer lifecycle
+            // edges before appending any host message. The registry
             // validates both generations before changing either one, so a
             // failed replacement remains completely rollback-safe.
             let snapshot_updated = match next_buffer {
@@ -1239,9 +1229,9 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
-        // Damage and commit were encoded as one batch before local state was
-        // finalized. Preserve their ordering while making a partial host
-        // transaction impossible.
+        // Damage and commit were built as one batch before local state was
+        // finalized. Append them together, in order, only once every check
+        // has passed, so the host never sees a partial transaction.
         ctx.client_to_host_queue.append(&mut host_messages);
         crate::handler::shm::retire_eligible_buffers(ctx);
         Action::Drop
@@ -1420,20 +1410,12 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
             ctx.fatal_protocol_error = true;
             return Action::Drop;
         };
-        let Ok(destroy_message) = crate::wire::MessageBuilder::new()
-            .try_build_message(host_xdg_toplevel_id, REQ_DESTROY_XDG_TOPLEVEL)
-        else {
-            log::error!(
-                "Unable to encode xdg_toplevel.destroy for host object {}",
-                host_xdg_toplevel_id
-            );
-            ctx.fatal_protocol_error = true;
-            return Action::Drop;
-        };
         // The Aura toplevel goes before the role destructor (see
         // `aura_objects::release`). Retain the guest ID until the host
         // acknowledges the role destructor.
         window_placement::release_toplevel(ctx, xdg_toplevel_id);
+        let destroy_message = crate::wire::MessageBuilder::new()
+            .build_message(host_xdg_toplevel_id, REQ_DESTROY_XDG_TOPLEVEL);
         ctx.client_to_host_queue.push((destroy_message, Vec::new()));
         ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
         ctx.shadow_table.mark_pending_destroy(xdg_toplevel_id);
@@ -2843,6 +2825,51 @@ mod tests {
                 .iter()
                 .any(|(message, _)| msg_sender(message) == host_buffer_id),
             "host buffer destroy must use the completed release interval"
+        );
+    }
+
+    #[test]
+    fn release_owed_after_surface_destroy_is_expected() {
+        // A GTK client's exit: the surface showing a submitted buffer is
+        // destroyed first, and Exo then releases the buffer it no longer
+        // shows while the guest still owns it.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        let buffer_id = 42;
+        let host_buffer_id = 43;
+        ctx.shadow_table.map_id(buffer_id, host_buffer_id);
+        ctx.shadow_table
+            .track_interface_with_version(buffer_id, "wl_buffer".to_string(), 1);
+        ctx.shadow_table.set_host_version(host_buffer_id, 1);
+        register_test_native(&mut ctx, buffer_id, (1, 1));
+        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
+        assert!(ctx.mark_buffer_submitted(buffer_id));
+
+        let mut compositor = CompositorHandler;
+        ctx.last_sender_id = surface_id;
+        assert_eq!(
+            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
+            Action::Drop
+        );
+        assert!(
+            !ctx.buffer_is_submitted(buffer_id),
+            "the ordered surface destructor ends the buffer's use"
+        );
+
+        let mut shm = crate::handler::shm::ShmHandler;
+        ctx.last_sender_id = host_buffer_id;
+        assert_eq!(
+            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            Action::Forward,
+            "the guest still gets its wl_buffer.release"
+        );
+        assert!(
+            ctx.buffer_is_released(buffer_id),
+            "the owed release is recorded instead of being ignored as unexpected"
+        );
+        assert!(
+            !ctx.mark_buffer_released(buffer_id),
+            "a second release is still unexpected"
         );
     }
 
@@ -4301,7 +4328,7 @@ mod tests {
         assert_eq!(
             buffer_lifecycle(&ctx, guest_buffer),
             Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::NeverSubmitted
+                RenderBufferUse::ReleaseOwed
             )),
             "destroying the only committed surface closes its compositor-use interval"
         );

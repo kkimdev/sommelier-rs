@@ -34,7 +34,7 @@ use self::render::RenderBufferRegistry;
 use self::render::{DamageRegion, MAX_PENDING_DAMAGE_RECTS};
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
-use log::warn;
+use log::{error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -400,7 +400,10 @@ impl ShadowTable {
     /// The dispatch metadata is removed immediately so stale events cannot
     /// reach a handler, but the numeric ID remains reserved until the host
     /// acknowledges the destructor with `wl_display.delete_id`.
-    pub fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
+    ///
+    /// Handlers go through [`Context::retire_destroyed_host_object`], which
+    /// owns what a refusal means.
+    fn mark_pending_destroy_host(&mut self, host_id: u32) -> bool {
         if self.host_to_guest.contains_key(&host_id) || !self.host_interfaces.contains_key(&host_id)
         {
             return false;
@@ -605,21 +608,6 @@ impl ShadowTable {
                 entry.insert(interface);
             }
         }
-    }
-
-    /// Complete a server-destroyed paired object while reserving its host ID.
-    ///
-    /// Some event-only objects, notably `wl_callback`, cease to exist when the
-    /// host sends their terminal event. The guest mapping must disappear
-    /// immediately, but the host numeric ID remains unavailable until the
-    /// compositor's later `wl_display.delete_id`. Combining both transitions
-    /// prevents callers from accidentally opening an ID-reuse window between
-    /// removing the pair and installing the host-only reservation.
-    pub fn retire_server_destroyed_object(&mut self, guest_id: u32) -> Option<HostId> {
-        let host_id = *self.guest_to_host.get(&guest_id)?;
-        self.remove_guest_mapping(guest_id);
-        self.mark_pending_destroy_host(host_id)
-            .then_some(HostId(host_id))
     }
 
     /// Mark a guest object as destroyed while retaining both sides of its
@@ -942,7 +930,8 @@ pub struct Context {
     /// The internal host zaura_shell binding (not exposed to the guest), if
     /// one is bound.
     pub(crate) host_zaura_shell: Option<HostAuraShell>,
-    /// VM identifier for ChromeOS guest_os app ID formatting (from SOMMELIER_VM_IDENTIFIER).
+    /// VM identifier for ChromeOS guest_os app ID formatting, resolved once
+    /// in `main` (see [`vm_identifier_from_environment`]).
     pub vm_identifier: String,
     /// This connection's ARC bounds policy state (see
     /// [`WindowPlacementState`] for what it owns). Built from `placement`.
@@ -1159,6 +1148,23 @@ impl Context {
         self.render_buffers.mark_guest_destroyed(host_id)
     }
 
+    /// Retire a host-only object that is being destroyed, by a destructor
+    /// just queued or by the host's terminal event, until its
+    /// `wl_display.delete_id` (see [`ShadowTable::mark_pending_destroy_host`]).
+    ///
+    /// Every caller tracked the object as host-only and has not retired it,
+    /// so a refusal means the proxy's ID bookkeeping diverged, which ends the
+    /// session.
+    pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
+        if !self.shadow_table.mark_pending_destroy_host(host_id) {
+            error!(
+                "Host object {} was not a live host-only object when it was retired",
+                host_id
+            );
+            self.fatal_protocol_error = true;
+        }
+    }
+
     pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
         self.render_buffers.remove(HostId(host_buffer_id))
     }
@@ -1261,9 +1267,16 @@ impl Context {
     /// # Arguments
     ///
     /// * `gpu_accel`, `xdg_decoration` - the command-line feature switches.
+    /// * `vm_identifier` - the VM namespace of application IDs, resolved
+    ///   once in `main` (see [`vm_identifier_from_environment`]).
     /// * `placement` - the process-wide placement configuration, resolved
     ///   once in `main`; `Context` never reads placement variables itself.
-    pub fn new(gpu_accel: bool, xdg_decoration: bool, placement: Arc<PlacementConfig>) -> Self {
+    pub fn new(
+        gpu_accel: bool,
+        xdg_decoration: bool,
+        vm_identifier: String,
+        placement: Arc<PlacementConfig>,
+    ) -> Self {
         // `Allocator::new` reads `SOMMELIER_DRM_DEVICE` and probes the DRM
         // render nodes; without one, buffers fall back to VirtWL or SHM.
         let allocator = match Allocator::new() {
@@ -1276,7 +1289,7 @@ impl Context {
         Self::from_parts(
             gpu_accel,
             xdg_decoration,
-            resolve_vm_identifier(std::env::var("SOMMELIER_VM_IDENTIFIER").ok()),
+            vm_identifier,
             allocator,
             placement,
         )
@@ -1441,6 +1454,28 @@ impl Context {
     }
 }
 
+/// The variable that names the VM in ChromeOS application IDs.
+const VM_IDENTIFIER_VARIABLE: &str = "SOMMELIER_VM_IDENTIFIER";
+
+/// Read the VM namespace of ChromeOS application IDs from
+/// [`VM_IDENTIFIER_VARIABLE`] (see [`resolve_vm_identifier`]).
+///
+/// A value that is not UTF-8 is logged and replaced by the default.
+pub(crate) fn vm_identifier_from_environment() -> String {
+    let value = std::env::var_os(VM_IDENTIFIER_VARIABLE).and_then(|value| {
+        value
+            .into_string()
+            .inspect_err(|value| {
+                warn!(
+                    "Ignoring non-UTF-8 {}={:?}; using the default",
+                    VM_IDENTIFIER_VARIABLE, value
+                );
+            })
+            .ok()
+    });
+    resolve_vm_identifier(value)
+}
+
 /// Resolve the VM namespace used in ChromeOS application IDs.
 ///
 /// An exported-but-empty environment variable is equivalent to an unset one.
@@ -1514,6 +1549,21 @@ mod tests {
         ));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
         assert!(!ctx.window_placement.uses_arc_bounds());
+    }
+
+    #[test]
+    fn retiring_a_destroyed_host_object_requires_a_live_host_only_object() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let host_id = ctx.shadow_table.allocate_host_id();
+        ctx.shadow_table
+            .track_host_interface(host_id, "wl_shm_pool".to_string());
+        ctx.retire_destroyed_host_object(host_id);
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(host_id));
+        assert!(!ctx.fatal_protocol_error);
+
+        // A second retirement means the bookkeeping diverged.
+        ctx.retire_destroyed_host_object(host_id);
+        assert!(ctx.fatal_protocol_error);
     }
 
     #[test]
@@ -2223,14 +2273,21 @@ mod tests {
         assert!(ctx.finish_surface_destroy_use(buffer, false));
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::NeverSubmitted)
+            Some(RenderBufferUse::ReleaseOwed)
         );
+        assert!(!ctx.buffer_is_submitted(buffer));
+        assert!(!ctx.buffer_is_released(buffer));
         assert_eq!(
             ctx.render_buffers.lifecycle(HostId(host_buffer)),
             Some(RenderBufferLifecycle::GuestAlive(
-                RenderBufferUse::NeverSubmitted
+                RenderBufferUse::ReleaseOwed
             ))
         );
+        assert!(
+            ctx.mark_buffer_released(buffer),
+            "the release the host owed for the ended use is expected"
+        );
+        assert_eq!(ctx.host_buffer_use(buffer), Some(RenderBufferUse::Released));
     }
 
     #[test]
@@ -2263,7 +2320,7 @@ mod tests {
         assert!(ctx.finish_surface_destroy_use(buffer, false));
         assert_eq!(
             ctx.host_buffer_use(buffer),
-            Some(RenderBufferUse::NeverSubmitted)
+            Some(RenderBufferUse::ReleaseOwed)
         );
     }
 
@@ -2331,14 +2388,14 @@ mod tests {
                         assert!(registry.submit(host_buffer));
                     }
                     Operation::Release => {
-                        let expected = matches!(&model, RenderBufferUse::AwaitingRelease { .. });
+                        let expected = model.owes_release();
                         if expected {
                             model = RenderBufferUse::Released;
                         }
                         assert_eq!(registry.release(host_buffer), expected);
                     }
                     Operation::Detach => {
-                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        let expected = model.may_be_current();
                         if matches!(&model, RenderBufferUse::AwaitingRelease { .. }) {
                             model = awaiting_release(true);
                         }
@@ -2348,9 +2405,9 @@ mod tests {
                         );
                     }
                     Operation::LastSurfaceDestroy => {
-                        let expected = !matches!(&model, RenderBufferUse::NeverSubmitted);
+                        let expected = model.may_be_current();
                         if model == awaiting_release(false) {
-                            model = RenderBufferUse::NeverSubmitted;
+                            model = RenderBufferUse::ReleaseOwed;
                         }
                         assert_eq!(registry.end_last_surface_use(host_buffer, false), expected);
                     }
@@ -2478,34 +2535,26 @@ mod tests {
                         true
                     }
                     (_, Operation::Release) => {
-                        let awaiting =
-                            matches!(&use_state, RenderBufferUse::AwaitingRelease { .. });
-                        if awaiting {
+                        let owed = use_state.owes_release();
+                        if owed {
                             use_state = RenderBufferUse::Released;
                         }
-                        awaiting
+                        owed
                     }
-                    (_, Operation::Detach) => match &use_state {
-                        RenderBufferUse::AwaitingRelease { .. } => {
+                    (_, Operation::Detach) => {
+                        let may_be_current = use_state.may_be_current();
+                        if use_state.is_awaiting_release() {
                             use_state = awaiting_release(true);
-                            true
                         }
-                        RenderBufferUse::Released => true,
-                        RenderBufferUse::NeverSubmitted => false,
-                    },
-                    (_, Operation::LastSurfaceDestroy) => match &use_state {
-                        RenderBufferUse::AwaitingRelease {
-                            has_detached_use: false,
-                        } => {
-                            use_state = RenderBufferUse::NeverSubmitted;
-                            true
+                        may_be_current
+                    }
+                    (_, Operation::LastSurfaceDestroy) => {
+                        let may_be_current = use_state.may_be_current();
+                        if use_state == awaiting_release(false) {
+                            use_state = RenderBufferUse::ReleaseOwed;
                         }
-                        RenderBufferUse::AwaitingRelease {
-                            has_detached_use: true,
-                        }
-                        | RenderBufferUse::Released => true,
-                        RenderBufferUse::NeverSubmitted => false,
-                    },
+                        may_be_current
+                    }
                     (ModelOwnership::GuestAlive, Operation::GuestDestroy) => {
                         ownership = ModelOwnership::GuestDestroyed;
                         true
