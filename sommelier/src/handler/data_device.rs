@@ -60,6 +60,12 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
         if let Some(virtwl) = &ctx.virtwayland_channel {
             debug!("Using virtwl for clipboard receive");
 
+            // Beyond the cap the request is dropped, which closes the
+            // guest's descriptor, so the guest reads EOF.
+            let Some(pump_slot) = ctx.clipboard_pumps.slot() else {
+                return Action::Drop;
+            };
+
             // The request closes the guest's descriptor once handled, so the
             // pump writes into a duplicate. Duplicate it before queueing
             // anything so a dup failure cannot leave a host request queued
@@ -116,7 +122,7 @@ impl wl_data_offer::WlDataOfferHandler for DataDeviceHandler {
                 return Action::Drop;
             }
 
-            ctx.clipboard_pumps.start(async move {
+            pump_slot.start(async move {
                 match pump(virtwl_pipe, client_fd).await {
                     Ok(()) => debug!("Clipboard pump finished"),
                     Err(e) => error!("Clipboard pump error: {}", e),

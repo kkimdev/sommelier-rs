@@ -37,7 +37,7 @@ use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
-use log::{error, warn};
+use log::{debug, error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -153,33 +153,65 @@ pub struct PendingDmabufGlobal {
     pub generation: u64,
 }
 
+/// The most clipboard transfers one connection may have in flight.
+///
+/// A paste fetches one MIME type and a drop a few, so the cap only bounds
+/// what a misbehaving client can pin: a task and two descriptors each.
+pub(crate) const MAX_CLIPBOARD_PUMPS: usize = 16;
+
 /// The clipboard transfers of one connection.
 ///
 /// Each pump owns its two descriptors until its transfer ends. The pumps
 /// belong to the connection: stopping the set, or dropping it with the
 /// [`Context`] on any path, aborts every unfinished one.
 #[derive(Default)]
-pub(crate) struct ClipboardPumps(JoinSet<()>);
+pub(crate) struct ClipboardPumps {
+    pumps: JoinSet<()>,
+    /// Whether the cap has refused a pump yet. Only the first refusal
+    /// warns, so a client that keeps asking cannot flood the log.
+    refused: bool,
+}
 
 impl ClipboardPumps {
-    /// Start a pump, after forgetting the ones that have finished.
-    pub(crate) fn start(&mut self, pump: impl Future<Output = ()> + Send + 'static) {
+    /// Room for one more pump, after forgetting the ones that have
+    /// finished, or `None` while [`MAX_CLIPBOARD_PUMPS`] are in flight.
+    pub(crate) fn slot(&mut self) -> Option<PumpSlot<'_>> {
         self.reap();
-        self.0.spawn(pump);
+        if self.pumps.len() < MAX_CLIPBOARD_PUMPS {
+            return Some(PumpSlot(&mut self.pumps));
+        }
+        if std::mem::replace(&mut self.refused, true) {
+            debug!("Refusing a clipboard transfer: {MAX_CLIPBOARD_PUMPS} are in flight");
+        } else {
+            warn!(
+                "Refusing a clipboard transfer: {MAX_CLIPBOARD_PUMPS} are in flight; \
+                 later refusals on this connection log at debug level"
+            );
+        }
+        None
     }
 
     /// Abort every pump and wait until each has dropped its descriptors.
     pub(crate) async fn stop(&mut self) {
-        self.0.shutdown().await;
+        self.pumps.shutdown().await;
     }
 
     /// Forget the pumps that have finished, reporting any that panicked.
     fn reap(&mut self) {
-        while let Some(result) = self.0.try_join_next() {
+        while let Some(result) = self.pumps.try_join_next() {
             if let Err(e) = result {
                 error!("A clipboard pump failed: {}", e);
             }
         }
+    }
+}
+
+/// Room for one more clipboard pump, from [`ClipboardPumps::slot`].
+pub(crate) struct PumpSlot<'a>(&'a mut JoinSet<()>);
+
+impl PumpSlot<'_> {
+    pub(crate) fn start(self, pump: impl Future<Output = ()> + Send + 'static) {
+        self.0.spawn(pump);
     }
 }
 
@@ -1160,7 +1192,7 @@ mod tests {
         let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
 
         let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.clipboard_pumps.start(async move {
+        ctx.clipboard_pumps.slot().unwrap().start(async move {
             let pump = crate::handler::data_device::pump(src.into(), dst.into());
             pump.await.expect("the pump runs until it is stopped");
         });
@@ -1179,6 +1211,31 @@ mod tests {
             0,
             "the guest reads EOF"
         );
+    }
+
+    /// A connection runs at most `MAX_CLIPBOARD_PUMPS` pumps, and one that
+    /// finishes makes room for another.
+    #[tokio::test]
+    async fn clipboard_pumps_are_capped_per_connection() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        let mut releases = Vec::new();
+        for _ in 0..MAX_CLIPBOARD_PUMPS {
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let slot = ctx.clipboard_pumps.slot().expect("room under the cap");
+            slot.start(async {
+                let _ = released.await;
+            });
+            releases.push(release);
+        }
+        assert!(
+            ctx.clipboard_pumps.slot().is_none(),
+            "no pump beyond the cap"
+        );
+
+        drop(releases.pop());
+        // Every ready task runs before this one resumes.
+        tokio::task::yield_now().await;
+        assert!(ctx.clipboard_pumps.slot().is_some());
     }
 
     #[test]
