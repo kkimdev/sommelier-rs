@@ -25,6 +25,7 @@ run the checks CI runs, plus `git diff --check`, from the repository root:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+python3 -I scripts/check-cited-tests.py
 git diff --check
 ```
 

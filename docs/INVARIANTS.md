@@ -6,7 +6,8 @@ stale pixels, or lost IME input. A change that touches one keeps it, or
 changes this document and the covering tests in the same pull request.
 
 The named tests pin each rule; search for them with
-`git grep -n <test_name>`. [DESIGN.md](DESIGN.md) explains the structure
+`git grep -n <test_name>`, and `scripts/check-cited-tests.py` checks that
+each still exists. [DESIGN.md](DESIGN.md) explains the structure
 the rules apply to. The window placement contract (a matched chord is
 always consumed; a configuration problem never stops the proxy) is owned by
 [WINDOW_SHORTCUT_CONFIGURATION.md](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).

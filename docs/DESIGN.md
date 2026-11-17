@@ -33,8 +33,8 @@ handler intercepts the ones whose meaning changes across the boundary.
   configuration (`PlacementConfig::from_environment`). Connections receive
   the results.
   `Context::from_parts` and the test constructors read no environment
-  (`test_contexts_read_no_environment`), with two exceptions below `main`:
-  `Context::new` creates the GBM allocator, which reads
+  (test: `test_contexts_read_no_environment`), with two exceptions below
+  `main`: `Context::new` creates the GBM allocator, which reads
   `SOMMELIER_DRM_DEVICE` (`allocator.rs`) on every connection, and the ARC
   task-ID reservation reads `XDG_RUNTIME_DIR` (`arc_task_ids.rs`).
 - `proxy::run` claims the socket through its lock file, then `serve`
