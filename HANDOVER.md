@@ -32,6 +32,10 @@
   `--gpu-accel` and the fork do not cover.
 - Upstream review and eventual rebase/cherry-pick coordination remain
   separate from this fork's `virtwl` branch.
+- A pending dma-buf plane (`state::PendingParam`) keeps its duplicated
+  descriptor as a `RawFd` that several paths close by hand; its `add`
+  encoder takes it over with `from_raw_fd`. Storing an `OwnedFd` would
+  remove the manual closes.
 - A late owed `wl_buffer.release` can mark a buffer released while the
   host holds it, which skips its damage-only copies until the next attach;
   see [Surfaces, damage and SHM](docs/INVARIANTS.md#surfaces-damage-and-shm).

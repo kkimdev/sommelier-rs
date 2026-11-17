@@ -80,6 +80,14 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   against the shadow table, so a repeated, null or reserved ID cannot
   overwrite a mapping, and each message is checked against the version
   that introduced it.
+- An encoder per message, `req::<request>` and `evt::<event>`, for every
+  message the proxy builds itself (see
+  [Wire messages](INVARIANTS.md#wire-messages)).
+- Enum constants named `<ENUM>_<ENTRY>`, and `<enum>_since`, the version
+  that introduced a value. A constant is `i32` when an `int` argument of
+  the same protocol file carries its enum and `u32` otherwise, so
+  `wl_output.transform` is `i32` although `preferred_buffer_transform`
+  carries it as a `uint`.
 - `*_SINCE` and `VERSION` constants. Since-version checks use these, never
   copied literals, and a child object takes its parent's negotiated
   version. A global's version bound is either the generated `VERSION` or a
