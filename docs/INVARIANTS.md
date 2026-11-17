@@ -190,6 +190,25 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `global_remove_keeps_aura_children_until_surface_destroy`,
   `removed_text_input_globals_keep_bound_manager_usable`,
   `global_remove_forgets_the_output_and_releases_its_aura_child`.
+- **A bind that crosses its global's removal is not an error.** A client
+  can bind a global it saw advertised after the compositor has already
+  removed it, because the bind and the `global_remove` cross on the wire;
+  libwayland-server makes this harmless. A bind of a `wl_output` name that
+  the binding registry advertised and then removed therefore creates an
+  inert guest object that never reaches the host and completes its
+  destructor locally, like a synthetic object. A request that names it
+  reaches the host with a null output, as if the guest had named none. It
+  never receives `geometry`, `mode` or `done`; that is harmless, because
+  the guest receives the global's `global_remove` on the same registry and
+  drops the output. A name the registry never
+  advertised, a wrong interface or version, and a removed global of any
+  other interface (whose requests create objects an inert parent cannot
+  serve) stay protocol errors.
+  Tests: `bind_crossing_an_output_removal_creates_an_inert_output`,
+  `inert_output_release_completes_locally`,
+  `bound_output_release_reaches_the_host_without_a_local_delete_id`,
+  `set_fullscreen_on_an_inert_output_is_forwarded_without_an_output`,
+  `global_remove_forwards_only_visible_globals_and_invalidates_bind`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the
   connection-wide metadata for that name MUST be replaced before the new

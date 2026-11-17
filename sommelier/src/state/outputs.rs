@@ -55,6 +55,12 @@ pub(crate) fn transformed_extent(transform: i32, width: i32, height: i32) -> (i3
     }
 }
 
+/// The one interface whose bind may cross its global's removal, as when a
+/// dock flaps (see `handler::registry::admit_guest_bind`). A `wl_output` up
+/// to the advertised v3 has no request that creates objects, so an inert
+/// one, a local-only guest object, needs nothing but its own destructor.
+pub(crate) const INERT_BIND_INTERFACE: &str = "wl_output";
+
 /// Units per 1.0 of an Aura scale factor: `zaura_output` sends both scale
 /// factors in thousandths.
 const AURA_SCALE_UNITS: u64 = 1000;

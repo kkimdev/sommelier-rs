@@ -1345,6 +1345,31 @@ mod tests {
         (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
     }
 
+    /// A request naming an inert output (whose bind crossed its global's
+    /// removal) reaches the host with no output, as if the guest named none.
+    #[test]
+    fn set_fullscreen_on_an_inert_output_is_forwarded_without_an_output() {
+        use crate::protocols::xdg_shell::xdg_toplevel::{dispatch_request, REQ_SET_FULLSCREEN};
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let (toplevel_guest, toplevel_host, inert_output) = (400, 500, 10);
+        ctx.shadow_table.map_id(toplevel_guest, toplevel_host);
+        ctx.shadow_table
+            .track_interface_with_version(toplevel_guest, "xdg_toplevel".into(), 3);
+        ctx.shadow_table
+            .track_interface_with_version(inert_output, "wl_output".into(), 3);
+
+        ctx.last_sender_id = toplevel_guest;
+        let payload = inert_output.to_ne_bytes();
+        let mut request =
+            crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload, &[]);
+        let (message, _) = dispatch_request(&mut request, &mut CompositorHandler, &mut ctx)
+            .expect("valid request")
+            .expect("forwarded");
+        assert_eq!(msg_sender(&message), toplevel_host);
+        assert_eq!(msg_opcode(&message), REQ_SET_FULLSCREEN);
+        assert_eq!(message[8..], 0u32.to_ne_bytes());
+    }
+
     #[test]
     fn surface_enter_leave_tracks_the_last_entered_output() {
         let mut ctx = Context::new_for_test(false, false, vec![]);

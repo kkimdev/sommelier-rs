@@ -136,9 +136,11 @@ Two mechanisms let a handler act outside its own message:
 ### Synthetic objects
 
 Some guest objects have no host counterpart and are implemented inside the
-proxy: `wl_shm` and its pools, and `zwp_text_input_manager_v3` and its
-children. They follow the guest lifecycle locally, including the
-`delete_id` a real compositor would send.
+proxy: `wl_shm` and its pools, `zwp_text_input_manager_v3` and its
+children, and an inert `wl_output` whose bind crossed its global's removal
+(see [Registry globals](INVARIANTS.md#registry-globals)). They follow the
+guest lifecycle locally, including the `delete_id` a real compositor would
+send.
 
 ## Buffers
 

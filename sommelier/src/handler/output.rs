@@ -20,7 +20,6 @@ limitations under the License.
 //! output fact; `wl_output.release` also releases the output's Aura child.
 
 use crate::handler::aura_objects;
-use crate::handler::display::queue_protocol_error;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
 use crate::state::{is_valid_transform, Context};
@@ -101,13 +100,10 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
         // retiring an unrelated host object when the two namespaces differ.
         let guest_output_id = ctx.last_sender_id;
         let Some(host_output_id) = ctx.shadow_table.get_host_id(guest_output_id) else {
-            queue_protocol_error(
-                ctx,
-                guest_output_id,
-                0,
-                "wl_output.release has no host object mapping",
-            );
-            return Action::Drop;
+            // Only an inert output, whose bind crossed its global's removal,
+            // gets here without a host object. The generated dispatcher
+            // completes its destructor locally.
+            return Action::Forward;
         };
         if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
             aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
@@ -206,7 +202,7 @@ mod tests {
         REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
     };
     use crate::protocols::wayland::wl_output::WlOutputHandler;
-    use crate::test_support::{msg_opcode, msg_sender, protocol_error_code, queued_headers};
+    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
     use crate::window_layout::Rect;
 
     const OUTPUT_HOST: u32 = 20;
@@ -622,17 +618,48 @@ mod tests {
         );
     }
 
+    /// A bound output's release reaches the host, which acknowledges it; the
+    /// proxy sends no `delete_id` of its own.
     #[test]
-    fn releasing_unmapped_output_reports_a_protocol_error() {
+    fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
+        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 10;
+        ctx.shadow_table.map_id(10, OUTPUT_HOST);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_output".into(), 3);
+        ctx.outputs.bind_for_test(OUTPUT_HOST, Default::default());
 
+        ctx.last_sender_id = 10;
+        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[], &[]);
+        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
+        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(
-            WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
-            Action::Drop
+            queued_headers(&ctx.client_to_host_queue),
+            [(OUTPUT_HOST, REQ_RELEASE_WL_OUTPUT)]
         );
-        assert!(ctx.fatal_protocol_error);
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(protocol_error_code(&ctx), 0);
+        assert!(ctx.host_to_client_queue.is_empty());
+        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
+    }
+
+    /// An inert output (its bind crossed its global's removal) has no host
+    /// object, so its release completes in the proxy with one `delete_id`.
+    #[test]
+    fn inert_output_release_completes_locally() {
+        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
+        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_output".into(), 3);
+
+        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[], &[]);
+        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
+        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(1, EVT_DELETE_ID)]
+        );
+        assert_eq!(ctx.shadow_table.get_interface(10), None);
+        assert!(!ctx.fatal_protocol_error);
     }
 }
