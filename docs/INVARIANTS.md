@@ -607,7 +607,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   reset Exo's composition.
   Tests: `content_type_takes_one_host_request_per_extension_version`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
-  `a_host_without_surrounding_text_support_gets_no_resend`.
+  `a_host_without_surrounding_text_support_gets_no_resend`, and the
+  fuzzer's end state against its model of Exo
+  (`guest_streams_cannot_crash_hang_or_leak`; see
+  [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
 - **A deferred activation replays the content type.** A commit that
   enables a text input while its previous host generation still drains
   reaches Exo before the deferred `activate`, while no input method is
@@ -618,7 +621,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   followed by the committed content type, with its support, and a
   `commit_state`. Exo keeps surrounding text and the cursor rectangle
   without an input method, so they are not replayed.
-  Test: `a_deferred_activation_replays_the_committed_content_type`.
+  Tests: `a_deferred_activation_replays_the_committed_content_type`, and
+  the fuzzer's end state against its model of Exo
+  (`guest_streams_cannot_crash_hang_or_leak`).
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A
