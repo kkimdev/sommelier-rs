@@ -2211,14 +2211,37 @@ mod tests {
         state.pending_preedit_selection = Some((0, 3));
         state.pending_deletes.push((3, 0));
         state.pending_cursor_position = Some((1, 1));
-        assert!(state.host.activate());
+        let applied = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (5, 6),
+                surrounding_text_support: Some(true),
+            }),
+        };
+        state.host = applied;
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
+        // What the host applied is the host's, so it survives: reconciling
+        // the reset target deactivates it and forgets the content type.
         let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
         expected.set_guest_commits(17);
-        assert!(expected.host.activate());
+        expected.host = applied;
         assert_eq!(state, expected);
+        let target = HostTarget {
+            active: state.committed.enabled,
+            seat_live: true,
+            content_type: HostContentType {
+                content_type: state.committed.content_type,
+                surrounding_text_support: Some(false),
+            },
+        };
+        assert_eq!(
+            reconcile(&target, &state.host),
+            HostSteps {
+                activation: Some(ActivationStep::Deactivate),
+                content_type: None,
+            }
+        );
     }
 
     #[test]
