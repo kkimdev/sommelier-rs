@@ -68,18 +68,24 @@ pub(crate) fn queue_protocol_error(
 /// object that can acknowledge their destructor. Their handlers call the
 /// local wrapper below after cleaning local state so the guest observes the
 /// same lifecycle as it would for a compositor-owned object.
+///
+/// # Returns
+///
+/// `false`, queueing nothing, only when `guest_id` is not a known guest
+/// object.
 pub(crate) fn queue_guest_delete_id(ctx: &mut Context, guest_id: u32) -> bool {
     if ctx.shadow_table.get_interface(guest_id).is_none() {
         return false;
     }
+    queue_delete_id(ctx, guest_id);
+    true
+}
+
+fn queue_delete_id(ctx: &mut Context, guest_id: u32) {
     let mut builder = MessageBuilder::new();
     builder.write_u32(guest_id);
-    queue_message(
-        &mut ctx.host_to_client_queue,
-        WL_DISPLAY_ID,
-        wl_display::EVT_DELETE_ID,
-        builder,
-    )
+    let delete_id = builder.build_message(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID);
+    ctx.host_to_client_queue.push((delete_id, Vec::new()));
 }
 
 /// Retire a synthetic guest object and queue its local delete acknowledgement.
@@ -125,16 +131,10 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(registry, "wl_registry".to_string());
 
-        // Send get_registry to host (opcode 1)
         let mut builder = MessageBuilder::new();
         builder.write_u32(host_registry_id);
-
-        queue_message(
-            &mut ctx.client_to_host_queue,
-            WL_DISPLAY_ID,
-            wl_display::REQ_GET_REGISTRY,
-            builder,
-        );
+        let get_registry = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_GET_REGISTRY);
+        ctx.client_to_host_queue.push((get_registry, Vec::new()));
 
         Action::Drop
     }
@@ -145,16 +145,10 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
         ctx.shadow_table
             .track_interface(callback, "wl_callback".to_string());
 
-        // Send sync to host (opcode 0)
         let mut builder = MessageBuilder::new();
         builder.write_u32(host_callback_id);
-
-        queue_message(
-            &mut ctx.client_to_host_queue,
-            WL_DISPLAY_ID,
-            wl_display::REQ_SYNC,
-            builder,
-        );
+        let sync = builder.build_message(WL_DISPLAY_ID, wl_display::REQ_SYNC);
+        ctx.client_to_host_queue.push((sync, Vec::new()));
 
         Action::Drop
     }
@@ -190,15 +184,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             ctx.pending_native_creates.remove(&HostId(id));
 
             // Forward the corrected delete_id event to the client
-            let mut builder = MessageBuilder::new();
-            builder.write_u32(guest_id);
-
-            queue_message(
-                &mut ctx.host_to_client_queue,
-                WL_DISPLAY_ID,
-                wl_display::EVT_DELETE_ID,
-                builder,
-            );
+            queue_delete_id(ctx, guest_id);
         }
         Action::Drop
     }

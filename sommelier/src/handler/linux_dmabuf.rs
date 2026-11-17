@@ -49,11 +49,10 @@ fn queue_message(
     sender_id: u32,
     opcode: u16,
     builder: MessageBuilder,
-    fds: Vec<RawFd>,
 ) -> bool {
     match builder.try_build_message(sender_id, opcode) {
         Ok(message) => {
-            queue.push((message, fds));
+            queue.push((message, Vec::new()));
             true
         }
         Err(error) => {
@@ -63,11 +62,6 @@ fn queue_message(
                 opcode,
                 error
             );
-            for fd in fds {
-                if fd >= 0 {
-                    let _ = nix::unistd::close(fd);
-                }
-            }
             false
         }
     }
@@ -271,12 +265,12 @@ fn build_synthetic_feedback_messages(
 ) -> io::Result<Vec<(Vec<u8>, Vec<RawFd>)>> {
     let (table_fd, table_size) = create_feedback_format_table(pairs)?;
     let mut pending = Vec::new();
+    // Only the array-carrying events can exceed the wire limit.
     let queue = |pending: &mut Vec<(Vec<u8>, Vec<RawFd>)>,
                  opcode: u16,
-                 builder: MessageBuilder,
-                 fds: Vec<RawFd>|
+                 builder: MessageBuilder|
      -> io::Result<()> {
-        if queue_message(pending, guest_id, opcode, builder, fds) {
+        if queue_message(pending, guest_id, opcode, builder) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -290,15 +284,9 @@ fn build_synthetic_feedback_messages(
     // compositors and allowing every following tranche index to refer to it.
     let mut format_table = MessageBuilder::new();
     format_table.write_u32(table_size);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
-        format_table,
-        vec![table_fd],
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
+    let format_table =
+        format_table.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE);
+    pending.push((format_table, vec![table_fd]));
 
     let mut main_device = MessageBuilder::new();
     main_device.write_array(device);
@@ -306,7 +294,6 @@ fn build_synthetic_feedback_messages(
         &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
         main_device,
-        Vec::new(),
     ) {
         close_queued_fds(&mut pending);
         return Err(error);
@@ -318,7 +305,6 @@ fn build_synthetic_feedback_messages(
         &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
         tranche_device,
-        Vec::new(),
     ) {
         close_queued_fds(&mut pending);
         return Err(error);
@@ -328,15 +314,9 @@ fn build_synthetic_feedback_messages(
     // zero flag is the conservative default tranche.
     let mut tranche_flags = MessageBuilder::new();
     tranche_flags.write_u32(0);
-    if let Err(error) = queue(
-        &mut pending,
-        zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS,
-        tranche_flags,
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
+    let tranche_flags =
+        tranche_flags.build_message(guest_id, zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS);
+    pending.push((tranche_flags, Vec::new()));
 
     for start in (0..pairs.len()).step_by(MAX_TRANCHE_INDICES_PER_EVENT) {
         let end = pairs
@@ -352,30 +332,18 @@ fn build_synthetic_feedback_messages(
             &mut pending,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
             tranche_formats,
-            Vec::new(),
         ) {
             close_queued_fds(&mut pending);
             return Err(error);
         }
     }
 
-    if let Err(error) = queue(
-        &mut pending,
+    for opcode in [
         zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
-        MessageBuilder::new(),
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
-    }
-    if let Err(error) = queue(
-        &mut pending,
         zwp_linux_dmabuf_feedback_v1::EVT_DONE,
-        MessageBuilder::new(),
-        Vec::new(),
-    ) {
-        close_queued_fds(&mut pending);
-        return Err(error);
+    ] {
+        let done = MessageBuilder::new().build_message(guest_id, opcode);
+        pending.push((done, Vec::new()));
     }
 
     Ok(pending)
@@ -832,7 +800,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
             builder,
-            Vec::new(),
         );
         Action::Drop
     }
@@ -855,7 +822,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
             builder,
-            Vec::new(),
         );
         Action::Drop
     }
@@ -998,7 +964,6 @@ impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmab
             guest_id,
             zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
             builder,
-            Vec::new(),
         );
 
         Action::Drop
@@ -1486,35 +1451,6 @@ mod tests {
             .insert(HostId(replacement_host_params_id), replacement);
 
         (ctx, handler, replacement_sync_fd, replacement_sync_identity)
-    }
-
-    #[test]
-    fn rejected_dmabuf_message_closes_attached_descriptors() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let attached_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(attached_fd >= 1000);
-        let attached_identity = fd_identity(attached_fd);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_array(&vec![0; u16::MAX as usize]);
-        let mut queue = Vec::new();
-        assert!(!super::queue_message(
-            &mut queue,
-            7,
-            0,
-            builder,
-            vec![attached_fd]
-        ));
-        assert!(queue.is_empty());
-        assert!(
-            !any_fd_has_identity(attached_identity),
-            "rejecting an oversized message must close its descriptors"
-        );
     }
 
     #[test]
