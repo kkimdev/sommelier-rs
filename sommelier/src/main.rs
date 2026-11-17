@@ -176,4 +176,3 @@ fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
         })
         .ok()
 }
-mod test_xkb;
