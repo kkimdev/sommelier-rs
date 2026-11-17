@@ -49,6 +49,11 @@ pub(crate) const SUPPORTED_SHM_FORMATS: [u32; 6] = [
     0x3432_4258, // WL_SHM_FORMAT_XBGR8888
 ];
 
+/// `wl_shm.error` codes. The generated protocol code has no enum constants.
+const WL_SHM_ERROR_INVALID_FORMAT: u32 = 0;
+const WL_SHM_ERROR_INVALID_STRIDE: u32 = 1;
+const WL_SHM_ERROR_INVALID_FD: u32 = 2;
+
 const MANDATORY_SHM_FORMATS: [u32; 2] = [
     0, // WL_SHM_FORMAT_ARGB8888
     1, // WL_SHM_FORMAT_XRGB8888
@@ -1054,7 +1059,7 @@ pub(crate) fn copy_shm_planes(src_ptr: *const u8, dst_ptr: *mut u8, layout: ShmC
 /// proxy has no object to service it.  Wayland errors terminate the connection,
 /// which is the only safe outcome once allocation has failed.
 fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'static str) {
-    queue_protocol_error(ctx, object_id, 2, message);
+    queue_protocol_error(ctx, object_id, WL_SHM_ERROR_INVALID_FD, message);
 }
 
 /// Undo the guest mapping after a host `wl_buffer` has already been queued.
@@ -1240,7 +1245,12 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 
         let Some(pool_size) = valid_pool_size(size) else {
             warn!("Rejecting invalid SHM pool size {}", size);
-            queue_protocol_error(ctx, ctx.last_sender_id, 1, "invalid wl_shm pool size");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                WL_SHM_ERROR_INVALID_STRIDE,
+                "invalid wl_shm pool size",
+            );
             return Action::Drop;
         };
         if !backing_fd_has_size(fd, pool_size) {
@@ -1248,7 +1258,12 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
                 "Rejecting SHM pool fd {} that is shorter than declared size {}",
                 fd, pool_size
             );
-            queue_protocol_error(ctx, ctx.last_sender_id, 2, "invalid wl_shm pool fd");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                WL_SHM_ERROR_INVALID_FD,
+                "invalid wl_shm pool fd",
+            );
             return Action::Drop;
         }
         debug!("Creating pool, fd={}", fd);
@@ -1260,7 +1275,12 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 
         if pool_fd < 0 {
             error!("Failed to dup FD for SHM pool");
-            queue_protocol_error(ctx, ctx.last_sender_id, 2, "invalid wl_shm pool fd");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                WL_SHM_ERROR_INVALID_FD,
+                "invalid wl_shm pool fd",
+            );
             return Action::Drop;
         }
 
@@ -1282,7 +1302,12 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             unsafe {
                 libc::close(pool_fd);
             }
-            queue_protocol_error(ctx, ctx.last_sender_id, 2, "invalid wl_shm pool fd");
+            queue_protocol_error(
+                ctx,
+                ctx.last_sender_id,
+                WL_SHM_ERROR_INVALID_FD,
+                "invalid wl_shm pool fd",
+            );
             return Action::Drop;
         }
 
@@ -1788,13 +1813,18 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             Some(p) => p.clone(),
             None => {
                 warn!("Unknown pool ID: {}", pool_id);
-                queue_protocol_error(ctx, pool_id, 2, "invalid wl_shm pool");
+                queue_protocol_error(ctx, pool_id, WL_SHM_ERROR_INVALID_FD, "invalid wl_shm pool");
                 return Action::Drop;
             }
         };
         if !supported_shm_format(format) || !guest_shm_format_available(ctx, format) {
             warn!("Rejecting unsupported SHM buffer format {:#010x}", format);
-            queue_protocol_error(ctx, pool_id, 0, "invalid wl_shm buffer format");
+            queue_protocol_error(
+                ctx,
+                pool_id,
+                WL_SHM_ERROR_INVALID_FORMAT,
+                "invalid wl_shm buffer format",
+            );
             return Action::Drop;
         }
         if !valid_shm_stride(format, width, stride) {
@@ -1802,7 +1832,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 "Rejecting SHM buffer stride {} for format {:#010x} and width {}",
                 stride, format, width
             );
-            queue_protocol_error(ctx, pool_id, 1, "invalid wl_shm buffer stride");
+            queue_protocol_error(
+                ctx,
+                pool_id,
+                WL_SHM_ERROR_INVALID_STRIDE,
+                "invalid wl_shm buffer stride",
+            );
             return Action::Drop;
         }
 
@@ -1821,7 +1856,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 "Rejecting invalid SHM buffer: pool={}, offset={}, width={}, height={}, stride={}, pool_size={}",
                 pool_id, offset, width, height, stride, pool_size
             );
-            queue_protocol_error(ctx, pool_id, 1, "invalid wl_shm buffer layout");
+            queue_protocol_error(
+                ctx,
+                pool_id,
+                WL_SHM_ERROR_INVALID_STRIDE,
+                "invalid wl_shm buffer layout",
+            );
             return Action::Drop;
         };
 
@@ -1877,7 +1917,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         "Rejecting non-growing SHM pool resize from {} to {}",
                         inner.size, size
                     );
-                    queue_protocol_error(ctx, pool_id, 1, "invalid wl_shm pool resize");
+                    queue_protocol_error(
+                        ctx,
+                        pool_id,
+                        WL_SHM_ERROR_INVALID_STRIDE,
+                        "invalid wl_shm pool resize",
+                    );
                     return Action::Drop;
                 };
                 if !backing_fd_has_size(pool.client_fd, new_size) {
@@ -1885,7 +1930,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                         "Rejecting SHM pool resize to {}: backing fd {} is too short",
                         new_size, pool.client_fd
                     );
-                    queue_protocol_error(ctx, pool_id, 2, "invalid wl_shm pool fd");
+                    queue_protocol_error(
+                        ctx,
+                        pool_id,
+                        WL_SHM_ERROR_INVALID_FD,
+                        "invalid wl_shm pool fd",
+                    );
                     return Action::Drop;
                 }
                 debug!(
@@ -1906,7 +1956,12 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                     // continues with the old mapping while believing that
                     // the pool has grown, and a later buffer request can
                     // address memory outside the mapped range.
-                    queue_protocol_error(ctx, pool_id, 2, "invalid wl_shm pool fd");
+                    queue_protocol_error(
+                        ctx,
+                        pool_id,
+                        WL_SHM_ERROR_INVALID_FD,
+                        "invalid wl_shm pool fd",
+                    );
                 } else {
                     inner.client_ptr = new_ptr;
                     inner.size = new_size;
