@@ -237,9 +237,10 @@ explains the ARC application-ID workaround it relies on.
 
 ## CI and release workflow
 
-The `virtwl` branch CI builds x86_64 and aarch64, runs executable tests on
-x86_64, compiles all test targets for aarch64, and checks formatting and
-Clippy. Successful pushes also upload debug binaries to
+The `virtwl` branch CI builds, tests, and checks formatting and Clippy on
+x86_64 and aarch64, each on a native GitHub-hosted Ubuntu 24.04 runner, with
+the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+Successful pushes also upload debug binaries to
 the Actions run and create non-release tags such as
 `virtwl-ci-<run-id>-<attempt>-<sha>`. Those artifacts expire after seven days;
 the cleanup job keeps the ten newest CI build runs by default. Set the
@@ -254,8 +255,8 @@ git tag -a virtwl-v0.2.6 personal/virtwl -m "Release virtwl-v0.2.6"
 git push personal refs/tags/virtwl-v0.2.6
 ```
 
-The release workflow builds both architectures on GitHub-hosted Ubuntu
-24.04 runners, runs the x86_64 regression suite, creates `SHA256SUMS`, and
+The release workflow builds both architectures on the same native runners,
+runs the regression suite on each, creates `SHA256SUMS`, and
 uploads all assets while the release is a draft. It publishes the
 prerelease only after both architecture builds succeed.
 The fork currently keeps `virtwl` as its only development branch.

@@ -1,0 +1,7 @@
+# The one Rust toolchain for CI and releases. rustup installs it on first
+# use; Clippy lints change between releases, so CI and local runs should
+# agree on this version. Dependabot does not bump it: update it deliberately.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,27 @@
+name: Set up the build environment
+description: >-
+  Install the system libraries Sommelier links against and the Rust
+  toolchain pinned in rust-toolchain.toml. Shared by CI and release.
+
+runs:
+  using: composite
+  steps:
+    - name: Install system libraries
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          libdrm-dev \
+          libexpat1-dev \
+          libgbm-dev \
+          libxkbcommon-dev \
+          pkg-config
+
+    - name: Install the pinned Rust toolchain
+      shell: bash
+      run: |
+        # Without arguments, rustup installs the toolchain named in
+        # rust-toolchain.toml.
+        rustup toolchain install
+        rustc --version
+        cargo clippy --version

@@ -18,60 +18,29 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        # Native builds on the same Ubuntu release as CI, so each binary is
+        # tested on its own architecture and links the same glibc baseline.
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install x86_64 dependencies
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            libdrm-dev \
-            libexpat1-dev \
-            libgbm-dev \
-            libxkbcommon-dev \
-            pkg-config
-
-      - name: Install aarch64 dependencies
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo sed -i 's/Types: deb/Types: deb\nArchitectures: amd64 i386/' /etc/apt/sources.list.d/ubuntu.sources
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
-          Types: deb
-          Architectures: arm64
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-security
-          Components: main universe restricted multiverse
-          EOF
-          sudo apt-get update
-          sudo apt-get install --yes \
-            gcc-aarch64-linux-gnu \
-            libdrm-dev:arm64 \
-            libexpat1-dev:arm64 \
-            libgbm-dev:arm64 \
-            libxkbcommon-dev:arm64 \
-            pkg-config
+      - uses: ./.github/actions/setup
 
       - name: Verify tag matches Cargo.toml
         shell: bash
         run: |
-          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "sommelier") | .version')"
           tag_version="${GITHUB_REF_NAME#virtwl-v}"
           base_tag_version="${tag_version%%-*}"
@@ -83,38 +52,26 @@ jobs:
             exit 1
           }
 
-      - name: Build release binary
-        shell: bash
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '1' || '0' }}
-          PKG_CONFIG_LIBDIR: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' || '/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig' }}
-        run: cargo build --release --verbose --target "${{ matrix.target }}"
+      - name: Run regression tests
+        run: cargo test --locked --workspace --all-targets -- --test-threads=1
 
-      - name: Run x86_64 regression tests
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --all-targets -- --test-threads=1
+      - name: Build release binary
+        run: cargo build --locked --release --package sommelier --verbose
 
       - name: Prepare release artifact
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          case "${TARGET}" in
-            x86_64-unknown-linux-gnu) short_arch=x86_64 ;;
-            aarch64-unknown-linux-gnu) short_arch=aarch64 ;;
-            *) echo "::error::Unsupported target ${TARGET}"; exit 1 ;;
-          esac
-
           version="${RELEASE_TAG#virtwl-}"
-          artifact="sommelier_rs_virtwl-${version}-${short_arch}"
-          install -Dm755 "target/${TARGET}/release/sommelier" "${artifact}"
+          artifact="sommelier_rs_virtwl-${version}-${ARCH}"
+          install -Dm755 target/release/sommelier "${artifact}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: virtwl-${{ matrix.target }}
+          name: virtwl-${{ matrix.arch }}
           path: sommelier_rs_virtwl-*
           if-no-files-found: error
           retention-days: 7
