@@ -64,6 +64,10 @@ const WL_COMPOSITOR_VERSION: u32 = 4;
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
+/// The `wl_shm` version the proxy offers the guest and binds on the host.
+/// The proxy implements the guest's `wl_shm` itself, as a v1 compatibility
+/// shim (`handler/shm.rs`), so a newer host or XML version is not offered.
+const WL_SHM_VERSION: u32 = 1;
 /// The `wl_output` ceiling; [`forwarded_global_version`] says why. The
 /// vendored XML is newer: v4 adds the `name` and `description` events.
 const WL_OUTPUT_VERSION: u32 = 3;
@@ -1017,38 +1021,44 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     name,
                     HostGlobal {
                         interface: interface.clone(),
-                        version: 1,
+                        version: WL_SHM_VERSION,
                     },
                 );
-                let visible = queue_synthetic_global(ctx, name, interface, 1);
+                let visible = queue_synthetic_global(ctx, name, interface, WL_SHM_VERSION);
                 record_registry_global_visibility(ctx, name, visible);
                 return Action::Drop;
             }
             // wl_shm is emulated: on_bind drops the guest request and sends synthetic
             // format events, so the host never sends wl_shm events to us. It is
             // nevertheless a live host object.
-            let host_id = ctx.shadow_table.create_host_only(interface, 1);
+            let host_id = ctx.shadow_table.create_host_only(interface, WL_SHM_VERSION);
             ctx.host_shm_id = Some(host_id);
             ctx.host_shm_global_name = Some(name);
             ctx.host_globals.insert(
                 name,
                 HostGlobal {
                     interface: interface.clone(),
-                    version: 1,
+                    version: WL_SHM_VERSION,
                 },
             );
 
             // Bind to wl_shm
             let registry_host_id = ctx.last_sender_id;
-            if let Err(end) = bind_internally(ctx, registry_host_id, name, interface, 1, host_id) {
+            if let Err(end) = bind_internally(
+                ctx,
+                registry_host_id,
+                name,
+                interface,
+                WL_SHM_VERSION,
+                host_id,
+            ) {
                 return end;
             }
 
-            // The SHM implementation is a v1 compatibility shim. Advertise
-            // the capped version explicitly instead of forwarding a host v2
-            // global: otherwise clients bind v2 and are rejected by
-            // `admit_guest_bind` even though v1 is fully supported.
-            let visible = queue_synthetic_global(ctx, name, interface, 1);
+            // Advertise the capped version explicitly instead of forwarding
+            // a host v2 global: otherwise clients bind v2 and are rejected
+            // by `admit_guest_bind`.
+            let visible = queue_synthetic_global(ctx, name, interface, WL_SHM_VERSION);
             record_registry_global_visibility(ctx, name, visible);
 
             return Action::Drop;
