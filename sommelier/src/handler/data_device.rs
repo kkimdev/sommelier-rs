@@ -216,6 +216,12 @@ enum Destination {
     Pipe(GuestPipe),
     /// A socket, written with `MSG_DONTWAIT`.
     Socket(AsyncFd<File>),
+    /// A regular file, such as a memfd, written directly. A local file
+    /// never waits on another process, but one on a network or FUSE file
+    /// system (virtiofs, 9p, NFS) can, and no flag prevents that. Its
+    /// writes are the only ones [`PUMP_IDLE_TIMEOUT`] does not bound: they
+    /// never report "would block", so there is no wait to time out.
+    File(File),
 }
 
 impl Destination {
@@ -232,11 +238,13 @@ impl Destination {
                 file,
                 Interest::WRITABLE,
             )?))
+        } else if kind.is_file() {
+            Ok(Self::File(file))
         } else {
-            // epoll cannot watch a regular file or a device.
+            // A device's write may sleep, and epoll cannot say when.
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "the guest's descriptor is not a pipe or a socket",
+                "the guest's descriptor is not a pipe, a socket or a regular file",
             ))
         }
     }
@@ -250,6 +258,10 @@ impl Destination {
                 let send = |socket: &File| Ok(send(socket.as_raw_fd(), data, flags)?);
                 wait_io(socket, Interest::WRITABLE, send).await
             }
+            Self::File(file) => retry_interrupted(|| {
+                let mut file: &File = file;
+                file.write(data)
+            }),
         }
     }
 }
@@ -566,8 +578,9 @@ mod tests {
         }
     }
 
-    /// A destination that is not a pipe or a socket, such as a device, is
-    /// refused, and dropping it lets the guest read EOF.
+    /// A destination that is not a pipe, a socket or a regular file, such
+    /// as a device whose write may sleep, is refused, and dropping it lets
+    /// the guest read EOF.
     #[tokio::test]
     async fn pump_refuses_a_character_device() {
         let (src, _src_writer) = io::pipe().unwrap();
@@ -625,6 +638,27 @@ mod tests {
         let mut received = Vec::new();
         dst_reader.read_to_end(&mut received).unwrap();
         assert_eq!(received.len(), capacity as usize, "the guest reads EOF");
+    }
+
+    /// A guest may receive into a regular file, such as a memfd, which the
+    /// pump writes directly.
+    #[tokio::test]
+    async fn pump_writes_into_a_regular_file() {
+        use std::io::{Seek, SeekFrom};
+        let data = Rng::new(3).bytes(1 << 20);
+        let (src, src_writer) = io::pipe().unwrap();
+        let mut file = crate::test_support::shm_pool_file(&[]);
+        let writer = write_on_a_thread(src_writer, &data);
+
+        pump(src.into(), file.try_clone().unwrap().into())
+            .await
+            .unwrap();
+
+        writer.join().unwrap();
+        let mut received = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut received).unwrap();
+        assert!(received == data, "the transfer must arrive intact");
     }
 
     #[test]
