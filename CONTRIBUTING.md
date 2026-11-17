@@ -51,7 +51,9 @@ request streams built from the vendored XML, some of them damaged, over
 real sockets. Half the cases end like a client typing into text fields
 (`proxy::fuzz::typing`): it moves the focus between its surfaces, waits
 for each move with a roundtrip, and enables, edits and disables the
-field. Each case must end without a panic or hang, close every
+field; now and then it releases its seat while the field is enabled,
+reuses the seat's ID for a surface once it is deleted, and disables the
+field, which the proxy can then no longer deactivate. Each case must end without a panic or hang, close every
 descriptor, and either answer the stream's closing `wl_display.sync` or
 send one `wl_display.error`, its last event. The fake compositor behind the proxy also checks
 that every request it receives comes from a live host object, creates
@@ -62,7 +64,7 @@ for each asynchronous dma-buf create), as weston does, destroys a
 destroyed surface's pending frame callbacks without `done`, and gives the
 keyboard focus to each surface the proxy commits. In a quarter of the
 cases it also destroys the live objects of one interface on its own as
-it answers a sync. After every batch that keeps the session, the proxy
+it answers some syncs. After every batch that keeps the session, the proxy
 must hold no state for an object that has ended
 (`Context::assert_no_orphans`). When a case's
 requests are whole and undamaged, the guest checks that it receives what
@@ -96,8 +98,8 @@ the cursor rectangle, or no active text input if the field was disabled.
 The expected content type comes from the proxy's own mapping, so this
 check finds ordering and state bugs, not mapping bugs; unit tests pin
 the mapping. The run reports how many fields it checked, how many
-activations the guest's plan deferred and how many input methods
-restarted.
+activations the guest's plan deferred, how many input methods
+restarted, and how many host activations outlived their seat.
 
 The suite runs 5000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:

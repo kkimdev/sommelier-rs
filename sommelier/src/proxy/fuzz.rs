@@ -22,7 +22,7 @@ limitations under the License.
 //! descriptors), mutates some requests, and writes the stream in random
 //! pieces over a socket to `Client::run`. Half the cases end like a client
 //! typing into text fields, switching the focus between surfaces and
-//! waiting for each with a roundtrip. The host peer is a compositor
+//! waiting for each with a roundtrip, and sometimes releasing its seat. The host peer is a compositor
 //! that advertised every global (and one `wl_output` it then removed, so a
 //! bind of it crosses the removal), answers each `wl_display.sync`, offers
 //! each new data device a selection and answers each asynchronous dma-buf
@@ -160,6 +160,8 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let deferred = DEFERRED_ACTIVATIONS.load(Ordering::Relaxed);
         let leaves = TEXT_INPUT_LEAVES.load(Ordering::Relaxed);
         let restarts = INPUT_METHOD_RESTARTS.load(Ordering::Relaxed);
+        let seatless = SEATLESS_ACTIVATIONS.load(Ordering::Relaxed);
+        let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
                 reused > 0,
@@ -189,12 +191,18 @@ fn guest_streams_cannot_crash_hang_or_leak() {
                 restarts > 0,
                 "no input method restarted while attached, so Exo's own detach went untested"
             );
+            assert!(
+                seatless > 0,
+                "no activation outlived its seat, so ending one without a seat went untested"
+            );
         }
         println!(
             "{cases} cases from seed {first_seed} passed: {outcomes:?}, {reused} host IDs reused, \
              {server_objects} guest server objects checked, {cancelled} frame callbacks cancelled, \
              {fields} text fields checked, {deferred} activations deferred, \
-             {leaves} text-input leaves sent, {restarts} input methods restarted"
+             {leaves} text-input leaves sent, {restarts} input methods restarted, \
+             {seatless} activations outlived their seat, \
+             {dead_seat_deactivates} deactivates named a destroyed seat"
         );
     });
 }
@@ -549,6 +557,7 @@ impl<'a> Guest<'a> {
                 .collect(),
             destroyed: BTreeSet::new(),
             cancelled: BTreeSet::new(),
+            reused: BTreeMap::new(),
             typed: None,
         };
         Self {
@@ -567,6 +576,14 @@ impl<'a> Guest<'a> {
         self.next_id += 1;
         self.objects.insert(id, (interface, version));
         self.view.interfaces.insert(id, interface.to_string());
+        id
+    }
+
+    /// Create an object of `interface` under `id`, an object the guest
+    /// destroyed and whose `delete_id` it has received.
+    fn reuse(&mut self, id: u32, interface: &'a str, version: u32) -> u32 {
+        self.objects.insert(id, (interface, version));
+        self.view.reused.insert(id, interface.to_string());
         id
     }
 
@@ -909,6 +926,9 @@ struct GuestView {
     /// The frame callbacks of surfaces the guest destroyed, which the
     /// compositor destroys with their surface.
     cancelled: BTreeSet<u32>,
+    /// The interface of each object the guest created under the ID of one
+    /// it destroyed, once that one's `delete_id` arrived.
+    reused: BTreeMap<u32, String>,
     /// What the guest's typing into text fields left, if it typed.
     typed: Option<typing::Typed>,
 }
@@ -1140,7 +1160,11 @@ fn check_guest_events(
                         .is_some_and(|interface| host_may_destroy(host_destroys, interface)),
                 "delete_id for guest object {id}, which was not destroyed, or a second one"
             );
-            interfaces.remove(&id);
+            // A reused ID names the new object from here on.
+            match guest.reused.get(&id) {
+                Some(interface) => interfaces.insert(id, interface),
+                None => interfaces.remove(&id),
+            };
             continue;
         }
         for arg in &event.args {
@@ -1416,7 +1440,7 @@ impl ServerIds {
 /// destroys a destroyed surface's frame callbacks (it never sends their
 /// `done`), gives the keyboard focus to each surface the proxy commits,
 /// with `host_destroys` destroys live objects of that interface on its own
-/// as it answers a sync ([`destroy_live_objects`]), answers a text input's
+/// as it answers some syncs ([`destroy_live_objects`]), answers a text input's
 /// drain barrier late (see below), and does nothing else, until the proxy
 /// closes the connection. Returns what Exo would hold then.
 ///
@@ -1454,6 +1478,8 @@ fn compositor(
     // Answers held back, and whether the last request was a deactivation.
     let mut held = Vec::new();
     let mut after_deactivate = false;
+    // The seat each active host text input was activated with.
+    let mut activations: BTreeMap<u32, u32> = BTreeMap::new();
     let mut server_ids = ServerIds {
         next: SERVER_ID_START,
         free: Vec::new(),
@@ -1528,6 +1554,19 @@ fn compositor(
             // changes nothing.
             if !zombie && !named.iter().any(|object| zombies.contains_key(object)) {
                 exo.request(&interface, sender, opcode, payload);
+            }
+            match (interface.as_str(), opcode) {
+                ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) if !zombie => {
+                    activations.insert(sender, named[0]);
+                }
+                ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE) => {
+                    // The proxy had not yet read the seat's delete_id.
+                    if zombies.contains_key(&named[0]) {
+                        DEACTIVATES_OF_DESTROYED_SEATS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    activations.remove(&sender);
+                }
+                _ => {}
             }
             let mut reply = Vec::new();
             // Objects the compositor creates in reply.
@@ -1607,7 +1646,7 @@ fn compositor(
             after_deactivate = (interface.as_str(), opcode)
                 == ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE);
             if sync {
-                if let Some(interface) = host_destroys {
+                if let Some(interface) = host_destroys.filter(|_| rng.one_in(3)) {
                     reply.extend(destroy_live_objects(
                         interface,
                         &mut objects,
@@ -1637,6 +1676,17 @@ fn compositor(
                     reply.push(delete_id(id));
                 }
             }
+            // An activation whose seat ended, released by the proxy or
+            // destroyed here, can never be deactivated: the proxy must end
+            // it on its own.
+            activations.retain(|text_input, seat| {
+                let live = objects.contains_key(text_input);
+                let seat_live = objects.get(seat).is_some_and(|seat| seat == "wl_seat");
+                if live && !seat_live {
+                    SEATLESS_ACTIVATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+                live && seat_live
+            });
             // A destroyed surface loses the focus without a `leave`.
             exo.forget(|id| objects.contains_key(&id));
             reply.extend(text_input_events(exo.take_events()));
@@ -1738,6 +1788,15 @@ fn destroy_live_objects(
         })
         .collect()
 }
+
+/// Host text-input activations whose seat ended before a `deactivate`, so
+/// that the proxy had to end them on its own, across all cases.
+static SEATLESS_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// `zwp_text_input_v1.deactivate` requests naming a seat the compositor
+/// had destroyed, whose `delete_id` the proxy had not read yet, across all
+/// cases.
+static DEACTIVATES_OF_DESTROYED_SEATS: AtomicU64 = AtomicU64::new(0);
 
 /// Input methods that went away while attached, as when their process
 /// restarts: one answer to a sync in eight takes them away. Across all

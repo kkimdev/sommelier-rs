@@ -92,6 +92,21 @@ impl Guest<'_> {
             for _ in 0..1 + self.rng.below(3) {
                 messages.extend(self.edit_field(text_input, &mut plan));
             }
+            // Now and then the guest releases the seat of an enabled field,
+            // which the proxy can then no longer deactivate. Its typing
+            // ends there, unchecked: Exo keeps the abandoned activation.
+            if plan.field.is_some()
+                && seat_version >= wl_seat::REQ_RELEASE_SINCE
+                && self.rng.one_in(4)
+            {
+                messages.extend(self.release_seat(
+                    seat,
+                    text_input,
+                    compositor,
+                    compositor_version,
+                ));
+                return messages;
+            }
         }
         // The closing sync follows.
         plan.release();
@@ -163,6 +178,31 @@ impl Guest<'_> {
             messages.extend(self.settle(plan));
         }
         messages
+    }
+
+    /// Release `seat`, wait for its `delete_id` with a roundtrip, reuse its
+    /// ID for a surface of `compositor`, and disable the field of
+    /// `text_input`: the proxy must end the field's host activation without
+    /// sending the reused ID as its seat.
+    fn release_seat(
+        &mut self,
+        seat: u32,
+        text_input: u32,
+        compositor: u32,
+        compositor_version: u32,
+    ) -> Vec<Message> {
+        use zwp_text_input_v3 as v3;
+        self.destroy(seat);
+        let release = request(seat, wl_seat::REQ_RELEASE, &[]);
+        let roundtrip = self.roundtrip();
+        let surface = self.reuse(seat, "wl_surface", compositor_version);
+        vec![
+            release,
+            roundtrip,
+            request(compositor, wl_compositor::REQ_CREATE_SURFACE, &[surface]),
+            request(text_input, v3::REQ_DISABLE, &[]),
+            request(text_input, v3::REQ_COMMIT, &[]),
+        ]
     }
 
     /// Now and then, a roundtrip after a focus change or a disable. Its
