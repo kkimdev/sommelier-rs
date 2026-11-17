@@ -25,13 +25,20 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
+            # Run the weston end-to-end test here; once is enough.
+            e2e: true
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            e2e: false
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - uses: ./.github/actions/setup
+
+      - name: Install the end-to-end test compositor and clients
+        if: matrix.e2e
+        run: sudo apt-get install --yes --no-install-recommends weston wayland-utils
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -43,6 +50,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run tests
+        env:
+          # Fail, rather than skip, if weston or a client is missing.
+          SOMMELIER_E2E_REQUIRED: ${{ matrix.e2e && '1' || '0' }}
         run: cargo test --locked --workspace --all-targets --verbose -- --test-threads=1
 
       - name: Prepare CI artifact

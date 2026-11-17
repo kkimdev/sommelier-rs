@@ -66,6 +66,16 @@ and `-- --nocapture` to see the proxy's log. The seed fixes the case's
 input, not its timing (how the pieces arrive, which side the proxy serves
 first), so replay a failing seed a few times before concluding it passes.
 
+## End-to-end test
+
+`sommelier/tests/weston_e2e.rs` runs real clients through
+`sommelier --local-compositor` against a headless weston: `wayland-info`
+must list the globals, and `weston-simple-shm` must draw for a few seconds
+and exit cleanly while the proxy logs no error. It needs `weston` and
+`wayland-info` on `PATH` (Debian and Ubuntu packages `weston` and
+`wayland-utils`) and passes with a note without them; CI installs them on
+x86_64 and sets `SOMMELIER_E2E_REQUIRED=1` so a missing one fails.
+
 ## Commit messages
 
 Make small commits, one logical change each, in the form
