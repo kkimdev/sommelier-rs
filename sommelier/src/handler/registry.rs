@@ -174,6 +174,47 @@ fn should_bind_internal_dmabuf(gpu_accel: bool, virtwl_supports_dmabuf: bool) ->
     gpu_accel || virtwl_supports_dmabuf
 }
 
+/// Whether a registry still lists global `name` at `generation`: it has not
+/// seen that advertisement's `global_remove` yet.
+fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64>) -> bool {
+    ctx.registry_global_names.iter().any(|(registry, names)| {
+        names.contains(&name)
+            && ctx
+                .registry_global_generations
+                .get(registry)
+                .and_then(|generations| generations.get(&name))
+                .copied()
+                == generation
+    })
+}
+
+/// Whether the host removed global `name` at `generation`, its current
+/// advertisement, as a registry has seen.
+fn global_removal_seen(ctx: &Context, name: u32, generation: u64) -> bool {
+    ctx.removed_global_generations.get(&name) == Some(&generation)
+        && ctx.global_generations.get(&name) == Some(&generation)
+}
+
+/// Retire global `name`, whose current advertisement the host removed,
+/// once no registry still lists it ([`global_still_seen`]): reset the
+/// internal binding it backed, and tombstone its connection-wide metadata,
+/// which blocks new binds.
+///
+/// `wl_registry.global_remove` invalidates only the *global name*. Any
+/// object that was already bound remains valid until its own destructor
+/// (the Wayland core protocol explicitly requires this), so an internal
+/// object keeps its ID and singleton state reserved, and queued host events
+/// cannot be routed to a later object that happens to reuse the ID.
+fn retire_unseen_global(ctx: &mut Context, name: u32) {
+    ctx.removed_global_generations.remove(&name);
+    reset_internal_binding_for_global(ctx, name);
+    let hidden = ctx.hidden_host_globals.remove(&name).is_some();
+    let advertised = ctx.host_globals.remove(&name).is_some();
+    if hidden || advertised {
+        ctx.removed_host_globals.insert(name);
+    }
+}
+
 fn next_global_generation(ctx: &mut Context) -> u64 {
     let generation = ctx.next_global_generation.max(1);
     ctx.next_global_generation = generation.wrapping_add(1).max(1);
@@ -458,6 +499,7 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
 /// Bound child objects remain in their own maps; only connection-wide global
 /// advertisement classification is replaced here.
 fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
+    ctx.removed_global_generations.remove(&name);
     ctx.host_globals.remove(&name);
     ctx.hidden_host_globals.remove(&name);
     ctx.removed_host_globals.remove(&name);
@@ -1073,55 +1115,21 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             .entry(registry_id)
             .or_default()
             .insert(name, inert_bind_version);
-        let still_seen = ctx.registry_global_names.iter().any(|(registry, names)| {
-            names.contains(&name)
-                && ctx
-                    .registry_global_generations
-                    .get(registry)
-                    .and_then(|generations| generations.get(&name))
-                    .copied()
-                    == current_generation
-        });
-        if removes_current_generation && !still_seen {
-            reset_internal_binding_for_global(ctx, name);
-        }
-        if ctx.hidden_host_globals.contains_key(&name) {
-            // `wl_registry.global_remove` invalidates only the *global name*.
-            // Any object that was already bound remains valid until its own
-            // destructor (the Wayland core protocol explicitly requires this).
-            // Keep the internal object's ID and singleton state reserved so
-            // queued host events cannot be routed to a later object that
-            // happens to reuse the ID.
-            if removes_current_generation && !still_seen {
-                ctx.removed_host_globals.insert(name);
-                ctx.hidden_host_globals.remove(&name);
-                ctx.host_globals.remove(&name);
+        if removes_current_generation {
+            if let Some(generation) = current_generation {
+                ctx.removed_global_generations.insert(name, generation);
             }
-            return if was_visible {
-                Action::Forward
-            } else {
-                Action::Drop
-            };
+            if !global_still_seen(ctx, name, current_generation) {
+                retire_unseen_global(ctx, name);
+            }
         }
         // Only globals previously exposed to the guest should generate a
         // matching removal event. Hidden/internal globals were never sent to
         // the guest and must not leak lifecycle notifications.
-        if ctx.host_globals.contains_key(&name) {
-            if removes_current_generation && !still_seen {
-                ctx.removed_host_globals.insert(name);
-                ctx.host_globals.remove(&name);
-            }
-            if was_visible {
-                Action::Forward
-            } else {
-                Action::Drop
-            }
+        if was_visible {
+            Action::Forward
         } else {
-            if was_visible {
-                Action::Forward
-            } else {
-                Action::Drop
-            }
+            Action::Drop
         }
     }
 
@@ -1234,7 +1242,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             bind_version,
             host_new_id,
         ) {
-            ctx.shadow_table.abandon(*guest_new_id);
+            ctx.abandon(*guest_new_id);
             return ctx.fail(format_args!(
                 "Failed to bind host {interface} for the guest"
             ));
@@ -1262,28 +1270,48 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
     }
 }
 
+/// Forget host registry `registry_host_id`, which ended (see
+/// `crate::state::lifecycle`): what it was advertised, and its hold on
+/// capability generations.
+///
+/// A global whose removal another registry has seen waits for every
+/// registry that still lists it (see `on_global_remove`). If this was the
+/// last one, it will never see the removal, so the global is retired now.
+pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
+    let generations = ctx
+        .registry_global_generations
+        .remove(&registry_host_id)
+        .unwrap_or_default();
+    let listed = ctx
+        .registry_global_names
+        .remove(&registry_host_id)
+        .unwrap_or_default();
+    ctx.registry_global_removed.remove(&registry_host_id);
+    ctx.registry_global_visibility.remove(&registry_host_id);
+    ctx.pending_dmabuf_globals
+        .retain(|pending| pending.registry_host_id != registry_host_id);
+    for name in listed {
+        let Some(&generation) = generations.get(&name) else {
+            continue;
+        };
+        if global_removal_seen(ctx, name, generation)
+            && !global_still_seen(ctx, name, Some(generation))
+        {
+            retire_unseen_global(ctx, name);
+        }
+    }
+    let generations: std::collections::HashSet<_> = generations.into_values().collect();
+    for generation in generations {
+        crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+    }
+}
+
 impl wl_fixes::WlFixesHandler for RegistryHandler {
     fn on_destroy_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
-        let registry_host_id = ctx.shadow_table.get_host_id(registry).unwrap_or(registry);
-        let generations = ctx
-            .registry_global_generations
-            .remove(&registry_host_id)
-            .into_iter()
-            .flat_map(|generations| generations.into_values())
-            .collect::<std::collections::HashSet<_>>();
-        ctx.registry_global_names.remove(&registry_host_id);
-        ctx.registry_global_removed.remove(&registry_host_id);
-        ctx.registry_global_visibility.remove(&registry_host_id);
-        ctx.pending_dmabuf_globals
-            .retain(|pending| pending.registry_host_id != registry_host_id);
-        for generation in generations {
-            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
-        }
-
         // wl_fixes destroys the registry passed as an object argument rather
         // than its own request sender. Reserve that guest/host mapping until
         // wl_display.delete_id acknowledges the host-side destruction.
-        ctx.shadow_table.guest_destroyed(registry);
+        ctx.guest_destroyed(registry);
         Action::Forward
     }
 }
@@ -2415,6 +2443,92 @@ mod tests {
         );
         assert!(ctx.is_fatal(), "registry 2 never saw name 10");
         assert_eq!(ctx.shadow_table.get_interface(21), None);
+    }
+
+    /// Registries 10 and 11 list global 7, a `wl_seat`, whose removal only
+    /// registry 10 has seen.
+    fn a_global_removed_from_one_of_two_registries() -> Context {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table
+            .insert_paired_for_test(10, 100, "wl_registry");
+        ctx.shadow_table
+            .insert_paired_for_test(11, 101, "wl_registry");
+        let seat = "wl_seat".to_string();
+        for registry in [100, 101] {
+            ctx.last_sender_id = registry;
+            assert_eq!(
+                RegistryHandler.on_global(&mut ctx, 7, &seat, 5),
+                Action::Forward
+            );
+        }
+        ctx.last_sender_id = 100;
+        assert_eq!(
+            RegistryHandler.on_global_remove(&mut ctx, 7),
+            Action::Forward
+        );
+        assert!(
+            ctx.host_globals.contains_key(&7),
+            "registry 11 has not seen the removal yet"
+        );
+        ctx.last_sender_id = 1;
+        ctx
+    }
+
+    /// O3: a global removed from one registry waits for every registry that
+    /// still lists it. Destroying the last of those through `wl_fixes`
+    /// means it never sees the removal, so the global is retired then.
+    #[test]
+    fn destroying_the_last_registry_to_list_a_removed_global_retires_it() {
+        let mut ctx = a_global_removed_from_one_of_two_registries();
+
+        assert_eq!(
+            RegistryHandler.on_destroy_registry(&mut ctx, 11),
+            Action::Forward
+        );
+
+        assert!(!ctx.host_globals.contains_key(&7));
+        assert!(ctx.removed_host_globals.contains(&7));
+    }
+
+    /// The removal stays on record when the only registry that saw it is
+    /// destroyed first, so destroying the last one still retires the
+    /// global.
+    #[test]
+    fn a_removal_outlives_the_registry_that_saw_it() {
+        let mut ctx = a_global_removed_from_one_of_two_registries();
+
+        assert_eq!(
+            RegistryHandler.on_destroy_registry(&mut ctx, 10),
+            Action::Forward
+        );
+        assert!(ctx.host_globals.contains_key(&7), "registry 11 lists it");
+        assert_eq!(
+            RegistryHandler.on_destroy_registry(&mut ctx, 11),
+            Action::Forward
+        );
+
+        assert!(!ctx.host_globals.contains_key(&7));
+        assert!(ctx.removed_host_globals.contains(&7));
+        assert!(ctx.removed_global_generations.is_empty());
+    }
+
+    /// A registry destroyed while a global is still advertised leaves it
+    /// to the other registries.
+    #[test]
+    fn destroying_a_registry_keeps_a_global_no_registry_saw_removed() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table
+            .insert_paired_for_test(10, 100, "wl_registry");
+        let mut handler = RegistryHandler;
+        let seat = "wl_seat".to_string();
+        ctx.last_sender_id = 100;
+        assert_eq!(handler.on_global(&mut ctx, 7, &seat, 5), Action::Forward);
+
+        ctx.last_sender_id = 1;
+        assert_eq!(handler.on_destroy_registry(&mut ctx, 10), Action::Forward);
+
+        assert!(ctx.host_globals.contains_key(&7));
+        assert!(!ctx.removed_host_globals.contains(&7));
     }
 
     #[test]

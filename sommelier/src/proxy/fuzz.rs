@@ -26,7 +26,8 @@ limitations under the License.
 //! each new data device a selection and answers each asynchronous dma-buf
 //! create with a buffer of its own, deletes each object the proxy
 //! destroys, and, as weston does, destroys a destroyed surface's pending
-//! frame callbacks without `done`.
+//! frame callbacks without `done`. In some cases it also destroys live
+//! objects of one interface on its own ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -35,6 +36,8 @@ limitations under the License.
 //!   `wl_display.sync` (the connection stayed healthy) or send the guest a
 //!   `wl_display.error` before closing it;
 //! - send the guest at most one `wl_display.error`, and nothing after it;
+//! - leave no state behind an ended object after any batch that keeps the
+//!   session (`Context::assert_no_orphans`);
 //! - send the host only what a real compositor accepts: requests from live
 //!   host objects with opcodes their interfaces have, fresh `new_id`s, and
 //!   object arguments naming live objects of the declared interface. The
@@ -43,8 +46,9 @@ limitations under the License.
 //! - when the guest's stream is whole and undamaged, send the guest only
 //!   what the proxy should send, which is stricter than what
 //!   libwayland-client tolerates: events from and naming only objects the
-//!   guest has, a `wl_display.delete_id` only for an object it destroyed or
-//!   a frame callback the compositor cancelled, once (and, in a healthy
+//!   guest has, a `wl_display.delete_id` only for an object it destroyed,
+//!   a frame callback the compositor cancelled, or an object the compositor
+//!   destroyed on its own, once (and, in a healthy
 //!   session, one for each cancelled callback), and objects the server
 //!   creates under fresh IDs from the server range.
 //!
@@ -133,6 +137,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let reused = HOST_IDS_REUSED.load(Ordering::Relaxed);
         let server_objects = GUEST_SERVER_OBJECTS.load(Ordering::Relaxed);
         let cancelled = FRAME_CALLBACKS_CANCELLED.load(Ordering::Relaxed);
+        let host_destroyed = LIVE_OBJECTS_HOST_DESTROYED.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
                 reused > 0,
@@ -145,6 +150,10 @@ fn guest_streams_cannot_crash_hang_or_leak() {
             assert!(
                 cancelled > 0,
                 "no case cancelled a frame callback, so host-destroyed objects went untested"
+            );
+            assert!(
+                host_destroyed > 0,
+                "the host destroyed no live object, so forgetting one went untested"
             );
         }
         println!(
@@ -393,8 +402,15 @@ struct Global {
 fn discover_globals(protocols: &Arc<Protocols>, config: Config) -> Vec<Global> {
     let callback = REGISTRY + 1;
     let sync = sync_request(callback).encode();
-    let events = exchange(protocols, config, vec![(sync, Vec::new())], true, callback)
-        .expect("the proxy answers a lone sync in time");
+    let events = exchange(
+        protocols,
+        config,
+        vec![(sync, Vec::new())],
+        true,
+        callback,
+        None,
+    )
+    .expect("the proxy answers a lone sync in time");
     frames(&events)
         .filter(|(header, _)| {
             (header.sender_id, header.opcode) == (REGISTRY, wl_registry::EVT_GLOBAL)
@@ -803,6 +819,9 @@ struct Case {
     /// What the guest knows of its objects, when its requests are whole
     /// and undamaged, so the events it receives can be checked.
     guest: Option<GuestView>,
+    /// The interface whose live objects the compositor destroys on its
+    /// own, if any (see [`HOST_DESTROYED`]).
+    host_destroys: Option<&'static str>,
 }
 
 /// The guest's objects, as its requests created and destroyed them.
@@ -883,11 +902,13 @@ impl Case {
                 }
             }
         }
+        let host_destroys = rng.one_in(4).then(|| *rng.pick(&HOST_DESTROYED));
         Self {
             sends,
             framed,
             callback,
             guest: (framed && mutations == 0).then_some(guest.view),
+            host_destroys,
         }
     }
 }
@@ -907,8 +928,15 @@ enum Outcome {
 fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed: u64) -> Outcome {
     let case = Case::generate(protocols, globals, seed);
     let framed = case.framed;
-    let events = exchange(protocols, config, case.sends, framed, case.callback)
-        .expect("the proxy answers or closes the connection in time");
+    let events = exchange(
+        protocols,
+        config,
+        case.sends,
+        framed,
+        case.callback,
+        case.host_destroys,
+    )
+    .expect("the proxy answers or closes the connection in time");
     let headers: Vec<_> = frames(&events)
         .map(|(header, _)| (header.sender_id, header.opcode))
         .collect();
@@ -926,7 +954,8 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
         headers.last()
     );
     if let Some(guest) = &case.guest {
-        check_guest_events(protocols, guest, &events, answered && !rejected);
+        let healthy = answered && !rejected;
+        check_guest_events(protocols, guest, &events, healthy, case.host_destroys);
     }
     match (framed, answered, rejected) {
         (false, ..) => Outcome::Unframed,
@@ -951,8 +980,15 @@ static GUEST_SERVER_OBJECTS: AtomicU64 = AtomicU64::new(0);
 /// every such frame callback gets one; and an object the server creates
 /// gets an ID from the server range that no guest object has. The guest
 /// never destroys an object the server created, so each needs an ID of its
-/// own.
-fn check_guest_events(protocols: &Protocols, guest: &GuestView, events: &[u8], healthy: bool) {
+/// own. When the compositor destroys live objects of an interface on its
+/// own (`host_destroys`), a `delete_id` may also name one of those.
+fn check_guest_events(
+    protocols: &Protocols,
+    guest: &GuestView,
+    events: &[u8],
+    healthy: bool,
+    host_destroys: Option<&str>,
+) {
     let mut interfaces: BTreeMap<u32, &str> = guest
         .interfaces
         .iter()
@@ -974,7 +1010,11 @@ fn check_guest_events(protocols: &Protocols, guest: &GuestView, events: &[u8], h
         if (sender, opcode) == (WL_DISPLAY_ID, wl_display::EVT_DELETE_ID) {
             let id = word(&mut message);
             assert!(
-                destroyed.remove(&id) || cancelled.remove(&id),
+                destroyed.remove(&id)
+                    || cancelled.remove(&id)
+                    || interfaces
+                        .get(&id)
+                        .is_some_and(|interface| host_may_destroy(host_destroys, interface)),
                 "delete_id for guest object {id}, which was not destroyed, or a second one"
             );
             interfaces.remove(&id);
@@ -1022,6 +1062,8 @@ fn check_guest_events(protocols: &Protocols, guest: &GuestView, events: &[u8], h
 /// Serve a guest that makes `sends` from one `Client` and return the events
 /// it received, or `None` if the proxy neither answered the guest's closing
 /// sync (`callback`) nor closed the connection within [`CASE_TIMEOUT`].
+/// With `host_destroys`, the compositor destroys live objects of that
+/// interface on its own (see [`compositor`]).
 ///
 /// Panics if the proxy panics, does not finish after the guest leaves, or
 /// sends the host a stream the wire cannot frame.
@@ -1031,6 +1073,7 @@ fn exchange(
     sends: Vec<(Vec<u8>, Vec<OwnedFd>)>,
     framed: bool,
     callback: u32,
+    host_destroys: Option<&'static str>,
 ) -> Option<Vec<u8>> {
     let deadline = Instant::now() + CASE_TIMEOUT;
     let (guest, proxy_guest) = UnixStream::pair().expect("guest socket pair");
@@ -1045,7 +1088,7 @@ fn exchange(
     });
     let compositor = {
         let protocols = Arc::clone(protocols);
-        std::thread::spawn(move || compositor(host, &protocols))
+        std::thread::spawn(move || compositor(host, &protocols, host_destroys))
     };
     let writer = {
         let guest = guest.try_clone().expect("clone the guest socket");
@@ -1085,6 +1128,7 @@ fn serve(guest: UnixStream, host: UnixStream, context: Context, globals: &[(Stri
             WaylandConnection::new(host.into()).expect("register the host socket"),
             context,
         );
+        client.check_orphans = true;
         let (get_registry, _) = wl_display::req::get_registry(WL_DISPLAY_ID, REGISTRY);
         client.client_conn.read_buf.extend(get_registry);
         assert!(client.handle_msgs(Direction::ClientToHost).await);
@@ -1212,7 +1256,10 @@ impl ServerIds {
 /// `zwp_linux_buffer_params_v1.create` with a `wl_buffer` it creates, sends
 /// `delete_id` after every destructor of an object the proxy created,
 /// destroys a destroyed surface's frame callbacks (it never sends their
-/// `done`), and does nothing else, until the proxy closes the connection.
+/// `done`), with `host_destroys` destroys live objects of that interface on
+/// its own as it answers a sync ([`destroy_live_objects`]), and does nothing
+/// else, until
+/// the proxy closes the connection.
 ///
 /// Panics on what a real compositor would refuse: a header the wire cannot
 /// frame, a request from an object the host does not have (never created,
@@ -1220,8 +1267,11 @@ impl ServerIds {
 /// still in use, or an object argument naming an object the host does not
 /// have or one of the wrong interface. Proxy-side ID translation bugs show
 /// up here.
-fn compositor(host: UnixStream, protocols: &Protocols) {
+fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&str>) {
     let mut objects = BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())]);
+    // Objects destroyed on their own, until their ID is reused (see
+    // `destroy_live_objects`).
+    let mut zombies = BTreeMap::new();
     let mut deleted = BTreeSet::new();
     // Each surface's frame callbacks, which never get `done` here.
     let mut frame_callbacks: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -1235,8 +1285,10 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
         for (header, payload) in frames(&requests[parsed..]) {
             parsed += header.len;
             let (sender, opcode) = (header.sender_id, header.opcode);
+            let zombie = zombies.contains_key(&sender);
             let interface = objects
                 .get(&sender)
+                .or_else(|| zombies.get(&sender))
                 .unwrap_or_else(|| panic!("a request from host object {sender}, which is gone"))
                 .clone();
             let request = protocols.requests[&interface]
@@ -1258,7 +1310,7 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
                     } => {
                         let object = word(&mut message);
                         named.push(object);
-                        let actual = objects.get(&object);
+                        let actual = objects.get(&object).or_else(|| zombies.get(&object));
                         assert!(
                             object == 0
                                 || actual.is_some_and(|actual| {
@@ -1286,6 +1338,7 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
                 if deleted.remove(&id) {
                     HOST_IDS_REUSED.fetch_add(1, Ordering::Relaxed);
                 }
+                zombies.remove(&id);
                 let previous = objects.insert(id, interface);
                 assert!(
                     previous.is_none(),
@@ -1320,12 +1373,27 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
                 let cancelled = frame_callbacks.remove(&sender).unwrap_or_default();
                 FRAME_CALLBACKS_CANCELLED.fetch_add(cancelled.len() as u64, Ordering::Relaxed);
                 ended.extend(cancelled);
-                ended.push(sender);
+                // A destroyed object's destructor crossed its delete_id.
+                if !zombie {
+                    ended.push(sender);
+                }
             }
-            if (interface.as_str(), opcode) == ("wl_fixes", wl_fixes::REQ_DESTROY_REGISTRY) {
+            // A registry the compositor destroyed already got its delete_id.
+            if (interface.as_str(), opcode) == ("wl_fixes", wl_fixes::REQ_DESTROY_REGISTRY)
+                && !zombies.contains_key(&named[0])
+            {
                 ended.push(named[0]);
             }
             if (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC) {
+                if let Some(interface) = host_destroys {
+                    reply.extend(destroy_live_objects(
+                        interface,
+                        &mut objects,
+                        &mut zombies,
+                        &mut frame_callbacks,
+                        &mut deleted,
+                    ));
+                }
                 let callback = WireMessage::new(sender, opcode, payload)
                     .read_u32()
                     .expect("a callback ID");
@@ -1355,6 +1423,84 @@ fn compositor(host: UnixStream, protocols: &Protocols) {
             "the proxy sent an invalid header"
         );
     }
+}
+
+/// Interfaces of objects that the compositor of a case that lets it
+/// destroys on its own, one interface per case, as a host may (see
+/// INVARIANTS "Object lifetimes"): the proxy pairs each with a guest object
+/// ([`guest_interface`]) and keeps per-object state for it. Only a
+/// `zwp_text_input_v1` can be an object only the proxy uses, once the guest
+/// has destroyed its v3 text input; its `delete_id` then changes nothing.
+const HOST_DESTROYED: [&str; 8] = [
+    "wl_registry",
+    "wl_output",
+    "wl_keyboard",
+    "wl_surface",
+    "wp_viewport",
+    "xdg_surface",
+    "xdg_toplevel",
+    "zwp_text_input_v1",
+];
+
+/// The interface of the guest object a host object of `host` stands for.
+fn guest_interface(host: &str) -> &str {
+    match host {
+        "zwp_text_input_v1" => "zwp_text_input_v3",
+        _ => host,
+    }
+}
+
+/// Live objects the compositor destroyed on its own, across all cases.
+static LIVE_OBJECTS_HOST_DESTROYED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a compositor that destroys live host objects of `destroyed` on
+/// its own may destroy the guest's object of `interface`: one of those, or
+/// the frame callback of a surface it destroyed.
+fn host_may_destroy(destroyed: Option<&str>, interface: &str) -> bool {
+    destroyed.is_some_and(|destroyed| {
+        interface == guest_interface(destroyed)
+            || (destroyed == "wl_surface" && interface == "wl_callback")
+    })
+}
+
+/// Destroy every live object of `interface` the proxy created, each
+/// surface's frame callbacks first, as a compositor destroys a surface.
+///
+/// Requests the proxy sent before it reads their `delete_id` may still come
+/// from or name these objects, where a real compositor would raise an
+/// error; they stay `zombies` until their ID is reused, and such requests
+/// change nothing.
+///
+/// # Returns
+///
+/// The `delete_id` of each destroyed object.
+fn destroy_live_objects(
+    interface: &str,
+    objects: &mut BTreeMap<u32, String>,
+    zombies: &mut BTreeMap<u32, String>,
+    frame_callbacks: &mut BTreeMap<u32, Vec<u32>>,
+    deleted: &mut BTreeSet<u32>,
+) -> Vec<Vec<u8>> {
+    let destroyed: Vec<u32> = objects
+        .iter()
+        .filter(|&(&id, live)| id < SERVER_ID_START && live == interface)
+        .map(|(&id, _)| id)
+        .collect();
+    LIVE_OBJECTS_HOST_DESTROYED.fetch_add(destroyed.len() as u64, Ordering::Relaxed);
+    let callbacks: Vec<u32> = destroyed
+        .iter()
+        .flat_map(|surface| frame_callbacks.remove(surface).unwrap_or_default())
+        .collect();
+    callbacks
+        .into_iter()
+        .chain(destroyed)
+        .map(|id| {
+            let interface = objects.remove(&id).expect("a live object");
+            zombies.insert(id, interface);
+            deleted.insert(id);
+            delete_id(id)
+        })
+        .collect()
 }
 
 /// `wl_display.delete_id(id)`.

@@ -107,7 +107,16 @@ pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, generation: u64) -> 
 }
 
 pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation: u64) {
-    let referenced = ctx.host_dmabuf_generation == Some(generation)
+    if !capability_generation_held(ctx, generation) {
+        ctx.dmabuf_capabilities.remove(&generation);
+    }
+}
+
+/// Whether anything still holds capability generation `generation`: the
+/// host's current global, a sync awaiting its formats, a guest factory or
+/// synthetic feedback, or a bind waiting for its formats.
+pub(crate) fn capability_generation_held(ctx: &Context, generation: u64) -> bool {
+    ctx.host_dmabuf_generation == Some(generation)
         || ctx.internal_callbacks.awaits_dmabuf_generation(generation)
         || ctx
             .dmabuf_guest_generations
@@ -120,10 +129,7 @@ pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation:
         || ctx
             .pending_dmabuf_globals
             .iter()
-            .any(|pending| pending.generation == generation);
-    if !referenced {
-        ctx.dmabuf_capabilities.remove(&generation);
-    }
+            .any(|pending| pending.generation == generation)
 }
 
 fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u32)> {
@@ -504,14 +510,41 @@ impl LinuxDmabufHandler {
     }
 }
 
-impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        if let Some(generation) = ctx.dmabuf_guest_generations.remove(&ctx.last_sender_id) {
-            maybe_reclaim_capability_generation(ctx, generation);
-        }
-        Action::Forward
+/// Forget guest `zwp_linux_dmabuf_v1` `factory_id`, which ended (see
+/// `crate::state::lifecycle`), and its hold on a capability generation.
+pub(crate) fn forget_factory(ctx: &mut Context, factory_id: u32) {
+    if let Some(generation) = ctx.dmabuf_guest_generations.remove(&factory_id) {
+        maybe_reclaim_capability_generation(ctx, generation);
     }
+}
 
+/// Forget synthetic guest `zwp_linux_dmabuf_feedback_v1` `feedback_id`,
+/// which ended (see `crate::state::lifecycle`), and its hold on a
+/// capability generation.
+pub(crate) fn forget_feedback(ctx: &mut Context, feedback_id: u32) {
+    if let Some(generation) = ctx.synthetic_feedback_objects.remove(&feedback_id) {
+        ctx.synthetic_feedback_refresh_pending.remove(&feedback_id);
+        maybe_reclaim_capability_generation(ctx, generation);
+    }
+}
+
+/// Forget guest `zwp_linux_buffer_params_v1` `params_id`, which ended (see
+/// `crate::state::lifecycle`), with its planes.
+///
+/// The host may still emit the created/failed event it owes before it
+/// processes params.destroy; `on_created` and `on_failed` recognize it by
+/// the guest's pending destructor. Removing the pending generation of the
+/// host object `host_params_id` closes its synchronization descriptor
+/// immediately.
+pub(crate) fn forget_params(ctx: &mut Context, params_id: u32, host_params_id: Option<u32>) {
+    ctx.used_dmabuf_params.remove(&params_id);
+    if let Some(host_params_id) = host_params_id {
+        ctx.pending_native_creates.remove(&HostId(host_params_id));
+    }
+    ctx.pending_params.remove(&params_id);
+}
+
+impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
     fn on_create_params(&mut self, ctx: &mut Context, params_id: u32) -> Action {
         ctx.used_dmabuf_params.remove(&params_id);
         // Reusing a params ID is a protocol violation; replacing the stale
@@ -634,33 +667,14 @@ impl zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler for LinuxDmabufHandler {
 /// host event of the interface can therefore arrive, and only the guest's
 /// destructor needs handling.
 impl zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1Handler for LinuxDmabufHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        // The generated dispatcher completes the local object's destructor.
-        let guest_id = ctx.last_sender_id;
-        if let Some(generation) = ctx.synthetic_feedback_objects.remove(&guest_id) {
-            ctx.synthetic_feedback_refresh_pending.remove(&guest_id);
-            maybe_reclaim_capability_generation(ctx, generation);
-        }
+    fn on_destroy(&mut self, _ctx: &mut Context) -> Action {
+        // The generated dispatcher completes the local object's destructor
+        // (see `forget_feedback`).
         Action::Drop
     }
 }
 
 impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let id = ctx.last_sender_id;
-        ctx.used_dmabuf_params.remove(&id);
-        if let Some(host_id) = ctx.shadow_table.get_host_id(id) {
-            // The host may still emit the created/failed event it owes
-            // before it processes params.destroy; `on_created` and
-            // `on_failed` recognize it by the guest's pending destructor.
-            // Removing the pending generation here closes its
-            // synchronization descriptor immediately.
-            ctx.pending_native_creates.remove(&HostId(host_id));
-        }
-        ctx.pending_params.remove(&id);
-        Action::Forward
-    }
-
     fn on_add(
         &mut self,
         ctx: &mut Context,
@@ -1194,7 +1208,7 @@ mod tests {
             Action::Drop
         );
 
-        ctx.shadow_table.release_deleted_host_id(20);
+        ctx.release_deleted_host_id(20);
         ctx.shadow_table
             .insert_paired_with_version_for_test(11, 21, "zwp_linux_dmabuf_v1", 3);
         ctx.last_sender_id = 21;
@@ -1826,12 +1840,8 @@ mod tests {
             pending_native_create(guest_params_id, (16, 8)),
         );
         ctx.last_sender_id = guest_params_id;
-        let mut handler = LinuxDmabufHandler;
 
-        assert_eq!(
-            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
+        ctx.guest_destroyed(guest_params_id);
         assert!(ctx.pending_native_creates.is_empty());
     }
 
@@ -1853,14 +1863,10 @@ mod tests {
         );
         let mut handler = LinuxDmabufHandler;
         ctx.last_sender_id = guest_params_id;
-        assert_eq!(
-            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
         // This is what the generated params.destroy dispatcher records after
         // forwarding a destroy request, before the delayed created event can
         // arrive from the host.
-        ctx.shadow_table.guest_destroyed(guest_params_id);
+        ctx.guest_destroyed(guest_params_id);
 
         ctx.last_sender_id = host_params_id;
         let payload = host_buffer_id.to_ne_bytes();
@@ -1915,19 +1921,15 @@ mod tests {
         let sync_identity = fd_identity(pending.sync_fds[0].as_raw_fd());
         ctx.pending_native_creates
             .insert(HostId(host_params_id), pending);
-        let mut handler = LinuxDmabufHandler;
         ctx.last_sender_id = guest_params_id;
-        assert_eq!(
-            ZwpLinuxBufferParamsV1Handler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
+        ctx.guest_destroyed(guest_params_id);
         assert!(
             !any_fd_has_identity(sync_identity),
             "destroying the params must close its generation's synchronization descriptor"
         );
         // The generated dispatcher records the guest destructor after the
         // handler returns.
-        ctx.shadow_table.guest_destroyed(guest_params_id);
+        ctx.guest_destroyed(guest_params_id);
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
 
         // The host destroyed the params object before emitting created or

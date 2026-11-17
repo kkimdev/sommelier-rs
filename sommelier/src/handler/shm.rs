@@ -1292,17 +1292,21 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 
         Action::Drop
     }
+}
 
-    fn on_release(&mut self, ctx: &mut Context) -> Action {
-        // Synthetic wl_shm is local-only. The generated dispatcher emits the
-        // guest delete_id after this handler returns, but it cannot know about
-        // the per-object capability cache. Clear it first so a later guest ID
-        // reuse cannot receive stale format events from this dead object.
-        let guest_id = ctx.last_sender_id;
-        ctx.shm_guest_formats.remove(&guest_id);
-        ctx.stale_shm_guest_objects.remove(&guest_id);
-        Action::Forward
-    }
+/// Forget synthetic guest `wl_shm` `shm_id`, which ended (see
+/// `crate::state::lifecycle`), so a later guest ID reuse cannot receive
+/// stale format events from it.
+pub(crate) fn forget_shm(ctx: &mut Context, shm_id: u32) {
+    ctx.shm_guest_formats.remove(&shm_id);
+    ctx.stale_shm_guest_objects.remove(&shm_id);
+}
+
+/// Forget synthetic guest `wl_shm_pool` `pool_id`, which ended (see
+/// `crate::state::lifecycle`), and close its file.
+pub(crate) fn forget_pool(ctx: &mut Context, pool_id: u32) {
+    ctx.pools.remove(&pool_id);
+    ctx.stale_shm_pools.remove(&pool_id);
 }
 
 /// A `wl_shm_pool.create_buffer` request that passed protocol validation.
@@ -1845,12 +1849,9 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         }
     }
 
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let pool_id = ctx.last_sender_id;
-        ctx.pools.remove(&pool_id);
-        ctx.stale_shm_pools.remove(&pool_id);
-        // The synthetic guest object's delete_id is queued by the generated
-        // local-only destructor path after this handler returns.
+    fn on_destroy(&mut self, _ctx: &mut Context) -> Action {
+        // The generated local-only destructor path ends the synthetic pool
+        // (see `forget_pool`) and queues its guest delete_id.
         Action::Drop
     }
 
@@ -1926,7 +1927,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
                     "Render buffer {guest_id} could not enter guest-destroyed state"
                 ));
             }
-            ctx.shadow_table.guest_destroyed_in_use(guest_id);
+            ctx.guest_destroyed_in_use(guest_id);
             return Action::Drop;
         }
 
@@ -2026,7 +2027,7 @@ mod tests {
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.guest_destroyed_in_use(guest_id);
+        ctx.guest_destroyed_in_use(guest_id);
     }
 
     fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {
@@ -3009,13 +3010,7 @@ mod tests {
             "a stale pool must not allocate a host buffer through replacement SHM"
         );
 
-        assert_eq!(
-            crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_destroy(
-                &mut handler,
-                &mut ctx
-            ),
-            Action::Drop
-        );
+        assert!(ctx.local_destroyed(30));
         assert!(!ctx.pools.contains_key(&30));
         assert!(!ctx.stale_shm_pools.contains(&30));
     }

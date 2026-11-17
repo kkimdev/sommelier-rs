@@ -379,6 +379,80 @@ fn copy_to_host_storage(
     })
 }
 
+/// Release the host Aura objects of a wl_surface that is ending: the Aura
+/// toplevels of its xdg roles, which end with it, and its Aura surface.
+///
+/// They must reach the host before the wl_surface destructor (see
+/// `aura_objects::release`), so the destructor's handler releases them
+/// before it queues that, and [`forget_surface`] finds nothing left to
+/// release.
+fn release_surface_aura_objects(
+    ctx: &mut Context,
+    wl_surface_guest_id: u32,
+    wl_surface_host_id: u32,
+) {
+    // xdg objects are separate guest objects, but their roles resolve back
+    // to this wl_surface. End them now so a later client ID reuse cannot
+    // associate a new toplevel with the destroyed surface.
+    for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
+        window_placement::release_toplevel(ctx, xdg_toplevel_id);
+    }
+    aura_objects::release_host_zaura_surface(ctx, wl_surface_host_id);
+}
+
+/// Forget guest wl_surface `wl_surface_guest_id` and its host object
+/// `wl_surface_host_id`, which ended (see `crate::state::lifecycle`): its
+/// roles and Aura objects, its ARC identity, outputs, GTK surfaces,
+/// viewports and pixel state, the buffer uses it held, and its keyboard
+/// focus, which ends with a text-input leave while the guest surface ID is
+/// still valid.
+pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_surface_host_id: u32) {
+    release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
+    ctx.window_placement.forget_surface(wl_surface_guest_id);
+    ctx.outputs.surface_destroyed(wl_surface_host_id);
+    let gtk_surface_ids = ctx
+        .gtk_surfaces
+        .iter()
+        .filter_map(|(&gtk_surface_id, state)| {
+            (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
+        })
+        .collect::<Vec<_>>();
+    for gtk_surface_id in gtk_surface_ids {
+        if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
+            if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
+                shell.surfaces.remove(&gtk_surface_id);
+            }
+        }
+    }
+    // A submitted buffer may have been detached from another surface and
+    // still be waiting for wl_buffer.release; only buffers that this host
+    // surface actually held may be retired merely because its destructor
+    // is ordered ahead of the buffer destructor.
+    let destroyed_surface_buffer = ctx
+        .surfaces
+        .remove(&wl_surface_guest_id)
+        .and_then(|surface| surface.current_buffer_id());
+    ctx.forget_surface_buffer_copies(wl_surface_guest_id);
+    crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
+    // Pending-only objects do not receive a host release event. Retire
+    // every buffer made eligible by removing this surface in one pass.
+    crate::handler::shm::retire_eligible_buffers(ctx);
+    ctx.viewport_to_wl_surface
+        .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
+    ctx.key_generations
+        .clear_peek_watermarks_for_surface(wl_surface_guest_id);
+    // Surface destruction can race the host's wl_keyboard.leave event.
+    // Transition the authoritative registry first, then emit the mandatory
+    // v3 leave while the guest surface ID is still valid. A later host leave
+    // matches no live generation and is idempotent.
+    let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
+    crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
+    crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
+    for keyboard_id in focus_update.retired_keyboards {
+        ctx.key_generations.clear_keyboard(keyboard_id);
+    }
+}
+
 impl WlSurfaceHandler for CompositorHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let wl_surface_guest_id = ctx.last_sender_id;
@@ -387,71 +461,17 @@ impl WlSurfaceHandler for CompositorHandler {
                 "Unable to destroy wl_surface {wl_surface_guest_id} without its host generation"
             ));
         };
-        // Keep the references owned by this surface before removing its
-        // state. A submitted buffer may have been detached from another
-        // surface and still be waiting for wl_buffer.release; only buffers
-        // that this host surface actually held may be retired merely because
-        // its destructor is ordered ahead of the buffer destructor.
-        let destroyed_surface_buffer = ctx
-            .surfaces
-            .get(&wl_surface_guest_id)
-            .and_then(|surface| surface.current_buffer_id());
-        // xdg objects are separate guest objects, but their roles resolve
-        // back to this wl_surface. End them now so a later client ID reuse
-        // cannot associate a new toplevel with the destroyed surface. Their
-        // Aura toplevels and the Aura surface go before the wl_surface
-        // destructor queued below (see `aura_objects::release`).
-        for xdg_toplevel_id in ctx.xdg_roles.remove_wl_surface(wl_surface_guest_id) {
-            window_placement::release_toplevel(ctx, xdg_toplevel_id);
-        }
-        // Retire the surface's ARC identity and release the host Aura
-        // surface created for it.
-        ctx.window_placement.forget_surface(wl_surface_guest_id);
-        aura_objects::release_host_zaura_surface(ctx, wl_surface_host_id);
-        ctx.outputs.surface_destroyed(wl_surface_host_id);
-        let gtk_surface_ids = ctx
-            .gtk_surfaces
-            .iter()
-            .filter_map(|(&gtk_surface_id, state)| {
-                (state.wl_surface_id == wl_surface_guest_id).then_some(gtk_surface_id)
-            })
-            .collect::<Vec<_>>();
-        for gtk_surface_id in gtk_surface_ids {
-            if let Some(state) = ctx.gtk_surfaces.remove(&gtk_surface_id) {
-                if let Some(shell) = ctx.gtk_shells.get_mut(&state.shell_id) {
-                    shell.surfaces.remove(&gtk_surface_id);
-                }
-            }
-        }
         // The generated dispatcher cannot express the ordering required by
-        // the aura-shell integration: zaura_surface.release must precede the
-        // paired wl_surface destructor.
+        // the aura-shell integration: the Aura objects' releases precede the
+        // wl_surface destructor, and what ending the surface sends follows
+        // it (see `forget_surface`).
+        release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
         ctx.client_to_host_queue
             .push(wl_surface::req::destroy(wl_surface_host_id));
-        ctx.surfaces.remove(&ctx.last_sender_id);
-        ctx.forget_surface_buffer_copies(wl_surface_guest_id);
-        crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
-        // Pending-only objects do not receive a host release event. Retire
-        // every buffer made eligible by removing this surface in one pass.
-        crate::handler::shm::retire_eligible_buffers(ctx);
-        ctx.viewport_to_wl_surface
-            .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
-        ctx.key_generations
-            .clear_peek_watermarks_for_surface(wl_surface_guest_id);
-        // Surface destruction can race the host's wl_keyboard.leave event.
-        // Transition the authoritative registry first, then emit the
-        // mandatory v3 leave while the guest surface ID is still valid. A
-        // later host leave matches no live generation and is idempotent.
-        let focus_update = ctx.keyboard_focus.destroy_surface(wl_surface_guest_id);
-        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
-        crate::handler::text_input::repair_destroyed_surface_focus(ctx, wl_surface_guest_id);
-        for keyboard_id in focus_update.retired_keyboards {
-            ctx.key_generations.clear_keyboard(keyboard_id);
-        }
-        // The host destructor is queued above. Retain the numeric mapping
-        // until the host acknowledges it with wl_display.delete_id so the
-        // guest can safely reuse the ID only after that acknowledgement.
-        ctx.shadow_table.guest_destroyed(wl_surface_guest_id);
+        // Retain the numeric mapping until the host acknowledges the
+        // destructor with wl_display.delete_id, so the guest can safely
+        // reuse the ID only after that acknowledgement.
+        ctx.guest_destroyed(wl_surface_guest_id);
         Action::Drop
     }
 
@@ -808,15 +828,16 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
             .destination = (!unset).then_some((width, height));
         Action::Forward
     }
+}
 
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let viewport_id = ctx.last_sender_id;
-        if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                surface.pending.viewport = Some(None);
-            }
+/// Forget guest `wp_viewport` `viewport_id`, which ended (see
+/// `crate::state::lifecycle`): its surface's next commit removes the
+/// viewport.
+pub(crate) fn forget_viewport(ctx: &mut Context, viewport_id: u32) {
+    if let Some(surface_id) = ctx.viewport_to_wl_surface.remove(&viewport_id) {
+        if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
+            surface.pending.viewport = Some(None);
         }
-        Action::Forward
     }
 }
 
@@ -838,20 +859,28 @@ impl crate::protocols::xdg_shell::xdg_wm_base::XdgWmBaseHandler for CompositorHa
     }
 }
 
-impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
-    fn on_destroy(&mut self, ctx: &mut Context) -> Action {
-        let xdg_surface_id = ctx.last_sender_id;
-        // Destroying an xdg_surface before its xdg_toplevel is a protocol
-        // error (`xdg_surface.defunct_role_object`) that ends the session,
-        // so the order of the forwarded destructor and the queued Aura
-        // release does not matter. End the role anyway, so the toplevel's
-        // later requests cannot reach an unrelated surface after ID reuse.
-        if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
-            window_placement::release_toplevel(ctx, xdg_toplevel_id);
-        }
-        Action::Forward
+/// Forget guest `xdg_surface` `xdg_surface_id`, which ended (see
+/// `crate::state::lifecycle`), with the role of its toplevel.
+///
+/// Destroying an xdg_surface before its xdg_toplevel is a protocol error
+/// (`xdg_surface.defunct_role_object`) that ends the session, so the order
+/// of the forwarded destructor and the queued Aura release does not matter.
+/// The role ends anyway, so the toplevel's later requests cannot reach an
+/// unrelated surface after ID reuse.
+pub(crate) fn forget_xdg_surface(ctx: &mut Context, xdg_surface_id: u32) {
+    if let Some(xdg_toplevel_id) = ctx.xdg_roles.remove_xdg_surface(xdg_surface_id) {
+        window_placement::release_toplevel(ctx, xdg_toplevel_id);
     }
+}
 
+/// Forget guest `xdg_toplevel` `xdg_toplevel_id`, which ended (see
+/// `crate::state::lifecycle`), and release its Aura toplevel.
+pub(crate) fn forget_xdg_toplevel(ctx: &mut Context, xdg_toplevel_id: u32) {
+    window_placement::release_toplevel(ctx, xdg_toplevel_id);
+    ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
+}
+
+impl crate::protocols::xdg_shell::xdg_surface::XdgSurfaceHandler for CompositorHandler {
     fn on_configure(&mut self, ctx: &mut Context, serial: u32) -> Action {
         let host_xdg_surface_id = ctx.last_sender_id;
         let Some(guest_xdg_surface_id) = ctx.shadow_table.get_guest_id(host_xdg_surface_id) else {
@@ -880,14 +909,13 @@ impl crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler for Composito
                 "Unable to destroy xdg_toplevel {xdg_toplevel_id} without its host generation"
             ));
         };
-        // The Aura toplevel goes before the role destructor (see
-        // `aura_objects::release`). Retain the guest ID until the host
+        // Ending the toplevel releases its Aura toplevel (see
+        // `forget_xdg_toplevel`), which goes before the role destructor (see
+        // `aura_objects::release`). The guest ID is retained until the host
         // acknowledges the role destructor.
-        window_placement::release_toplevel(ctx, xdg_toplevel_id);
+        ctx.guest_destroyed(xdg_toplevel_id);
         ctx.client_to_host_queue
             .push(xdg_toplevel::req::destroy(host_xdg_toplevel_id));
-        ctx.xdg_roles.remove_toplevel(xdg_toplevel_id);
-        ctx.shadow_table.guest_destroyed(xdg_toplevel_id);
         Action::Drop
     }
 
@@ -1121,7 +1149,7 @@ mod tests {
             3,
         );
         ctx.outputs.bind_for_test(output_host, Default::default());
-        ctx.shadow_table.guest_destroyed(output_guest);
+        ctx.guest_destroyed(output_guest);
 
         let payload = output_host.to_ne_bytes();
         for opcode in [EVT_ENTER, EVT_LEAVE] {
@@ -1530,7 +1558,7 @@ mod tests {
 
     fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
         assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.shadow_table.guest_destroyed_in_use(guest_id);
+        ctx.guest_destroyed_in_use(guest_id);
     }
 
     /// Only a paired or local object can send a request or be named in one:
@@ -2964,7 +2992,7 @@ mod tests {
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
-        ctx.shadow_table.release_deleted_host_id(200);
+        ctx.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
@@ -3418,6 +3446,9 @@ mod tests {
             handler.on_get_viewport(&mut ctx, 700, surface_id),
             Action::Forward
         );
+        // The generated dispatcher pairs the forwarded viewport.
+        ctx.shadow_table
+            .insert_paired_for_test(700, 701, "wp_viewport");
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert!(ctx
             .surfaces
@@ -3425,11 +3456,7 @@ mod tests {
             .and_then(|surface| surface.viewport)
             .is_some());
 
-        ctx.last_sender_id = 700;
-        assert_eq!(
-            WpViewportHandler::on_destroy(&mut handler, &mut ctx),
-            Action::Forward
-        );
+        ctx.guest_destroyed(700);
         assert!(
             ctx.surfaces
                 .get(&surface_id)

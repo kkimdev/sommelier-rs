@@ -419,6 +419,13 @@ impl OutputRegistry {
     pub(crate) fn is_empty_for_test(&self) -> bool {
         self.records.is_empty() && self.surface_outputs.is_empty()
     }
+
+    /// Every host wl_surface with an output, and that output.
+    pub(super) fn surface_outputs_for_test(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.surface_outputs
+            .iter()
+            .map(|(&surface, &output)| (surface, output))
+    }
 }
 
 #[cfg(test)]

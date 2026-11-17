@@ -95,7 +95,7 @@ impl WlCallbackHandler for CallbackHandler {
 
             // The terminal event destroys the callback on both sides, but the
             // host numeric ID cannot be reused until its later delete_id.
-            ctx.shadow_table.guest_ended_host_destroyed(guest_id);
+            ctx.guest_ended_host_destroyed(guest_id);
         }
         Action::Drop
     }

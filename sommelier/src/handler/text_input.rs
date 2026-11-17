@@ -1713,49 +1713,55 @@ fn end_backspace_repeat_for_text_input(ctx: &mut Context, guest_seat: u32, guest
     }
 }
 
+/// Forget guest `zwp_text_input_v3` `guest_id`, which ended (see
+/// `crate::state::lifecycle`), and destroy its host extension. Nothing is
+/// sent to its v1 object once the host has deleted it (`host_deleted`).
+pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: bool) {
+    // Destruction is the final disabled transition. Route it through the
+    // same activation reconciler as commit/focus changes so parent-seat
+    // lifetime validation cannot drift between teardown paths.
+    let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.begin_destroy();
+    }
+    if let Some(guest_seat) = guest_seat {
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+    }
+    if !host_deleted {
+        update_host_activation(ctx, guest_id);
+    } else if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.deactivate_host_without_barrier();
+    }
+
+    // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
+    // Stop extension events and remove all local routing state.
+    let host_ext_id = ctx
+        .text_inputs
+        .remove(&guest_id)
+        .and_then(|state| state.host_ext_id);
+    if let Some(host_ext_id) = host_ext_id {
+        ctx.client_to_host_queue
+            .push(zcr_extended_text_input_v1::req::destroy(host_ext_id));
+        ctx.retire_destroyed_host_object(host_ext_id);
+    }
+}
+
 pub struct TextInputV3Handler;
 impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
-        // Destruction is the final disabled transition. Route it through the
-        // same activation reconciler as commit/focus changes so parent-seat
-        // lifetime validation cannot drift between teardown paths.
-        let guest_seat = ctx.text_inputs.get(&guest_id).map(|state| state.guest_seat);
-        if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.begin_destroy();
-        }
-        if let Some(guest_seat) = guest_seat {
-            end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        }
-        update_host_activation(ctx, guest_id);
-
-        let Some(state) = ctx.text_inputs.remove(&guest_id) else {
-            // Keep the guest lifecycle well-formed even if local text-input
-            // state was already cleaned by a focus/seat teardown path.
-            if ctx.shadow_table.guest_ended_host_kept(guest_id) {
-                crate::handler::display::queue_delete_id(ctx, guest_id);
-            }
-            return Action::Drop;
-        };
-
-        // zwp_text_input_v1 has no destructor, but its ChromeOS extension does.
-        // Stop extension events and remove all local routing state.
-        if let Some(host_ext_id) = state.host_ext_id {
-            ctx.client_to_host_queue
-                .push(zcr_extended_text_input_v1::req::destroy(host_ext_id));
-            ctx.retire_destroyed_host_object(host_ext_id);
-        }
         // The v3 object is guest-facing but backed by a v1 host object whose
         // protocol has no destructor, so the host object stays for the
-        // connection and the guest lifecycle completes locally.
-        if !ctx.shadow_table.guest_ended_host_kept(guest_id) {
+        // connection and the guest lifecycle completes locally. Ending the
+        // object forgets its state (see `forget_text_input`).
+        if ctx.guest_ended_host_kept(guest_id) {
+            crate::handler::display::queue_delete_id(ctx, guest_id);
+        } else {
             log::debug!(
                 "Text input {} had already been retired before its destroy handler ran",
                 guest_id
             );
-            return Action::Drop;
         }
-        crate::handler::display::queue_delete_id(ctx, guest_id);
         Action::Drop
     }
 

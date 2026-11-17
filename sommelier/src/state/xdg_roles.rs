@@ -151,6 +151,14 @@ impl XdgRoles {
     pub(crate) fn is_empty(&self) -> bool {
         self.by_xdg_surface.is_empty()
     }
+
+    /// Every recorded xdg_surface with its wl_surface and toplevel.
+    #[cfg(test)]
+    pub(super) fn roles_for_test(&self) -> impl Iterator<Item = (u32, u32, Option<u32>)> + '_ {
+        self.by_xdg_surface
+            .iter()
+            .map(|(&xdg_surface, role)| (xdg_surface, role.wl_surface, role.toplevel))
+    }
 }
 
 #[cfg(test)]

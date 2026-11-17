@@ -18,6 +18,7 @@ mod aura_surfaces;
 mod id_allocator;
 mod input;
 mod internal_callbacks;
+mod lifecycle;
 mod objects;
 mod outputs;
 mod render;
@@ -38,6 +39,7 @@ use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
+use xkbcommon::xkb;
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
@@ -381,6 +383,17 @@ pub struct Context {
     pub key_generations: KeyGenerationRegistry,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
     pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
+    /// Parsed keymap for each host keyboard. Keymap updates and failures are
+    /// scoped to their sender so one seat cannot invalidate another seat.
+    pub(crate) keyboard_keymaps: HashMap<HostId, xkb::Keymap>,
+    /// XKB state for each host keyboard. A client can bind keyboards from
+    /// multiple seats, whose modifier and layout-group state must not leak.
+    /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
+    /// interior mutation, so a connection stays on its one thread.
+    pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
+    /// Current modifier bitmask for each host keyboard (using accelerator.rs
+    /// conventions).
+    pub(crate) keyboard_modifiers: HashMap<HostId, u32>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
@@ -416,6 +429,12 @@ pub struct Context {
     pub registry_global_visibility: HashMap<u32, HashMap<u32, bool>>,
     pub global_generations: HashMap<u32, u64>,
     pub next_global_generation: u64,
+    /// The generation of each global whose current advertisement the host
+    /// removed, from the first registry's `global_remove` until the global
+    /// is retired or advertised anew. It outlives the registries that saw
+    /// the removal, which a guest may destroy before the last registry that
+    /// lists the global sees it.
+    pub removed_global_generations: HashMap<u32, u64>,
     /// Globals that have been removed from the host registry. Keep their
     /// metadata until every registry has observed the removal so a second
     /// registry can still receive its own global_remove event, while blocking
@@ -786,10 +805,6 @@ impl Context {
         }
     }
 
-    pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
-        self.render_buffers.remove(HostId(host_buffer_id))
-    }
-
     /// Apply the ID-ownership policy after a host `wl_buffer.destroy` has
     /// successfully entered the ordered outgoing stream.
     ///
@@ -813,7 +828,7 @@ impl Context {
                 || self.render_buffers.mark_host_destroy_queued(host_buffer_id)
         };
         if render_buffer_ended {
-            self.shadow_table.guest_destroyed(guest_buffer_id);
+            self.guest_destroyed(guest_buffer_id);
         }
         render_buffer_ended
     }
@@ -960,6 +975,9 @@ impl Context {
             extended_keyboard_to_keyboard: HashMap::new(),
             key_generations: KeyGenerationRegistry::default(),
             keyboard_repeatable_keys: HashMap::new(),
+            keyboard_keymaps: HashMap::new(),
+            keyboard_xkb_states: HashMap::new(),
+            keyboard_modifiers: HashMap::new(),
             keyboard_keysym_to_keycode: HashMap::new(),
             placement,
             supported_formats: HashSet::new(),
@@ -971,6 +989,7 @@ impl Context {
             registry_global_visibility: HashMap::new(),
             global_generations: HashMap::new(),
             next_global_generation: 1,
+            removed_global_generations: HashMap::new(),
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
             used_dmabuf_params: HashSet::new(),
