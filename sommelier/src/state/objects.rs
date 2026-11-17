@@ -728,6 +728,7 @@ impl ShadowTable {
 
     /// Record the host object's own interface and version. An ID with no
     /// live object becomes a host-only object.
+    #[cfg(test)]
     pub fn track_host_interface_with_version(
         &mut self,
         host_id: u32,
@@ -739,6 +740,7 @@ impl ShadowTable {
 
     /// Record `host`'s own interface, and `version` or, when `None`, the
     /// version it has (else the unknown one).
+    #[cfg(test)]
     fn set_host_interface(&mut self, host: HostId, interface: String, version: Option<u32>) {
         let new_version =
             |own: Option<u32>| Some(version.or(own).unwrap_or(Self::UNKNOWN_OBJECT_VERSION));

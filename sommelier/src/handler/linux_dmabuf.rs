@@ -1049,29 +1049,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             let orphaned = ctx.shadow_table.is_pending_destroy_guest(guest_params_id);
             if orphaned {
                 // params.destroy may have been queued before the compositor
-                // emitted `created`.  The generated dispatcher cannot map the
-                // event's new_id when the event is consumed locally, so retain
-                // the host buffer as a host-only wl_buffer and destroy it
-                // explicitly.  Otherwise it would live until connection
-                // teardown with no guest object or release path.
-                if !ctx.shadow_table.is_host_id_available(buffer) {
-                    error!(
-                        "Host returned an already-used wl_buffer ID {} for orphaned dmabuf",
-                        buffer
-                    );
-                    ctx.fail_session();
-                    return Action::Drop;
-                }
-                let version = ctx
-                    .shadow_table
-                    .host_object_version_or_unknown(host_params_id);
-                ctx.shadow_table.track_host_interface_with_version(
-                    buffer,
-                    "wl_buffer".to_string(),
-                    version,
-                );
+                // emitted `created`, so no guest object can take the buffer:
+                // destroy it, or it would live until connection teardown.
+                // The host created it with a server ID, which it frees as
+                // soon as it processes the destructor, so the proxy keeps
+                // nothing for it.
                 crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
-                ctx.retire_destroyed_host_object(buffer);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }
