@@ -182,7 +182,8 @@ pub struct ShadowTable {
     /// server and sent to the client in an event. Host and guest object
     /// namespaces are independent, so host-generated `new_id` values must be
     /// translated to a fresh ID in this range before they reach the guest.
-    next_guest_server_id: u32,
+    /// An ID returns here when [`Self::remove_id`] forgets its object.
+    guest_server_ids: IdAllocator,
 }
 
 impl ShadowTable {
@@ -190,6 +191,10 @@ impl ShadowTable {
     /// The IDs a Wayland client allocates: 0 is null, 1 is `wl_display`,
     /// and libwayland-server accepts up to `WL_MAP_MAX_OBJECTS` inclusive.
     const CLIENT_IDS: std::ops::Range<u32> = 2..WL_MAP_MAX_OBJECTS + 1;
+    /// The server IDs a libwayland client accepts: index (offset from
+    /// [`Self::GUEST_SERVER_ID_START`]) up to `WL_MAP_MAX_OBJECTS` inclusive.
+    const SERVER_IDS: std::ops::Range<u32> =
+        Self::GUEST_SERVER_ID_START..Self::GUEST_SERVER_ID_START + WL_MAP_MAX_OBJECTS + 1;
     /// The version of an object registered without a negotiated version.
     ///
     /// Test fixtures and legacy internal registrations that do not carry a
@@ -209,7 +214,7 @@ impl ShadowTable {
             pending_destroy_host_ids: HashSet::new(),
             pending_destroy_guest_ids: HashSet::new(),
             host_ids: IdAllocator::new(Self::CLIENT_IDS),
-            next_guest_server_id: Self::GUEST_SERVER_ID_START,
+            guest_server_ids: IdAllocator::new(Self::SERVER_IDS),
         }
     }
 
@@ -275,29 +280,26 @@ impl ShadowTable {
     /// A host compositor is allowed to choose a different raw ID than the
     /// guest-side proxy can expose. Returning the host ID verbatim can collide
     /// with a guest-created object and makes later requests use the wrong
-    /// namespace. Keep a separate wrapping cursor for the server range and
+    /// namespace. Allocate from the guest's own server range instead, and
     /// reserve the chosen ID in the normal guest maps at the call site.
+    ///
+    /// # Panics
+    ///
+    /// Like [`Self::allocate_host_id`], when the range is exhausted; that
+    /// ends only the client whose task allocates.
     pub fn allocate_guest_server_id(&mut self) -> u32 {
-        // The range is exactly 0x0100_0000 IDs
-        // (0xff00_0000..=u32::MAX). Use a u64 loop counter so the inclusive
-        // bound itself cannot overflow.
-        for _ in 0u64..=0x00ff_ffff {
-            let id = self.next_guest_server_id;
-            self.next_guest_server_id = if id == u32::MAX {
-                Self::GUEST_SERVER_ID_START
-            } else {
-                id + 1
+        loop {
+            let Some(id) = self.guest_server_ids.next_candidate() else {
+                log::error!("Ending the client: its guest server IDs are exhausted");
+                panic!("guest Wayland server IDs exhausted");
             };
-
-            if id >= Self::GUEST_SERVER_ID_START
-                && !self.guest_to_host.contains_key(&id)
-                && !self.interfaces.contains_key(&id)
-            {
+            if !self.guest_to_host.contains_key(&id) && !self.interfaces.contains_key(&id) {
                 return id;
             }
+            // As in `allocate_host_id`: only an ID registered without being
+            // allocated (a test fixture) gets here.
+            warn!("Skipping guest server ID {id}, which is registered but was never allocated");
         }
-        log::error!("sommelier: guest Wayland server ID space exhausted");
-        panic!("sommelier: guest Wayland server ID space exhausted — this should never happen");
     }
 
     pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
@@ -310,8 +312,7 @@ impl ShadowTable {
         if let Some(old_guest_id) = self.host_to_guest.insert(host_id, guest_id) {
             if old_guest_id != guest_id && self.guest_to_host.get(&old_guest_id) == Some(&host_id) {
                 self.guest_to_host.remove(&old_guest_id);
-                self.interfaces.remove(&old_guest_id);
-                self.guest_versions.remove(&old_guest_id);
+                self.forget_guest_object(old_guest_id, true);
             }
         }
     }
@@ -583,14 +584,36 @@ impl ShadowTable {
     }
 
     pub fn remove_id(&mut self, guest_id: u32) {
-        self.pending_destroy_guest_ids.remove(&guest_id);
-        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+        let host_id = self.guest_to_host.remove(&guest_id);
+        if let Some(host_id) = host_id {
             self.host_to_guest.remove(&host_id);
             self.host_interfaces.remove(&host_id);
             self.host_versions.remove(&host_id);
         }
-        self.interfaces.remove(&guest_id);
+        self.forget_guest_object(guest_id, host_id.is_some());
+    }
+
+    /// Forget the guest side of `guest_id`, whose mapping to a host object
+    /// the caller has just removed (`was_mapped`) or never had.
+    ///
+    /// The one place a guest object ends: its metadata goes, and an ID from
+    /// the server range returns to the allocator. A server-created object
+    /// gets no `delete_id`; libwayland-client frees its ID as soon as either
+    /// side destroys it, which is when the proxy drops its mapping. Nothing
+    /// is freed for an ID that named no object, so no ID is freed twice.
+    ///
+    /// # Returns
+    ///
+    /// The object's interface, if it still had one.
+    fn forget_guest_object(&mut self, guest_id: u32, was_mapped: bool) -> Option<String> {
+        debug_assert!(!self.guest_to_host.contains_key(&guest_id));
+        self.pending_destroy_guest_ids.remove(&guest_id);
         self.guest_versions.remove(&guest_id);
+        let interface = self.interfaces.remove(&guest_id);
+        if was_mapped || interface.is_some() {
+            self.guest_server_ids.release(guest_id);
+        }
+        interface
     }
 
     /// Remove only the guest-side half of a mapping.
@@ -601,9 +624,9 @@ impl ShadowTable {
     /// host interface reservation prevents a later allocation from reusing
     /// that ID and routing stale host events to a new object.
     pub fn remove_guest_mapping(&mut self, guest_id: u32) {
-        let guest_interface = self.interfaces.remove(&guest_id);
-        self.guest_versions.remove(&guest_id);
-        if let Some(host_id) = self.guest_to_host.remove(&guest_id) {
+        let host_id = self.guest_to_host.remove(&guest_id);
+        let guest_interface = self.forget_guest_object(guest_id, host_id.is_some());
+        if let Some(host_id) = host_id {
             if self.host_to_guest.get(&host_id) == Some(&guest_id) {
                 self.host_to_guest.remove(&host_id);
             }
@@ -631,13 +654,18 @@ impl ShadowTable {
     /// metadata is intentionally removed so a destroyed object cannot accept
     /// another request.
     pub fn retire_guest_object(&mut self, guest_id: u32) {
+        let Some(&host_id) = self.guest_to_host.get(&guest_id) else {
+            // Nothing can name an unmapped object again: it ends here.
+            self.forget_guest_object(guest_id, false);
+            return;
+        };
         let interface = self.interfaces.remove(&guest_id);
         self.guest_versions.remove(&guest_id);
-        if let (Some(host_id), Some(interface)) = (self.guest_to_host.get(&guest_id), interface) {
+        if let Some(interface) = interface {
             self.pending_destroy_guest_ids.insert(guest_id);
-            self.host_interfaces.entry(*host_id).or_insert(interface);
+            self.host_interfaces.entry(host_id).or_insert(interface);
             self.host_versions
-                .entry(*host_id)
+                .entry(host_id)
                 .or_insert(Self::UNKNOWN_OBJECT_VERSION);
         }
     }
@@ -1735,15 +1763,61 @@ mod tests {
     }
 
     #[test]
-    fn allocate_guest_server_id_wraps_inside_server_range() {
+    fn guest_server_ids_are_reused_and_stay_below_the_client_map_limit() {
         let mut table = ShadowTable::new();
-        table.next_guest_server_id = u32::MAX;
-
-        let last = table.allocate_guest_server_id();
         let first = table.allocate_guest_server_id();
+        table.map_id(first, ShadowTable::GUEST_SERVER_ID_START + 40);
+        table.track_interface(first, "wl_buffer".to_string());
+        table.remove_id(first);
+        assert_eq!(
+            table.allocate_guest_server_id(),
+            first,
+            "a destroyed server-created object frees its guest ID"
+        );
 
-        assert_eq!(last, u32::MAX);
-        assert_eq!(first, ShadowTable::GUEST_SERVER_ID_START);
+        // libwayland-client accepts the server index WL_MAP_MAX_OBJECTS
+        // itself and refuses the next one.
+        table.guest_server_ids =
+            IdAllocator::new(ShadowTable::SERVER_IDS.end - 1..ShadowTable::SERVER_IDS.end);
+        assert_eq!(table.allocate_guest_server_id(), 0xfff0_0000);
+        let exhausted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.allocate_guest_server_id()
+        }));
+        assert!(
+            exhausted.is_err(),
+            "libwayland-client refuses server IDs past 0xff000000 + WL_MAP_MAX_OBJECTS"
+        );
+    }
+
+    #[test]
+    fn every_end_of_a_server_created_guest_object_frees_its_id() {
+        let mut table = ShadowTable::new();
+        let host_object = ShadowTable::GUEST_SERVER_ID_START + 40;
+
+        // The guest half goes while the host object stays reserved.
+        let guest = table.allocate_guest_server_id();
+        table.map_id(guest, host_object);
+        table.track_interface(guest, "zwp_text_input_v3".to_string());
+        table.remove_guest_mapping(guest);
+        assert_eq!(table.allocate_guest_server_id(), guest);
+
+        // A new guest object takes over the host object.
+        table.map_id(guest, host_object);
+        let replacement = table.allocate_guest_server_id();
+        table.map_id(replacement, host_object);
+        assert_eq!(table.get_host_id(guest), None);
+        assert_eq!(table.allocate_guest_server_id(), guest);
+
+        // Retiring keeps the ID until the mapping is removed, and frees it
+        // once.
+        table.track_interface(replacement, "wl_buffer".to_string());
+        table.retire_guest_object(replacement);
+        let next = table.allocate_guest_server_id();
+        assert_ne!(next, replacement, "a retired object still owns its ID");
+        table.remove_id(replacement);
+        table.remove_id(replacement);
+        assert_eq!(table.allocate_guest_server_id(), replacement);
+        assert_eq!(table.allocate_guest_server_id(), next + 1);
     }
 
     #[test]

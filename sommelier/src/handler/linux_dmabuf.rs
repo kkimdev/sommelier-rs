@@ -2131,7 +2131,10 @@ mod tests {
             .shadow_table
             .get_guest_id(host_buffer_id)
             .expect("reused host buffer ID must map to a new guest server ID");
-        assert_ne!(second_guest_buffer, first_guest_buffer);
+        assert_eq!(
+            second_guest_buffer, first_guest_buffer,
+            "a destroyed server-created buffer's guest ID is reused first"
+        );
         assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
         assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
         assert!(!ctx.fatal_protocol_error);

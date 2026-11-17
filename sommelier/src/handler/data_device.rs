@@ -239,6 +239,48 @@ mod tests {
         );
     }
 
+    /// Every clipboard or drag-and-drop selection brings a new host data
+    /// offer. The guest IDs must be recycled, or a long session would run
+    /// out of server IDs.
+    #[test]
+    fn cycled_data_offers_keep_their_guest_id_small() {
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
+        ctx.shadow_table.map_id(10, 80);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_data_device".to_string(), 3);
+        let mut handler = DataDeviceHandler;
+        let mut first_guest_offer = None;
+
+        for round in 0..1000u32 {
+            // The host may pick any free server ID for each offer.
+            let host_offer = 0xff00_0000 + round % 3;
+            let payload = host_offer.to_ne_bytes();
+            let mut offer = WireMessage::new(80, wl_data_device::EVT_DATA_OFFER, &payload, &[]);
+            let (event, _) = wl_data_device::dispatch_event(&mut offer, &mut handler, &mut ctx)
+                .expect("data_offer should decode")
+                .expect("data_offer should be forwarded");
+            let guest_offer = u32::from_ne_bytes(event[8..12].try_into().unwrap());
+            assert_eq!(
+                guest_offer,
+                *first_guest_offer.get_or_insert(guest_offer),
+                "round {round}: a destroyed offer's guest ID must be reused"
+            );
+
+            let mut destroy = WireMessage::new(
+                guest_offer,
+                crate::protocols::wayland::wl_data_offer::REQ_DESTROY,
+                &[],
+                &[],
+            );
+            crate::protocols::wayland::wl_data_offer::dispatch_request(
+                &mut destroy,
+                &mut handler,
+                &mut ctx,
+            )
+            .expect("data_offer.destroy should decode");
+        }
+    }
+
     #[test]
     fn destroyed_host_data_offer_allows_ordered_server_id_reuse() {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
@@ -287,7 +329,10 @@ mod tests {
                 .expect("reused server ID should decode")
                 .expect("replacement data_offer should be forwarded");
         let replacement_guest_id = u32::from_ne_bytes(replacement_event[8..12].try_into().unwrap());
-        assert_ne!(replacement_guest_id, first_guest_id);
+        assert_eq!(
+            replacement_guest_id, first_guest_id,
+            "a destroyed server-created object's guest ID is reused first"
+        );
         assert_eq!(
             ctx.shadow_table.get_host_id(replacement_guest_id),
             Some(host_offer_id)

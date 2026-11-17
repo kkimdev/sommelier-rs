@@ -3270,7 +3270,10 @@ mod tests {
         assert!(ctx.host_to_client_queue.is_empty());
 
         let reused_guest = register_test_server_native(&mut ctx, host_buffer);
-        assert_ne!(reused_guest, guest_buffer);
+        assert_eq!(
+            reused_guest, guest_buffer,
+            "a destroyed server-created buffer's guest ID is reused first"
+        );
         assert_eq!(
             ctx.shadow_table.get_host_id(reused_guest),
             Some(host_buffer),
