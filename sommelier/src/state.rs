@@ -34,7 +34,7 @@ use self::render::RenderBufferRegistry;
 use self::render::MAX_PENDING_DAMAGE_RECTS;
 use crate::allocator::Allocator;
 use crate::virtwl_channel::VirtWaylandChannel;
-use crate::wire::Outgoing;
+use crate::wire::{Action, Outgoing};
 use log::{error, warn};
 
 #[allow(unused_imports)]
@@ -464,9 +464,25 @@ impl Context {
         }
     }
 
-    /// End the session because the proxy failed (see [`Self::end_session`]).
-    pub(crate) fn fail_session(&mut self) {
+    /// Reject the message being dispatched with protocol error `code` on
+    /// guest object `object` (see [`Self::end_session`]). A handler returns
+    /// the [`Action::Drop`] this returns.
+    pub(crate) fn reject(&mut self, object: u32, code: u32, message: impl Into<String>) -> Action {
+        self.end_session(SessionEnd::Protocol {
+            object,
+            code,
+            message: message.into(),
+        });
+        Action::Drop
+    }
+
+    /// End the session because the proxy failed to handle the message being
+    /// dispatched, and log `why` (see [`Self::end_session`]). A handler
+    /// returns the [`Action::Drop`] this returns.
+    pub(crate) fn fail(&mut self, why: impl std::fmt::Display) -> Action {
+        error!("{why}");
         self.end_session(SessionEnd::Internal);
+        Action::Drop
     }
 
     /// Take what the message just dispatched produced (see [`Effects`]).
@@ -709,11 +725,9 @@ impl Context {
     /// session.
     pub(crate) fn retire_destroyed_host_object(&mut self, host_id: u32) {
         if !self.shadow_table.host_destroy_queued(host_id) {
-            error!(
-                "Host object {} was not a live host-only object when it was retired",
-                host_id
-            );
-            self.fail_session();
+            self.fail(format_args!(
+                "Host object {host_id} was not a live host-only object when it was retired"
+            ));
         }
     }
 

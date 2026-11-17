@@ -40,21 +40,6 @@ pub(crate) fn request_error(error: &ProtocolError) -> SessionEnd {
     }
 }
 
-/// Report a fatal protocol error against a guest object (see
-/// [`Context::end_session`]).
-pub(crate) fn queue_protocol_error(
-    ctx: &mut Context,
-    object_id: u32,
-    code: u32,
-    message: impl AsRef<str>,
-) {
-    ctx.end_session(SessionEnd::Protocol {
-        object: object_id,
-        code,
-        message: message.as_ref().to_string(),
-    });
-}
-
 /// The one `wl_display.error` that tells the guest its session ended.
 pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
     let error = match end {
@@ -176,12 +161,9 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             // would make the guest receive an invalid Wayland error event and
             // can trigger a secondary protocol error in its display parser.
             // The session still ends with an `implementation` error.
-            error!(
-                "Dropping host display error for unmapped object_id={} (code={}): {}",
-                object_id, code, message
-            );
-            ctx.fail_session();
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Dropping host display error for unmapped object_id={object_id} (code={code}): {message}"
+            ));
         };
         error!(
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
@@ -208,8 +190,7 @@ mod tests {
 
     impl WlDisplayHandler for ProbeHandler {
         fn on_get_registry(&mut self, ctx: &mut Context, _registry: u32) -> Action {
-            ctx.fail_session();
-            Action::Drop
+            ctx.fail("the probe handler ran")
         }
     }
 
@@ -285,7 +266,7 @@ mod tests {
     #[test]
     fn fatal_protocol_error_keeps_a_bounded_diagnostic() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        queue_protocol_error(&mut ctx, 7, 3, "x".repeat(4_084));
+        ctx.reject(7, 3, "x".repeat(4_084));
 
         let (error, _) = session_error(ctx.session_end().expect("the session ends"));
         assert!(

@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::allocator::Allocator;
-use crate::handler::display::queue_protocol_error;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
@@ -1075,7 +1074,7 @@ pub(crate) fn copy_shm_damage(
 /// proxy has no object to service it.  Wayland errors terminate the connection,
 /// which is the only safe outcome once allocation has failed.
 fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'static str) {
-    queue_protocol_error(ctx, object_id, wl_shm::ERROR_INVALID_FD, message);
+    ctx.reject(object_id, wl_shm::ERROR_INVALID_FD, message);
 }
 
 /// Undo the guest mapping after a host `wl_buffer` has already been queued.
@@ -1125,12 +1124,10 @@ fn record_host_buffer_release(ctx: &mut Context, guest_id: u32) {
 
 fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: HostId) {
     if !ctx.complete_queued_buffer_destroy(guest_id, host_id) {
-        log::error!(
+        ctx.fail(format_args!(
             "Render buffer generation diverged while destroying guest {} host {}",
-            guest_id,
-            host_id.0
-        );
-        ctx.fail_session();
+            guest_id, host_id.0
+        ));
     }
 }
 
@@ -1226,11 +1223,9 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     if ctx.host_buffer_use(guest_id).is_some()
         && !ctx.finish_surface_destroy_use(guest_id, references.has_current(guest_id))
     {
-        log::error!(
-            "Render buffer {} could not finish its destroyed-surface use",
-            guest_id
-        );
-        ctx.fail_session();
+        ctx.fail(format_args!(
+            "Render buffer {guest_id} could not finish its destroyed-surface use"
+        ));
     }
 }
 
@@ -1261,13 +1256,11 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 
         let Some(pool_size) = valid_pool_size(size) else {
             warn!("Rejecting invalid SHM pool size {}", size);
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm pool size",
             );
-            return Action::Drop;
         };
         // The request closes `fd` once handled, so the pool owns a
         // duplicate, close-on-exec like every descriptor the proxy keeps.
@@ -1275,13 +1268,11 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
             Ok(duplicate) => File::from(duplicate),
             Err(error) => {
                 error!("Failed to dup FD for SHM pool: {}", error);
-                queue_protocol_error(
-                    ctx,
+                return ctx.reject(
                     ctx.last_sender_id,
                     wl_shm::ERROR_INVALID_FD,
                     "invalid wl_shm pool fd",
                 );
-                return Action::Drop;
             }
         };
         if !regular_file_has_size(&file, pool_size) {
@@ -1290,13 +1281,11 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
                 fd.as_raw_fd(),
                 pool_size
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 ctx.last_sender_id,
                 wl_shm::ERROR_INVALID_FD,
                 "invalid wl_shm pool fd",
             );
-            return Action::Drop;
         }
         let pool = ShmPool {
             file: Arc::new(file),
@@ -1801,38 +1790,28 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
         }
         let Some(pool) = ctx.pools.get(&pool_id) else {
             warn!("Unknown pool ID: {}", pool_id);
-            queue_protocol_error(
-                ctx,
-                pool_id,
-                wl_shm::ERROR_INVALID_FD,
-                "invalid wl_shm pool",
-            );
-            return Action::Drop;
+            return ctx.reject(pool_id, wl_shm::ERROR_INVALID_FD, "invalid wl_shm pool");
         };
         let pool_file = Arc::clone(&pool.file);
         let pool_size = pool.size;
         if !supported_shm_format(format) || !guest_shm_format_available(ctx, format) {
             warn!("Rejecting unsupported SHM buffer format {:#010x}", format);
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 pool_id,
                 wl_shm::ERROR_INVALID_FORMAT,
                 "invalid wl_shm buffer format",
             );
-            return Action::Drop;
         }
         if !valid_shm_stride(format, width, stride) {
             warn!(
                 "Rejecting SHM buffer stride {} for format {:#010x} and width {}",
                 stride, format, width
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 pool_id,
                 wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm buffer stride",
             );
-            return Action::Drop;
         }
 
         let Some(buffer_size) =
@@ -1842,13 +1821,11 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 "Rejecting invalid SHM buffer: pool={}, offset={}, width={}, height={}, stride={}, pool_size={}",
                 pool_id, offset, width, height, stride, pool_size
             );
-            queue_protocol_error(
-                ctx,
+            return ctx.reject(
                 pool_id,
                 wl_shm::ERROR_INVALID_STRIDE,
                 "invalid wl_shm buffer layout",
             );
-            return Action::Drop;
         };
 
         let request = ShmBufferRequest {
@@ -1922,10 +1899,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
                 None
             }
         };
-        if let Some((code, message)) = error {
-            queue_protocol_error(ctx, pool_id, code, message);
+        match error {
+            Some((code, message)) => ctx.reject(pool_id, code, message),
+            None => Action::Drop,
         }
-        Action::Drop
     }
 }
 
@@ -1950,11 +1927,9 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
             && (!ctx.buffer_is_released(guest_id) || uncommitted_attach)
         {
             if !ctx.mark_buffer_guest_destroyed(guest_id) {
-                log::error!(
-                    "Render buffer {} could not enter guest-destroyed state",
-                    guest_id
-                );
-                ctx.fail_session();
+                return ctx.fail(format_args!(
+                    "Render buffer {guest_id} could not enter guest-destroyed state"
+                ));
             }
             ctx.shadow_table.guest_destroyed_in_use(guest_id);
             return Action::Drop;

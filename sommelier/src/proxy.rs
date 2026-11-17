@@ -2039,7 +2039,14 @@ mod tests {
         // A handler can end the session without queueing an error (a host
         // storage failure, say); the trailing data still gets reported.
         assert_eq!(
-            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[0]).await,
+            surface_request_errors(
+                |client| {
+                    client.ctx.fail("a host storage failure");
+                },
+                REQ_COMMIT,
+                &[0]
+            )
+            .await,
             [(
                 crate::wire::WL_DISPLAY_ID,
                 protocols::wayland::wl_display::ERROR_INVALID_METHOD
@@ -2053,7 +2060,14 @@ mod tests {
         // As a failed dma-buf sync during a commit does: fatal, with no
         // error of its own.
         assert_eq!(
-            surface_request_errors(|client| client.ctx.fail_session(), REQ_COMMIT, &[]).await,
+            surface_request_errors(
+                |client| {
+                    client.ctx.fail("a host storage failure");
+                },
+                REQ_COMMIT,
+                &[]
+            )
+            .await,
             [(
                 crate::wire::WL_DISPLAY_ID,
                 protocols::wayland::wl_display::ERROR_IMPLEMENTATION

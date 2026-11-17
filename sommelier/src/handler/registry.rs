@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::handler::callback::queue_internal_sync;
-use crate::handler::display::queue_protocol_error;
 use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
@@ -784,7 +783,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             if bound && can_synthesize_feedback {
                 queue_internal_sync(ctx, InternalCallback::DmabufCapabilities { generation });
             } else if !bound {
-                ctx.fail_session();
+                ctx.fail(format_args!("Failed to bind host {interface} internally"));
             }
 
             // Drop the original global event so we don't send the host's
@@ -1150,8 +1149,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     "Rejecting bind for unadvertised, unsupported, or too-new global {}:{} v{}",
                     name, interface, version
                 );
-                queue_protocol_error(
-                    ctx,
+                return ctx.reject(
                     ctx.last_sender_id,
                     wl_display::ERROR_INVALID_OBJECT,
                     format!(
@@ -1159,7 +1157,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                         name, interface, version
                     ),
                 );
-                return Action::Drop;
             }
         };
 
@@ -1237,8 +1234,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             host_new_id,
         ) {
             ctx.shadow_table.abandon(*guest_new_id);
-            ctx.fail_session();
-            return Action::Drop;
+            return ctx.fail(format_args!(
+                "Failed to bind host {interface} for the guest"
+            ));
         }
         if interface == "wl_output" {
             // Register the output only once its bind is queued, so the
