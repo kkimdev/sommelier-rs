@@ -45,7 +45,7 @@ pub(crate) use self::input::{
     PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
-pub use self::objects::{DeletedHostId, ShadowTable};
+pub use self::objects::{DeletedHostId, Link, ShadowTable};
 pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, transformed_extent, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,

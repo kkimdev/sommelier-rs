@@ -39,6 +39,15 @@ pub enum DeletedHostId {
     Paired(u32),
 }
 
+/// What a live guest object stands for on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    /// The host object it is paired with.
+    Host(u32),
+    /// Nothing: the proxy implements the object itself.
+    Local,
+}
+
 /// The interface and negotiated version of a guest object.
 #[derive(Debug)]
 struct Interface {
@@ -302,6 +311,23 @@ impl ShadowTable {
         host.0
     }
 
+    /// Create a guest object for host object `host_id`, which a host event
+    /// just created, with a fresh ID from the guest's server range; both
+    /// take `interface` and `version`.
+    ///
+    /// # Returns
+    ///
+    /// The guest object's ID.
+    pub fn adopt_host_created(&mut self, host_id: u32, interface: &str, version: u32) -> u32 {
+        let guest = GuestId(self.allocate_guest_server_id());
+        let interface = || Interface {
+            name: interface.to_string(),
+            version,
+        };
+        self.insert_pair(guest, interface(), HostId(host_id), interface());
+        guest.0
+    }
+
     /// Create a host object that only the proxy uses.
     ///
     /// # Returns
@@ -371,6 +397,7 @@ impl ShadowTable {
     /// ones. The guest object's old host object then keeps its own
     /// interface, without a version, as a host-only object, or ends if it
     /// has none; the host object's old guest object ends.
+    #[cfg(test)]
     pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
         let (guest, host) = (GuestId(guest_id), HostId(host_id));
         if let Some(old_host) = self.host_id_of(guest).filter(|&old_host| old_host != host) {
@@ -443,6 +470,46 @@ impl ShadowTable {
 
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
         self.host_id_of(GuestId(guest_id)).map(|host| host.0)
+    }
+
+    /// Resolve the sender of a guest request: a live guest object.
+    ///
+    /// `None` when `guest_id` names no object, or one the guest destroyed.
+    pub fn request_sender(&self, guest_id: u32) -> Option<Link> {
+        if self.is_pending_destroy_guest(guest_id) {
+            return None;
+        }
+        match self.get_host_id(guest_id) {
+            Some(host_id) => Some(Link::Host(host_id)),
+            None => self
+                .is_local_only_guest_object(guest_id)
+                .then_some(Link::Local),
+        }
+    }
+
+    /// Resolve an object argument of a guest request, which must be a live
+    /// guest object of `interface`: Wayland object IDs are not
+    /// interchangeable, and forwarding a `wl_surface` where a `wl_seat` is
+    /// expected would send a type-invalid request to the host.
+    ///
+    /// `None` when the request may not name `guest_id` there.
+    pub fn request_object(&self, guest_id: u32, interface: &str) -> Option<Link> {
+        self.request_sender(guest_id)
+            .filter(|_| self.guest_object_matches(guest_id, interface))
+    }
+
+    /// Resolve an object argument of a host event, which must be a host
+    /// object of `interface` paired with a live guest object.
+    ///
+    /// # Returns
+    ///
+    /// The guest object's ID, or `None` when the event may not reach the
+    /// guest naming `host_id` there.
+    pub fn event_object(&self, host_id: u32, interface: &str) -> Option<u32> {
+        if self.is_pending_destroy_host(host_id) || !self.host_object_matches(host_id, interface) {
+            return None;
+        }
+        self.get_guest_id(host_id)
     }
 
     /// Check that a guest object has the interface required by a request
@@ -704,6 +771,7 @@ impl ShadowTable {
     }
 
     /// Record the interface and version of guest object `guest_id`.
+    #[cfg(test)]
     pub fn track_interface_with_version(&mut self, guest_id: u32, interface: String, version: u32) {
         let tracked = Interface {
             name: interface,
@@ -771,6 +839,7 @@ impl ShadowTable {
 
     /// Set the negotiated version of a live host object, usually one just
     /// paired with a guest object.
+    #[cfg(test)]
     pub fn set_host_version(&mut self, host_id: u32, version: u32) {
         let object = self.hosts.get_mut(&HostId(host_id));
         debug_assert!(

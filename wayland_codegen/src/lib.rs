@@ -75,29 +75,18 @@ mod tests {
         assert!(code.contains("pub enum Request"));
         assert!(code.contains("fn from_wire"));
         assert!(
-            code.contains("allocate_guest_server_id"),
-            "host-generated new_id events must allocate a guest server ID"
+            compact.contains("adopt_host_created(id,\"wl_data_offer\",version"),
+            "host-generated new_id events must get a guest object"
         );
         assert!(
-            compact.contains("map_id(guest_id,id)"),
-            "generated host-generated new_id events must map guest IDs to host IDs"
-        );
-        assert!(
-            compact.contains("mark_pending_destroy(msg.sender_id)"),
-            "generated destructor requests must retain mappings until host delete_id"
-        );
-        assert!(
-            compact.contains("is_guest_server_id(msg.sender_id)")
-                && compact.contains("remove_id(msg.sender_id)"),
-            "generated server-object destructors must release mappings without delete_id"
+            compact.contains("guest_destroyed(msg.sender_id)"),
+            "generated destructor requests must end the guest object"
         );
         // wl_display.sync is the first request arm and has a new_id.
         let sender_check = compact
-            .find("Droppingrequestfromunmappedsender")
+            .find("Droppingrequestfromlocalobject")
             .expect("request sender check");
-        let allocation = compact
-            .find("allocate_host_id()")
-            .expect("new_id allocation");
+        let allocation = compact.find("create_paired(").expect("new_id allocation");
         assert!(
             sender_check < allocation,
             "a request's sender must be checked before its new_id is mapped"
@@ -387,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_object_validation_accepts_local_only_objects() {
+    fn test_request_object_arguments_are_validated_and_translated_at_once() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let protocol_path = manifest_dir.join("../third_party/protocols/gtk-shell.xml");
         let protocol = parse(protocol_path).expect("Failed to parse gtk-shell.xml");
@@ -396,9 +385,9 @@ mod tests {
 
         assert!(
             compact.contains(
-                "get_host_id(surface).is_none()&&!ctx.shadow_table.is_local_only_guest_object(surface)"
+                "lettranslated_surface=ctx.shadow_table.request_object(surface,\"wl_surface\").ok_or(ProtocolError::InvalidObjectId(surface))?;"
             ),
-            "typed object arguments must accept synthetic local-only objects for local handlers"
+            "an object argument must be resolved once, before the handler runs"
         );
     }
 
