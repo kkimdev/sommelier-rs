@@ -303,6 +303,29 @@ impl ShadowTable {
         }
     }
 
+    /// Pair the hard-coded IDs of a test fixture as one object of
+    /// `interface`, with no negotiated version, and keep both allocators
+    /// from handing those IDs out.
+    ///
+    /// # Panics
+    ///
+    /// When either ID is already in use.
+    #[cfg(test)]
+    pub(crate) fn insert_paired_for_test(&mut self, guest_id: u32, host_id: u32, interface: &str) {
+        assert!(
+            self.get_host_id(guest_id).is_none()
+                && self.get_interface(guest_id).is_none()
+                && self.guest_server_ids.reserve(guest_id),
+            "fixture guest ID {guest_id} is in use"
+        );
+        assert!(
+            self.is_host_id_available(host_id) && self.host_ids.reserve(host_id),
+            "fixture host ID {host_id} is in use"
+        );
+        self.map_id(guest_id, host_id);
+        self.track_interface(guest_id, interface.to_string());
+    }
+
     pub fn map_id(&mut self, guest_id: u32, host_id: u32) {
         if let Some(old_host_id) = self.guest_to_host.insert(guest_id, host_id) {
             if old_host_id != host_id && self.host_to_guest.get(&old_host_id) == Some(&guest_id) {
@@ -2014,6 +2037,31 @@ mod tests {
             "a delete_id for an ID never allocated changes nothing"
         );
         assert_eq!(table.allocate_host_id(), second + 1);
+    }
+
+    #[test]
+    fn fixture_ids_are_never_handed_out() {
+        let mut table = ShadowTable::new();
+        let server_guest = ShadowTable::GUEST_SERVER_ID_START + 1;
+        table.insert_paired_for_test(10, 3, "wl_surface");
+        table.insert_paired_for_test(server_guest, 4, "wl_data_offer");
+        assert_eq!(table.get_host_id(10), Some(3));
+        assert_eq!(
+            table.get_interface(server_guest),
+            Some(&"wl_data_offer".to_string())
+        );
+
+        // The allocators skip the fixture IDs themselves.
+        assert_eq!(table.host_ids.next_candidate(), Some(2));
+        assert_eq!(table.host_ids.next_candidate(), Some(5));
+        assert_eq!(
+            table.guest_server_ids.next_candidate(),
+            Some(ShadowTable::GUEST_SERVER_ID_START)
+        );
+        assert_eq!(
+            table.guest_server_ids.next_candidate(),
+            Some(server_guest + 1)
+        );
     }
 
     /// A guest `zwp_text_input_v3` is backed by a host `zwp_text_input_v1`,
