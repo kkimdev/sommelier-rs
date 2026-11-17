@@ -52,6 +52,10 @@ fn main() {
             "../third_party/protocols/fractional-scale-v1.xml",
         ),
         (
+            "xdg_output_unstable_v1",
+            "../third_party/protocols/xdg-output-unstable-v1.xml",
+        ),
+        (
             "keyboard_extension_unstable_v1",
             "../third_party/protocols/keyboard-extension-unstable-v1.xml",
         ),

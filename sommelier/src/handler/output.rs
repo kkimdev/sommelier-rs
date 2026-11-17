@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Host `wl_output` events and their host-only `zaura_output` extension.
+//! Host `wl_output` events, their host-only `zaura_output` extension, and
+//! the guest's `zxdg_output_v1` extension.
 //!
 //! The events feed [`crate::state::OutputRegistry`], which owns every
 //! output fact; `wl_output.release` also releases the output's Aura child.
+//! `zxdg_output_v1` passes through: on a fractionally scaled display only
+//! its logical size describes the output in surface coordinates, which the
+//! integer `wl_output.scale` cannot.
 
 use crate::handler::aura_objects;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::wayland::wl_output::REQ_RELEASE as REQ_RELEASE_WL_OUTPUT;
+use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
@@ -191,6 +196,26 @@ impl ZauraOutputHandler for OutputHandler {
 
     /// Not used: see [`crate::state::OutputState::panel_transform`].
     fn on_logical_transform(&mut self, _ctx: &mut Context, _transform: i32) -> Action {
+        Action::Drop
+    }
+}
+
+/// `zxdg_output_manager_v1` is forwarded. The generated code translates
+/// the IDs of its `zxdg_output_v1` children and their events, and checks
+/// each event against the child's version, which is its manager's.
+impl ZxdgOutputManagerV1Handler for OutputHandler {
+    fn on_get_xdg_output(&mut self, ctx: &mut Context, id: u32, output: u32) -> Action {
+        if ctx.shadow_table.get_host_id(output).is_some() {
+            return Action::Forward;
+        }
+        // An inert output (its bind crossed its global's removal) has no
+        // host object to extend, so its xdg_output is inert too: a
+        // local-only object whose destructor completes in the proxy.
+        let version = ctx
+            .shadow_table
+            .guest_object_version_or_unknown(ctx.last_sender_id);
+        ctx.shadow_table
+            .track_interface_with_version(id, "zxdg_output_v1".to_string(), version);
         Action::Drop
     }
 }
@@ -661,5 +686,106 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.get_interface(10), None);
         assert!(!ctx.fatal_protocol_error);
+    }
+
+    /// Forwards every `zxdg_output_v1` message, as the proxy's dispatcher
+    /// does for an interface without a custom handler.
+    struct ForwardXdgOutput;
+    impl crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::ZxdgOutputV1Handler
+        for ForwardXdgOutput
+    {
+    }
+
+    /// Guest `zxdg_output_manager_v1` 30 on host 31 at `version`.
+    fn bind_xdg_output_manager(ctx: &mut Context, version: u32) {
+        ctx.shadow_table.map_id(30, 31);
+        ctx.shadow_table
+            .track_interface_with_version(30, "zxdg_output_manager_v1".into(), version);
+        ctx.shadow_table.set_host_version(31, version);
+    }
+
+    /// Dispatch `get_xdg_output(40, output_guest)` from manager 30.
+    fn get_xdg_output(ctx: &mut Context, output_guest: u32) -> Option<Vec<u8>> {
+        use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::{
+            dispatch_request, REQ_GET_XDG_OUTPUT,
+        };
+        let payload = [40u32.to_ne_bytes(), output_guest.to_ne_bytes()].concat();
+        let mut request = crate::wire::WireMessage::new(30, REQ_GET_XDG_OUTPUT, &payload, &[]);
+        ctx.last_sender_id = 30;
+        let dispatched = dispatch_request(&mut request, &mut OutputHandler, ctx);
+        dispatched
+            .expect("valid request")
+            .map(|(message, _)| message)
+    }
+
+    /// The xdg_output of a live output gets a host object; its events
+    /// reach the guest translated, at its manager's version.
+    #[test]
+    fn xdg_output_passes_through_with_translated_ids_and_versions() {
+        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
+            dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
+        };
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        bind_xdg_output_manager(&mut ctx, 1);
+        ctx.shadow_table.map_id(10, OUTPUT_HOST);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_output".into(), 3);
+
+        let request = get_xdg_output(&mut ctx, 10).expect("forwarded");
+        let host_xdg_output = ctx.shadow_table.get_host_id(40).expect("host object");
+        assert_eq!(msg_sender(&request), 31);
+        assert_eq!(
+            request[8..],
+            [host_xdg_output.to_ne_bytes(), OUTPUT_HOST.to_ne_bytes()].concat()
+        );
+
+        // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
+        let size = [1600i32.to_ne_bytes(), 1000i32.to_ne_bytes()].concat();
+        let mut event =
+            crate::wire::WireMessage::new(host_xdg_output, EVT_LOGICAL_SIZE, &size, &[]);
+        let (event, _) = dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx)
+            .expect("valid event")
+            .expect("forwarded");
+        assert_eq!(msg_sender(&event), 40);
+        assert_eq!(event[8..], size);
+
+        // `description` is a v2 event, which a v1 xdg_output never gets.
+        let mut description = crate::wire::MessageBuilder::new();
+        description.write_string("Built-in display");
+        let description = description.build_message(host_xdg_output, EVT_DESCRIPTION);
+        let mut event =
+            crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..], &[]);
+        assert!(matches!(
+            dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx),
+            Err(crate::wire::ProtocolError::UnsupportedVersion { .. })
+        ));
+    }
+
+    /// The xdg_output of an inert output is inert too: nothing reaches the
+    /// host, and its destroy completes in the proxy with one `delete_id`.
+    #[test]
+    fn xdg_output_of_an_inert_output_is_inert() {
+        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
+        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
+            dispatch_request, REQ_DESTROY,
+        };
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        bind_xdg_output_manager(&mut ctx, 3);
+        ctx.shadow_table
+            .track_interface_with_version(10, "wl_output".into(), 3);
+
+        assert_eq!(get_xdg_output(&mut ctx, 10), None);
+        assert_eq!(ctx.shadow_table.get_host_id(40), None);
+        assert!(ctx.shadow_table.guest_object_matches(40, "zxdg_output_v1"));
+        assert_eq!(ctx.shadow_table.guest_object_version(40), Some(3));
+
+        let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[], &[]);
+        let dispatched = dispatch_request(&mut destroy, &mut ForwardXdgOutput, &mut ctx);
+        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(1, EVT_DELETE_ID)]
+        );
     }
 }

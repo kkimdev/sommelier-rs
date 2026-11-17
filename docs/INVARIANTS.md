@@ -196,8 +196,9 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   libwayland-server makes this harmless. A bind of a `wl_output` name that
   the binding registry advertised and then removed therefore creates an
   inert guest object that never reaches the host and completes its
-  destructor locally, like a synthetic object. A request that names it
-  reaches the host with a null output, as if the guest had named none. It
+  destructor locally, like a synthetic object; so does a `zxdg_output_v1`
+  created for it. A request that names an inert output reaches the host
+  with a null output, as if the guest had named none. An inert output
   never receives `geometry`, `mode` or `done`; that is harmless, because
   the guest receives the global's `global_remove` on the same registry and
   drops the output. A name the registry never
@@ -208,6 +209,7 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `inert_output_release_completes_locally`,
   `bound_output_release_reaches_the_host_without_a_local_delete_id`,
   `set_fullscreen_on_an_inert_output_is_forwarded_without_an_output`,
+  `xdg_output_of_an_inert_output_is_inert`,
   `global_remove_forwards_only_visible_globals_and_invalidates_bind`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the

@@ -334,7 +334,7 @@ impl ShadowTable {
     /// Synthetic guest objects are intentionally not paired with a host
     /// object. Their handlers consume requests locally (such as the SHM shim,
     /// the v3 text-input manager, and an inert `wl_output` whose bind crossed
-    /// its global's removal), so the generated dispatcher must let those
+    /// its global's removal, with its `zxdg_output_v1`), so the generated dispatcher must let those
     /// requests reach the handler while rejecting every other unmapped
     /// sender before it can mutate state.
     pub fn is_local_only_guest_object(&self, guest_id: u32) -> bool {
@@ -343,7 +343,9 @@ impl ShadowTable {
             Some(
                 "wl_shm"
                     | "wl_shm_pool"
+                    // An inert output and the xdg_output created for it.
                     | INERT_BIND_INTERFACE
+                    | "zxdg_output_v1"
                     | "zwp_text_input_manager_v3"
                     | "zwp_linux_dmabuf_feedback_v1"
                     | "gtk_shell1"
@@ -1861,6 +1863,7 @@ mod tests {
         table.track_interface(22, "wl_shm_pool".to_string());
         table.track_interface(23, "wl_surface".to_string());
         table.track_interface(25, INERT_BIND_INTERFACE.to_string());
+        table.track_interface(26, "zxdg_output_v1".to_string());
 
         assert!(table.is_local_only_guest_object(20));
         assert!(table.is_local_only_guest_object(21));
@@ -1868,6 +1871,7 @@ mod tests {
         assert!(!table.is_local_only_guest_object(23));
         assert!(!table.is_local_only_guest_object(24));
         assert!(table.is_local_only_guest_object(25), "an inert output");
+        assert!(table.is_local_only_guest_object(26), "its xdg_output");
     }
 
     #[test]

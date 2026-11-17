@@ -31,6 +31,9 @@ use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
 use crate::protocols::wayland::{wl_fixes, wl_registry};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
+use crate::protocols::xdg_output_unstable_v1::{
+    zxdg_output_manager_v1, ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED,
+};
 use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
 use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
@@ -126,6 +129,7 @@ fn advertised_global_version(interface: &str, host_version: u32) -> u32 {
         "wl_data_device_manager" => WL_DATA_DEVICE_MANAGER_VERSION,
         "xdg_wm_base" => XDG_SHELL_VERSION,
         "zwp_linux_dmabuf_v1" => GUEST_DMABUF_VERSION,
+        "zxdg_output_manager_v1" => zxdg_output_manager_v1::VERSION,
         _ => host_version,
     };
     host_version.min(cap)
@@ -141,6 +145,7 @@ fn forwards_host_global(ctx: &Context, interface: &str) -> bool {
         || TEXT_INPUT_ALLOWED.contains(&interface)
         || (XDG_DECORATION_ALLOWED.contains(&interface) && ctx.xdg_decoration)
         || FRACTIONAL_SCALE_ALLOWED.contains(&interface)
+        || XDG_OUTPUT_ALLOWED.contains(&interface)
         || interface == "wl_data_device_manager"
 }
 
@@ -2763,6 +2768,7 @@ mod tests {
         assert_eq!(advertised_global_version("wl_data_device_manager", 99), 3);
         assert_eq!(advertised_global_version("xdg_wm_base", 7), 3);
         assert_eq!(advertised_global_version("zwp_linux_dmabuf_v1", 5), 4);
+        assert_eq!(advertised_global_version("zxdg_output_manager_v1", 4), 3);
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
@@ -2770,6 +2776,11 @@ mod tests {
         ctx.shadow_table
             .track_interface(1, "wl_registry".to_string());
         let mut handler = RegistryHandler;
+        let xdg_output_manager = "zxdg_output_manager_v1".to_string();
+        assert_eq!(
+            handler.on_global(&mut ctx, 9, &xdg_output_manager, 3),
+            Action::Forward
+        );
         let seat = "wl_seat".to_string();
         assert_eq!(handler.on_global(&mut ctx, 10, &seat, 10), Action::Drop);
         assert_eq!(
