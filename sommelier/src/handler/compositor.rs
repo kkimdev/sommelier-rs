@@ -856,34 +856,18 @@ impl WlSurfaceHandler for CompositorHandler {
         Action::Drop
     }
 
+    /// An enter or leave naming a surface or output the guest has destroyed
+    /// never gets here: the proxy suppresses events from a destroyed sender,
+    /// and generated validation drops events naming a destroyed object.
     fn on_enter(&mut self, ctx: &mut Context, output: u32) -> Action {
-        let host_surface_id = ctx.last_sender_id;
-        if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
-            || ctx.shadow_table.is_pending_destroy_host(output)
-        {
-            // The guest has already destroyed one of the objects named by
-            // this event.  Forwarding a late enter would make the client
-            // observe an event for a dead wl_surface/wl_output and can turn a
-            // normal destroy race into a protocol error.
-            return Action::Drop;
-        }
         // An output whose global was removed is still a valid guest object,
         // so the event is forwarded; the registry ignores it for placement.
-        ctx.outputs.surface_entered(host_surface_id, output);
+        ctx.outputs.surface_entered(ctx.last_sender_id, output);
         Action::Forward
     }
 
     fn on_leave(&mut self, ctx: &mut Context, output: u32) -> Action {
-        let host_surface_id = ctx.last_sender_id;
-        ctx.outputs.surface_left(host_surface_id, output);
-        if ctx.shadow_table.is_pending_destroy_host(host_surface_id)
-            || ctx.shadow_table.is_pending_destroy_host(output)
-        {
-            // See on_enter: consume the state transition locally, but do not
-            // expose a late event to a guest object that has already been
-            // destroyed (or released its output).
-            return Action::Drop;
-        }
+        ctx.outputs.surface_left(ctx.last_sender_id, output);
         Action::Forward
     }
 
@@ -1882,42 +1866,30 @@ mod tests {
         );
     }
 
+    /// The enter and leave handlers rely on generated validation to drop an
+    /// event that names a released output, which stays mapped until the
+    /// host's `delete_id`.
     #[test]
-    fn surface_output_events_drop_after_surface_or_output_release() {
+    fn surface_events_naming_a_released_output_never_reach_the_handlers() {
+        use crate::protocols::wayland::wl_surface::{dispatch_event, EVT_ENTER, EVT_LEAVE};
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = CompositorHandler;
-        let surface_guest = 100;
-        let surface_host = 200;
-        let output_guest = 10;
-        let output_host = 20;
+        let (surface_guest, surface_host, output_guest, output_host) = (100, 200, 10, 20);
         ctx.shadow_table.map_id(surface_guest, surface_host);
+        ctx.shadow_table
+            .track_interface_with_version(surface_guest, "wl_surface".into(), 4);
         ctx.shadow_table.map_id(output_guest, output_host);
+        ctx.shadow_table
+            .track_interface_with_version(output_guest, "wl_output".into(), 3);
         ctx.outputs.bind_for_test(output_host, Default::default());
-
-        ctx.last_sender_id = surface_host;
-        ctx.shadow_table.mark_pending_destroy(surface_guest);
-        assert_eq!(
-            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, output_host),
-            Action::Drop
-        );
-        assert_eq!(
-            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, output_host),
-            Action::Drop
-        );
-
-        // A released output remains mapped until the host's delete_id, so a
-        // late surface event must still be consumed without being forwarded
-        // as an event naming a dead guest wl_output.
-        ctx.shadow_table.clear_pending_destroy_guest(surface_guest);
         ctx.shadow_table.mark_pending_destroy(output_guest);
-        assert_eq!(
-            WlSurfaceHandler::on_enter(&mut handler, &mut ctx, output_host),
-            Action::Drop
-        );
-        assert_eq!(
-            WlSurfaceHandler::on_leave(&mut handler, &mut ctx, output_host),
-            Action::Drop
-        );
+
+        let payload = output_host.to_ne_bytes();
+        for opcode in [EVT_ENTER, EVT_LEAVE] {
+            let mut event = crate::wire::WireMessage::new(surface_host, opcode, &payload, &[]);
+            let dispatched = dispatch_event(&mut event, &mut CompositorHandler, &mut ctx);
+            assert!(matches!(dispatched, Ok(None)), "opcode {opcode}");
+            assert_eq!(ctx.outputs.entered_for_test(surface_host), None);
+        }
     }
 
     #[test]

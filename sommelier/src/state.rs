@@ -465,14 +465,6 @@ impl ShadowTable {
         self.pending_destroy_guest_ids.contains(&guest_id)
     }
 
-    /// Undo [`Self::mark_pending_destroy`], for tests that stage one object's
-    /// destructor after another's. Production clears the marker only through
-    /// the host's `delete_id`.
-    #[cfg(test)]
-    pub fn clear_pending_destroy_guest(&mut self, guest_id: u32) {
-        self.pending_destroy_guest_ids.remove(&guest_id);
-    }
-
     pub fn is_pending_destroy_host(&self, host_id: u32) -> bool {
         self.host_to_guest
             .get(&host_id)
