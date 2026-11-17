@@ -203,7 +203,7 @@ keysyms back to keycodes and to classify chords; chords listed in
 - **Aura objects.** `aura_objects.rs` creates, versions and releases every
   host-only Aura child (`zaura_surface`, `zaura_toplevel`, `zaura_output`)
   from one table. The guest never sees them.
-- **Outputs.** `OutputRegistry` owns bound outputs and their Aura metadata.
+- **Outputs.** `OutputRegistry` owns live outputs and their Aura metadata.
   The work area follows the `wl_output` geometry (panel) transform, not
   `zaura_output.logical_transform`, as ChromiumOS Sommelier does.
 

@@ -313,7 +313,7 @@ that task ends, an error says reloads have stopped.
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
 | `sommelier/src/state/internal_callbacks.rs` | `InternalCallbacks`: what each proxy-issued `wl_display.sync` waits for, including the placement barrier. |
-| `sommelier/src/state/outputs.rs` | `OutputRegistry`: bound outputs, their committed metadata and liveness, and the output a surface is placed on; `OutputState::work_area`. |
+| `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
 | `sommelier/src/handler/window_placement.rs` | Placement mechanics: the focused toplevel and its output, the ARC identity (`set_aura_application_id` chooses it or the guest's ID for XDG and GTK), `set_window_bounds` and its barrier, and the configures held behind it. Protocol handlers call one entry point per event (listed in its module docs). |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |

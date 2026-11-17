@@ -1401,13 +1401,14 @@ mod tests {
     }
 
     #[test]
-    fn surface_enter_of_an_inactive_output_is_forwarded_but_not_recorded() {
+    fn surface_enter_of_a_removed_output_is_forwarded_but_not_recorded() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.outputs.bind_for_test(20, Default::default());
-        ctx.outputs.deactivate(crate::state::GlobalBinding {
+        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
             name: 20,
             generation: 1,
         });
+        assert!(removed_aura_outputs.is_empty());
         ctx.last_sender_id = 100;
         assert_eq!(
             WlSurfaceHandler::on_enter(&mut CompositorHandler, &mut ctx, 20),

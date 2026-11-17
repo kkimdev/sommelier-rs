@@ -1046,9 +1046,20 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         if let Some(generation) = removed_generation {
             // A bound wl_output remains a valid Wayland object after its
             // global advertisement disappears, but it must stop feeding
-            // compositor-owned placement.  Match the exact advertisement
-            // generation so a delayed remove cannot retire a replacement.
-            ctx.outputs.deactivate(GlobalBinding { name, generation });
+            // compositor-owned placement, and its host-only zaura_output is
+            // released now (see `OutputRegistry::remove_global`). Match the
+            // exact advertisement generation so a delayed remove cannot
+            // retire a replacement.
+            for aura_output in ctx
+                .outputs
+                .remove_global(GlobalBinding { name, generation })
+            {
+                crate::handler::aura_objects::release(
+                    ctx,
+                    crate::handler::aura_objects::AuraChild::OUTPUT,
+                    aura_output,
+                );
+            }
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
         }
         if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
@@ -1709,40 +1720,44 @@ mod tests {
         );
     }
 
+    /// A removed output is forgotten and its `zaura_output` released at
+    /// once: a `wl_output` before v3 has no release request to free them
+    /// later. The guest's object itself stays valid until it releases it.
     #[test]
-    fn global_remove_deactivates_bound_output_without_destroying_object() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+    fn global_remove_forgets_the_output_and_releases_its_aura_child() {
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        );
         ctx.last_sender_id = 1;
         ctx.shadow_table.map_id(1, 1);
         ctx.shadow_table
             .track_interface(1, "wl_registry".to_string());
         let mut handler = RegistryHandler;
         let output = "wl_output".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &output, 3), Action::Forward);
-        let bind = (output.clone(), 3, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
+        assert_eq!(
+            handler.on_global(&mut ctx, 11, &"zaura_shell".to_string(), 38),
+            Action::Drop
+        );
+        assert_eq!(handler.on_global(&mut ctx, 10, &output, 2), Action::Forward);
+        assert_eq!(
+            handler.on_bind(&mut ctx, 10, &(output, 2, 20)),
+            Action::Drop
+        );
         let output_host = ctx.shadow_table.get_host_id(20).expect("bound output");
-        assert!(ctx.outputs.update(output_host, |state| {
-            *state = crate::state::OutputState {
-                mode_width: 1920,
-                mode_height: 1080,
-                aura_current_scale: Some(1000),
-                aura_device_scale_factor: Some(1000),
-                ..Default::default()
-            };
-        }));
-        ctx.outputs.commit(output_host);
-        assert_eq!(ctx.outputs.primary().map(|(id, _)| id), Some(output_host));
+        let aura_output = ctx.outputs.aura_output(output_host).expect("Aura output");
+        ctx.client_to_host_queue.clear();
 
-        ctx.last_sender_id = 1;
         assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert!(!ctx.outputs.is_live(output_host));
-        assert!(ctx.outputs.primary().is_none());
-        // The object itself stays valid until the guest releases it.
-        assert_eq!(ctx.shadow_table.get_host_id(20), Some(output_host));
-        assert_eq!(ctx.outputs.release(output_host), None);
+        assert_eq!(
+            crate::test_support::queued_headers(&ctx.client_to_host_queue),
+            [(
+                aura_output,
+                crate::protocols::aura_shell::zaura_output::REQ_RELEASE
+            )]
+        );
+        assert!(ctx.shadow_table.is_pending_destroy_host_only(aura_output));
         assert!(ctx.outputs.is_empty_for_test());
+        assert_eq!(ctx.shadow_table.get_host_id(20), Some(output_host));
     }
 
     #[test]

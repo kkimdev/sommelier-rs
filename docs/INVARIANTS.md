@@ -181,10 +181,15 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   manager or `zaura_surface` children of a `zaura_shell`. They stay mapped
   and routable until their own destructor or the connection closes; a
   replacement manager global may coexist with them. Already-bound manager
-  objects (such as the text-input managers) stay usable.
+  objects (such as the text-input managers) stay usable. The one exception
+  is the host-only `zaura_output` of a removed `wl_output`: the proxy
+  releases it and forgets the output at once, because nothing reads them
+  again and a `wl_output` before v3 has no release request that could free
+  them later. The guest's `wl_output` itself stays valid.
   Tests: `keyboard_extension_global_remove_keeps_existing_children_alive`,
   `global_remove_keeps_aura_children_until_surface_destroy`,
-  `removed_text_input_globals_keep_bound_manager_usable`.
+  `removed_text_input_globals_keep_bound_manager_usable`,
+  `global_remove_forgets_the_output_and_releases_its_aura_child`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the
   connection-wide metadata for that name MUST be replaced before the new

@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn aura_scale_events_ignore_unknown_inactive_and_released_outputs() {
+    fn aura_scale_events_ignore_unknown_removed_and_released_outputs() {
         let global = crate::state::GlobalBinding {
             name: 7,
             generation: 1,
@@ -326,7 +326,7 @@ mod tests {
             if retired != 0 {
                 bind_output_with_aura(&mut ctx, 3, Default::default());
                 if retired == 1 {
-                    ctx.outputs.deactivate(global);
+                    assert_eq!(ctx.outputs.remove_global(global), [AURA_OUTPUT_HOST]);
                 } else {
                     ctx.outputs.release(OUTPUT_HOST);
                 }
@@ -424,13 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn inactive_output_ignores_late_wl_output_and_aura_events() {
+    fn removed_output_ignores_late_wl_output_and_aura_events() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         bind_output_with_aura(&mut ctx, 3, Default::default());
-        ctx.outputs.deactivate(crate::state::GlobalBinding {
+        let global = crate::state::GlobalBinding {
             name: 7,
             generation: 1,
-        });
+        };
+        assert_eq!(ctx.outputs.remove_global(global), [AURA_OUTPUT_HOST]);
         let mut handler = OutputHandler;
 
         // The guest still owns a valid wl_output, so its events are
@@ -451,8 +452,11 @@ mod tests {
         );
         assert!(!ctx.outputs.has_pending_for_test());
         assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), None);
-        // Release still tears the Aura child down.
-        assert_eq!(ctx.outputs.release(OUTPUT_HOST), Some(AURA_OUTPUT_HOST));
+        assert_eq!(
+            ctx.outputs.release(OUTPUT_HOST),
+            None,
+            "the removal already handed over the Aura child"
+        );
     }
 
     /// Send one Exo display-metrics group: `wl_output.geometry` (panel
@@ -590,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn released_outputs_leave_no_liveness_bookkeeping() {
+    fn released_outputs_leave_no_record() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let mut handler = OutputHandler;
         // Output 20 lost its global before release; output 30 did not.
@@ -600,10 +604,11 @@ mod tests {
                 .track_interface_with_version(output_guest, "wl_output".into(), 3);
             ctx.outputs.bind_for_test(output_host, Default::default());
         }
-        ctx.outputs.deactivate(crate::state::GlobalBinding {
+        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
             name: 20,
             generation: 1,
         });
+        assert!(removed_aura_outputs.is_empty());
         for output_guest in [10, 11] {
             ctx.last_sender_id = output_guest;
             assert_eq!(
