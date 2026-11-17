@@ -34,6 +34,7 @@ limitations under the License.
 //! - when its framing is intact, either answer the stream's closing
 //!   `wl_display.sync` (the connection stayed healthy) or send the guest a
 //!   `wl_display.error` before closing it;
+//! - send the guest at most one `wl_display.error`, and nothing after it;
 //! - send the host only what a real compositor accepts: requests from live
 //!   host objects with opcodes their interfaces have, fresh `new_id`s, and
 //!   object arguments naming live objects of the declared interface. The
@@ -908,11 +909,22 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
     let framed = case.framed;
     let events = exchange(protocols, config, case.sends, framed, case.callback)
         .expect("the proxy answers or closes the connection in time");
-    let saw = |event: (u32, u16)| {
-        frames(&events).any(|(header, _)| (header.sender_id, header.opcode) == event)
-    };
-    let answered = saw((case.callback, wl_callback::EVT_DONE));
-    let rejected = saw((WL_DISPLAY_ID, wl_display::EVT_ERROR));
+    let headers: Vec<_> = frames(&events)
+        .map(|(header, _)| (header.sender_id, header.opcode))
+        .collect();
+    let answered = headers.contains(&(case.callback, wl_callback::EVT_DONE));
+    let error = (WL_DISPLAY_ID, wl_display::EVT_ERROR);
+    let errors = headers.iter().filter(|&&event| event == error).count();
+    assert!(
+        errors <= 1,
+        "the guest received {errors} wl_display.error events"
+    );
+    let rejected = errors == 1;
+    assert!(
+        !rejected || headers.last() == Some(&error),
+        "the guest received {:?} after its wl_display.error",
+        headers.last()
+    );
     if let Some(guest) = &case.guest {
         check_guest_events(protocols, guest, &events, answered && !rejected);
     }
