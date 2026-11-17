@@ -290,7 +290,9 @@ pub struct TextInputState {
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
     /// Whether the proxy warned that the guest seat cannot carry an
-    /// activation, which every later reconcile would repeat.
+    /// activation, which every later reconcile would repeat. It is never
+    /// reset, so the proxy warns once per text input, not once per seat it
+    /// loses.
     pub(crate) warned_seat_missing: bool,
 }
 

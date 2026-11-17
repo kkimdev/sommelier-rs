@@ -95,10 +95,11 @@ real sockets. Half the cases end like a client typing into text fields
 for each move with a roundtrip, and enables, edits and disables the
 field; now and then it releases its seat while the field is enabled,
 reuses the seat's ID for a surface once it is deleted, and disables the
-field, which the proxy can then no longer deactivate. Each case must end without a panic or hang, close every
-descriptor, and either answer the stream's closing `wl_display.sync` or
-send one `wl_display.error`, its last event. The fake compositor behind the proxy also checks
-that every request it receives comes from a live host object, creates
+field, which the proxy can then no longer deactivate. Each case must end
+without a panic or hang, close every descriptor, and either answer the
+stream's closing `wl_display.sync` or send one `wl_display.error`, its
+last event. The fake compositor behind the proxy also checks that every
+request it receives comes from a live host object, creates
 only fresh IDs and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,
 creates objects of its own (a data offer for each data device, a buffer
@@ -141,7 +142,8 @@ The expected content type comes from the proxy's own mapping, so this
 check finds ordering and state bugs, not mapping bugs; unit tests pin
 the mapping. The run reports how many fields it checked, how many
 activations the guest's plan deferred, how many input methods
-restarted, and how many host activations outlived their seat.
+restarted, how many host activations had their seat end while active,
+and how many deactivates named a destroyed seat.
 
 The suite runs 5000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:
