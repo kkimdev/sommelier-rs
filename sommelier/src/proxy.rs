@@ -151,6 +151,10 @@ struct Client {
     /// failed. No later batch dispatches anything, so the guest gets at most
     /// one error. A failed receive or a closed peer stops `run` without it.
     ended: bool,
+    /// Whether every batch that keeps the session checks that it left no
+    /// state behind an ended object (`Context::assert_no_orphans`).
+    #[cfg(test)]
+    check_orphans: bool,
 }
 
 impl Client {
@@ -162,6 +166,8 @@ impl Client {
             ctx,
             handler: SommelierHandler::new(),
             ended: false,
+            #[cfg(test)]
+            check_orphans: false,
         }
     }
 
@@ -573,6 +579,12 @@ impl Client {
         // refreshes within this dispatch batch; allow the next batch to
         // publish a newer table after more capabilities have arrived.
         self.ctx.synthetic_feedback_refresh_pending.clear();
+        // A session that ends rolls nothing back, so only a batch that
+        // keeps it must leave no state behind an ended object.
+        #[cfg(test)]
+        if self.check_orphans && end.is_none() {
+            self.ctx.assert_no_orphans();
+        }
 
         // A send passes the peer copies of the descriptors. `out` and
         // `reverse_out` still own them and close them when the batch ends,

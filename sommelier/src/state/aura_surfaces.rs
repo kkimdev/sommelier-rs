@@ -61,6 +61,12 @@ impl AuraSurfaces {
     pub(crate) fn count(&self) -> usize {
         self.by_wl_surface.len()
     }
+
+    /// Every host wl_surface that has an Aura surface.
+    #[cfg(test)]
+    pub(super) fn wl_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+        self.by_wl_surface.keys().copied()
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ mod aura_surfaces;
 mod id_allocator;
 mod input;
 mod internal_callbacks;
+mod lifecycle;
 mod objects;
 mod outputs;
 mod render;

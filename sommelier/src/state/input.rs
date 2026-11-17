@@ -1653,6 +1653,12 @@ impl KeyboardFocusRegistry {
             .is_some_and(|focus| focus.guest_surface == guest_surface)
     }
 
+    /// Every host keyboard with a focus.
+    #[cfg(test)]
+    pub(super) fn keyboards_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.keyboards.keys().copied()
+    }
+
     #[cfg(test)]
     pub fn set_for_test(
         &mut self,

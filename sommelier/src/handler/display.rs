@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
     use crate::state::Context;
-    use crate::test_support::{protocol_error, raw_dispatch};
+    use crate::test_support::{protocol_error, queued_headers, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
 
     struct ProbeHandler;
@@ -197,6 +197,127 @@ mod tests {
             "a delete_id the table does not track must not end other state"
         );
         assert!(ctx.host_to_client_queue.is_empty());
+    }
+
+    /// A host may destroy a guest's object on its own (INVARIANTS "Object
+    /// lifetimes"). Its `delete_id` must forget the object's state, as the
+    /// guest's destructor would, so the host ID the allocator hands out next
+    /// starts clean.
+    #[test]
+    #[ignore = "O1a: a host delete_id leaves the output record behind"]
+    fn a_host_destroyed_output_is_forgotten() {
+        use crate::handler::registry::RegistryHandler;
+        use crate::protocols::aura_shell::zaura_output;
+        use crate::protocols::wayland::wl_registry::WlRegistryHandler;
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        );
+        ctx.last_sender_id = 1;
+        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
+        let output = "wl_output".to_string();
+        RegistryHandler.on_global(&mut ctx, 11, &"zaura_shell".to_string(), 38);
+        RegistryHandler.on_global(&mut ctx, 10, &output, 3);
+        RegistryHandler.on_bind(&mut ctx, 10, &(output.clone(), 3, 20));
+        let host = ctx.shadow_table.get_host_id(20).expect("a bound output");
+        let aura_output = ctx.outputs.aura_output(host).expect("an Aura output");
+        ctx.client_to_host_queue.clear();
+        ctx.host_to_client_queue.clear();
+
+        DisplayHandler.on_delete_id(&mut ctx, host);
+
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(aura_output, zaura_output::REQ_RELEASE)]
+        );
+        assert!(ctx.outputs.is_empty_for_test());
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
+        );
+        ctx.assert_no_orphans();
+
+        // The next output gets the freed host ID.
+        RegistryHandler.on_bind(&mut ctx, 10, &(output, 3, 21));
+        assert_eq!(ctx.shadow_table.get_host_id(21), Some(host));
+        assert_eq!(ctx.outputs.live_outputs(), [host]);
+    }
+
+    #[test]
+    #[ignore = "O1b: a host delete_id leaves the keyboard state behind"]
+    fn a_host_destroyed_keyboard_is_forgotten() {
+        use crate::handler::keyboard::KeyboardHandler;
+        use crate::protocols::keyboard_extension_unstable_v1::{
+            zcr_extended_keyboard_v1, zcr_keyboard_extension_v1,
+        };
+        const SEAT: u32 = 10;
+        const EXTENSION: u32 = 100;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table.insert_paired_for_test(SEAT, 11, "wl_seat");
+        ctx.shadow_table
+            .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
+        ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
+        let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
+        ctx.keyboard_to_seat.insert(20, SEAT);
+        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        let extended = ctx.keyboard_to_extended_keyboard[&HostId(host)];
+        ctx.client_to_host_queue.clear();
+
+        DisplayHandler.on_delete_id(&mut ctx, host);
+
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(extended.0, zcr_extended_keyboard_v1::REQ_DESTROY)]
+        );
+        assert!(ctx.shadow_table.is_retired_host(extended.0));
+        assert!(ctx.keyboard_to_seat.is_empty());
+        assert!(ctx.extended_keyboard_to_keyboard.is_empty());
+        assert!(!ctx.is_fatal());
+        ctx.assert_no_orphans();
+
+        // The next keyboard gets the freed host ID, and its own extended
+        // keyboard.
+        ctx.client_to_host_queue.clear();
+        assert_eq!(
+            ctx.shadow_table.create_paired(21, "wl_keyboard", 1, 1),
+            host
+        );
+        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(
+                EXTENSION,
+                zcr_keyboard_extension_v1::REQ_GET_EXTENDED_KEYBOARD
+            )]
+        );
+    }
+
+    #[test]
+    #[ignore = "O1c: a host delete_id leaves the surface state behind"]
+    fn a_host_destroyed_surface_is_forgotten() {
+        use crate::protocols::aura_shell::zaura_surface;
+        const SURFACE: u32 = 30;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.bind_aura_shell_for_test(100);
+        let host = ctx.shadow_table.create_paired(SURFACE, "wl_surface", 1, 1);
+        ctx.surface_mut(SURFACE);
+        let aura_surface =
+            crate::handler::aura_objects::ensure_host_zaura_surface(&mut ctx, SURFACE)
+                .expect("an Aura surface");
+        ctx.client_to_host_queue.clear();
+
+        DisplayHandler.on_delete_id(&mut ctx, host);
+
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue),
+            [(aura_surface, zaura_surface::REQ_RELEASE)]
+        );
+        assert_eq!(ctx.aura_surfaces.count(), 0);
+        assert!(ctx.surfaces.is_empty());
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
+        );
+        ctx.assert_no_orphans();
     }
 
     #[test]

@@ -1,0 +1,157 @@
+/*
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! How per-object state ends with its object.
+
+#[cfg(test)]
+use super::{Context, HostId};
+
+#[cfg(test)]
+impl Context {
+    /// Panic if per-object state outlived its object: every key of a map
+    /// that holds state for an object, and every object such state names,
+    /// must be a live object of the right interface in the
+    /// [`super::ShadowTable`].
+    ///
+    /// A guest key must be a live guest object (local, or paired and not
+    /// destroyed); a host key must be paired with one. State for a host ID
+    /// that outlives its guest object (a render buffer, an asynchronous
+    /// dma-buf create) only needs the ID to be in use, retired included.
+    pub(crate) fn assert_no_orphans(&self) {
+        let table = &self.shadow_table;
+        let guest = |what: &str, id: u32, interface: &str| {
+            assert!(
+                table.request_object(id, interface).is_some(),
+                "{what} outlived guest {interface} {id}"
+            );
+        };
+        let host = |what: &str, id: u32, interface: &str| {
+            assert!(
+                table
+                    .get_guest_id(id)
+                    .is_some_and(|paired| table.request_object(paired, interface).is_some()),
+                "{what} outlived host {interface} {id}"
+            );
+        };
+        let host_id_in_use = |what: &str, id: HostId| {
+            assert!(
+                !table.is_host_id_available(id.0),
+                "{what} outlived host ID {}",
+                id.0
+            );
+        };
+
+        for &surface in self.surfaces.keys() {
+            guest("wl_surface state", surface, "wl_surface");
+        }
+        for (&viewport, &surface) in &self.viewport_to_wl_surface {
+            guest("viewport link", viewport, "wp_viewport");
+            guest("viewport link", surface, "wl_surface");
+        }
+        for (&gtk_shell, state) in &self.gtk_shells {
+            guest("GTK shell", gtk_shell, "gtk_shell1");
+            for &gtk_surface in &state.surfaces {
+                guest("GTK shell surface", gtk_surface, "gtk_surface1");
+            }
+        }
+        for (&gtk_surface, state) in &self.gtk_surfaces {
+            guest("GTK surface", gtk_surface, "gtk_surface1");
+            guest("GTK surface", state.wl_surface_id, "wl_surface");
+        }
+        for (xdg_surface, wl_surface, toplevel) in self.xdg_roles.roles_for_test() {
+            guest("xdg role", xdg_surface, "xdg_surface");
+            guest("xdg role", wl_surface, "wl_surface");
+            if let Some(toplevel) = toplevel {
+                guest("xdg role", toplevel, "xdg_toplevel");
+            }
+        }
+        let (arc_surfaces, aura_toplevels) = self.window_placement.objects_for_test();
+        for surface in arc_surfaces {
+            guest("ARC identity", surface, "wl_surface");
+        }
+        for toplevel in aura_toplevels {
+            guest("Aura toplevel", toplevel, "xdg_toplevel");
+        }
+        for surface in self.aura_surfaces.wl_surfaces_for_test() {
+            host("Aura surface", surface, "wl_surface");
+        }
+        for output in self.outputs.live_outputs() {
+            host("output record", output, "wl_output");
+        }
+        for surface in self.outputs.surfaces_for_test() {
+            host("surface output", surface, "wl_surface");
+        }
+
+        for &keyboard in self.keyboard_to_seat.keys() {
+            guest("keyboard seat", keyboard, "wl_keyboard");
+        }
+        let host_keyboards = self
+            .keyboard_to_extended_keyboard
+            .keys()
+            .chain(self.extended_keyboard_to_keyboard.values())
+            .chain(self.keyboard_repeatable_keys.keys())
+            .chain(self.keyboard_keysym_to_keycode.keys())
+            .copied()
+            .chain(self.keyboard_focus.keyboards_for_test());
+        for keyboard in host_keyboards {
+            host("keyboard state", keyboard.0, "wl_keyboard");
+        }
+        for &text_input in self.text_inputs.keys() {
+            guest("text input state", text_input, "zwp_text_input_v3");
+        }
+
+        for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
+            guest("SHM pool", pool, "wl_shm_pool");
+        }
+        for &shm in self
+            .shm_guest_formats
+            .keys()
+            .chain(&self.stale_shm_guest_objects)
+        {
+            guest("wl_shm state", shm, "wl_shm");
+        }
+        for (buffer, _) in self.render_buffer_lifecycles() {
+            host_id_in_use("render buffer", buffer);
+        }
+        for &params in self.pending_native_creates.keys() {
+            host_id_in_use("asynchronous dma-buf create", params);
+        }
+        for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
+            guest("dma-buf params", params, "zwp_linux_buffer_params_v1");
+        }
+        for &factory in self.dmabuf_guest_generations.keys() {
+            guest("dma-buf factory", factory, "zwp_linux_dmabuf_v1");
+        }
+        for &feedback in self.synthetic_feedback_objects.keys() {
+            guest("dma-buf feedback", feedback, "zwp_linux_dmabuf_feedback_v1");
+        }
+
+        let registries = self
+            .registry_global_names
+            .keys()
+            .chain(self.registry_global_removed.keys())
+            .chain(self.registry_global_generations.keys())
+            .chain(self.registry_global_visibility.keys())
+            .chain(
+                self.pending_dmabuf_globals
+                    .iter()
+                    .map(|pending| &pending.registry_host_id),
+            );
+        for &registry in registries {
+            host("registry globals", registry, "wl_registry");
+        }
+    }
+}

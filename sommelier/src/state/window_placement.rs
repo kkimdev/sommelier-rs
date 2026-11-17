@@ -277,6 +277,16 @@ impl WindowPlacementState {
         self.aura_toplevel_by_xdg_toplevel.len()
     }
 
+    /// Every guest wl_surface with an ARC identity, and every guest
+    /// xdg_toplevel with an Aura toplevel.
+    #[cfg(test)]
+    pub(super) fn objects_for_test(&self) -> (Vec<u32>, Vec<u32>) {
+        (
+            self.arc_application_ids.keys().copied().collect(),
+            self.aura_toplevel_by_xdg_toplevel.keys().copied().collect(),
+        )
+    }
+
     // ── Bounds barriers and held configures ───────────────────────────────
 
     /// Make a newly queued barrier callback the one that gates an Aura
