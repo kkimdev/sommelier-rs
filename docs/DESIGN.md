@@ -217,8 +217,15 @@ or host error wins over an internal failure. After dispatch,
   messages, `handler::display::session_error` encodes the session's one
   `wl_display.error`. Nothing else writes one.
 
-A session that ends never handles another message, so a fatal branch rolls
-nothing back: only output could escape, and the loop drops it.
+A session that ends never handles another message (`Client` remembers
+that it ended), so a fatal branch rolls nothing back: only output could
+escape, and the loop drops it.
+
+Effects cover only wire output. What a handler does outside the wire
+takes effect at once: it starts clipboard pumps, copies pixels into a
+buffer's host storage, waits for dma-buf fences and allocates GBM
+buffers. A session that ends aborts its pumps (`Client::run`), and its
+`Context` frees the rest.
 
 Encoded output, a `wire::Outgoing`, never outlives its message. State
 that a later message releases, such as the configures a placement barrier
