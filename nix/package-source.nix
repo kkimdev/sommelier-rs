@@ -9,7 +9,8 @@
 
 rustPlatform.buildRustPackage {
   pname = "sommelier-rs";
-  version = "0.2.6";
+  # sommelier/Cargo.toml owns the version.
+  inherit ((lib.importTOML "${src}/sommelier/Cargo.toml").package) version;
 
   inherit src;
 
