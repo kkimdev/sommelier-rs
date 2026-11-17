@@ -174,12 +174,13 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 ## Object lifetimes
 
 - **Destructors wait for `delete_id`.** A generated destructor request keeps
-  its guest/host mapping until the host sends the matching
-  `wl_display.delete_id`. Meanwhile the guest object rejects new requests
-  and stale host events do not reach its handler, but the host ID stays
-  resolvable so the `delete_id` can be translated and forwarded. Handlers
-  that synthesize `delete_id` themselves (such as `wl_callback.done`) may
-  retire their mapping when they queue it.
+  its guest/host pairing until the host sends the matching
+  `wl_display.delete_id` (`ShadowTable::guest_destroyed`). Meanwhile the
+  guest object rejects new requests and stale host events do not reach its
+  handler, but the host ID stays resolvable so the `delete_id` can be
+  translated and forwarded. Handlers that synthesize `delete_id` themselves
+  (such as `wl_callback.done`) may end their guest object when they queue
+  it.
   Test: `destructor_mapping_survives_until_host_delete_id`.
 - **An ID is reused only once the peer has forgotten it.** An ID the
   proxy allocated on the host connection becomes reusable only through
@@ -192,14 +193,17 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   callback, host-only params) is one the host never destroys on its own: a
   `delete_id` for one, or for an ID the proxy does not track, changes
   nothing, so a misbehaving host cannot hand a live object's ID to a new
-  one. An ID the host allocated (from `0xff000000`) gets no
-  `delete_id`; it stops being reserved as soon as the proxy destroys the
-  object. A guest ID from the server range returns, through
-  `ShadowTable::forget_guest_object`, when its guest object ends. Generated
-  dispatchers map a `new_id` only when its message's sender is mapped, so a
-  message dropped for an unmapped sender consumes no ID; one dropped later,
-  for a local-only object in a non-nullable argument, still does (a
-  nullable one is sent as null). Freed IDs are reused first, so the ID
+  one. A host ID whose object never reached the host returns at once
+  (`ShadowTable::abandon`). An ID the host allocated (from `0xff000000`)
+  gets no `delete_id`; it stops being reserved as soon as the proxy
+  destroys the object. The host creates objects only with server IDs: a
+  host `new_id` from the client range, which the proxy allocates from,
+  ends the connection like a reused one. A guest ID from the server range
+  returns when its guest object ends. Generated dispatchers create a
+  `new_id`'s object only when its message's sender is paired, so a message
+  dropped for a local sender consumes no ID; one dropped later, for a
+  local object in a non-nullable argument, still does (a nullable one is
+  sent as null). Freed IDs are reused first, so the ID
   spaces stay as dense as the live objects, and each stays within
   libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
   inclusive, the ID itself on the client side and its offset from
@@ -214,6 +218,8 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `delete_id_for_an_untracked_host_id_changes_nothing`,
   `a_host_destroyed_frame_callback_reaches_the_guest`,
   `a_delete_id_for_a_live_host_only_object_changes_nothing`,
+  `an_abandoned_object_frees_both_ids`,
+  `host_data_offer_rejects_a_client_range_id`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **Host-only objects keep their ID reservation.** A host-only proxy object
