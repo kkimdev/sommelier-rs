@@ -36,7 +36,7 @@ use crate::protocols::wayland::wl_keyboard::{
     KEY_STATE_REPEATED,
 };
 use crate::state::{
-    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
+    Context, GuestKeyDelivery, GuestKeyEvent, GuestKeyOwner, HostId, KeyboardFocus,
 };
 use crate::window_layout::WindowLayoutAction;
 use crate::wire::Action;
@@ -175,7 +175,7 @@ impl KeyboardHandler {
     }
 
     fn guest_seat_for_host_keyboard(ctx: &Context, host_keyboard_id: HostId) -> Option<u32> {
-        let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id)?.0;
+        let guest_keyboard_id = ctx.shadow_table.get_guest_id(host_keyboard_id.0)?;
         ctx.keyboard_to_seat.get(&guest_keyboard_id).copied()
     }
 
@@ -577,8 +577,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let host_keyboard_id = HostId::from_event_sender(ctx);
         let guest_keyboard_id = ctx
             .shadow_table
-            .guest_id_of(host_keyboard_id)
-            .map(|g| g.0)
+            .get_guest_id(host_keyboard_id.0)
             .unwrap_or(0);
         let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
 
@@ -676,8 +675,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let host_keyboard_id = HostId::from_event_sender(ctx);
         let guest_keyboard_id = ctx
             .shadow_table
-            .guest_id_of(host_keyboard_id)
-            .map(|g| g.0)
+            .get_guest_id(host_keyboard_id.0)
             .unwrap_or(0);
         let guest_surface_id = ctx.shadow_table.get_guest_id(surface).unwrap_or(0);
         let surface_can_be_forwarded =
@@ -726,8 +724,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         let host_keyboard_id = HostId::from_event_sender(ctx);
         let guest_keyboard_id = ctx
             .shadow_table
-            .guest_id_of(host_keyboard_id)
-            .map(|g| g.0)
+            .get_guest_id(host_keyboard_id.0)
             .unwrap_or(0);
         let guest_seat = Self::guest_seat_for_host_keyboard(ctx, host_keyboard_id);
         log::trace!(
@@ -966,18 +963,14 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ///
     /// `on_release` is a **client→host request**: `ctx.last_sender_id` is the
     /// **guest** keyboard ID. We must translate it to a host ID before looking
-    /// up `keyboard_to_extended_keyboard` (which is keyed by host IDs).
-    /// Using the typed [`GuestId`] / [`HostId`] wrappers makes a wrong-direction
-    /// lookup a compile error.
+    /// up `keyboard_to_extended_keyboard` (which is keyed by [`HostId`]s).
     fn on_release(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         log::info!(">>> wl_keyboard.on_release: guest_id={}", guest_id);
         let guest_seat = ctx.keyboard_to_seat.remove(&guest_id);
         // Translate guest ID → host ID. Returns None for unknown keyboards
         // (e.g. keyboards that never received an on_enter event).
-        let Some(host_keyboard_id) = ctx
-            .shadow_table
-            .host_id_of(GuestId::from_request_sender(ctx))
+        let Some(host_keyboard_id) = ctx.shadow_table.get_host_id(ctx.last_sender_id).map(HostId)
         else {
             if let Some(guest_seat) = guest_seat {
                 crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);

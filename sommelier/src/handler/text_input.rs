@@ -25,8 +25,8 @@ use crate::protocols::wayland::wl_keyboard;
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    Context, GuestId, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId,
-    InternalCallback, SeatFocusChange,
+    Context, GuestKeyDelivery, GuestKeyEvent, HostActivationState, HostId, InternalCallback,
+    SeatFocusChange,
 };
 use crate::wire::{queue_or_drop, Action, Outgoing};
 
@@ -214,7 +214,7 @@ fn ime_repeat_active_for_seat(ctx: &Context, guest_seat: u32) -> bool {
         .iter()
         .filter(|(_, seat)| **seat == guest_seat)
         .filter_map(|(&guest_keyboard_id, _)| {
-            ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id))
+            ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
         })
         .any(|host_keyboard_id| {
             ctx.key_generations.ime_repeat_active(
@@ -236,7 +236,8 @@ fn keyboard_for_seat(ctx: &Context, guest_seat: u32) -> Option<(u32, HostId)> {
         .filter(|(_, seat)| **seat == guest_seat)
         .filter_map(|(&guest_keyboard_id, _)| {
             ctx.shadow_table
-                .host_id_of(GuestId(guest_keyboard_id))
+                .get_host_id(guest_keyboard_id)
+                .map(HostId)
                 .map(|host_keyboard_id| (guest_keyboard_id, host_keyboard_id))
         })
         .collect();
@@ -281,7 +282,8 @@ fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeat
         if seat != guest_seat {
             continue;
         }
-        let Some(host_keyboard_id) = ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id)) else {
+        let Some(host_keyboard_id) = ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId)
+        else {
             continue;
         };
         let focused = active_surface.is_some_and(|surface| {
@@ -362,7 +364,8 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
         .filter(|(_, seat)| **seat == guest_seat)
         .filter_map(|(&guest_keyboard_id, _)| {
             ctx.shadow_table
-                .host_id_of(GuestId(guest_keyboard_id))
+                .get_host_id(guest_keyboard_id)
+                .map(HostId)
                 .map(|host_keyboard_id| (guest_keyboard_id, host_keyboard_id))
         })
         .collect();
@@ -1543,7 +1546,7 @@ pub(crate) fn end_backspace_repeat_for_seat(ctx: &mut Context, guest_seat: u32) 
         .iter()
         .filter_map(|(&guest_keyboard_id, &seat)| {
             (seat == guest_seat)
-                .then(|| ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id)))
+                .then(|| ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId))
                 .flatten()
         })
         .collect();
@@ -1570,7 +1573,7 @@ fn end_backspace_repeat_for_text_input(ctx: &mut Context, guest_seat: u32, guest
         .iter()
         .filter_map(|(&guest_keyboard_id, &seat)| {
             (seat == guest_seat)
-                .then(|| ctx.shadow_table.host_id_of(GuestId(guest_keyboard_id)))
+                .then(|| ctx.shadow_table.get_host_id(guest_keyboard_id).map(HostId))
                 .flatten()
         })
         .collect();

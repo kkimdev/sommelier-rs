@@ -64,27 +64,17 @@ use crate::placement_config::PlacementConfig;
 
 /// A Wayland object ID allocated by the **guest** (client) side.
 ///
-/// Request handlers (client→host) receive guest IDs. Use [`ShadowTable::host_id_of`]
-/// to translate to the corresponding host ID. Passing a `GuestId` where a `HostId`
-/// is expected (or vice versa) is a **compile error**.
+/// [`ShadowTable`] keys guest objects by it. Passing a `GuestId` where a
+/// `HostId` is expected (or vice versa) is a **compile error**.
 ///
 /// The inner field is intentionally `pub(crate)` so that arbitrary `GuestId(host_id)`
 /// constructions cannot be made from outside this crate, preserving the type invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuestId(pub(crate) u32);
 
-impl GuestId {
-    /// Wrap the raw sender ID from a **client→host request** handler.
-    /// Only call this in handlers where `ctx.last_sender_id` is a guest ID.
-    #[inline]
-    pub(crate) fn from_request_sender(ctx: &Context) -> Self {
-        Self(ctx.last_sender_id)
-    }
-}
-
 /// A Wayland object ID allocated by the **host** compositor side.
 ///
-/// Event handlers (host→client) receive host IDs. Use [`ShadowTable::guest_id_of`]
+/// Event handlers (host→client) receive host IDs. Use [`ShadowTable::get_guest_id`]
 /// to translate to the corresponding guest ID. Passing a `HostId` where a `GuestId`
 /// is expected (or vice versa) is a **compile error**.
 ///
@@ -1140,14 +1130,9 @@ mod tests {
     }
 
     #[test]
-    fn guest_id_and_host_id_raw_round_trip() {
-        // Verify the typed constructors round-trip through the same inner u32.
-        let ctx = Context::new_for_test(false, false, Vec::new());
-        let mut ctx = ctx;
-        ctx.last_sender_id = 42;
-        let gid = GuestId::from_request_sender(&ctx);
-        assert_eq!(gid.0, 42);
-
+    fn host_id_raw_round_trip() {
+        // Verify the typed constructor round-trips through the same inner u32.
+        let mut ctx = Context::new_for_test(false, false, Vec::new());
         ctx.last_sender_id = 99;
         let hid = HostId::from_event_sender(&ctx);
         assert_eq!(hid.0, 99);

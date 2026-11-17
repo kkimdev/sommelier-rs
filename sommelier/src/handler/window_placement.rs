@@ -145,7 +145,7 @@ struct FocusedToplevel {
 
 /// Resolve the xdg_toplevel that `host_keyboard_id` focuses, if any.
 fn focused_toplevel(ctx: &Context, host_keyboard_id: HostId) -> Option<FocusedToplevel> {
-    let guest_keyboard_id = ctx.shadow_table.guest_id_of(host_keyboard_id)?.0;
+    let guest_keyboard_id = ctx.shadow_table.get_guest_id(host_keyboard_id.0)?;
     let guest_seat_id = *ctx.keyboard_to_seat.get(&guest_keyboard_id)?;
     let wl_surface_guest_id = ctx.keyboard_focus.surface_for_seat(guest_seat_id)?;
     if !ctx

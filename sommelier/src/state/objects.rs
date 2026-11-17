@@ -425,24 +425,14 @@ impl ShadowTable {
 
     // Queries.
 
+    /// The host object paired with guest object `guest_id`.
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
-        self.host_id_of(GuestId(guest_id)).map(|host| host.0)
+        Some(self.guests.get(&GuestId(guest_id))?.host()?.0)
     }
 
+    /// The guest object paired with host object `host_id`.
     pub fn get_guest_id(&self, host_id: u32) -> Option<u32> {
-        self.guest_id_of(HostId(host_id)).map(|guest| guest.0)
-    }
-
-    /// Typed lookup: translate a guest-allocated object ID to its host counterpart.
-    /// Use in **client→host request** handlers where `ctx.last_sender_id` is a guest ID.
-    pub fn host_id_of(&self, guest: GuestId) -> Option<HostId> {
-        self.guests.get(&guest)?.host()
-    }
-
-    /// Typed lookup: translate a host-allocated object ID to its guest counterpart.
-    /// Use in **host→client event** handlers where `ctx.last_sender_id` is a host ID.
-    pub fn guest_id_of(&self, host: HostId) -> Option<GuestId> {
-        self.hosts.get(&host)?.guest()
+        Some(self.hosts.get(&HostId(host_id))?.guest()?.0)
     }
 
     /// The guest object's interface.
