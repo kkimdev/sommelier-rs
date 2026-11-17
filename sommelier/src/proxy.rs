@@ -1904,6 +1904,22 @@ mod tests {
         );
     }
 
+    /// `Session::bind` binds a global the proxy advertises under another
+    /// interface, which the proxy itself binds on the host when it sees it.
+    #[tokio::test]
+    async fn the_harness_binds_globals_the_guest_sees_under_another_name() {
+        use protocols::{
+            aura_shell::zaura_shell, text_input_unstable_v1::zwp_text_input_manager_v1,
+        };
+        let mut s = Session::new();
+        s.bind("zaura_shell", zaura_shell::VERSION).await;
+        s.bind(
+            "zwp_text_input_manager_v1",
+            zwp_text_input_manager_v1::VERSION,
+        )
+        .await;
+    }
+
     /// A send that fails ends the session, whether it carries the batch's
     /// forwards or its output back to the source: the batch reports it,
     /// and no later batch dispatches anything.

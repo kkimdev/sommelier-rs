@@ -220,10 +220,11 @@ impl Session {
     }
 
     /// The host advertises global `interface` at `version`, and the guest
-    /// binds it as the proxy advertises it; returns the guest's object.
-    /// The bind reaches the host, unless the proxy implements the global,
-    /// and the guest gets only events of the new object, which are not
-    /// kept.
+    /// binds it as the proxy advertises it, possibly under another
+    /// interface; returns the guest's object. The guest gets only events
+    /// of the new object, which are not kept. What the proxy sends the host
+    /// is not kept either: its own reactions to the global, and the bind,
+    /// unless the proxy implements the global.
     pub(super) async fn bind(&mut self, interface: &str, version: u32) -> u32 {
         let earlier = (self.guest.received.len(), self.host.received.len());
         let name = self.advertise(interface, version).await;
@@ -244,19 +245,17 @@ impl Session {
         let id = self.new_id();
         self.guest([wl_registry::req::bind(registry.id, name, interface, *version, id).unwrap()])
             .await;
-        let host_bind = self.host.received.split_off(earlier.1);
-        match &host_bind[..] {
-            [] => {}
-            [(
-                sender,
-                AnyRequest::WlRegistry(wl_registry::Request::Bind {
-                    name: bound_name,
-                    id: (bound_interface, _, _),
-                }),
-            )] if *sender == registry.host
-                && *bound_name == name
-                && bound_interface == interface => {}
-            other => panic!("the host got more than the bind: {other:?}"),
+        let host = self.host.received.split_off(earlier.1);
+        for (sender, request) in &host {
+            if let AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                name: bound_name, ..
+            }) = request
+            {
+                assert!(
+                    *sender == registry.host && *bound_name == name,
+                    "the host got a bind of another global: {host:?}"
+                );
+            }
         }
         let events = self.guest.received.split_off(earlier.0);
         assert!(
