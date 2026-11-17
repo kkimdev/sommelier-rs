@@ -20,7 +20,7 @@ use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::HashSet;
 use std::io::{self, IoSlice};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
@@ -248,27 +248,21 @@ fn recv_unix_message(
 }
 
 impl WaylandConnection {
-    pub fn new(fd: RawFd) -> Self {
-        // Safety: We assume we own the fd passed in
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        // Ensure non-blocking mode for AsyncFd
-        let raw_fd = owned.as_raw_fd();
-        unsafe {
-            let borrowed_fd = std::os::fd::BorrowedFd::borrow_raw(raw_fd);
-            let flags_int = fcntl(borrowed_fd, FcntlArg::F_GETFL).unwrap_or(0);
-            let flags = OFlag::from_bits_truncate(flags_int);
-            let _ = fcntl(borrowed_fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK));
-        }
-
-        Self {
-            transport: ConnectionTransport::Unix(
-                AsyncFd::new(owned).expect("Failed to create AsyncFd"),
-            ),
+    /// Wrap a Unix socket, which the connection then owns.
+    ///
+    /// Fails when the descriptor cannot be made non-blocking or registered
+    /// with the event loop; the caller drops only this connection.
+    pub fn new(fd: OwnedFd) -> io::Result<Self> {
+        // AsyncFd requires a non-blocking descriptor. F_SETFL replaces the
+        // status flags, so keep the existing ones.
+        let flags = OFlag::from_bits_truncate(fcntl(&fd, FcntlArg::F_GETFL)?);
+        fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self {
+            transport: ConnectionTransport::Unix(AsyncFd::new(fd)?),
             read_buf: Vec::new(),
             read_fds: Vec::new(),
             ambiguous_untracked_fd: false,
-        }
+        })
     }
 
     pub fn new_virtwayland(channel: Arc<VirtWaylandChannel>) -> Self {
@@ -473,7 +467,7 @@ mod tests {
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
-    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -487,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn try_recv_is_nonblocking_and_preserves_the_ordered_stream() {
         let (mut peer, socket) = UnixStream::pair().expect("unix socket pair");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
 
         assert_eq!(
             connection.try_recv().expect("empty non-blocking receive"),
@@ -502,6 +496,14 @@ mod tests {
         );
         assert_eq!(connection.read_buf, message);
         assert!(connection.read_fds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unregistrable_descriptor_is_an_error_not_a_panic() {
+        // epoll refuses regular files, so the event loop cannot watch one.
+        let name = CString::new("sommelier-unpollable").unwrap();
+        let memfd = memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
+        assert!(WaylandConnection::new(memfd).is_err());
     }
 
     /// Send one byte with `fd` attached, as a message that takes no
@@ -522,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn too_many_unconsumed_fds_end_the_connection() {
         let (peer, socket) = UnixStream::pair().expect("unix socket pair");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
         // Stand-ins for descriptors already pending; negative entries are
         // never closed, so the test does not need a thousand real ones.
         connection.read_fds.resize(MAX_PENDING_FDS - 1, -1);
@@ -570,7 +572,9 @@ mod tests {
         unsafe {
             libc::close(pipe_fds[1]);
         }
-        let mut connection = WaylandConnection::new(read_fd);
+        let mut connection =
+            WaylandConnection::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) })
+                .expect("register test pipe");
         connection.read_fds.push(pending_fd);
         drop(connection);
 
@@ -677,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn buffered_message_readiness_distinguishes_partial_and_complete_frames() {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
 
         // Opcode 0 keeps the bytes that hold the opcode zero, so a decoder
         // that reads the length from the opcode half sees an invalid length
@@ -702,7 +706,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_buffered_length_is_ready_for_protocol_validation() {
         let (socket, _peer) = UnixStream::pair().expect("Unix socket pair should be created");
-        let mut connection = WaylandConnection::new(socket.into_raw_fd());
+        let mut connection = WaylandConnection::new(socket.into()).expect("register test socket");
         let mut message = MessageBuilder::new().build_message(1, 0);
         // Rewrite the length to 6, below the header size.
         let invalid_word = (6_u32 << 16).to_ne_bytes();

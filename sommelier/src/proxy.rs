@@ -20,10 +20,8 @@ use crate::protocols;
 use crate::state::{Context, PostDispatch, ShadowTable};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader, ProtocolError, WireMessage};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::io;
-use std::os::fd::BorrowedFd;
-use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -119,17 +117,6 @@ fn apply_post_dispatch(ctx: &mut Context, effect: PostDispatch) {
             xdg_toplevel,
         } => crate::handler::compositor::record_xdg_toplevel(ctx, xdg_surface, xdg_toplevel),
     }
-}
-
-fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
-    // The raw descriptor is owned by the caller for the duration of this
-    // function. Preserve all existing status flags while adding O_NONBLOCK;
-    // F_SETFL replaces, rather than merges, the flag set.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let current = fcntl(borrowed, FcntlArg::F_GETFL)?;
-    let updated = OFlag::from_bits_truncate(current) | OFlag::O_NONBLOCK;
-    fcntl(borrowed, FcntlArg::F_SETFL(updated))?;
-    Ok(())
 }
 
 struct SommelierHandler {
@@ -705,6 +692,7 @@ mod tests {
     use std::ffi::CString;
     use std::fs;
     use std::io::Write;
+    use std::os::fd::IntoRawFd;
 
     #[test]
     fn generated_classifier_routes_each_protocol_family() {
@@ -729,7 +717,6 @@ mod tests {
 
     #[tokio::test]
     async fn fairness_probe_receives_preferred_host_events_between_render_batches() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (_guest_peer, client_socket) =
@@ -737,8 +724,8 @@ mod tests {
         let (mut host_peer, host_socket) =
             UnixStream::pair().expect("host unix socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -770,7 +757,6 @@ mod tests {
     #[test]
     fn run_receives_the_rest_of_a_partially_buffered_message() {
         use std::io::Read;
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
@@ -803,8 +789,8 @@ mod tests {
                 .expect("proxy runtime")
                 .block_on(async move {
                     let mut client = Client::new(
-                        WaylandConnection::new(client_socket.into_raw_fd()),
-                        WaylandConnection::new(host_socket.into_raw_fd()),
+                        WaylandConnection::new(client_socket.into()).expect("register test socket"),
+                        WaylandConnection::new(host_socket.into()).expect("register test socket"),
                         Context::new_for_test(false, false, Vec::new()),
                     );
                     client.client_conn.read_buf.extend_from_slice(&header);
@@ -836,7 +822,6 @@ mod tests {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ) {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_peer, client_socket) =
@@ -844,8 +829,8 @@ mod tests {
         let (host_peer, host_socket) =
             UnixStream::pair().expect("host unix socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
         client.ctx.shadow_table.map_id(1, 1);
@@ -949,14 +934,13 @@ mod tests {
 
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -999,7 +983,6 @@ mod tests {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ) {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_peer, guest_socket) =
@@ -1010,8 +993,8 @@ mod tests {
             .set_nonblocking(true)
             .expect("guest peer should become nonblocking");
         let mut client = Client::new(
-            WaylandConnection::new(guest_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(guest_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1181,14 +1164,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_is_retained_when_followup_is_partial() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1234,14 +1216,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_survives_separate_receive_calls() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1291,14 +1272,13 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_message_fd_ambiguity_terminates_before_followup_complete() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1338,14 +1318,13 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_client_sender_is_a_protocol_error() {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (client_socket, host_socket) =
             UnixStream::pair().expect("test socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(client_socket.into_raw_fd()),
-            WaylandConnection::new(host_socket.into_raw_fd()),
+            WaylandConnection::new(client_socket.into()).expect("register test socket"),
+            WaylandConnection::new(host_socket.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -1378,7 +1357,6 @@ mod tests {
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,
     ) {
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_proxy, guest_peer) =
@@ -1386,8 +1364,8 @@ mod tests {
         let (host_proxy, host_peer) =
             UnixStream::pair().expect("host socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into_raw_fd()),
-            WaylandConnection::new(host_proxy.into_raw_fd()),
+            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
+            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
             Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test("")),
         );
         let ctx = &mut client.ctx;
@@ -1503,7 +1481,6 @@ mod tests {
     #[tokio::test]
     async fn invalid_registry_bind_flushes_display_error_before_disconnect() {
         use std::io::Read;
-        use std::os::fd::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
         let (guest_proxy, guest_peer) =
@@ -1511,8 +1488,8 @@ mod tests {
         let (host_proxy, host_peer) =
             UnixStream::pair().expect("host socket pair should be created");
         let mut client = Client::new(
-            WaylandConnection::new(guest_proxy.into_raw_fd()),
-            WaylandConnection::new(host_proxy.into_raw_fd()),
+            WaylandConnection::new(guest_proxy.into()).expect("register test socket"),
+            WaylandConnection::new(host_proxy.into()).expect("register test socket"),
             Context::new_for_test(false, false, Vec::new()),
         );
 
@@ -4010,6 +3987,16 @@ protocols::gtk::impl_sommelier_delegates!(SommelierHandler, {
 });
 impl protocols::gtk::ProtocolHandler for SommelierHandler {}
 
+/// What every client connection needs from the proxy's configuration.
+struct ClientConfig {
+    local_compositor: Option<String>,
+    virtio_wayland: Option<String>,
+    gpu_accel: bool,
+    xdg_decoration: bool,
+    vm_identifier: String,
+    placement: Arc<PlacementConfig>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     display: &str,
@@ -4019,7 +4006,7 @@ pub async fn run(
     virtio_wayland: Option<String>,
     vm_identifier: String,
     placement: Arc<PlacementConfig>,
-    mut reload_signal: Option<tokio::signal::unix::Signal>,
+    reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
     if let Some(path) = &virtio_wayland {
         if let Err(e) = std::fs::OpenOptions::new()
@@ -4044,119 +4031,105 @@ pub async fn run(
     let listener = UnixListener::bind(display).expect("Failed to bind socket");
     log::info!("Listening on {}", display);
 
+    let config = ClientConfig {
+        local_compositor,
+        virtio_wayland,
+        gpu_accel,
+        xdg_decoration,
+        vm_identifier,
+        placement,
+    };
     // KeyboardHandler owns xkb state, which is intentionally !Send. Keep each
     // client task on this executor's thread instead of using `tokio::spawn`
     // (whose Send bound would require an unsound manual Send implementation).
     // `LocalSet::run_until` also makes the ownership requirement visible in
     // this function's future type: callers cannot accidentally move the
     // proxy's client tasks to another executor thread.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            loop {
-                let accepted = tokio::select! {
-                    // The reload runs on this event loop between accepts, so
-                    // it never races a key event.
-                    Some(()) = next_reload_signal(&mut reload_signal) => {
-                        placement.reload_and_log();
-                        continue;
-                    }
-                    accepted = listener.accept() => accepted,
-                };
-                match accepted {
-                    Ok((stream, _)) => {
-                        log::info!("New client connected");
+    tokio::task::LocalSet::new()
+        .run_until(serve(listener, config, reload_signal))
+        .await;
+}
 
-                        let client_fd = stream.into_std().unwrap().into_raw_fd();
-                        if let Err(e) = set_nonblocking(client_fd) {
-                            log::error!("Failed to set non-blocking on client fd: {}", e);
-                            let _ = nix::unistd::close(client_fd);
-                            continue;
-                        }
-                        let client_conn = WaylandConnection::new(client_fd);
-
-                        let mut virtwayland_channel_ref = None;
-
-                        let host_conn = {
-                            let mut conn = None;
-
-                            if let Some(path) = &virtio_wayland {
-                                match VirtWaylandChannel::new(path) {
-                                    Ok(channel) => {
-                                        let channel_arc = Arc::new(channel);
-                                        virtwayland_channel_ref = Some(channel_arc.clone());
-                                        conn =
-                                            Some(WaylandConnection::new_virtwayland(channel_arc));
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to open virtio-wayland channel at {}: {}",
-                                            path,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-
-                            if conn.is_none() {
-                                if let Some(path) = local_compositor.as_ref() {
-                                    match UnixStream::connect(path).await {
-                                        Ok(stream) => {
-                                            let host_fd =
-                                                stream.into_std().unwrap().into_raw_fd();
-                                            if let Err(e) = set_nonblocking(host_fd) {
-                                                log::error!(
-                                                    "Failed to set non-blocking on host fd: {}",
-                                                    e
-                                                );
-                                                let _ = nix::unistd::close(host_fd);
-                                            } else {
-                                                conn = Some(WaylandConnection::new(host_fd));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to connect to host: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    log::error!(
-                                        "Local compositor path required if not using virtio-wayland (or if it failed)"
-                                    );
-                                }
-                            }
-                            conn
-                        };
-
-                        if let Some(host_conn) = host_conn {
-                            let mut client = Client::new(
-                                client_conn,
-                                host_conn,
-                                Context::new(
-                                    gpu_accel,
-                                    xdg_decoration,
-                                    vm_identifier.clone(),
-                                    Arc::clone(&placement),
-                                ),
-                            );
-                            if let Some(channel) = virtwayland_channel_ref {
-                                client.ctx.virtwayland_channel = Some(channel);
-                            }
-
-                            tokio::task::spawn_local(async move {
-                                client.run().await;
-                                log::info!("Client disconnected");
-                            });
-                        } else {
-                            log::error!("Failed to establish host connection, closing client");
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Accept error: {}", e);
-                    }
+/// Accept guest clients for the life of the process, and reload the
+/// shortcut configuration on each reload signal.
+///
+/// A failure concerning one client is logged and ends only that client.
+async fn serve(
+    listener: UnixListener,
+    config: ClientConfig,
+    mut reload_signal: Option<tokio::signal::unix::Signal>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            // The reload runs on this event loop between accepts, so
+            // it never races a key event.
+            Some(()) = next_reload_signal(&mut reload_signal) => {
+                config.placement.reload_and_log();
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                log::info!("New client connected");
+                if let Err(error) = start_client(stream, &config).await {
+                    log::error!("Closing the new client: {error}");
                 }
             }
-        })
-        .await;
+            Err(e) => {
+                log::error!("Accept error: {}", e);
+            }
+        }
+    }
+}
+
+/// Pair an accepted guest connection with a new host connection and serve
+/// the pair on its own task.
+async fn start_client(stream: UnixStream, config: &ClientConfig) -> io::Result<()> {
+    let client_conn = WaylandConnection::new(stream.into_std()?.into())?;
+    let (host_conn, virtwayland_channel) = connect_host(config).await?;
+    let mut client = Client::new(
+        client_conn,
+        host_conn,
+        Context::new(
+            config.gpu_accel,
+            config.xdg_decoration,
+            config.vm_identifier.clone(),
+            Arc::clone(&config.placement),
+        ),
+    );
+    client.ctx.virtwayland_channel = virtwayland_channel;
+    tokio::task::spawn_local(async move {
+        client.run().await;
+        log::info!("Client disconnected");
+    });
+    Ok(())
+}
+
+/// Open this client's connection to the host compositor: a VirtWL channel
+/// when configured, else (or when that fails) the local compositor socket.
+async fn connect_host(
+    config: &ClientConfig,
+) -> io::Result<(WaylandConnection, Option<Arc<VirtWaylandChannel>>)> {
+    if let Some(path) = &config.virtio_wayland {
+        match VirtWaylandChannel::new(path) {
+            Ok(channel) => {
+                let channel = Arc::new(channel);
+                let conn = WaylandConnection::new_virtwayland(Arc::clone(&channel));
+                return Ok((conn, Some(channel)));
+            }
+            Err(e) => {
+                log::error!("Failed to open virtio-wayland channel at {}: {}", path, e);
+            }
+        }
+    }
+    let Some(path) = &config.local_compositor else {
+        return Err(io::Error::other(
+            "no host connection: virtio-wayland is unavailable and no local compositor is set",
+        ));
+    };
+    let stream = UnixStream::connect(path).await?;
+    Ok((WaylandConnection::new(stream.into_std()?.into())?, None))
 }
 
 /// Wait for the next shortcut reload signal; never resolves without one.
