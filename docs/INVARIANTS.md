@@ -600,30 +600,32 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   to `set_input_type` is lossy: the `latin` hint, `multiline` outside the
   normal, alpha and name purposes, and the `terminal` purpose have no
   equivalent. They had no effect before either, because `set_input_type`
-  replaced what Exo derived from `set_content_type`. Because Exo learns
-  the support only with a content type, a commit that changes whether the
-  field has surrounding text resends the content type with the new
-  support; nothing else resends an unchanged content type, which can
-  reset Exo's composition.
-  Tests: `content_type_takes_one_host_request_per_extension_version`,
+  replaced what Exo derived from `set_content_type`.
+  Test: `content_type_takes_one_host_request_per_extension_version`.
+- **The host gets each content type once it can apply it, and only
+  then.** Exo applies a content type only while an input method is
+  attached: it drops one after `deactivate` and before `activate`, and
+  attaching resets the type and mode to text while keeping the previous
+  field's flags, learning mode and surrounding-text support, so a password
+  field would be treated as text the IME may learn. It learns whether the
+  field has surrounding text only with a content type. So the proxy keeps
+  what the host applied (`HostApplied`) and `reconcile` sends the
+  committed content type, with its support, whenever the attached input
+  method lacks it: after every `activate`, including one a drain barrier
+  or a seat without a host object deferred, when the guest changes it,
+  when the field's surrounding text appears or goes, and when an enable
+  starts a new field. It sends none while no input method is attached and
+  none the host already has, because a resend can reset Exo's
+  composition. Exo keeps surrounding text and the cursor rectangle without
+  an input method, so they are forwarded as committed and never replayed.
+  Tests: `reconcile_reaches_every_target_with_only_needed_requests`,
   `surrounding_text_support_follows_the_field_and_resends_only_on_change`,
-  `a_host_without_surrounding_text_support_gets_no_resend`, and the
-  fuzzer's end state against its model of Exo
-  (`guest_streams_cannot_crash_hang_or_leak`; see
-  [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
-- **A deferred activation replays the content type.** A commit that
-  enables a text input while its previous host generation still drains
-  reaches Exo before the deferred `activate`, while no input method is
-  attached. Exo drops a content type then, and attaching resets the type
-  and mode but keeps the previous field's flags, learning mode and
-  surrounding-text support, so a password field would be treated as text
-  the IME may learn. The `activate` that ends the barrier is therefore
-  followed by the committed content type, with its support, and a
-  `commit_state`. Exo keeps surrounding text and the cursor rectangle
-  without an input method, so they are not replayed.
-  Tests: `a_deferred_activation_replays_the_committed_content_type`, and
-  the fuzzer's end state against its model of Exo
-  (`guest_streams_cannot_crash_hang_or_leak`).
+  `a_host_without_surrounding_text_support_gets_no_resend`,
+  `a_deferred_activation_replays_the_committed_content_type`,
+  `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
+  `a_content_type_waits_for_the_host_to_attach`, and the fuzzer's end
+  state against its model of Exo (`guest_streams_cannot_crash_hang_or_leak`;
+  see [Randomized tests](../CONTRIBUTING.md#randomized-tests)).
 - **Focus teardown sends `leave` first.** When a focused text-input surface
   is destroyed or loses focus, the proxy MUST send the guest
   `zwp_text_input_v3.leave` before clearing the active-surface state. A
