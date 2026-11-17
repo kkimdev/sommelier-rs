@@ -38,6 +38,15 @@ type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 // while bounding the opposite direction to roughly one frame of work.
 const MAX_MESSAGES_PER_BATCH: usize = 32;
 
+/// How long the accept loop waits after a failed accept.
+///
+/// A failed accept such as EMFILE or ENFILE leaves the pending connection
+/// queued, so the listener stays readable and an immediate retry fails
+/// again: without a pause the loop spins on the one thread every client
+/// shares. Descriptors come back as clients close, which takes far longer
+/// than this pause, while a new client waits at most this long.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     ClientToHost,
@@ -930,6 +939,65 @@ mod tests {
 
         host_events(&mut client, &[delete_id(first)]).await;
         assert_eq!(guest_sync(&mut client, 4).await, first);
+    }
+
+    /// CPU time this thread has used.
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) },
+            0
+        );
+        std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    }
+
+    fn test_client_config() -> ClientConfig {
+        ClientConfig {
+            local_compositor: None,
+            virtio_wayland: None,
+            gpu_accel: false,
+            xdg_decoration: false,
+            vm_identifier: "termina".to_string(),
+            placement: Arc::new(PlacementConfig::for_test(Vec::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_accepts_back_off_instead_of_spinning() {
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+
+        // A stream socket that never listened polls as hung up, so the event
+        // loop sees it readable, and every accept on it fails at once, as
+        // accepts do while the descriptor table is full.
+        let not_listening = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("create a socket");
+        let listener =
+            UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
+                .expect("register the socket");
+
+        let window = std::time::Duration::from_millis(500);
+        let cpu_before = thread_cpu_time();
+        let served = tokio::task::LocalSet::new()
+            .run_until(tokio::time::timeout(
+                window,
+                serve(listener, test_client_config(), None),
+            ))
+            .await;
+        let cpu = thread_cpu_time() - cpu_before;
+
+        assert!(served.is_err(), "serve runs until the process ends");
+        assert!(
+            cpu < window / 4,
+            "the accept loop used {cpu:?} of CPU in {window:?} of failing accepts"
+        );
     }
 
     #[tokio::test]
@@ -4059,6 +4127,8 @@ async fn serve(
     config: ClientConfig,
     mut reload_signal: Option<tokio::signal::unix::Signal>,
 ) {
+    // Log a run of failed accepts once, not every retry.
+    let mut accept_failing = false;
     loop {
         let accepted = tokio::select! {
             // The reload runs on this event loop between accepts, so
@@ -4071,13 +4141,21 @@ async fn serve(
         };
         match accepted {
             Ok((stream, _)) => {
+                if std::mem::take(&mut accept_failing) {
+                    log::info!("Accepting clients again");
+                }
                 log::info!("New client connected");
                 if let Err(error) = start_client(stream, &config).await {
                     log::error!("Closing the new client: {error}");
                 }
             }
             Err(e) => {
-                log::error!("Accept error: {}", e);
+                if !std::mem::replace(&mut accept_failing, true) {
+                    log::error!(
+                        "Accept error: {e}; retrying every {ACCEPT_RETRY_DELAY:?} until one succeeds"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
             }
         }
     }
