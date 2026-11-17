@@ -397,8 +397,9 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not
-  forwarded to the host. The count is a `CommitCount`, which only
-  `TextInputState::count_guest_commit` advances.
+  forwarded to the host. The count is a private field of
+  `TextInputState`, so only code in `state/input.rs` can change it, and it
+  does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
 

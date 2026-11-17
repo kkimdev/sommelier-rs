@@ -2084,7 +2084,7 @@ mod tests {
         assert!(ctx.client_to_host_queue.is_empty());
         let state = &ctx.text_inputs[&guest_id];
         // The protocol counts the commit even though nothing reached the host.
-        expected.guest_commit_serial = crate::state::CommitCount::at(1);
+        expected.set_guest_commits(1);
         assert_eq!(state, &expected);
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.surrounding_text_dirty);
@@ -2107,39 +2107,18 @@ mod tests {
             .track_interface(guest_id, "zwp_text_input_v3".to_string());
         ctx.shadow_table
             .track_host_interface(host_v1_id, "zwp_text_input_v1".to_string());
-        ctx.text_inputs.insert(
-            guest_id,
-            crate::state::TextInputState {
-                host_v1_id,
-                host_ext_id: Some(host_ext_id),
-                guest_seat: 0,
-                // Most unit tests exercise the v3 transaction bridge without
-                // modelling a keyboard enter. Use a stable synthetic focus
-                // by default; tests covering the protocol's pre-enter/after-
-                // leave behavior explicitly clear this field.
-                active_surface: Some(900),
-                pending_enabled: true,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(0),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(guest_id, {
+            // Most unit tests exercise the v3 transaction bridge without
+            // modelling a keyboard enter. Use a stable synthetic focus
+            // by default; tests covering the protocol's pre-enter/after-
+            // leave behavior explicitly clear this field.
+            let mut state =
+                crate::state::TextInputState::new(host_v1_id, Some(host_ext_id), 0, Some(900));
+            state.pending_enabled = true;
+            state.committed_enabled = true;
+            state.host_activation = HostActivationState::Active;
+            state
+        });
         (ctx, host_v1_id, guest_id)
     }
 
@@ -2243,7 +2222,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = crate::state::CommitCount::at(42);
+            state.set_guest_commits(42);
         }
 
         let mut handler = TextInputV1Handler;
@@ -2422,7 +2401,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = crate::state::CommitCount::at(42);
+            state.set_guest_commits(42);
             state.current_preedit = "미완성".to_string();
         }
 
@@ -2465,7 +2444,7 @@ mod tests {
         ctx.last_sender_id = host_v1_id;
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
-            state.guest_commit_serial = crate::state::CommitCount::at(42);
+            state.set_guest_commits(42);
         }
 
         let mut handler = TextInputV1Handler;
@@ -2545,7 +2524,7 @@ mod tests {
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.committed_surrounding_text = Some(("가나다".to_string(), 6, 6));
-            state.guest_commit_serial = crate::state::CommitCount::at(42);
+            state.set_guest_commits(42);
         }
 
         let mut handler = ExtendedTextInputV1Handler;
@@ -2670,7 +2649,7 @@ mod tests {
 
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.current_preedit = "나".to_string();
-            state.guest_commit_serial = crate::state::CommitCount::at(42);
+            state.set_guest_commits(42);
             state.record_preedit_selection(0, 3);
             state.record_preedit_cursor(3);
             assert!(state.record_delete(3, 0));
@@ -2787,7 +2766,7 @@ mod tests {
         ctx.text_inputs
             .get_mut(&guest_id)
             .unwrap()
-            .guest_commit_serial = crate::state::CommitCount::at(2);
+            .set_guest_commits(2);
         let mut handler = ExtendedTextInputV1Handler;
 
         assert_eq!(handler.on_confirm_preedit(&mut ctx, 1), Action::Drop);
@@ -3009,7 +2988,7 @@ mod tests {
         );
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = crate::state::CommitCount::at(2);
+            state.set_guest_commits(2);
             state.committed_surrounding_text = Some(("A가".to_string(), 4, 4));
             state.pending_surrounding_text = state.committed_surrounding_text.clone();
         }
@@ -3412,32 +3391,7 @@ mod tests {
         ctx.shadow_table.map_id(second_id, 11);
         ctx.text_inputs.insert(
             second_id,
-            crate::state::TextInputState {
-                host_v1_id: 11,
-                host_ext_id: None,
-                guest_seat: 0,
-                active_surface: Some(surface),
-                pending_enabled: false,
-                committed_enabled: false,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(0),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: HostActivationState::Inactive,
-            },
+            crate::state::TextInputState::new(11, None, 0, Some(surface)),
         );
         let mut handler = TextInputV3Handler;
 
@@ -3554,7 +3508,7 @@ mod tests {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = crate::state::CommitCount::at(17);
+            state.set_guest_commits(17);
             state.pending_surrounding_text = Some(("pending".to_string(), 7, 7));
             state.committed_surrounding_text = Some(("current".to_string(), 7, 7));
             state.surrounding_text_dirty = true;
@@ -3570,7 +3524,7 @@ mod tests {
         let active_surface = state.active_surface;
         assert_eq!(state.apply_focus(active_surface), active_surface);
 
-        assert_eq!(state.guest_commit_serial.get(), 17);
+        assert_eq!(state.guest_commit_serial(), 17);
         assert!(state.host_is_active());
         assert!(!state.pending_enabled);
         assert!(!state.committed_enabled);
@@ -3781,14 +3735,14 @@ mod tests {
         let (mut ctx, _, guest_id) = setup_v1_ctx();
         {
             let state = ctx.text_inputs.get_mut(&guest_id).unwrap();
-            state.guest_commit_serial = crate::state::CommitCount::at(u32::MAX);
+            state.set_guest_commits(u32::MAX);
             state.host_activation = HostActivationState::Inactive;
         }
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
         handler.on_commit(&mut ctx);
 
-        assert_eq!(ctx.text_inputs[&guest_id].guest_commit_serial.get(), 0);
+        assert_eq!(ctx.text_inputs[&guest_id].guest_commit_serial(), 0);
         let commit_state = ctx.client_to_host_queue.last().unwrap();
         assert_eq!(msg_done_serial(std::slice::from_ref(commit_state), 0), 0);
     }
@@ -5298,7 +5252,7 @@ mod tests {
                 state.text_change_cause,
             )
         };
-        let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial.get();
+        let commits_before = ctx.text_inputs[&guest_id].guest_commit_serial();
         ctx.last_sender_id = guest_id;
         let mut handler = TextInputV3Handler;
 
@@ -5335,7 +5289,7 @@ mod tests {
             "inactive v3 requests must not mutate double-buffered state"
         );
         assert_eq!(
-            state.guest_commit_serial.get(),
+            state.guest_commit_serial(),
             commits_before.wrapping_add(1),
             "an inactive commit still counts toward the done serial"
         );

@@ -1291,35 +1291,20 @@ mod tests {
     fn add_active_text_input(ctx: &mut Context, guest_id: u32, guest_seat: u32, host_ext_id: u32) {
         let host_v1_id = guest_id + 100;
         ctx.shadow_table.map_id(guest_id, host_v1_id);
-        ctx.text_inputs.insert(
-            guest_id,
-            crate::state::TextInputState {
+        ctx.text_inputs.insert(guest_id, {
+            let mut state = crate::state::TextInputState::new(
                 host_v1_id,
-                host_ext_id: Some(host_ext_id),
+                Some(host_ext_id),
                 guest_seat,
-                active_surface: Some(900),
-                pending_enabled: true,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: Some(("가".to_string(), 3, 3)),
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+                Some(900),
+            );
+            state.pending_enabled = true;
+            state.committed_enabled = true;
+            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
     }
 
     fn map_keyboard(
@@ -5052,35 +5037,15 @@ mod tests {
         );
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         focus_keyboard(&mut ctx, host_keyboard, guest_seat, guest_surface);
-        ctx.text_inputs.insert(
-            guest_text_input,
-            crate::state::TextInputState {
-                host_v1_id: 401,
-                host_ext_id: None,
-                guest_seat,
-                active_surface: Some(guest_surface),
-                pending_enabled: false,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(guest_text_input, {
+            let mut state =
+                crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
+            state.committed_enabled = true;
+            state.current_preedit = "한".to_string();
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         ctx.last_sender_id = guest_keyboard;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
@@ -5145,35 +5110,15 @@ mod tests {
             "zwp_text_input_v3".to_string(),
             1,
         );
-        ctx.text_inputs.insert(
-            guest_text_input,
-            crate::state::TextInputState {
-                host_v1_id: 401,
-                host_ext_id: None,
-                guest_seat,
-                active_surface: Some(guest_surface),
-                pending_enabled: false,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(guest_text_input, {
+            let mut state =
+                crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
+            state.committed_enabled = true;
+            state.current_preedit = "한".to_string();
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         ctx.last_sender_id = guest_keyboard;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
@@ -5233,35 +5178,15 @@ mod tests {
         );
         ctx.key_generations
             .cancel_backspace_repeat(HostId(other_host_keyboard), EVDEV_KEY_BACKSPACE);
-        ctx.text_inputs.insert(
-            guest_text_input,
-            crate::state::TextInputState {
-                host_v1_id: 401,
-                host_ext_id: None,
-                guest_seat,
-                active_surface: Some(guest_surface),
-                pending_enabled: false,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(guest_text_input, {
+            let mut state =
+                crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
+            state.committed_enabled = true;
+            state.current_preedit = "한".to_string();
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         ctx.last_sender_id = guest_keyboard;
         assert_eq!(handler.on_release(&mut ctx), Action::Forward);
@@ -5298,35 +5223,14 @@ mod tests {
             .track_interface_with_version(40, "zwp_text_input_v3".to_string(), 1);
         ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
         focus_keyboard(&mut ctx, host_keyboard, guest_seat, guest_surface);
-        ctx.text_inputs.insert(
-            40,
-            crate::state::TextInputState {
-                host_v1_id: 401,
-                host_ext_id: None,
-                guest_seat,
-                active_surface: Some(guest_surface),
-                pending_enabled: false,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(40, {
+            let mut state =
+                crate::state::TextInputState::new(401, None, guest_seat, Some(guest_surface));
+            state.committed_enabled = true;
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         // Parent seat release has already invalidated the host seat proxy.
         ctx.shadow_table.mark_pending_destroy(guest_seat);
@@ -5379,35 +5283,18 @@ mod tests {
                 "zwp_text_input_v3".to_string(),
                 1,
             );
-            ctx.text_inputs.insert(
-                guest_text_input,
-                crate::state::TextInputState {
-                    host_v1_id: guest_text_input + 500,
-                    host_ext_id: None,
+            ctx.text_inputs.insert(guest_text_input, {
+                let mut state = crate::state::TextInputState::new(
+                    guest_text_input + 500,
+                    None,
                     guest_seat,
                     active_surface,
-                    pending_enabled: false,
-                    committed_enabled: true,
-                    enabled_dirty: false,
-                    pending_surrounding_text: None,
-                    committed_surrounding_text: None,
-                    surrounding_text_dirty: false,
-                    content_hint: 0,
-                    content_purpose: 0,
-                    committed_content_type: None,
-                    content_type_dirty: false,
-                    cursor_rect: None,
-                    cursor_rect_dirty: false,
-                    text_change_cause: 0,
-                    current_preedit: String::new(),
-                    guest_commit_serial: crate::state::CommitCount::at(1),
-                    pending_preedit_cursor: None,
-                    pending_preedit_selection: None,
-                    pending_deletes: Vec::new(),
-                    pending_cursor_position: None,
-                    host_activation: crate::state::HostActivationState::Active,
-                },
-            );
+                );
+                state.committed_enabled = true;
+                state.set_guest_commits(1);
+                state.host_activation = crate::state::HostActivationState::Active;
+                state
+            });
         }
 
         ctx.last_sender_id = guest_keyboard;
@@ -5462,35 +5349,18 @@ mod tests {
         ctx.shadow_table.map_id(7, 2);
         ctx.shadow_table.track_interface(7, "wl_seat".to_string());
         ctx.shadow_table.map_id(20, 30);
-        ctx.text_inputs.insert(
-            40,
-            crate::state::TextInputState {
-                host_v1_id: 50,
-                host_ext_id: None,
-                guest_seat: 7,
-                active_surface: Some(21),
-                pending_enabled: true,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: Some(("stale".to_string(), 5, 5)),
-                committed_surrounding_text: Some(("stale".to_string(), 5, 5)),
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(9),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: vec![(3, 0)],
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(40, {
+            let mut state = crate::state::TextInputState::new(50, None, 7, Some(21));
+            state.pending_enabled = true;
+            state.committed_enabled = true;
+            state.pending_surrounding_text = Some(("stale".to_string(), 5, 5));
+            state.committed_surrounding_text = Some(("stale".to_string(), 5, 5));
+            state.current_preedit = "한".to_string();
+            state.set_guest_commits(9);
+            state.pending_deletes = vec![(3, 0)];
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
         ctx.last_sender_id = 10;
 
         assert_eq!(handler.on_enter(&mut ctx, 1, 30, &[]), Action::Forward);
@@ -5503,7 +5373,7 @@ mod tests {
         assert!(state.committed_surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
         assert!(state.pending_deletes.is_empty());
-        assert_eq!(state.guest_commit_serial.get(), 9);
+        assert_eq!(state.guest_commit_serial(), 9);
 
         let deactivate = ctx.client_to_host_queue.iter().find(|(message, _)| {
             crate::test_support::msg_sender(message) == 50

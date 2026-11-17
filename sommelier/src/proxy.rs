@@ -2511,35 +2511,20 @@ mod tests {
             "zcr_extended_text_input_v1".to_string(),
             11,
         );
-        ctx.text_inputs.insert(
-            GUEST_TEXT_INPUT,
-            TextInputState {
-                host_v1_id: HOST_TEXT_INPUT,
-                host_ext_id: Some(HOST_EXTENDED_TEXT_INPUT),
-                guest_seat: GUEST_SEAT,
-                active_surface: Some(GUEST_SURFACE),
-                pending_enabled: true,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: Some(("가".to_string(), 3, 3)),
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(GUEST_TEXT_INPUT, {
+            let mut state = TextInputState::new(
+                HOST_TEXT_INPUT,
+                Some(HOST_EXTENDED_TEXT_INPUT),
+                GUEST_SEAT,
+                Some(GUEST_SURFACE),
+            );
+            state.pending_enabled = true;
+            state.committed_enabled = true;
+            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         (ctx, SommelierHandler::new())
     }
