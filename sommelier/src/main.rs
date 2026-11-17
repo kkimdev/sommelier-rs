@@ -139,9 +139,6 @@ async fn main() {
     let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR not set");
     let socket_path = format!("{}/{}", xdg_runtime, args.display);
 
-    // Clean up old socket
-    let _ = std::fs::remove_file(&socket_path);
-
     proxy::run(
         &socket_path,
         local_compositor,

@@ -1110,6 +1110,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_held_socket_lock_protects_the_live_socket() {
+        let dir = crate::test_support::TempDir::new("socket-lock");
+        let socket = dir.path().join("wayland-test");
+        let stale = std::os::unix::net::UnixListener::bind(&socket).expect("bind a stale socket");
+        drop(stale);
+
+        // No one holds the lock, so the socket is stale and is removed.
+        let lock = claim_display_socket(&socket).expect("claim the free socket path");
+        assert!(!socket.exists(), "the stale socket must be removed");
+
+        // While the lock is held, a second claim fails and leaves the
+        // owner's socket in place.
+        let live = std::os::unix::net::UnixListener::bind(&socket).expect("bind the live socket");
+        let error = claim_display_socket(&socket).expect_err("the path is claimed");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(socket.exists(), "a live socket must not be removed");
+
+        // Once the owner is gone, the path can be claimed again.
+        drop(live);
+        drop(lock);
+        claim_display_socket(&socket).expect("claim the released socket path");
+        assert!(!socket.exists());
+    }
+
     #[tokio::test]
     async fn message_batches_leave_buffered_frames_for_fair_dispatch() {
         use std::os::unix::net::UnixStream;
@@ -4208,6 +4233,12 @@ pub async fn run(
         }
     }
 
+    // Held until the process exits, like the socket itself.
+    let _socket_lock =
+        claim_display_socket(std::path::Path::new(display)).unwrap_or_else(|error| {
+            log::error!("Cannot claim the Wayland socket {display}: {error}");
+            std::process::exit(1);
+        });
     let listener = UnixListener::bind(display).expect("Failed to bind socket");
     log::info!("Listening on {}", display);
 
@@ -4228,6 +4259,42 @@ pub async fn run(
     tokio::task::LocalSet::new()
         .run_until(serve(listener, config, reload_signal))
         .await;
+}
+
+/// Claim the socket path `display` for this process, as libwayland claims
+/// its socket: take an exclusive lock on `<display>.lock` and, only while
+/// holding it, remove a socket a previous owner left behind.
+///
+/// The lock lasts as long as the returned value. Fails, leaving the socket
+/// alone, while another process holds the lock: that process is serving
+/// the socket, and removing it would cut its clients off from new
+/// connections.
+fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut lock_path = display.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o660)
+        .open(&lock_path)?;
+    let lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, errno)| match errno {
+            nix::errno::Errno::EWOULDBLOCK => io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another process holds its lock and is serving it",
+            ),
+            errno => io::Error::from(errno),
+        })?;
+    match std::fs::remove_file(display) {
+        Ok(()) => log::info!("Removed the stale socket {}", display.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(lock)
 }
 
 /// Accept guest clients for the life of the process, and reload the
