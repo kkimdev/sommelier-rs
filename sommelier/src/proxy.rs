@@ -25,6 +25,9 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(test)]
+mod fuzz;
+
 type DispatchResult = Result<Option<(Vec<u8>, Vec<RawFd>)>, ProtocolError>;
 
 // A frame can generate many small Wayland requests (damage, attach, commit,
@@ -391,6 +394,17 @@ impl Client {
                 Framing::Partial => break,
                 Framing::Invalid(header) => {
                     log::error!("Invalid message length: {}", header.len);
+                    if matches!(direction, Direction::ClientToHost) {
+                        // libwayland-server reports a length under 8 or
+                        // over 4096 the same way (the alignment check is
+                        // the proxy's own); the stream cannot be framed
+                        // past it, so the session ends.
+                        crate::handler::display::queue_request_error(
+                            &mut self.ctx,
+                            &ProtocolError::InvalidMessageLength(header.len),
+                        );
+                        break;
+                    }
                     close_pending_output_fds(&mut out, &conn.read_fds);
                     return false;
                 }
@@ -479,6 +493,13 @@ impl Client {
                 } else {
                     res
                 }
+            } else if matches!(direction, Direction::ClientToHost) {
+                // A guest request is only valid when its sender is a live
+                // object owned by this connection. Unlike a stale host event
+                // (which may have raced object teardown), silently dropping
+                // an unknown client request makes the client believe the
+                // request was accepted and can desynchronize protocol state.
+                Err(ProtocolError::InvalidSender(sender_id))
             } else {
                 if guest_id.is_some() {
                     log::warn!(
@@ -488,17 +509,6 @@ impl Client {
                         opcode,
                         len
                     );
-                    if matches!(direction, Direction::ClientToHost) {
-                        // A guest request is only valid when its sender is a
-                        // live object owned by this connection. Unlike a
-                        // stale host event (which may have raced object
-                        // teardown), silently dropping an unknown client
-                        // request makes the client believe the request was
-                        // accepted and can desynchronize protocol state.
-                        log::error!("Rejecting client request from unknown sender {}", sender_id);
-                        close_pending_output_fds(&mut out, &conn.read_fds);
-                        return false;
-                    }
                 } else {
                     log::debug!(
                         "[{:?}] untracked host id {} opcode {} (len={})",
@@ -559,6 +569,13 @@ impl Client {
                         .and_then(|gid| self.ctx.shadow_table.get_interface(gid).cloned())
                         .unwrap_or_else(|| "unknown".to_string());
                     log::error!("Protocol error: {} (direction={:?}, id={}, guest_id={:?}, interface={}, opcode={})", e, direction, sender_id, guest_id_for_log, interface, opcode);
+                    if matches!(direction, Direction::ClientToHost) {
+                        // Tell the guest why before closing, as
+                        // libwayland-server does. The requests before this
+                        // one were valid, so they are forwarded as usual.
+                        crate::handler::display::queue_request_error(&mut self.ctx, &e);
+                        break;
+                    }
                     close_pending_output_fds(&mut out, &conn.read_fds);
                     return false;
                 }
@@ -605,6 +622,16 @@ impl Client {
             }
             if processed_messages >= MAX_MESSAGES_PER_BATCH {
                 break;
+            }
+        }
+
+        // A session ending here gets its one error even when the cause did
+        // not queue one. Toward the guest it goes with the forwarded events;
+        // otherwise it is in the reverse queue sent below.
+        crate::handler::display::queue_error_if_none_queued(&mut self.ctx);
+        if self.ctx.fatal_protocol_error && matches!(direction, Direction::HostToClient) {
+            for (p_data, p_fds) in self.ctx.host_to_client_queue.drain(..) {
+                out.push(&p_data, &p_fds);
             }
         }
 
@@ -682,7 +709,7 @@ impl Client {
 mod tests {
     use super::*;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender,
+        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, stream_headers,
     };
     use crate::wire::MessageBuilder;
     use nix::sys::memfd::{memfd_create, MFdFlags};
@@ -1571,17 +1598,32 @@ mod tests {
         assert_fd_released(pending_fd, &pending_target);
     }
 
+    /// The object and code of each `wl_display.error` the guest received
+    /// before the proxy closed the connection.
+    fn display_errors(guest_peer: &mut std::os::unix::net::UnixStream) -> Vec<(u32, u32)> {
+        use std::io::Read;
+        let mut events = Vec::new();
+        guest_peer
+            .read_to_end(&mut events)
+            .expect("read the guest's events");
+        crate::test_support::frames(&events)
+            .filter(|(header, _)| {
+                (header.sender_id, header.opcode)
+                    == (
+                        crate::wire::WL_DISPLAY_ID,
+                        protocols::wayland::wl_display::EVT_ERROR,
+                    )
+            })
+            .map(|(header, payload)| {
+                let mut error = WireMessage::new(header.sender_id, header.opcode, payload, &[]);
+                (error.read_u32().unwrap(), error.read_u32().unwrap())
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn unknown_client_sender_is_a_protocol_error() {
-        use std::os::unix::net::UnixStream;
-
-        let (client_socket, host_socket) =
-            UnixStream::pair().expect("test socket pair should be created");
-        let mut client = Client::new(
-            WaylandConnection::new(client_socket.into()).expect("register test socket"),
-            WaylandConnection::new(host_socket.into()).expect("register test socket"),
-            Context::new_for_test(false, false, Vec::new()),
-        );
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
 
         // A client request with an unknown sender is malformed Wayland
         // traffic. It must not be silently discarded because doing so leaves
@@ -1596,6 +1638,220 @@ mod tests {
             "unknown client sender IDs must terminate the connection"
         );
         drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+            )],
+            "the guest learns why, as libwayland-server reports an unknown sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_request_is_reported_after_forwarding_earlier_requests() {
+        use std::io::Read;
+        let (mut client, mut guest_peer, mut host_peer) = client_with_socket_peers();
+
+        // A whole wl_display.sync, then one without its callback argument.
+        let mut sync = MessageBuilder::new();
+        sync.write_u32(2);
+        let sync = sync.build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        let truncated =
+            MessageBuilder::new().build_message(1, protocols::wayland::wl_display::REQ_SYNC);
+        client.client_conn.read_buf.extend_from_slice(&sync);
+        client.client_conn.read_buf.extend_from_slice(&truncated);
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(1, crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD)]
+        );
+        let mut forwarded = Vec::new();
+        host_peer
+            .read_to_end(&mut forwarded)
+            .expect("read the forwarded requests");
+        assert_eq!(
+            stream_headers(&forwarded),
+            [(1, protocols::wayland::wl_display::REQ_SYNC)],
+            "the valid request before the bad one still reaches the host"
+        );
+    }
+
+    /// The guest's `wl_surface` in [`client_with_a_surface`].
+    const SURFACE: u32 = 5;
+
+    /// A proxy whose guest has the v4 `wl_surface` [`SURFACE`].
+    fn client_with_a_surface() -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (mut client, guest_peer, host_peer) = client_with_socket_peers();
+        let host_surface = 6;
+        client.ctx.shadow_table.map_id(SURFACE, host_surface);
+        client
+            .ctx
+            .shadow_table
+            .track_interface_with_version(SURFACE, "wl_surface".to_string(), 4);
+        client.ctx.shadow_table.track_host_interface_with_version(
+            host_surface,
+            "wl_surface".to_string(),
+            4,
+        );
+        (client, guest_peer, host_peer)
+    }
+
+    /// The errors the guest receives when, after `prepare`, `SURFACE`
+    /// sends request `opcode` with `payload`.
+    async fn surface_request_errors(
+        prepare: impl FnOnce(&mut Client),
+        opcode: u16,
+        payload: &[u32],
+    ) -> Vec<(u32, u32)> {
+        let (mut client, mut guest_peer, _host_peer) = client_with_a_surface();
+        prepare(&mut client);
+        let mut request = MessageBuilder::new();
+        payload.iter().for_each(|&word| request.write_u32(word));
+        client
+            .client_conn
+            .read_buf
+            .extend(request.build_message(SURFACE, opcode));
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        display_errors(&mut guest_peer)
+    }
+
+    /// libwayland-server reports every rejected request on `wl_display`,
+    /// and only an unusable sender as `invalid_object`: the code is read
+    /// against the interface of the error's object.
+    #[tokio::test]
+    async fn rejected_requests_report_invalid_method_on_the_display() {
+        use crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD;
+        use protocols::wayland::wl_surface::REQ_ATTACH;
+        let expected = [(crate::wire::WL_DISPLAY_ID, WL_DISPLAY_ERROR_INVALID_METHOD)];
+
+        assert_eq!(
+            surface_request_errors(|_| {}, REQ_ATTACH, &[0]).await,
+            expected,
+            "an attach without its offsets does not decode"
+        );
+        assert_eq!(
+            surface_request_errors(|_| {}, REQ_ATTACH, &[999, 0, 0]).await,
+            expected,
+            "an attach of an unknown buffer names an unusable object argument"
+        );
+        assert_eq!(
+            surface_request_errors(|_| {}, REQ_ATTACH, &[SURFACE, 0, 0]).await,
+            expected,
+            "a bad object argument is invalid_method even when it is the sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_destroyed_sender_is_an_invalid_object_whatever_it_sends() {
+        let errors = surface_request_errors(
+            |client| client.ctx.shadow_table.mark_pending_destroy(SURFACE),
+            99,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            errors,
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                crate::handler::display::WL_DISPLAY_ERROR_INVALID_OBJECT
+            )],
+            "the sender is checked before its opcode, as in libwayland-server"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_gets_exactly_one_error() {
+        use protocols::wayland::wl_surface::{REQ_COMMIT, REQ_SET_BUFFER_SCALE};
+        // The handler rejects scale 0 with wl_surface.invalid_scale; the
+        // extra word then leaves trailing data, which must not add another.
+        assert_eq!(
+            surface_request_errors(|_| {}, REQ_SET_BUFFER_SCALE, &[0, 0]).await,
+            [(SURFACE, 0)]
+        );
+        // A handler can end the session without queueing an error (a host
+        // storage failure, say); the trailing data still gets reported.
+        assert_eq!(
+            surface_request_errors(
+                |client| client.ctx.fatal_protocol_error = true,
+                REQ_COMMIT,
+                &[0]
+            )
+            .await,
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_internal_failure_ends_the_session_with_an_implementation_error() {
+        use protocols::wayland::wl_surface::REQ_COMMIT;
+        // As a failed dma-buf sync during a commit does: fatal, with no
+        // error of its own.
+        assert_eq!(
+            surface_request_errors(
+                |client| client.ctx.fatal_protocol_error = true,
+                REQ_COMMIT,
+                &[]
+            )
+            .await,
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                crate::handler::display::WL_DISPLAY_ERROR_IMPLEMENTATION
+            )]
+        );
+    }
+
+    /// The host's error is the guest's one error: a malformed request that
+    /// follows it gets none of its own.
+    #[tokio::test]
+    async fn a_host_error_is_the_sessions_only_error() {
+        let (mut client, mut guest_peer, _host_peer) = client_with_a_surface();
+        let host_surface = client.ctx.shadow_table.get_host_id(SURFACE).unwrap();
+        let mut error = MessageBuilder::new();
+        error.write_u32(host_surface);
+        error.write_u32(2);
+        error.write_string("host failure");
+        client.host_conn.read_buf.extend(error.build_message(
+            crate::wire::WL_DISPLAY_ID,
+            protocols::wayland::wl_display::EVT_ERROR,
+        ));
+        assert!(!client.handle_msgs(Direction::HostToClient).await);
+        client
+            .client_conn
+            .read_buf
+            .extend(MessageBuilder::new().build_message(SURFACE, 99));
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_message_length_is_reported_before_closing() {
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        // A header claiming 6 bytes, less than the header itself.
+        client
+            .client_conn
+            .read_buf
+            .extend([1u32.to_ne_bytes(), (6u32 << 16).to_ne_bytes()].concat());
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(
+                crate::wire::WL_DISPLAY_ID,
+                crate::handler::display::WL_DISPLAY_ERROR_INVALID_METHOD
+            )]
+        );
     }
 
     const XDG_SURFACE: u32 = 10;
@@ -2255,35 +2511,20 @@ mod tests {
             "zcr_extended_text_input_v1".to_string(),
             11,
         );
-        ctx.text_inputs.insert(
-            GUEST_TEXT_INPUT,
-            TextInputState {
-                host_v1_id: HOST_TEXT_INPUT,
-                host_ext_id: Some(HOST_EXTENDED_TEXT_INPUT),
-                guest_seat: GUEST_SEAT,
-                active_surface: Some(GUEST_SURFACE),
-                pending_enabled: true,
-                committed_enabled: true,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: Some(("가".to_string(), 3, 3)),
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: String::new(),
-                guest_commit_serial: crate::state::CommitCount::at(1),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(GUEST_TEXT_INPUT, {
+            let mut state = TextInputState::new(
+                HOST_TEXT_INPUT,
+                Some(HOST_EXTENDED_TEXT_INPUT),
+                GUEST_SEAT,
+                Some(GUEST_SURFACE),
+            );
+            state.pending_enabled = true;
+            state.committed_enabled = true;
+            state.committed_surrounding_text = Some(("가".to_string(), 3, 3));
+            state.set_guest_commits(1);
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         (ctx, SommelierHandler::new())
     }
@@ -3657,7 +3898,7 @@ mod tests {
                 &mut handler,
                 &mut ctx,
             ),
-            Err(ProtocolError::InvalidObjectId(guest_id))
+            Err(ProtocolError::InvalidSender(guest_id))
         );
         assert_eq!(
             ctx.host_to_client_queue.len(),
@@ -4455,9 +4696,8 @@ async fn connect_host(
 ///
 /// Once installed, `SIGHUP` no longer terminates the process. Tokio delivers
 /// the signal through its own self-pipe; [`reload_on_signal`] runs the
-/// reload. `main`
-/// installs it before anything else can take long, whatever the
-/// configuration.
+/// reload. `main` installs it before anything else can take long, whatever
+/// the configuration.
 ///
 /// # Returns
 ///
@@ -4473,6 +4713,7 @@ pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
         })
         .ok()
 }
+
 /// Reload the shortcut configuration on each `signal`.
 ///
 /// A task of its own, so a reload never waits behind the accept loop (its

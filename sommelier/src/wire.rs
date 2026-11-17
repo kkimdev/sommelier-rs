@@ -120,7 +120,11 @@ pub enum ProtocolError {
     InsufficientData,
     InvalidString,
     MissingFd,
+    /// An object argument or `new_id` that cannot be used.
     InvalidObjectId(u32),
+    /// The message's sender is not a usable object: unknown, or destroyed
+    /// and awaiting `delete_id`.
+    InvalidSender(u32),
     UnsupportedVersion {
         object_id: u32,
         required: u32,
@@ -140,6 +144,9 @@ impl fmt::Display for ProtocolError {
             ProtocolError::MissingFd => write!(f, "Missing file descriptor in wire message"),
             ProtocolError::InvalidObjectId(id) => {
                 write!(f, "Invalid or unmapped Wayland object ID: {}", id)
+            }
+            ProtocolError::InvalidSender(id) => {
+                write!(f, "Invalid or unmapped Wayland sender ID: {}", id)
             }
             ProtocolError::UnsupportedVersion {
                 object_id,
@@ -445,6 +452,80 @@ impl MessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::{Framing, MessageBuilder, MessageHeader, ProtocolError, WireMessage};
+    use crate::test_support::Rng;
+
+    /// Decoding holds for arbitrary bytes: a frame never claims more bytes
+    /// than the stream has, no read moves past the payload or the
+    /// descriptors, and what `MessageBuilder` writes decodes unchanged.
+    #[test]
+    fn arbitrary_bytes_decode_within_bounds_and_written_values_round_trip() {
+        let mut rng = Rng::new(0);
+        let (mut partial, mut invalid, mut complete) = (0, 0, 0);
+        for _ in 0..20_000 {
+            let len = rng.below(64);
+            let mut stream = rng.bytes(len);
+            // Random length words are almost never valid, so half the time
+            // write a valid one, about as often too long as not.
+            if stream.len() >= MessageHeader::LEN && rng.one_in(2) {
+                let message_len = 4 * (2 + rng.below(stream.len() / 2)) as u32;
+                stream[4..8].copy_from_slice(&((message_len << 16) | 1).to_ne_bytes());
+            }
+            match MessageHeader::frame(&stream) {
+                Framing::Partial => {
+                    partial += 1;
+                    assert!(MessageHeader::parse(&stream)
+                        .is_none_or(|header| header.len > stream.len()))
+                }
+                Framing::Invalid(header) => {
+                    invalid += 1;
+                    assert!(!header.has_valid_len())
+                }
+                Framing::Complete(header) => {
+                    complete += 1;
+                    assert!(header.has_valid_len() && header.len <= stream.len())
+                }
+            }
+
+            let fds = [3, 4];
+            let mut message = WireMessage::new(1, 0, &stream, &fds[..rng.below(fds.len() + 1)]);
+            for _ in 0..8 {
+                let _ = match rng.below(5) {
+                    0 => message.read_u32().map(drop),
+                    1 => message.read_string().map(drop),
+                    2 => message.read_nullable_string().map(drop),
+                    3 => message.read_array().map(drop),
+                    _ => message.read_fd().map(drop),
+                };
+                assert!(message.offset <= message.payload.len());
+                assert!(message.fd_offset <= message.fds.len());
+            }
+
+            let value = rng.next_u32();
+            let text: String = (0..rng.below(12))
+                .map(|_| char::from(b' ' + rng.below(95) as u8))
+                .collect();
+            let len = rng.below(9);
+            let array = rng.bytes(len);
+            let mut builder = MessageBuilder::new();
+            builder.write_u32(value);
+            builder.write_string(&text);
+            builder.write_array(&array);
+            builder.write_nullable_string(None);
+            let mut message = WireMessage::new(1, 0, &builder.payload, &[]);
+            assert_eq!(message.read_u32(), Ok(value));
+            assert_eq!(message.read_string(), Ok(text));
+            assert_eq!(message.read_array(), Ok(array));
+            assert_eq!(message.read_nullable_string(), Ok(None));
+            assert!(message.is_payload_consumed());
+        }
+        for (framing, count) in [
+            ("partial", partial),
+            ("invalid", invalid),
+            ("complete", complete),
+        ] {
+            assert!(count > 1000, "only {count} {framing} frames");
+        }
+    }
 
     #[test]
     fn header_length_is_the_high_half_of_the_second_word() {

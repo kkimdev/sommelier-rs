@@ -117,35 +117,12 @@ mod tests {
             guest_surface,
             host_surface,
         );
-        ctx.text_inputs.insert(
-            guest_text_input,
-            TextInputState {
-                host_v1_id: 60,
-                host_ext_id: None,
-                guest_seat,
-                active_surface: Some(guest_surface),
-                pending_enabled: false,
-                committed_enabled: false,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(0),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(guest_text_input, {
+            let mut state = TextInputState::new(60, None, guest_seat, Some(guest_surface));
+            state.current_preedit = "한".to_string();
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         ctx.last_sender_id = guest_seat;
         assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);

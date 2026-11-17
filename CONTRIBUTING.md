@@ -24,11 +24,13 @@ run the checks CI runs, plus `git diff --check`, from the repository root:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo test --locked --workspace --all-targets
 git diff --check
 ```
 
-Tests must run serially (`--test-threads=1`).
+Tests run in parallel, so a test must not assume which descriptor
+numbers or global state another test leaves alone; see
+[Testing](docs/DESIGN.md#testing).
 
 - Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before changing transport,
   object lifetimes, SHM or dma-buf, keyboard and IME, or application-ID
@@ -41,6 +43,40 @@ Tests must run serially (`--test-threads=1`).
   `sommelier/docs/` each feature's contract.
 - Never commit transient files; `*.local.*` and `_local/` are ignored for
   them.
+
+## Randomized tests
+
+`proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
+request streams built from the vendored XML, some of them damaged, over
+real sockets. Each case must end without a panic or hang, close every
+descriptor, and either answer the stream's closing `wl_display.sync` or
+send `wl_display.error`. The fake compositor behind the proxy also checks
+that every request it receives comes from a live host object, creates
+only fresh IDs and names live objects of the right interface; it deletes
+destroyed objects at once, so the proxy's host ID reuse is exercised.
+The suite runs 5000 cases from seed 0; run more, from another seed,
+after changing how the proxy reads guest requests:
+
+```bash
+SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
+  cargo test -p sommelier --bins proxy::fuzz
+```
+
+A failure names its seed; rerun that seed alone with
+`SOMMELIER_FUZZ_SEED=<seed> SOMMELIER_FUZZ_CASES=1`, and add `RUST_LOG=debug`
+and `-- --nocapture` to see the proxy's log. The seed fixes the case's
+input, not its timing (how the pieces arrive, which side the proxy serves
+first), so replay a failing seed a few times before concluding it passes.
+
+## End-to-end test
+
+`sommelier/tests/weston_e2e.rs` runs real clients through
+`sommelier --local-compositor` against a headless weston: `wayland-info`
+must list the globals, and `weston-simple-shm` must draw for a few seconds
+and exit cleanly while the proxy logs no error. It needs `weston` and
+`wayland-info` on `PATH` (Debian and Ubuntu packages `weston` and
+`wayland-utils`) and passes with a note without them; CI installs them on
+x86_64 and sets `SOMMELIER_E2E_REQUIRED=1` so a missing one fails.
 
 ## Commit messages
 

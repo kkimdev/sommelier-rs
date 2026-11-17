@@ -157,6 +157,9 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   like the guest buffer and imported by the host as a `wl_shm` pool, or,
   with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
   a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
+  With `--local-compositor` and no VirtWL, the shared memory is a memfd
+  (or, with `--gpu-accel`, a DRM render node and the host's linux-dmabuf,
+  a GBM dma-buf).
   `ShmBacking` records the choice, so the copy path re-checks nothing.
 - On commit, the damaged region is copied from the guest pool into the host
   storage before the host `wl_surface.commit` is queued, so the host never
@@ -219,10 +222,18 @@ keysyms back to keycodes and to classify chords; chords listed in
 
 Each fix lands with a regression test that fails before it; the test names
 in [INVARIANTS.md](INVARIANTS.md) are anchors for the rules they pin. Tests
-run serially (`--test-threads=1`) because some observe process-wide state
-such as open file descriptors. `sommelier_test_app` is a standalone
-GUI for manual IME and glyph checks, and `sommelier/tests/gui_smoke.rs`
-(ignored by default) drives it through a real proxy; see the README.
+run in parallel. A descriptor number can be reused by another test the
+moment it is closed, so a test that checks a descriptor was closed checks
+that no descriptor still refers to its object
+(`test_support::any_fd_has_identity`), never its number; the randomized
+`proxy::fuzz` test, which counts every open descriptor, runs its cases in
+a child process of its own. Beyond unit tests, `proxy::fuzz` feeds whole
+clients random guest streams, and `sommelier/tests/weston_e2e.rs` runs
+real clients through the proxy against a headless weston; CONTRIBUTING
+says how to run them. `sommelier_test_app` is a standalone GUI for manual
+IME and glyph checks, and `sommelier/tests/gui_smoke.rs` (ignored by
+default) drives it through a real proxy on a Crostini VirtWL device; see
+the README.
 
 ## Not in scope
 

@@ -171,7 +171,7 @@ From the repository root:
 cargo build --locked --release -p sommelier
 
 # Test
-cargo test --locked --workspace --all-targets -- --test-threads=1
+cargo test --locked --workspace --all-targets
 
 # Run the proxy from the local build
 ./target/release/sommelier --virtio-wl /dev/wl0 --gpu-accel wayland-2

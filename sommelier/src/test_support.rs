@@ -55,15 +55,25 @@ pub fn queued_headers(queue: &[(Vec<u8>, Vec<RawFd>)]) -> Vec<(u32, u16)> {
         .collect()
 }
 
+/// Each complete message at the start of a Wayland byte stream, up to a
+/// partial or corrupt one, with its payload.
+pub fn frames(mut stream: &[u8]) -> impl Iterator<Item = (MessageHeader, &[u8])> {
+    std::iter::from_fn(move || {
+        let Framing::Complete(header) = MessageHeader::frame(stream) else {
+            return None;
+        };
+        let (message, rest) = stream.split_at(header.len);
+        stream = rest;
+        Some((header, &message[MessageHeader::LEN..]))
+    })
+}
+
 /// The `(sender, opcode)` of every complete message at the start of a
 /// Wayland byte stream, up to a partial or corrupt one.
-pub fn stream_headers(mut stream: &[u8]) -> Vec<(u32, u16)> {
-    let mut headers = Vec::new();
-    while let Framing::Complete(header) = MessageHeader::frame(stream) {
-        headers.push((header.sender_id, header.opcode));
-        stream = &stream[header.len..];
-    }
-    headers
+pub fn stream_headers(stream: &[u8]) -> Vec<(u32, u16)> {
+    frames(stream)
+        .map(|(header, _)| (header.sender_id, header.opcode))
+        .collect()
 }
 
 /// The `(device, inode)` pair of an open file description.
@@ -114,6 +124,51 @@ pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
     let mut file = std::fs::File::from(fd);
     file.write_all(bytes).expect("fill the SHM pool file");
     file
+}
+
+/// A seeded pseudo-random generator (SplitMix64) for randomized tests.
+///
+/// Small and dependency-free; the same seed always yields the same values,
+/// so a failing case's input reproduces from the seed it reports. A test
+/// whose outcome also depends on timing may need a few replays.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    /// A value in `0..bound`; `bound` must be positive.
+    pub fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+
+    /// True once in `n` calls on average.
+    pub fn one_in(&mut self, n: u64) -> bool {
+        self.next_u64().is_multiple_of(n)
+    }
+
+    /// One element of the non-empty slice `items`.
+    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+
+    /// `len` random bytes.
+    pub fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next_u64() as u8).collect()
+    }
 }
 
 /// A uniquely named scratch directory removed when dropped.

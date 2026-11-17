@@ -60,7 +60,7 @@ jobs:
           echo "CARGO_VERSION=${cargo_version}" >> "${GITHUB_ENV}"
 
       - name: Run regression tests
-        run: cargo test --locked --workspace --all-targets -- --test-threads=1
+        run: cargo test --locked --workspace --all-targets
 
       - name: Build release binary
         run: cargo build --locked --release --package sommelier --verbose

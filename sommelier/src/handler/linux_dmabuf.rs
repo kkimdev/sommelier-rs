@@ -1729,9 +1729,12 @@ mod tests {
             u32::from_ne_bytes(ctx.host_to_client_queue[0].0[12..16].try_into().unwrap()),
             2
         );
+        // The context owns the first plane's descriptor and closes it; a
+        // second close here would close whatever a parallel test had just
+        // opened under that number.
+        drop(ctx);
         unsafe {
             libc::close(first_pipe[0]);
-            libc::close(first_pipe[1]);
             libc::close(second_pipe[0]);
             libc::close(second_pipe[1]);
         }

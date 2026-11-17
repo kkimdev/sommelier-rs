@@ -1442,32 +1442,29 @@ mod tests {
         guest_seat: u32,
         active_surface: u32,
     ) -> crate::state::TextInputState {
-        crate::state::TextInputState {
-            host_v1_id,
-            host_ext_id: None,
-            guest_seat,
-            active_surface: Some(active_surface),
-            pending_enabled: true,
-            committed_enabled: true,
-            enabled_dirty: true,
-            pending_surrounding_text: Some(("한".to_string(), 3, 3)),
-            committed_surrounding_text: Some(("한".to_string(), 3, 3)),
-            surrounding_text_dirty: true,
-            content_hint: 1,
-            content_purpose: 1,
-            committed_content_type: Some((1, 1)),
-            content_type_dirty: true,
-            cursor_rect: Some((1, 2, 3, 4)),
-            cursor_rect_dirty: true,
-            text_change_cause: 1,
-            current_preedit: "한".to_string(),
-            guest_commit_serial: crate::state::CommitCount::at(1),
-            pending_preedit_cursor: Some(1),
-            pending_preedit_selection: Some((0, 1)),
-            pending_deletes: vec![(1, 1)],
-            pending_cursor_position: Some((1, 1)),
-            host_activation: crate::state::HostActivationState::Active,
-        }
+        let mut state =
+            crate::state::TextInputState::new(host_v1_id, None, guest_seat, Some(active_surface));
+        state.pending_enabled = true;
+        state.committed_enabled = true;
+        state.enabled_dirty = true;
+        state.pending_surrounding_text = Some(("한".to_string(), 3, 3));
+        state.committed_surrounding_text = Some(("한".to_string(), 3, 3));
+        state.surrounding_text_dirty = true;
+        state.content_hint = 1;
+        state.content_purpose = 1;
+        state.committed_content_type = Some((1, 1));
+        state.content_type_dirty = true;
+        state.cursor_rect = Some((1, 2, 3, 4));
+        state.cursor_rect_dirty = true;
+        state.text_change_cause = 1;
+        state.current_preedit = "한".to_string();
+        state.set_guest_commits(1);
+        state.pending_preedit_cursor = Some(1);
+        state.pending_preedit_selection = Some((0, 1));
+        state.pending_deletes = vec![(1, 1)];
+        state.pending_cursor_position = Some((1, 1));
+        state.host_activation = crate::state::HostActivationState::Active;
+        state
     }
 
     fn mapped_test_buffer(
@@ -2977,30 +2974,27 @@ mod tests {
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
 
-        assert_eq!(
-            handler.on_set_buffer_scale(&mut ctx, 0),
-            Action::Drop,
-            "wl_surface.set_buffer_scale(0) is a protocol error"
-        );
-        assert_eq!(
-            handler.on_set_buffer_scale(&mut ctx, -2),
-            Action::Drop,
-            "negative buffer scales must not enter pending state"
-        );
-        assert_eq!(
-            handler.on_set_buffer_transform(&mut ctx, 8),
-            Action::Drop,
-            "wl_output.transform values are limited to 0..=7"
-        );
+        // A client gets one error, so each rejection starts afresh.
+        let mut rejected = |reject: &dyn Fn(&mut CompositorHandler, &mut Context) -> Action,
+                            code: u32| {
+            ctx.host_to_client_queue.clear();
+            ctx.clear_protocol_error_for_test();
+            assert_eq!(reject(&mut handler, &mut ctx), Action::Drop);
+            assert!(ctx.fatal_protocol_error);
+            assert_eq!(ctx.host_to_client_queue.len(), 1);
+            assert_eq!(protocol_error_code(&ctx), code);
+        };
+        // wl_surface.invalid_scale for 0 and negative scales, and
+        // invalid_transform outside wl_output.transform's 0..=7.
+        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, 0), 0);
+        rejected(&|handler, ctx| handler.on_set_buffer_scale(ctx, -2), 0);
+        rejected(&|handler, ctx| handler.on_set_buffer_transform(ctx, 8), 1);
         assert!(
             ctx.surfaces.get(&surface_id).is_none_or(|surface| {
                 surface.pending_buffer_scale.is_none() && surface.pending_buffer_transform.is_none()
             }),
             "invalid requests must not create or mutate pending surface state"
         );
-        assert_eq!(ctx.host_to_client_queue.len(), 3);
-        assert_eq!(protocol_error_code(&ctx), 0);
-        assert!(ctx.fatal_protocol_error);
     }
 
     #[test]
@@ -3024,7 +3018,7 @@ mod tests {
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.shadow_table
             .track_interface_with_version(surface_id, "wl_surface".to_string(), 4);
         assert_eq!(handler.on_attach(&mut ctx, 42, 3, 4), Action::Forward);
@@ -3611,13 +3605,13 @@ mod tests {
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         assert_eq!(handler.on_set_destination(&mut ctx, 0, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 0);
         assert!(ctx.fatal_protocol_error);
 
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.viewport_to_wl_surface.remove(&700);
         assert_eq!(handler.on_set_destination(&mut ctx, 10, 10), Action::Drop);
         assert_eq!(protocol_error_code(&ctx), 3);
@@ -3636,7 +3630,7 @@ mod tests {
             Action::Forward
         );
         ctx.host_to_client_queue.clear();
-        ctx.fatal_protocol_error = false;
+        ctx.clear_protocol_error_for_test();
         ctx.last_sender_id = surface_id;
         assert_eq!(
             handler.on_get_viewport(&mut ctx, 701, surface_id),
@@ -4354,35 +4348,12 @@ mod tests {
             surface,
             _wl_surface_host,
         );
-        ctx.text_inputs.insert(
-            text_input,
-            crate::state::TextInputState {
-                host_v1_id: 702,
-                host_ext_id: None,
-                guest_seat: 1,
-                active_surface: Some(surface),
-                pending_enabled: false,
-                committed_enabled: false,
-                enabled_dirty: false,
-                pending_surrounding_text: None,
-                committed_surrounding_text: None,
-                surrounding_text_dirty: false,
-                content_hint: 0,
-                content_purpose: 0,
-                committed_content_type: None,
-                content_type_dirty: false,
-                cursor_rect: None,
-                cursor_rect_dirty: false,
-                text_change_cause: 0,
-                current_preedit: "한".to_string(),
-                guest_commit_serial: crate::state::CommitCount::at(0),
-                pending_preedit_cursor: None,
-                pending_preedit_selection: None,
-                pending_deletes: Vec::new(),
-                pending_cursor_position: None,
-                host_activation: crate::state::HostActivationState::Active,
-            },
-        );
+        ctx.text_inputs.insert(text_input, {
+            let mut state = crate::state::TextInputState::new(702, None, 1, Some(surface));
+            state.current_preedit = "한".to_string();
+            state.host_activation = crate::state::HostActivationState::Active;
+            state
+        });
 
         let mut compositor = CompositorHandler;
         ctx.last_sender_id = surface;

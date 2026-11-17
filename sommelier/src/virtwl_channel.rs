@@ -461,10 +461,12 @@ mod tests {
         owned_fds_from_txn, VirtWaylandChannel, DEFAULT_BUFFER_SIZE, MAX_SEND_SIZE,
     };
     use crate::protocols::wayland::wl_display;
+    use crate::test_support::{any_fd_has_identity, fd_identity, TestFdIdentity};
     use crate::virtwl::virtwl_ioctl_txn;
     use crate::wire::{MessageBuilder, WL_DISPLAY_ID};
     use nix::fcntl::OFlag;
-    use std::os::fd::AsRawFd;
+    use nix::sys::memfd::{memfd_create, MFdFlags};
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -568,31 +570,28 @@ mod tests {
         assert_eq!(layout.offsets, [0, 4096 * 1080, 0]);
     }
 
+    /// A descriptor as a device returns it: a raw number the proxy now
+    /// owns, with the identity of its unique memfd.
+    ///
+    /// Tests assert on the identity, because the number can be reused by a
+    /// parallel test as soon as the code under test closes it.
+    fn returned_fd() -> (RawFd, TestFdIdentity) {
+        let memfd = memfd_create(c"sommelier-virtwl-returned-fd", MFdFlags::MFD_CLOEXEC)
+            .expect("memfd_create");
+        let identity = fd_identity(memfd.as_raw_fd());
+        (memfd.into_raw_fd(), identity)
+    }
+
     #[test]
     fn returned_ioctl_fd_is_closed_on_error_paths() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let returned_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(returned_fd >= 1000);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-
+        let (returned_fd, identity) = returned_fd();
         close_returned_fd(returned_fd);
-        assert_eq!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
+        assert!(!any_fd_has_identity(identity));
     }
 
     #[test]
     fn recv_ioctl_error_closes_descriptors_written_before_failure() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let returned_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(returned_fd >= 1000);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        let (returned_fd, identity) = returned_fd();
 
         // Model a device that wrote a descriptor and then returned an ioctl
         // error. The receive error branch must reclaim it before propagating
@@ -604,31 +603,16 @@ mod tests {
         txn.fds[0] = returned_fd;
         close_raw_fds(&txn.fds);
 
-        assert_eq!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
-        unsafe {
-            libc::close(pipe_fds[1]);
-        }
+        assert!(!any_fd_has_identity(identity));
     }
 
     #[test]
     fn virtwl_fd_array_must_be_packed() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        // Keep the descriptor out of the low-numbered range used by other
-        // tests. `owned_fds_from_txn` closes malformed arrays immediately;
-        // a parallel test must not be able to reuse the just-closed number
-        // before the assertion below checks it.
-        let returned_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
-        assert!(returned_fd >= 1000);
-        unsafe {
-            libc::close(pipe_fds[1]);
-        }
+        let (returned_fd, identity) = returned_fd();
+        // `owned_fds_from_txn` closes a malformed array at once.
         let invalid = [-1, returned_fd];
         assert!(owned_fds_from_txn(&invalid).is_err());
-        assert_eq!(unsafe { libc::fcntl(returned_fd, libc::F_GETFD) }, -1);
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
+        assert!(!any_fd_has_identity(identity));
     }
 
     #[test]

@@ -38,10 +38,10 @@ use log::{error, warn};
 
 #[allow(unused_imports)]
 pub(crate) use self::input::{
-    CommitCount, ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery,
-    GuestKeyEvent, GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan,
-    KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate,
-    PeekKeyProvenance, PreeditRegionPlan, SeatFocusChange, TextInputState,
+    ConfirmPreeditPlan, GuestCommitPlan, GuestKeyDecision, GuestKeyDelivery, GuestKeyEvent,
+    GuestKeyOwner, HostActivationState, HostCommitPlan, HostPreeditPlan, KeyGenerationRegistry,
+    KeyboardFocus, KeyboardFocusRegistry, KeyboardFocusUpdate, PeekKeyProvenance,
+    PreeditRegionPlan, SeatFocusChange, TextInputState,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::outputs::OutputState;
@@ -814,6 +814,9 @@ pub struct Context {
     /// A queued `wl_display.error` must be flushed before the client session
     /// is torn down. This is set by fatal protocol validation paths.
     pub fatal_protocol_error: bool,
+    /// Whether a `wl_display.error` has been queued for the guest; see
+    /// [`Self::note_protocol_error`].
+    protocol_error_queued: bool,
     /// Work deferred by the handler of the message being dispatched; see
     /// [`PostDispatch`].
     post_dispatch: Vec<PostDispatch>,
@@ -1000,6 +1003,21 @@ impl Context {
     /// discarded if the message is dropped or rejected.
     pub(crate) fn defer_until_forwarded(&mut self, effect: PostDispatch) {
         self.post_dispatch.push(effect);
+    }
+
+    /// Record that a `wl_display.error` is being queued for the guest, and
+    /// return whether it is the first. libwayland-server posts one error per
+    /// client and ignores later ones (`wl_resource_post_error_vargs`), so
+    /// only the first is sent.
+    pub(crate) fn note_protocol_error(&mut self) -> bool {
+        !std::mem::replace(&mut self.protocol_error_queued, true)
+    }
+
+    /// Forget a fatal error, so a test can go on with the same context.
+    #[cfg(test)]
+    pub(crate) fn clear_protocol_error_for_test(&mut self) {
+        self.fatal_protocol_error = false;
+        self.protocol_error_queued = false;
     }
 
     /// Whether work deferred by a dispatched message has not been taken.
@@ -1374,6 +1392,7 @@ impl Context {
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),
             fatal_protocol_error: false,
+            protocol_error_queued: false,
             post_dispatch: Vec::new(),
             synthetic_keyboard_serial: 0,
             allocator,
@@ -1645,18 +1664,15 @@ mod tests {
     #[tokio::test]
     async fn stop_clipboard_pumps_aborts_and_closes_owned_fds() {
         let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let read_fd = unsafe { libc::fcntl(pipe_fds[0], libc::F_DUPFD_CLOEXEC, 1000) };
-        let write_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1001) };
-        assert!(read_fd >= 1000);
-        assert!(write_fd >= 1001);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-
-        let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
-        let write_owned = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // Both ends of a pipe share its identity, and a parallel test can
+        // reuse either number once the pump closes it.
+        let pipe = crate::test_support::fd_identity(pipe_fds[0]);
+        let read_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
         let pump = tokio::spawn(async move {
             let mut input = tokio::fs::File::from_std(std::fs::File::from(read_owned));
             let mut output = tokio::fs::File::from_std(std::fs::File::from(write_owned));
@@ -1667,8 +1683,7 @@ mod tests {
         ctx.clipboard_pumps.push(pump);
         ctx.stop_clipboard_pumps().await;
 
-        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
-        assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
+        assert!(!crate::test_support::any_fd_has_identity(pipe));
     }
 
     #[test]

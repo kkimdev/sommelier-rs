@@ -78,10 +78,39 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `MessageTooLarge` without panicking; generated forwarding already does.
   A message of only integers, object IDs and descriptors cannot exceed the
   wire limit and uses `build_message`.
-- **Unknown senders are protocol errors.** A guest request from an object
-  the proxy does not know ends the session with a protocol error, with its
-  descriptors closed.
-  Test: `unknown_client_sender_is_a_protocol_error`.
+- **A rejected request is reported.** A guest request the proxy cannot
+  frame, decode or dispatch ends the session, with its descriptors closed,
+  after one `wl_display.error` reaches the guest. The error is always on
+  `wl_display` (object 1), as in libwayland-server's
+  `wl_client_connection_data`:
+  - `invalid_object` when the sender is not a usable object: unknown, or
+    destroyed and awaiting `delete_id`. The sender is checked before the
+    opcode and arguments (`ProtocolError::InvalidSender`).
+  - `invalid_method` for anything else: an invalid length (libwayland
+    rejects one under 8 or over 4096; the alignment check is the proxy's
+    own), an unknown opcode, a request too new for its object, arguments
+    that do not decode, or an object or `new_id` argument that cannot be
+    used (even one that names the sender).
+  - `invalid_method` for trailing bytes after the arguments too. This one
+    is the proxy's own rule: libwayland-server ignores trailing bytes, but
+    the proxy re-encodes requests and must not drop data silently.
+
+  Every session that is closed for a protocol reason gets exactly one
+  error, like a libwayland client (`wl_resource_post_error_vargs`):
+  `queue_protocol_error` queues only the first, so a handler's error is
+  not followed by a decoding one, and a host's forwarded error counts as
+  the one. A session an internal failure ended without an error of its
+  own (a failed dma-buf sync during a commit, say) gets `implementation`
+  on `wl_display` when its batch ends. The requests before the rejected
+  one in the same batch were valid and are forwarded.
+  Tests: `unknown_client_sender_is_a_protocol_error`,
+  `undecodable_request_is_reported_after_forwarding_earlier_requests`,
+  `rejected_requests_report_invalid_method_on_the_display`,
+  `a_destroyed_sender_is_an_invalid_object_whatever_it_sends`,
+  `a_session_gets_exactly_one_error`,
+  `an_internal_failure_ends_the_session_with_an_implementation_error`,
+  `a_host_error_is_the_sessions_only_error`,
+  `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors
 
@@ -122,11 +151,14 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   `delete_id`; it stops being reserved as soon as the proxy destroys the
   object. A guest ID from the server range returns, through
   `ShadowTable::forget_guest_object`, when its guest object ends. Generated
-  dispatchers map a `new_id` only for a message they forward, so a dropped
-  message consumes no ID. Freed IDs are reused first, so the ID spaces stay
-  as dense as the live objects, and each stays within libwayland's map
-  limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`) inclusive, the ID itself
-  on the client side and its offset from `0xff000000` on the server side.
+  dispatchers map a `new_id` only when its message's sender is mapped, so a
+  message dropped for an unmapped sender consumes no ID; one dropped later,
+  for a local-only object in a non-nullable argument, still does (a
+  nullable one is sent as null). Freed IDs are reused first, so the ID
+  spaces stay as dense as the live objects, and each stays within
+  libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
+  inclusive, the ID itself on the client side and its offset from
+  `0xff000000` on the server side.
   A client that exhausts a range ends; allocation runs in its own task, so
   no other client is affected.
   Tests: `host_ids_are_recycled_through_delete_id`,
@@ -368,8 +400,9 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
 - **Every v3 commit counts.** A text-input-v3 `done` serial is the number
   of `commit` requests the guest made on the object, including commits made
   while unfocused or whose state could not be encoded; those are still not
-  forwarded to the host. The count is a `CommitCount`, which only
-  `TextInputState::count_guest_commit` advances.
+  forwarded to the host. The count is a private field of
+  `TextInputState`, so only code in `state/input.rs` can change it, and it
+  does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
 

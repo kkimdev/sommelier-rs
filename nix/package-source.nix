@@ -30,7 +30,6 @@ rustPlatform.buildRustPackage {
     "--package"
     "sommelier"
   ];
-  checkFlags = [ "--test-threads=1" ];
 
   postInstall = ''
     ln -s sommelier "$out/bin/sommelier-rs"
