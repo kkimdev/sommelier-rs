@@ -810,7 +810,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 .iter()
                 .find(|(_, &owner)| owner == surface_id)
             {
-                ctx.reject(
+                return ctx.reject(
                     viewport_id,
                     wp_viewport::ERROR_BAD_SIZE,
                     "fractional wp_viewport source requires a destination",
@@ -842,14 +842,9 @@ impl WlSurfaceHandler for CompositorHandler {
             &commit.state,
             force_full_damage,
         ) else {
-            ctx.fail(format_args!(
+            return ctx.fail(format_args!(
                 "Cannot commit wl_surface {surface_id} without its host object"
             ));
-            if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                commit.rollback(surface);
-            }
-            crate::handler::shm::retire_eligible_buffers(ctx);
-            return Action::Drop;
         };
 
         // A SHM-backed buffer is copied into host storage before the host
@@ -864,11 +859,11 @@ impl WlSurfaceHandler for CompositorHandler {
                     // the file. Like libwayland's SIGBUS guard, report it on
                     // the buffer and end the session.
                     ShmCopyError::Source(_) => {
-                        ctx.reject(
+                        return ctx.reject(
                             buffer_id,
                             wl_shm::ERROR_INVALID_FD,
                             "error accessing SHM buffer",
-                        );
+                        )
                     }
                     ShmCopyError::Destination => log::warn!(
                         "Skipping host wl_surface.commit for {} because its SHM copy failed",
@@ -892,14 +887,9 @@ impl WlSurfaceHandler for CompositorHandler {
                     // wl_surface.commit has no recoverable failure response.
                     // Disconnect rather than silently rolling back a request
                     // the guest reasonably believes was accepted.
-                    ctx.fail(format_args!(
+                    return ctx.fail(format_args!(
                         "Native dma-buf synchronization failed for surface {surface_id}: {error}"
                     ));
-                    if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                        commit.rollback(surface);
-                    }
-                    crate::handler::shm::retire_eligible_buffers(ctx);
-                    return Action::Drop;
                 }
             }
         }
@@ -935,12 +925,7 @@ impl WlSurfaceHandler for CompositorHandler {
                     next_buffer.and_then(|id| ctx.host_buffer_use(id)),
                     snapshot_updated,
                 );
-                ctx.fail(why);
-                if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
-                    commit.rollback(surface);
-                }
-                crate::handler::shm::retire_eligible_buffers(ctx);
-                return Action::Drop;
+                return ctx.fail(why);
             }
         }
 
@@ -1569,11 +1554,6 @@ mod tests {
                 .iter()
                 .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
             "a commit whose synchronization failed must not reach the host"
-        );
-        assert_eq!(
-            ctx.surfaces.get(&surface).unwrap().pending.attachment,
-            SurfaceAttachment::Attach(buffer),
-            "fatal teardown still rolls back the prepared surface transaction"
         );
     }
 
@@ -3181,21 +3161,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_host_surface_rolls_back_the_complete_commit() {
+    fn missing_host_surface_ends_the_session_without_a_commit() {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
         assert_eq!(handler.on_damage(&mut ctx, 1, 2, 3, 4), Action::Drop);
         assert_eq!(handler.on_offset(&mut ctx, 5, 6), Action::Forward);
-        let pending = ctx.surfaces.get(&surface_id).unwrap().clone();
         ctx.shadow_table.release_deleted_host_id(200);
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
     }
 
     #[test]
@@ -3213,13 +3191,11 @@ mod tests {
             handler.on_attach(&mut ctx, buffer_id, 0, 0),
             Action::Forward
         );
-        let pending = ctx.surfaces.get(&surface_id).unwrap().clone();
 
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
         assert!(ctx.is_fatal());
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.surfaces.get(&surface_id), Some(&pending));
         assert_eq!(
             ctx.render_buffer_lifecycle_for_host(host_id),
             Some(RenderBufferLifecycle::HostDestroyQueued)
