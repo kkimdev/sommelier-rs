@@ -1727,6 +1727,37 @@ mod tests {
         );
     }
 
+    /// What earlier messages of the batch send back toward the guest still
+    /// reaches it, ahead of the error: a local `wl_shm_pool.destroy` gets
+    /// its delete_id although the next request is malformed.
+    #[tokio::test]
+    async fn earlier_reverse_output_reaches_the_guest_before_the_error() {
+        use protocols::wayland::{wl_display, wl_shm_pool};
+        const POOL: u32 = 21;
+        let (mut client, mut guest_peer, _host_peer) = client_with_socket_peers();
+        client.ctx.shadow_table.create_local(POOL, "wl_shm_pool", 1);
+        let destroy = MessageBuilder::new().build_message(POOL, wl_shm_pool::REQ_DESTROY);
+        let malformed = MessageBuilder::new().build_message(crate::wire::WL_DISPLAY_ID, 99);
+        client.client_conn.read_buf.extend(destroy);
+        client.client_conn.read_buf.extend(malformed);
+
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
+        drop(client);
+        let mut events = Vec::new();
+        std::io::Read::read_to_end(&mut guest_peer, &mut events).expect("read the guest's events");
+        assert_eq!(
+            stream_headers(&events),
+            [
+                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_DELETE_ID),
+                (crate::wire::WL_DISPLAY_ID, wl_display::EVT_ERROR),
+            ]
+        );
+        assert_eq!(
+            display_errors_in(&events),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_INVALID_METHOD)]
+        );
+    }
+
     /// A handler that ends the session sends nothing, not even the message
     /// it returns to be forwarded: a `created` whose buffer the proxy cannot
     /// track must not hand the guest a buffer.
