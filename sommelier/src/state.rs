@@ -1645,18 +1645,15 @@ mod tests {
     #[tokio::test]
     async fn stop_clipboard_pumps_aborts_and_closes_owned_fds() {
         let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let read_fd = unsafe { libc::fcntl(pipe_fds[0], libc::F_DUPFD_CLOEXEC, 1000) };
-        let write_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1001) };
-        assert!(read_fd >= 1000);
-        assert!(write_fd >= 1001);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
-
-        let read_owned = unsafe { OwnedFd::from_raw_fd(read_fd) };
-        let write_owned = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // Both ends of a pipe share its identity, and a parallel test can
+        // reuse either number once the pump closes it.
+        let pipe = crate::test_support::fd_identity(pipe_fds[0]);
+        let read_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_owned = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
         let pump = tokio::spawn(async move {
             let mut input = tokio::fs::File::from_std(std::fs::File::from(read_owned));
             let mut output = tokio::fs::File::from_std(std::fs::File::from(write_owned));
@@ -1667,8 +1664,7 @@ mod tests {
         ctx.clipboard_pumps.push(pump);
         ctx.stop_clipboard_pumps().await;
 
-        assert_eq!(unsafe { libc::fcntl(read_fd, libc::F_GETFD) }, -1);
-        assert_eq!(unsafe { libc::fcntl(write_fd, libc::F_GETFD) }, -1);
+        assert!(!crate::test_support::any_fd_has_identity(pipe));
     }
 
     #[test]
