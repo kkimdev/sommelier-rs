@@ -23,9 +23,10 @@ use crate::protocols::wayland::{wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
 use crate::wire::{queue_or_drop, Action, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
+use nix::sys::memfd::MFdFlags;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// `DRM_FORMAT_MOD_INVALID` is the legacy implicit-modifier marker used by
 /// the linux-dmabuf v3 format events. Keep this local instead of depending on
@@ -193,18 +194,10 @@ fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u3
         .len()
         .checked_mul(16)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "format table overflow"))?;
-    let name = b"sommelier-dmabuf\0";
-    let fd = unsafe {
-        libc::memfd_create(
-            name.as_ptr().cast::<libc::c_char>(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut file = File::from(nix::sys::memfd::memfd_create(
+        c"sommelier-dmabuf",
+        MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
+    )?);
     file.set_len(size as u64)?;
 
     let mut table = Vec::with_capacity(size);
