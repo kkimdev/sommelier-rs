@@ -328,10 +328,18 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`.
 - **Releasing a parent does not end its children.** `wl_seat.release`
   forwards the seat's destructor without tearing down keyboards, key
-  routing or IME state that child devices still own.
+  routing or IME state that child devices still own. A keyboard or text
+  input stays a member of the seat it was created from after the seat
+  ends, through its release or a host `delete_id`, and a `wl_seat` the
+  guest later binds under the same ID takes it over (Exo has one seat).
+  Until then the guest may reuse the ID for any object, so a text input
+  sends it to the host as its seat only while it names a live `wl_seat`.
   Tests: `seat_release_does_not_break_live_child_keyboard_press_release_pair`,
   `release_keeps_child_keyboard_routing_state`,
-  `release_does_not_end_child_text_input_focus`.
+  `release_does_not_end_child_text_input_focus`,
+  `an_activation_deferred_for_an_unmapped_seat_sends_the_content_type`,
+  `a_seat_id_reused_for_another_object_is_not_sent_as_a_seat`,
+  `a_released_seat_whose_id_becomes_a_surface_carries_no_deactivate`.
 
 ## Registry globals
 

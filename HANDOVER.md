@@ -43,9 +43,10 @@
 - A text input whose guest `wl_seat` goes away while it is active ends its
   host generation without a `deactivate`, since none can name a live
   seat. Exo keeps its input method attached until its own focus moves,
-  and if the guest later reuses the seat ID on that surface, Exo's
-  `activate` does nothing and the stale attachment stays. Any live host
-  seat would do for the `deactivate`; this was never seen on a host.
+  and if the guest later binds a new seat under the seat ID on that
+  surface, Exo's `activate` does nothing and the stale attachment stays.
+  Any live host seat would do for the `deactivate`; this was never seen
+  on a host.
 - Clipboard pumps rely on a VirtWL pipe supporting `poll` and returning
   `EAGAIN` under `O_NONBLOCK`. The ChromiumOS `virtio_wl.c` does both, but
   no transfer has been checked on a device since the pumps stopped

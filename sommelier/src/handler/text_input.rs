@@ -26,7 +26,7 @@ use crate::protocols::wayland::wl_keyboard;
 use crate::state::GuestKeyOwner;
 use crate::state::{
     reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
-    HostContentType, HostId, HostTarget, InternalCallback, SeatFocusChange, TextInputState,
+    HostContentType, HostId, HostTarget, InternalCallback, Link, SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, Outgoing};
 
@@ -1428,20 +1428,33 @@ fn host_target(ctx: &Context, state: &TextInputState) -> HostTarget {
         .active_surface
         .and_then(|surface| ctx.shadow_table.get_host_id(surface))
         .is_some();
-    // A guest wl_seat can be pending destruction while its text inputs
-    // live on: its host ID stays reserved for delete_id, but it is no
-    // longer an object an activate or deactivate may carry, and neither is
-    // a seat with no host object (ID 0 is a protocol error).
-    let seat_live = ctx.shadow_table.get_host_id(state.guest_seat).is_some()
-        && !ctx.shadow_table.is_pending_destroy_guest(state.guest_seat);
     HostTarget {
         active: state.committed.enabled && surface_known,
-        seat_live,
+        seat_live: live_host_seat(ctx, state).is_some(),
         content_type: HostContentType {
             content_type: state.committed.content_type,
             surrounding_text_support: host_takes_surrounding_text_support(ctx, state.host_ext_id)
                 .then_some(state.committed.surrounding_text.is_some()),
         },
+    }
+}
+
+/// The host seat that can carry the text input `state`'s `activate` or
+/// `deactivate`: the host object of its guest seat, while that ID names a
+/// live `wl_seat`.
+///
+/// A seat can end while its text inputs live on, and the guest may then
+/// reuse its ID for any object, which the host would reject as a seat. A
+/// seat awaiting its `delete_id` carries nothing either, and neither does
+/// an ID with no host object (ID 0 is a protocol error).
+fn live_host_seat(ctx: &Context, state: &TextInputState) -> Option<u32> {
+    let seat = ctx
+        .shadow_table
+        .request_object(state.guest_seat, "wl_seat")?;
+    match seat {
+        Link::Host(host_seat) => Some(host_seat),
+        // The proxy implements no wl_seat itself.
+        Link::Local => None,
     }
 }
 
@@ -1474,7 +1487,7 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     let steps = reconcile(&target, &state.host);
     let host_ids = (state.host_v1_id, state.host_ext_id);
     let serial = state.guest_commit_serial();
-    let host_seat = ctx.shadow_table.get_host_id(state.guest_seat);
+    let host_seat = live_host_seat(ctx, state);
     let host_surface = state
         .active_surface
         .and_then(|surface| ctx.shadow_table.get_host_id(surface));
@@ -4359,6 +4372,66 @@ mod tests {
         assert_eq!(msg_sender(&ctx.client_to_host_queue, 0), 30);
         assert_eq!(msg_opcode(&ctx.client_to_host_queue, 0), 0);
         assert_eq!(ctx.host_to_client_queue.len(), 1);
+    }
+
+    #[test]
+    fn a_seat_id_reused_for_another_object_is_not_sent_as_a_seat() {
+        use zwp_text_input_v1::{REQ_ACTIVATE, REQ_DEACTIVATE};
+        // The active text input's seat ended, and the guest reused its ID
+        // for a surface, which the host would reject as a seat.
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        ctx.shadow_table.insert_paired_for_test(7, 70, "wl_surface");
+        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = 7;
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+
+        // Neither disabling the field nor enabling it again sends the ID.
+        v3.on_disable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        v3.on_enable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        let requests = take_requests(&mut ctx);
+        assert!(
+            !requests.iter().any(|&(sender, opcode)| {
+                sender == host_v1_id && matches!(opcode, REQ_ACTIVATE | REQ_DEACTIVATE)
+            }),
+            "{requests:?}"
+        );
+        assert!(!ctx.text_inputs[&guest_id].host_is_active());
+    }
+
+    #[test]
+    fn a_released_seat_whose_id_becomes_a_surface_carries_no_deactivate() {
+        use crate::handler::display::DisplayHandler;
+        use crate::protocols::wayland::wl_display::WlDisplayHandler;
+        use crate::protocols::wayland::wl_seat;
+        // The guest releases the active text input's seat, the host deletes
+        // it, and the guest reuses its ID for a surface before disabling.
+        let (mut ctx, host_v1_id, guest_id) = setup_v1_ctx();
+        let (guest_seat, host_seat) = (7, 70);
+        ctx.shadow_table
+            .insert_paired_with_version_for_test(guest_seat, host_seat, "wl_seat", 5);
+        ctx.text_inputs.get_mut(&guest_id).unwrap().guest_seat = guest_seat;
+        ctx.last_sender_id = guest_seat;
+        let mut release = WireMessage::new(guest_seat, wl_seat::REQ_RELEASE, &[]);
+        wl_seat::dispatch_request(&mut release, &mut SeatHandler, &mut ctx)
+            .expect("wl_seat.release decodes");
+        DisplayHandler.on_delete_id(&mut ctx, host_seat);
+        ctx.shadow_table
+            .insert_paired_for_test(guest_seat, 71, "wl_surface");
+        take_requests(&mut ctx);
+
+        ctx.last_sender_id = guest_id;
+        let mut v3 = TextInputV3Handler;
+        v3.on_disable(&mut ctx);
+        v3.on_commit(&mut ctx);
+        let requests = take_requests(&mut ctx);
+        assert!(
+            !requests.iter().any(|&(sender, opcode)| sender == host_v1_id
+                && opcode == zwp_text_input_v1::REQ_DEACTIVATE),
+            "{requests:?}"
+        );
+        assert!(!ctx.text_inputs[&guest_id].host_is_active());
     }
 
     #[test]

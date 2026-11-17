@@ -213,10 +213,10 @@ pub enum ActivationStep {
     /// No live seat can carry a `deactivate`: the generation ends locally.
     /// Exo keeps the input method attached until its own focus moves or the
     /// surface goes, and its `leave` then usually arrives while inactive and
-    /// is ignored. If the guest first reuses the seat ID and the text input
-    /// activates again, Exo's `activate` does nothing on the surface it
-    /// still has; on another surface it detaches first, and that `leave`
-    /// arrives while active: the proxy ends the new generation and
+    /// is ignored. If the guest first binds a new seat under the seat ID and
+    /// the text input activates again, Exo's `activate` does nothing on the
+    /// surface it still has; on another surface it detaches first, and that
+    /// `leave` arrives while active: the proxy ends the new generation and
     /// activates once more, which Exo ignores for the surface it now has.
     /// That costs one redundant `activate` and content type.
     Abandon,
