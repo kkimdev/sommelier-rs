@@ -1378,7 +1378,10 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
                     ended.push(sender);
                 }
             }
-            if (interface.as_str(), opcode) == ("wl_fixes", wl_fixes::REQ_DESTROY_REGISTRY) {
+            // A registry the compositor destroyed already got its delete_id.
+            if (interface.as_str(), opcode) == ("wl_fixes", wl_fixes::REQ_DESTROY_REGISTRY)
+                && !zombies.contains_key(&named[0])
+            {
                 ended.push(named[0]);
             }
             if (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC) {
@@ -1428,7 +1431,8 @@ fn compositor(host: UnixStream, protocols: &Protocols, host_destroys: Option<&st
 /// ([`guest_interface`]) and keeps per-object state for it. Only a
 /// `zwp_text_input_v1` can be an object only the proxy uses, once the guest
 /// has destroyed its v3 text input; its `delete_id` then changes nothing.
-const HOST_DESTROYED: [&str; 7] = [
+const HOST_DESTROYED: [&str; 8] = [
+    "wl_registry",
     "wl_output",
     "wl_keyboard",
     "wl_surface",
