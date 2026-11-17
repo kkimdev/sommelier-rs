@@ -1077,21 +1077,6 @@ fn queue_buffer_creation_error(ctx: &mut Context, object_id: u32, message: &'sta
     ctx.reject(object_id, wl_shm::ERROR_INVALID_FD, message);
 }
 
-/// Undo the guest mapping after a host `wl_buffer` has already been queued.
-///
-/// The host stream is ordered, so queueing `wl_buffer.destroy` after the
-/// create requests retires the host object even though no local
-/// `BufferState` was registered.  Keep the host numeric ID reserved until its
-/// `delete_id` acknowledgement; otherwise a subsequent allocation could route
-/// a late release to an unrelated object.
-fn rollback_registered_buffer(ctx: &mut Context, guest_id: u32, host_id: u32) {
-    if ctx.shadow_table.get_host_id(guest_id) != Some(host_id) {
-        return;
-    }
-    queue_host_buffer_destroy(ctx, host_id);
-    ctx.shadow_table.guest_ended_host_destroyed(guest_id);
-}
-
 fn queue_host_params_destroy(ctx: &mut Context, params_id: u32) {
     ctx.client_to_host_queue
         .push(zwp_linux_buffer_params_v1::req::destroy(params_id));
@@ -1752,8 +1737,7 @@ fn create_dmabuf_buffer(
 }
 
 /// Register the storage of the guest `wl_buffer` paired with host buffer
-/// `host_buffer_id`. A duplicate host generation rolls the buffer back and
-/// reports `failure`.
+/// `host_buffer_id`. A duplicate host generation reports `failure`.
 fn register_shm_buffer(
     ctx: &mut Context,
     request: &ShmBufferRequest,
@@ -1763,7 +1747,6 @@ fn register_shm_buffer(
 ) {
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
         error!("Duplicate render buffer host ID {}", host_buffer_id);
-        rollback_registered_buffer(ctx, request.id, host_buffer_id);
         queue_buffer_creation_error(ctx, request.pool_id, failure);
     }
 }
@@ -1997,9 +1980,8 @@ mod tests {
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, coalesce_damage_rects,
         copy_shm_damage, guest_shm_format_available, record_host_shm_drm_format,
         record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
-        regular_file_has_size, retire_eligible_buffers, rollback_registered_buffer,
-        same_dma_buf_object, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, ShmCopyError,
+        regular_file_has_size, retire_eligible_buffers, same_dma_buf_object, valid_buffer_layout,
+        valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout, ShmCopyError,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
@@ -2844,29 +2826,6 @@ mod tests {
         assert!(ctx.shadow_table.is_guest_id_available(buffer_id));
         assert_eq!(ctx.render_buffer_count(), 0);
         assert!(ctx.client_to_host_queue.is_empty());
-    }
-
-    #[test]
-    fn failed_registration_retires_host_buffer_without_guest_mapping() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_id = 30;
-        let host_id = 40;
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-
-        rollback_registered_buffer(&mut ctx, guest_id, host_id);
-
-        assert_eq!(ctx.shadow_table.get_host_id(guest_id), None);
-        assert_eq!(ctx.shadow_table.get_interface(guest_id), None);
-        assert!(ctx.shadow_table.is_guest_id_available(guest_id));
-        assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
-        assert!(ctx.shadow_table.is_retired_host(host_id));
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(
-            crate::test_support::msg_opcode(&ctx.client_to_host_queue[0].0),
-            0,
-            "rollback must queue wl_buffer.destroy"
-        );
     }
 
     #[test]
