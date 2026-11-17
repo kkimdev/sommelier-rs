@@ -447,31 +447,24 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
                                     // A child object takes its parent's
-                                    // version on each side.
+                                    // version on each side. No local is
+                                    // bound, so none can shadow a later
+                                    // argument.
                                     mapping_and_writing.push(quote! {
-                                        let version = ctx
-                                            .shadow_table
-                                            .guest_object_version_or_unknown(msg.sender_id);
-                                        let host_version = ctx
-                                            .shadow_table
-                                            .host_object_version_or_unknown(host_sender_id);
-                                        let host_id = ctx.shadow_table.create_paired(
+                                        builder.write_u32(ctx.shadow_table.create_paired(
                                             #name,
                                             #interface_name,
-                                            version,
-                                            host_version,
-                                        );
-                                        builder.write_u32(host_id);
+                                            ctx.shadow_table.guest_object_version_or_unknown(msg.sender_id),
+                                            ctx.shadow_table.host_object_version_or_unknown(host_sender_id),
+                                        ));
                                     });
                                 } else {
                                     mapping_and_writing.push(quote! {
-                                        let (ref interface_name, version, id) = #name;
-                                        builder.write_string(interface_name);
-                                        builder.write_u32(version);
-                                        let host_id = ctx
-                                            .shadow_table
-                                            .create_paired(id, interface_name, version, version);
-                                        builder.write_u32(host_id);
+                                        builder.write_string(&#name.0);
+                                        builder.write_u32(#name.1);
+                                        builder.write_u32(
+                                            ctx.shadow_table.create_paired(#name.2, &#name.0, #name.1, #name.1),
+                                        );
                                     });
                                 }
                             }
@@ -617,17 +610,14 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
                                     // A child object takes its parent's
-                                    // version.
+                                    // version, bound to no local that could
+                                    // shadow a later argument.
                                     mapping_and_writing.push(quote! {
-                                        let version = ctx
-                                            .shadow_table
-                                            .host_object_version_or_unknown(msg.sender_id);
-                                        let guest_id = ctx.shadow_table.adopt_host_created(
+                                        builder.write_u32(ctx.shadow_table.adopt_host_created(
                                             #name,
                                             #interface_name,
-                                            version,
-                                        );
-                                        builder.write_u32(guest_id);
+                                            ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
+                                        ));
                                     });
                                 } else {
                                     mapping_and_writing.push(quote! {

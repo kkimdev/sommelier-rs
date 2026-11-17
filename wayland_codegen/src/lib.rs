@@ -75,7 +75,7 @@ mod tests {
         assert!(code.contains("pub enum Request"));
         assert!(code.contains("fn from_wire"));
         assert!(
-            compact.contains("adopt_host_created(id,\"wl_data_offer\",version"),
+            compact.contains("adopt_host_created(id,\"wl_data_offer\","),
             "host-generated new_id events must get a guest object"
         );
         assert!(
