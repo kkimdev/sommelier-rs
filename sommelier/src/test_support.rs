@@ -130,12 +130,18 @@ pub fn fd_identity(fd: RawFd) -> TestFdIdentity {
 
 /// Returns whether any descriptor in this process refers to `identity`.
 pub fn any_fd_has_identity(identity: TestFdIdentity) -> bool {
+    fds_with_identity(identity) > 0
+}
+
+/// Returns how many descriptors in this process refer to `identity`.
+pub fn fds_with_identity(identity: TestFdIdentity) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .expect("read process descriptor directory")
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<RawFd>().ok())
         .filter_map(try_fd_identity)
-        .any(|current| current == identity)
+        .filter(|&current| current == identity)
+        .count()
 }
 
 /// A memfd holding `bytes`, as a guest client creates a `wl_shm` pool file.

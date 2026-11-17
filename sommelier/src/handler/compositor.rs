@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::Allocator;
+use crate::allocator::{Allocator, DmabufFence};
 use crate::handler::aura_objects;
 use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
@@ -27,14 +27,14 @@ use crate::protocols::wayland::wl_subsurface::WlSubsurfaceHandler;
 use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_SINCE};
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
-    is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, PostDispatch,
-    ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect, SurfaceState,
-    ViewportState,
+    is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, FenceWait,
+    PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
+    SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
 use log::trace;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
 
 pub struct CompositorHandler;
@@ -105,27 +105,34 @@ impl Drop for DmabufWriteSync<'_> {
     }
 }
 
-fn wait_for_native_buffer(ctx: &mut Context, guest_buffer_id: u32) -> std::io::Result<()> {
+/// The fence a commit of native buffer `guest_buffer_id` waits for while
+/// the guest GPU still writes the buffer, checked without waiting.
+fn pending_native_fence(
+    ctx: &mut Context,
+    guest_buffer_id: u32,
+) -> std::io::Result<Option<FenceWait>> {
     if ctx.native_buffer_uses_implicit_sync(guest_buffer_id) {
-        return Ok(());
+        return Ok(None);
     }
-
-    let needs_implicit_sync = {
-        let Some(sync_fds) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
-            return Ok(());
-        };
-        let mut needs_implicit_sync = false;
-        for sync_fd in sync_fds {
-            match crate::allocator::wait_for_dmabuf(sync_fd.as_raw_fd(), ctx.allocator.as_ref())? {
-                crate::allocator::DmabufWaitResult::Synchronized => {}
-                crate::allocator::DmabufWaitResult::ImplicitSyncFallback => {
-                    needs_implicit_sync = true;
-                    break;
-                }
+    let Some(planes) = ctx.native_buffer_sync_fds(guest_buffer_id) else {
+        return Ok(None);
+    };
+    // A buffer has at most four planes.
+    let plane_count = planes.len() as u32;
+    let mut needs_implicit_sync = false;
+    for plane in planes {
+        match plane_fence(ctx, plane.as_fd())? {
+            DmabufFence::Signalled => {}
+            DmabufFence::Pending(fence) => {
+                let timeout = fence.timeout() * plane_count;
+                return Ok(Some(FenceWait { fence, timeout }));
+            }
+            DmabufFence::ImplicitSyncFallback => {
+                needs_implicit_sync = true;
+                break;
             }
         }
-        needs_implicit_sync
-    };
+    }
 
     if needs_implicit_sync {
         if !ctx.enable_native_buffer_implicit_sync(guest_buffer_id) {
@@ -138,7 +145,25 @@ fn wait_for_native_buffer(ctx: &mut Context, guest_buffer_id: u32) -> std::io::R
             guest_buffer_id
         );
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Whether the guest GPU has finished writing one plane of a native buffer.
+fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFence> {
+    #[cfg(test)]
+    if let Some(stand_in) = ctx.plane_fences_for_test {
+        use crate::allocator::PendingFence;
+        use crate::state::PlaneFenceForTest;
+        return Ok(
+            match crate::allocator::sync_file_fence(plane.try_clone_to_owned()?)? {
+                DmabufFence::Pending(_) if matches!(stand_in, PlaneFenceForTest::Busy) => {
+                    DmabufFence::Pending(PendingFence::Busy)
+                }
+                fence => fence,
+            },
+        );
+    }
+    crate::allocator::dmabuf_fence(plane, ctx.allocator.as_ref())
 }
 
 impl WlCompositorHandler for CompositorHandler {}
@@ -601,6 +626,33 @@ impl WlSurfaceHandler for CompositorHandler {
     fn on_commit(&mut self, ctx: &mut Context) -> Action {
         let surface_id = ctx.last_sender_id;
 
+        // A native dma-buf's fence belongs to the contents an attach
+        // submits, so an attach(NULL) or damage-only commit waits for
+        // nothing, as in ChromiumOS Sommelier, whose sync point is set at
+        // attach. The wait comes before the commit changes anything.
+        let attached = ctx
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.pending.attachment.buffer_id());
+        if let Some(buffer_id) = attached {
+            // Wait for guest GPU writes before the host compositor samples
+            // the buffer, matching ChromiumOS Sommelier's sync_point path,
+            // but without stalling the event loop: the commit is
+            // dispatched again once its fence may have signalled.
+            match pending_native_fence(ctx, buffer_id) {
+                Ok(None) => {}
+                Ok(Some(wait)) => return ctx.wait_for_fence(wait),
+                // wl_surface.commit has no recoverable failure response.
+                // Disconnect rather than silently dropping a request the
+                // guest reasonably believes was accepted.
+                Err(error) => {
+                    return ctx.fail(format_args!(
+                        "Native dma-buf synchronization failed for surface {surface_id}: {error}"
+                    ))
+                }
+            }
+        }
+
         let mut default_surface = SurfaceState::default();
         let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
             || default_surface.prepare_commit(),
@@ -608,13 +660,6 @@ impl WlSurfaceHandler for CompositorHandler {
         );
         let attached_buffer_id = commit.attached_buffer_id();
         let copied_buffer_id = buffer_to_copy(ctx, &commit);
-        // A native dma-buf acquire fence belongs to the new contents submitted
-        // by an attach.  Re-running the dma-buf wait for a damage-only commit
-        // blocks this single-threaded proxy even though the host compositor
-        // is already using the same buffer.  ChromiumOS Sommelier waits at
-        // attach time as well; keep explicit attach(NULL) and damage-only
-        // commits non-blocking.
-        let wait_for_native_sync = attached_buffer_id.is_some();
 
         let mapping = commit.state.mapping(shown_buffer_size(ctx, &commit.state));
         // wp_viewport.bad_size and out_of_buffer are deliberately not raised:
@@ -682,22 +727,6 @@ impl WlSurfaceHandler for CompositorHandler {
                 }
                 crate::handler::shm::retire_eligible_buffers(ctx);
                 return Action::Drop;
-            }
-        }
-
-        if wait_for_native_sync {
-            if let Some(buffer_id) = attached_buffer_id {
-                // Native linux-dmabuf buffers bypass the local SHM copy path.
-                // Wait for guest GPU writes before the host compositor samples
-                // the buffer, matching ChromiumOS Sommelier's sync_point path.
-                if let Err(error) = wait_for_native_buffer(ctx, buffer_id) {
-                    // wl_surface.commit has no recoverable failure response.
-                    // Disconnect rather than silently rolling back a request
-                    // the guest reasonably believes was accepted.
-                    return ctx.fail(format_args!(
-                        "Native dma-buf synchronization failed for surface {surface_id}: {error}"
-                    ));
-                }
             }
         }
 
@@ -1356,7 +1385,7 @@ mod tests {
         let surface = 100;
         let buffer = 50;
         let sync_fd = invalid_ioctl_fd();
-        let error = crate::allocator::wait_for_dmabuf(sync_fd.as_raw_fd(), None).unwrap_err();
+        let error = crate::allocator::dmabuf_fence(sync_fd.as_fd(), None).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
         register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![sync_fd]);
 
@@ -1372,6 +1401,41 @@ mod tests {
                 .iter()
                 .all(|(message, _)| msg_opcode(message) != REQ_COMMIT),
             "a commit whose synchronization failed must not reach the host"
+        );
+    }
+
+    /// A commit of a buffer the guest GPU still writes waits before it
+    /// changes anything, and goes through once the fence signals.
+    #[test]
+    fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        ctx.plane_fences_for_test = Some(crate::state::PlaneFenceForTest::SyncFile);
+        let buffer = 50;
+        let (fence, signal) = nix::unistd::pipe().unwrap();
+        register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![fence]);
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_attach(&mut ctx, buffer, 0, 0), Action::Forward);
+        let before = ctx.surfaces[&TEST_SURFACE].clone();
+
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        let effects = ctx.take_effects();
+        assert!(effects.end.is_none());
+        assert!(effects.to_host.is_empty() && effects.to_guest.is_empty());
+        let wait = effects.wait.expect("the commit waits for its fence");
+        assert_eq!(wait.timeout, crate::allocator::SYNC_FILE_TIMEOUT);
+        assert_eq!(
+            ctx.surfaces[&TEST_SURFACE], before,
+            "a commit that waits changes nothing, so it can be dispatched again"
+        );
+
+        assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        let effects = ctx.take_effects();
+        assert!(effects.end.is_none() && effects.wait.is_none());
+        assert_eq!(
+            queued_headers(&effects.to_host).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
         );
     }
 

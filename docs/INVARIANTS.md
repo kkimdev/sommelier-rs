@@ -544,9 +544,28 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `virtgpu_resource_info_probe_and_extended_abi_sizes_remain_distinct`,
   `extended_resource_info_probe_requires_virtgpu_feature_query`.
 - **Native buffers are fenced.** A commit of a guest dma-buf is forwarded
-  only after the guest GPU's writes have completed; a failed wait is fatal
-  and never commits.
-  Test: `unexpected_native_sync_failure_is_fatal_and_never_commits`.
+  only after the guest GPU's writes have completed; a failed check is
+  fatal and never commits. The check never waits: a busy buffer parks
+  the commit before it changes anything, and the proxy dispatches it
+  again once the fence may have signalled (see
+  [Message effects](DESIGN.md#message-effects)). Nothing from the guest
+  is dispatched before the parked commit, so the host sees the order the
+  guest sent, while host events and other clients go on. Each mechanism
+  keeps the bound of its old blocking wait, per plane and counted from
+  the first time the commit waits: a second for a sync_file, as
+  ChromiumOS Sommelier bounds its wait, and 15 s for the virtio-gpu
+  fallback, the kernel's bound for a blocking `DRM_IOCTL_VIRTGPU_WAIT`.
+  Then the session ends with one `implementation` error.
+  Tests: `unexpected_native_sync_failure_is_fatal_and_never_commits`,
+  `a_commit_waits_for_a_pending_fence_before_it_changes_anything`,
+  `a_pending_fence_parks_the_guest_stream_while_host_events_flow`,
+  `a_parked_commit_is_forwarded_once_when_its_fence_signals`,
+  `run_forwards_a_parked_commit_once_its_sync_file_signals`,
+  `host_traffic_does_not_postpone_polling_a_busy_fence`,
+  `a_fence_that_never_signals_ends_the_session_at_its_deadline`,
+  `a_fallback_fence_that_never_signals_ends_the_session_at_its_deadline`,
+  `a_slow_fallback_fence_outlasts_the_sync_file_bound`,
+  `a_fence_without_a_descriptor_is_polled_less_often_as_it_waits`.
 
 ## Keyboard and IME
 
@@ -676,10 +695,10 @@ end it.
 
   `sommelier/clippy.toml` rejects the blocking calls Clippy can name, but
   it cannot tell a blocking `read` or `ioctl` from a non-blocking one, and
-  its lint also guards descriptors, so an allow for either lifts both. The
-  one exception left is the dma-buf fence wait
-  ([native buffers are fenced](#dma-buf)), which blocks a commit until the
-  guest GPU is done; its scoped allow names the follow-up that removes it.
+  its lint also guards descriptors, so an allow for either lifts both.
+  The dma-buf fence check polls with a zero timeout and asks virtio-gpu
+  with `VIRTGPU_WAIT_NOWAIT`, so a commit the guest GPU is still writing
+  waits off the loop ([native buffers are fenced](#dma-buf)).
   Tests: `stop_clipboard_pumps_aborts_and_closes_owned_fds`,
   `clipboard_pumps_are_capped_per_connection`,
   `a_transfer_the_host_stalls_ends_after_the_idle_timeout`,

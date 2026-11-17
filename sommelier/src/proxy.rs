@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::allocator::PendingFence;
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
@@ -21,8 +22,14 @@ use crate::state::{Context, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 use std::io;
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::Instant;
 
 #[cfg(test)]
 mod fuzz;
@@ -48,6 +55,17 @@ const MAX_MESSAGES_PER_BATCH: usize = 32;
 /// shares. Descriptors come back as clients close, which takes far longer
 /// than this pause, while a new client waits at most this long.
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How soon a parked request whose fence gives no descriptor to wait on
+/// (the virtio-gpu fallback) is first dispatched again to ask once more.
+/// Each later ask waits twice as long, up to [`MAX_FENCE_POLL_INTERVAL`]:
+/// an ask costs a dma-buf import, a wait and a GEM close, and the fence may
+/// take seconds.
+const FENCE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// The longest pause between two asks about a fallback fence: about a
+/// frame, so a fence that signals late delays its commit by at most that.
+const MAX_FENCE_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -142,6 +160,94 @@ impl SommelierHandler {
     }
 }
 
+/// A guest request that waits for a fence ([`Context::wait_for_fence`]).
+/// It stays first in the guest stream's buffer, and the guest stream is
+/// neither read nor dispatched until the request is dispatched again.
+struct ParkedRequest {
+    fence: ParkedFence,
+    /// When the session ends if the fence has not signalled. Dispatching
+    /// the request again keeps it.
+    deadline: Instant,
+    /// How long after parking a polled fence is asked about again.
+    poll_interval: Duration,
+}
+
+/// What a parked request waits on.
+enum ParkedFence {
+    /// A sync_file, readable once the fence signals.
+    Readable(AsyncFd<OwnedFd>),
+    /// Nothing: the request is dispatched again at this instant to ask.
+    /// It is absolute, so host traffic that wakes the loop before then
+    /// does not postpone it.
+    PollAt(Instant),
+}
+
+/// Whether a sync_file has failed to register with the event loop yet.
+/// Only the first failure warns, so a kernel that refuses every one does
+/// not flood the log.
+static FENCE_REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
+
+impl ParkedRequest {
+    /// Park a request that waits for the first time.
+    fn new(fence: PendingFence, deadline: Instant) -> Self {
+        Self::with(fence, deadline, FENCE_POLL_INTERVAL)
+    }
+
+    /// Park the request this one parked again, as it still waits: it keeps
+    /// its deadline, and a polled fence is asked about less often.
+    fn wait_again(self, fence: PendingFence) -> Self {
+        let poll_interval = (self.poll_interval * 2).min(MAX_FENCE_POLL_INTERVAL);
+        Self::with(fence, self.deadline, poll_interval)
+    }
+
+    fn with(fence: PendingFence, deadline: Instant, poll_interval: Duration) -> Self {
+        let poll_at = || ParkedFence::PollAt(Instant::now() + poll_interval);
+        let fence = match fence {
+            PendingFence::SyncFile(sync_file) => {
+                match AsyncFd::with_interest(sync_file, Interest::READABLE) {
+                    Ok(sync_file) => ParkedFence::Readable(sync_file),
+                    Err(error) => {
+                        if FENCE_REGISTRATION_FAILED.swap(true, Ordering::Relaxed) {
+                            log::debug!("Polling a dma-buf fence that cannot be awaited: {error}");
+                        } else {
+                            log::warn!("Polling a dma-buf fence that cannot be awaited: {error}");
+                        }
+                        poll_at()
+                    }
+                }
+            }
+            PendingFence::Busy => poll_at(),
+        };
+        Self {
+            fence,
+            deadline,
+            poll_interval,
+        }
+    }
+
+    /// Resolve when `parked` is due to be dispatched again: its fence may
+    /// have signalled, or its deadline has passed. Never resolves for none.
+    async fn due(parked: Option<&Self>) {
+        let Some(parked) = parked else {
+            return std::future::pending().await;
+        };
+        let fence = async {
+            match &parked.fence {
+                // An error, like readiness, sends the request back to its
+                // fence check, which tells them apart.
+                ParkedFence::Readable(fence) => {
+                    let _ = fence.readable().await;
+                }
+                ParkedFence::PollAt(at) => tokio::time::sleep_until(*at).await,
+            }
+        };
+        tokio::select! {
+            () = fence => {}
+            () = tokio::time::sleep_until(parked.deadline) => {}
+        }
+    }
+}
+
 struct Client {
     client_conn: WaylandConnection,
     host_conn: WaylandConnection,
@@ -155,6 +261,8 @@ struct Client {
     /// state behind an ended object (`Context::assert_no_orphans`).
     #[cfg(test)]
     check_orphans: bool,
+    /// The guest request waiting for a fence, if one is.
+    parked: Option<ParkedRequest>,
 }
 
 impl Client {
@@ -168,6 +276,7 @@ impl Client {
             ended: false,
             #[cfg(test)]
             check_orphans: false,
+            parked: None,
         }
     }
 
@@ -193,7 +302,7 @@ impl Client {
             }
 
             tokio::select! {
-                res = self.client_conn.recv() => {
+                res = self.client_conn.recv(), if self.parked.is_none() => {
                     match res {
                         Ok(bytes) => {
                             if bytes == 0 { break; }
@@ -212,6 +321,10 @@ impl Client {
                         }
                         Err(_) => break,
                     }
+                }
+                () = ParkedRequest::due(self.parked.as_ref()) => {
+                    if !self.handle_msgs(Direction::ClientToHost).await { break; }
+                    prefer_host = true;
                 }
             }
         }
@@ -232,7 +345,10 @@ impl Client {
     /// preferred side once before consuming another fallback batch so input
     /// latency is bounded by one batch rather than the entire buffered burst.
     fn next_buffered_direction(&mut self, prefer_host: bool) -> io::Result<Option<Direction>> {
-        let (preferred_direction, fallback_direction) = if prefer_host {
+        // A parked guest stream has nothing to dispatch until its request
+        // is due (see `run`).
+        let guest_parked = self.parked.is_some();
+        let (preferred_direction, fallback_direction) = if prefer_host || guest_parked {
             (Direction::HostToClient, Direction::ClientToHost)
         } else {
             (Direction::ClientToHost, Direction::HostToClient)
@@ -241,7 +357,7 @@ impl Client {
         if self.connection(preferred_direction).has_complete_message() {
             return Ok(Some(preferred_direction));
         }
-        if !self.connection(fallback_direction).has_complete_message() {
+        if guest_parked || !self.connection(fallback_direction).has_complete_message() {
             return Ok(None);
         }
 
@@ -348,6 +464,12 @@ impl Client {
         if self.ended {
             return false;
         }
+        // A parked request is the first in the guest stream (see
+        // `ParkedRequest::wait_again`).
+        let resumed = match direction {
+            Direction::ClientToHost => self.parked.take(),
+            Direction::HostToClient => None,
+        };
         let (conn, other_conn) = match direction {
             Direction::ClientToHost => (&mut self.client_conn, &mut self.host_conn),
             Direction::HostToClient => (&mut self.host_conn, &mut self.client_conn),
@@ -407,6 +529,7 @@ impl Client {
             }
 
             let packet = &conn.read_buf[offset..message_end];
+            let queued_fds = conn.read_fds.len();
 
             let suppress_host_event = matches!(direction, Direction::HostToClient)
                 && pending_host_event_is_stale(&self.ctx, sender_id, opcode);
@@ -522,6 +645,7 @@ impl Client {
             // Work deferred until the message is forwarded runs only if it
             // is, which a message that ends the session never is.
             let after_forward = self.ctx.take_post_dispatch();
+            let deferred_work = after_forward.len();
             if forward.is_some() && !self.ctx.is_fatal() {
                 for effect in after_forward {
                     apply_post_dispatch(&mut self.ctx, effect);
@@ -534,6 +658,39 @@ impl Client {
             let effects = self.ctx.take_effects();
             if let Some(session_end) = effects.end {
                 end = Some(session_end);
+                break;
+            }
+            // A message that waits for a fence changed nothing, so it stays
+            // buffered with everything after it, and is dispatched again
+            // when it is due. Nothing overtakes it.
+            if let Some(wait) = effects.wait {
+                // Only a guest request waits, and only one that takes no
+                // descriptors: they would be gone when it is dispatched
+                // again. A host event that waited would spin the loop.
+                debug_assert_eq!(direction, Direction::ClientToHost);
+                debug_assert_eq!(conn.read_fds.len(), queued_fds);
+                debug_assert!(
+                    forward.is_none()
+                        && deferred_work == 0
+                        && effects.to_host.is_empty()
+                        && effects.to_guest.is_empty(),
+                    "a message that waits has no output"
+                );
+                let now = Instant::now();
+                let timeout = wait.timeout;
+                let parked = match resumed {
+                    Some(parked) if offset == 0 => parked.wait_again(wait.fence),
+                    _ => ParkedRequest::new(wait.fence, now + timeout),
+                };
+                if now >= parked.deadline {
+                    log::error!(
+                        "A dma-buf fence did not signal within {timeout:?} for a request \
+                         from guest object {sender_id}; ending the session"
+                    );
+                    end = Some(SessionEnd::Internal);
+                } else {
+                    self.parked = Some(parked);
+                }
                 break;
             }
             // The generated dispatcher encoded the forward under the sender
@@ -616,9 +773,10 @@ impl Client {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::state::PlaneFenceForTest;
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, msg_header, msg_opcode, msg_sender, raw_dispatch,
-        shm_pool_file, stream_headers,
+        any_fd_has_identity, fd_identity, fds_with_identity, msg_header, msg_opcode, msg_sender,
+        raw_dispatch, shm_pool_file, stream_headers,
     };
     use crate::wire::MessageBuilder;
     use std::fs;
@@ -1966,6 +2124,8 @@ mod tests {
 
     /// The guest's `wl_surface` in [`client_with_a_surface`].
     const SURFACE: u32 = 5;
+    /// The host's [`SURFACE`].
+    const SURFACE_HOST: u32 = 6;
 
     /// A proxy whose guest has the v4 `wl_surface` [`SURFACE`].
     fn client_with_a_surface() -> (
@@ -1974,10 +2134,9 @@ mod tests {
         std::os::unix::net::UnixStream,
     ) {
         let (mut client, guest_peer, host_peer) = client_with_socket_peers();
-        let host_surface = 6;
         client.ctx.shadow_table.insert_paired_with_version_for_test(
             SURFACE,
-            host_surface,
+            SURFACE_HOST,
             "wl_surface",
             4,
         );
@@ -2086,6 +2245,385 @@ mod tests {
                 protocols::wayland::wl_display::ERROR_IMPLEMENTATION
             )]
         );
+    }
+
+    /// The native buffer of [`client_committing_a_fenced_buffer`], and its
+    /// host ID.
+    const FENCED_BUFFER: u32 = 7;
+    const HOST_FENCED_BUFFER: u32 = 8;
+    /// A callback the host can finish while the guest stream is parked.
+    const CALLBACK: u32 = 9;
+    const HOST_CALLBACK: u32 = 10;
+    /// The callback of the `wl_display.sync` the guest sends after its commit.
+    const SYNC_CALLBACK: u32 = 11;
+
+    /// Thirty planes that share one fence give a commit a 30 s deadline,
+    /// which no loaded test machine reaches, so a test that runs the proxy
+    /// in real time fails only when the commit is held back.
+    const SLOW_DEADLINE_PLANES: usize = 30;
+
+    /// A proxy whose guest has buffered an attach of [`FENCED_BUFFER`] to
+    /// [`SURFACE`], its commit and a `wl_display.sync`. The buffer has
+    /// `planes` planes that share one fence, which `stand_in` describes;
+    /// the guest GPU writes the buffer until the returned descriptor is
+    /// written.
+    fn client_committing_a_fenced_buffer(
+        stand_in: PlaneFenceForTest,
+        planes: usize,
+    ) -> (
+        Client,
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        OwnedFd,
+    ) {
+        use protocols::wayland::{wl_display, wl_surface};
+        let (mut client, guest_peer, host_peer) = client_with_a_surface();
+        let ctx = &mut client.ctx;
+        ctx.plane_fences_for_test = Some(stand_in);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            FENCED_BUFFER,
+            HOST_FENCED_BUFFER,
+            "wl_buffer",
+            1,
+        );
+        let (fence, signal) = nix::unistd::pipe().expect("create the fence pipe");
+        let planes = (0..planes)
+            .map(|_| fence.try_clone().expect("share the fence"))
+            .collect();
+        assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), planes));
+        ctx.shadow_table
+            .insert_paired_for_test(CALLBACK, HOST_CALLBACK, "wl_callback");
+        for (request, _) in [
+            wl_surface::req::attach(SURFACE, Some(FENCED_BUFFER), 0, 0),
+            wl_surface::req::commit(SURFACE),
+            wl_display::req::sync(crate::wire::WL_DISPLAY_ID, SYNC_CALLBACK),
+        ] {
+            client.client_conn.read_buf.extend_from_slice(&request);
+        }
+        (client, guest_peer, host_peer, signal)
+    }
+
+    /// `peer` as a Tokio stream, so a test can drive it beside
+    /// `Client::run` on the same thread.
+    fn async_peer(peer: std::os::unix::net::UnixStream) -> tokio::net::UnixStream {
+        peer.set_nonblocking(true).expect("non-blocking peer");
+        tokio::net::UnixStream::from_std(peer).expect("register the peer")
+    }
+
+    /// The next message the proxy sends `peer`.
+    async fn read_frame(peer: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut frame = vec![0; MessageHeader::LEN];
+        peer.read_exact(&mut frame).await.expect("read a header");
+        frame.resize(msg_header(&frame).len, 0);
+        peer.read_exact(&mut frame[MessageHeader::LEN..])
+            .await
+            .expect("read a body");
+        frame
+    }
+
+    /// The headers of what the host reads up to the guest's
+    /// `wl_display.sync`, which follows the commit, waiting at most `limit`.
+    async fn forwarded_through_sync(
+        host: &mut (impl tokio::io::AsyncRead + Unpin),
+        limit: Duration,
+    ) -> Vec<(u32, u16)> {
+        let sync = (
+            crate::wire::WL_DISPLAY_ID,
+            protocols::wayland::wl_display::REQ_SYNC,
+        );
+        let read = async {
+            let mut headers = Vec::new();
+            while headers.last() != Some(&sync) {
+                headers.extend(stream_headers(&read_frame(host).await));
+            }
+            headers
+        };
+        tokio::time::timeout(limit, read)
+            .await
+            .expect("the commit and the request after it reach the host")
+    }
+
+    /// Assert that `forwarded` has one commit, as the guest sent it (a
+    /// commit has no arguments, so its header is all its bytes), and that
+    /// the request after it follows it.
+    fn assert_one_commit_then_sync(forwarded: &[(u32, u16)]) {
+        use protocols::wayland::{wl_display, wl_surface};
+        let commit = (SURFACE_HOST, wl_surface::REQ_COMMIT);
+        assert_eq!(forwarded.iter().filter(|&&m| m == commit).count(), 1);
+        assert_eq!(
+            forwarded[forwarded.len() - 2..],
+            [commit, (crate::wire::WL_DISPLAY_ID, wl_display::REQ_SYNC)]
+        );
+    }
+
+    /// A commit whose fence is pending parks the guest stream: neither it
+    /// nor the request after it is dispatched, fair dispatch does not offer
+    /// the stream, and the commit keeps its deadline when it waits again,
+    /// while host events still reach the guest.
+    #[tokio::test]
+    async fn a_pending_fence_parks_the_guest_stream_while_host_events_flow() {
+        use protocols::wayland::{wl_callback, wl_surface};
+        let (mut client, mut guest_peer, mut host_peer, _signal) =
+            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, 1);
+
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.parked.is_some());
+        assert_eq!(
+            client.ctx.shadow_table.get_host_id(SYNC_CALLBACK),
+            None,
+            "the request after the commit waits behind it"
+        );
+        assert_eq!(
+            client.next_buffered_direction(false).unwrap(),
+            None,
+            "fair dispatch must not offer a parked stream"
+        );
+        let deadline = client.parked.as_ref().map(|parked| parked.deadline);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert_eq!(
+            client.parked.as_ref().map(|parked| parked.deadline),
+            deadline,
+            "a request that waits again keeps its deadline"
+        );
+
+        client
+            .host_conn
+            .read_buf
+            .extend_from_slice(&callback_done(HOST_CALLBACK));
+        assert_eq!(
+            client.next_buffered_direction(false).unwrap(),
+            Some(Direction::HostToClient),
+            "a parked client still serves the host"
+        );
+        assert!(client.handle_msgs(Direction::HostToClient).await);
+        assert!(client.parked.is_some());
+        drop(client);
+        assert_eq!(
+            sent_messages(&mut host_peer),
+            [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+        );
+        assert!(sent_messages(&mut guest_peer).contains(&(CALLBACK, wl_callback::EVT_DONE)));
+    }
+
+    /// Once its fence signals, the parked commit is dispatched again and
+    /// forwarded once, unchanged, before the request after it, and the
+    /// descriptor it waited on is closed.
+    #[tokio::test]
+    async fn a_parked_commit_is_forwarded_once_when_its_fence_signals() {
+        use protocols::wayland::wl_surface;
+        let (mut client, _guest_peer, mut host_peer, signal) =
+            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, 1);
+        let fence = fd_identity(signal.as_raw_fd());
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        // The registered plane, the parked duplicate and `signal`.
+        assert_eq!(fds_with_identity(fence), 3);
+
+        assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+        ParkedRequest::due(client.parked.as_ref()).await;
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        assert!(client.parked.is_none());
+        assert_eq!(fds_with_identity(fence), 2);
+
+        drop(client);
+        let forwarded = sent_messages(&mut host_peer);
+        assert_eq!(
+            forwarded.first(),
+            Some(&(SURFACE_HOST, wl_surface::REQ_ATTACH))
+        );
+        assert_one_commit_then_sync(&forwarded);
+        drop(signal);
+        assert!(!any_fd_has_identity(fence));
+    }
+
+    /// Through `Client::run`: the parked commit waits while host events
+    /// reach the guest, and is forwarded once its sync_file becomes
+    /// readable, before the request after it and only once.
+    #[tokio::test]
+    async fn run_forwards_a_parked_commit_once_its_sync_file_signals() {
+        use protocols::wayland::{wl_callback, wl_surface};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, guest_peer, host_peer, signal) =
+            client_committing_a_fenced_buffer(PlaneFenceForTest::SyncFile, SLOW_DEADLINE_PLANES);
+        let mut guest_peer = async_peer(guest_peer);
+        let mut host_peer = async_peer(host_peer);
+
+        let peers = async {
+            let attach = read_frame(&mut host_peer).await;
+            assert_eq!(
+                stream_headers(&attach),
+                [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+            );
+            host_peer
+                .write_all(&callback_done(HOST_CALLBACK))
+                .await
+                .expect("send a host event");
+            let done = read_frame(&mut guest_peer).await;
+            assert_eq!(stream_headers(&done), [(CALLBACK, wl_callback::EVT_DONE)]);
+
+            assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+            let forwarded = forwarded_through_sync(&mut host_peer, Duration::from_secs(5)).await;
+            assert_one_commit_then_sync(&forwarded);
+
+            drop(guest_peer);
+            let mut rest = Vec::new();
+            host_peer
+                .read_to_end(&mut rest)
+                .await
+                .expect("read until the proxy closes");
+            assert_eq!(stream_headers(&rest), []);
+        };
+        tokio::join!(client.run(), peers);
+    }
+
+    /// Host traffic must not postpone asking about a fence that gives no
+    /// descriptor to wait on: the commit is forwarded within a few poll
+    /// intervals of its fence signalling, while the host sends an event
+    /// every 500 µs, each of which wakes the loop (a 1 kHz mouse wakes it
+    /// every millisecond). Time moves only with the traffic, so no pause
+    /// between events can let a postponed poll through.
+    #[tokio::test(start_paused = true)]
+    async fn host_traffic_does_not_postpone_polling_a_busy_fence() {
+        use protocols::wayland::wl_surface;
+        use tokio::io::AsyncWriteExt;
+        /// A host object the proxy does not track, so it reads and drops
+        /// what the object sends.
+        const UNTRACKED_HOST_OBJECT: u32 = 0x7000;
+        let (client, _guest_peer, host_peer, signal) =
+            client_committing_a_fenced_buffer(PlaneFenceForTest::Busy, 1);
+        let mut host_peer = async_peer(host_peer);
+
+        let peers = async {
+            let (mut reader, mut writer) = host_peer.split();
+            let traffic = async {
+                let event = MessageBuilder::new().build_message(UNTRACKED_HOST_OBJECT, 0);
+                loop {
+                    writer.write_all(&event).await.expect("send host traffic");
+                    tokio::time::advance(Duration::from_micros(500)).await;
+                }
+            };
+            let forwarded = async {
+                let attach = read_frame(&mut reader).await;
+                assert_eq!(
+                    stream_headers(&attach),
+                    [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+                );
+                assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+                // The first polls are 2, 4 and 8 ms apart; the deadline is
+                // 15 s away.
+                forwarded_through_sync(&mut reader, Duration::from_millis(100)).await
+            };
+            tokio::select! {
+                forwarded = forwarded => assert_one_commit_then_sync(&forwarded),
+                () = traffic => unreachable!("the traffic never ends"),
+            }
+        };
+        tokio::select! {
+            () = client.run() => panic!("the proxy loop ended"),
+            () = peers => {}
+        }
+    }
+
+    /// Dispatch a commit behind a fence, which `stand_in` describes, that
+    /// never signals, each time it is due, and assert that the session
+    /// ends with one `implementation` error and without the commit or
+    /// anything after it. Returns how long the session lasted. A deadline
+    /// that never comes fails the test instead of hanging it.
+    ///
+    /// The loop is driven by hand rather than by `Client::run`: paused
+    /// time jumps to the next timer whenever the runtime waits on a
+    /// socket, so a guard timer beside `run` would be jumped to.
+    async fn session_with_a_fence_that_never_signals(stand_in: PlaneFenceForTest) -> Duration {
+        use protocols::wayland::{wl_display, wl_surface};
+        let (mut client, mut guest_peer, mut host_peer, signal) =
+            client_committing_a_fenced_buffer(stand_in, 1);
+        let fence = fd_identity(signal.as_raw_fd());
+
+        let start = Instant::now();
+        let mut alive = client.handle_msgs(Direction::ClientToHost).await;
+        while alive {
+            assert!(
+                start.elapsed() < crate::allocator::VIRTGPU_WAIT_TIMEOUT * 4,
+                "the session outlives its deadline"
+            );
+            ParkedRequest::due(client.parked.as_ref()).await;
+            alive = client.handle_msgs(Direction::ClientToHost).await;
+        }
+        let lasted = start.elapsed();
+
+        drop(client);
+        assert_eq!(
+            display_errors(&mut guest_peer),
+            [(crate::wire::WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)]
+        );
+        assert_eq!(
+            sent_messages(&mut host_peer),
+            [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
+        );
+        drop(signal);
+        assert!(!any_fd_has_identity(fence));
+        lasted
+    }
+
+    /// A sync_file that never signals ends the session at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_that_never_signals_ends_the_session_at_its_deadline() {
+        let lasted = session_with_a_fence_that_never_signals(PlaneFenceForTest::SyncFile).await;
+        let deadline = crate::allocator::SYNC_FILE_TIMEOUT;
+        assert!(deadline <= lasted && lasted < deadline * 2, "{lasted:?}");
+    }
+
+    /// A virtio-gpu fallback fence that never signals ends the session at
+    /// the kernel's bound, though it is polled all the while.
+    #[tokio::test(start_paused = true)]
+    async fn a_fallback_fence_that_never_signals_ends_the_session_at_its_deadline() {
+        let lasted = session_with_a_fence_that_never_signals(PlaneFenceForTest::Busy).await;
+        let deadline = crate::allocator::VIRTGPU_WAIT_TIMEOUT;
+        assert!(
+            deadline <= lasted && lasted < deadline + MAX_FENCE_POLL_INTERVAL * 2,
+            "{lasted:?}"
+        );
+    }
+
+    /// A fence with no descriptor to wait on is asked about again after a
+    /// pause that doubles each time, up to about a frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_without_a_descriptor_is_polled_less_often_as_it_waits() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut parked = ParkedRequest::new(PendingFence::Busy, deadline);
+        for millis in [2, 4, 8, 16, 16] {
+            let start = Instant::now();
+            ParkedRequest::due(Some(&parked)).await;
+            assert_eq!(start.elapsed(), Duration::from_millis(millis));
+            parked = parked.wait_again(PendingFence::Busy);
+        }
+        assert_eq!(parked.deadline, deadline);
+    }
+
+    /// The virtio-gpu fallback keeps the kernel's bound of its old blocking
+    /// wait: its commit goes through after a fence that took longer than a
+    /// sync_file may, asked about all the while.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_fallback_fence_outlasts_the_sync_file_bound() {
+        let (mut client, _guest_peer, mut host_peer, signal) =
+            client_committing_a_fenced_buffer(PlaneFenceForTest::Busy, 1);
+        assert!(client.handle_msgs(Direction::ClientToHost).await);
+        let start = Instant::now();
+        let gpu_time = crate::allocator::SYNC_FILE_TIMEOUT * 5;
+        assert!(gpu_time < crate::allocator::VIRTGPU_WAIT_TIMEOUT);
+        while client.parked.is_some() {
+            if start.elapsed() >= gpu_time {
+                assert_eq!(nix::unistd::write(&signal, &[1]), Ok(1));
+            }
+            ParkedRequest::due(client.parked.as_ref()).await;
+            assert!(
+                client.handle_msgs(Direction::ClientToHost).await,
+                "a slow fallback fence must not end the session"
+            );
+        }
+        assert!(start.elapsed() < gpu_time + MAX_FENCE_POLL_INTERVAL * 2);
+        drop(client);
+        assert_one_commit_then_sync(&sent_messages(&mut host_peer));
     }
 
     /// The host's error is the guest's one error: a malformed request that

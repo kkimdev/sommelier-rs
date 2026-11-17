@@ -35,7 +35,7 @@ pub(crate) use self::aura_surfaces::AuraSurfaces;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;
-use crate::allocator::Allocator;
+use crate::allocator::{Allocator, PendingFence};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Action, Outgoing};
 use log::{debug, error, warn};
@@ -126,6 +126,30 @@ pub(crate) struct Effects {
     pub(crate) to_host: Vec<Outgoing>,
     pub(crate) to_guest: Vec<Outgoing>,
     pub(crate) end: Option<SessionEnd>,
+    /// The fence the message waits for before it can be dispatched again;
+    /// see [`Context::wait_for_fence`].
+    pub(crate) wait: Option<FenceWait>,
+}
+
+/// A guest GPU write that a message waits for ([`Context::wait_for_fence`]).
+#[derive(Debug)]
+pub(crate) struct FenceWait {
+    pub(crate) fence: PendingFence,
+    /// How long the message may wait, counted from the first time it does,
+    /// before its session ends.
+    pub(crate) timeout: std::time::Duration,
+}
+
+/// The fence a test's pipe plane stands in for
+/// ([`Context::plane_fences_for_test`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PlaneFenceForTest {
+    /// The plane is its own sync_file.
+    SyncFile,
+    /// The virtio-gpu fallback, which reports a busy buffer and nothing to
+    /// wait on.
+    Busy,
 }
 
 /// Metadata for one global advertised by the host compositor.
@@ -317,6 +341,9 @@ pub struct Context {
     /// Work deferred by the handler of the message being dispatched; see
     /// [`PostDispatch`].
     post_dispatch: Vec<PostDispatch>,
+    /// The fence the message being dispatched waits for, if it does; see
+    /// [`Self::wait_for_fence`].
+    fence_wait: Option<FenceWait>,
     /// Monotonic serial source for synthetic keyboard compatibility events.
     pub synthetic_keyboard_serial: u32,
     pub allocator: Option<Allocator>,
@@ -324,6 +351,11 @@ pub struct Context {
     /// feedback lifecycle without depending on the runner's `/dev/dri`.
     #[cfg(test)]
     pub synthetic_feedback_available_for_test: bool,
+    /// Test-only: what each native buffer plane stands in for. No test can
+    /// make a dma-buf whose fence is pending, so a pipe stands in, pending
+    /// until it is readable (see `handler::compositor::plane_fence`).
+    #[cfg(test)]
+    pub plane_fences_for_test: Option<PlaneFenceForTest>,
     pub virtwayland_channel: Option<Arc<VirtWaylandChannel>>,
     pub host_dmabuf_id: Option<u32>,
     /// Global name that produced the currently bound internal dmabuf object.
@@ -552,12 +584,26 @@ impl Context {
         Action::Drop
     }
 
+    /// Have the message being dispatched wait for a guest GPU write: the
+    /// proxy holds it and every later message from its peer back, and
+    /// dispatches it again once the fence may have signalled. A handler
+    /// returns the [`Action::Drop`] this returns, before it changes
+    /// anything, so that dispatching the message again is like the first
+    /// time. Only a request without descriptor arguments may wait, as its
+    /// descriptors would be gone by then.
+    #[must_use = "a handler returns the Action::Drop"]
+    pub(crate) fn wait_for_fence(&mut self, wait: FenceWait) -> Action {
+        self.fence_wait = Some(wait);
+        Action::Drop
+    }
+
     /// Take what the message just dispatched produced (see [`Effects`]).
     pub(crate) fn take_effects(&mut self) -> Effects {
         Effects {
             to_host: std::mem::take(&mut self.client_to_host_queue),
             to_guest: std::mem::take(&mut self.host_to_client_queue),
             end: self.session_end.take(),
+            wait: self.fence_wait.take(),
         }
     }
 
@@ -950,10 +996,13 @@ impl Context {
             host_to_client_queue: Vec::new(),
             session_end: None,
             post_dispatch: Vec::new(),
+            fence_wait: None,
             synthetic_keyboard_serial: 0,
             allocator,
             #[cfg(test)]
             synthetic_feedback_available_for_test: false,
+            #[cfg(test)]
+            plane_fences_for_test: None,
             virtwayland_channel: None,
             host_dmabuf_id: None,
             host_dmabuf_global_name: None,
