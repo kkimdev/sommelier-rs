@@ -1149,14 +1149,10 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     version,
                     guest_new_id
                 );
-                // A local-only object: it never reaches the host, and its
-                // destructor completes in the proxy (see
-                // `ShadowTable::is_local_only_guest_object`).
-                ctx.shadow_table.track_interface_with_version(
-                    *guest_new_id,
-                    interface.clone(),
-                    *version,
-                );
+                // A local object: it never reaches the host, and its
+                // destructor completes in the proxy.
+                ctx.shadow_table
+                    .create_local(*guest_new_id, interface, *version);
                 return Action::Drop;
             }
             None => {
@@ -1179,12 +1175,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
         if interface == "wl_shm" {
             // Do NOT forward wl_shm to host. We emulate it.
-            // Just track it so we know this guest ID is wl_shm.
-            ctx.shadow_table.track_interface_with_version(
-                *guest_new_id,
-                "wl_shm".to_string(),
-                *version,
-            );
+            ctx.shadow_table
+                .create_local(*guest_new_id, interface, *version);
 
             // Advertise mandatory formats immediately and optional formats
             // only after the host wl_shm/dmabuf capability event has arrived.
@@ -1202,18 +1194,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // ID to that host ID would overwrite the previous manager's
             // reverse mapping and allow one manager's destroy to unregister
             // the shared host object.
-            ctx.shadow_table.track_interface_with_version(
-                *guest_new_id,
-                interface.clone(),
-                *version,
-            );
+            ctx.shadow_table
+                .create_local(*guest_new_id, interface, *version);
             return Action::Drop;
         } else if interface == "gtk_shell1" {
-            ctx.shadow_table.track_interface_with_version(
-                *guest_new_id,
-                interface.clone(),
-                *version,
-            );
+            ctx.shadow_table
+                .create_local(*guest_new_id, interface, *version);
             ctx.gtk_shells
                 .insert(*guest_new_id, GtkShellState::default());
             queue_internal_sync(

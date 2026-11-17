@@ -208,8 +208,7 @@ impl ZxdgOutputManagerV1Handler for OutputHandler {
         let version = ctx
             .shadow_table
             .guest_object_version_or_unknown(ctx.last_sender_id);
-        ctx.shadow_table
-            .track_interface_with_version(id, "zxdg_output_v1".to_string(), version);
+        ctx.shadow_table.create_local(id, "zxdg_output_v1", version);
         Action::Drop
     }
 }

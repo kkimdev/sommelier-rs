@@ -78,11 +78,8 @@ impl GtkShell1Handler for GtkShellHandler {
 
         // A new object takes its parent's version.
         let version = ctx.shadow_table.guest_object_version_or_unknown(shell_id);
-        ctx.shadow_table.track_interface_with_version(
-            gtk_surface_id,
-            "gtk_surface1".to_string(),
-            version,
-        );
+        ctx.shadow_table
+            .create_local(gtk_surface_id, "gtk_surface1", version);
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
             GtkSurfaceState {

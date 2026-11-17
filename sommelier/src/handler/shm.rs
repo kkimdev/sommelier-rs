@@ -1308,8 +1308,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
         };
 
         ctx.pools.insert(pool_id, pool);
-        ctx.shadow_table
-            .track_interface_with_version(pool_id, "wl_shm_pool".to_string(), 1);
+        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
 
         Action::Drop
     }

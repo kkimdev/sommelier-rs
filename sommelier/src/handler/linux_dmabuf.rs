@@ -348,9 +348,9 @@ impl LinuxDmabufHandler {
             );
             return Action::Drop;
         };
-        ctx.shadow_table.track_interface_with_version(
+        ctx.shadow_table.create_local(
             guest_id,
-            "zwp_linux_dmabuf_feedback_v1".to_string(),
+            "zwp_linux_dmabuf_feedback_v1",
             GUEST_DMABUF_VERSION,
         );
         ctx.synthetic_feedback_objects.insert(guest_id, generation);

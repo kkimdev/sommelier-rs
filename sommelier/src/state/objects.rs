@@ -337,6 +337,17 @@ impl ShadowTable {
         );
     }
 
+    /// Create guest object `guest_id`, which the proxy implements itself:
+    /// it has no host object (see [`Self::is_local_only_guest_object`]).
+    pub fn create_local(&mut self, guest_id: u32, interface: &str, version: u32) {
+        let local = GuestObject::Local(Interface {
+            name: interface.to_string(),
+            version,
+        });
+        let previous = self.guests.insert(GuestId(guest_id), local);
+        debug_assert!(previous.is_none(), "guest ID {guest_id} is in use");
+    }
+
     pub fn get_host_id(&self, guest_id: u32) -> Option<u32> {
         self.host_id_of(GuestId(guest_id)).map(|host| host.0)
     }
