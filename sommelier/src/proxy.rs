@@ -158,6 +158,10 @@ struct Client {
     host_conn: WaylandConnection,
     ctx: Context,
     handler: SommelierHandler,
+    /// Whether a batch ended the session: one of its messages did, or a send
+    /// failed. No later batch dispatches anything, so the guest gets at most
+    /// one error. A failed receive or a closed peer stops `run` without it.
+    ended: bool,
 }
 
 impl Client {
@@ -168,6 +172,7 @@ impl Client {
             host_conn,
             ctx,
             handler: SommelierHandler::new(),
+            ended: false,
         }
     }
 
@@ -345,6 +350,9 @@ impl Client {
     }
 
     async fn handle_msgs(&mut self, direction: Direction) -> bool {
+        if self.ended {
+            return false;
+        }
         self.ctx.reap_clipboard_pumps();
         let (conn, other_conn) = match direction {
             Direction::ClientToHost => (&mut self.client_conn, &mut self.host_conn),
@@ -615,6 +623,7 @@ impl Client {
         }
 
         conn.read_buf.drain(..offset);
+        self.ended = !success;
         success
     }
 }
@@ -2075,8 +2084,8 @@ mod tests {
         );
     }
 
-    /// The host's error is the guest's one error: a malformed event that
-    /// follows it gets none of its own.
+    /// The host's error is the guest's one error: a malformed request that
+    /// follows it gets none of its own, even in a later batch.
     #[tokio::test]
     async fn a_host_error_is_the_sessions_only_error() {
         let (mut client, mut guest_peer, _host_peer) = client_with_a_surface();
@@ -2089,11 +2098,12 @@ mod tests {
             crate::wire::WL_DISPLAY_ID,
             protocols::wayland::wl_display::EVT_ERROR,
         ));
-        client
-            .host_conn
-            .read_buf
-            .extend(MessageBuilder::new().build_message(host_surface, 99));
         assert!(!client.handle_msgs(Direction::HostToClient).await);
+        client
+            .client_conn
+            .read_buf
+            .extend(MessageBuilder::new().build_message(SURFACE, 99));
+        assert!(!client.handle_msgs(Direction::ClientToHost).await);
         drop(client);
         assert_eq!(display_errors(&mut guest_peer), [(SURFACE, 2)]);
     }
