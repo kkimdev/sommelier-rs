@@ -48,18 +48,22 @@ numbers or global state another test leaves alone; see
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
 request streams built from the vendored XML, some of them damaged, over
-real sockets. Each case must end without a panic or hang, close every
+real sockets. Half the cases end like a client typing into text fields
+(`proxy::fuzz::typing`): it moves the focus between its surfaces, waits
+for each move with a roundtrip, and enables, edits and disables the
+field. Each case must end without a panic or hang, close every
 descriptor, and either answer the stream's closing `wl_display.sync` or
 send one `wl_display.error`, its last event. The fake compositor behind the proxy also checks
 that every request it receives comes from a live host object, creates
 only fresh IDs and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,
 creates objects of its own (a data offer for each data device, a buffer
-for each asynchronous dma-buf create), and, as weston does, destroys a
-destroyed surface's pending frame callbacks without `done`. In a quarter
-of the cases it also destroys the live objects of one interface on its
-own as it answers a sync. After every batch that keeps the session, the
-proxy must hold no state for an object that has ended
+for each asynchronous dma-buf create), as weston does, destroys a
+destroyed surface's pending frame callbacks without `done`, and gives the
+keyboard focus to each surface the proxy commits. In a quarter of the
+cases it also destroys the live objects of one interface on its own as
+it answers a sync. After every batch that keeps the session, the proxy
+must hold no state for an object that has ended
 (`Context::assert_no_orphans`). When a case's
 requests are whole and undamaged, the guest checks that it receives what
 the proxy should send, which is stricter than what libwayland-client
@@ -69,6 +73,31 @@ callback the compositor cancelled, or an object the compositor destroyed
 on its own, once (and every cancelled callback
 gets one before the closing sync is answered), and each object the server
 creates gets a fresh ID from the server range.
+
+The compositor also models what Exo makes of the text-input requests
+(`proxy::fuzz::exo`, which cites the Chromium source of each rule): it
+drops a content type while no input method is attached, spends a pending
+surrounding-text support on the next content type, keeps surrounding
+text and the cursor rectangle regardless, and sends `enter` and `leave`
+as an input method attaches and detaches. `RESTART_INPUT_METHODS`, off
+for now, also makes the input method go away now and then, as when its
+process restarts. The seed picks the host's
+`zcr_text_input_extension_v1` version, one for each way the proxy sends
+a content type. Whether an enable reaches the proxy before or after the
+previous activation has drained follows from the seed too: the
+compositor holds its answer to every drain barrier's sync until it
+answers anything else, and the guest sometimes waits with a second
+roundtrip, whose sync releases it. When such a case typed into text
+fields, stayed healthy and had no objects destroyed by the compositor on
+its own, Exo must end, once the proxy has closed the connection, with
+the field the guest last committed on the focused surface: the content
+type as the proxy maps it, the surrounding text and support for it, and
+the cursor rectangle, or no active text input if the field was disabled.
+The expected content type comes from the proxy's own mapping, so this
+check finds ordering and state bugs, not mapping bugs; unit tests pin
+the mapping. The run reports how many fields it checked and how many
+activations the guest's plan deferred.
+
 The suite runs 5000 cases from seed 0; run more, from another seed,
 after changing how the proxy reads guest requests or tracks objects:
 
