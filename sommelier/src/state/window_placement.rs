@@ -277,14 +277,30 @@ impl WindowPlacementState {
         self.aura_toplevel_by_xdg_toplevel.len()
     }
 
-    /// Every guest wl_surface with an ARC identity, and every guest
-    /// xdg_toplevel with an Aura toplevel.
+    /// Every guest wl_surface with an ARC identity.
     #[cfg(test)]
-    pub(super) fn objects_for_test(&self) -> (Vec<u32>, Vec<u32>) {
-        (
-            self.arc_application_ids.keys().copied().collect(),
-            self.aura_toplevel_by_xdg_toplevel.keys().copied().collect(),
-        )
+    pub(super) fn arc_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+        self.arc_application_ids.keys().copied()
+    }
+
+    /// Every guest xdg_toplevel with an Aura toplevel, and that host
+    /// `zaura_toplevel`, from both maps.
+    #[cfg(test)]
+    pub(super) fn aura_toplevels_for_test(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.aura_toplevel_by_xdg_toplevel
+            .iter()
+            .map(|(&xdg, &aura)| (xdg, aura))
+            .chain(
+                self.xdg_toplevel_by_aura_toplevel
+                    .iter()
+                    .map(|(&aura, &xdg)| (xdg, aura)),
+            )
+    }
+
+    /// Every host `zaura_toplevel` with an active barrier.
+    #[cfg(test)]
+    pub(super) fn barrier_toplevels_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+        self.active_barriers.keys().copied()
     }
 
     // ── Bounds barriers and held configures ───────────────────────────────

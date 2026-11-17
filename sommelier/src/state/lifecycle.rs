@@ -177,10 +177,11 @@ impl Context {
     /// must be a live object of the right interface in the
     /// [`super::ShadowTable`].
     ///
-    /// A guest key must be a live guest object (local, or paired and not
-    /// destroyed); a host key must be paired with one. State for a host ID
-    /// that outlives its guest object (a render buffer, an asynchronous
-    /// dma-buf create) only needs the ID to be in use, retired included.
+    /// A guest object must be live (local, or paired and not destroyed). A
+    /// host object must be paired with one, or, if only the proxy uses it,
+    /// be live itself. A render buffer, which the host may still show after
+    /// its guest object ends, only needs its host ID to be in use, retired
+    /// included.
     pub(crate) fn assert_no_orphans(&self) {
         let table = &self.shadow_table;
         let guest = |what: &str, id: u32, interface: &str| {
@@ -197,14 +198,14 @@ impl Context {
                 "{what} outlived host {interface} {id}"
             );
         };
-        let host_id_in_use = |what: &str, id: HostId| {
+        let host_only = |what: &str, id: u32, interface: &str| {
             assert!(
-                !table.is_host_id_available(id.0),
-                "{what} outlived host ID {}",
-                id.0
+                table.get_host_interface(id) == Some(interface) && table.get_guest_id(id).is_none(),
+                "{what} outlived host-only {interface} {id}"
             );
         };
 
+        // Surfaces, their roles and what they show.
         for &surface in self.surfaces.keys() {
             guest("wl_surface state", surface, "wl_surface");
         }
@@ -229,23 +230,42 @@ impl Context {
                 guest("xdg role", toplevel, "xdg_toplevel");
             }
         }
-        let (arc_surfaces, aura_toplevels) = self.window_placement.objects_for_test();
-        for surface in arc_surfaces {
-            guest("ARC identity", surface, "wl_surface");
-        }
-        for toplevel in aura_toplevels {
-            guest("Aura toplevel", toplevel, "xdg_toplevel");
-        }
         for surface in self.aura_surfaces.wl_surfaces_for_test() {
             host("Aura surface", surface, "wl_surface");
         }
-        for output in self.outputs.live_outputs() {
+        for surface in self.render_buffers.copy_surfaces_for_test() {
+            guest("buffer copy", surface, "wl_surface");
+        }
+        let outputs = self.outputs.live_outputs();
+        for &output in &outputs {
             host("output record", output, "wl_output");
         }
-        for surface in self.outputs.surfaces_for_test() {
+        for (surface, output) in self.outputs.surface_outputs_for_test() {
             host("surface output", surface, "wl_surface");
+            assert!(
+                outputs.contains(&output),
+                "surface output outlived output {output}"
+            );
         }
 
+        // Window placement.
+        for surface in self.window_placement.arc_surfaces_for_test() {
+            guest("ARC identity", surface, "wl_surface");
+        }
+        let mut aura_toplevels = std::collections::HashSet::new();
+        for (toplevel, aura_toplevel) in self.window_placement.aura_toplevels_for_test() {
+            guest("Aura toplevel", toplevel, "xdg_toplevel");
+            host_only("Aura toplevel", aura_toplevel, "zaura_toplevel");
+            aura_toplevels.insert(aura_toplevel);
+        }
+        for aura_toplevel in self.window_placement.barrier_toplevels_for_test() {
+            assert!(
+                aura_toplevels.contains(&aura_toplevel),
+                "placement barrier outlived Aura toplevel {aura_toplevel}"
+            );
+        }
+
+        // Keyboards, their focus and keys, and text input.
         for &keyboard in self.keyboard_to_seat.keys() {
             guest("keyboard seat", keyboard, "wl_keyboard");
         }
@@ -259,14 +279,25 @@ impl Context {
             .chain(self.keyboard_xkb_states.keys())
             .chain(self.keyboard_modifiers.keys())
             .copied()
-            .chain(self.keyboard_focus.keyboards_for_test());
+            .chain(self.key_generations.keyboards_for_test());
         for keyboard in host_keyboards {
             host("keyboard state", keyboard.0, "wl_keyboard");
         }
-        for &text_input in self.text_inputs.keys() {
+        for (keyboard, focus) in self.keyboard_focus.focuses_for_test() {
+            host("keyboard focus", keyboard.0, "wl_keyboard");
+            guest("keyboard focus", focus.guest_surface, "wl_surface");
+        }
+        for surface in self.key_generations.peek_surfaces_for_test() {
+            guest("peek watermark", surface, "wl_surface");
+        }
+        for (&text_input, state) in &self.text_inputs {
             guest("text input state", text_input, "zwp_text_input_v3");
+            if let Some(surface) = state.active_surface {
+                guest("text input focus", surface, "wl_surface");
+            }
         }
 
+        // SHM and dma-buf.
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
             guest("SHM pool", pool, "wl_shm_pool");
         }
@@ -278,10 +309,19 @@ impl Context {
             guest("wl_shm state", shm, "wl_shm");
         }
         for (buffer, _) in self.render_buffer_lifecycles() {
-            host_id_in_use("render buffer", buffer);
+            assert!(
+                !table.is_host_id_available(buffer.0),
+                "render buffer outlived host ID {}",
+                buffer.0
+            );
         }
-        for &params in self.pending_native_creates.keys() {
-            host_id_in_use("asynchronous dma-buf create", params);
+        for (&params, create) in &self.pending_native_creates {
+            assert_eq!(
+                table.event_object(params.0, "zwp_linux_buffer_params_v1"),
+                Some(create.guest_params_id),
+                "asynchronous dma-buf create outlived host params {}",
+                params.0
+            );
         }
         for &params in self.pending_params.keys().chain(&self.used_dmabuf_params) {
             guest("dma-buf params", params, "zwp_linux_buffer_params_v1");
@@ -292,7 +332,14 @@ impl Context {
         for &feedback in self.synthetic_feedback_objects.keys() {
             guest("dma-buf feedback", feedback, "zwp_linux_dmabuf_feedback_v1");
         }
+        for &generation in self.dmabuf_capabilities.keys() {
+            assert!(
+                linux_dmabuf::capability_generation_held(self, generation),
+                "dma-buf capabilities outlived every hold on generation {generation}"
+            );
+        }
 
+        // Registries.
         let registries = self
             .registry_global_names
             .keys()

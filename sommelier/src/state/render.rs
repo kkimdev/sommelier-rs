@@ -151,6 +151,12 @@ impl StalePixels {
         }
     }
 
+    /// The surface the host copy is relative to, if any.
+    #[cfg(test)]
+    fn surface_for_test(&self) -> Option<u32> {
+        self.surface
+    }
+
     /// `surface` was destroyed, and its ID may name a new surface.
     fn forget_surface(&mut self, surface: u32) {
         if self.surface == Some(surface) {
@@ -1135,6 +1141,17 @@ impl RenderBufferRegistry {
             self.lifecycle(host_id)
                 .map(|lifecycle| (host_id, lifecycle))
         })
+    }
+
+    /// Every guest wl_surface a host copy is relative to.
+    #[cfg(test)]
+    pub(super) fn copy_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+        self.entries
+            .values()
+            .filter_map(|buffer| match &buffer.active()?.backing {
+                RenderBufferBacking::LocalCopy(backing) => backing.stale.surface_for_test(),
+                RenderBufferBacking::Native { .. } => None,
+            })
     }
 
     #[cfg(test)]

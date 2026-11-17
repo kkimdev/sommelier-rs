@@ -107,7 +107,16 @@ pub(crate) fn has_synthetic_feedback_formats(ctx: &Context, generation: u64) -> 
 }
 
 pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation: u64) {
-    let referenced = ctx.host_dmabuf_generation == Some(generation)
+    if !capability_generation_held(ctx, generation) {
+        ctx.dmabuf_capabilities.remove(&generation);
+    }
+}
+
+/// Whether anything still holds capability generation `generation`: the
+/// host's current global, a sync awaiting its formats, a guest factory or
+/// synthetic feedback, or a bind waiting for its formats.
+pub(crate) fn capability_generation_held(ctx: &Context, generation: u64) -> bool {
+    ctx.host_dmabuf_generation == Some(generation)
         || ctx.internal_callbacks.awaits_dmabuf_generation(generation)
         || ctx
             .dmabuf_guest_generations
@@ -120,10 +129,7 @@ pub(crate) fn maybe_reclaim_capability_generation(ctx: &mut Context, generation:
         || ctx
             .pending_dmabuf_globals
             .iter()
-            .any(|pending| pending.generation == generation);
-    if !referenced {
-        ctx.dmabuf_capabilities.remove(&generation);
-    }
+            .any(|pending| pending.generation == generation)
 }
 
 fn create_feedback_format_table(pairs: &[(u32, u64)]) -> io::Result<(OwnedFd, u32)> {

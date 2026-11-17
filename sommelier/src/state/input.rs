@@ -756,6 +756,33 @@ impl KeyGenerationRegistry {
         }
     }
 
+    /// Every host keyboard with a key generation, a retired guest
+    /// release or a peek watermark.
+    #[cfg(test)]
+    pub(super) fn keyboards_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.entries
+            .keys()
+            .copied()
+            .chain(
+                self.retired_guest_releases
+                    .keys()
+                    .map(|&(keyboard, _)| keyboard),
+            )
+            .chain(
+                self.latest_peek_sequences
+                    .values()
+                    .map(|watermark| watermark.keyboard),
+            )
+    }
+
+    /// Every guest wl_surface a peek watermark is for.
+    #[cfg(test)]
+    pub(super) fn peek_surfaces_for_test(&self) -> impl Iterator<Item = u32> + '_ {
+        self.latest_peek_sequences
+            .keys()
+            .filter_map(|&(_, surface)| surface)
+    }
+
     pub(crate) fn clear_keyboard(&mut self, keyboard: HostId) {
         self.entries.remove(&keyboard);
         self.retired_guest_releases
@@ -1653,10 +1680,17 @@ impl KeyboardFocusRegistry {
             .is_some_and(|focus| focus.guest_surface == guest_surface)
     }
 
-    /// Every host keyboard with a focus.
+    /// Every focus, current or retired, and its host keyboard.
     #[cfg(test)]
-    pub(super) fn keyboards_for_test(&self) -> impl Iterator<Item = HostId> + '_ {
-        self.keyboards.keys().copied()
+    pub(super) fn focuses_for_test(&self) -> impl Iterator<Item = (HostId, KeyboardFocus)> + '_ {
+        self.keyboards
+            .iter()
+            .map(|(&keyboard, &focus)| (keyboard, focus))
+            .chain(
+                self.retired_guest_enters
+                    .iter()
+                    .map(|(&(keyboard, _), &focus)| (keyboard, focus)),
+            )
     }
 
     #[cfg(test)]
