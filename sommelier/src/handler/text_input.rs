@@ -479,80 +479,90 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
 }
 
 fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
-    const V1_SENSITIVE_DATA: u32 = 0x80;
-    const INPUT_FLAG_AUTOCOMPLETE_ON: u32 = 1 << 0;
-    const INPUT_FLAG_SPELLCHECK_ON: u32 = 1 << 4;
-    const INPUT_FLAG_AUTOCAPITALIZE_NONE: u32 = 1 << 6;
-    const INPUT_FLAG_AUTOCAPITALIZE_CHARACTERS: u32 = 1 << 7;
-    const INPUT_FLAG_AUTOCAPITALIZE_WORDS: u32 = 1 << 8;
-    const INPUT_FLAG_AUTOCAPITALIZE_SENTENCES: u32 = 1 << 9;
-    const INPUT_FLAG_HAS_BEEN_PASSWORD: u32 = 1 << 10;
+    use zcr_extended_text_input_v1 as ext;
+    use zwp_text_input_v1 as v1;
+    use zwp_text_input_v3 as v3;
 
     // zwp_text_input_v1 has no PIN purpose and its values after PASSWORD are
     // shifted by one compared with v3.
     let mut v1_hint = hint;
     let v1_purpose = match purpose {
-        0..=8 => purpose,
-        9 => {
-            v1_hint |= V1_SENSITIVE_DATA;
-            2 // PIN -> DIGITS + sensitive_data
+        v3::CONTENT_PURPOSE_NORMAL..=v3::CONTENT_PURPOSE_PASSWORD => purpose,
+        v3::CONTENT_PURPOSE_PIN => {
+            v1_hint |= v1::CONTENT_HINT_SENSITIVE_DATA;
+            v1::CONTENT_PURPOSE_DIGITS
         }
-        10 => 9,  // DATE
-        11 => 10, // TIME
-        12 => 11, // DATETIME
-        13 => 12, // TERMINAL
-        _ => 0,   // Unknown values degrade to NORMAL.
+        v3::CONTENT_PURPOSE_DATE => v1::CONTENT_PURPOSE_DATE,
+        v3::CONTENT_PURPOSE_TIME => v1::CONTENT_PURPOSE_TIME,
+        v3::CONTENT_PURPOSE_DATETIME => v1::CONTENT_PURPOSE_DATETIME,
+        v3::CONTENT_PURPOSE_TERMINAL => v1::CONTENT_PURPOSE_TERMINAL,
+        _ => v1::CONTENT_PURPOSE_NORMAL, // Unknown values degrade to NORMAL.
     };
 
     // Chrome's extension uses TextInputType/TextInputMode enums rather than
     // Wayland's content-purpose enum.
-    let input_type = match (purpose, hint & 0x200 != 0) {
-        (0 | 1 | 7, true) => 14, // TEXT_AREA
-        (2 | 3 | 9, _) => 5,     // NUMBER
-        (4, _) => 6,             // TELEPHONE
-        (5, _) => 7,             // URL
-        (6, _) => 4,             // EMAIL
-        (8, _) => 2,             // PASSWORD
-        (10, _) => 8,            // DATE
-        (11, _) => 12,           // TIME
-        (12, _) => 9,            // DATE_TIME
-        _ => 1,                  // TEXT
+    let multiline = hint & v3::CONTENT_HINT_MULTILINE != 0;
+    let input_type = match (purpose, multiline) {
+        (
+            v3::CONTENT_PURPOSE_NORMAL | v3::CONTENT_PURPOSE_ALPHA | v3::CONTENT_PURPOSE_NAME,
+            true,
+        ) => ext::INPUT_TYPE_TEXT_AREA,
+        (v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_NUMBER | v3::CONTENT_PURPOSE_PIN, _) => {
+            ext::INPUT_TYPE_NUMBER
+        }
+        (v3::CONTENT_PURPOSE_PHONE, _) => ext::INPUT_TYPE_TELEPHONE,
+        (v3::CONTENT_PURPOSE_URL, _) => ext::INPUT_TYPE_URL,
+        (v3::CONTENT_PURPOSE_EMAIL, _) => ext::INPUT_TYPE_EMAIL,
+        (v3::CONTENT_PURPOSE_PASSWORD, _) => ext::INPUT_TYPE_PASSWORD,
+        (v3::CONTENT_PURPOSE_DATE, _) => ext::INPUT_TYPE_DATE,
+        (v3::CONTENT_PURPOSE_TIME, _) => ext::INPUT_TYPE_TIME,
+        (v3::CONTENT_PURPOSE_DATETIME, _) => ext::INPUT_TYPE_DATE_TIME,
+        _ => ext::INPUT_TYPE_TEXT,
     };
     let input_mode = match purpose {
-        2 | 9 => 6, // NUMERIC
-        3 => 7,     // DECIMAL
-        4 => 3,     // TEL
-        5 => 4,     // URL
-        6 => 5,     // EMAIL
-        _ => 0,     // DEFAULT
+        v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_PIN => ext::INPUT_MODE_NUMERIC,
+        v3::CONTENT_PURPOSE_NUMBER => ext::INPUT_MODE_DECIMAL,
+        v3::CONTENT_PURPOSE_PHONE => ext::INPUT_MODE_TEL,
+        v3::CONTENT_PURPOSE_URL => ext::INPUT_MODE_URL,
+        v3::CONTENT_PURPOSE_EMAIL => ext::INPUT_MODE_EMAIL,
+        _ => ext::INPUT_MODE_DEFAULT,
     };
 
-    let mut input_flags = 0;
-    if hint & 0x1 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCOMPLETE_ON;
+    let mut input_flags = ext::INPUT_FLAGS_NONE;
+    if hint & v3::CONTENT_HINT_COMPLETION != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCOMPLETE_ON;
     }
-    if hint & 0x2 != 0 {
+    if hint & v3::CONTENT_HINT_SPELLCHECK != 0 {
         // text-input-v3 calls bit 1 `spellcheck`. Chrome's extension keeps
         // spellchecking distinct from its separate autocorrect flag.
-        input_flags |= INPUT_FLAG_SPELLCHECK_ON;
+        input_flags |= ext::INPUT_FLAGS_SPELLCHECK_ON;
     }
-    if hint & 0x4 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_SENTENCES;
+    if hint & v3::CONTENT_HINT_AUTO_CAPITALIZATION != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_SENTENCES;
     }
-    if hint & 0x8 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_NONE;
+    if hint & v3::CONTENT_HINT_LOWERCASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_NONE;
     }
-    if hint & 0x10 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_CHARACTERS;
+    if hint & v3::CONTENT_HINT_UPPERCASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_CHARACTERS;
     }
-    if hint & 0x20 != 0 {
-        input_flags |= INPUT_FLAG_AUTOCAPITALIZE_WORDS;
+    if hint & v3::CONTENT_HINT_TITLECASE != 0 {
+        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_WORDS;
     }
-    if hint & (0x40 | 0x80) != 0 || matches!(purpose, 8 | 9) {
-        input_flags |= INPUT_FLAG_HAS_BEEN_PASSWORD;
+    let secret = hint & (v3::CONTENT_HINT_HIDDEN_TEXT | v3::CONTENT_HINT_SENSITIVE_DATA) != 0
+        || matches!(
+            purpose,
+            v3::CONTENT_PURPOSE_PASSWORD | v3::CONTENT_PURPOSE_PIN
+        );
+    if secret {
+        input_flags |= ext::INPUT_FLAGS_HAS_BEEN_PASSWORD;
     }
 
-    let learning_mode = u32::from(!matches!(purpose, 8 | 9) && hint & (0x40 | 0x80) == 0);
+    let learning_mode = if secret {
+        ext::LEARNING_MODE_DISABLED
+    } else {
+        ext::LEARNING_MODE_ENABLED
+    };
     (
         v1_hint,
         v1_purpose,
@@ -1850,7 +1860,11 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                     transaction.push(
                         zcr_extended_text_input_v1::req::set_surrounding_text_support(
                             host_ext_id,
-                            u32::from(plan.has_surrounding_text),
+                            if plan.has_surrounding_text {
+                                zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
+                            } else {
+                                zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
+                            },
                         ),
                     );
                 }
@@ -1881,7 +1895,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
                         input_mode,
                         input_flags,
                         learning_mode,
-                        1,
+                        zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
                     ));
                 } else if extension_version_allows(
                     host_ext_version,
