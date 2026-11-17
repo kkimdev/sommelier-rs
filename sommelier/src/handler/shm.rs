@@ -765,6 +765,25 @@ fn clipped_damage(
     ))
 }
 
+/// Whether copying `damage` would write any pixel of `buffer`'s host copy:
+/// damage that clips to nothing needs no copy, and no dma-buf sync either.
+pub(crate) fn damage_reaches_buffer(damage: &DamageRegion, buffer: &BufferState) -> bool {
+    let (Ok(width), Ok(height)) = (
+        usize::try_from(buffer.width),
+        usize::try_from(buffer.height),
+    ) else {
+        // Malformed dimensions: let the copy report them.
+        return true;
+    };
+    match damage {
+        DamageRegion::Empty => false,
+        DamageRegion::Full => width > 0 && height > 0,
+        DamageRegion::Rects(rects) => rects
+            .iter()
+            .any(|&rect| clipped_damage(rect, width, height).is_some()),
+    }
+}
+
 /// Return the half-open edges of a damage rectangle without overflowing i32.
 ///
 /// Wayland damage coordinates are signed and may extend outside the buffer.

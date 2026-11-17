@@ -177,16 +177,26 @@ Tests: `invalid_shm_requests_queue_protocol_errors`,
   the declared size; any other is rejected with `wl_shm.invalid_fd` at
   `create_pool` and `resize`.
   Test: `pool_backing_must_be_a_long_enough_regular_file`.
-- **Damage-only commits (open).** The rule this project has followed says
-  a damage-only commit (no new `attach`) MUST also copy the damaged pixels
-  of the currently committed SHM buffer, since gating the copy on a new
-  attach leaves the host image stale while its damage is signaled. The
-  current code copies only on a new attach: commit `227206b` deliberately
-  renamed `damage_only_commit_copies_mutated_committed_shm_buffer` to
-  `damage_only_commit_does_not_recopy_mutated_released_shm_buffer`, which
-  asserts that behavior. The two disagree, and a separate pull request is
-  resolving it; until it lands, do not change either without resolving it
-  here.
+- **Damage-only commits copy from a buffer the host holds.** A commit
+  without a new `attach` still damages the surface's current buffer, which
+  the host samples again, so its damaged pixels MUST be copied before the
+  commit is forwarded; gating the copy on a new attach leaves the host
+  image stale while its damage is signaled. The one exception is a buffer
+  the host has released (`Released`): per `wl_buffer.release` the client
+  then owns the storage and may be drawing its next frame into it, so
+  reading it could tear, and the host no longer samples it. Exo releases
+  a buffer only after it is detached, so with Exo every damage-only commit
+  copies. A commit with nothing to copy (no damage, or damage outside the
+  buffer) skips the copy path entirely (no dma-buf sync or BO map), so a
+  damage-free commit, such as one acknowledging a configure, is never
+  dropped by a host storage failure.
+  Known limit: a release carries no serial. If a surface is destroyed while
+  buffer A awaits release (`ReleaseOwed`) and A is attached elsewhere before
+  the owed release arrives, that release marks A `Released` while the host
+  holds it, and damage-only commits skip A's copy until its next attach.
+  Tests: `damage_only_commit_copies_the_mutated_current_shm_buffer`,
+  `damage_only_commit_does_not_read_a_released_shm_buffer`,
+  `commit_without_damage_on_a_held_buffer_skips_the_copy`.
 - **`attach` offsets at version 5.** For a `wl_surface` at version 5 or
   newer, `attach(buffer, 0, 0)` MUST NOT create a pending legacy offset, so
   a committed `wl_surface.offset` survives a later zero-coordinate attach.

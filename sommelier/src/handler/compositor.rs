@@ -17,7 +17,9 @@ limitations under the License.
 use crate::allocator::Allocator;
 use crate::handler::aura_objects;
 use crate::handler::display::queue_protocol_error;
-use crate::handler::shm::{copy_shm_damage, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD};
+use crate::handler::shm::{
+    copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout, WL_SHM_ERROR_INVALID_FD,
+};
 use crate::handler::window_placement;
 use crate::protocols::aura_shell::zaura_output::ZauraOutputHandler;
 use crate::protocols::wayland::wl_compositor::WlCompositorHandler;
@@ -632,6 +634,25 @@ fn build_surface_commit_messages(
     Some(messages)
 }
 
+/// The buffer whose host copy `commit` refreshes before it reaches the host.
+///
+/// An attached buffer always is. A commit without an attach still damages
+/// the surface's current buffer, which the host samples again, so the SHM
+/// Commit Copy Invariant refreshes its copy too, while the host holds the
+/// buffer. Once the host has released it, the client owns the storage and
+/// may be drawing its next frame there (`wl_buffer.release`): reading it
+/// could tear, and the host no longer samples it.
+fn buffer_to_copy(ctx: &Context, commit: &SurfaceCommit) -> Option<u32> {
+    match commit.attachment {
+        SurfaceAttachment::Attach(buffer_id) => Some(buffer_id),
+        SurfaceAttachment::Unchanged => commit
+            .state
+            .current_buffer_id()
+            .filter(|&buffer_id| ctx.buffer_is_submitted(buffer_id)),
+        SurfaceAttachment::Detach => None,
+    }
+}
+
 /// Copy one locally bridged SHM buffer before its prepared surface commit.
 ///
 /// Native linux-dmabuf buffers have no local copy state and are immediately
@@ -655,6 +676,12 @@ fn copy_surface_buffer(
     } else {
         commit.buffer_copy_damage()
     };
+    // Nothing to copy needs no dma-buf sync or BO map either. Skipping them
+    // also keeps a commit without damage, such as one that acknowledges a
+    // configure, from being dropped when the host storage misbehaves.
+    if !damage_reaches_buffer(&damage, buffer) {
+        return Ok(());
+    }
     let result = copy_to_host_storage(buffer, resources.allocator, resources.channel, &damage);
     match &result {
         Ok(()) => {
@@ -995,6 +1022,7 @@ impl WlSurfaceHandler for CompositorHandler {
             SurfaceState::prepare_commit,
         );
         let attached_buffer_id = commit.attached_buffer_id();
+        let copied_buffer_id = buffer_to_copy(ctx, &commit);
         let attached_full_mapping = attached_buffer_id.is_some() && commit.uses_full_mapping();
         // A native dma-buf acquire fence belongs to the new contents submitted
         // by an attach.  Re-running the dma-buf wait for a damage-only commit
@@ -1035,7 +1063,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // translation. The buffer copy below can clear `needs_full_copy`, so
         // the pre-copy value is retained separately for the host damage
         // request.
-        let needs_full_damage = attached_buffer_id
+        let needs_full_damage = copied_buffer_id
             .and_then(|buffer_id| ctx.local_buffer(buffer_id))
             .map(|buffer| buffer.needs_full_copy)
             .unwrap_or(false);
@@ -1069,7 +1097,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // compositor sample stale or uninitialised pixels if dma-buf sync,
         // mmap, or GBM mapping fails. A failed copy leaves `needs_full_copy`
         // set so a later commit retries the complete image.
-        if let Some(buffer_id) = attached_buffer_id {
+        if let Some(buffer_id) = copied_buffer_id {
             if let Err(error) = copy_surface_buffer(ctx, buffer_id, &commit) {
                 match error {
                     // The client broke its pool, for example by truncating
@@ -3203,34 +3231,79 @@ mod tests {
     }
 
     #[test]
-    fn damage_only_commit_does_not_recopy_mutated_released_shm_buffer() {
-        const BUFFER_BYTES: usize = 4;
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, true),
-        );
-        let pool = test_pool_file(&ctx, buffer_id);
-        pool.write_all_at(&[0x11; BUFFER_BYTES], 0).unwrap();
+    fn damage_only_commit_copies_the_mutated_current_shm_buffer() {
+        // The SHM Commit Copy Invariant: the host samples the current buffer
+        // again for a commit without an attach, so its damage must be copied
+        // before the commit is forwarded.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        ctx.client_to_host_queue.clear();
+        draw_test_frame(&ctx, 42, 0x22);
 
         let mut handler = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(test_destination(&ctx, buffer_id), [0x11; BUFFER_BYTES]);
-        pool.write_all_at(&[0x22; BUFFER_BYTES], 0).unwrap();
 
-        // No attach is submitted here. The surface keeps its existing content,
-        // and the mutated wl_buffer storage must not be sampled again.
-        assert_eq!(handler.on_damage(&mut ctx, 0, 0, 1, 1), Action::Drop);
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
+        );
+    }
+
+    #[test]
+    fn damage_only_commit_does_not_read_a_released_shm_buffer() {
+        // After wl_buffer.release the client owns the storage and may be
+        // drawing its next frame there; the host no longer samples it.
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        assert!(ctx.mark_buffer_released(42));
+        ctx.client_to_host_queue.clear();
+        draw_test_frame(&ctx, 42, 0x22);
+
+        let mut handler = CompositorHandler;
+        ctx.last_sender_id = TEST_SURFACE;
+        assert_eq!(handler.on_damage_buffer(&mut ctx, 1, 2, 2, 1), Action::Drop);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(test_destination(&ctx, buffer_id), [0x11; BUFFER_BYTES]);
+
+        assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
+        assert_eq!(
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
+        );
+    }
+
+    #[test]
+    fn commit_without_damage_on_a_held_buffer_skips_the_copy() {
+        // A commit that only acknowledges a configure must reach the host
+        // even when the buffer's dma-buf sync would fail (here: no channel).
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        commit_test_frame(&mut ctx, TEST_SURFACE, 42);
+        let host_id = ctx.render_buffer_host_id(42).unwrap();
+        ctx.local_buffer_copy_resources(host_id)
+            .unwrap()
+            .buffer
+            .dmabuf_sync = true;
+        ctx.client_to_host_queue.clear();
+
+        // No damage at all, then damage that clips to nothing.
+        for damage in [None, Some((FRAME_SIDE as i32, 0, 1, 1))] {
+            ctx.last_sender_id = TEST_SURFACE;
+            if let Some((x, y, width, height)) = damage {
+                assert_eq!(
+                    CompositorHandler.on_damage_buffer(&mut ctx, x, y, width, height),
+                    Action::Drop
+                );
+            }
+            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert!(!ctx.fatal_protocol_error);
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue).last(),
+                Some(&(wl_surface_host, REQ_COMMIT))
+            );
+            ctx.client_to_host_queue.clear();
+        }
     }
 
     #[test]
