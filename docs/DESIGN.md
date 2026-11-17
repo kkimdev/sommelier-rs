@@ -196,6 +196,35 @@ Two mechanisms let a handler act outside its own message:
   `state::InternalCallbacks` records what it waits for, such as the
   text-input drain or the placement barrier.
 
+### Message effects
+
+Each message is a transaction. Its handler writes what the message does
+beyond its forward into the `Context`: requests for the host
+(`client_to_host_queue`), events for the guest (`host_to_client_queue`),
+work deferred until the forward (`defer_until_forwarded`), and, if the
+message ends the session, a `state::SessionEnd`. A handler ends one with
+`return ctx.reject(object, code, message)` for a protocol error or
+`return ctx.fail(why)` for the proxy's own failure; the first protocol
+or host error wins over an internal failure. After dispatch,
+`Client::handle_msgs` takes the message's `state::Effects` once
+(`Context::take_effects`):
+
+- If the message did not end the session, it sends the forward, then the
+  output in the same direction, and, once the batch ends, the output back
+  toward the message's source.
+- If it did, it drops the forward and every effect, which closes their
+  descriptors, and ends the batch. After the batch's earlier, valid
+  messages, `handler::display::session_error` encodes the session's one
+  `wl_display.error`. Nothing else writes one.
+
+A session that ends never handles another message, so a fatal branch rolls
+nothing back: only output could escape, and the loop drops it.
+
+Encoded output, a `wire::Outgoing`, never outlives its message. State
+that a later message releases, such as the configures a placement barrier
+holds or a text-input drain, stays structured, and the message that
+releases it encodes it into its own effects.
+
 ### Double-buffered state
 
 The convention for state that a request sets and a later commit applies

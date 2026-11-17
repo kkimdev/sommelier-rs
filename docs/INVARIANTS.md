@@ -142,18 +142,19 @@ always consumed; a configuration problem never stops the proxy) is owned by
     is the proxy's own rule: libwayland-server ignores trailing bytes, but
     the proxy re-encodes requests and must not drop data silently.
 
-  Every session that is closed for a protocol reason gets exactly one
-  error, like a libwayland client (`wl_resource_post_error_vargs`):
-  `queue_protocol_error` queues only the first, so a handler's error is
-  not followed by a decoding one, and a host's forwarded error counts as
-  the one. A session an internal failure or the host ended without an
-  error of its own (a failed dma-buf sync during a commit, say, a host
-  error too long to forward or naming an object only the proxy uses, or
-  a host event the proxy rejects or whose descriptors are ambiguous) gets
-  `implementation` on `wl_display` when its batch ends. The messages
-  before the rejected one in the same batch were valid and are forwarded
-  first; nothing the rejected message's handler queued is sent, except
-  an error of its own.
+  Every session that ends gets exactly one error, like a libwayland
+  client (`wl_resource_post_error_vargs`), written in one place after its
+  batch (see [Message effects](DESIGN.md#message-effects)). The first
+  protocol error wins, so a handler's error is not followed by a decoding
+  one, and a host's forwarded error counts as the one. A session an
+  internal failure or the host ended without an error the guest can be
+  given (a failed dma-buf sync during a commit, say, a host error too long
+  to forward or naming an object only the proxy uses, or a host event the
+  proxy rejects or whose descriptors are ambiguous) gets `implementation`
+  on `wl_display`. The messages before the one that ended the session in
+  the same batch were valid and are sent first. Nothing the ending message
+  produced is sent: not its forward, and nothing its handler queued in
+  either direction, before or after it ended the session.
   Tests: `unknown_client_sender_is_a_protocol_error`,
   `undecodable_request_is_reported_after_forwarding_earlier_requests`,
   `rejected_requests_report_invalid_method_on_the_display`,
@@ -167,13 +168,16 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `descriptor_ambiguity_is_reported_after_the_valid_events`,
   `a_rejected_host_event_sends_nothing_of_its_own`,
   `a_rejected_request_sends_nothing_of_its_own`,
+  `a_failed_handler_forwards_nothing`,
+  `a_handler_error_discards_its_earlier_output`,
+  `a_rejected_message_sends_no_reverse_output`,
   `an_invalid_message_length_is_reported_before_closing`.
 
 ## Protocol errors
 
-A request that violates a protocol error rule MUST queue the specified
-`wl_display.error` on the offending object and end the connection after the
-diagnostic is flushed. Silently returning `Action::Drop` leaves the client
+A request that violates a protocol error rule MUST be rejected with the
+specified `wl_display.error` on the offending object (`ctx.reject`), which
+ends the connection after the diagnostic is flushed. Silently returning `Action::Drop` leaves the client
 believing its state was accepted and desynchronizes later requests. This
 covers invalid `wl_surface.attach` offsets, non-positive buffer scales,
 out-of-range transforms, malformed `wp_viewport` rectangles, invalid
