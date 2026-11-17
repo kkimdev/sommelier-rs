@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
 use crate::state::{Context, DeletedHostId, HostId, SessionEnd};
-use crate::wire::{Action, Outgoing, ProtocolError, WL_DISPLAY_ID};
+use crate::wire::{Action, MessageHeader, Outgoing, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
 pub struct DisplayHandler;
@@ -42,37 +42,30 @@ pub(crate) fn request_error(error: &ProtocolError) -> SessionEnd {
 
 /// The one `wl_display.error` that tells the guest its session ended.
 pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
-    let error = match end {
+    let (object, code, message) = match end {
         SessionEnd::Protocol {
             object,
             code,
             message,
-        } => wl_display::evt::error(WL_DISPLAY_ID, *object, *code, bounded(message)),
-        SessionEnd::HostError {
-            object,
-            code,
-            message,
-        } => wl_display::evt::error(WL_DISPLAY_ID, *object, *code, message),
-        SessionEnd::Internal => wl_display::evt::error(
-            WL_DISPLAY_ID,
+        } => (*object, *code, bounded(message)),
+        SessionEnd::Internal => (
             WL_DISPLAY_ID,
             wl_display::ERROR_IMPLEMENTATION,
             "the proxy failed to handle a request",
         ),
     };
-    error.unwrap_or_else(|error| {
-        // Only the host's message is not bounded. Too long to forward, it
-        // leaves the guest the `implementation` error.
-        log::warn!("Dropping the host error: {error}");
-        session_error(&SessionEnd::Internal)
-    })
+    wl_display::evt::error(WL_DISPLAY_ID, object, code, message)
+        .expect("a bounded diagnostic fits in an error event")
 }
 
-/// A prefix of the proxy's own diagnostic `message` that fits in an error
-/// event. A client-controlled interface name could otherwise make the
-/// event exceed the wire's message length limit (`MessageHeader::MAX_LEN`).
+/// A prefix of `message` that fits in an error event. A host's message or
+/// a client-controlled interface name could otherwise make the event exceed
+/// the wire's message length limit (`MessageHeader::MAX_LEN`).
 fn bounded(message: &str) -> &str {
     const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+    // The header, object, code and string length, and at most 4 bytes of
+    // terminator and padding: every bounded error event fits.
+    const _: () = assert!(MessageHeader::LEN + 16 + MAX_DIAGNOSTIC_BYTES <= MessageHeader::MAX_LEN);
     let mut end = message.len().min(MAX_DIAGNOSTIC_BYTES);
     while !message.is_char_boundary(end) {
         end -= 1;
@@ -169,12 +162,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
             "Wayland Error from Host: object_id={} (guest_id={}), code={}, message={}",
             object_id, guest_id, code, message
         );
-        ctx.end_session(SessionEnd::HostError {
-            object: guest_id,
-            code,
-            message: message.clone(),
-        });
-        Action::Drop
+        ctx.reject(guest_id, code, message.as_str())
     }
 }
 
@@ -248,18 +236,21 @@ mod tests {
         );
     }
 
-    /// A host error too long to forward does not take the session's one
-    /// error: the guest still learns why it ends.
+    /// The host's error reaches the guest on its object and with its code,
+    /// its diagnostic bounded like the proxy's own.
     #[test]
-    fn an_unforwardable_host_error_leaves_the_implementation_error() {
+    fn a_host_error_is_forwarded_with_a_bounded_diagnostic() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.insert_paired_for_test(7, 77, "wl_surface");
 
-        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(4_084));
+        DisplayHandler.on_error(&mut ctx, 77, 3, &"x".repeat(2_000));
 
+        assert_eq!(protocol_error(&ctx), (7, 3));
+        let (error, _) = session_error(ctx.session_end().expect("the session ends"));
         assert_eq!(
-            protocol_error(&ctx),
-            (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
+            u32::from_ne_bytes(error[16..20].try_into().unwrap()),
+            1025,
+            "the diagnostic keeps 1024 bytes and its terminator"
         );
     }
 

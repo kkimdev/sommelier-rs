@@ -146,12 +146,12 @@ always consumed; a configuration problem never stops the proxy) is owned by
   client (`wl_resource_post_error_vargs`), written in one place after its
   batch (see [Message effects](DESIGN.md#message-effects)). The first
   protocol error wins, so a handler's error is not followed by a decoding
-  one, and a host's forwarded error counts as the one. A session an
-  internal failure or the host ended without an error the guest can be
-  given (a failed dma-buf sync during a commit, say, a host error too long
-  to forward or naming an object only the proxy uses, or a host event the
-  proxy rejects or whose descriptors are ambiguous) gets `implementation`
-  on `wl_display`. The messages before the one that ended the session in
+  one, and a host's forwarded error counts as the one, its diagnostic
+  bounded like the proxy's own. A session an internal failure or the host
+  ended without an error the guest can be given (a failed dma-buf sync
+  during a commit, say, a host error naming an object only the proxy uses,
+  or a host event the proxy rejects or whose descriptors are ambiguous)
+  gets `implementation` on `wl_display`. The messages before the one that ended the session in
   the same batch were valid and are sent first. Nothing the ending message
   produced is sent: not its forward, and nothing its handler queued in
   either direction, before or after it ended the session.
@@ -162,7 +162,7 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `a_session_gets_exactly_one_error`,
   `an_internal_failure_ends_the_session_with_an_implementation_error`,
   `a_host_error_is_the_sessions_only_error`,
-  `an_unforwardable_host_error_leaves_the_implementation_error`,
+  `a_host_error_is_forwarded_with_a_bounded_diagnostic`,
   `a_host_error_on_a_host_only_object_ends_the_session`,
   `an_invalid_host_event_is_reported_after_the_valid_ones`,
   `descriptor_ambiguity_is_reported_after_the_valid_events`,

@@ -102,15 +102,9 @@ impl HostId {
 /// one `wl_display.error` (`handler::display::session_error`).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SessionEnd {
-    /// The guest broke the protocol: error `code` on guest object `object`.
+    /// Protocol error `code` on guest object `object`: one the proxy found
+    /// in a guest request, or the host's own, which becomes the guest's.
     Protocol {
-        object: u32,
-        code: u32,
-        message: String,
-    },
-    /// The host's error, on guest object `object`, which becomes the
-    /// guest's own.
-    HostError {
         object: u32,
         code: u32,
         message: String,
