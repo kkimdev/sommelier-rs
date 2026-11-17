@@ -105,7 +105,6 @@ const SERVER_ID_START: u32 = 0xff00_0000;
 const CHILD_ENV: &str = "SOMMELIER_FUZZ_CHILD";
 
 #[test]
-#[ignore = "a host delete_id of a live object leaves its state behind"]
 fn guest_streams_cannot_crash_hang_or_leak() {
     in_own_process(|| {
         // `RUST_LOG` shows the proxy's view of a failing seed.

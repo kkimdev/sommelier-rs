@@ -799,10 +799,6 @@ impl Context {
         }
     }
 
-    pub(crate) fn remove_render_buffer_host(&mut self, host_buffer_id: u32) -> bool {
-        self.render_buffers.remove(HostId(host_buffer_id))
-    }
-
     /// Apply the ID-ownership policy after a host `wl_buffer.destroy` has
     /// successfully entered the ordered outgoing stream.
     ///

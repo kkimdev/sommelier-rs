@@ -504,7 +504,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let (destructor_cleanup, local_destructor_cleanup, dropped_destructor_cleanup) =
                     if req.msg_type.as_deref() == Some("destructor") {
                         (
-                            quote! { ctx.shadow_table.guest_destroyed(msg.sender_id); },
+                            quote! { ctx.guest_destroyed(msg.sender_id); },
                             quote! { crate::handler::display::queue_local_delete_id(ctx, msg.sender_id); },
                             quote! {
                                 if sender == Link::Local {
@@ -659,7 +659,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 let is_destructor = evt.msg_type.as_deref() == Some("destructor");
                 let destructor_cleanup = if is_destructor {
                     quote! {
-                        ctx.shadow_table.guest_destroyed(guest_sender_id);
+                        ctx.guest_destroyed(guest_sender_id);
                     }
                 } else {
                     quote! {}

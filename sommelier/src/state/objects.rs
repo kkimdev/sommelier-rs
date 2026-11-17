@@ -35,8 +35,14 @@ pub enum DeletedHostId {
     Ignored,
     /// A host-only object; no guest object is owed a `delete_id`.
     HostOnly,
-    /// An object paired with this guest object, now owed its `delete_id`.
-    Paired(u32),
+    /// An object paired with guest object `guest`, now owed its `delete_id`.
+    Paired {
+        guest: u32,
+        /// Whether the guest object was live: the host destroyed it on its
+        /// own, rather than acknowledging the guest's destructor, so this
+        /// is the object's first end.
+        was_live: bool,
+    },
 }
 
 /// What a live guest object stands for on the host.
@@ -675,11 +681,15 @@ impl ShadowTable {
         let Some(guest) = guest else {
             return DeletedHostId::HostOnly;
         };
+        let was_live = !self.is_pending_destroy_guest(guest.0);
         let paired = self
             .forget_guest_object(guest)
             .and_then(|object| object.host());
         debug_assert_eq!(paired, Some(host), "guest {guest:?} was not paired");
-        DeletedHostId::Paired(guest.0)
+        DeletedHostId::Paired {
+            guest: guest.0,
+            was_live,
+        }
     }
 
     /// End guest object `guest`: the one place a guest object ends.
@@ -1142,7 +1152,10 @@ mod tests {
 
         assert_eq!(
             table.release_deleted_host_id(first),
-            DeletedHostId::Paired(10)
+            DeletedHostId::Paired {
+                guest: 10,
+                was_live: false
+            }
         );
         assert_eq!(table.get_host_id(10), None);
         assert_eq!(table.get_interface(10), None);

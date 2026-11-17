@@ -15,9 +15,97 @@ limitations under the License.
 */
 
 //! How per-object state ends with its object.
+//!
+//! An object can end in several ways: the guest's destructor, a terminal
+//! event, an object that never reached the host, or a host
+//! `wl_display.delete_id`, which the host may send for a live object of the
+//! guest's (INVARIANTS "Object lifetimes"). Whatever the way, the
+//! [`Context`] wrapper of the [`super::ShadowTable`] transition runs the
+//! one hook for the state the object leaves behind:
+//!
+//! - [`forget_object`] runs exactly once per object, at its first end,
+//!   such as a guest destructor, or a host `delete_id` while the guest
+//!   object was live. A later `delete_id` acknowledging the destructor
+//!   forgets nothing again.
+//! - [`forget_host_id`] runs when the host ID is released, for state that
+//!   outlives the guest object: a render buffer the host still shows, or an
+//!   asynchronous dma-buf create.
+//!
+//! What a hook sends joins the current message's effects. A guest
+//! destructor runs it before the transition, while the table still knows
+//! the object; a `delete_id` runs it after, so a hook gets the object's
+//! interface and IDs and never looks up its own entry.
 
-#[cfg(test)]
-use super::{Context, HostId};
+use super::{Context, DeletedHostId, HostId};
+use crate::handler::{compositor, keyboard, output};
+
+impl Context {
+    /// The guest destroyed guest object `guest_id`; see
+    /// [`super::ShadowTable::guest_destroyed`].
+    pub(crate) fn guest_destroyed(&mut self, guest_id: u32) {
+        self.forget_live_object(guest_id);
+        self.shadow_table.guest_destroyed(guest_id);
+    }
+
+    /// Apply the host's `wl_display.delete_id` for `host_id`; see
+    /// [`super::ShadowTable::release_deleted_host_id`].
+    pub(crate) fn release_deleted_host_id(&mut self, host_id: u32) -> DeletedHostId {
+        let interface = self
+            .shadow_table
+            .get_guest_id(host_id)
+            .and_then(|guest| self.shadow_table.get_interface(guest))
+            .map(str::to_owned);
+        let deleted = self.shadow_table.release_deleted_host_id(host_id);
+        if let (
+            DeletedHostId::Paired {
+                guest,
+                was_live: true,
+            },
+            Some(interface),
+        ) = (deleted, interface)
+        {
+            forget_object(self, &interface, guest, Some(host_id));
+        }
+        if deleted != DeletedHostId::Ignored {
+            forget_host_id(self, HostId(host_id));
+        }
+        deleted
+    }
+
+    /// Forget guest object `guest_id` if it is live: local, or paired and
+    /// not destroyed yet.
+    fn forget_live_object(&mut self, guest_id: u32) {
+        let table = &self.shadow_table;
+        let Some(interface) = table
+            .request_sender(guest_id)
+            .and(table.get_interface(guest_id))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let host_id = table.get_host_id(guest_id);
+        forget_object(self, &interface, guest_id, host_id);
+    }
+}
+
+/// Forget the state of guest object `guest`, of `interface`, at its first
+/// end, through the owner of each interface's state. `host` is its host
+/// object, if it has one.
+fn forget_object(ctx: &mut Context, interface: &str, guest: u32, host: Option<u32>) {
+    match (interface, host) {
+        ("wl_output", Some(host)) => output::forget_output(ctx, host),
+        ("wl_keyboard", Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
+        ("wl_surface", Some(host)) => compositor::forget_surface(ctx, guest, host),
+        _ => {}
+    }
+}
+
+/// Forget the state of host ID `host`, which the host released: what
+/// outlived its guest object.
+fn forget_host_id(ctx: &mut Context, host: HostId) {
+    ctx.render_buffers.remove(host);
+    ctx.pending_native_creates.remove(&host);
+}
 
 #[cfg(test)]
 impl Context {

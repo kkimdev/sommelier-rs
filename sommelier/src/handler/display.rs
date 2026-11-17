@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::{wl_callback, wl_display, wl_registry};
-use crate::state::{Context, DeletedHostId, HostId, SessionEnd};
+use crate::state::{Context, DeletedHostId, SessionEnd};
 use crate::wire::{Action, MessageHeader, Outgoing, ProtocolError, WL_DISPLAY_ID};
 use log::error;
 
@@ -123,18 +123,12 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 
     fn on_delete_id(&mut self, ctx: &mut Context, id: u32) -> Action {
         // The host has destroyed the object, so no later event can name it,
-        // and the ID may go to the next new object: drop all state keyed by
-        // the host ID along with the ID itself.
-        let paired_guest = match ctx.shadow_table.release_deleted_host_id(id) {
-            DeletedHostId::Ignored => return Action::Drop,
-            DeletedHostId::HostOnly => None,
-            DeletedHostId::Paired(guest_id) => Some(guest_id),
-        };
-        ctx.remove_render_buffer_host(id);
-        ctx.pending_native_creates.remove(&HostId(id));
-        if let Some(guest_id) = paired_guest {
-            // Forward the translated acknowledgement for the guest object.
-            queue_delete_id(ctx, guest_id);
+        // and the ID may go to the next new object: the object's state ends
+        // with the ID (see `crate::state::lifecycle`).
+        if let DeletedHostId::Paired { guest, .. } = ctx.release_deleted_host_id(id) {
+            // Forward the translated acknowledgement for the guest object,
+            // after whatever ending it sent the guest.
+            queue_delete_id(ctx, guest);
         }
         Action::Drop
     }
@@ -170,7 +164,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
 mod tests {
     use super::*;
     use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
-    use crate::state::Context;
+    use crate::state::{Context, HostId};
     use crate::test_support::{protocol_error, queued_headers, raw_dispatch};
     use crate::wire::{ProtocolError, WireMessage};
 
@@ -204,7 +198,6 @@ mod tests {
     /// guest's destructor would, so the host ID the allocator hands out next
     /// starts clean.
     #[test]
-    #[ignore = "O1a: a host delete_id leaves the output record behind"]
     fn a_host_destroyed_output_is_forgotten() {
         use crate::handler::registry::RegistryHandler;
         use crate::protocols::aura_shell::zaura_output;
@@ -243,7 +236,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "O1b: a host delete_id leaves the keyboard state behind"]
     fn a_host_destroyed_keyboard_is_forgotten() {
         use crate::handler::keyboard::KeyboardHandler;
         use crate::protocols::keyboard_extension_unstable_v1::{
@@ -291,8 +283,33 @@ mod tests {
         );
     }
 
+    /// An object is forgotten once, at its first end: the `delete_id` that
+    /// acknowledges the guest's destructor forgets nothing again, so the
+    /// extended keyboard is destroyed and retired once.
     #[test]
-    #[ignore = "O1c: a host delete_id leaves the surface state behind"]
+    fn a_delete_id_after_the_destructor_forgets_nothing_again() {
+        use crate::handler::keyboard::KeyboardHandler;
+        const EXTENSION: u32 = 100;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.shadow_table
+            .insert_host_only_for_test(EXTENSION, "zcr_keyboard_extension_v1", 2);
+        ctx.host_keyboard_extension_id = Some(HostId(EXTENSION));
+        let host = ctx.shadow_table.create_paired(20, "wl_keyboard", 1, 1);
+        KeyboardHandler::ensure_extended_keyboard_bound(&mut ctx, HostId(host));
+        ctx.guest_destroyed(20);
+        ctx.client_to_host_queue.clear();
+
+        DisplayHandler.on_delete_id(&mut ctx, host);
+
+        assert!(ctx.client_to_host_queue.is_empty());
+        assert!(!ctx.is_fatal(), "the extended keyboard is retired once");
+        assert_eq!(
+            queued_headers(&ctx.host_to_client_queue),
+            [(WL_DISPLAY_ID, wl_display::EVT_DELETE_ID)]
+        );
+    }
+
+    #[test]
     fn a_host_destroyed_surface_is_forgotten() {
         use crate::protocols::aura_shell::zaura_surface;
         const SURFACE: u32 = 30;

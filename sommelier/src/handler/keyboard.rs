@@ -947,53 +947,39 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         }
         Action::Forward
     }
+}
 
-    /// Clean up when the guest destroys the wl_keyboard object.
-    ///
-    /// `on_release` is a **client→host request**: `ctx.last_sender_id` is the
-    /// **guest** keyboard ID. We must translate it to a host ID before looking
-    /// up `keyboard_to_extended_keyboard` (which is keyed by [`HostId`]s).
-    fn on_release(&mut self, ctx: &mut Context) -> Action {
-        let guest_id = ctx.last_sender_id;
-        log::info!(">>> wl_keyboard.on_release: guest_id={}", guest_id);
-        let guest_seat = ctx.keyboard_to_seat.remove(&guest_id);
-        // Translate guest ID → host ID. Returns None for unknown keyboards
-        // (e.g. keyboards that never received an on_enter event).
-        let Some(host_keyboard_id) = ctx.shadow_table.get_host_id(ctx.last_sender_id).map(HostId)
-        else {
-            if let Some(guest_seat) = guest_seat {
-                crate::handler::text_input::end_backspace_repeat_for_seat(ctx, guest_seat);
-            }
-            return Action::Forward;
-        };
-        let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
-        // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
-        // All must be reset so that a re-created keyboard starts from a clean
-        // slate and doesn't inherit stale state from the previous session.
-        //
-        // accelerator suppression: a key dropped under the old session would
-        //   cause its release event to be silently swallowed on the new keyboard.
-        // modifiers: if the new keyboard receives a key event before the first
-        //   wl_keyboard.modifiers, the accelerator check would use stale modifier
-        //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
-        Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
-        if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id)
-        {
-            ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
-            ctx.client_to_host_queue
-                .push(zcr_extended_keyboard_v1::req::destroy(host_extended_id.0));
-            // Unregister from the host dispatch table so stale peek_key events
-            // (version ≥ 2) sent after destroy cannot be dispatched to a dead object.
-            ctx.retire_destroyed_host_object(host_extended_id.0);
-            log::debug!(
-                "Destroyed extended keyboard: host_extended_id={} for host_keyboard_id={}",
-                host_extended_id.0,
-                host_keyboard_id.0
-            );
-        }
-        crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
-        Action::Forward
+/// Forget guest keyboard `guest_keyboard_id` and its host keyboard
+/// `host_keyboard_id`, which ended (see `crate::state::lifecycle`): end its
+/// focus, destroy its extended keyboard, and clear its routing, keymap, XKB
+/// and key state.
+pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_keyboard_id: HostId) {
+    ctx.keyboard_to_seat.remove(&guest_keyboard_id);
+    let focus_update = ctx.keyboard_focus.release(host_keyboard_id);
+    // Clear per-keyboard keymap, dropped keys, XKB state, and modifiers.
+    // All must be reset so that a re-created keyboard starts from a clean
+    // slate and doesn't inherit stale state from the previous session.
+    //
+    // accelerator suppression: a key dropped under the old session would
+    //   cause its release event to be silently swallowed on the new keyboard.
+    // modifiers: if the new keyboard receives a key event before the first
+    //   wl_keyboard.modifiers, the accelerator check would use stale modifier
+    //   bits and could produce wrong NOT_HANDLED/HANDLED decisions.
+    KeyboardHandler::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+    if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
+        ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
+        ctx.client_to_host_queue
+            .push(zcr_extended_keyboard_v1::req::destroy(host_extended_id.0));
+        // Unregister from the host dispatch table so stale peek_key events
+        // (version ≥ 2) sent after destroy cannot be dispatched to a dead object.
+        ctx.retire_destroyed_host_object(host_extended_id.0);
+        log::debug!(
+            "Destroyed extended keyboard: host_extended_id={} for host_keyboard_id={}",
+            host_extended_id.0,
+            host_keyboard_id.0
+        );
     }
+    crate::handler::text_input::apply_keyboard_focus_changes(ctx, &focus_update.seat_changes);
 }
 
 /// `zcr_keyboard_extension_v1` handler — sommelier only sends requests to this
@@ -1172,6 +1158,14 @@ mod tests {
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::wire::WireMessage;
     use std::os::fd::AsFd;
+
+    /// Release guest keyboard `ctx.last_sender_id` as the generated
+    /// dispatcher does: the handler forwards `wl_keyboard.release`, and
+    /// ending the keyboard forgets its state.
+    fn release_keyboard(handler: &mut KeyboardHandler, ctx: &mut Context) {
+        assert_eq!(handler.on_release(ctx), Action::Forward);
+        ctx.guest_destroyed(ctx.last_sender_id);
+    }
 
     /// Helper: create an anonymous memfd, write the default keymap into it
     /// (with a trailing NUL byte as required by the Wayland spec), and call
@@ -2757,8 +2751,7 @@ mod tests {
         // Simulate a wl_keyboard.release from the guest (last_sender_id = guest ID).
         ctx.last_sender_id = guest_keyboard_id;
 
-        let action = handler.on_release(&mut ctx);
-        assert_eq!(action, Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
 
         // Map entry must be removed so re-binding is possible.
         assert!(
@@ -4105,7 +4098,7 @@ mod tests {
         // produce another event. Its watermark must disappear with it so the
         // still-live keyboard 100 can continue the held-Space repeat.
         ctx.last_sender_id = 11;
-        assert_eq!(keyboard_handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut keyboard_handler, &mut ctx);
         ctx.client_to_host_queue.clear();
 
         ctx.last_sender_id = 2000;
@@ -4800,7 +4793,7 @@ mod tests {
         ctx.shadow_table
             .insert_paired_for_test(5, 10, "wl_keyboard"); // guest 5 ↔ host 10
         ctx.last_sender_id = 5;
-        handler.on_release(&mut ctx);
+        release_keyboard(&mut handler, &mut ctx);
 
         // Accelerator suppression must be empty after release.
         assert!(
@@ -4963,7 +4956,7 @@ mod tests {
 
         // Release the keyboard (client->host request: last_sender_id = guest ID).
         ctx.last_sender_id = 5;
-        handler.on_release(&mut ctx);
+        release_keyboard(&mut handler, &mut ctx);
 
         assert!(
             !ctx.keyboard_modifiers.contains_key(&HostId(10)),
@@ -4979,24 +4972,10 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, Vec::new());
         // last_sender_id 999 is not in the shadow table.
         ctx.last_sender_id = 999;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "no destroy message should be queued for an unknown keyboard"
-        );
-    }
-
-    #[test]
-    fn on_release_before_host_mapping_cleans_guest_seat_routing() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.keyboard_to_seat.insert(5, 7);
-        ctx.last_sender_id = 5;
-
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
-        assert!(
-            !ctx.keyboard_to_seat.contains_key(&5),
-            "release before the first host event must not leave a stale keyboard route"
         );
     }
 
@@ -5038,7 +5017,7 @@ mod tests {
         });
 
         ctx.last_sender_id = guest_keyboard;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert!(
             ctx.keyboard_focus.surface_for_seat(guest_seat).is_none(),
             "keyboard release must not leave a stale seat focus"
@@ -5111,7 +5090,7 @@ mod tests {
         });
 
         ctx.last_sender_id = guest_keyboard;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert_eq!(
             ctx.keyboard_focus.surface_for_seat(guest_seat),
             Some(guest_surface)
@@ -5179,7 +5158,7 @@ mod tests {
         });
 
         ctx.last_sender_id = guest_keyboard;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert!(ctx
             .key_generations
             .physically_held(HostId(other_host_keyboard), EVDEV_KEY_BACKSPACE));
@@ -5221,7 +5200,7 @@ mod tests {
         // Parent seat release has already invalidated the host seat proxy.
         ctx.shadow_table.guest_destroyed(guest_seat);
         ctx.last_sender_id = guest_keyboard;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert!(
             ctx.client_to_host_queue.is_empty(),
             "do not send v1 deactivate through a released host seat"
@@ -5280,7 +5259,7 @@ mod tests {
         }
 
         ctx.last_sender_id = guest_keyboard;
-        assert_eq!(handler.on_release(&mut ctx), Action::Forward);
+        release_keyboard(&mut handler, &mut ctx);
         assert!(ctx
             .text_inputs
             .values()

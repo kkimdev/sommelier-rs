@@ -18,7 +18,7 @@ limitations under the License.
 //! the guest's `zxdg_output_v1` extension.
 //!
 //! The events feed [`crate::state::OutputRegistry`], which owns every
-//! output fact; `wl_output.release` also releases the output's Aura child.
+//! output fact; the end of an output also releases its Aura child.
 //! `zxdg_output_v1` passes through: on a fractionally scaled display only
 //! its logical size describes the output in surface coordinates, which the
 //! integer `wl_output.scale` cannot.
@@ -105,16 +105,22 @@ impl crate::protocols::wayland::wl_output::WlOutputHandler for OutputHandler {
             // generated dispatcher completes the destructor locally.
             return Action::Drop;
         };
-        if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
-            aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
-        }
-        // The Aura child goes first (see `aura_objects::release`). Returning
-        // Forward would put wl_output.release ahead of the queued Aura
-        // release, so queue the translated destructor explicitly.
-        ctx.shadow_table.guest_destroyed(guest_output_id);
+        // Ending the output releases its Aura child (see `forget_output`),
+        // which goes first (see `aura_objects::release`). Returning Forward
+        // would put wl_output.release ahead of the queued Aura release, so
+        // queue the translated destructor explicitly.
+        ctx.guest_destroyed(guest_output_id);
         ctx.client_to_host_queue
             .push(wl_output::req::release(host_output_id));
         Action::Drop
+    }
+}
+
+/// Forget host output `host_output_id`, which ended (see
+/// `crate::state::lifecycle`), and release its Aura child.
+pub(crate) fn forget_output(ctx: &mut Context, host_output_id: u32) {
+    if let Some(zaura_output_host_id) = ctx.outputs.release(host_output_id) {
+        aura_objects::release(ctx, aura_objects::AuraChild::OUTPUT, zaura_output_host_id);
     }
 }
 
