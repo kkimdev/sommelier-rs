@@ -222,6 +222,7 @@ fn global_removal_seen(ctx: &Context, name: u32, generation: u64) -> bool {
 fn retire_unseen_global(ctx: &mut Context, name: u32) {
     ctx.removed_global_generations.remove(&name);
     reset_internal_binding_for_global(ctx, name);
+    crate::handler::shm::retire_guest_shms(ctx, name);
     ctx.singleton_candidates.remove(&name);
     let hidden = ctx.hidden_host_globals.remove(&name).is_some();
     let advertised = ctx.host_globals.remove(&name).is_some();
@@ -689,13 +690,6 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         if let Some(host_id) = ctx.host_shm_id.take() {
             ctx.shadow_table.retire_host(host_id);
         }
-        // A synthetic wl_shm object is bound locally, but its capability
-        // source is the internal host binding above. Once that binding's
-        // global disappears, requests from already-bound guest objects must
-        // be ignored rather than being serviced by a replacement binding.
-        ctx.stale_shm_guest_objects
-            .extend(ctx.shm_guest_formats.keys().copied());
-        ctx.stale_shm_pools.extend(ctx.pools.keys().copied());
         ctx.host_shm_global_name = None;
         clear_host_shm_wl_formats(ctx);
     }
@@ -938,6 +932,8 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             if starts_new_generation && internal_binding_matches(ctx, name) {
                 reset_internal_binding_for_global(ctx, name);
             }
+            // The old generation of the name has retired.
+            crate::handler::shm::retire_guest_shms(ctx, name);
             replace_global_metadata_for_generation(ctx, name);
             // The name may now be another interface's, so a singleton
             // whose binding it was needs another candidate.
@@ -1293,7 +1289,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // only after the host wl_shm/dmabuf capability event has arrived.
             // This mirrors ChromiumOS Sommelier and prevents a guest from
             // selecting a format that the host cannot import.
-            register_guest_shm(ctx, *guest_new_id);
+            register_guest_shm(ctx, *guest_new_id, name);
 
             // The host-side wl_shm object was bound when the host global was
             // observed. Binding the synthetic guest global must not issue a

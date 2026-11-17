@@ -318,6 +318,18 @@ pub(crate) struct HostAuraShell {
     pub(crate) version: u32,
 }
 
+/// A synthetic guest `wl_shm` object.
+#[derive(Debug, Default)]
+pub struct GuestShm {
+    /// The host `wl_shm` global the guest bound it from. Its requests are
+    /// ignored once that name retires (`Context::stale_shm_guest_objects`),
+    /// whichever global the proxy itself has bound.
+    pub global_name: u32,
+    /// The formats already sent to it, so a host capability event that
+    /// arrives after the bind is not sent twice.
+    pub formats: HashSet<u32>,
+}
+
 /// The modifier and group state a host `wl_keyboard.modifiers` event
 /// carries, as XKB masks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -391,19 +403,17 @@ pub struct Context {
     /// Optional formats learned from the internal host linux-dmabuf binding.
     /// These are removed when that binding's global is withdrawn.
     pub host_dmabuf_shm_formats: HashSet<u32>,
-    /// Formats already sent to each synthetic guest wl_shm object. Keeping
-    /// this per object prevents duplicate format events when host capability
-    /// events arrive after a guest bind.
-    pub shm_guest_formats: HashMap<u32, HashSet<u32>>,
-    /// Synthetic guest wl_shm objects whose host capability binding has been
-    /// removed. Wayland keeps an already-bound global object valid for
-    /// teardown, but requests sent to it after global removal are ignored.
-    /// Keep these IDs reserved and reject create_pool without allowing a
-    /// replacement host wl_shm binding to service the old object.
+    /// Every synthetic guest wl_shm object.
+    pub guest_shms: HashMap<u32, GuestShm>,
+    /// Synthetic guest wl_shm objects whose own global, the name each was
+    /// bound from, has retired. Wayland keeps an already-bound global
+    /// object valid for teardown, but requests sent to it after its
+    /// global's removal are ignored, even while the proxy has bound a
+    /// replacement; objects bound from a live name are unaffected.
     pub stale_shm_guest_objects: HashSet<u32>,
-    /// Synthetic wl_shm_pool children created before the host capability
-    /// binding disappeared. They remain destroyable, but must not resize or
-    /// create buffers through a replacement host binding.
+    /// Synthetic wl_shm_pool children of a stale guest wl_shm, created before
+    /// its global retired or after it. They remain destroyable, but must not
+    /// resize or create buffers through a replacement host binding.
     pub stale_shm_pools: HashSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
@@ -1030,7 +1040,7 @@ impl Context {
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),
-            shm_guest_formats: HashMap::new(),
+            guest_shms: HashMap::new(),
             stale_shm_guest_objects: HashSet::new(),
             stale_shm_pools: HashSet::new(),
             host_text_input_manager_v1_id: None,

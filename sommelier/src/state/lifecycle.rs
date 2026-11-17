@@ -331,11 +331,7 @@ impl Context {
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
             guest("SHM pool", pool, "wl_shm_pool");
         }
-        for &shm in self
-            .shm_guest_formats
-            .keys()
-            .chain(&self.stale_shm_guest_objects)
-        {
+        for &shm in self.guest_shms.keys().chain(&self.stale_shm_guest_objects) {
             guest("wl_shm state", shm, "wl_shm");
         }
         for (buffer, _) in self.render_buffer_lifecycles() {

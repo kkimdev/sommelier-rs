@@ -38,6 +38,8 @@ pub struct ShmPool {
     pub file: Arc<File>,
     /// The size the client declared. `wl_shm_pool.resize` only grows it.
     pub size: usize,
+    /// The guest `wl_shm` that created it, whose host global it depends on.
+    pub shm: u32,
 }
 
 pub struct BufferState {

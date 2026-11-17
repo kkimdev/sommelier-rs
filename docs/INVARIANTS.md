@@ -331,8 +331,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   guest owns its ID, but inert: a `wl_shm_pool` that ignores its requests
   in turn, or a `wl_buffer` that attaches as no buffer. Children created
   before the removal (such as a `wl_shm_pool`) still complete their own
-  lifecycle and emit exactly one `delete_id`.
+  lifecycle and emit exactly one `delete_id`. Only the objects bound from
+  the removed global, and their children, go inert: a guest `wl_shm` bound
+  from a replacement name keeps working.
   Tests: `removed_host_shm_creates_only_inert_pools_and_buffers`,
+  `only_objects_bound_from_a_retired_shm_global_go_inert`,
+  `a_guest_shm_bound_from_an_unbound_name_goes_inert_when_it_retires`,
+  `a_re_advertised_shm_name_retires_only_its_old_generation`,
   `removed_host_shm_ignores_requests_from_existing_pool_until_destroy`,
   `attaching_an_inert_buffer_detaches_the_surface`.
 - **Releasing a parent does not end its children.** `wl_seat.release`
@@ -419,8 +424,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   one under a new name while the old name is bound; when the old one
   retires, the proxy binds the lowest other name that a registry still
   lists and that no registry has seen removed, since a compositor may
-  destroy a global as soon as it removes it. Guest `wl_shm` objects bound
-  before the retirement stay inert, whichever name they were bound from.
+  destroy a global as soon as it removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
   `a_replacement_another_registry_saw_removed_is_not_bound`,
   `a_replacement_removed_first_is_not_bound`,
