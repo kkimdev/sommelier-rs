@@ -172,6 +172,27 @@ and exit cleanly while the proxy logs no error. It needs `weston` and
 `wayland-utils`) and passes with a note without them; CI installs them on
 x86_64 and sets `SOMMELIER_E2E_REQUIRED=1` so a missing one fails.
 
+## Live VirtWL test
+
+Unit tests reach the VirtWL channel only through the functions that
+handle what an ioctl returned; the ioctls themselves need a real
+`virtio_wl` device. `virtwl_channel`'s
+`live_try_recv_eagain_then_async_recv_wakes` drives one: it opens a
+VirtWL context, checks that a receive on the empty context returns at
+once and that an asynchronous receive waits, then sends a
+`wl_display.sync` and waits up to five seconds for the host compositor's
+`wl_callback.done`. It is ignored by default, because CI has no such
+device. Run it in a Crostini container, or another guest whose
+`/dev/wl0` you can read and write and whose host compositor answers;
+set `SOMMELIER_TEST_VIRTWL` to use another device path:
+
+```bash
+cargo test -p sommelier --bins live_try_recv -- --ignored
+```
+
+The test opens a context of its own, a new connection to the host
+compositor, so a Sommelier already running in the guest keeps working.
+
 ## Commit messages
 
 Make small commits, one logical change each, in the form
