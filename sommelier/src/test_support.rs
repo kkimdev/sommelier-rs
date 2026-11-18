@@ -404,22 +404,20 @@ impl Rng {
 
 /// A uniquely named scratch directory removed when dropped.
 ///
-/// Tests run in parallel inside one process, so the name combines the process
-/// ID, a caller label, and a per-process counter.
+/// `mkdtemp` picks a name no other directory has, so tests running in
+/// parallel, and a directory a crashed run left behind, never collide.
+/// The name stays short: a socket bound inside must fit its whole path
+/// in the 108 bytes of `sun_path`.
 pub struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    /// Create a fresh directory under the system temporary directory.
+    /// Create a fresh directory, `sommelier-<label>-` and six random
+    /// characters, under the system temporary directory.
     pub fn new(label: &str) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sommelier-test-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).expect("create test directory");
+        let template = std::env::temp_dir().join(format!("sommelier-{label}-XXXXXX"));
+        let path = nix::unistd::mkdtemp(&template).expect("create test directory");
         Self { path }
     }
 
