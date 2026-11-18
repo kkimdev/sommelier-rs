@@ -1937,11 +1937,22 @@ pub struct KeyboardFocusRegistry {
 }
 
 impl KeyboardFocusRegistry {
+    /// The surface the keyboards of `guest_seat` focus. [`Self::enter`]
+    /// retires every other keyboard of the seat on another surface, so
+    /// they all focus the same one.
     pub fn surface_for_seat(&self, guest_seat: u32) -> Option<u32> {
-        self.keyboards
-            .values()
-            .find(|focus| focus.guest_seat == guest_seat)
-            .map(|focus| focus.guest_surface)
+        let surfaces = || {
+            self.keyboards
+                .values()
+                .filter(move |focus| focus.guest_seat == guest_seat)
+                .map(|focus| focus.guest_surface)
+        };
+        let surface = surfaces().next();
+        debug_assert!(
+            surfaces().all(|other| Some(other) == surface),
+            "the keyboards of seat {guest_seat} focus different surfaces"
+        );
+        surface
     }
 
     pub fn focus_for_keyboard(&self, host_keyboard: HostId) -> Option<KeyboardFocus> {
