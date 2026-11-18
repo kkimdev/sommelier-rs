@@ -14,34 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A model of the `zwp_text_input_v3` client of GTK3 and GTK4: facts C6 to
-//! C9.
+//! A model of the `zwp_text_input_v3` client of GTK3 and GTK4, for a
+//! single-line entry: facts C6 to C9.
 //!
-//! Sources:
-//!
-//! - GTK3, branch `gtk-3-24`: the input module `modules/input/imwayland.c`
-//!   and the entry `gtk/gtkentry.c`;
-//! - GTK4, branch `main`: `gtk/gtkimcontextwayland.c` and the text widget
-//!   `gtk/gtktext.c`.
+//! Sources: GTK3 (`gtk-3-24`) `modules/input/imwayland.c` and the entry,
+//! `gtk/gtkentry.c`; GTK4 (`main`) `gtk/gtkimcontextwayland.c` and the
+//! entry's text widget, `gtk/gtktext.c`. A multi-line `GtkTextView`
+//! resets and reports differently and is not modelled.
 //!
 //! A display has one text input (`GtkIMContextWaylandGlobal`). Each field
-//! has an input method context, and the context of the field with the
-//! keyboard focus is the current one (`global->current`), which every
-//! event goes to and which alone sends requests. The two versions differ
-//! in three ways:
+//! has an entry and its input method context; the context of the field
+//! with the keyboard focus is current (`global->current`), receives every
+//! event, and alone sends requests. The versions differ:
 //!
 //! - GTK3 sends requests only between its own `enable` and `disable`
 //!   (`context->enabled`); GTK4 whenever its context is current.
-//! - On a press, GTK4 always resets; GTK3 only when its entry needs it
-//!   (C8).
-//! - On a single-click release, GTK4 always enables; GTK3 only if the
-//!   caret did not jump (C7).
+//! - GTK3 states a surrounding text that changed twice in one report.
+//! - GTK4 reports the caret it last laid out, and lays out after each
+//!   event the model handles: a caret that moved goes out with a `commit`
+//!   of its own (`after_layout_cb`).
+//! - On a press GTK4 always resets, and GTK3 only when its entry needs it
+//!   (C8); a single-click release enables on GTK4 always, and on GTK3
+//!   only if the caret did not jump (C7).
+//!
+//! GTK's gestures take a touch as a press, so the press kind is ignored.
 
 use std::mem;
 
 use super::{
-    caret_rect, content_type, cursor_rectangle, field_on, utf8, Client, DropReason, Dropped, Field,
-    Part, PressKind, Protocol,
+    caret_rect, chars_around, content_type, cursor_rectangle, delete_chars, field_on, utf8, Client,
+    DropReason, Dropped, Field, Part, PressKind, Protocol,
 };
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, req, Event};
 use crate::sim::clock::Micros;
@@ -49,14 +51,33 @@ use crate::sim::editor::{Target, Txn};
 use crate::sim::hangul::Key;
 use crate::wire::Outgoing;
 
-/// The events of the transaction in progress, as the current context
-/// holds them (`pending_preedit`, `pending_commit`,
-/// `pending_surrounding_delete`). A preedit or commit of null is `None`.
+/// A transaction in progress (`pending_preedit`, `pending_commit`,
+/// `pending_surrounding_delete`). A null preedit or commit is `None`; the
+/// delete is in characters.
 #[derive(Clone, Debug, Default)]
 struct Events {
     preedit: Option<String>,
     commit: Option<String>,
-    delete: (u32, u32),
+    delete: (usize, usize),
+}
+
+/// What GTK keeps for a field: its context and its entry.
+#[derive(Clone, Debug)]
+struct Context {
+    /// The transaction in progress.
+    events: Events,
+    /// The preedit it shows (`current_preedit`).
+    preedit: Option<String>,
+    /// GTK3: it enabled the text input (`context->enabled`).
+    enabled: bool,
+    /// The text and cursor it last retrieved from the entry
+    /// (`context->surrounding`).
+    surrounding: Option<(String, usize)>,
+    /// GTK4: the caret it last laid out (`surface_cursor_rect`).
+    laid_out: [i32; 4],
+    /// The entry resets the context before its cursor next moves
+    /// (`need_im_reset`).
+    need_im_reset: bool,
 }
 
 /// The v3 client of GTK3 or GTK4.
@@ -66,20 +87,11 @@ pub(super) struct Gtk {
     v4: bool,
     protocol: Protocol,
     fields: Vec<Field>,
+    contexts: Vec<Context>,
     /// The field with the keyboard focus, whose context is current.
     current: Option<usize>,
-    /// GTK3: whether the current context enabled the text input
-    /// (`context->enabled`).
-    enabled: bool,
     /// The commits it made (`global->serial`).
     commits: u32,
-    /// GTK3: whether the entry resets its context before its cursor next
-    /// moves (`GtkEntryPrivate::need_im_reset`).
-    need_im_reset: bool,
-    /// The transaction in progress.
-    events: Events,
-    /// The preedit the current context shows (`current_preedit`).
-    preedit: Option<String>,
     /// The field of the last press and whether it made the caret jump.
     press: Option<(usize, bool)>,
     drops: Vec<Dropped>,
@@ -87,18 +99,26 @@ pub(super) struct Gtk {
 
 impl Gtk {
     /// An application with `fields`, on GTK4 if `v4` and otherwise on GTK3,
-    /// its text input `text_input`.
+    /// its text input `text_input`. Each field was laid out once.
     pub fn new(v4: bool, text_input: u32, fields: Vec<Field>) -> Self {
+        let contexts = fields
+            .iter()
+            .map(|field| Context {
+                events: Events::default(),
+                preedit: None,
+                enabled: false,
+                surrounding: None,
+                laid_out: caret_rect(&field.model),
+                need_im_reset: false,
+            })
+            .collect();
         Self {
             v4,
             protocol: Protocol::new(text_input),
             fields,
+            contexts,
             current: None,
-            enabled: false,
             commits: 0,
-            need_im_reset: false,
-            events: Events::default(),
-            preedit: None,
             press: None,
             drops: Vec::new(),
         }
@@ -108,9 +128,10 @@ impl Gtk {
         self.protocol.text_input
     }
 
-    /// Whether the current context may send requests.
-    fn may_send(&self) -> bool {
-        self.current.is_some() && (self.v4 || self.enabled)
+    /// The current field, if its context may send requests.
+    fn sender(&self) -> Option<usize> {
+        self.current
+            .filter(|&field| self.v4 || self.contexts[field].enabled)
     }
 
     /// `commit`, counted (`commit_state`).
@@ -120,73 +141,100 @@ impl Gtk {
     }
 
     /// The current field's state and a `commit`, with `cause`
-    /// (`notify_im_change`). GTK3 sends `anchor = cursor`, and GTK4 the
-    /// selection bound, which is the cursor here (C9).
+    /// (`notify_im_change`). The context first retrieves the entry's text,
+    /// which GTK3 states at once if it changed (`set_surrounding`). GTK3
+    /// sends `anchor = cursor`, and GTK4 the selection bound, which is the
+    /// cursor here (C9).
     fn notify(&mut self, cause: u32) -> Vec<Outgoing> {
-        let Some(field) = self.current.filter(|_| self.may_send()) else {
+        let Some(field) = self.sender() else {
             return Vec::new();
         };
         let model = &self.fields[field].model;
+        let context = &mut self.contexts[field];
+        let surrounding = (model.text.clone(), model.cursor);
+        let changed = context.surrounding.as_ref() != Some(&surrounding);
+        context.surrounding = Some(surrounding);
+        let rect = if self.v4 {
+            context.laid_out
+        } else {
+            caret_rect(model)
+        };
         let ti = self.text_input();
-        let mut out = vec![
-            self.protocol.surrounding_text(&model.text, model.cursor),
-            req::set_text_change_cause(ti, cause),
-            content_type(ti),
-            cursor_rectangle(ti, caret_rect(model)),
-        ];
+        let mut out = Vec::new();
+        let times = if !self.v4 && changed { 2 } else { 1 };
+        for _ in 0..times {
+            out.push(self.protocol.surrounding_text(&model.text, model.cursor));
+            out.push(req::set_text_change_cause(ti, cause));
+        }
+        out.push(content_type(ti));
+        out.push(cursor_rectangle(ti, rect));
         out.push(self.commit());
         out
     }
 
     /// C7: `enable`, the state and a `commit` (`enable`, or GTK4's
-    /// `activate_osk_with_event`).
+    /// `activate_osk_with_event`), for the current context.
     fn enable(&mut self) -> Vec<Outgoing> {
-        self.enabled = true;
+        let Some(field) = self.current else {
+            return Vec::new();
+        };
+        self.contexts[field].enabled = true;
+        self.protocol.sent.clear();
         let mut out = vec![req::enable(self.text_input())];
         out.extend(self.notify(zwp_text_input_v3::CHANGE_CAUSE_OTHER));
         out
     }
 
-    /// `disable` and a `commit`; the context then clears its preedit
-    /// locally (`disable`).
+    /// `disable` and a `commit`; the current context then clears its
+    /// preedit (`disable`).
     fn disable(&mut self) -> Vec<Outgoing> {
         let mut out = vec![req::disable(self.text_input())];
-        if self.may_send() {
+        let Some(field) = self.current else {
+            return out;
+        };
+        if self.sender().is_some() {
             out.push(self.commit());
         }
-        self.enabled = false;
-        if let Some(field) = self.current {
-            self.preedit = None;
-            self.fields[field].model.preedit.clear();
-        }
+        let context = &mut self.contexts[field];
+        context.enabled = false;
+        context.preedit = None;
+        self.fields[field].model.preedit.clear();
         out
+    }
+
+    /// The entry of `field` resets its context, which reports with cause
+    /// `other` if it is current (`gtk_im_context_wayland_reset`). The
+    /// preedit stays.
+    fn reset(&mut self, field: usize) -> Vec<Outgoing> {
+        self.contexts[field].need_im_reset = false;
+        if self.current != Some(field) {
+            return Vec::new();
+        }
+        self.notify(zwp_text_input_v3::CHANGE_CAUSE_OTHER)
     }
 
     /// C6: at `done`, whatever its serial, the current context applies the
     /// delete, the commit, then the preedit, which an absent
-    /// `preedit_string` clears (`text_input_done`). It answers each
+    /// `preedit_string` clears (`text_input_done`). It reports after each
     /// applied delete (`text_input_delete_surrounding_text_apply`) and
-    /// each applied commit (the class handler of `commit`,
-    /// `gtk_im_context_wayland_commit`) with its state and a `commit`. A
-    /// transaction that only changes the preedit is answered only when its
-    /// serial names the last commit.
+    /// each applied commit (`gtk_im_context_wayland_commit`, the class
+    /// handler of `commit`); a transaction that changes only the preedit
+    /// is reported only when its serial names the last commit.
     ///
-    /// C9: a delete counts from the cursor, with the preedit still shown.
+    /// C9: the delete counts characters from the entry's cursor, with the
+    /// preedit still shown, clamped to its text
+    /// (`gtk_entry_delete_surrounding_cb`, `gtk_editable_delete_text`).
     fn done(&mut self, serial: u32) -> Vec<Outgoing> {
         let Some(field) = self.current else {
             return Vec::new();
         };
-        let events = mem::take(&mut self.events);
-        let update_im = events.commit.is_some() || events.preedit != self.preedit;
+        let context = &mut self.contexts[field];
+        let events = mem::take(&mut context.events);
+        let update_im = events.commit.is_some() || events.preedit != context.preedit;
         let mut out = Vec::new();
         let (before, after) = events.delete;
-        if before > 0 || after > 0 {
-            let model = &mut self.fields[field].model;
-            model.apply_txn(&Txn {
-                delete: (before as usize, after as usize),
-                preedit: model.preedit.clone(),
-                ..Txn::default()
-            });
+        if before + after > 0 {
+            delete_chars(&mut self.fields[field].model, before, after);
             out.extend(self.notify(zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD));
         }
         if let Some(commit) = events.commit {
@@ -197,31 +245,69 @@ impl Gtk {
                 ..Txn::default()
             });
             // The entry takes the commit (`gtk_entry_enter_text`).
-            self.need_im_reset = false;
+            self.contexts[field].need_im_reset = false;
             out.extend(self.notify(zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD));
         }
-        self.preedit = events.preedit;
-        self.fields[field].model.preedit = self.preedit.clone().unwrap_or_default();
+        let context = &mut self.contexts[field];
+        context.preedit = events.preedit;
+        self.fields[field].model.preedit = context.preedit.clone().unwrap_or_default();
         if update_im && serial == self.commits {
             out.extend(self.notify(zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD));
         }
         out
     }
 
-    /// Holds an event part for `done` with `hold`, or drops it if no
-    /// context is current (`text_input_preedit` and the others).
-    fn hold(&mut self, now: Micros, part: Part, hold: impl FnOnce(&mut Events)) -> Vec<Outgoing> {
-        if self.current.is_some() {
-            hold(&mut self.events);
-        } else {
+    /// Holds a part of a transaction in the current context, or drops it
+    /// if none is current (`text_input_preedit` and the others).
+    fn hold(&mut self, now: Micros, part: Part) {
+        let Some(field) = self.current else {
             let reason = DropReason::NoFocusedField;
             self.drops.push(Dropped {
                 at: now,
                 part,
                 reason,
             });
+            return;
+        };
+        let context = &mut self.contexts[field];
+        match part {
+            Part::Preedit(text) => context.events.preedit = Some(text),
+            Part::Commit(text) => context.events.commit = Some(text),
+            // Counted in characters of the text it last retrieved
+            // (`text_input_delete_surrounding_text`).
+            Part::Delete { before, after } => {
+                let (text, cursor) = context.surrounding.clone().unwrap_or_default();
+                context.events.delete = chars_around(&text, cursor, before, after);
+            }
         }
-        Vec::new()
+    }
+
+    /// A null string replaces what the current context held, with nothing
+    /// to drop.
+    fn hold_null(&mut self, clear: impl FnOnce(&mut Events)) {
+        if let Some(field) = self.current {
+            clear(&mut self.contexts[field].events);
+        }
+    }
+
+    /// GTK4 lays out each field: a caret that moved is laid out, and the
+    /// current context sends it with a `commit` (`after_layout_cb`).
+    fn layout(&mut self, mut out: Vec<Outgoing>) -> Vec<Outgoing> {
+        if !self.v4 {
+            return out;
+        }
+        for field in 0..self.fields.len() {
+            let rect = caret_rect(&self.fields[field].model);
+            if self.contexts[field].laid_out == rect {
+                continue;
+            }
+            self.contexts[field].laid_out = rect;
+            if self.current == Some(field) {
+                out.push(cursor_rectangle(self.text_input(), rect));
+                out.push(self.commit());
+            }
+        }
+        out
     }
 }
 
@@ -240,8 +326,8 @@ impl Client for Gtk {
 
     /// C7: the context that loses the keyboard focus disables, if the text
     /// input is entered, and the one that gains it enables
-    /// (`gtk_im_context_wayland_focus_out`, `focus_in`). GTK3's entry needs
-    /// a reset after either (`gtk_entry_focus_in`, `gtk_entry_focus_out`).
+    /// (`gtk_im_context_wayland_focus_out`, `focus_in`). The entry needs a
+    /// reset after either (`gtk_entry_focus_in`, `gtk_entry_focus_out`).
     fn keyboard_focus(&mut self, _now: Micros, surface: Option<u32>) -> Vec<Outgoing> {
         let focus = surface.map(|surface| field_on(&self.fields, surface));
         if focus == self.current {
@@ -249,15 +335,20 @@ impl Client for Gtk {
         }
         let entered = self.protocol.entered.is_some();
         let mut out = Vec::new();
-        if self.current.is_some() && entered {
-            out.extend(self.disable());
+        if let Some(field) = self.current {
+            self.contexts[field].need_im_reset = true;
+            if entered {
+                out.extend(self.disable());
+            }
         }
         self.current = focus;
-        self.need_im_reset = true;
-        if self.current.is_some() && entered {
-            out.extend(self.enable());
+        if let Some(field) = focus {
+            self.contexts[field].need_im_reset = true;
+            if entered {
+                out.extend(self.enable());
+            }
         }
-        out
+        self.layout(out)
     }
 
     /// C7: `enter` enables the current context and `leave` disables it
@@ -266,18 +357,23 @@ impl Client for Gtk {
     fn event(&mut self, now: Micros, sender: u32, event: Event) -> Vec<Outgoing> {
         self.protocol
             .check(&self.fields, sender, &event, self.commits);
-        match event {
+        let out = match event {
             Event::Enter { .. } if self.current.is_some() => self.enable(),
             Event::Leave { .. } if self.current.is_some() => self.disable(),
-            Event::Enter { .. } | Event::Leave { .. } => Vec::new(),
+            Event::Done { serial } => self.done(serial),
             Event::PreeditString { text, .. } => {
-                let text = utf8(text);
-                let part = Part::Preedit(text.clone().unwrap_or_default());
-                self.hold(now, part, |events| events.preedit = text)
+                match utf8(text) {
+                    Some(text) => self.hold(now, Part::Preedit(text)),
+                    None => self.hold_null(|events| events.preedit = None),
+                }
+                Vec::new()
             }
             Event::CommitString { text } => {
-                let part = Part::Commit(text.clone().unwrap_or_default());
-                self.hold(now, part, |events| events.commit = text)
+                match text {
+                    Some(text) => self.hold(now, Part::Commit(text)),
+                    None => self.hold_null(|events| events.commit = None),
+                }
+                Vec::new()
             }
             Event::DeleteSurroundingText {
                 before_length,
@@ -287,40 +383,53 @@ impl Client for Gtk {
                     before: before_length,
                     after: after_length,
                 };
-                self.hold(now, part, |events| {
-                    events.delete = (before_length, after_length)
-                })
+                self.hold(now, part);
+                Vec::new()
             }
-            Event::Done { serial } => self.done(serial),
-        }
+            Event::Enter { .. } | Event::Leave { .. } => Vec::new(),
+        };
+        self.layout(out)
     }
 
-    /// The field edits as [`TextModel::insert_key`] does. A printable key
-    /// goes through the context, which commits it to the entry and so
-    /// reports it as C6 does (GTK3's `GtkIMContextSimple`, GTK4's
-    /// `gtk_im_context_wayland_filter_keypress`); GTK3's entry then needs a
-    /// reset (`gtk_entry_key_press`).
+    /// The entry edits as [`TextModel::insert_key`] does, except that
+    /// Enter activates it rather than inserting a line break.
+    ///
+    /// - A printable key goes through the context, which commits it to the
+    ///   entry and so reports as C6 does (GTK3's `GtkIMContextSimple`,
+    ///   GTK4's `gtk_im_context_wayland_filter_keypress`); GTK3's entry
+    ///   then needs a reset (`gtk_entry_key_press`).
+    /// - Left and Right reset (`gtk_entry_move_cursor`), and so does a
+    ///   Backspace that deletes (`gtk_entry_backspace`).
+    /// - Enter resets if the entry needs it.
     ///
     /// [`TextModel::insert_key`]: crate::sim::editor::TextModel::insert_key
     fn key(&mut self, _now: Micros, key: Key) -> Vec<Outgoing> {
         let field = self
             .current
             .expect("protocol violation: a key without the keyboard focus");
-        self.fields[field].model.insert_key(key);
-        if !matches!(key, Key::Char(_)) {
-            return Vec::new();
-        }
-        let out = self.notify(zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD);
-        self.need_im_reset = true;
-        out
+        let model = &mut self.fields[field].model;
+        let out = match key {
+            Key::Char(_) => {
+                model.insert_key(key);
+                self.contexts[field].need_im_reset = false;
+                let out = self.notify(zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD);
+                self.contexts[field].need_im_reset = !self.v4;
+                out
+            }
+            Key::Backspace if model.cursor == 0 => Vec::new(),
+            Key::Backspace | Key::Left | Key::Right => {
+                model.insert_key(key);
+                self.reset(field)
+            }
+            Key::Enter if self.contexts[field].need_im_reset => self.reset(field),
+            Key::Enter => Vec::new(),
+        };
+        self.layout(out)
     }
 
     /// C8: before the cursor moves, GTK4 always resets
-    /// (`gtk_text_click_gesture_pressed`), and GTK3 only if the entry
-    /// needs it and the cursor moves (`gtk_entry_real_set_position`). A
-    /// reset is the state and a `commit` with cause `other`, from the
-    /// current context only (`gtk_im_context_wayland_reset`); the preedit
-    /// stays.
+    /// (`gtk_text_click_gesture_pressed`), and GTK3 only if the entry needs
+    /// it and the cursor moves (`gtk_entry_real_set_position`).
     fn press(&mut self, _now: Micros, surface: u32, at: Target, _kind: PressKind) -> Vec<Outgoing> {
         let field = field_on(&self.fields, surface);
         let model = &self.fields[field].model;
@@ -331,16 +440,14 @@ impl Client for Gtk {
         // (`gtk_im_context_wayland_set_cursor_location`).
         let [x, _, _, height] = caret_rect(model);
         let jumped = (caret_rect(&clicked)[0] - x).abs() >= height;
-        let mut out = Vec::new();
-        if self.v4 || (self.need_im_reset && moved) {
-            self.need_im_reset = false;
-            if self.current == Some(field) {
-                out = self.notify(zwp_text_input_v3::CHANGE_CAUSE_OTHER);
-            }
-        }
+        let out = if self.v4 || (self.contexts[field].need_im_reset && moved) {
+            self.reset(field)
+        } else {
+            Vec::new()
+        };
         self.fields[field].model.click(at);
         self.press = Some((field, jumped));
-        out
+        self.layout(out)
     }
 
     /// C7: a single-click release in the current field that did not drag
@@ -355,7 +462,8 @@ impl Client for Gtk {
         if dragged || self.current != Some(field) || !(self.v4 || (entered && !jumped)) {
             return Vec::new();
         }
-        self.enable()
+        let out = self.enable();
+        self.layout(out)
     }
 }
 
@@ -365,90 +473,108 @@ mod tests {
     use super::*;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::Request;
 
-    /// GTK4 if `v4`, else GTK3, with fields holding `texts`, the keyboard
-    /// focus on field 0 and the text input entered there.
-    fn entered(v4: bool, texts: &[&str]) -> Gtk {
-        let mut gtk = Gtk::new(v4, TEXT_INPUT, fields(texts));
-        assert_eq!(
-            requests(gtk.keyboard_focus(Micros(0), Some(SURFACES[0]))),
-            []
-        );
-        let enter = Event::Enter {
-            surface: SURFACES[0],
-        };
-        assert_eq!(gtk.event(Micros(0), TEXT_INPUT, enter).len(), 6);
-        gtk
+    /// The requests `gtk` sends for each of `events` at `now`, then for
+    /// a `done` that names its last commit.
+    fn answered(
+        gtk: &mut Gtk,
+        now: Micros,
+        events: impl IntoIterator<Item = Event>,
+    ) -> Vec<Request> {
+        let mut out = send(gtk, now, events);
+        let serial = gtk.commits;
+        out.extend(send(gtk, now, [done(serial)]));
+        out
     }
 
-    /// The requests GTK sends for each of `events`, at time 0.
-    fn send(gtk: &mut Gtk, events: impl IntoIterator<Item = Event>) -> Vec<Request> {
+    const OTHER: u32 = zwp_text_input_v3::CHANGE_CAUSE_OTHER;
+    const INPUT_METHOD: u32 = zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD;
+
+    /// What GTK sends to report `text`, the cursor at byte `cursor`, for
+    /// `cause`, with the caret after `cells` characters. GTK3 states a
+    /// text that `changed` twice. GTK4 sends the caret it laid out, after
+    /// `was` characters, and then lays out the new one.
+    fn report(
+        v4: bool,
+        cause: u32,
+        (text, cursor): (&str, i32),
+        (was, cells): (i32, i32),
+        changed: bool,
+    ) -> Vec<Request> {
         let mut out = Vec::new();
-        for event in events {
-            out.extend(requests(gtk.event(Micros(0), TEXT_INPUT, event)));
+        for _ in 0..if !v4 && changed { 2 } else { 1 } {
+            out.push(surrounding(text, cursor));
+            out.push(Request::SetTextChangeCause { cause });
+        }
+        out.push(plain_text());
+        out.push(caret(if v4 { was } else { cells }));
+        out.push(Request::Commit {});
+        if v4 && was != cells {
+            out.extend([caret(cells), Request::Commit {}]);
         }
         out
     }
 
-    /// The requests that state `text` with the cursor at byte `cursor`
-    /// and the caret after `cells` characters, with `cause`, then commit.
-    fn state(text: &str, cursor: i32, cells: i32, cause: u32) -> Vec<Request> {
-        vec![
-            surrounding(text, cursor),
-            Request::SetTextChangeCause { cause },
-            plain_text(),
-            caret(cells),
-            Request::Commit {},
-        ]
+    /// `enable`, then the [`report`] of a text that changed.
+    fn enabled(v4: bool, text: (&str, i32), cells: (i32, i32)) -> Vec<Request> {
+        let mut out = vec![Request::Enable {}];
+        out.extend(report(v4, OTHER, text, cells, true));
+        out
     }
 
-    /// [`state`] for an edit of the input method.
-    fn edited(text: &str, cursor: i32, cells: i32) -> Vec<Request> {
-        state(
-            text,
-            cursor,
-            cells,
-            zwp_text_input_v3::CHANGE_CAUSE_INPUT_METHOD,
-        )
-    }
-
-    /// `enable`, then [`state`] with cause `other`.
-    fn enabled(text: &str, cursor: i32, cells: i32) -> Vec<Request> {
-        let state = state(text, cursor, cells, zwp_text_input_v3::CHANGE_CAUSE_OTHER);
-        [vec![Request::Enable {}], state]
-            .into_iter()
-            .flatten()
-            .collect()
+    /// GTK4 if `v4`, else GTK3, with fields holding `texts`, the keyboard
+    /// focus on field 0 and the text input entered there.
+    fn entered(v4: bool, texts: &[&str]) -> Gtk {
+        let mut gtk = Gtk::new(v4, TEXT_INPUT, fields(texts));
+        let focus = gtk.keyboard_focus(Micros(0), Some(SURFACES[0]));
+        assert_eq!(requests(focus), []);
+        let cells = i32::try_from(texts[0].chars().count()).unwrap();
+        let cursor = i32::try_from(texts[0].len()).unwrap();
+        let enable = send(&mut gtk, Micros(0), [enter(0)]);
+        assert_eq!(enable, enabled(v4, (texts[0], cursor), (cells, cells)));
+        gtk
     }
 
     #[test]
-    fn c6_each_applied_commit_or_delete_is_answered_at_once() {
+    fn c6_each_applied_commit_or_delete_is_reported_at_once() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["0"]);
-            // A commit is answered whatever the serial.
-            let out = send(&mut gtk, [commit("가"), Event::Done { serial: 0 }]);
-            assert_eq!(out, edited("0가", 4, 2), "v4: {v4}");
-            // A preedit alone is answered only when the serial names the
-            // last commit.
+            let t0 = Micros(0);
+            // A commit is reported whatever the serial.
+            let out = send(&mut gtk, t0, [commit("가"), done(0)]);
             assert_eq!(
-                send(&mut gtk, [preedit("ㄴ"), Event::Done { serial: 1 }]),
-                []
+                out,
+                report(v4, INPUT_METHOD, ("0가", 4), (1, 2), true),
+                "v4: {v4}"
             );
-            let out = send(&mut gtk, [preedit("나"), Event::Done { serial: 2 }]);
-            assert_eq!(out, edited("0가", 4, 3), "v4: {v4}");
-            // The delete, then the commit, each answered; the preedit
-            // goes last.
-            let out = send(
-                &mut gtk,
-                [delete(3, 0), commit("다"), Event::Done { serial: 3 }],
+            // A preedit alone, only when the serial names the last commit;
+            // GTK4 still lays out the caret it moved.
+            let out = send(&mut gtk, t0, [preedit("ㄴ"), done(0)]);
+            let laid_out = if v4 {
+                vec![caret(3), Request::Commit {}]
+            } else {
+                vec![]
+            };
+            assert_eq!(out, laid_out, "v4: {v4}");
+            let out = answered(&mut gtk, t0, [preedit("나")]);
+            assert_eq!(
+                out,
+                report(v4, INPUT_METHOD, ("0가", 4), (3, 3), false),
+                "v4: {v4}"
             );
-            let answers: Vec<_> = [edited("0", 1, 2), edited("0다", 4, 3)]
-                .into_iter()
-                .flatten()
-                .collect();
-            assert_eq!(out, answers, "v4: {v4}");
+            // The delete, then the commit, each reported; the preedit goes
+            // last.
+            let out = answered(&mut gtk, t0, [delete(3, 0), commit("다")]);
+            // GTK3 shows the preedit until the end; GTK4 lays out once.
+            let (deleted, committed) = if v4 {
+                ((3, 3), (3, 2))
+            } else {
+                ((2, 2), (3, 3))
+            };
+            let mut reports = report(v4, INPUT_METHOD, ("0", 1), deleted, true);
+            reports.extend(report(v4, INPUT_METHOD, ("0다", 4), committed, true));
+            assert_eq!(out, reports, "v4: {v4}");
             assert_eq!(gtk.fields()[0].model, model("0다", 4, ""), "v4: {v4}");
-            // Nothing changed: no answer.
-            assert_eq!(send(&mut gtk, [Event::Done { serial: 5 }]), []);
+            assert_eq!(answered(&mut gtk, t0, []), []);
             assert_eq!(gtk.drops(), []);
         }
     }
@@ -457,9 +583,9 @@ mod tests {
     fn c6_a_bare_done_clears_the_preedit() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["0"]);
-            send(&mut gtk, [preedit("가"), Event::Done { serial: 0 }]);
+            send(&mut gtk, Micros(0), [preedit("가"), done(0)]);
             assert_eq!(gtk.fields()[0].model, model("0", 1, "가"), "v4: {v4}");
-            send(&mut gtk, [Event::Done { serial: 0 }]);
+            send(&mut gtk, Micros(0), [done(0)]);
             assert_eq!(gtk.fields()[0].model, model("0", 1, ""), "v4: {v4}");
         }
     }
@@ -467,128 +593,138 @@ mod tests {
     #[test]
     fn c7_gtk3_enables_on_enter_focus_and_a_release_where_the_caret_stays() {
         let mut gtk = Gtk::new(false, TEXT_INPUT, fields(&["ab1", ""]));
-        let enter = Event::Enter {
-            surface: SURFACES[0],
-        };
+        let t0 = Micros(0);
         // No context is current yet.
-        assert_eq!(send(&mut gtk, [enter]), []);
-        let focus = gtk.keyboard_focus(Micros(0), Some(SURFACES[0]));
-        assert_eq!(requests(focus), enabled("ab1", 3, 3));
+        assert_eq!(send(&mut gtk, t0, [enter(0)]), []);
+        let focus = gtk.keyboard_focus(t0, Some(SURFACES[0]));
+        assert_eq!(requests(focus), enabled(false, ("ab1", 3), (3, 3)));
         // A click where the caret is enables again.
-        assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button)),
-            []
-        );
-        let release = gtk.release(Micros(0), false);
-        assert_eq!(requests(release), enabled("ab1", 3, 3));
+        let press = gtk.press(t0, SURFACES[0], Target::End, PressKind::Button);
+        assert_eq!(requests(press), []);
+        let mut again = vec![Request::Enable {}];
+        again.extend(report(false, OTHER, ("ab1", 3), (3, 3), false));
+        assert_eq!(requests(gtk.release(t0, false)), again);
         // So does one a character away, which moves the caret less than
         // its height. The focus left the entry needing a reset, which the
         // press sends before the cursor moves.
-        let press = gtk.press(
-            Micros(0),
-            SURFACES[0],
-            Target::BeforeMarker(1),
-            PressKind::Button,
-        );
-        let reset = state("ab1", 3, 3, zwp_text_input_v3::CHANGE_CAUSE_OTHER);
-        assert_eq!(requests(press), reset);
-        let release = gtk.release(Micros(0), false);
-        assert_eq!(requests(release), enabled("ab1", 2, 2));
-        // A drag does not enable.
+        let press = gtk.press(t0, SURFACES[0], Target::BeforeMarker(1), PressKind::Button);
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button)),
-            []
+            requests(press),
+            report(false, OTHER, ("ab1", 3), (3, 3), false)
         );
-        assert_eq!(requests(gtk.release(Micros(0), true)), []);
-        // Nor does a click that makes the caret jump.
-        assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
-            []
-        );
-        assert_eq!(requests(gtk.release(Micros(0), false)), []);
+        let release = gtk.release(t0, false);
+        assert_eq!(requests(release), enabled(false, ("ab1", 2), (2, 2)));
+        // A drag does not enable, nor does a click that makes the caret
+        // jump.
+        gtk.press(t0, SURFACES[0], Target::End, PressKind::Button);
+        assert_eq!(requests(gtk.release(t0, true)), []);
+        gtk.press(t0, SURFACES[0], Target::Start, PressKind::Button);
+        assert_eq!(requests(gtk.release(t0, false)), []);
         // The keyboard focus disables one field and enables the other.
-        let focus = gtk.keyboard_focus(Micros(0), Some(SURFACES[1]));
-        let switch = [
-            vec![Request::Disable {}, Request::Commit {}],
-            enabled("", 0, 0),
-        ];
-        let switch: Vec<_> = switch.into_iter().flatten().collect();
+        let focus = gtk.keyboard_focus(t0, Some(SURFACES[1]));
+        let mut switch = vec![Request::Disable {}, Request::Commit {}];
+        switch.extend(enabled(false, ("", 0), (0, 0)));
         assert_eq!(requests(focus), switch);
     }
 
     #[test]
     fn c7_gtk4_enables_on_any_single_click_release() {
         let mut gtk = entered(true, &["ab"]);
-        let press = gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button);
-        let reset = state("ab", 2, 2, zwp_text_input_v3::CHANGE_CAUSE_OTHER);
-        assert_eq!(requests(press), reset);
-        assert_eq!(requests(gtk.release(Micros(0), false)), enabled("ab", 0, 0));
-        gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
-        assert_eq!(requests(gtk.release(Micros(0), true)), []);
+        let t0 = Micros(0);
+        let press = gtk.press(t0, SURFACES[0], Target::Start, PressKind::Touch);
+        assert_eq!(
+            requests(press),
+            report(true, OTHER, ("ab", 2), (2, 0), false)
+        );
+        let release = gtk.release(t0, false);
+        assert_eq!(requests(release), enabled(true, ("ab", 0), (0, 0)));
+        gtk.press(t0, SURFACES[0], Target::End, PressKind::Button);
+        assert_eq!(requests(gtk.release(t0, true)), []);
     }
 
     #[test]
     fn c8_a_press_resets_on_gtk4_always_and_on_gtk3_when_the_entry_needs_it() {
-        let other = zwp_text_input_v3::CHANGE_CAUSE_OTHER;
+        let t0 = Micros(0);
         // GTK4 resets even where the caret is, after an input method's
         // commit, and keeps the preedit.
         let mut gtk = entered(true, &["0"]);
-        send(&mut gtk, [commit("가"), Event::Done { serial: 1 }]);
-        send(&mut gtk, [preedit("ㄴ"), Event::Done { serial: 2 }]);
-        let press = gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
-        assert_eq!(requests(press), state("0가", 4, 3, other));
+        send(&mut gtk, t0, [commit("가"), preedit("ㄴ"), done(0)]);
+        let press = gtk.press(t0, SURFACES[0], Target::End, PressKind::Button);
+        assert_eq!(
+            requests(press),
+            report(true, OTHER, ("0가", 4), (3, 3), false)
+        );
         assert_eq!(gtk.fields()[0].model, model("0가", 4, "ㄴ"));
 
+        // The focus left GTK3's entry needing a reset; the input method's
+        // commit cleared that.
         let mut gtk = entered(false, &["0"]);
-        // The focus left the entry needing a reset; the input method's
-        // commit then clears that.
-        send(&mut gtk, [commit("가"), Event::Done { serial: 1 }]);
+        send(&mut gtk, t0, [commit("가"), done(0)]);
+        let press = gtk.press(t0, SURFACES[0], Target::Start, PressKind::Button);
+        assert_eq!(requests(press), []);
+        // A passed key sets it again, but a press must move the cursor.
+        let key = gtk.key(t0, Key::Char('a'));
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
-            []
+            requests(key),
+            report(false, INPUT_METHOD, ("a0가", 1), (1, 1), true)
         );
-        // A passed key sets it again, but a press that does not move the
-        // cursor does not reset.
-        let key = gtk.key(Micros(0), Key::Char('a'));
-        assert_eq!(requests(key), edited("a0가", 1, 1));
+        let press = gtk.press(t0, SURFACES[0], Target::BeforeMarker(0), PressKind::Button);
+        assert_eq!(requests(press), []);
+        let press = gtk.press(t0, SURFACES[0], Target::End, PressKind::Button);
         assert_eq!(
-            requests(gtk.press(
-                Micros(0),
-                SURFACES[0],
-                Target::BeforeMarker(0),
-                PressKind::Button
-            )),
-            []
+            requests(press),
+            report(false, OTHER, ("a0가", 1), (1, 1), false)
         );
-        let press = gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
-        assert_eq!(requests(press), state("a0가", 1, 1, other));
-        assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
-            []
-        );
+        let press = gtk.press(t0, SURFACES[0], Target::Start, PressKind::Button);
+        assert_eq!(requests(press), []);
+    }
+
+    #[test]
+    fn c8_keys_that_move_the_cursor_or_delete_reset() {
+        for v4 in [false, true] {
+            let mut gtk = entered(v4, &["ab"]);
+            let t0 = Micros(0);
+            let left = gtk.key(t0, Key::Left);
+            assert_eq!(
+                requests(left),
+                report(v4, OTHER, ("ab", 1), (2, 1), true),
+                "v4: {v4}"
+            );
+            let back = gtk.key(t0, Key::Backspace);
+            assert_eq!(
+                requests(back),
+                report(v4, OTHER, ("b", 0), (1, 0), true),
+                "v4: {v4}"
+            );
+            assert_eq!(requests(gtk.key(t0, Key::Backspace)), [], "v4: {v4}");
+            // A printable key leaves GTK3's entry needing a reset, which
+            // Enter sends; GTK4's took the key as a commit. Neither
+            // inserts a line break.
+            gtk.key(t0, Key::Char('c'));
+            let enter = requests(gtk.key(t0, Key::Enter));
+            let reset = if v4 {
+                vec![]
+            } else {
+                report(v4, OTHER, ("cb", 1), (1, 1), false)
+            };
+            assert_eq!(enter, reset, "v4: {v4}");
+            assert_eq!(gtk.fields()[0].model, model("cb", 1, ""), "v4: {v4}");
+        }
     }
 
     #[test]
     fn c9_a_delete_counts_from_the_cursor_and_ignores_the_preedit() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["0ab1cd"]);
-            gtk.press(
-                Micros(0),
-                SURFACES[0],
-                Target::BeforeMarker(1),
-                PressKind::Button,
-            );
-            // The answer reports the moved cursor, which the delete counts
-            // from.
-            let serial = gtk.commits;
-            send(&mut gtk, [preedit("가"), Event::Done { serial }]);
-            let out = send(
-                &mut gtk,
-                [preedit("가"), delete(1, 1), Event::Done { serial: 0 }],
-            );
-            assert_eq!(out, edited("0acd", 2, 3), "v4: {v4}");
+            let t0 = Micros(0);
+            gtk.press(t0, SURFACES[0], Target::BeforeMarker(1), PressKind::Button);
+            gtk.release(t0, false);
+            answered(&mut gtk, t0, [preedit("가")]);
+            let events = [preedit("가"), delete(1, 1), done(0)];
+            let out = send(&mut gtk, t0, events);
+            let expected = report(v4, INPUT_METHOD, ("0acd", 2), (4, 3), true);
+            assert_eq!(out, expected, "v4: {v4}");
             assert_eq!(gtk.fields()[0].model, model("0acd", 2, "가"), "v4: {v4}");
-            assert_eq!(gtk.drops(), []);
         }
     }
 
@@ -596,14 +732,12 @@ mod tests {
     fn leave_disables_and_clears_the_preedit() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["0"]);
-            send(&mut gtk, [preedit("가"), Event::Done { serial: 1 }]);
-            let leave = Event::Leave {
-                surface: SURFACES[0],
-            };
-            assert_eq!(
-                send(&mut gtk, [leave]),
-                [Request::Disable {}, Request::Commit {}]
-            );
+            answered(&mut gtk, Micros(0), [preedit("가")]);
+            let mut disable = vec![Request::Disable {}, Request::Commit {}];
+            if v4 {
+                disable.extend([caret(1), Request::Commit {}]);
+            }
+            assert_eq!(send(&mut gtk, Micros(0), [leave(0)]), disable, "v4: {v4}");
             assert_eq!(gtk.fields()[0].model, model("0", 1, ""), "v4: {v4}");
         }
     }
@@ -613,15 +747,15 @@ mod tests {
         let mut gtk = entered(true, &["0"]);
         let blur = gtk.keyboard_focus(Micros(0), None);
         assert_eq!(requests(blur), [Request::Disable {}, Request::Commit {}]);
+        assert_eq!(gtk.focused_field(), None);
         let at = Micros(7);
-        gtk.event(at, TEXT_INPUT, commit("가"));
-        gtk.event(at, TEXT_INPUT, Event::Done { serial: 2 });
+        answered(&mut gtk, at, [commit("가")]);
         assert_eq!(gtk.fields()[0].model, model("0", 1, ""));
-        let dropped = Dropped {
+        let expected = dropped(
             at,
-            part: Part::Commit("가".to_owned()),
-            reason: DropReason::NoFocusedField,
-        };
-        assert_eq!(gtk.drops(), [dropped]);
+            Part::Commit("가".to_owned()),
+            DropReason::NoFocusedField,
+        );
+        assert_eq!(gtk.drops(), [expected]);
     }
 }
