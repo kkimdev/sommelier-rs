@@ -512,7 +512,11 @@ moment it is closed, so a test that checks a descriptor was closed checks
 that no descriptor still refers to its object
 (`test_support::any_fd_has_identity`), never its number; the randomized
 `proxy::fuzz` test, which counts every open descriptor, runs its cases in
-a child process of its own. `proxy::harness::Session` drives a whole
+a child process of its own. A flag that makes a warning once per
+process, such as `window_placement`'s `OLD_SHELL_WARNED`, is the
+process's too: no test resets one. A test passes the function that reads
+it a flag of its own, or runs in its own process
+(`test_support::in_own_process`). `proxy::harness::Session` drives a whole
 `Client` as its guest and host, decoding what the proxy sends each into
 the generated message types; CONTRIBUTING says how to write a test with
 it. Beyond unit tests, `proxy::fuzz` feeds whole

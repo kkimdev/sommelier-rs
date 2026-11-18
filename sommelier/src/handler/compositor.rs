@@ -1042,6 +1042,11 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::handler::test_support::{
+        buffer_host_destroy_is_queued, buffer_is_guest_destroyed, buffer_lifecycle,
+        mark_test_buffer_guest_destroyed, toplevel_ctx, toplevel_ctx_with, SHELL, SURFACE,
+        TOPLEVEL,
+    };
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
@@ -1061,47 +1066,6 @@ mod tests {
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
-
-    fn setup_ctx() -> (Context, u32, u32, u32) {
-        setup_ctx_with(crate::placement_config::PlacementConfig::for_test(
-            Vec::new(),
-        ))
-    }
-
-    /// [`setup_ctx`] with an explicit placement configuration.
-    fn setup_ctx_with(
-        placement: crate::placement_config::PlacementConfig,
-    ) -> (Context, u32, u32, u32) {
-        let mut ctx = Context::with_placement_for_test(placement);
-        let wl_surface_guest = 100u32;
-        let wl_surface_host = 200u32;
-        let zaura_shell_host = 300u32;
-        let xdg_toplevel_id = 400u32;
-        let xdg_surface_id = 500u32;
-
-        ctx.shadow_table
-            .insert_paired_for_test(wl_surface_guest, wl_surface_host, "wl_surface");
-        ctx.shadow_table.insert_paired_for_test(
-            xdg_surface_id,
-            xdg_surface_id + 100,
-            "xdg_surface",
-        );
-        ctx.shadow_table.insert_paired_for_test(
-            xdg_toplevel_id,
-            xdg_toplevel_id + 100,
-            "xdg_toplevel",
-        );
-        ctx.bind_aura_shell_for_test(zaura_shell_host);
-        ctx.shadow_table.insert_host_only_for_test(
-            zaura_shell_host,
-            "zaura_shell",
-            zaura_shell::VERSION,
-        );
-        ctx.xdg_roles
-            .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
-
-        (ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host)
-    }
 
     /// A request naming an inert output (whose bind crossed its global's
     /// removal) reaches the host with no output, as if the guest named none.
@@ -1295,10 +1259,7 @@ mod tests {
     }
 
     fn unsupported_dmabuf_sync_fd() -> OwnedFd {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::close(pipe_fds[1]) }, 0);
-        unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) }
+        crate::test_support::pipe().0
     }
 
     fn invalid_ioctl_fd() -> OwnedFd {
@@ -1320,7 +1281,7 @@ mod tests {
 
     #[test]
     fn unsupported_native_sync_uses_cached_implicit_fallback_and_commits() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface = 100;
         let buffer = 50;
         register_test_native_with_sync_fds(
@@ -1338,7 +1299,7 @@ mod tests {
         assert!(ctx.native_buffer_uses_implicit_sync(buffer));
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(wl_surface_host, REQ_COMMIT))
+            Some(&(SURFACE.host, REQ_COMMIT))
         );
 
         ctx.client_to_host_queue.clear();
@@ -1347,14 +1308,14 @@ mod tests {
         assert!(!ctx.is_fatal());
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(wl_surface_host, REQ_COMMIT)),
+            Some(&(SURFACE.host, REQ_COMMIT)),
             "the cached compatibility mode must keep later commits live"
         );
     }
 
     #[test]
     fn unexpected_native_sync_failure_is_fatal_and_never_commits() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface = 100;
         let buffer = 50;
         let sync_fd = invalid_ioctl_fd();
@@ -1381,10 +1342,10 @@ mod tests {
     /// changes anything, and goes through once the fence signals.
     #[test]
     fn a_commit_waits_for_a_pending_fence_before_it_changes_anything() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.plane_fences_for_test = Some(crate::state::PlaneFenceForTest::SyncFile);
         let buffer = 50;
-        let (fence, signal) = nix::unistd::pipe().unwrap();
+        let (fence, signal) = crate::test_support::pipe();
         register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![fence]);
         let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
@@ -1408,12 +1369,12 @@ mod tests {
         assert!(effects.end.is_none() && effects.wait.is_none());
         assert_eq!(
             queued_headers(&effects.to_host).last(),
-            Some(&(wl_surface_host, REQ_COMMIT))
+            Some(&(SURFACE.host, REQ_COMMIT))
         );
     }
 
-    /// The wl_surface that `setup_ctx` maps to a host surface.
-    const TEST_SURFACE: u32 = 100;
+    /// The wl_surface that [`toplevel_ctx`] maps to a host surface.
+    const TEST_SURFACE: u32 = SURFACE.guest;
     /// The side of the square ARGB8888 frames of the copy tests.
     const FRAME_SIDE: usize = 4;
     const FRAME_STRIDE: usize = FRAME_SIDE * 4;
@@ -1482,7 +1443,7 @@ mod tests {
 
     #[test]
     fn buffer_damage_under_a_buffer_scale_copies_only_its_pixels() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_buffer_scale(&mut ctx, 2);
         draw_test_frame(&ctx, 42, 0x22);
@@ -1498,7 +1459,7 @@ mod tests {
         // A HiDPI client: buffer scale 2, transform 0, no viewport. Its
         // surface damage maps exactly to buffer pixels, so a small update
         // must not copy the whole buffer every frame.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_buffer_scale(&mut ctx, 2);
         draw_test_frame(&ctx, 42, 0x22);
@@ -1511,7 +1472,7 @@ mod tests {
 
     #[test]
     fn surface_damage_under_a_buffer_transform_copies_the_whole_buffer() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         draw_test_frame(&ctx, 42, 0x22);
         let mut handler = CompositorHandler;
@@ -1534,7 +1495,7 @@ mod tests {
         // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
         // so a surface unit is half a buffer pixel. It damages surface
         // units, as a client that does not use damage_buffer does.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
@@ -1555,7 +1516,7 @@ mod tests {
 
     #[test]
     fn commit_without_damage_copies_nothing() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         draw_test_frame(&ctx, 42, 0x22);
         attach_and_commit(&mut ctx, TEST_SURFACE, 42);
@@ -1564,7 +1525,7 @@ mod tests {
 
     #[test]
     fn damage_beyond_the_buffer_is_clipped_to_it() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         draw_test_frame(&ctx, 42, 0x22);
         let mut handler = CompositorHandler;
@@ -1578,24 +1539,6 @@ mod tests {
             copied_pixels(&ctx, 42, 0x22),
             rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
         );
-    }
-
-    fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
-        let host_id = ctx.render_buffer_host_id(guest_id)?;
-        ctx.render_buffer_lifecycle_for_host(host_id)
-    }
-
-    fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {
-        buffer_lifecycle(ctx, guest_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
-    }
-
-    fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> bool {
-        buffer_lifecycle(ctx, guest_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
-    }
-
-    fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
-        assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.guest_destroyed_in_use(guest_id);
     }
 
     /// Only a paired or local object can send a request or be named in one:
@@ -1648,25 +1591,25 @@ mod tests {
 
     #[test]
     fn set_app_id_creates_zaura_surface_and_sets_app_id() {
-        let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
-        let requests = set_test_app_id(&mut ctx, xdg_toplevel_id, "my_app");
-        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
+        let mut ctx = toplevel_ctx();
+        let requests = set_test_app_id(&mut ctx, TOPLEVEL.guest, "my_app");
+        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
         let app_id = "org.chromium.guest_os.termina.wayland.my_app";
         assert_eq!(
             requests,
             [
                 (
-                    xdg_toplevel_id + 100,
+                    TOPLEVEL.host,
                     xdg_toplevel::Request::SetAppId {
                         app_id: app_id.into()
                     }
                     .into()
                 ),
                 (
-                    zaura_shell_host,
+                    SHELL,
                     zaura_shell::Request::GetAuraSurface {
                         id: zaura_surface_host,
-                        surface: wl_surface_host
+                        surface: SURFACE.host
                     }
                     .into()
                 ),
@@ -1683,21 +1626,20 @@ mod tests {
 
     #[test]
     fn set_app_id_reuses_existing_zaura_surface() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         // An Aura surface created earlier, tracked the way
         // ensure_host_zaura_surface records it.
         let zaura_surface_host = 99u32;
         ctx.shadow_table
             .insert_host_only_for_test(zaura_surface_host, "zaura_surface", 38);
-        ctx.aura_surfaces
-            .remember(wl_surface_host, zaura_surface_host);
+        ctx.aura_surfaces.remember(SURFACE.host, zaura_surface_host);
 
         let app_id = "org.chromium.guest_os.termina.wayland.reused";
         assert_eq!(
-            set_test_app_id(&mut ctx, xdg_toplevel_id, "reused"),
+            set_test_app_id(&mut ctx, TOPLEVEL.guest, "reused"),
             [
                 (
-                    xdg_toplevel_id + 100,
+                    TOPLEVEL.host,
                     xdg_toplevel::Request::SetAppId {
                         app_id: app_id.into()
                     }
@@ -1716,10 +1658,10 @@ mod tests {
 
     #[test]
     fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
-        let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) =
-            setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
-        let requests = set_test_app_id(&mut ctx, xdg_toplevel_id, "com.example.Terminal");
-        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
+        let mut ctx =
+            toplevel_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
+        let requests = set_test_app_id(&mut ctx, TOPLEVEL.guest, "com.example.Terminal");
+        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
         // The Aura surface gets the first ID of the test policy's ARC task
         // block; the role keeps the guest's.
         let arc_app_id = "org.chromium.arc.2000000000";
@@ -1734,17 +1676,17 @@ mod tests {
             requests,
             [
                 (
-                    xdg_toplevel_id + 100,
+                    TOPLEVEL.host,
                     xdg_toplevel::Request::SetAppId {
                         app_id: "org.chromium.guest_os.termina.wayland.com.example.Terminal".into()
                     }
                     .into()
                 ),
                 (
-                    zaura_shell_host,
+                    SHELL,
                     zaura_shell::Request::GetAuraSurface {
                         id: zaura_surface_host,
-                        surface: wl_surface_host
+                        surface: SURFACE.host
                     }
                     .into()
                 ),
@@ -1761,12 +1703,12 @@ mod tests {
 
     #[test]
     fn set_app_id_noop_when_no_zaura_shell() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.host_zaura_shell = None;
         assert_eq!(
-            set_test_app_id(&mut ctx, xdg_toplevel_id, "no_shell"),
+            set_test_app_id(&mut ctx, TOPLEVEL.guest, "no_shell"),
             [(
-                xdg_toplevel_id + 100,
+                TOPLEVEL.host,
                 xdg_toplevel::Request::SetAppId {
                     app_id: "org.chromium.guest_os.termina.wayland.no_shell".into()
                 }
@@ -1777,8 +1719,8 @@ mod tests {
 
     #[test]
     fn oversized_namespaced_app_id_is_dropped_before_wire_encoding() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.last_sender_id = xdg_toplevel_id;
+        let mut ctx = toplevel_ctx();
+        ctx.last_sender_id = TOPLEVEL.guest;
         let oversized = "x".repeat(4_084);
 
         let mut handler = CompositorHandler;
@@ -1799,7 +1741,7 @@ mod tests {
 
     #[test]
     fn commit_without_attach_keeps_the_current_buffer() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -1840,7 +1782,7 @@ mod tests {
     /// object and no content.
     #[test]
     fn attaching_an_inert_buffer_detaches_the_surface() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -1865,7 +1807,7 @@ mod tests {
     fn damage_only_commit_preserves_a_released_use() {
         // Only committing an explicit attach begins a compositor use.
         for kind in BUFFER_KINDS {
-            let (mut ctx, ..) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let buffer = 42;
             set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
             register_test_buffer(&mut ctx, kind, buffer, 43);
@@ -1892,7 +1834,7 @@ mod tests {
 
     #[test]
     fn native_buffer_damage_uses_recorded_dimensions() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_native(&mut ctx, buffer_id, (100, 50));
@@ -1914,7 +1856,7 @@ mod tests {
 
     #[test]
     fn destroyed_buffer_damage_uses_committed_content_dimensions() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let mut surface = SurfaceState::default();
         surface.current_buffer_transform = 1;
@@ -1935,7 +1877,7 @@ mod tests {
 
     #[test]
     fn native_release_damage_commit_destroy_does_not_wait_for_another_release() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
@@ -1976,7 +1918,7 @@ mod tests {
         // A GTK client's exit: the surface showing a submitted buffer is
         // destroyed first, and Exo then releases the buffer it no longer
         // shows while the guest still owns it.
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
@@ -2015,7 +1957,7 @@ mod tests {
     #[test]
     fn attaching_an_idle_buffer_without_commit_keeps_its_release_edge() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, ..) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (buffer, host_buffer) = (42, 43);
             register_test_buffer(&mut ctx, kind, buffer, host_buffer);
             set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
@@ -2063,7 +2005,7 @@ mod tests {
     #[test]
     fn a_delayed_release_before_a_pending_commit_keeps_the_host_buffer_alive() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, ..) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (buffer, host_buffer) = (42, 43);
             register_test_buffer(&mut ctx, kind, buffer, host_buffer);
             set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
@@ -2115,7 +2057,7 @@ mod tests {
     #[test]
     fn replacing_a_pending_destroyed_buffer_does_not_wait_for_release() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, ..) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (old_buffer, old_host_buffer, new_buffer) = (42, 43, 44);
             register_test_buffer(&mut ctx, kind, old_buffer, old_host_buffer);
 
@@ -2150,7 +2092,7 @@ mod tests {
 
     #[test]
     fn replacing_detached_submitted_buffer_waits_for_release() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let guest_buffer = 42;
         let host_buffer = 43;
@@ -2217,7 +2159,7 @@ mod tests {
         // Damage is relative to the surface's current contents. A client
         // alternating A, B, A damages only what changed since B, so A's host
         // copy must also receive what B's frame changed.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_frame(&mut ctx, TEST_SURFACE, 44);
         let mut handler = CompositorHandler;
@@ -2250,7 +2192,7 @@ mod tests {
     #[test]
     fn reattached_buffer_copies_the_damage_of_every_frame_it_missed() {
         // A, B, C, A: A must also receive what both B's and C's frames changed.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         for buffer in [42, 44, 46] {
             commit_test_frame(&mut ctx, TEST_SURFACE, buffer);
         }
@@ -2267,7 +2209,7 @@ mod tests {
 
     #[test]
     fn damage_skipped_on_a_released_buffer_is_copied_at_its_next_attach() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         assert!(ctx.mark_buffer_released(42));
         draw_test_frame(&ctx, 42, 0x22);
@@ -2282,7 +2224,7 @@ mod tests {
     #[test]
     fn a_buffer_moving_between_surfaces_copies_everything() {
         // Its host copy relates to the contents of one surface only.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let other_surface = 101;
         ctx.shadow_table
             .insert_paired_for_test(other_surface, 201, "wl_surface");
@@ -2300,7 +2242,7 @@ mod tests {
 
     #[test]
     fn a_failed_copy_stales_the_whole_host_copy() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let set_dmabuf_sync = |ctx: &mut Context, enabled| {
             let host_id = ctx.render_buffer_host_id(42).unwrap();
@@ -2329,7 +2271,7 @@ mod tests {
     fn a_mapping_change_stales_the_other_host_copies() {
         // B's frame is rotated 180 degrees: its pixel damage does not mark
         // the same pixels of A, which was shown unrotated.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_frame(&mut ctx, TEST_SURFACE, 44);
         ctx.last_sender_id = TEST_SURFACE;
@@ -2354,7 +2296,7 @@ mod tests {
         // A's host copy holds its old frame, unrotated. The client rotates A
         // by 180 degrees and damages one pixel: the rest of A's host copy no
         // longer matches what the surface shows.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         commit_test_frame(&mut ctx, TEST_SURFACE, 44);
         draw_test_frame(&ctx, 42, 0x33);
@@ -2373,7 +2315,7 @@ mod tests {
 
     #[test]
     fn a_frame_of_another_size_stales_the_whole_host_copy() {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         register_test_local(
             &mut ctx,
@@ -2396,7 +2338,7 @@ mod tests {
     #[test]
     fn destroying_a_surface_stales_the_host_copies_it_showed() {
         // A new surface may reuse the ID; nothing relates to its contents.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let in_sync = |ctx: &Context| {
             ctx.local_buffer(42)
@@ -2420,7 +2362,7 @@ mod tests {
         // The SHM Commit Copy Invariant: the host samples the current buffer
         // again for a commit without an attach, so its damage must be copied
         // before the commit is forwarded.
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         ctx.client_to_host_queue.clear();
         draw_test_frame(&ctx, 42, 0x22);
@@ -2433,7 +2375,7 @@ mod tests {
         assert_eq!(copied_pixels(&ctx, 42, 0x22), rect_pixels(1, 2, 2, 1));
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(wl_surface_host, REQ_COMMIT))
+            Some(&(SURFACE.host, REQ_COMMIT))
         );
     }
 
@@ -2523,7 +2465,7 @@ mod tests {
     fn damage_only_commit_does_not_read_a_released_shm_buffer() {
         // After wl_buffer.release the client owns the storage and may be
         // drawing its next frame there; the host no longer samples it.
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         assert!(ctx.mark_buffer_released(42));
         ctx.client_to_host_queue.clear();
@@ -2537,7 +2479,7 @@ mod tests {
         assert_eq!(copied_pixels(&ctx, 42, 0x22), []);
         assert_eq!(
             queued_headers(&ctx.client_to_host_queue).last(),
-            Some(&(wl_surface_host, REQ_COMMIT))
+            Some(&(SURFACE.host, REQ_COMMIT))
         );
     }
 
@@ -2545,7 +2487,7 @@ mod tests {
     fn commit_without_damage_on_a_held_buffer_skips_the_copy() {
         // A commit that only acknowledges a configure must reach the host
         // even when the buffer's dma-buf sync would fail (here: no channel).
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let host_id = ctx.render_buffer_host_id(42).unwrap();
         ctx.local_buffer_copy_resources(host_id)
@@ -2567,7 +2509,7 @@ mod tests {
             assert!(!ctx.is_fatal());
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue).last(),
-                Some(&(wl_surface_host, REQ_COMMIT))
+                Some(&(SURFACE.host, REQ_COMMIT))
             );
             ctx.client_to_host_queue.clear();
         }
@@ -2576,7 +2518,7 @@ mod tests {
     #[test]
     fn destroyed_pending_shm_attach_survives_until_commit() {
         const BUFFER_BYTES: usize = 4;
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
@@ -2631,7 +2573,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_scale_and_transform_without_mutating_pending_state() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2659,7 +2601,7 @@ mod tests {
 
     #[test]
     fn v5_attach_rejects_nonzero_offsets_but_legacy_attach_tracks_them() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         ctx.last_sender_id = surface_id;
@@ -2690,7 +2632,7 @@ mod tests {
 
     #[test]
     fn v5_zero_attach_does_not_create_an_attach_offset() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         ctx.last_sender_id = surface_id;
@@ -2719,7 +2661,7 @@ mod tests {
 
     #[test]
     fn offset_request_wins_over_legacy_attach_offset_at_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         ctx.last_sender_id = surface_id;
@@ -2747,7 +2689,7 @@ mod tests {
 
     #[test]
     fn consumed_attach_offset_is_not_reapplied_on_later_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.shadow_table.set_guest_version_for_test(surface_id, 4);
         ctx.last_sender_id = surface_id;
@@ -2770,7 +2712,7 @@ mod tests {
 
     #[test]
     fn damage_buffer_is_translated_to_host_damage_before_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2792,7 +2734,7 @@ mod tests {
 
     #[test]
     fn first_shm_commit_without_explicit_damage_queues_full_host_damage() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_local(
@@ -2818,7 +2760,7 @@ mod tests {
 
     #[test]
     fn failed_shm_copy_does_not_queue_a_host_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         let mut buffer = mapped_test_buffer(8, 6, 32, StalePixels::all());
@@ -2850,7 +2792,7 @@ mod tests {
 
     #[test]
     fn missing_host_surface_ends_the_session_without_a_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2866,7 +2808,7 @@ mod tests {
 
     #[test]
     fn terminal_buffer_cannot_partially_commit_a_new_attach() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_native(&mut ctx, buffer_id, (8, 6));
@@ -2892,7 +2834,7 @@ mod tests {
 
     #[test]
     fn invalid_damage_spam_does_not_escalate_to_full_frame_damage() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2915,7 +2857,7 @@ mod tests {
 
     #[test]
     fn bounded_damage_overflow_uses_the_exact_content_extent() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_native(&mut ctx, buffer_id, (8, 6));
@@ -2943,7 +2885,7 @@ mod tests {
 
     #[test]
     fn surface_damage_is_outset_before_host_forwarding() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -2994,7 +2936,7 @@ mod tests {
         size: (i32, i32),
         rect: (i32, i32, i32, i32),
     ) -> Vec<(i32, i32, i32, i32)> {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.surfaces.insert(TEST_SURFACE, surface);
         set_test_surface_content(&mut ctx, TEST_SURFACE, None, Some(size));
         ctx.last_sender_id = TEST_SURFACE;
@@ -3035,7 +2977,7 @@ mod tests {
         );
         // A buffer attached under a viewport without damage damages the
         // whole destination.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.surfaces.insert(
             TEST_SURFACE,
             viewed_surface(1, None, Some((i32::MAX, i32::MAX))),
@@ -3059,7 +3001,7 @@ mod tests {
 
     #[test]
     fn full_mapping_without_explicit_damage_still_damages_the_host_surface() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_local(
@@ -3104,7 +3046,7 @@ mod tests {
 
     #[test]
     fn offset_without_explicit_damage_does_not_invent_host_damage() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_local(
@@ -3131,7 +3073,7 @@ mod tests {
 
     #[test]
     fn nonzero_surface_offset_with_explicit_damage_forces_full_host_damage() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let buffer_id = 42;
         register_test_local(
@@ -3158,7 +3100,7 @@ mod tests {
 
     #[test]
     fn extreme_surface_damage_is_clamped_before_host_encoding() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.last_sender_id = 100;
         let mut handler = CompositorHandler;
 
@@ -3204,7 +3146,7 @@ mod tests {
 
     #[test]
     fn viewport_damage_uses_committed_crop_and_destination() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -3305,7 +3247,7 @@ mod tests {
 
     #[test]
     fn destroying_viewport_is_double_buffered_until_surface_commit() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let mut handler = CompositorHandler;
 
@@ -3346,7 +3288,7 @@ mod tests {
 
     #[test]
     fn invalid_viewport_values_and_dead_surface_are_fatal() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let mut handler = CompositorHandler;
 
@@ -3376,7 +3318,7 @@ mod tests {
 
     #[test]
     fn duplicate_viewport_is_a_fatal_viewporter_error() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface_id = 100;
         let mut handler = CompositorHandler;
 
@@ -3400,7 +3342,7 @@ mod tests {
     fn fractional_source_without_destination_is_logged_and_forwarded() {
         // Exo takes the fractional source size as the surface size, and the
         // host damage covers it, rounded up.
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
@@ -3430,7 +3372,7 @@ mod tests {
     /// `source` (24.8 fixed point) and a destination, which lets the
     /// source be fractional.
     fn commit_viewport_source(size: (i32, i32), source: (i32, i32, i32, i32)) -> Context {
-        let (mut ctx, ..) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
@@ -3493,28 +3435,28 @@ mod tests {
 
     #[test]
     fn xdg_toplevel_destroy_cleans_up_map() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
 
         let mut handler = CompositorHandler;
-        ctx.last_sender_id = xdg_toplevel_id;
+        ctx.last_sender_id = TOPLEVEL.guest;
 
         assert!(ctx
             .xdg_roles
-            .wl_surface_of_toplevel(xdg_toplevel_id)
+            .wl_surface_of_toplevel(TOPLEVEL.guest)
             .is_some());
 
-        ctx.last_sender_id = xdg_toplevel_id;
+        ctx.last_sender_id = TOPLEVEL.guest;
         let action = XdgToplevelHandler::on_destroy(&mut handler, &mut ctx);
         assert_eq!(action, Action::Drop);
 
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id), None);
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
     }
 
     #[test]
     fn wl_surface_destroy_releases_zaura_surface() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        set_test_app_id(&mut ctx, xdg_toplevel_id, "app");
-        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
+        let mut ctx = toplevel_ctx();
+        set_test_app_id(&mut ctx, TOPLEVEL.guest, "app");
+        let zaura_surface_host = ctx.aura_surfaces.get(SURFACE.host).unwrap();
 
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = TEST_SURFACE;
@@ -3528,16 +3470,16 @@ mod tests {
             queued_headers(&ctx.client_to_host_queue),
             [
                 (zaura_surface_host, zaura_surface::REQ_RELEASE),
-                (wl_surface_host, wl_surface::REQ_DESTROY),
+                (SURFACE.host, wl_surface::REQ_DESTROY),
             ]
         );
-        assert_eq!(ctx.aura_surfaces.get(wl_surface_host), None);
+        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
     }
 
     #[test]
     fn wl_surface_destroy_retires_a_submitted_buffer_after_the_surface() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, _, _, wl_surface_host) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (buffer, host_buffer) = (50, 60);
             register_test_buffer(&mut ctx, kind, buffer, host_buffer);
             mark_test_buffer_guest_destroyed(&mut ctx, buffer);
@@ -3555,7 +3497,7 @@ mod tests {
             assert_eq!(
                 host_requests(&ctx),
                 [
-                    (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                    (SURFACE.host, wl_surface::Request::Destroy {}.into()),
                     (host_buffer, wl_buffer::Request::Destroy {}.into()),
                 ],
                 "the host {kind:?} buffer must be destroyed after the surface"
@@ -3565,7 +3507,7 @@ mod tests {
 
     #[test]
     fn shared_buffer_waits_for_its_last_surface_destroy() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, first_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let first_surface = 100u32;
         let second_surface = 101u32;
         let second_surface_host = 201u32;
@@ -3595,7 +3537,7 @@ mod tests {
         assert!(ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             host_requests(&ctx),
-            [(first_surface_host, wl_surface::Request::Destroy {}.into())],
+            [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
             "one surface cannot retire a buffer still owned by another"
         );
 
@@ -3609,7 +3551,7 @@ mod tests {
         assert_eq!(
             host_requests(&ctx),
             [
-                (first_surface_host, wl_surface::Request::Destroy {}.into()),
+                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
                 (second_surface_host, wl_surface::Request::Destroy {}.into()),
                 (host_buffer, wl_buffer::Request::Destroy {}.into()),
             ],
@@ -3619,7 +3561,7 @@ mod tests {
 
     #[test]
     fn pending_attach_preserves_backing_but_not_destroyed_surface_use() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, first_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let first_surface = 100u32;
         let second_surface = 101u32;
         let second_surface_host = 201u32;
@@ -3666,7 +3608,7 @@ mod tests {
         assert_eq!(
             host_requests(&ctx),
             [
-                (first_surface_host, wl_surface::Request::Destroy {}.into()),
+                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
                 (second_surface_host, wl_surface::Request::Destroy {}.into()),
                 (host_buffer, wl_buffer::Request::Destroy {}.into()),
             ],
@@ -3676,7 +3618,7 @@ mod tests {
 
     #[test]
     fn destroying_surface_then_live_buffer_does_not_wait_for_release() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let wl_surface_guest = 100u32;
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
@@ -3710,7 +3652,7 @@ mod tests {
         assert_eq!(
             host_requests(&ctx),
             [
-                (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                (SURFACE.host, wl_surface::Request::Destroy {}.into()),
                 (host_buffer, wl_buffer::Request::Destroy {}.into()),
             ],
             "surface destroy must precede the live buffer destroy"
@@ -3719,7 +3661,7 @@ mod tests {
 
     #[test]
     fn destroying_unrelated_surface_keeps_detached_submitted_buffer() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
@@ -3741,7 +3683,7 @@ mod tests {
         assert!(ctx.buffer_is_submitted(guest_buffer));
         assert_eq!(
             host_requests(&ctx),
-            [(wl_surface_host, wl_surface::Request::Destroy {}.into())],
+            [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
             "an unrelated surface destroy must not preempt wl_buffer.release"
         );
     }
@@ -3749,7 +3691,7 @@ mod tests {
     #[test]
     fn a_detached_use_survives_destroy_of_the_new_current_surface() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, ..) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (first_surface, second_surface) = (TEST_SURFACE, 101);
             let (buffer, host_buffer) = (50, 51);
             ctx.shadow_table.insert_paired_with_version_for_test(
@@ -3827,7 +3769,7 @@ mod tests {
     #[test]
     fn destroying_a_pending_only_surface_keeps_awaiting_release() {
         for kind in BUFFER_KINDS {
-            let (mut ctx, _, _, wl_surface_host) = setup_ctx();
+            let mut ctx = toplevel_ctx();
             let (buffer, host_buffer) = (50, 51);
             register_test_buffer(&mut ctx, kind, buffer, host_buffer);
             let awaiting_release = Some(RenderBufferLifecycle::GuestDestroyed(
@@ -3867,7 +3809,7 @@ mod tests {
             );
             assert_eq!(
                 host_requests(&ctx),
-                [(wl_surface_host, wl_surface::Request::Destroy {}.into())],
+                [(SURFACE.host, wl_surface::Request::Destroy {}.into())],
                 "the host {kind:?} buffer must remain alive until its real release"
             );
 
@@ -3880,7 +3822,7 @@ mod tests {
             assert_eq!(
                 host_requests(&ctx),
                 [
-                    (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                    (SURFACE.host, wl_surface::Request::Destroy {}.into()),
                     (host_buffer, wl_buffer::Request::Destroy {}.into()),
                 ],
                 "the real release must retire the {kind:?} buffer after the \
@@ -3891,7 +3833,7 @@ mod tests {
 
     #[test]
     fn wl_surface_destroy_removes_stale_xdg_surface_links() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let wl_surface_guest_id = 100u32;
         ctx.xdg_roles.add_xdg_surface(601, wl_surface_guest_id);
         ctx.xdg_roles
@@ -3907,17 +3849,17 @@ mod tests {
         assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(602), None);
         // The setup role is also ended because it is on the same surface;
         // no stale association should survive destruction.
-        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(xdg_toplevel_id), None);
+        assert_eq!(ctx.xdg_roles.wl_surface_of_toplevel(TOPLEVEL.guest), None);
         assert!(ctx.xdg_roles.is_empty());
     }
 
     #[test]
     fn wl_surface_destroy_removes_keyboard_focus_links() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let wl_surface_guest_id = 100u32;
         let host_keyboard_id = crate::state::HostId(700);
         ctx.keyboard_focus
-            .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, _wl_surface_host);
+            .set_for_test(host_keyboard_id, 1, wl_surface_guest_id, SURFACE.host);
         let sequence = ctx
             .key_generations
             .observe_peek_press(host_keyboard_id, 14, 1, 123, true);
@@ -4000,7 +3942,7 @@ mod tests {
 
     #[test]
     fn wl_surface_destroy_sends_text_input_leave_before_delayed_keyboard_leave() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let surface = 100;
         let text_input = 700;
         let guest_keyboard = 800;
@@ -4016,7 +3958,7 @@ mod tests {
             crate::state::HostId(host_keyboard),
             1,
             surface,
-            _wl_surface_host,
+            SURFACE.host,
         );
         ctx.text_inputs.insert(text_input, {
             let mut state = crate::state::TextInputState::new(702, None, 1, Some(surface));
@@ -4054,7 +3996,7 @@ mod tests {
 
     #[test]
     fn wl_surface_destroy_transitions_all_focused_seats_and_preserves_others() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, destroyed_host_surface) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let destroyed_surface = 100;
         let live_surface = 101;
         let live_host_surface = 201;
@@ -4095,13 +4037,13 @@ mod tests {
             crate::state::HostId(900),
             1,
             destroyed_surface,
-            destroyed_host_surface,
+            SURFACE.host,
         );
         ctx.keyboard_focus.set_for_test(
             crate::state::HostId(901),
             3,
             destroyed_surface,
-            destroyed_host_surface,
+            SURFACE.host,
         );
         ctx.keyboard_focus.set_for_test(
             crate::state::HostId(902),
@@ -4178,7 +4120,7 @@ mod tests {
         for host_keyboard in [900, 901] {
             ctx.last_sender_id = host_keyboard;
             assert_eq!(
-                WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 10, destroyed_host_surface,),
+                WlKeyboardHandler::on_leave(&mut keyboard, &mut ctx, 10, SURFACE.host,),
                 Action::Drop
             );
         }
@@ -4188,7 +4130,7 @@ mod tests {
 
     #[test]
     fn wl_surface_destroy_repairs_only_text_inputs_on_the_stale_surface() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         let destroyed_surface = 100;
         let replacement_surface = 101;
         let replacement_host_surface = 201;
@@ -4317,18 +4259,18 @@ mod tests {
 
     #[test]
     fn old_aura_surface_stays_reserved_without_release_request() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
+        let mut ctx = toplevel_ctx();
         ctx.host_zaura_shell
             .as_mut()
             .expect("bound zaura_shell")
             .version = 37;
-        ctx.last_sender_id = xdg_toplevel_id;
+        ctx.last_sender_id = TOPLEVEL.guest;
 
         let mut handler = CompositorHandler;
         handler.on_set_app_id(&mut ctx, &"legacy".to_string());
         let zaura_surface_host = ctx
             .aura_surfaces
-            .get(wl_surface_host)
+            .get(SURFACE.host)
             .expect("set_app_id must create the aura surface");
 
         ctx.client_to_host_queue.clear();

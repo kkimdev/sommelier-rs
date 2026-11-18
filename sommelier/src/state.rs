@@ -1250,8 +1250,85 @@ mod tests {
         assert!(ctx.is_fatal());
     }
 
+    /// The test constructors ignore every `SOMMELIER_*` variable, which a
+    /// developer's environment may set (Crostini sets some). The test sets
+    /// all of them, in a child process, so a constructor that read one
+    /// fails here wherever the test runs. It also checks that it sets every
+    /// variable the sources name, so a new one cannot be left out.
     #[test]
     fn test_contexts_read_no_environment() {
+        const VARIABLES: &[(&str, &str)] = &[
+            ("SOMMELIER_ACCELERATORS", "<Alt>w"),
+            // A probe of this node is seen (as an allocator) only where it
+            // is a virtio-gpu render node, as in a Crostini container;
+            // elsewhere a probe fails unseen.
+            ("SOMMELIER_DRM_DEVICE", "/dev/dri/renderD128"),
+            ("SOMMELIER_VM_IDENTIFIER", "penguin-vm"),
+            ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+            ("SOMMELIER_WINDOW_PLACEMENT_BACKEND", "arc"),
+            ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"),
+        ];
+        // Variables only tests read.
+        const TEST_ONLY: &[&str] = &["SOMMELIER_FUZZ_", "SOMMELIER_TEST_"];
+        let named = source_files(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        )))
+        .into_iter()
+        .flat_map(|path| {
+            let source = std::fs::read_to_string(&path).expect("read a source file");
+            source
+                .split("\"SOMMELIER_")
+                .skip(1)
+                .filter_map(|rest| {
+                    let (name, _) = rest.split_once('"')?;
+                    // A whole literal of a variable's name, not a message.
+                    (!name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte == b'_'))
+                    .then(|| format!("SOMMELIER_{name}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|name| !TEST_ONLY.iter().any(|prefix| name.starts_with(prefix)))
+        .collect::<std::collections::BTreeSet<_>>();
+        let set = VARIABLES
+            .iter()
+            .map(|&(name, _)| name.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(set, named, "the test sets every SOMMELIER_* variable");
+
+        crate::test_support::in_own_process_with_env(
+            "state::tests::test_contexts_read_no_environment",
+            VARIABLES,
+            test_contexts_read_no_environment_in_child,
+        );
+    }
+
+    /// Every `.rs` file under `dir`.
+    fn source_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read a source directory")
+            .map(|entry| entry.expect("a source directory entry").path())
+            .flat_map(|path| {
+                if path.is_dir() {
+                    source_files(&path)
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    vec![path]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
+    }
+
+    fn test_contexts_read_no_environment_in_child() {
+        assert_eq!(
+            std::env::var("SOMMELIER_VM_IDENTIFIER").as_deref(),
+            Ok("penguin-vm"),
+            "the child has the variables"
+        );
         let accelerators = vec![alt_q()];
         let ctx = Context::new_for_test(true, false, accelerators);
         assert!(ctx.gpu_accel);

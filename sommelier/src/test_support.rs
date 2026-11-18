@@ -37,9 +37,19 @@ const OWN_PROCESS_ENV: &str = "SOMMELIER_TEST_OWN_PROCESS";
 ///
 /// In the test's own process, the child's standard output once the test
 /// passed there; in the child, which runs `body`, nothing.
+pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
+    in_own_process_with_env(test_path, &[], body)
+}
+
+/// [`in_own_process`], with the environment variables `env` set in the
+/// child, for a test of what the process reads from its environment.
 // A test may wait for its child; no client runs on the test's thread.
 #[allow(clippy::disallowed_methods)]
-pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
+pub fn in_own_process_with_env(
+    test_path: &str,
+    env: &[(&str, &str)],
+    body: impl FnOnce(),
+) -> String {
     if std::env::var_os(OWN_PROCESS_ENV).is_some() {
         body();
         return String::new();
@@ -47,6 +57,7 @@ pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
     let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args([test_path, "--exact", "--test-threads=1", "--nocapture"])
         .env(OWN_PROCESS_ENV, "1")
+        .envs(env.iter().copied())
         .output()
         .expect("run the test binary");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -266,12 +277,19 @@ pub fn fds_with_identity(identity: TestFdIdentity) -> usize {
         .count()
 }
 
+/// A new pipe's read and write ends. They close on exec, so the child
+/// copies of the test binary that some tests start (see
+/// [`in_own_process`]) do not inherit them.
+pub fn pipe() -> (OwnedFd, OwnedFd) {
+    nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("create a pipe")
+}
+
 /// A memfd holding `bytes`, as a guest client creates a `wl_shm` pool file.
 pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
     use std::io::Write;
     let fd = nix::sys::memfd::memfd_create(
         c"sommelier-test-shm-pool",
-        nix::sys::memfd::MFdFlags::empty(),
+        nix::sys::memfd::MFdFlags::MFD_CLOEXEC,
     )
     .expect("memfd_create");
     let mut file = std::fs::File::from(fd);
@@ -397,22 +415,20 @@ impl Rng {
 
 /// A uniquely named scratch directory removed when dropped.
 ///
-/// Tests run in parallel inside one process, so the name combines the process
-/// ID, a caller label, and a per-process counter.
+/// `mkdtemp` picks a name no other directory has, so tests running in
+/// parallel, and a directory a crashed run left behind, never collide.
+/// The name stays short: a socket bound inside must fit its whole path
+/// in the 108 bytes of `sun_path`.
 pub struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    /// Create a fresh directory under the system temporary directory.
+    /// Create a fresh directory, `sommelier-<label>-` and six random
+    /// characters, under the system temporary directory.
     pub fn new(label: &str) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "sommelier-test-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).expect("create test directory");
+        let template = std::env::temp_dir().join(format!("sommelier-{label}-XXXXXX"));
+        let path = nix::unistd::mkdtemp(&template).expect("create test directory");
         Self { path }
     }
 

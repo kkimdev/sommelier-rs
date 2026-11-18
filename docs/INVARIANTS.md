@@ -1054,9 +1054,11 @@ end it.
 - **`SIGHUP` never ends the proxy.** `prepare_process` in `main` installs
   the handler first, in every configuration, before the shortcut file is
   first read. Reloads run in their own task, so they never wait for the
-  accept loop, and an error is logged if that task ever ends.
+  accept loop. If that task ever ends, an error is logged; no test covers
+  that log.
   Tests: `sighup_after_process_preparation_reaches_the_reload_handler`,
-  `sighup_without_a_shortcuts_file_does_not_end_the_proxy`,
+  `a_real_sighup_reloads_the_shortcuts_file`,
+  `a_no_op_reload_keeps_the_proxy_and_its_reloads`,
   `reload_does_not_wait_for_the_accept_retry_pause`.
 - **The socket belongs to the process holding its lock.** Like libwayland,
   the proxy takes `flock(LOCK_EX | LOCK_NB)` on `<socket>.lock` for its
