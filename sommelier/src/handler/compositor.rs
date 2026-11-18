@@ -622,6 +622,11 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
+        // A surface has state only once a request sets some
+        // (`Context::surface_mut`), so a first commit with nothing pending,
+        // as a client sends to map an xdg surface, has none. It commits
+        // the defaults, which a fresh surface has; keeping that state would
+        // record nothing.
         let mut default_surface = SurfaceState::default();
         let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
             || default_surface.prepare_commit(),
@@ -644,15 +649,20 @@ impl WlSurfaceHandler for CompositorHandler {
         };
         let attached_full_mapping =
             attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
-        let surface_damage = commit.surface_damage.rects();
-        let buffer_damage = commit.buffer_damage.rects();
+        // `None`: full damage, which sends the whole surface instead of
+        // any rectangle.
+        let damage = commit
+            .surface_damage
+            .rects()
+            .zip(commit.buffer_damage.rects());
+        let (surface_damage, buffer_damage) = damage.unwrap_or_default();
         ctx.stale_surface_pixels(surface_id, &commit, &mapping);
         // A buffer that copies everything shows the host a whole new image.
         let needs_full_damage = copied_buffer_id
             .and_then(|buffer_id| ctx.local_buffer(buffer_id))
             .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
         let force_full_damage = needs_full_damage
-            || commit.has_full_damage()
+            || damage.is_none()
             || (commit.buffer_offset != (0, 0)
                 && (!surface_damage.is_empty() || !buffer_damage.is_empty()))
             || (attached_full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());
@@ -2425,6 +2435,88 @@ mod tests {
             queued_headers(&ctx.client_to_host_queue).last(),
             Some(&(wl_surface_host, REQ_COMMIT))
         );
+    }
+
+    /// A surface has no state until a request sets some, so its first
+    /// commit may have none; it commits the defaults, as a fresh surface
+    /// has them, and is forwarded.
+    #[tokio::test]
+    async fn a_first_commit_without_surface_state_is_forwarded() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        s.guest([wl_surface::req::commit(surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Commit {}.into())]
+        );
+        assert_eq!(s.guest_received(), []);
+    }
+
+    /// Surface damage of more rectangles than the proxy keeps damages the
+    /// whole surface, so a damage-only commit copies the whole buffer, not
+    /// just the buffer damage, which here is none.
+    #[tokio::test]
+    async fn overflowing_surface_damage_copies_the_whole_buffer() {
+        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        let pool_file = shm_pool_file(&[0x11; 8]);
+        let pool = s.shm_pool(shm, pool_file.try_clone().unwrap()).await;
+        let buffer = s.new_id();
+        s.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            0,
+            2,
+            1,
+            8,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let received = s.host_received();
+        let Some(host_pool) = received.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, .. }) => Some(fd),
+            _ => None,
+        }) else {
+            panic!("the host got no pool: {received:?}");
+        };
+        let host_pool = std::fs::File::from(host_pool.try_clone().unwrap());
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
+            wl_surface::req::damage(surface.id, 0, 0, 2, 1),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
+
+        // The client redraws both pixels, and damages only the first, in
+        // more rectangles than the proxy keeps (256).
+        pool_file.write_all_at(&[0x22; 8], 0).unwrap();
+        let damage = (0..=256).map(|_| wl_surface::req::damage(surface.id, 0, 0, 1, 1));
+        s.guest(damage.chain([wl_surface::req::commit(surface.id)]))
+            .await;
+        assert_eq!(
+            s.host_received(),
+            [
+                (
+                    surface.host,
+                    wl_surface::Request::Damage {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1
+                    }
+                    .into()
+                ),
+                (surface.host, wl_surface::Request::Commit {}.into()),
+            ]
+        );
+
+        let mut host_pixels = [0; 8];
+        host_pool.read_exact_at(&mut host_pixels, 0).unwrap();
+        assert_eq!(host_pixels, [0x22; 8]);
+        assert_eq!(s.guest_received(), []);
     }
 
     #[test]
