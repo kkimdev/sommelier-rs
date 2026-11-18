@@ -197,7 +197,8 @@ encode wire bytes ad hoc.
 | Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
-| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs`, `window_placement.rs` | `aura_surfaces.rs`, `xdg_roles.rs`, `window_placement.rs` |
+| ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
+| Window placement | `window_placement.rs` and a submodule per backend | `window_placement.rs` and a submodule per backend |
 
 Two mechanisms let a handler act outside its own message:
 
@@ -207,6 +208,40 @@ Two mechanisms let a handler act outside its own message:
 - `callback::queue_internal_sync` issues a host-only `wl_display.sync` and
   `state::InternalCallbacks` records what it waits for, such as the
   text-input drain or the placement barrier.
+
+### Window placement
+
+Window placement is opt-in and experimental, and it is built so that
+the rest of the proxy does not depend on how a window is moved. The
+contract is in
+[Window placement shortcuts](../sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
+
+- **One boundary.** `handler/window_placement.rs` is the only placement
+  code the protocol handlers call, one entry point per event; the table
+  in its module docs is the one list of them. Each dispatches on the
+  connection's `WindowPlacementState` and does nothing while placement is
+  off.
+- **Shared target resolution.** Which toplevel the keyboard focuses, the
+  output it entered last, and the bounds the bound rectangle maps to in
+  that output's work area (`resolve_target`) are the same for every
+  backend; a backend gets the resolved `PlacementTarget` and only moves
+  the window.
+- **Backends own their state.** `WindowPlacementState` has one variant
+  per backend and `Off`, the default, which holds nothing. A backend's
+  per-connection state (`state/window_placement/<backend>.rs`), its host
+  objects and its requests (`handler/window_placement/<backend>.rs`) are
+  reachable only through its variant, so another backend, or placement
+  off, cannot touch them. The ARC backend (`arc`) is the only one: an ARC
+  policy identity, a host-only `zaura_toplevel` and
+  `set_window_bounds`.
+- **Lifecycle through the boundary.** A backend's per-object state ends
+  through the boundary's `release_toplevel` and `forget_surface`, which
+  the owners' `forget_*` functions call from `forget_object` (see
+  [Object ends](#object-ends)), and `WindowPlacementState::assert_no_orphans`
+  checks it after every batch in tests.
+- **Off is the absence of placement.** With placement off a session's
+  traffic is what it would be without placement (test:
+  `placement_off_traffic_is_unchanged`).
 
 ### Object ends
 

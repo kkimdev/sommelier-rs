@@ -3007,7 +3007,12 @@ mod tests {
             "a request from a pending xdg_surface must terminate the session"
         );
         assert!(
-            client.ctx.window_placement.aura_toplevel_count() == 0,
+            client
+                .ctx
+                .window_placement
+                .arc()
+                .map_or(0, |arc| arc.aura_toplevel_count())
+                == 0,
             "failed get_toplevel requests must not leave an internal Aura child"
         );
     }
@@ -3038,7 +3043,8 @@ mod tests {
         let aura_toplevel = client
             .ctx
             .window_placement
-            .aura_toplevel_for_xdg_toplevel(XDG_TOPLEVEL)
+            .arc()
+            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(XDG_TOPLEVEL))
             .expect("placement Aura toplevel");
         drop(client);
 
@@ -3075,7 +3081,14 @@ mod tests {
             client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
             None
         );
-        assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(
+            client
+                .ctx
+                .window_placement
+                .arc()
+                .map_or(0, |arc| arc.aura_toplevel_count()),
+            0
+        );
     }
 
     /// A get_toplevel that is forwarded but ends the session (here, as if
@@ -3093,7 +3106,14 @@ mod tests {
             client.ctx.xdg_roles.toplevel_of_xdg_surface(XDG_SURFACE),
             None
         );
-        assert_eq!(client.ctx.window_placement.aura_toplevel_count(), 0);
+        assert_eq!(
+            client
+                .ctx
+                .window_placement
+                .arc()
+                .map_or(0, |arc| arc.aura_toplevel_count()),
+            0
+        );
     }
 
     #[tokio::test]

@@ -399,7 +399,7 @@ fn release_surface_aura_objects(
 /// still valid.
 pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_surface_host_id: u32) {
     release_surface_aura_objects(ctx, wl_surface_guest_id, wl_surface_host_id);
-    ctx.window_placement.forget_surface(wl_surface_guest_id);
+    window_placement::forget_surface(ctx, wl_surface_guest_id);
     ctx.outputs.surface_destroyed(wl_surface_host_id);
     let gtk_surface_ids = ctx
         .gtk_surfaces
@@ -1705,7 +1705,8 @@ mod tests {
         let arc_app_id = "org.chromium.arc.2000000000";
         assert_eq!(
             ctx.window_placement
-                .arc_application_id(TEST_SURFACE)
+                .arc_mut()
+                .and_then(|arc| arc.arc_application_id(TEST_SURFACE))
                 .as_deref(),
             Some(arc_app_id)
         );

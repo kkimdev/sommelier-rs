@@ -562,20 +562,8 @@ impl Singleton {
                     bound_version,
                     host_id,
                 )?;
-                if ctx.window_placement.uses_arc_bounds() {
-                    // A guest may bind an output before the host registry has
-                    // delivered zaura_shell. Retry every already-live output
-                    // now that the shell object and its version are
-                    // available; the output bind path cannot do this
-                    // retroactively on its own.
-                    for output_host_id in ctx.outputs.live_outputs() {
-                        crate::handler::aura_objects::ensure_zaura_output(ctx, output_host_id);
-                    }
-                    // Apply the same retry to XDG roles created before the
-                    // shell global arrived.
-                    crate::handler::window_placement::attach_recorded_toplevels(ctx);
-                    crate::handler::window_placement::warn_if_shell_cannot_place(bound_version);
-                }
+                // Placement retries what a guest set up before the shell.
+                crate::handler::window_placement::shell_bound(ctx, bound_version);
                 log::debug!("Bound {interface} internally (host_id={host_id})");
             }
             Self::Shm => {
@@ -1375,11 +1363,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 bind_version,
                 GlobalBinding { name, generation },
             );
-            if ctx.window_placement.uses_arc_bounds() {
-                // Host-only Aura output metadata (scale factors and insets).
-                // A missing shell is retried when zaura_shell binds.
-                crate::handler::aura_objects::ensure_zaura_output(ctx, host_new_id);
-            }
+            // Placement's host-only Aura output metadata (scale factors and
+            // insets).
+            crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
         if interface == "zwp_linux_dmabuf_v1" {
             ctx.dmabuf_guest_generations
@@ -2108,11 +2094,15 @@ mod tests {
         assert_eq!(A.global(&mut ctx, 11, "zaura_shell", 38), Action::Drop);
         let attached = ctx
             .window_placement
-            .aura_toplevel_for_xdg_toplevel(13)
+            .arc()
+            .and_then(|arc| arc.aura_toplevel_for_xdg_toplevel(13))
             .is_some();
         if attached {
             assert!(
-                ctx.window_placement.arc_application_id(12).is_some(),
+                ctx.window_placement
+                    .arc_mut()
+                    .and_then(|arc| arc.arc_application_id(12))
+                    .is_some(),
                 "an attached toplevel's surface carries an ARC identity"
             );
         }

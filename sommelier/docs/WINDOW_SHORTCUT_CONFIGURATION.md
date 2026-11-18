@@ -315,13 +315,15 @@ that task ends, an error says reloads have stopped.
 | `sommelier/src/window_layout.rs` | `WindowLayoutAction` (named presets plus a configured rect) and its name parser; `NormalizedRect` validation and the rounding rule that maps it from a work-area `Rect` to window bounds. |
 | `sommelier/src/accelerator.rs` | Chord types and parsing only. |
 | `sommelier/src/state.rs` | `Context` holds the connection's owners below and its `host_zaura_shell` binding; `placement_action_for` / `is_host_accelerator` ask the shared `PlacementConfig`. |
-| `sommelier/src/state/window_placement.rs` | Per-connection policy state: ARC identities (from the `PlacementConfig` block), placement Aura toplevels, the barrier that gates each one, and the configures held behind it. |
+| `sommelier/src/state/window_placement.rs` | `WindowPlacementState`: which backend a connection uses, with that backend's state; `Off` holds nothing. |
+| `sommelier/src/state/window_placement/arc.rs` | `ArcPlacementState`, the ARC backend's per-connection state: ARC identities (from the `PlacementConfig` block), placement Aura toplevels, the barrier that gates each one, and the configures held behind it. |
 | `sommelier/src/state/aura_surfaces.rs` | `AuraSurfaces`: the one host Aura surface of each `wl_surface`, shared by XDG and GTK metadata and placement. |
 | `sommelier/src/state/xdg_roles.rs` | `XdgRoles`: which `wl_surface` each `xdg_surface` and `xdg_toplevel` belongs to; placement finds the focused toplevel here. |
 | `sommelier/src/state/internal_callbacks.rs` | `InternalCallbacks`: what each proxy-issued `wl_display.sync` waits for, including the placement barrier. |
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
-| `sommelier/src/handler/window_placement.rs` | Placement mechanics: the focused toplevel and its output, the ARC identity (`set_aura_application_id` chooses it or the guest's ID for XDG and GTK), `set_window_bounds` and its barrier, and the configures held behind it. Protocol handlers call one entry point per event (listed in its module docs). |
+| `sommelier/src/handler/window_placement.rs` | The placement boundary: the focused toplevel, its output and the bounds (shared by every backend), `set_aura_application_id` (the guest's ID, or the one the backend chooses, for XDG and GTK), and one entry point per protocol event (listed in its module docs), each of which dispatches to the connection's backend. |
+| `sommelier/src/handler/window_placement/arc.rs` | The ARC backend: the ARC identity, the placement Aura toplevel, `set_window_bounds` and its barrier, and the configures held behind it. |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |
 | `sommelier/src/main.rs` | The `--window-shortcuts-config` option, and when the `SIGHUP` handler is installed. |

@@ -57,7 +57,7 @@ org.chromium.guest_os.<vm>.wayland.<app>
 `<id>` comes from the process-wide allocator described in
 [Sommelier's task-ID allocator](#sommeliers-task-id-allocator).
 
-`WindowPlacementState` (`sommelier/src/state/window_placement.rs`) owns the
+`ArcPlacementState` (`sommelier/src/state/window_placement/arc.rs`) owns the
 per-surface identity: it is allocated on first use (when an XDG toplevel is
 created for the surface, or when GTK metadata or a placement first sends it),
 shared by the XDG and GTK metadata paths, queued to the Aura surface at most

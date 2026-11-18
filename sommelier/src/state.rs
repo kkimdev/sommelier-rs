@@ -64,7 +64,8 @@ pub(crate) use self::render::{
 #[cfg(test)]
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
-    PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure, WindowPlacementState,
+    ArcPlacementState, PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure,
+    WindowPlacementState,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;
@@ -1219,7 +1220,7 @@ mod tests {
             "the next lookup adopts the reloaded generation"
         );
         assert!(
-            ctx.window_placement.uses_arc_bounds(),
+            ctx.window_placement.arc().is_some(),
             "reload never changes the gate"
         );
     }
@@ -1232,7 +1233,7 @@ mod tests {
             crate::arc_task_ids::ArcIdAllocator::block_for_test(),
         ));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
-        assert!(!ctx.window_placement.uses_arc_bounds());
+        assert!(ctx.window_placement.arc().is_none());
     }
 
     #[test]
@@ -1255,7 +1256,7 @@ mod tests {
         assert!(ctx.gpu_accel);
         assert!(ctx.is_host_accelerator(&alt_q()));
         assert_eq!(ctx.placement_action_for(&alt_q()), None);
-        assert!(!ctx.window_placement.uses_arc_bounds());
+        assert!(ctx.window_placement.arc().is_none());
         assert_eq!(ctx.vm_identifier, "termina");
         assert!(ctx.allocator.is_none(), "no DRM device is probed");
 

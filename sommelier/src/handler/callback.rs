@@ -111,6 +111,14 @@ mod tests {
     use crate::state::{Context, HostId, InternalCallback};
     use crate::wire::Action;
 
+    /// A context whose placement uses the ARC backend, whose barriers these
+    /// tests complete.
+    fn arc_context() -> Context {
+        Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::arc_bounds_for_test(""),
+        )
+    }
+
     #[test]
     fn internal_sync_is_a_tracked_host_callback() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -192,7 +200,7 @@ mod tests {
     fn window_bounds_barrier_completes_and_reserves_callback_until_delete_id() {
         let zaura_toplevel_id = 77;
         let callback_id = 40;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = arc_context();
         ctx.shadow_table
             .insert_host_only_for_test(callback_id, "wl_callback", 1);
         register_window_bounds_barrier_for_test(&mut ctx, callback_id, zaura_toplevel_id);
@@ -201,7 +209,10 @@ mod tests {
         let mut handler = CallbackHandler;
         assert_eq!(handler.on_done(&mut ctx, 123), Action::Drop);
         assert_eq!(ctx.internal_callbacks.count(), 0);
-        assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
+        assert!(!ctx
+            .window_placement
+            .arc()
+            .is_some_and(|arc| arc.has_active_barrier(zaura_toplevel_id)));
         assert!(ctx.shadow_table.is_retired_host(callback_id));
         assert!(!ctx.shadow_table.is_host_id_available(callback_id));
 
@@ -218,7 +229,7 @@ mod tests {
         let zaura_toplevel_id = 77;
         let old_callback_id = 40;
         let new_callback_id = 41;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let mut ctx = arc_context();
         for callback_id in [old_callback_id, new_callback_id] {
             ctx.shadow_table
                 .insert_host_only_for_test(callback_id, "wl_callback", 1);
@@ -231,7 +242,8 @@ mod tests {
         assert_eq!(handler.on_done(&mut ctx, 1), Action::Drop);
         assert_eq!(
             ctx.window_placement
-                .active_barrier_for_toplevel(zaura_toplevel_id),
+                .arc()
+                .and_then(|arc| arc.active_barrier_for_toplevel(zaura_toplevel_id)),
             Some(new_callback_id)
         );
         assert!(ctx.shadow_table.is_retired_host(old_callback_id));
@@ -244,7 +256,10 @@ mod tests {
 
         ctx.last_sender_id = new_callback_id;
         assert_eq!(handler.on_done(&mut ctx, 2), Action::Drop);
-        assert!(!ctx.window_placement.has_active_barrier(zaura_toplevel_id));
+        assert!(!ctx
+            .window_placement
+            .arc()
+            .is_some_and(|arc| arc.has_active_barrier(zaura_toplevel_id)));
         assert_eq!(ctx.internal_callbacks.count(), 0);
         assert!(ctx.shadow_table.is_retired_host(new_callback_id));
     }

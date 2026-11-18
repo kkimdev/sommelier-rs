@@ -253,21 +253,7 @@ impl Context {
         }
 
         // Window placement.
-        for surface in self.window_placement.arc_surfaces_for_test() {
-            guest("ARC identity", surface, "wl_surface");
-        }
-        let mut aura_toplevels = std::collections::HashSet::new();
-        for (toplevel, aura_toplevel) in self.window_placement.aura_toplevels_for_test() {
-            guest("Aura toplevel", toplevel, "xdg_toplevel");
-            host_only("Aura toplevel", aura_toplevel, "zaura_toplevel");
-            aura_toplevels.insert(aura_toplevel);
-        }
-        for aura_toplevel in self.window_placement.barrier_toplevels_for_test() {
-            assert!(
-                aura_toplevels.contains(&aura_toplevel),
-                "placement barrier outlived Aura toplevel {aura_toplevel}"
-            );
-        }
+        self.window_placement.assert_no_orphans(&guest, &host_only);
 
         // Keyboards, their focus and keys, and text input.
         for &keyboard in self.keyboard_to_seat.keys() {
