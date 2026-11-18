@@ -22,6 +22,8 @@ limitations under the License.
 
 mod clock;
 mod editor;
+mod engine;
 pub(crate) mod exo;
 mod hangul;
 mod keymap;
+mod sched;
