@@ -507,21 +507,12 @@ fn map_read_fn(arg: &Arg) -> TokenStream {
     }
 }
 
+/// The write of a forwarded argument that needs no translation: every
+/// type but `object` and `new_id`, whose IDs dispatch translates itself.
 fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
     match arg.typ.as_str() {
         "int" => quote! { builder.write_i32(#name) },
-        "uint" | "object" => quote! { builder.write_u32(#name) },
-        "new_id" => {
-            if arg.interface.is_none() {
-                quote! {
-                    builder.write_string(&#name.0);
-                    builder.write_u32(#name.1);
-                    builder.write_u32(#name.2);
-                }
-            } else {
-                quote! { builder.write_u32(#name) }
-            }
-        }
+        "uint" => quote! { builder.write_u32(#name) },
         "fixed" => quote! { builder.write_fixed(#name) },
         "string" if arg.byte_indexed && arg.allow_null.unwrap_or(false) => {
             quote! { builder.write_nullable_indexed_string(#name.as_ref()) }
@@ -830,22 +821,22 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 });
                             }
                             "new_id" => {
-                                if let Some(ref interface_name) = arg.interface {
-                                    // A child object takes its parent's
-                                    // version, bound to no local that could
-                                    // shadow a later argument.
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(ctx.shadow_table.adopt_host_created(
-                                            #name,
-                                            #interface_name,
-                                            ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
-                                        ));
-                                    });
-                                } else {
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(#name);
-                                    });
-                                }
+                                let Some(interface_name) = &arg.interface else {
+                                    panic!(
+                                        "event argument {} creates an object of no interface, which no vendored protocol has",
+                                        arg.name
+                                    );
+                                };
+                                // A child object takes its parent's version,
+                                // bound to no local that could shadow a later
+                                // argument.
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(ctx.shadow_table.adopt_host_created(
+                                        #name,
+                                        #interface_name,
+                                        ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
+                                    ));
+                                });
                             }
                             _ => {
                                 let write_call = map_write_fn(arg, &name);

@@ -577,6 +577,26 @@ mod tests {
         );
     }
 
+    /// An event's `new_id` of no interface has no type to adopt the host's
+    /// object as; generation names the argument instead of emitting code
+    /// that fails to compile with an obscure type error.
+    #[test]
+    #[should_panic(expected = "event argument id creates an object of no interface")]
+    fn test_generate_rejects_an_event_new_id_of_no_interface() {
+        let xml = r#"
+        <protocol name="untyped">
+          <interface name="thing" version="1">
+            <event name="made">
+              <arg name="id" type="new_id"/>
+            </event>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        generator::generate(&protocol);
+    }
+
     #[test]
     #[should_panic(expected = "interface `wl_display` is defined by more than one protocol")]
     fn routing_rejects_an_interface_defined_twice() {
