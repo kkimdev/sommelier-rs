@@ -49,7 +49,8 @@ use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1 as extended, zcr_text_input_extension_v1,
 };
 use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_text_input_v1};
-use crate::wire::WireMessage;
+use crate::protocols::AnyRequest;
+use crate::wire::{IndexedString, Outgoing};
 use std::collections::BTreeMap;
 
 /// What one Exo `TextInput` holds for its field.
@@ -148,9 +149,6 @@ struct TextInput {
     field: Field,
     /// The delegate's `pending_surrounding_text_supported_`.
     pending_support: bool,
-    /// The events not yet sent: `enter` with its surface when an input
-    /// method attaches, `leave` (`None`) when it detaches.
-    events: Vec<Option<u32>>,
 }
 
 impl TextInput {
@@ -172,50 +170,6 @@ impl TextInput {
                 cursor_rectangle: (0, 0, 0, 0),
             },
             pending_support: true,
-            events: Vec::new(),
-        }
-    }
-
-    /// `TextInput::Activate`: nothing for the surface it already has;
-    /// otherwise detach, take the surface, and attach if the seat's focus
-    /// is on it.
-    fn activate(&mut self, surface: u32, focus: Option<u32>) {
-        if self.surface == Some(surface) {
-            return;
-        }
-        self.detach();
-        self.surface = Some(surface);
-        if focus == Some(surface) {
-            self.attach();
-        }
-    }
-
-    /// `TextInput::Deactivate`.
-    fn deactivate(&mut self) {
-        self.detach();
-        self.surface = None;
-    }
-
-    /// `AttachInputMethod` resets the type and mode to text, and keeps the
-    /// flags, learning and surrounding-text support of the previous field.
-    /// Its delegate's `Activated` sends `enter` with the surface of the
-    /// last `activate` (`zwp_text_input_manager.cc:127`).
-    fn attach(&mut self) {
-        self.events.push(self.surface);
-        self.field.attached = true;
-        self.field.content_type.input_type = extended::INPUT_TYPE_TEXT;
-        self.field.content_type.input_mode = extended::INPUT_MODE_TEXT;
-    }
-
-    /// `DetachInputMethod`, which does nothing without an input method.
-    /// Its delegate's `Deactivated` sends `leave`
-    /// (`zwp_text_input_manager.cc:132`).
-    fn detach(&mut self) {
-        if self.field.attached {
-            self.events.push(None);
-            self.field.attached = false;
-            self.field.content_type.input_type = extended::INPUT_TYPE_NONE;
-            self.field.content_type.input_mode = extended::INPUT_MODE_DEFAULT;
         }
     }
 
@@ -242,6 +196,8 @@ pub(crate) struct Exo {
     text_inputs: BTreeMap<u32, TextInput>,
     /// The text input of each host `zcr_extended_text_input_v1`.
     extensions: BTreeMap<u32, u32>,
+    /// The events Exo sent and no one has taken yet, in order.
+    events: Vec<Outgoing>,
 }
 
 impl Exo {
@@ -257,11 +213,12 @@ impl Exo {
         if lost == focus {
             return;
         }
-        for text_input in self.text_inputs.values_mut() {
-            if text_input.surface.is_some() && text_input.surface == focus {
-                text_input.attach();
-            } else if text_input.surface.is_some() && text_input.surface == lost {
-                text_input.deactivate();
+        for id in self.ids() {
+            let surface = self.text_inputs[&id].surface;
+            if surface.is_some() && surface == focus {
+                self.attach(id);
+            } else if surface.is_some() && surface == lost {
+                self.deactivate(id);
             }
         }
     }
@@ -276,86 +233,32 @@ impl Exo {
             self.set_focus(None);
         }
         self.text_inputs.retain(|&id, _| live(id));
-        for text_input in self.text_inputs.values_mut() {
-            if text_input.surface.is_some_and(|surface| !live(surface)) {
-                text_input.deactivate();
+        for id in self.ids() {
+            if self.text_inputs[&id]
+                .surface
+                .is_some_and(|surface| !live(surface))
+            {
+                self.deactivate(id);
             }
         }
     }
 
-    /// Apply a request from the proxy that the compositor has accepted.
-    pub(crate) fn request(&mut self, interface: &str, sender: u32, opcode: u16, payload: &[u8]) {
-        let mut message = WireMessage::new(sender, opcode, payload);
-        let mut word = || message.read_u32().expect("an accepted request");
-        match (interface, opcode) {
-            ("zwp_text_input_manager_v1", zwp_text_input_manager_v1::REQ_CREATE_TEXT_INPUT) => {
-                self.text_inputs.insert(word(), TextInput::new());
-            }
-            (
-                "zcr_text_input_extension_v1",
-                zcr_text_input_extension_v1::REQ_GET_EXTENDED_TEXT_INPUT,
+    /// Apply a request from the proxy, sent by host object `sender`, that
+    /// the compositor has accepted.
+    pub(crate) fn request(&mut self, sender: u32, request: &AnyRequest) {
+        match request {
+            AnyRequest::ZwpTextInputManagerV1(
+                zwp_text_input_manager_v1::Request::CreateTextInput { id },
             ) => {
-                let extension = word();
-                self.extensions.insert(extension, word());
+                self.text_inputs.insert(*id, TextInput::new());
             }
-            ("zcr_extended_text_input_v1", extended::REQ_DESTROY) => {
-                self.extensions.remove(&sender);
-            }
-            ("zcr_extended_text_input_v1", extended::REQ_SET_SURROUNDING_TEXT_SUPPORT) => {
-                let support = match word() {
-                    extended::SURROUNDING_TEXT_SUPPORT_SUPPORTED => true,
-                    extended::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED => false,
-                    // Exo only logs an unknown value.
-                    _ => return,
-                };
-                if let Some(text_input) = self.extended(sender) {
-                    text_input.pending_support = support;
-                }
-            }
-            (
-                "zcr_extended_text_input_v1",
-                extended::REQ_SET_INPUT_TYPE | extended::REQ_DEPRECATED_SET_INPUT_TYPE,
+            AnyRequest::ZcrTextInputExtensionV1(
+                zcr_text_input_extension_v1::Request::GetExtendedTextInput { id, text_input },
             ) => {
-                let content_type = ContentType {
-                    input_type: word(),
-                    input_mode: word(),
-                    flags: word(),
-                    learning: word() == extended::LEARNING_MODE_ENABLED,
-                    // The deprecated request is the new one with inline
-                    // composition supported.
-                    inline_composition: opcode == extended::REQ_DEPRECATED_SET_INPUT_TYPE
-                        || word() == extended::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-                };
-                if let Some(text_input) = self.extended(sender) {
-                    text_input.set_type_mode_flags(content_type);
-                }
+                self.extensions.insert(*id, *text_input);
             }
-            ("zwp_text_input_v1", zwp_text_input_v1::REQ_SET_CONTENT_TYPE) => {
-                let content_type = v1_content_type(word(), word());
-                self.text_input(sender).set_type_mode_flags(content_type);
-            }
-            ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) => {
-                let _seat = word();
-                let surface = word();
-                let focus = self.focus;
-                self.text_input(sender).activate(surface, focus);
-            }
-            ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE) => {
-                self.text_input(sender).deactivate();
-            }
-            // Exo keeps surrounding text and the cursor rectangle with or
-            // without an input method.
-            ("zwp_text_input_v1", zwp_text_input_v1::REQ_SET_SURROUNDING_TEXT) => {
-                let text = message.read_string().expect("an accepted request");
-                let mut word = || message.read_u32().expect("an accepted request");
-                let surrounding_text = (text, word(), word());
-                self.text_input(sender).field.surrounding_text = surrounding_text;
-            }
-            ("zwp_text_input_v1", zwp_text_input_v1::REQ_SET_CURSOR_RECTANGLE) => {
-                let mut int = || message.read_i32().expect("an accepted request");
-                let rectangle = (int(), int(), int(), int());
-                self.text_input(sender).field.cursor_rectangle = rectangle;
-            }
+            AnyRequest::ZcrExtendedTextInputV1(request) => self.extension_request(sender, request),
+            AnyRequest::ZwpTextInputV1(request) => self.text_input_request(sender, request),
             _ => {}
         }
     }
@@ -366,26 +269,18 @@ impl Exo {
     /// `activate`. Returns whether one was attached.
     pub(crate) fn destroy_input_method(&mut self) -> bool {
         let mut detached = false;
-        for text_input in self.text_inputs.values_mut() {
-            if text_input.field.attached {
-                text_input.deactivate();
+        for id in self.ids() {
+            if self.text_inputs[&id].field.attached {
+                self.deactivate(id);
                 detached = true;
             }
         }
         detached
     }
 
-    /// The `enter` (with its surface) and `leave` (`None`) events Exo sent
-    /// since the last call, with the host text input of each.
-    pub(crate) fn take_events(&mut self) -> Vec<(u32, Option<u32>)> {
-        self.text_inputs
-            .iter_mut()
-            .flat_map(|(&id, text_input)| {
-                std::mem::take(&mut text_input.events)
-                    .into_iter()
-                    .map(move |event| (id, event))
-            })
-            .collect()
+    /// The events Exo sent since the last call, in order.
+    pub(crate) fn take_events(&mut self) -> Vec<Outgoing> {
+        std::mem::take(&mut self.events)
     }
 
     /// The fields of the text inputs active on the focused surface.
@@ -395,6 +290,145 @@ impl Exo {
             .filter(|text_input| self.focus.is_some() && text_input.surface == self.focus)
             .map(|text_input| text_input.field.clone())
             .collect()
+    }
+
+    fn extension_request(&mut self, sender: u32, request: &extended::Request) {
+        let content_type = match *request {
+            extended::Request::Destroy {} => {
+                self.extensions.remove(&sender);
+                return;
+            }
+            extended::Request::SetSurroundingTextSupport { support } => {
+                let support = match support {
+                    extended::SURROUNDING_TEXT_SUPPORT_SUPPORTED => true,
+                    extended::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED => false,
+                    // Exo only logs an unknown value.
+                    _ => return,
+                };
+                if let Some(text_input) = self.extended(sender) {
+                    text_input.pending_support = support;
+                }
+                return;
+            }
+            extended::Request::SetInputType {
+                input_type,
+                input_mode,
+                input_flags,
+                learning_mode,
+                inline_composition_support,
+            } => ContentType {
+                input_type,
+                input_mode,
+                flags: input_flags,
+                learning: learning_mode == extended::LEARNING_MODE_ENABLED,
+                inline_composition: inline_composition_support
+                    == extended::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+            },
+            // The new request with inline composition supported.
+            extended::Request::DeprecatedSetInputType {
+                input_type,
+                input_mode,
+                input_flags,
+                learning_mode,
+            } => ContentType {
+                input_type,
+                input_mode,
+                flags: input_flags,
+                learning: learning_mode == extended::LEARNING_MODE_ENABLED,
+                inline_composition: true,
+            },
+            _ => return,
+        };
+        if let Some(text_input) = self.extended(sender) {
+            text_input.set_type_mode_flags(content_type);
+        }
+    }
+
+    fn text_input_request(&mut self, sender: u32, request: &zwp_text_input_v1::Request) {
+        use zwp_text_input_v1::Request;
+        match request {
+            Request::SetContentType { hint, purpose } => {
+                let content_type = v1_content_type(*hint, *purpose);
+                self.text_input(sender).set_type_mode_flags(content_type);
+            }
+            Request::Activate { surface, .. } => self.activate(sender, *surface),
+            Request::Deactivate { .. } => self.deactivate(sender),
+            // Exo keeps surrounding text and the cursor rectangle with or
+            // without an input method.
+            Request::SetSurroundingText {
+                text,
+                cursor,
+                anchor,
+            } => {
+                let text = match text {
+                    IndexedString::Utf8(text) => text.clone(),
+                    IndexedString::NotUtf8(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                };
+                self.text_input(sender).field.surrounding_text = (text, *cursor, *anchor);
+            }
+            Request::SetCursorRectangle {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let rectangle = (*x, *y, *width, *height);
+                self.text_input(sender).field.cursor_rectangle = rectangle;
+            }
+            _ => {}
+        }
+    }
+
+    /// `TextInput::Activate`: nothing for the surface it already has;
+    /// otherwise detach, take the surface, and attach if the seat's focus
+    /// is on it.
+    fn activate(&mut self, id: u32, surface: u32) {
+        if self.text_input(id).surface == Some(surface) {
+            return;
+        }
+        self.detach(id);
+        self.text_input(id).surface = Some(surface);
+        if self.focus == Some(surface) {
+            self.attach(id);
+        }
+    }
+
+    /// `TextInput::Deactivate`.
+    fn deactivate(&mut self, id: u32) {
+        self.detach(id);
+        self.text_input(id).surface = None;
+    }
+
+    /// `AttachInputMethod` resets the type and mode to text, and keeps the
+    /// flags, learning and surrounding-text support of the previous field.
+    /// Its delegate's `Activated` sends `enter` with the surface of the
+    /// last `activate` (`zwp_text_input_manager.cc:127`).
+    fn attach(&mut self, id: u32) {
+        let text_input = self.text_input(id);
+        let surface = text_input.surface.expect("an activated text input");
+        text_input.field.attached = true;
+        text_input.field.content_type.input_type = extended::INPUT_TYPE_TEXT;
+        text_input.field.content_type.input_mode = extended::INPUT_MODE_TEXT;
+        self.events.push(zwp_text_input_v1::evt::enter(id, surface));
+    }
+
+    /// `DetachInputMethod`, which does nothing without an input method.
+    /// Its delegate's `Deactivated` sends `leave`
+    /// (`zwp_text_input_manager.cc:132`).
+    fn detach(&mut self, id: u32) {
+        let text_input = self.text_input(id);
+        if !text_input.field.attached {
+            return;
+        }
+        text_input.field.attached = false;
+        text_input.field.content_type.input_type = extended::INPUT_TYPE_NONE;
+        text_input.field.content_type.input_mode = extended::INPUT_MODE_DEFAULT;
+        self.events.push(zwp_text_input_v1::evt::leave(id));
+    }
+
+    /// The IDs of the text inputs, in order.
+    fn ids(&self) -> Vec<u32> {
+        self.text_inputs.keys().copied().collect()
     }
 
     fn text_input(&mut self, id: u32) -> &mut TextInput {

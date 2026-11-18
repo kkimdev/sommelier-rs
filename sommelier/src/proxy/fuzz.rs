@@ -85,10 +85,11 @@ use crate::protocols::wayland::{
     wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
     wl_registry, wl_seat, wl_surface,
 };
+use crate::protocols::AnyRequest;
 use crate::sim::exo::{self, Exo};
 use crate::state::Context;
-use crate::test_support::{frames, Rng};
-use crate::wire::{Framing, MessageBuilder, MessageHeader, WireMessage, WL_DISPLAY_ID};
+use crate::test_support::{frames, msg_opcode, Rng};
+use crate::wire::{Framing, MessageBuilder, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IoSlice, Read, Write};
@@ -1581,9 +1582,16 @@ fn compositor(
                 );
             }
             // A request from or naming an object the compositor destroyed
-            // changes nothing.
-            if !zombie && !named.iter().any(|object| zombies.contains_key(object)) {
-                exo.request(&interface, sender, opcode, payload);
+            // changes nothing. Exo models the text inputs; the rest of the
+            // host is this compositor's.
+            if !zombie
+                && !named.iter().any(|object| zombies.contains_key(object))
+                && interface.contains("text_input")
+            {
+                let mut message = WireMessage::new(sender, opcode, payload);
+                let request = AnyRequest::from_wire(&interface, &mut message)
+                    .expect("an accepted text-input request");
+                exo.request(sender, &request);
             }
             match (interface.as_str(), opcode) {
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) if !zombie => {
@@ -1835,19 +1843,15 @@ static INPUT_METHOD_RESTARTS: AtomicU64 = AtomicU64::new(0);
 /// `zwp_text_input_v1.leave` events the compositor sent, across all cases.
 static TEXT_INPUT_LEAVES: AtomicU64 = AtomicU64::new(0);
 
-/// The `zwp_text_input_v1.enter` (with its surface) and `leave` events of
-/// the host text inputs in `events`.
-fn text_input_events(events: Vec<(u32, Option<u32>)>) -> Vec<Vec<u8>> {
-    events
-        .into_iter()
-        .map(|(text_input, surface)| match surface {
-            Some(surface) => zwp_text_input_v1::evt::enter(text_input, surface).0,
-            None => {
-                TEXT_INPUT_LEAVES.fetch_add(1, Ordering::Relaxed);
-                zwp_text_input_v1::evt::leave(text_input).0
-            }
-        })
-        .collect()
+/// `events`, which Exo sent, after counting their `zwp_text_input_v1.leave`
+/// events: the requests Exo is given here make it send nothing else.
+fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
+    let leaves = events
+        .iter()
+        .filter(|(event, _)| msg_opcode(event) == zwp_text_input_v1::EVT_LEAVE)
+        .count();
+    TEXT_INPUT_LEAVES.fetch_add(leaves as u64, Ordering::Relaxed);
+    events.into_iter().map(|(event, _)| event).collect()
 }
 
 /// `wl_keyboard.enter` of `keyboard` on `surface`, with no keys pressed.
