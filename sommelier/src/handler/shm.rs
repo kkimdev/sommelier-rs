@@ -1641,9 +1641,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             ctx.shadow_table.create_local(id, wl_buffer::NAME, 1);
             return Action::Drop;
         }
+        // A live pool that is not stale has state: `wl_shm.create_pool`
+        // records it, and only the pool's end forgets it (`forget_pool`).
         let Some(pool) = ctx.pools.get(&pool_id) else {
-            warn!("Unknown pool ID: {}", pool_id);
-            return ctx.reject(pool_id, wl_shm::ERROR_INVALID_FD, "invalid wl_shm pool");
+            return ctx.fail(format_args!("wl_shm_pool {pool_id} has no state"));
         };
         let pool_file = Arc::clone(&pool.file);
         let pool_size = pool.size;
@@ -1717,9 +1718,10 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             return Action::Drop;
         }
+        // A live pool that is not stale has state: `wl_shm.create_pool`
+        // records it, and only the pool's end forgets it (`forget_pool`).
         let Some(pool) = ctx.pools.get_mut(&pool_id) else {
-            warn!("Pool not found for resize: {}", pool_id);
-            return Action::Drop;
+            return ctx.fail(format_args!("wl_shm_pool {pool_id} has no state"));
         };
         let error = match valid_pool_resize(pool.size, size) {
             // A client that needs a smaller pool must create a new one;
@@ -2002,6 +2004,34 @@ mod tests {
                 // No peer sees the size the proxy records for the pool.
                 assert_eq!(s.ctx().pools[&pool].size, 4096);
             }
+            assert_eq!(s.host_received(), []);
+        }
+    }
+
+    /// Every live pool that is not stale has state, so a request of one
+    /// without any is the proxy's own divergence: the session ends with an
+    /// `implementation` error, rather than blaming the guest or dropping
+    /// the request.
+    #[tokio::test]
+    async fn a_request_of_a_pool_without_state_is_an_internal_failure() {
+        for create_buffer in [false, true] {
+            let (mut s, shm) = session_with_shm().await;
+            let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+            let request = if create_buffer {
+                let buffer = s.new_id();
+                wl_shm_pool::req::create_buffer(pool, buffer, 0, 1, 1, 4, wl_shm::FORMAT_ARGB8888)
+            } else {
+                wl_shm_pool::req::resize(pool, 4096)
+            };
+            // Injects a fault no peer can cause: the proxy loses the pool's
+            // state.
+            s.ctx().pools.remove(&pool);
+            s.guest_fatal([request]).await;
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
+                "create_buffer: {create_buffer}"
+            );
             assert_eq!(s.host_received(), []);
         }
     }
