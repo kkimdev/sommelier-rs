@@ -1231,6 +1231,76 @@ struct ShmBufferRequest {
     size: i32,
 }
 
+/// Where the planes of a guest SHM buffer's host copy lie.
+struct HostCopyPlanes {
+    /// Plane 0's stride.
+    stride: u32,
+    /// Plane 1's offset from plane 0, or 0 for a single-plane format.
+    plane1_offset: usize,
+    /// Plane 1's stride, or 0 for a single-plane format.
+    plane1_stride: usize,
+}
+
+impl HostCopyPlanes {
+    /// A host copy laid out exactly like the guest buffer of `request`, as
+    /// shared memory is: NV12's plane 1 follows plane 0's rows.
+    fn like_guest(request: &ShmBufferRequest) -> Self {
+        let stride = request.stride as usize;
+        let (plane1_offset, plane1_stride) = if request.format == wl_shm::FORMAT_NV12 {
+            ((request.height as usize) * stride, stride)
+        } else {
+            (0, 0)
+        };
+        Self {
+            stride: request.stride as u32,
+            plane1_offset,
+            plane1_stride,
+        }
+    }
+}
+
+impl From<DmabufLayout> for HostCopyPlanes {
+    /// A host copy laid out as the dma-buf allocator returned it.
+    fn from(layout: DmabufLayout) -> Self {
+        Self {
+            stride: layout.plane0().stride,
+            plane1_offset: layout.plane1_relative_offset(),
+            plane1_stride: layout.plane1_stride(),
+        }
+    }
+}
+
+impl ShmBufferRequest {
+    /// The state of this buffer, whose host copy is `dest_fd`, mapped at
+    /// `dest_ptr` for `dest_size` bytes, which the state unmaps when it is
+    /// dropped, with its planes at `planes`. The host copy lacks every
+    /// pixel so far.
+    fn buffer_state(
+        &self,
+        dest_fd: OwnedFd,
+        (dest_ptr, dest_size): (*mut u8, usize),
+        planes: HostCopyPlanes,
+        dmabuf_sync: bool,
+    ) -> BufferState {
+        BufferState {
+            pool_file: Arc::clone(&self.pool_file),
+            offset: self.offset,
+            width: self.width,
+            height: self.height,
+            stride: self.stride as u32,
+            format: self.format,
+            dmabuf_fd: Some(dest_fd),
+            dest_stride: planes.stride,
+            dmabuf_plane1_offset: planes.plane1_offset,
+            dmabuf_plane1_stride: planes.plane1_stride,
+            dmabuf_sync,
+            dest_ptr,
+            dest_size,
+            stale: StalePixels::all(),
+        }
+    }
+}
+
 /// Choose and allocate the host storage for a guest SHM buffer.
 ///
 /// # Returns
@@ -1349,8 +1419,6 @@ fn create_shared_buffer(
 ) -> Action {
     let ShmBufferRequest {
         pool_id,
-        ref pool_file,
-        offset,
         width,
         height,
         stride,
@@ -1440,27 +1508,8 @@ fn create_shared_buffer(
     // SHM buffer.
     ctx.retire_destroyed_host_object(host_pool_id);
 
-    let (plane1_offset, plane1_stride) = if format == wl_shm::FORMAT_NV12 {
-        ((height as usize) * (stride as usize), stride as usize)
-    } else {
-        (0, 0)
-    };
-    let state = BufferState {
-        pool_file: Arc::clone(pool_file),
-        offset,
-        width,
-        height,
-        stride: stride as u32,
-        format,
-        dmabuf_fd: Some(shared_fd),
-        dest_stride: stride as u32,
-        dmabuf_plane1_offset: plane1_offset,
-        dmabuf_plane1_stride: plane1_stride,
-        dmabuf_sync: false,
-        dest_ptr,
-        dest_size,
-        stale: StalePixels::all(),
-    };
+    let planes = HostCopyPlanes::like_guest(&request);
+    let state = request.buffer_state(shared_fd, (dest_ptr, dest_size), planes, false);
     register_shm_buffer(ctx, &request, host_buffer_id, state)
 }
 
@@ -1474,11 +1523,8 @@ fn create_dmabuf_buffer(
 ) -> Action {
     let ShmBufferRequest {
         pool_id,
-        ref pool_file,
-        offset,
         width,
         height,
-        stride,
         format,
         ..
     } = request;
@@ -1581,22 +1627,12 @@ fn create_dmabuf_buffer(
     // acknowledges its destruction.
     queue_host_params_destroy(ctx, params_id);
 
-    let state = BufferState {
-        pool_file: Arc::clone(pool_file),
-        offset,
-        width,
-        height,
-        stride: stride as u32,
-        format,
-        dmabuf_fd: Some(dmabuf_fd_owned),
-        dest_stride: layout.plane0().stride,
-        dmabuf_plane1_offset: layout.plane1_relative_offset(),
-        dmabuf_plane1_stride: layout.plane1_stride(),
+    let state = request.buffer_state(
+        dmabuf_fd_owned,
+        (dest_ptr, dest_size),
+        HostCopyPlanes::from(layout),
         dmabuf_sync,
-        dest_ptr,
-        dest_size,
-        stale: StalePixels::all(),
-    };
+    );
     register_shm_buffer(ctx, &request, host_buffer_id, state)
 }
 
