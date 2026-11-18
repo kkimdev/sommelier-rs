@@ -788,6 +788,7 @@ impl Client {
 mod tests {
     use super::harness::Session;
     use super::*;
+    use crate::handler::test_support::session_with_shm;
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::state::PlaneFenceForTest;
     use crate::test_support::{
@@ -2044,18 +2045,8 @@ mod tests {
 
     /// A session whose guest has a `wl_shm_pool`, which the proxy implements.
     async fn session_with_a_shm_pool() -> (Session, u32) {
-        use protocols::wayland::wl_shm;
-        let mut s = Session::new();
-        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
-        let pool = s.new_id();
-        s.guest([wl_shm::req::create_pool(
-            shm,
-            pool,
-            shm_pool_file(&[0; 64]).into(),
-            64,
-        )])
-        .await;
-        assert_eq!(s.host_received(), [], "the pool is the proxy's own");
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 64])).await;
         (s, pool)
     }
 

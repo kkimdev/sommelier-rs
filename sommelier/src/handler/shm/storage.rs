@@ -510,9 +510,9 @@ fn register_shm_buffer(
 mod tests {
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::shm::dmabuf_layout::validate_dmabuf_layout;
-    use crate::handler::shm::tests::session_with_shm;
     use crate::handler::shm::ShmHandler;
     use crate::handler::shm::{copy_shm_damage, ShmCopyLayout};
+    use crate::handler::test_support::session_with_shm;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface};

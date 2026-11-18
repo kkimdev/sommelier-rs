@@ -365,7 +365,7 @@ mod tests {
     };
     use crate::handler::registry::RegistryHandler;
     use crate::handler::shm::register_guest_shm;
-    use crate::handler::shm::tests::session_with_shm;
+    use crate::handler::test_support::session_with_shm;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
