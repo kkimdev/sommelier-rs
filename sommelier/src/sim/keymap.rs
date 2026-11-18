@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Keys as the US layout's evdev keycodes, and where clicks and taps land.
+//! Keys as the US layout's evdev keycodes.
 //!
 //! Exo sends a key the input method passes as a `wl_keyboard.key` with the
 //! key's evdev keycode, and a client maps it back. Shift is not a key of its
 //! own here: a key that needs it, such as an uppercase letter, comes with
 //! the Shift modifier set around it.
 
-use super::editor::Target;
 use super::hangul::Key;
 
 /// The first evdev keycode of each letter row, and the row's letters.
@@ -86,26 +85,6 @@ pub(super) fn key(keycode: u32, shift: bool) -> Option<Key> {
     Some(key)
 }
 
-/// Where a click or tap on `target` lands, in surface coordinates as
-/// `wl_fixed`: each target has a cell 10 pixels wide along x.
-pub(super) fn position(target: Target) -> (i32, i32) {
-    let cell = match target {
-        Target::Start => 0,
-        Target::End => 1,
-        Target::BeforeMarker(digit) => 2 + i32::from(digit),
-    };
-    ((cell * 10 + 5) << 8, 5 << 8)
-}
-
-/// The target a click or tap at surface `x`, as `wl_fixed`, lands on.
-pub(super) fn target(x: i32) -> Target {
-    match (x >> 8) / 10 {
-        0 => Target::Start,
-        1 => Target::End,
-        cell => Target::BeforeMarker(u8::try_from(cell - 2).expect("a marker's cell")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,13 +100,5 @@ mod tests {
         assert_eq!(keycode(Key::Char('q')), (16, false));
         assert_eq!(keycode(Key::Char('M')), (50, true));
         assert_eq!(super::key(1, false), None, "KEY_ESC");
-    }
-
-    #[test]
-    fn every_target_maps_back_from_where_it_lands() {
-        let markers = (0..10).map(Target::BeforeMarker);
-        for at in [Target::Start, Target::End].into_iter().chain(markers) {
-            assert_eq!(target(position(at).0), at);
-        }
     }
 }

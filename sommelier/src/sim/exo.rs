@@ -23,12 +23,11 @@ limitations under the License.
 //! compositor keeps this model of each host `zwp_text_input_v1` to compare
 //! with what the guest committed, and plays the rest of the host itself.
 //!
-//! The simulation also gives the model the seat's keyboards, pointers and
-//! touches, the user's keys, clicks and taps, and the answers of the input
-//! method engine ([`super::engine`]), and takes what the model hands the
-//! engine. Exo then sends a key raw while no text input is attached, or
-//! with the engine's edits once it answers, and confirms the composition it
-//! tracks when a text input detaches. A host
+//! The simulation also gives the model the seat's keyboards, the user's
+//! keys and the answers of the input method engine ([`super::engine`]), and
+//! takes what the model hands the engine. Exo then sends a key raw while no
+//! text input is attached, or with the engine's edits once it answers, and
+//! confirms the composition it tracks when a text input detaches. A host
 //! behaviour no source settles is drawn per case ([`Host`]). Answers that
 //! belong to the display, a sync's `done` and the `delete_id` of a
 //! destroyed object, are left to whoever plays it. The model is a test
@@ -51,11 +50,9 @@ limitations under the License.
 //!   ignores;
 //! - which of several attached text inputs the input method serves, and
 //!   the virtual keyboard, focus reason, grammar and autocorrect state;
-//! - `preedit_styling` and `cursor_position` around the engine's edits;
-//! - the keymap and `wl_pointer.frame`, and key repeats, which Exo never
-//!   sends;
-//! - the release of a keyboard, a pointer, a touch or a keyboard's
-//!   extension.
+//! - `preedit_styling` and `cursor_position` around the engine's edits, the
+//!   keymap, key repeats, which Exo never sends, and the release of a
+//!   keyboard or its extension.
 //!
 //! Where the model is stricter than Exo: it keeps the surrounding text's
 //! cursor and anchor as sent, where Exo keeps the range between them, and
@@ -63,7 +60,7 @@ limitations under the License.
 //! or height to 0.
 
 use super::clock::Micros;
-use super::editor::{Target, TextModel, Txn};
+use super::editor::{TextModel, Txn};
 use super::engine::{EngineIn, EngineOut, TextAction};
 use super::hangul::Key;
 use super::keymap;
@@ -75,13 +72,10 @@ use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1 as extended, zcr_text_input_extension_v1,
 };
 use crate::protocols::text_input_unstable_v1::{zwp_text_input_manager_v1, zwp_text_input_v1};
-use crate::protocols::wayland::{wl_keyboard, wl_pointer, wl_seat, wl_touch};
+use crate::protocols::wayland::{wl_keyboard, wl_seat};
 use crate::protocols::AnyRequest;
 use crate::wire::{IndexedString, Outgoing};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-/// The left button's evdev code.
-const BTN_LEFT: u32 = 0x110;
+use std::collections::{BTreeMap, VecDeque};
 
 /// What one Exo `TextInput` holds for its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,10 +268,6 @@ pub(crate) struct Exo {
     /// Each `wl_keyboard`, with its `zcr_extended_keyboard_v1` if it has
     /// one.
     keyboards: BTreeMap<u32, Option<u32>>,
-    pointers: BTreeSet<u32>,
-    /// The surface the pointers are on.
-    pointer_focus: Option<u32>,
-    touches: BTreeSet<u32>,
     /// The last serial an event took.
     serial: u32,
     /// The serial `MaybeNextKeySerial` keeps for keys: a `peek_key` takes
@@ -354,56 +344,6 @@ impl Exo {
             late: false,
         });
         self.to_engine.push(EngineIn::Key { key, id });
-    }
-
-    /// The user clicks `target` on `surface` at `now`: each pointer enters
-    /// the surface unless it is on it, moves to the target, and presses and
-    /// releases the left button. A click on another window moves the
-    /// keyboard focus before the press reaches it, which is the caller's
-    /// [`Exo::move_focus`].
-    pub(super) fn click(&mut self, now: Micros, surface: u32, target: Target) {
-        let (x, y) = keymap::position(target);
-        let time = millis(now);
-        let left = self.pointer_focus.replace(surface);
-        for pointer in self.pointers.iter().copied().collect::<Vec<_>>() {
-            if left != Some(surface) {
-                if let Some(left) = left {
-                    let serial = self.next_serial();
-                    self.events
-                        .push(wl_pointer::evt::leave(pointer, serial, left));
-                }
-                let serial = self.next_serial();
-                self.events
-                    .push(wl_pointer::evt::enter(pointer, serial, surface, x, y));
-            }
-            self.events
-                .push(wl_pointer::evt::motion(pointer, time, x, y));
-            for state in [
-                wl_pointer::BUTTON_STATE_PRESSED,
-                wl_pointer::BUTTON_STATE_RELEASED,
-            ] {
-                let serial = self.next_serial();
-                let button = wl_pointer::evt::button(pointer, serial, time, BTN_LEFT, state);
-                self.events.push(button);
-            }
-        }
-    }
-
-    /// The user taps `target` on `surface` at `now`: on each touch, a point
-    /// goes down there and up, each in a frame of its own.
-    pub(super) fn tap(&mut self, now: Micros, surface: u32, target: Target) {
-        let (x, y) = keymap::position(target);
-        let time = millis(now);
-        for touch in self.touches.iter().copied().collect::<Vec<_>>() {
-            let serial = self.next_serial();
-            let down = wl_touch::evt::down(touch, serial, time, surface, 0, x, y);
-            let serial = self.next_serial();
-            let up = wl_touch::evt::up(touch, serial, time, 0);
-            for event in [down, up] {
-                self.events.push(event);
-                self.events.push(wl_touch::evt::frame(touch));
-            }
-        }
     }
 
     /// The engine's answer to a key. Exo applies the edits to the text
@@ -498,12 +438,6 @@ impl Exo {
                 if let Some(surface) = self.focus {
                     self.keyboard_enter(*id, surface);
                 }
-            }
-            AnyRequest::WlSeat(wl_seat::Request::GetPointer { id }) => {
-                self.pointers.insert(*id);
-            }
-            AnyRequest::WlSeat(wl_seat::Request::GetTouch { id }) => {
-                self.touches.insert(*id);
             }
             AnyRequest::ZcrKeyboardExtensionV1(
                 zcr_keyboard_extension_v1::Request::GetExtendedKeyboard { id, keyboard },
@@ -714,9 +648,9 @@ impl Exo {
     /// Apply the engine's edits to the text input it serves, sending each
     /// as Exo does: a composition as `preedit_cursor` at its end and a
     /// `preedit_string` that is its own commit text, or an empty
-    /// `preedit_string` to end it; a commit as in [`Exo::commit`]; a delete
-    /// as `delete_surrounding_text` alone, with an absolute byte index into
-    /// the predicted text (E10).
+    /// `preedit_string` to end it; a commit as in [`Exo::commit`]. The
+    /// engine's deletes, which Exo sends as an absolute byte index into the
+    /// predicted text (E10), come with the suggestions that make them.
     fn edit(&mut self, actions: &[TextAction]) {
         let Some(id) = self.attached() else {
             return;
@@ -734,23 +668,6 @@ impl Exo {
                     let event = zwp_text_input_v1::evt::preedit_string(id, serial, text, text);
                     self.events.push(event.expect("a preedit fits a message"));
                     self.text_input(id).text.preedit.clone_from(text);
-                }
-                &TextAction::Delete { before, after } => {
-                    let text = &mut self.text_input(id).text;
-                    assert!(text.preedit.is_empty(), "a delete while composing");
-                    let range = text
-                        .delete_range(before, after)
-                        .expect("a delete of predicted text");
-                    text.apply_txn(&Txn {
-                        delete: (before, after),
-                        ..Txn::default()
-                    });
-                    let index = i32::try_from(range.start).expect("a short text");
-                    let length = u32::try_from(range.len()).expect("a short text");
-                    self.events
-                        .push(zwp_text_input_v1::evt::delete_surrounding_text(
-                            id, index, length,
-                        ));
                 }
             }
         }
@@ -895,8 +812,6 @@ mod tests {
     const KEYBOARD: u32 = 30;
     const PEEK: u32 = 31;
     const KEYBOARD2: u32 = 32;
-    const POINTER: u32 = 33;
-    const TOUCH: u32 = 34;
     /// The time of every key, and its milliseconds.
     const NOW: Micros = Micros(7_000);
     const MS: u32 = 7;
@@ -1028,8 +943,6 @@ mod tests {
             EXT => "zcr_extended_text_input_v1",
             KEYBOARD | KEYBOARD2 => "wl_keyboard",
             PEEK => "zcr_extended_keyboard_v1",
-            POINTER => "wl_pointer",
-            TOUCH => "wl_touch",
             _ => panic!("no test object has ID {id}"),
         }
     }
@@ -1414,25 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn e10_a_delete_counts_bytes_from_the_start_of_the_predicted_text() {
-        let mut exo = active(Host::default());
-        send(&mut exo, TI, surrounding("ab", 2));
-        press(&mut exo, 'r', &[commits("가")], true);
-        let delete = TextAction::Delete {
-            before: 3,
-            after: 0,
-        };
-        // 가 starts 2 bytes into "ab가", and no commit comes with it.
-        let deleted = zwp_text_input_v1::Event::DeleteSurroundingText {
-            index: 2,
-            length: 3,
-        };
-        let events = [(TI, deleted.into()), peek(2, 'r', DOWN), peek(2, 'r', UP)];
-        assert_eq!(press(&mut exo, 'r', &[delete], true), events);
-        assert_eq!(*predicted(&exo), TextModel::new("ab"));
-    }
-
-    #[test]
     fn e11_each_request_sends_its_events_at_once_in_order() {
         let mut exo = exo();
         send(&mut exo, TI, activate(A));
@@ -1493,78 +1387,5 @@ mod tests {
             confirm_commits: true,
         };
         assert_eq!(Host::draw(&mut |n| n - 1), last);
-    }
-
-    #[test]
-    fn a_click_moves_the_pointer_there_and_a_tap_touches_down_and_up() {
-        let mut exo = exo();
-        send(&mut exo, SEAT, wl_seat::Request::GetPointer { id: POINTER });
-        send(&mut exo, SEAT, wl_seat::Request::GetTouch { id: TOUCH });
-        let (x, y) = keymap::position(Target::End);
-        let enter = |serial, surface| wl_pointer::Event::Enter {
-            serial,
-            surface,
-            surface_x: x,
-            surface_y: y,
-        };
-        let motion = || wl_pointer::Event::Motion {
-            time: MS,
-            surface_x: x,
-            surface_y: y,
-        };
-        let button = |serial, state| wl_pointer::Event::Button {
-            serial,
-            time: MS,
-            button: BTN_LEFT,
-            state,
-        };
-        let (pressed, released) = (
-            wl_pointer::BUTTON_STATE_PRESSED,
-            wl_pointer::BUTTON_STATE_RELEASED,
-        );
-        exo.click(NOW, A, Target::End);
-        exo.click(NOW, A, Target::End);
-        exo.click(NOW, B, Target::End);
-        let leave = wl_pointer::Event::Leave {
-            serial: 6,
-            surface: A,
-        };
-        let clicks: Vec<(u32, AnyEvent)> = vec![
-            (POINTER, enter(1, A).into()),
-            (POINTER, motion().into()),
-            (POINTER, button(2, pressed).into()),
-            (POINTER, button(3, released).into()),
-            // Already on A, the pointer only moves.
-            (POINTER, motion().into()),
-            (POINTER, button(4, pressed).into()),
-            (POINTER, button(5, released).into()),
-            (POINTER, leave.into()),
-            (POINTER, enter(7, B).into()),
-            (POINTER, motion().into()),
-            (POINTER, button(8, pressed).into()),
-            (POINTER, button(9, released).into()),
-        ];
-        assert_eq!(events(&mut exo), clicks);
-        exo.tap(NOW, A, Target::End);
-        let down = wl_touch::Event::Down {
-            serial: 10,
-            time: MS,
-            surface: A,
-            id: 0,
-            x,
-            y,
-        };
-        let up = wl_touch::Event::Up {
-            serial: 11,
-            time: MS,
-            id: 0,
-        };
-        let tap = [
-            (TOUCH, down.into()),
-            (TOUCH, wl_touch::Event::Frame {}.into()),
-            (TOUCH, up.into()),
-            (TOUCH, wl_touch::Event::Frame {}.into()),
-        ];
-        assert_eq!(events(&mut exo), tap);
     }
 }
