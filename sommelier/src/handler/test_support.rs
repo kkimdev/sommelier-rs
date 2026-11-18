@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::placement_config::PlacementConfig;
 use crate::protocols::aura_shell::zaura_shell;
-use crate::state::Context;
+use crate::state::{Context, HostId, RenderBufferLifecycle};
 
 /// A guest object and the host object it is paired with.
 #[derive(Clone, Copy)]
@@ -78,4 +78,28 @@ pub(crate) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
 /// [`toplevel_ctx_with`] placement off, the default.
 pub(crate) fn toplevel_ctx() -> Context {
     toplevel_ctx_with(PlacementConfig::for_test(Vec::new()))
+}
+
+/// The lifecycle of render buffer `guest_id`, while it has one.
+pub(crate) fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
+    let host_id: HostId = ctx.render_buffer_host_id(guest_id)?;
+    ctx.render_buffer_lifecycle_for_host(host_id)
+}
+
+/// Whether the guest has destroyed render buffer `guest_id`, which the
+/// proxy still holds.
+pub(crate) fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {
+    buffer_lifecycle(ctx, guest_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
+}
+
+/// Whether the host destroy of render buffer `guest_id` is queued.
+pub(crate) fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> bool {
+    buffer_lifecycle(ctx, guest_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
+}
+
+/// Record that the guest destroyed render buffer `guest_id`, as its
+/// `wl_buffer.destroy` does.
+pub(crate) fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
+    assert!(ctx.mark_buffer_guest_destroyed(guest_id));
+    ctx.guest_destroyed_in_use(guest_id);
 }

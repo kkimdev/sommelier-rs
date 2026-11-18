@@ -1889,6 +1889,9 @@ mod tests {
     };
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::registry::RegistryHandler;
+    use crate::handler::test_support::{
+        buffer_host_destroy_is_queued, buffer_is_guest_destroyed, mark_test_buffer_guest_destroyed,
+    };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
@@ -1900,7 +1903,7 @@ mod tests {
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion};
-    use crate::state::{Context, HostId, RenderBufferLifecycle, ShmPool};
+    use crate::state::{Context, HostId, ShmPool};
     use crate::test_support::{
         decode, decoded, protocol_error_code, queued_headers, raw_dispatch, register_test_buffer,
         shm_pool_file, BufferKind, BUFFER_KINDS,
@@ -1915,23 +1918,6 @@ mod tests {
         let guest_id = ctx.shadow_table.adopt_host_created(host_id, "wl_buffer", 1);
         assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
         guest_id
-    }
-
-    fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
-        assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.guest_destroyed_in_use(guest_id);
-    }
-
-    fn buffer_lifecycle(ctx: &Context, host_id: u32) -> Option<RenderBufferLifecycle> {
-        ctx.render_buffer_lifecycle_for_host(HostId(host_id))
-    }
-
-    fn buffer_is_guest_destroyed(ctx: &Context, host_id: u32) -> bool {
-        buffer_lifecycle(ctx, host_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
-    }
-
-    fn buffer_host_destroy_is_queued(ctx: &Context, host_id: u32) -> bool {
-        buffer_lifecycle(ctx, host_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
     }
 
     /// A session whose guest has bound `wl_shm`, which the proxy
@@ -3301,7 +3287,7 @@ mod tests {
                 WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
                 Action::Drop
             );
-            assert!(buffer_is_guest_destroyed(&ctx, host_buffer), "{case}");
+            assert!(buffer_is_guest_destroyed(&ctx, guest_buffer), "{case}");
             assert!(ctx.buffer_is_submitted(guest_buffer), "{case}");
             assert_eq!(
                 ctx.shadow_table.get_host_id(guest_buffer),
@@ -3323,7 +3309,7 @@ mod tests {
                 WlBufferHandler::on_release(&mut ShmHandler, &mut ctx),
                 Action::Drop
             );
-            assert!(buffer_host_destroy_is_queued(&ctx, host_buffer), "{case}");
+            assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
             assert!(!ctx.buffer_is_submitted(guest_buffer), "{case}");
             assert_eq!(
                 ctx.shadow_table.get_host_id(guest_buffer),
@@ -3383,7 +3369,7 @@ mod tests {
                 WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
                 Action::Drop
             );
-            assert!(buffer_host_destroy_is_queued(&ctx, host_buffer), "{case}");
+            assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
             assert!(ctx.host_buffer_use(guest_buffer).is_none(), "{case}");
             assert_eq!(
                 queued_headers(&ctx.client_to_host_queue),
@@ -3456,7 +3442,7 @@ mod tests {
             "the mapping must remain until a delayed host release can resolve"
         );
         assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-        assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
 
         ctx.last_sender_id = host_buffer;
         assert_eq!(
@@ -3519,8 +3505,8 @@ mod tests {
             crate::state::SurfaceAttachment::Attach(native_buffer);
 
         retire_eligible_buffers(&mut ctx);
-        assert!(buffer_is_guest_destroyed(&ctx, local_host));
-        assert!(buffer_is_guest_destroyed(&ctx, native_host));
+        assert!(buffer_is_guest_destroyed(&ctx, local_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, native_buffer));
 
         ctx.surfaces.get_mut(&40).unwrap().pending.attachment =
             crate::state::SurfaceAttachment::Detach;
@@ -3528,8 +3514,8 @@ mod tests {
             crate::state::SurfaceAttachment::Detach;
         retire_eligible_buffers(&mut ctx);
 
-        assert!(buffer_host_destroy_is_queued(&ctx, local_host));
-        assert!(buffer_host_destroy_is_queued(&ctx, native_host));
+        assert!(buffer_host_destroy_is_queued(&ctx, local_buffer));
+        assert!(buffer_host_destroy_is_queued(&ctx, native_buffer));
         assert!(ctx.host_buffer_use(local_buffer).is_none());
         assert!(ctx.host_buffer_use(native_buffer).is_none());
         let mut destroyed_hosts = ctx
@@ -3553,13 +3539,17 @@ mod tests {
         register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
+        assert!(
+            ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
+            "the guest object waits for the host to release the buffer"
+        );
 
         retire_eligible_buffers(&mut ctx);
-        assert!(buffer_is_guest_destroyed(&ctx, host_buffer));
+        assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
 
         assert!(ctx.mark_buffer_released(guest_buffer));
         retire_eligible_buffers(&mut ctx);
-        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
+        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer),

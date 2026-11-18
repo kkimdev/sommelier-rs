@@ -1042,7 +1042,11 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::handler::test_support::{toplevel_ctx, toplevel_ctx_with, SHELL, SURFACE, TOPLEVEL};
+    use crate::handler::test_support::{
+        buffer_host_destroy_is_queued, buffer_is_guest_destroyed, buffer_lifecycle,
+        mark_test_buffer_guest_destroyed, toplevel_ctx, toplevel_ctx_with, SHELL, SURFACE,
+        TOPLEVEL,
+    };
     use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
@@ -1535,24 +1539,6 @@ mod tests {
             copied_pixels(&ctx, 42, 0x22),
             rect_pixels(0, 0, FRAME_SIDE, FRAME_SIDE)
         );
-    }
-
-    fn buffer_lifecycle(ctx: &Context, guest_id: u32) -> Option<RenderBufferLifecycle> {
-        let host_id = ctx.render_buffer_host_id(guest_id)?;
-        ctx.render_buffer_lifecycle_for_host(host_id)
-    }
-
-    fn buffer_is_guest_destroyed(ctx: &Context, guest_id: u32) -> bool {
-        buffer_lifecycle(ctx, guest_id).is_some_and(|lifecycle| lifecycle.is_guest_destroyed())
-    }
-
-    fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> bool {
-        buffer_lifecycle(ctx, guest_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
-    }
-
-    fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
-        assert!(ctx.mark_buffer_guest_destroyed(guest_id));
-        ctx.guest_destroyed_in_use(guest_id);
     }
 
     /// Only a paired or local object can send a request or be named in one:
