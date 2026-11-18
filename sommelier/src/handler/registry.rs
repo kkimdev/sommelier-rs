@@ -2254,19 +2254,22 @@ mod tests {
             ZwpTextInputManagerV3Handler::on_get_text_input(&mut manager_handler, &mut ctx, 21, 30),
             Action::Drop
         );
-        let text_input = &ctx.text_inputs[&21];
-        let (host_text_input, host_extended) = (
-            text_input.host_v1_id,
-            text_input.host_ext_id.expect("an extended text input"),
+        let host = host_requests(
+            &mut ctx,
+            &[
+                (manager, "zwp_text_input_manager_v1"),
+                (extension, "zcr_text_input_extension_v1"),
+            ],
         );
+        // The host IDs come from the requests that create them, and the
+        // extension extends the text input the manager creates.
+        let created = |request: &(u32, AnyRequest)| request.1.new_object().map(|(id, _)| id);
+        let (Some(host_text_input), Some(host_extended)) = (created(&host[0]), created(&host[1]))
+        else {
+            panic!("the host got no extended text input: {host:?}");
+        };
         assert_eq!(
-            host_requests(
-                &mut ctx,
-                &[
-                    (manager, "zwp_text_input_manager_v1"),
-                    (extension, "zcr_text_input_extension_v1"),
-                ]
-            ),
+            host,
             [
                 (
                     manager,
