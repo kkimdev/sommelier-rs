@@ -732,6 +732,14 @@ impl Context {
         self.render_buffers.len()
     }
 
+    /// Create the state of guest `wl_surface` `surface`, as its
+    /// `wl_compositor.create_surface` arrives. The state ends with the
+    /// surface (see `forget_surface`).
+    pub(crate) fn create_surface(&mut self, surface: u32) {
+        let previous = self.surfaces.insert(surface, SurfaceState::default());
+        debug_assert!(previous.is_none(), "wl_surface {surface} created twice");
+    }
+
     /// The state of the guest `wl_surface` `surface`, created by the first
     /// request that sets any.
     pub(crate) fn surface_mut(&mut self, surface: u32) -> &mut SurfaceState {

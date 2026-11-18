@@ -166,7 +166,12 @@ fn plane_fence(ctx: &Context, plane: BorrowedFd<'_>) -> std::io::Result<DmabufFe
     crate::allocator::dmabuf_fence(plane, ctx.allocator.as_ref())
 }
 
-impl WlCompositorHandler for CompositorHandler {}
+impl WlCompositorHandler for CompositorHandler {
+    fn on_create_surface(&mut self, ctx: &mut Context, id: u32) -> Action {
+        ctx.create_surface(id);
+        Action::Forward
+    }
+}
 
 pub(crate) fn native_wayland_app_id(vm_identifier: &str, app_id: &str) -> String {
     format!("org.chromium.guest_os.{}.wayland.{}", vm_identifier, app_id)
@@ -2232,6 +2237,7 @@ mod tests {
         let other_surface = 101;
         ctx.shadow_table
             .insert_paired_for_test(other_surface, 201, "wl_surface");
+        ctx.create_surface(other_surface);
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         for surface in [other_surface, TEST_SURFACE] {
             draw_test_frame(&ctx, 42, 0x22);
@@ -3698,6 +3704,7 @@ mod tests {
                 "wl_surface",
                 5,
             );
+            ctx.create_surface(second_surface);
             register_test_buffer(&mut ctx, kind, buffer, host_buffer);
             let awaiting_detached_release = Some(RenderBufferUse::AwaitingRelease {
                 has_detached_use: true,

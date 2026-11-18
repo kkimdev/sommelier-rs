@@ -2349,6 +2349,7 @@ mod tests {
             "wl_surface",
             4,
         );
+        client.ctx.create_surface(SURFACE);
         (client, guest_peer, host_peer)
     }
 
@@ -3724,6 +3725,11 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.guest_object_version(30), Some(4));
         assert_eq!(ctx.shadow_table.host_object_version(host_surface), Some(3));
+        assert!(
+            ctx.surfaces.contains_key(&30),
+            "a surface has its state from its creation"
+        );
+        ctx.assert_no_orphans();
     }
 
     #[test]
