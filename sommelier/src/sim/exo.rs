@@ -535,9 +535,11 @@ impl Exo {
             self.set_text_input_focus(None);
         }
         self.text_inputs.retain(|&id, _| live(id));
-        // A text input that ends stops being served, and can be sent nothing.
+        // A text input that ends detaches as `DetachInputMethod` does, which
+        // drops its type first: IMA stops serving it, can send it nothing,
+        // and leaves the engine as it is ([`Exo::reset_context`]).
         if self.ima.client.is_some_and(|id| !live(id)) {
-            self.ima = Ima::default();
+            self.ima.client = None;
         }
         let text_inputs = &self.text_inputs;
         let extended = |extension: u32, id: u32| live(extension) && text_inputs.contains_key(&id);
@@ -761,9 +763,10 @@ impl Exo {
         self.events.push(zwp_text_input_v1::evt::enter(id, surface));
     }
 
-    /// `DetachInputMethod`, which does nothing without an input method. If
-    /// the input method serves this text input, it stops, which confirms
-    /// the composition first (E6). Then the delegate's `Deactivated` sends
+    /// `DetachInputMethod`, which does nothing without an input method. It
+    /// drops the type before the input method stops serving this text
+    /// input, which confirms the composition but, with the type none,
+    /// leaves the engine as it is (E6). Then the delegate's `Deactivated` sends
     /// `leave` (`zwp_text_input_manager.cc:132`).
     fn detach(&mut self, id: u32) {
         let text_input = self.text_input(id);
@@ -888,10 +891,16 @@ impl Exo {
     }
 
     /// `InputMethodAsh::ResetContext`, which does nothing without a text
-    /// input to serve: the buffered text goes, and the engine resets if IMA
-    /// took it to be composing.
+    /// input to serve, or while its type is none
+    /// (`IsPasswordOrNoneInputFieldFocused`), as after a detach: the
+    /// buffered text goes, and the engine resets if IMA took it to be
+    /// composing.
     fn reset_context(&mut self) {
-        if self.ima.client.is_none() {
+        let Some(client) = self.ima.client else {
+            return;
+        };
+        let served = self.text_inputs.get(&client);
+        if served.is_none_or(|ti| ti.field.content_type.input_type == extended::INPUT_TYPE_NONE) {
             return;
         }
         self.ima.commit = None;
@@ -1508,11 +1517,44 @@ mod tests {
         press(&mut exo, 'r', &[shows("가")], true);
         send(&mut exo, TI, deactivate());
         assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
-        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        assert_eq!(exo.take_engine(), []);
         // The end of the input method confirms too.
         let mut exo = active(V11);
         assert!(exo.destroy_input_method());
         assert_eq!(events(&mut exo), [confirm(), leave()]);
+    }
+
+    #[test]
+    fn a_detach_confirms_but_leaves_the_engine_to_the_next_attach() {
+        // The detach drops the type first, so IMA's reset returns early:
+        // the engine is not reset, a key in flight is not late, and IMA
+        // still takes the engine to be composing.
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        send(&mut exo, TI, deactivate());
+        assert_eq!(events(&mut exo), [cursor(3), commit(3, "가"), leave()]);
+        assert_eq!(exo.take_engine(), []);
+        assert!(!exo.in_engine[0].late);
+        assert!(exo.ima.composing);
+        // The next attach resets it, as real IMA's does.
+        send(&mut exo, TI, activate(A));
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        assert!(exo.in_engine[0].late);
+    }
+
+    #[test]
+    fn a_text_input_that_ends_leaves_the_engine_alone_too() {
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("가")], true);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        exo.forget(|id| id != TI);
+        assert_eq!(exo.take_engine(), []);
+        assert!(!exo.in_engine[0].late);
+        assert!(exo.ima.composing);
+        assert_eq!(exo.ima.client, None);
     }
 
     #[test]
