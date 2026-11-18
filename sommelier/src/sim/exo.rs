@@ -57,12 +57,20 @@ limitations under the License.
 //!   `activate` (`zwp_text_input_manager.cc` 569-577) and the proxy
 //!   ignores;
 //! - the virtual keyboard, focus reason, grammar and autocorrect state;
-//! - IMA's character composer and password fields, its reset when the
-//!   content type changes (`OnTextInputTypeChanged`), the engine's focus
-//!   and blur, and a single-character commit sent as a key
+//! - IMA's character composer and password fields, the engine's focus and
+//!   blur on a type change, and a single-character commit sent as a key
 //!   (`NeedInsertChar`), which the Korean engine never makes;
 //! - `preedit_styling`, the keymap and key repeats, which Exo never sends,
 //!   and the release of a keyboard or its extension.
+//!
+//! IMA drops a handled release: it reaches the extension as a `peek_key`
+//! only, as its press did, and no `wl_keyboard.key` follows.
+//!
+//! Where the model's output differs from Exo's: the tracker's prediction
+//! keeps a selection as a cursor only (`state.cursor == anchor` when it
+//! names a report), so a report with a selection never names a predicted
+//! state and replaces the prediction, where Exo's tracker would match
+//! the range.
 //!
 //! Where the model is stricter than Exo: it keeps the surrounding text's
 //! cursor and anchor as sent, where Exo keeps the range between them, and
@@ -551,7 +559,11 @@ impl Exo {
         }
     }
 
-    /// What Exo handed the engine since the last call, in order.
+    /// What Exo handed the engine since the last call, in order. Whoever
+    /// plays the engine drains it after every input it hands the model
+    /// ([`Exo::key`], a request, a focus move, [`Exo::destroy_input_method`])
+    /// and sends each part to the engine at that time, so the engine's
+    /// queue holds what Exo handed it in the order it did.
     pub(super) fn take_engine(&mut self) -> Vec<EngineIn> {
         std::mem::take(&mut self.to_engine)
     }
@@ -829,7 +841,7 @@ impl Exo {
     /// `DetachInputMethod`, which does nothing without an input method. It
     /// drops the type before the input method stops serving this text
     /// input, which confirms the composition but, with the type none,
-    /// leaves the engine as it is (E6). Then the delegate's `Deactivated` sends
+    /// leaves the engine as it is. Then the delegate's `Deactivated` sends
     /// `leave` (`zwp_text_input_manager.cc:132`).
     fn detach(&mut self, id: u32) {
         let text_input = self.text_input(id);

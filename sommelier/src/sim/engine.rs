@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_cancels_no_key_handed_over_before_it() {
+    fn a_reset_waits_for_the_keys_before_it() {
         let mut engine = Engine::new(Lag::Fast);
         let mut choices = |_| 0;
         for (id, key) in (0..).zip(keys("rk")) {
