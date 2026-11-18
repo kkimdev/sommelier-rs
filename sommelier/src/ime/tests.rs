@@ -1086,3 +1086,262 @@ fn row_W2_a_fence_ends_only_with_its_own_barrier() {
     ime.step(Input::BarrierDone(fence));
     assert_eq!(ime.compose("다").guest, [preedit("다"), done(3)]);
 }
+
+// 2.3 Cross-concern inputs and reconcile outcomes.
+
+#[test]
+fn row_F1_a_focus_change_resets_the_field() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: Some(OTHER),
+    });
+    assert_eq!(
+        out.guest,
+        [
+            v3(TI, V3::Leave { surface: SURFACE.0 }),
+            v3(TI, V3::Enter { surface: OTHER.0 }),
+        ]
+    );
+    let [barrier] = out.barriers()[..] else {
+        panic!("one barrier in {out:?}");
+    };
+    assert_eq!(
+        out.host,
+        [
+            req(v1(TI), V1::Deactivate { seat: HOST_SEAT }),
+            Host::Barrier(barrier),
+        ]
+    );
+    // The keyboard concern ends the seat's leases.
+    assert_eq!(out.keys, []);
+    // The new field is disabled.
+    assert_eq!(ime.step(Input::Commit(TI)).guest, []);
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: None,
+    });
+    assert_eq!(out.guest, [v3(TI, V3::Leave { surface: OTHER.0 })]);
+    let out = ime.step(Input::FocusChanged {
+        seat: SeatId(6),
+        surface: Some(SURFACE),
+    });
+    assert_eq!(out.guest, []);
+}
+
+#[test]
+fn row_F2_a_destroyed_surface_is_left_while_it_is_valid() {
+    let mut ime = Ime::enabled();
+    ime.world.surfaces.remove(&SURFACE);
+    ime.world.focus.insert(SEAT, OTHER);
+    let out = ime.step(Input::SurfaceDestroyed(SURFACE));
+    assert_eq!(
+        out.guest,
+        [
+            v3(TI, V3::Leave { surface: SURFACE.0 }),
+            v3(TI, V3::Enter { surface: OTHER.0 }),
+        ]
+    );
+    assert_eq!(out.host[0], req(v1(TI), V1::Deactivate { seat: HOST_SEAT }));
+
+    // A repair that stays on the surface tells the guest nothing, and the
+    // field counts as disabled until enabled again.
+    let mut ime = Ime::enabled();
+    let out = ime.step(Input::SurfaceDestroyed(SURFACE));
+    assert_eq!(out.guest, []);
+    assert_eq!(out.host[0], req(v1(TI), V1::Deactivate { seat: HOST_SEAT }));
+    assert_eq!(ime.step(Input::Commit(TI)).guest, []);
+}
+
+#[test]
+fn row_F3_a_bound_seat_carries_the_deferred_activation() {
+    let mut ime = Ime::new();
+    ime.world.seats.clear();
+    ime.create(TI);
+    let out = ime.enable(TI);
+    assert_eq!(
+        out.host,
+        [
+            surrounding(TI, "", 0),
+            cursor_rect(TI, (0, 0, 0, 0)),
+            commit_state(TI, 1),
+        ]
+    );
+    ime.world.seats.insert(SEAT, HOST_SEAT);
+    let out = ime.step(Input::SeatBound(SEAT));
+    let mut host = vec![req(
+        v1(TI),
+        V1::Activate {
+            seat: HOST_SEAT,
+            surface: HOST_SURFACE,
+        },
+    )];
+    host.extend(content_type(TI, false));
+    host.push(commit_state(TI, 1));
+    assert_eq!(out.host, host);
+}
+
+#[test]
+fn row_F4_a_press_commits_the_preedit_then_resends_the_press() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    ime.v1(HostIme::PreeditCursor(0));
+    let out = ime.press(SURFACE);
+    let button = wl_pointer::Event::Button {
+        serial: 7,
+        time: 8,
+        button: 0x110,
+        state: 1,
+    };
+    assert_eq!(
+        out.guest,
+        [
+            no_preedit(),
+            commit("가"),
+            done(1),
+            (POINTER, button.into())
+        ]
+    );
+    let [fence] = out.barriers()[..] else {
+        panic!("one barrier in {out:?}");
+    };
+    assert_eq!(out.host, [req(v1(TI), V1::Reset {}), Host::Barrier(fence)]);
+    assert_eq!(out.keys, [lease(LeaseOutcome::End)]);
+    assert!(!out.forward);
+    // The press took the assembly.
+    ime.step(Input::BarrierDone(fence));
+    assert_eq!(ime.compose("나").guest, [preedit("나"), done(1)]);
+}
+
+#[test]
+fn row_F4_a_press_elsewhere_or_without_a_composition_is_forwarded() {
+    let mut ime = Ime::enabled();
+    let out = ime.press(SURFACE);
+    assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
+    ime.compose("가");
+    let out = ime.press(OTHER);
+    assert!(out.forward && out.guest.is_empty() && out.host.is_empty());
+}
+
+#[test]
+fn row_F4_events_in_flight_at_a_press_are_dropped_and_take_the_assembly() {
+    type Event = (&'static str, fn() -> Input);
+    let events: [Event; 5] = [
+        ("preedit", || {
+            Input::V1(
+                TI,
+                HostIme::Preedit {
+                    serial: 0,
+                    text: "각".into(),
+                    commit: "각".into(),
+                },
+            )
+        }),
+        ("commit", || {
+            Input::V1(
+                TI,
+                HostIme::Commit {
+                    serial: 0,
+                    text: "가".into(),
+                },
+            )
+        }),
+        ("delete", || {
+            Input::V1(
+                TI,
+                HostIme::Delete {
+                    index: -1,
+                    length: 1,
+                },
+            )
+        }),
+        ("region", || Input::Ext {
+            ext: ext_id(TI),
+            event: HostIme::PreeditRegion {
+                index: -1,
+                length: 1,
+            },
+        }),
+        ("confirm", || Input::Ext {
+            ext: ext_id(TI),
+            event: HostIme::Confirm,
+        }),
+    ];
+    for (event, input) in events {
+        let mut ime = Ime::enabled();
+        ime.report("ab", 2);
+        ime.compose("가");
+        let fence = ime.press(SURFACE).barriers()[0];
+        let selection = zwp_text_input_v1::PREEDIT_STYLE_SELECTION;
+        ime.v1(HostIme::PreeditStyling {
+            index: 0,
+            length: 3,
+            style: selection,
+        });
+        ime.v1(HostIme::PreeditCursor(0));
+        let out = ime.step(input());
+        assert!(out.guest.is_empty() && out.keys.is_empty(), "{event}");
+        ime.step(Input::BarrierDone(fence));
+        assert_eq!(ime.compose("나").guest, [preedit("나"), done(2)], "{event}");
+    }
+}
+
+#[test]
+fn row_F6_a_host_deleted_text_input_sends_nothing_to_its_v1_object() {
+    let mut ime = Ime::enabled();
+    let out = ime.step(Input::Destroy {
+        ti: TI,
+        host_deleted: true,
+    });
+    assert_eq!(
+        out.host,
+        [req(ext_id(TI), Ext::Destroy {}), Host::Retire(ext_id(TI))]
+    );
+}
+
+#[test]
+fn row_R1_a_dead_seat_abandons_the_link_and_keeps_the_fence() {
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    // The field's surface goes while its seat is dead: the composition
+    // ends with the link, and the commit's answer repeats none.
+    ime.world.seats.clear();
+    ime.world.surfaces.remove(&SURFACE);
+    let out = ime.step(Input::SeatBound(SeatId(6)));
+    assert!(out.host.is_empty() && out.guest.is_empty());
+    assert_eq!(ime.step(Input::Commit(TI)).guest, [done(2)]);
+
+    let mut ime = Ime::enabled();
+    ime.compose("가");
+    let fence = ime.press(SURFACE).barriers()[0];
+    ime.world.seats.clear();
+    ime.step(Input::Disable(TI));
+    let out = ime.step(Input::Commit(TI));
+    assert_eq!(
+        out.host,
+        [
+            surrounding(TI, "", 0),
+            cursor_rect(TI, (0, 0, 0, 0)),
+            commit_state(TI, 2),
+        ]
+    );
+    ime.world.seats.insert(SEAT, HOST_SEAT);
+    assert_eq!(ime.enable(TI).host, activation(TI, 3));
+    assert_eq!(ime.compose("나").guest, []);
+    ime.step(Input::BarrierDone(fence));
+    assert_eq!(ime.compose("다").guest, [preedit("다"), done(3)]);
+}
+
+#[test]
+fn row_R2_an_activation_waits_for_a_live_seat() {
+    let mut ime = Ime::new();
+    ime.world.seats.clear();
+    ime.create(TI);
+    ime.enable(TI);
+    for _ in 0..2 {
+        let out = ime.step(Input::SeatBound(SeatId(6)));
+        assert!(out.host.is_empty());
+    }
+    assert_eq!(ime.compose("가").guest, []);
+}
