@@ -25,7 +25,7 @@ mod render;
 mod window_placement;
 mod xdg_roles;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -87,7 +87,7 @@ pub struct GuestId(pub(crate) u32);
 /// buffers) uses it, so a guest ID cannot be passed there. Event handlers
 /// receive the raw sender as `ctx.last_sender_id`; [`HostId::from_event_sender`]
 /// wraps it, and [`ShadowTable::get_guest_id`] translates a host ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub(crate) u32);
 
 /// Compare Wayland serials across wrapping `u32` space.
@@ -477,8 +477,9 @@ pub struct Context {
     /// Global names already emitted by each host registry object. A single
     /// Wayland client may create more than one wl_registry; the compositor
     /// sends the complete global list to each one, so this must not be a
-    /// connection-wide set keyed only by global name.
-    pub registry_global_names: HashMap<u32, HashSet<u32>>,
+    /// connection-wide set keyed only by global name. Ordered, because a
+    /// registry's end retires the globals it alone listed in that order.
+    pub registry_global_names: HashMap<u32, BTreeSet<u32>>,
     /// Names removed from each registry. A subsequent global event for a
     /// removed name represents a new advertisement generation; a bind of a
     /// removed name crossed its removal on the wire. Each name keeps the
@@ -514,8 +515,9 @@ pub struct Context {
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
     /// generation keeps an object created from an old, still-bound factory
-    /// isolated from a replacement global's capabilities.
-    pub synthetic_feedback_objects: HashMap<u32, u64>,
+    /// isolated from a replacement global's capabilities. Ordered, because
+    /// completed capabilities reach the objects in that order.
+    pub synthetic_feedback_objects: BTreeMap<u32, u64>,
     /// Avoid queuing one complete feedback sequence for every legacy
     /// format/modifier event. A host can advertise hundreds of pairs in a
     /// single roundtrip; sending one memfd per event can overflow the
@@ -1069,7 +1071,7 @@ impl Context {
             removed_host_globals: HashSet::new(),
             pending_params: HashMap::new(),
             used_dmabuf_params: HashSet::new(),
-            synthetic_feedback_objects: HashMap::new(),
+            synthetic_feedback_objects: BTreeMap::new(),
             synthetic_feedback_refresh_pending: HashSet::new(),
             dmabuf_capabilities: HashMap::new(),
             host_dmabuf_generation: None,

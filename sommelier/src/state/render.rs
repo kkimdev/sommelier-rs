@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::protocols::wayland::wl_output;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::marker::PhantomData;
@@ -993,16 +993,17 @@ impl RenderBuffer {
 /// A host ID is the Wayland generation identity: it remains unique while late
 /// `release` and `delete_id` events are in flight even if the guest numeric ID
 /// becomes reusable. All backing, use, and ownership state therefore moves
-/// together under this one key.
+/// together under this one key. Ordered, because buffers retired together
+/// are destroyed in that order.
 #[derive(Default)]
 pub(super) struct RenderBufferRegistry {
-    entries: HashMap<HostId, RenderBuffer>,
+    entries: BTreeMap<HostId, RenderBuffer>,
 }
 
 impl RenderBufferRegistry {
     pub(super) fn register_local(&mut self, host_id: HostId, backing: BufferState) -> bool {
         match self.entries.entry(host_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer::GuestAlive(ActiveRenderBuffer {
                     backing: RenderBufferBacking::LocalCopy(backing),
                     use_state: RenderBufferUse::NeverSubmitted,
@@ -1010,7 +1011,7 @@ impl RenderBufferRegistry {
                 }));
                 true
             }
-            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Occupied(_) => false,
         }
     }
 
@@ -1021,7 +1022,7 @@ impl RenderBufferRegistry {
         sync_fds: Vec<OwnedFd>,
     ) -> bool {
         match self.entries.entry(host_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(RenderBuffer::GuestAlive(ActiveRenderBuffer {
                     backing: RenderBufferBacking::Native { size, sync_fds },
                     use_state: RenderBufferUse::NeverSubmitted,
@@ -1029,7 +1030,7 @@ impl RenderBufferRegistry {
                 }));
                 true
             }
-            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::btree_map::Entry::Occupied(_) => false,
         }
     }
 

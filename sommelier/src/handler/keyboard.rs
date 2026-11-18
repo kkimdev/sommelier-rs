@@ -221,7 +221,9 @@ impl KeyboardHandler {
         keys: &[u8],
     ) {
         let (chunks, remainder) = keys.as_chunks::<4>();
-        let pressed_keys: std::collections::HashSet<_> = chunks
+        // Ordered: each key's generation is numbered in this order, and a
+        // peek of a key held since the enter takes its number.
+        let pressed_keys: std::collections::BTreeSet<_> = chunks
             .iter()
             .map(|chunk| u32::from_ne_bytes(*chunk))
             .collect();
