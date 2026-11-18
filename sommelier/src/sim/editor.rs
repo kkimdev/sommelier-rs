@@ -34,10 +34,8 @@ use super::hangul::{Composer, Key};
 pub(super) struct TextModel {
     /// The committed text.
     pub text: String,
-    /// The cursor.
+    /// The cursor. Nothing generates a selection, so the model has none.
     pub cursor: usize,
-    /// The other end of the selection; `cursor` when nothing is selected.
-    pub anchor: usize,
     /// The composition, shown at the cursor and not part of `text`; empty
     /// if none.
     pub preedit: String,
@@ -99,18 +97,13 @@ impl TextModel {
         Self {
             text: text.to_owned(),
             cursor: text.len(),
-            anchor: text.len(),
             preedit: String::new(),
         }
     }
 
     /// Applies a transaction in the order `zwp_text_input_v3.done` gives:
     /// the preedit goes, the surrounding text is deleted, the commit is
-    /// inserted, and the new preedit is shown at the cursor.
-    ///
-    /// The delete counts from the cursor and ignores the selection, as GTK
-    /// does, and leaves nothing selected. The commit replaces the
-    /// selection, as typing does.
+    /// inserted at the cursor, and the new preedit is shown there.
     ///
     /// # Panics
     ///
@@ -121,40 +114,26 @@ impl TextModel {
         if before + after > 0 {
             self.replace(self.cursor - before..self.cursor + after, "");
         }
-        if !txn.commit.is_empty() {
-            self.replace(self.selection(), &txn.commit);
-        }
+        self.replace(self.cursor..self.cursor, &txn.commit);
         self.preedit.clone_from(&txn.preedit);
     }
 
     /// Applies a key that the input method passed to the application, as a
-    /// text field does: a character replaces the selection, Enter inserts a
-    /// line break, Backspace deletes the selection or else the character
-    /// before the cursor, and an arrow moves the cursor to that side of the
-    /// selection or else by one character. The preedit stays.
+    /// text field does: a character is inserted at the cursor, Enter inserts
+    /// a line break, Backspace deletes the character before the cursor, and
+    /// an arrow moves the cursor by one character. The preedit stays.
     pub fn insert_key(&mut self, key: Key) {
-        let selection = self.selection();
-        let collapsed = selection.is_empty();
+        let at = self.cursor;
         match key {
-            Key::Char(c) => self.replace(selection, c.encode_utf8(&mut [0; 4])),
-            Key::Enter => self.replace(selection, "\n"),
-            Key::Backspace if collapsed => self.replace(self.char_before()..self.cursor, ""),
-            Key::Backspace => self.replace(selection, ""),
-            Key::Left => self.move_to(if collapsed {
-                self.char_before()
-            } else {
-                selection.start
-            }),
-            Key::Right => self.move_to(if collapsed {
-                self.char_after()
-            } else {
-                selection.end
-            }),
+            Key::Char(c) => self.replace(at..at, c.encode_utf8(&mut [0; 4])),
+            Key::Enter => self.replace(at..at, "\n"),
+            Key::Backspace => self.replace(self.char_before()..at, ""),
+            Key::Left => self.cursor = self.char_before(),
+            Key::Right => self.cursor = self.char_after(),
         }
     }
 
-    /// Moves the cursor to `target`, leaving nothing selected. The preedit
-    /// moves with the cursor.
+    /// Moves the cursor to `target`. The preedit moves with the cursor.
     pub fn click(&mut self, target: Target) {
         let marker = |digit: u8| char::from_digit(digit.into(), 10);
         let at = match target {
@@ -162,12 +141,7 @@ impl TextModel {
             Target::End => None,
             Target::BeforeMarker(digit) => marker(digit).and_then(|m| self.text.find(m)),
         };
-        self.move_to(at.unwrap_or(self.text.len()));
-    }
-
-    /// The selected bytes; empty, at the cursor, when nothing is selected.
-    fn selection(&self) -> Range<usize> {
-        self.cursor.min(self.anchor)..self.cursor.max(self.anchor)
+        self.cursor = at.unwrap_or(self.text.len());
     }
 
     /// Where the character before the cursor starts; the cursor at the
@@ -188,13 +162,7 @@ impl TextModel {
     fn replace(&mut self, range: Range<usize>, text: &str) {
         let at = range.start + text.len();
         self.text.replace_range(range, text);
-        self.move_to(at);
-    }
-
-    /// Puts the cursor at `at`, leaving nothing selected.
-    fn move_to(&mut self, at: usize) {
         self.cursor = at;
-        self.anchor = at;
     }
 }
 
@@ -282,12 +250,11 @@ mod tests {
     use super::*;
     use crate::sim::hangul::keys;
 
-    /// A model with nothing selected.
+    /// A model holding `text`, with the cursor at `cursor`.
     fn model(text: &str, cursor: usize, preedit: &str) -> TextModel {
         TextModel {
             text: text.to_owned(),
             cursor,
-            anchor: cursor,
             preedit: preedit.to_owned(),
         }
     }
@@ -337,50 +304,16 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_replaces_the_selection() {
-        let mut field = TextModel {
-            anchor: 1,
-            ..model("abcdef", 4, "")
-        };
-        field.apply_txn(&Txn {
-            commit: "Z".to_owned(),
-            ..Txn::default()
-        });
-        assert_eq!(field, model("aZef", 2, ""));
-    }
-
-    #[test]
-    fn a_delete_counts_from_the_cursor_and_ignores_the_selection() {
-        let mut field = TextModel {
-            anchor: 1,
-            ..model("abcdef", 4, "")
-        };
-        field.apply_txn(&Txn {
-            delete: (1, 0),
-            ..Txn::default()
-        });
-        assert_eq!(field, model("abcef", 3, ""));
-    }
-
-    #[test]
     fn a_passed_key_edits_like_a_text_field() {
-        let selected = TextModel {
-            anchor: 1,
-            ..model("a가b", 4, "")
-        };
         let table = [
             (model("a가", 4, ""), Key::Char('x'), model("a가x", 5, "")),
-            (selected.clone(), Key::Char('x'), model("axb", 2, "")),
             (model("a가", 4, ""), Key::Enter, model("a가\n", 5, "")),
             (model("a가", 4, ""), Key::Backspace, model("a", 1, "")),
             (model("a가", 0, ""), Key::Backspace, model("a가", 0, "")),
-            (selected.clone(), Key::Backspace, model("ab", 1, "")),
             (model("a가", 4, ""), Key::Left, model("a가", 1, "")),
             (model("a가", 0, ""), Key::Left, model("a가", 0, "")),
-            (selected.clone(), Key::Left, model("a가b", 1, "")),
             (model("a가", 1, ""), Key::Right, model("a가", 4, "")),
             (model("a가", 4, ""), Key::Right, model("a가", 4, "")),
-            (selected, Key::Right, model("a가b", 4, "")),
         ];
         for (mut field, key, after) in table {
             let before = field.clone();
@@ -391,10 +324,7 @@ mod tests {
 
     #[test]
     fn a_click_moves_the_cursor_to_its_target() {
-        let field = TextModel {
-            anchor: 0,
-            ..model("0ab1cd2", 2, "가")
-        };
+        let field = model("0ab1cd2", 2, "가");
         let table = [
             (Target::Start, 0),
             (Target::End, 7),
