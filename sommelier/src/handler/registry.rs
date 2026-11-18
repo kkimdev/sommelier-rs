@@ -1452,8 +1452,7 @@ mod tests {
     use crate::handler::callback::CallbackHandler;
     use crate::handler::linux_dmabuf::LinuxDmabufHandler;
     use crate::placement_config::PlacementConfig;
-    use crate::protocols::aura_shell::zaura_shell::REQ_RELEASE as ZAURA_SHELL_RELEASE;
-    use crate::protocols::aura_shell::{zaura_output, zaura_shell, zaura_surface};
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell};
     use crate::protocols::gtk::gtk_shell1;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -2422,213 +2421,154 @@ mod tests {
         );
     }
 
+    /// Removing the global a singleton is bound to retires the binding: its
+    /// host ID stays reserved, the host object is destroyed if its
+    /// interface has a destructor, and the name's next advertisement is
+    /// bound afresh.
     #[test]
-    fn global_remove_releases_bound_internal_singleton() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
+    fn removing_a_bound_singleton_global_retires_its_binding() {
+        struct Case {
+            singleton: Singleton,
+            /// The version the host advertises, and the one the proxy binds.
+            version: u32,
+            bound_version: u32,
+            /// What the proxy does with the host's `global_remove`.
+            removal: Action,
+            /// The request that destroys the old binding, if its interface
+            /// has one.
+            destructor: Option<AnyRequest>,
+            /// Whether a new binding asks for its capabilities with a sync.
+            capability_sync: bool,
+            /// Whether a guest global waits for the binding's capabilities
+            /// when the host removes it.
+            pending_guest_global: bool,
+        }
+        for Case {
+            singleton,
+            version,
+            bound_version,
+            removal,
+            destructor,
+            capability_sync,
+            pending_guest_global,
+        } in [
+            Case {
+                singleton: Singleton::Shm,
+                version: 1,
+                bound_version: 1,
+                removal: Action::Forward,
+                destructor: None,
+                capability_sync: false,
+                pending_guest_global: false,
+            },
+            Case {
+                singleton: Singleton::KeyboardExtension,
+                version: 2,
+                bound_version: 2,
+                removal: Action::Drop,
+                destructor: None,
+                capability_sync: false,
+                pending_guest_global: false,
+            },
+            Case {
+                singleton: Singleton::AuraShell,
+                version: 38,
+                bound_version: 38,
+                removal: Action::Forward,
+                destructor: Some(zaura_shell::Request::Release {}.into()),
+                capability_sync: false,
+                pending_guest_global: false,
+            },
+            // Removed before its capabilities arrived, the global was never
+            // shown to the guest.
+            Case {
+                singleton: Singleton::Dmabuf,
+                version: 4,
+                bound_version: 3,
+                removal: Action::Drop,
+                destructor: Some(zwp_linux_dmabuf_v1::Request::Destroy {}.into()),
+                capability_sync: true,
+                pending_guest_global: true,
+            },
+        ] {
+            let interface = singleton.interface();
+            let mut ctx = gpu_context(&[A]);
+            ctx.synthetic_feedback_available_for_test = true;
+            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
+            let old = bound_host_id(singleton, &ctx).expect("a binding");
+            ctx.client_to_host_queue.clear();
+            assert_eq!(
+                ctx.pending_dmabuf_globals.len(),
+                usize::from(pending_guest_global),
+                "{interface}"
+            );
 
-        assert_eq!(handler.on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let host_id = ctx.host_shm_id.expect("SHM binding");
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(
-            ctx.host_shm_id, None,
-            "global_remove must release the stale singleton binding"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(host_id),
-            None,
-            "the removed host global must not keep stale dispatch state"
-        );
+            assert_eq!(A.remove(&mut ctx, 10), removal, "{interface}");
+            assert_eq!(singleton.bound_name(&ctx), None);
+            assert_eq!(bound_host_id(singleton, &ctx), None);
+            assert_eq!(ctx.shadow_table.get_host_interface(old), None);
+            assert_eq!(
+                host_requests(&mut ctx, &[(old, interface)]),
+                Vec::from_iter(destructor.map(|request| (old, request))),
+                "{interface}"
+            );
+            assert!(ctx.pending_dmabuf_globals.is_empty(), "{interface}");
+            assert_ne!(ctx.shadow_table.create_host_only("wl_callback", 1), old);
 
-        let keyboard = "zcr_keyboard_extension_v1".to_string();
-        assert_eq!(handler.on_global(&mut ctx, 20, &keyboard, 2), Action::Drop);
-        let keyboard_id = ctx
-            .host_keyboard_extension_id
-            .expect("keyboard extension binding")
-            .0;
-        assert_eq!(handler.on_global_remove(&mut ctx, 20), Action::Drop);
-        assert_eq!(ctx.host_keyboard_extension_id.map(|id| id.0), None);
-        assert_eq!(ctx.shadow_table.get_host_interface(keyboard_id), None);
+            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
+            let new = bound_host_id(singleton, &ctx).expect("a new binding");
+            assert_ne!(new, old, "{interface}");
+            let mut requests = host_requests(&mut ctx, &[]);
+            if capability_sync {
+                assert!(matches!(
+                    requests.pop(),
+                    Some((
+                        WL_DISPLAY_ID,
+                        AnyRequest::WlDisplay(wl_display::Request::Sync { .. })
+                    ))
+                ));
+            }
+            assert_eq!(
+                requests,
+                [(A.host, bind_request(10, interface, bound_version, new))],
+                "{interface}"
+            );
+        }
     }
 
-    #[test]
-    fn global_remove_releases_internal_singleton_for_re_advertisement() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let first_host_id = ctx.host_shm_id.expect("first SHM binding");
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-
-        assert_eq!(
-            ctx.host_shm_id, None,
-            "a removed host global must not leave the singleton pointing at a stale object"
-        );
-        assert_eq!(ctx.host_shm_global_name, None);
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(first_host_id),
-            None,
-            "stale internal object registrations must not receive later host events"
-        );
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let replacement_host_id = ctx.host_shm_id.expect("replacement SHM binding");
-        assert_ne!(
-            replacement_host_id, first_host_id,
-            "a re-advertised global must bind a fresh host object"
-        );
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "the replacement global must issue a new host bind"
-        );
-    }
-
-    #[test]
-    fn removing_shm_global_keeps_old_host_proxy_id_reserved() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let old_host_id = ctx.host_shm_id.expect("internal SHM binding");
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_ne!(
-            ctx.shadow_table.create_host_only("wl_callback", 1),
-            old_host_id,
-            "wl_shm has no host-side destructor; its proxy ID must not be recycled"
-        );
-    }
-
-    #[test]
-    fn global_remove_destroys_internal_dmabuf_factory() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.synthetic_feedback_available_for_test = true;
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &dmabuf, 4), Action::Drop);
-        let host_id = ctx.host_dmabuf_id.expect("internal dmabuf binding");
-        assert_eq!(
-            handler.on_global_remove(&mut ctx, 10),
-            Action::Drop,
-            "a global removed before capability discovery was never visible"
-        );
-        assert_eq!(ctx.host_dmabuf_id, None);
-        assert!(ctx.pending_dmabuf_globals.is_empty());
-        assert_eq!(ctx.shadow_table.get_host_interface(host_id), None);
-        let destroy = ctx
-            .client_to_host_queue
-            .last()
-            .expect("internal dmabuf destroy request")
-            .0
-            .clone();
-        assert_eq!(
-            crate::test_support::msg_opcode(&destroy),
-            zwp_linux_dmabuf_v1::REQ_DESTROY
-        );
-        assert_eq!(crate::test_support::msg_sender(&destroy), host_id);
-    }
-
+    /// Removing the `zaura_shell` global releases the proxy's binding if
+    /// its version has a destructor, and keeps the `zaura_surface`s made
+    /// from it until their surfaces are destroyed.
     #[test]
     fn global_remove_keeps_aura_children_until_surface_destroy() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shell = "zaura_shell".to_string();
+        for (version, released) in [(38, true), (37, false)] {
+            let mut ctx = context(&[A]);
+            assert_eq!(A.global(&mut ctx, 10, "zaura_shell", version), Action::Drop);
+            let shell = ctx.host_zaura_shell.expect("aura shell binding").id;
+            let surface = ctx.shadow_table.create_host_only("zaura_surface", 38);
+            ctx.aura_surfaces.remember(50, surface);
+            ctx.client_to_host_queue.clear();
 
-        assert_eq!(handler.on_global(&mut ctx, 10, &shell, 38), Action::Drop);
-        let shell_id = ctx
-            .host_zaura_shell
-            .map(|shell| shell.id)
-            .expect("aura shell binding");
-        let surface_id = ctx.shadow_table.create_host_only("zaura_surface", 38);
-        ctx.aura_surfaces.remember(50, surface_id);
-
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_eq!(ctx.host_zaura_shell, None);
-        assert_eq!(ctx.shadow_table.get_host_interface(shell_id), None);
-        assert_eq!(
-            ctx.aura_surfaces.get(50),
-            Some(surface_id),
-            "global removal must not destroy an existing aura child"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(surface_id),
-            Some("zaura_surface")
-        );
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "only the internal bind and manager release should be queued"
-        );
-        let shell_message = &ctx.client_to_host_queue[1].0;
-        assert_eq!(
-            crate::test_support::msg_opcode(shell_message),
-            zaura_shell::REQ_RELEASE
-        );
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| crate::test_support::msg_opcode(message)
-                    != zaura_surface::REQ_RELEASE),
-            "global removal must not release existing aura children"
-        );
-    }
-
-    #[test]
-    fn removing_legacy_aura_global_keeps_shell_and_surface_ids_reserved() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shell = "zaura_shell".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &shell, 37), Action::Drop);
-        let shell_id = ctx
-            .host_zaura_shell
-            .map(|shell| shell.id)
-            .expect("legacy aura shell");
-        let surface_id = ctx.shadow_table.create_host_only("zaura_surface", 38);
-        ctx.aura_surfaces.remember(50, surface_id);
-
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-        assert_ne!(
-            ctx.shadow_table.create_host_only("wl_callback", 1),
-            shell_id
-        );
-        assert_ne!(
-            ctx.shadow_table.create_host_only("wl_callback", 1),
-            surface_id
-        );
-        assert_eq!(
-            ctx.aura_surfaces.get(50),
-            Some(surface_id),
-            "legacy aura children also survive global removal"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_interface(surface_id),
-            Some("zaura_surface"),
-            "legacy child dispatch metadata remains live until surface destroy"
-        );
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .all(|(message, _)| message.len() < 8
-                    || crate::test_support::msg_opcode(message) != ZAURA_SHELL_RELEASE),
-            "legacy aura shell must not receive an unsupported release request"
-        );
+            assert_eq!(A.remove(&mut ctx, 10), Action::Forward);
+            assert_eq!(ctx.host_zaura_shell, None);
+            assert_eq!(ctx.shadow_table.get_host_interface(shell), None);
+            assert_eq!(
+                host_requests(&mut ctx, &[(shell, "zaura_shell")]),
+                Vec::from_iter(released.then(|| (shell, zaura_shell::Request::Release {}.into()))),
+                "v{version}"
+            );
+            assert_eq!(ctx.aura_surfaces.get(50), Some(surface));
+            assert_eq!(
+                ctx.shadow_table.get_host_interface(surface),
+                Some("zaura_surface")
+            );
+            for reserved in [shell, surface] {
+                assert_ne!(
+                    ctx.shadow_table.create_host_only("wl_callback", 1),
+                    reserved
+                );
+            }
+        }
     }
 
     /// A host may advertise a singleton global under a new name before it
