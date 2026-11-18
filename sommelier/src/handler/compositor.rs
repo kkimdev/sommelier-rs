@@ -430,10 +430,10 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
         .remove(&wl_surface_guest_id)
         .and_then(|surface| surface.current_buffer_id());
     ctx.forget_surface_buffer_copies(wl_surface_guest_id);
-    crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
+    crate::handler::buffer::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
     // Pending-only objects do not receive a host release event. Retire
     // every buffer made eligible by removing this surface in one pass.
-    crate::handler::shm::retire_eligible_buffers(ctx);
+    crate::handler::buffer::retire_eligible_buffers(ctx);
     ctx.viewport_to_wl_surface
         .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
     ctx.key_generations
@@ -533,7 +533,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // means the compositor will never emit wl_buffer.release for the
         // superseded object, so retire its host proxy after the new attach
         // request in the ordered queue.
-        crate::handler::shm::retire_eligible_buffers(ctx);
+        crate::handler::buffer::retire_eligible_buffers(ctx);
         Action::Forward
     }
 
@@ -712,7 +712,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                     commit.rollback(surface);
                 }
-                crate::handler::shm::retire_eligible_buffers(ctx);
+                crate::handler::buffer::retire_eligible_buffers(ctx);
                 return Action::Drop;
             }
         }
@@ -765,7 +765,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
         ctx.client_to_host_queue.append(&mut host_messages);
-        crate::handler::shm::retire_eligible_buffers(ctx);
+        crate::handler::buffer::retire_eligible_buffers(ctx);
         Action::Drop
     }
 }

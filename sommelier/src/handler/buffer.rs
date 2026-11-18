@@ -18,7 +18,7 @@ limitations under the License.
 //! the host's release, and retiring a destroyed buffer once the host is
 //! done with it.
 
-use super::ShmHandler;
+use crate::handler::shm::ShmHandler;
 use crate::protocols;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
