@@ -394,8 +394,8 @@ fn lease(outcome: LeaseOutcome) -> Key {
 /// Every combination of a transaction's parts, and whether the guest
 /// shows a preedit, encodes in mutter's and KWin's order: the clear of a
 /// shown preedit, the delete, the commit, the new preedit, then `done`.
-/// An empty preedit goes out only to clear a shown one, and a delete only
-/// when it deletes something.
+/// An empty preedit goes out only to clear a shown one, a delete only when
+/// it deletes something, and a commit only when it commits something.
 #[test]
 fn guest_txn_encodes_in_canonical_order() {
     // Per combination of (shown before, delete, commit, preedit), the
@@ -430,23 +430,29 @@ fn guest_txn_encodes_in_canonical_order() {
         };
         let mut events: Vec<_> = parts.chars().map(event).collect();
         events.push(done(0));
-        let txn = |delete| GuestTxn {
+        let txn = |delete, commit: Option<&str>| GuestTxn {
             delete,
-            commit: commits.then(|| "가".into()),
-            preedit: shows.then(|| Preedit {
-                text: "나".into(),
-                cursor: (0, 3),
-            }),
+            commit: commit.map(str::to_string),
+            preedit: shows.then(|| Preedit::new("나".into(), (0, 3)).unwrap()),
         };
         let case = (shown, deletes, commits, shows);
-        let encoded = txn(deletes.then_some((1, 2))).encode(TI, shown, serial);
+        let commit = commits.then_some("가");
+        let encoded = txn(deletes.then_some((1, 2)), commit).encode(TI, shown, serial);
         assert_eq!(guest_events(&encoded.unwrap()), events, "{case:?}");
-        // A zero-length delete is no delete.
+        // A zero-length delete is no delete, and an empty commit no
+        // commit.
         if !deletes {
-            let encoded = txn(Some((0, 0))).encode(TI, shown, serial);
+            let encoded = txn(Some((0, 0)), commit).encode(TI, shown, serial);
+            assert_eq!(guest_events(&encoded.unwrap()), events, "{case:?}");
+        }
+        if !commits {
+            let encoded = txn(deletes.then_some((1, 2)), Some("")).encode(TI, shown, serial);
             assert_eq!(guest_events(&encoded.unwrap()), events, "{case:?}");
         }
     }
+    // An empty preedit is none, and its cursor is (0, 0).
+    assert_eq!(Preedit::new(String::new(), (3, 3)), None);
+    assert_eq!(guest::resolve_preedit_cursor("", None, Some(3)), (0, 0));
 }
 
 #[test]

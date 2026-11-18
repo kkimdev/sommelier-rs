@@ -404,12 +404,11 @@ impl TextInput {
         if shown.is_some() || *assembly != Assembly::default() {
             assert!(attached, "I2: {ti:?} composes while not attached");
         }
-        if let Some(shown) = shown {
+        if shown.is_some() {
             assert!(
                 self.fence.is_none(),
                 "I2: {ti:?} shows a preedit behind a fence"
             );
-            assert!(!shown.text.is_empty(), "{ti:?} shows an empty preedit");
         }
     }
 }
@@ -502,10 +501,8 @@ impl<'a> Current<'a> {
             true => LeaseOutcome::ArmIfBackspaceHeld,
             false => LeaseOutcome::End,
         };
-        let preedit = (!text.is_empty()).then(|| Preedit {
-            cursor: resolve_preedit_cursor(&text, assembly.selection, assembly.cursor),
-            text,
-        });
+        let cursor = resolve_preedit_cursor(&text, assembly.selection, assembly.cursor);
+        let preedit = Preedit::new(text, cursor);
         let txn = GuestTxn {
             preedit,
             ..GuestTxn::default()
@@ -565,20 +562,17 @@ impl<'a> Current<'a> {
         // The cursor is a character boundary of `text`, at most its length.
         let cursor = *cursor as usize;
         let region = &text[cursor - before as usize..cursor + after as usize];
-        let preedit = (!region.is_empty()).then(|| Preedit {
-            text: region.to_string(),
-            cursor: resolve_preedit_cursor(
-                region,
-                assembly.selection,
-                assembly.cursor.or(Some(before as i32)),
-            ),
-        });
+        let cursor = assembly.cursor.or(Some(before as i32));
+        let cursor = resolve_preedit_cursor(region, assembly.selection, cursor);
+        // An empty region deletes nothing and leaves no preedit, so the
+        // guest has no edit to report.
+        let ahead = !region.is_empty();
         let txn = GuestTxn {
             delete: Some((before, after)),
-            preedit,
+            preedit: Preedit::new(region.to_string(), cursor),
             ..GuestTxn::default()
         };
-        Ok(self.plan(txn, true, LeaseOutcome::End))
+        Ok(self.plan(txn, ahead, LeaseOutcome::End))
     }
 
     /// X2 commits the shown preedit; X2', with none shown, recovers the
@@ -604,11 +598,11 @@ impl<'a> Current<'a> {
     }
 
     fn commit_shown(self) -> Result<Planned<'a>, Self> {
-        let Some(shown) = self.shown().cloned() else {
+        let Some(text) = self.shown().map(|shown| shown.text().to_string()) else {
             return Err(self);
         };
         let txn = GuestTxn {
-            commit: Some(shown.text),
+            commit: Some(text),
             ..GuestTxn::default()
         };
         Ok(self.plan(txn, true, LeaseOutcome::End))

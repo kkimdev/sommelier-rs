@@ -24,12 +24,23 @@ use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::wire::Outgoing;
 
 /// A preedit as the guest is shown it. Its text is never empty: an empty
-/// preedit is no preedit.
+/// preedit is no preedit, which [`Self::new`] makes impossible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Preedit {
-    pub(super) text: String,
+    text: String,
     /// The `cursor_begin` and `cursor_end` sent with it.
-    pub(super) cursor: (i32, i32),
+    cursor: (i32, i32),
+}
+
+impl Preedit {
+    /// The preedit `text` with `cursor`, or `None` if `text` is empty.
+    pub(super) fn new(text: String, cursor: (i32, i32)) -> Option<Self> {
+        (!text.is_empty()).then_some(Self { text, cursor })
+    }
+
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// What the guest applies at one `done`, in the protocol's order: the
@@ -57,7 +68,7 @@ impl GuestTxn {
     ///    shows (`shown_before`) before an edit, or when no new one
     ///    follows;
     /// 2. `delete_surrounding_text`, only if it deletes something;
-    /// 3. `commit_string`;
+    /// 3. `commit_string`, if it commits something;
     /// 4. the new `preedit_string`;
     /// 5. `done(serial)`.
     ///
@@ -65,8 +76,8 @@ impl GuestTxn {
     /// in that order whatever the wire order, but some apply events as
     /// they arrive: winit drops a preedit that precedes a commit, and SDL3
     /// ignores a delete while a preedit shows. An empty preedit over none
-    /// makes GTK4 delete the selection, and so does a zero-length delete
-    /// in Chromium, so neither is ever sent. A new preedit equal to the
+    /// makes GTK4 delete the selection, as do a zero-length delete in
+    /// Chromium and an empty commit in GTK, so none of them is ever sent. A new preedit equal to the
     /// shown one is still sent: a `done` without one clears it.
     pub(super) fn encode(
         &self,
@@ -77,7 +88,8 @@ impl GuestTxn {
         use zwp_text_input_v3::evt;
         let ti = ti.0;
         let delete = self.delete.filter(|&lengths| lengths != (0, 0));
-        let edits = delete.is_some() || self.commit.is_some();
+        let commit = self.commit.as_deref().filter(|text| !text.is_empty());
+        let edits = delete.is_some() || commit.is_some();
         let mut events = Vec::new();
         if shown_before && (edits || self.preedit.is_none()) {
             events.push(evt::preedit_string(ti, Some(""), 0, 0).map_err(|_| TooLong)?);
@@ -85,7 +97,7 @@ impl GuestTxn {
         if let Some((before, after)) = delete {
             events.push(evt::delete_surrounding_text(ti, before, after));
         }
-        if let Some(text) = &self.commit {
+        if let Some(text) = commit {
             events.push(evt::commit_string(ti, Some(text)).map_err(|_| TooLong)?);
         }
         if let Some(Preedit { text, cursor }) = &self.preedit {
