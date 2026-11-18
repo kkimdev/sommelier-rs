@@ -897,9 +897,20 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
 - **A v3 transaction's events go in one order.** Every transaction the
   proxy sends a guest text input puts its events in this order, each one
-  it has: a `preedit_string("")` that clears the preedit the guest shows,
-  `delete_surrounding_text`, `commit_string`, a new non-empty
-  `preedit_string`, then `done`. It is the order of mutter, which sends
+  it has:
+  1. `preedit_string("")`, when the guest shows a preedit and the
+     transaction clears it, deletes or commits;
+  2. `delete_surrounding_text`;
+  3. `commit_string`;
+  4. `preedit_string` with the new, non-empty preedit;
+  5. `done`.
+
+  A shown preedit is thus gone before any delete or commit, and a
+  transaction that replaces it with a new one without editing text
+  sends only the new one. A client that applies the transaction at its
+  `done` keeps only the last `preedit_string`, so a clear followed by a
+  new preedit is the same to it as the new one alone. It is the order of
+  mutter, which sends
   a delete when the input method makes it, a commit right after a
   preedit clear, and the new preedit last, with the `done`
   (`src/wayland/meta-wayland-text-input.c` 317, 336-337 and 195-224,
@@ -923,16 +934,52 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   - SDL3 acts on each event as it arrives and turns a delete into a
     Backspace (`src/video/wayland/SDL_waylandevents.c` 2649-2710, main
     1fc62260fc81), which its `testime` ignores while a preedit is shown
-    (`test/testime.c` 1084-1086), so a delete after a new preedit deletes
-    nothing.
+    (`test/testime.c` 1084-1086), so a delete while the old or the new
+    preedit is shown deletes nothing.
 
   No transaction has both a delete and a commit yet, since Exo's deletes
   stand alone (next rule). One order also gives each transaction one wire
   form, which a recorded trace can compare byte for byte.
+
+  A transaction carries no event that changes nothing, since some
+  clients do not read one as nothing and would delete the user's
+  selected text:
+  - no `preedit_string("")` while the guest shows no preedit: the `done`
+    alone leaves it without one. GTK tells an empty preedit from none
+    and emits `preedit-start` for one over none
+    (`gtk/gtkimcontextwayland.c` 241-244), on which GTK4's `GtkText`
+    deletes the selection (`gtk_text_preedit_start_cb`, `gtk/gtktext.c`
+    4491), as does `GtkTextView` (`gtk_text_view_preedit_start_handler`,
+    `gtk/gtktextview.c` 8834). Chromium applies a `done`'s preedit only
+    if it differs from the last one it applied, an absent one counting
+    as `("", 0, 0)` (`zwp_text_input_v3.cc` 466, `zwp_text_input_v3.h`
+    139-140), so an empty preedit with the cursor `(0, 0)` over none
+    changes nothing there. With the hidden cursor `(-1, -1)` it differs,
+    and an empty composition over none deletes the selection
+    (`ui/base/ime/linux/input_method_auralinux.cc` 325-328). So every
+    empty `preedit_string`, the one that clears a shown preedit
+    included, carries the cursor `(0, 0)`: after `("", -1, -1)`, the
+    next `done` without a preedit would differ.
+  - no `delete_surrounding_text(0, 0)`, such as an empty preedit region
+    would make. Chromium applies it (`zwp_text_input_v3.cc` 440 tests
+    that a delete arrived, not its lengths), and while nothing is
+    composed `InputMethodAuraLinux::OnDeleteSurroundingText` deletes the
+    selection (`input_method_auralinux.cc` 518).
+  - no `commit_string("")`, which inserts nothing. GTK emits `commit`
+    for it all the same (`text_input_commit_apply`,
+    `gtk/gtkimcontextwayland.c` 281-282), and GTK4's `GtkText` and
+    `GtkTextView` delete the selection before they insert the text
+    (`gtk_text_enter_text`, `gtk/gtktext.c` 4592-4593;
+    `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779). Chromium
+    skips an empty commit (`zwp_text_input_v3.cc` 452).
+
   Tests: `host_ime_events_become_v3_transactions`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `on_set_preedit_region_translates_correctly`,
-  `exo_deletes_become_v3_deletes_around_the_cursor`.
+  `exo_deletes_become_v3_deletes_around_the_cursor`,
+  `an_empty_preedit_reaches_only_a_guest_that_shows_one`,
+  `an_empty_preedit_has_no_hidden_cursor`,
+  `an_empty_preedit_region_sends_no_delete`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`
   a byte offset from the start of the surrounding text, not from the
@@ -965,8 +1012,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     802-825), so no lengths delete Exo's range in both;
   - for a non-negative index, while an edit of the input method that the
     proxy forwarded (a non-empty commit, the reset commit of a cleared
-    preedit, a confirmation, a preedit region or a delete) is not yet in
-    a surrounding text the guest committed
+    preedit, a confirmation, a non-empty preedit region or a delete) is
+    not yet in a surrounding text the guest committed
     (`TextInputState::unreported_host_edit`), since Exo measures against
     its prediction of the text, which includes the edit;
   - if the range does not contain the cursor, does not fit that text on
