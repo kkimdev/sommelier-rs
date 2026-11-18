@@ -2015,6 +2015,17 @@ mod tests {
                 bind: (10, "wl_output", 3),
             },
             Case {
+                // Registry B listed nothing, so only the retirement of the
+                // global its removal from A completed can refuse the bind.
+                name: "a retired global bound through a registry that listed nothing",
+                setup: |ctx| {
+                    assert_eq!(A.global(ctx, 10, "wl_seat", 5), Action::Forward);
+                    assert_eq!(A.remove(ctx, 10), Action::Forward);
+                },
+                through: B,
+                bind: (10, "wl_seat", 5),
+            },
+            Case {
                 // Reachable only through a proxy bookkeeping bug, not a
                 // guest error: a name in `host_globals` whose advertisement
                 // generation was never recorded.
