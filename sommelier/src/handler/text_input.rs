@@ -4109,6 +4109,45 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// A press that ends a composition is re-sent in its place in its host
+    /// batch: the guest gets the commit transaction, then the press, then
+    /// the rest of the batch in order and unchanged.
+    #[tokio::test]
+    async fn a_press_keeps_its_place_in_its_batch() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([
+            Field::button(pointer, pressed),
+            wl_pointer::evt::frame(pointer.host),
+            wl_pointer::evt::motion(pointer.host, 510, 300, 520),
+            wl_pointer::evt::frame(pointer.host),
+        ])
+        .await;
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        let frame = || -> (u32, AnyEvent) { (pointer.id, wl_pointer::Event::Frame {}.into()) };
+        let motion = wl_pointer::Event::Motion {
+            time: 510,
+            surface_x: 300,
+            surface_y: 520,
+        };
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.extend([
+            Field::guest_button(pointer, pressed),
+            frame(),
+            (pointer.id, motion.into()),
+            frame(),
+        ]);
+        assert_eq!(f.s.guest_received(), expected);
+        f.drain(fence).await;
+    }
+
     /// The events Exo sent before it handled the press's `reset` still
     /// arrive, and its commits belong to the composition the press
     /// committed: the input method's own commit of the syllable, as when
@@ -4408,6 +4447,58 @@ mod tests {
         f.s.host([f.commit("나")]).await;
         let expected = [commit("나"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A touch-down that ends a composition is re-sent in its place in its
+    /// host batch: the guest gets the commit transaction, then the down,
+    /// then the rest of the batch in order and unchanged, a second finger's
+    /// down during the reset fence included.
+    #[tokio::test]
+    async fn a_touch_down_keeps_its_place_in_its_batch() {
+        let mut f = Field::enabled().await;
+        let touch = f.s.touch(f.seat.id).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        let host_frame = || wl_touch::evt::frame(touch.host);
+        f.s.host([
+            Field::down(touch, f.surface, 1),
+            host_frame(),
+            wl_touch::evt::motion(touch.host, 610, 1, 300, 520),
+            Field::down(touch, f.surface, 2),
+            host_frame(),
+            wl_touch::evt::up(touch.host, 7, 620, 1),
+            host_frame(),
+        ])
+        .await;
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        let frame = || -> (u32, AnyEvent) { (touch.id, wl_touch::Event::Frame {}.into()) };
+        let motion = wl_touch::Event::Motion {
+            time: 610,
+            id: 1,
+            x: 300,
+            y: 520,
+        };
+        let up = wl_touch::Event::Up {
+            serial: 7,
+            time: 620,
+            id: 1,
+        };
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.extend([
+            Field::guest_down(touch, f.surface, 1),
+            frame(),
+            (touch.id, motion.into()),
+            Field::guest_down(touch, f.surface, 2),
+            frame(),
+            (touch.id, up.into()),
+            frame(),
+        ]);
+        assert_eq!(f.s.guest_received(), expected);
+        f.drain(fence).await;
     }
 
     /// Only a touch-down on the surface of a composition ends it: one with
