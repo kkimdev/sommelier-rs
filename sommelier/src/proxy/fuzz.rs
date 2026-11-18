@@ -41,10 +41,10 @@ limitations under the License.
 //! - when its framing is intact, either answer the stream's closing
 //!   `wl_display.sync` (the connection stayed healthy) or send the guest a
 //!   `wl_display.error` before closing it;
-//! - send the guest at most one `wl_display.error`, and nothing after it, and
-//!   never the one for `SessionEnd::Internal`: the proxy failing is a bug the
-//!   case's seed reproduces, never a rejection of the guest (no reason is
-//!   exempt today; one that is would be named here and matched exactly);
+//! - send the guest at most one `wl_display.error`, and nothing after it;
+//! - never end a session with `SessionEnd::Internal`: that is the proxy
+//!   failing, never a rejection of the guest, and it is counted even when
+//!   the guest has gone or a protocol error overrides it;
 //! - leave no state behind an ended object after any batch that keeps the
 //!   session (`Context::assert_no_orphans`);
 //! - send the host only what a real compositor accepts: requests from live
@@ -83,7 +83,6 @@ mod typing;
 
 use super::{Client, Direction};
 use crate::connection::{WaylandConnection, MAX_FDS_PER_SEND};
-use crate::handler::display::INTERNAL_ERROR_MESSAGE;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::{
@@ -151,7 +150,12 @@ fn guest_streams_cannot_crash_hang_or_leak() {
                 outcome
             }))
             .unwrap_or_else(|_| {
-                panic!("seed {seed} failed; rerun it alone with SOMMELIER_FUZZ_SEED={seed} SOMMELIER_FUZZ_CASES=1")
+                panic!(
+                    "seed {seed} failed; rerun it alone with SOMMELIER_FUZZ_SEED={seed} \
+                     SOMMELIER_FUZZ_CASES=1, repeating it if need be: the proxy and the \
+                     compositor write to their sockets at once, so the order their \
+                     messages arrive in, and a failure, may not recur on every run"
+                )
             });
             *outcomes.entry(outcome).or_insert(0) += 1;
         }
@@ -165,7 +169,8 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let restarts = INPUT_METHOD_RESTARTS.load(Ordering::Relaxed);
         let seatless = SEATLESS_ACTIVATIONS.load(Ordering::Relaxed);
         let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
-        let presses = PRESSES_DURING_PREEDITS.load(Ordering::Relaxed);
+        let presses = COMPOSITIONS_ENDED_BY_PRESSES.load(Ordering::Relaxed);
+        let press_restarts = RESTARTS_AFTER_PRESSES.load(Ordering::Relaxed);
         let remote_surfaces = REMOTE_SURFACES.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
@@ -174,7 +179,11 @@ fn guest_streams_cannot_crash_hang_or_leak() {
             );
             assert!(
                 presses > 0,
-                "no press followed a preedit, so ending a composition went untested"
+                "no press ended a composition, so the reset fence went untested"
+            );
+            assert!(
+                press_restarts > 0,
+                "no input method restarted after a press, so a leave during the fence went untested"
             );
             assert!(
                 reused > 0,
@@ -216,17 +225,19 @@ fn guest_streams_cannot_crash_hang_or_leak() {
              {leaves} text-input leaves sent, {restarts} input methods restarted, \
              {seatless} activations outlived their seat, \
              {dead_seat_deactivates} deactivates named a destroyed seat, \
-             {presses} presses sent with a preedit, \
+             {presses} compositions ended by a press, {press_restarts} restarts after a press, \
              {remote_surfaces} facade windows got a remote surface"
         );
     });
 }
 
-/// The proxy's `error!` messages since the last [`take_proxy_errors`]: the
-/// reasons behind a `SessionEnd::Internal`, which the guest is not told.
-static PROXY_ERRORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// What the proxy logged at `error` since the last [`take_proxy_errors`]:
+/// how many sessions ended as `SessionEnd::Internal`
+/// (`SessionEnd::internal`), and every message, which says why.
+static PROXY_ERRORS: std::sync::Mutex<(usize, Vec<String>)> =
+    std::sync::Mutex::new((0, Vec::new()));
 
-/// A logger that keeps the error messages and passes everything to
+/// A logger that keeps the proxy's errors and passes everything to
 /// `env_logger`, which `RUST_LOG` configures.
 struct CaptureErrors(env_logger::Logger);
 
@@ -237,10 +248,12 @@ impl log::Log for CaptureErrors {
 
     fn log(&self, record: &log::Record) {
         if record.level() == log::Level::Error {
-            PROXY_ERRORS
-                .lock()
-                .expect("the error list")
-                .push(record.args().to_string());
+            let mut errors = PROXY_ERRORS.lock().expect("the error list");
+            if record.target() == crate::state::INTERNAL_END_TARGET {
+                errors.0 += 1;
+            } else {
+                errors.1.push(record.args().to_string());
+            }
         }
         self.0.log(record);
     }
@@ -260,15 +273,8 @@ fn install_logger() {
     }
 }
 
-fn take_proxy_errors() -> Vec<String> {
+fn take_proxy_errors() -> (usize, Vec<String>) {
     std::mem::take(&mut *PROXY_ERRORS.lock().expect("the error list"))
-}
-
-/// Whether `payload` of a `wl_display.error` carries `message`.
-fn payload_names(payload: &[u8], message: &str) -> bool {
-    payload
-        .windows(message.len())
-        .any(|window| window == message.as_bytes())
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -1144,18 +1150,18 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
     );
     let rejected = errors == 1;
     // `SessionEnd::Internal` is the proxy failing, never a rejection of a
-    // guest: its bookkeeping disagreed with itself or the host. A fuzz case
-    // is made only of what a guest and a compositor may do, so each one is
-    // a bug in the proxy or an input to exempt by its exact reason.
-    for (header, payload) in frames(&events) {
-        if (header.sender_id, header.opcode) == error {
-            assert!(
-                !payload_names(payload, INTERNAL_ERROR_MESSAGE),
-                "seed {seed} ended with SessionEnd::Internal; the proxy logged: {:?}",
-                take_proxy_errors()
-            );
-        }
-    }
+    // guest: its bookkeeping disagreed with itself or the host. It logs why
+    // (`Context::fail`), whether or not the guest is still there to be told
+    // and whatever protocol error overrides it, so [`SessionEnd::internal`]'s
+    // log is the signal.
+    // A fuzz case is made only of what a guest and a compositor may do, so
+    // each is a bug in the proxy.
+    let (internal_ends, proxy_errors) = take_proxy_errors();
+    assert_eq!(
+        internal_ends, 0,
+        "seed {seed} ended {internal_ends} time(s) with SessionEnd::Internal; the proxy \
+         logged these errors: {proxy_errors:?}"
+    );
     assert!(
         !rejected || headers.last() == Some(&error),
         "the guest received {:?} after its wl_display.error",
@@ -1580,8 +1586,10 @@ fn compositor(
     // Answers held back, and whether the last request was a deactivation.
     let mut held = Vec::new();
     let mut after_deactivate = false;
-    // Whether a pointer or touch event went out.
-    let mut pressed = false;
+    // The compositor's pointers and touches ([`Pointers`]), and whether the
+    // last request was a `reset`, whose sync is the proxy's fence.
+    let mut pointers = Pointers::default();
+    let mut after_reset = false;
     // The seat each active host text input was activated with.
     let mut activations: BTreeMap<u32, u32> = BTreeMap::new();
     let mut server_ids = ServerIds {
@@ -1630,20 +1638,20 @@ fn compositor(
                         );
                     }
                     Arg::NewId { interface } => {
-                        let interface = match interface {
-                            Some(interface) => interface.clone(),
+                        let (interface, version) = match interface {
+                            Some(interface) => (interface.clone(), None),
                             None => {
                                 let interface = message.read_string().expect("an interface");
-                                word(&mut message);
-                                interface
+                                (interface, Some(word(&mut message)))
                             }
                         };
-                        created.push((word(&mut message), interface));
+                        created.push((word(&mut message), interface, version));
                     }
                 }
             }
-            let first_created = created.first().map(|&(id, _)| id);
-            for (id, interface) in created {
+            let first_created = created.first().map(|&(id, ..)| id);
+            for (id, interface, version) in created {
+                pointers.created(sender, id, &interface, version);
                 if deleted.remove(&id) {
                     HOST_IDS_REUSED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1670,6 +1678,10 @@ fn compositor(
                 exo.request(sender, &request);
             }
             match (interface.as_str(), opcode) {
+                // The proxy's own answer to a press on a composition.
+                ("zwp_text_input_v1", zwp_text_input_v1::REQ_RESET) if !zombie => {
+                    COMPOSITIONS_ENDED_BY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                }
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) if !zombie => {
                     activations.insert(sender, named[0]);
                 }
@@ -1756,7 +1768,11 @@ fn compositor(
                 ended.push(named[0]);
             }
             let sync = (sender, opcode) == (WL_DISPLAY_ID, wl_display::REQ_SYNC);
+            let mut sync_callback = None;
             let hold = sync && after_deactivate;
+            let fence = sync && after_reset;
+            after_reset =
+                (interface.as_str(), opcode) == ("zwp_text_input_v1", zwp_text_input_v1::REQ_RESET);
             after_deactivate = (interface.as_str(), opcode)
                 == ("zwp_text_input_v1", zwp_text_input_v1::REQ_DEACTIVATE);
             if sync {
@@ -1769,23 +1785,11 @@ fn compositor(
                         &mut deleted,
                     ));
                 }
-                // No restart once a press went out: the proxy's reset fence
-                // is its own sync, which the compositor answers after the
-                // guest may have closed, and the proxy then exits before it
-                // reads the `leave` that answer carries.
-                if !pressed && rng.one_in(8) && exo.destroy_input_method() {
-                    INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
-                } else if rng.one_in(2) {
-                    let events = composition_and_presses(&exo, &objects, &mut serial, &mut rng);
-                    pressed |= !events.is_empty();
-                    reply.extend(events);
-                }
-                let callback = WireMessage::new(sender, opcode, payload)
-                    .read_u32()
-                    .expect("a callback ID");
-                // `done` destroys the callback.
-                reply.push(wl_callback::evt::done(callback, 0).0);
-                ended.push(callback);
+                sync_callback = Some(
+                    WireMessage::new(sender, opcode, payload)
+                        .read_u32()
+                        .expect("a callback ID"),
+                );
             }
             for id in ended {
                 objects.remove(&id);
@@ -1810,7 +1814,30 @@ fn compositor(
             });
             // A destroyed surface loses the focus without a `leave`.
             exo.forget(|id| objects.contains_key(&id));
+            if sync_callback.is_some() {
+                // The presses name only what the compositor still has, and
+                // come before the sync's `done`, which the guest may close
+                // on. So does a restart, except on the answer to the proxy's
+                // own fence sync, which follows a press: the guest may have
+                // closed by then, and the proxy exits when it does, before
+                // it reads the `leave` the answer carries.
+                let sent = pointers.presses(&exo, &objects, &mut serial, &mut rng);
+                reply.extend(sent.events);
+                if !fence && rng.one_in(8) && exo.destroy_input_method() {
+                    INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                    if sent.pressed {
+                        RESTARTS_AFTER_PRESSES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             reply.extend(text_input_events(exo.take_events()));
+            if let Some(callback) = sync_callback {
+                // `done` destroys the callback.
+                reply.push(wl_callback::evt::done(callback, 0).0);
+                objects.remove(&callback);
+                deleted.insert(callback);
+                reply.push(delete_id(callback));
+            }
             let release = !hold && !reply.is_empty();
             held.append(&mut reply);
             if release {
@@ -1938,76 +1965,134 @@ fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
     events.into_iter().map(|(event, _)| event).collect()
 }
 
-/// `wl_pointer` and `wl_touch` events whose compositor presses on the
-/// focused surface, as a click or tap on its window does, and the preedits
-/// they follow: each text input attached on that surface composes, then each
-/// pointer enters the surface and presses and releases, and each touch goes
-/// down and up. The press reaches the proxy while the preedit is live, and
-/// ends it ([`crate::handler::text_input::end_composition_on_press`]); the
-/// run's checks (`Context::assert_no_orphans`, the guest's event checks and
-/// the exchange with Exo) judge what follows.
-fn composition_and_presses(
-    exo: &Exo,
-    objects: &BTreeMap<u32, String>,
-    serial: &mut u32,
-    rng: &mut Rng,
-) -> Vec<Vec<u8>> {
-    let Some(surface) = exo.focus() else {
-        return Vec::new();
-    };
-    let mut events = Vec::new();
-    let mut composing = false;
-    for text_input in exo.composing_text_inputs() {
-        if rng.one_in(2) {
-            composing = true;
-            *serial += 1;
-            events.push(
-                zwp_text_input_v1::evt::preedit_string(text_input, *serial, "나", "나")
-                    .expect("a short preedit fits a message")
-                    .0,
-            );
-        }
-    }
-    let with = |interface: &str| -> Vec<u32> {
-        objects
-            .iter()
-            .filter(|&(_, candidate)| candidate == interface)
-            .map(|(&id, _)| id)
-            .collect()
-    };
-    let mut presses = 0;
-    for pointer in with("wl_pointer") {
-        *serial += 1;
-        events.push(wl_pointer::evt::enter(pointer, *serial, surface, 0, 0).0);
-        if rng.one_in(2) {
-            presses += 1;
-            for state in [
-                wl_pointer::BUTTON_STATE_PRESSED,
-                wl_pointer::BUTTON_STATE_RELEASED,
-            ] {
-                *serial += 1;
-                events.push(wl_pointer::evt::button(pointer, *serial, 0, BTN_LEFT, state).0);
-            }
-        }
-    }
-    for touch in with("wl_touch") {
-        if rng.one_in(2) {
-            presses += 1;
-            *serial += 1;
-            events.push(wl_touch::evt::down(touch, *serial, 0, surface, 0, 0, 0).0);
-            *serial += 1;
-            events.push(wl_touch::evt::up(touch, *serial, 0, 0).0);
-        }
-    }
-    if composing {
-        PRESSES_DURING_PREEDITS.fetch_add(presses, Ordering::Relaxed);
-    }
-    events
+/// Compositor presses that made the proxy `reset` Exo's composition, across
+/// all cases.
+static COMPOSITIONS_ENDED_BY_PRESSES: AtomicU64 = AtomicU64::new(0);
+
+/// Input method restarts that followed a press in the same reply, across
+/// all cases.
+static RESTARTS_AFTER_PRESSES: AtomicU64 = AtomicU64::new(0);
+
+/// The compositor's pointers and touches: what they are bound at, and
+/// where each pointer is.
+#[derive(Default)]
+struct Pointers {
+    /// The version of each seat, pointer and touch.
+    versions: BTreeMap<u32, u32>,
+    /// The surface each pointer has entered.
+    focus: BTreeMap<u32, u32>,
 }
 
-/// Pointer presses and touch-downs the compositor sent in a batch with a
-/// preedit, across all cases.
-static PRESSES_DURING_PREEDITS: AtomicU64 = AtomicU64::new(0);
+/// What [`Pointers::presses`] sends.
+struct Presses {
+    events: Vec<Vec<u8>>,
+    /// Whether it includes a button press or a touch-down.
+    pressed: bool,
+}
+
+impl Pointers {
+    /// A request of `sender` created `id`, which `version` names if the
+    /// request binds a global; a pointer or touch has its seat's.
+    fn created(&mut self, sender: u32, id: u32, interface: &str, version: Option<u32>) {
+        let version = match interface {
+            "wl_pointer" | "wl_touch" => self.versions.get(&sender).copied(),
+            _ => version,
+        };
+        if let Some(version) = version {
+            self.versions.insert(id, version);
+        }
+    }
+
+    /// Events of a compositor presses on the focused surface, as a click or
+    /// tap on its window does, and the preedits they follow: each text input
+    /// attached on that surface composes, then each pointer enters the
+    /// surface (leaving the one it was on) and presses and releases, and
+    /// each touch goes down and up, each with the frames its version has. The
+    /// press reaches the proxy while the preedit is live, and ends it
+    /// ([`crate::handler::text_input::end_composition_on_press`]); the run's
+    /// checks (`Context::assert_no_orphans`, the guest's event checks and the
+    /// exchange with Exo) judge what follows. Only live objects are named.
+    fn presses(
+        &mut self,
+        exo: &Exo,
+        objects: &BTreeMap<u32, String>,
+        serial: &mut u32,
+        rng: &mut Rng,
+    ) -> Presses {
+        let mut sent = Presses {
+            events: Vec::new(),
+            pressed: false,
+        };
+        // A pointer or surface that ended takes the pointer's focus with it.
+        self.focus.retain(|pointer, surface| {
+            objects.contains_key(pointer) && objects.contains_key(surface)
+        });
+        let Some(surface) = exo.focus() else {
+            return sent;
+        };
+        let events = &mut sent.events;
+        for text_input in exo.composing_text_inputs() {
+            if rng.one_in(2) {
+                *serial += 1;
+                events.push(
+                    zwp_text_input_v1::evt::preedit_string(text_input, *serial, "나", "나")
+                        .expect("a short preedit fits a message")
+                        .0,
+                );
+            }
+        }
+        let with = |interface: &str| -> Vec<u32> {
+            objects
+                .iter()
+                .filter(|&(_, candidate)| candidate == interface)
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        for pointer in with("wl_pointer") {
+            let frame = self
+                .versions
+                .get(&pointer)
+                .is_some_and(|&version| version >= 5);
+            let frame = |events: &mut Vec<Vec<u8>>| {
+                if frame {
+                    events.push(wl_pointer::evt::frame(pointer).0);
+                }
+            };
+            if self.focus.get(&pointer) != Some(&surface) {
+                if let Some(left) = self.focus.insert(pointer, surface) {
+                    *serial += 1;
+                    events.push(wl_pointer::evt::leave(pointer, *serial, left).0);
+                }
+                *serial += 1;
+                events.push(wl_pointer::evt::enter(pointer, *serial, surface, 0, 0).0);
+                frame(events);
+            }
+            if rng.one_in(2) {
+                sent.pressed = true;
+                for state in [
+                    wl_pointer::BUTTON_STATE_PRESSED,
+                    wl_pointer::BUTTON_STATE_RELEASED,
+                ] {
+                    *serial += 1;
+                    events.push(wl_pointer::evt::button(pointer, *serial, 0, BTN_LEFT, state).0);
+                    frame(events);
+                }
+            }
+        }
+        for touch in with("wl_touch") {
+            if rng.one_in(2) {
+                sent.pressed = true;
+                *serial += 1;
+                events.push(wl_touch::evt::down(touch, *serial, 0, surface, 0, 0, 0).0);
+                events.push(wl_touch::evt::frame(touch).0);
+                *serial += 1;
+                events.push(wl_touch::evt::up(touch, *serial, 0, 0).0);
+                events.push(wl_touch::evt::frame(touch).0);
+            }
+        }
+        sent
+    }
+}
 
 /// `wl_keyboard.enter` of `keyboard` on `surface`, with no keys pressed.
 fn keyboard_enter(keyboard: u32, serial: u32, surface: u32) -> Vec<u8> {

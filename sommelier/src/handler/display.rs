@@ -40,10 +40,6 @@ pub(crate) fn request_error(error: &ProtocolError) -> SessionEnd {
     }
 }
 
-/// The message of the `wl_display.error` that tells the guest the proxy
-/// failed ([`SessionEnd::Internal`]); the fuzzer fails a case that gets it.
-pub(crate) const INTERNAL_ERROR_MESSAGE: &str = "the proxy failed to handle a request";
-
 /// The one `wl_display.error` that tells the guest its session ended.
 pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
     let (object, code, message) = match end {
@@ -55,7 +51,7 @@ pub(crate) fn session_error(end: &SessionEnd) -> Outgoing {
         SessionEnd::Internal => (
             WL_DISPLAY_ID,
             wl_display::ERROR_IMPLEMENTATION,
-            INTERNAL_ERROR_MESSAGE,
+            "the proxy failed to handle a request",
         ),
     };
     wl_display::evt::error(WL_DISPLAY_ID, object, code, message)
