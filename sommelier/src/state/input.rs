@@ -383,6 +383,7 @@ pub(crate) struct PreeditRegionPlan {
     pub surrounding_text: String,
     pub surrounding_cursor: i32,
     pub done_serial: u32,
+    pub had_preedit: bool,
     pub selection: Option<(u32, u32)>,
     pub cursor: Option<i32>,
 }
@@ -626,6 +627,7 @@ impl TextInputState {
             surrounding_text: surrounding_text.clone(),
             surrounding_cursor: *surrounding_cursor,
             done_serial: self.guest_commit_serial,
+            had_preedit: self.current_preedit.has_text(),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
@@ -638,6 +640,7 @@ impl TextInputState {
         cursor: (i32, i32),
     ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         self.pending_preedit_selection = None;

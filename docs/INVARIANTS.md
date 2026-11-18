@@ -920,16 +920,26 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   A transaction carries no event that changes nothing, since some
   clients do not read one as nothing and would delete the user's
   selected text:
+  - no `preedit_string("")` while the guest shows no preedit: the `done`
+    alone leaves it without one. GTK tells an empty preedit from none
+    and emits `preedit-start` for one over none
+    (`gtk/gtkimcontextwayland.c` 241-244), on which GTK4's `GtkText`
+    deletes the selection (`gtk/gtktext.c` 4491), as does `GtkTextView`.
+    Chromium applies one that differs from the preedit it last applied
+    (`zwp_text_input_v3.cc` 466), and an empty composition over none
+    deletes the selection (`ui/base/ime/linux/input_method_auralinux.cc`
+    325-328).
   - no `delete_surrounding_text(0, 0)`, such as an empty preedit region
     would make. Chromium applies it (`zwp_text_input_v3.cc` 440 tests
     that a delete arrived, not its lengths), and while nothing is
     composed `InputMethodAuraLinux::OnDeleteSurroundingText` deletes the
-    selection (`ui/base/ime/linux/input_method_auralinux.cc` 518).
+    selection (`input_method_auralinux.cc` 518).
 
   Tests: `host_ime_events_become_v3_transactions`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `on_set_preedit_region_translates_correctly`,
   `exo_deletes_become_v3_deletes_around_the_cursor`,
+  `an_empty_preedit_reaches_only_a_guest_that_shows_one`,
   `an_empty_preedit_region_sends_no_delete`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`

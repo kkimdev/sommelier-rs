@@ -659,11 +659,13 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
-        // An empty preedit clears the shown one before its reset commit;
-        // a new preedit carries no commit, so it is last
+        // An empty preedit goes only to clear the shown one, before its
+        // reset commit; a new preedit carries no commit, so it is last
         // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
-        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+        if (plan.had_preedit || !text.is_empty())
+            && !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end)
+        {
             return drop_host_preedit(ctx, guest_id);
         }
         // The v1 `commit` argument is the replacement text to use if this
@@ -1169,8 +1171,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
         // The delete goes first and the new preedit last; an empty region
-        // deletes nothing (docs/INVARIANTS.md, "A v3 transaction's events
-        // go in one order").
+        // deletes nothing and clears only a shown preedit
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
         if (before_length, after_length) != (0, 0) {
             transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
@@ -1179,13 +1181,15 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
                 after_length,
             ));
         }
-        if !push_preedit_string_to(
-            &mut transaction,
-            guest_id,
-            &preedit_text,
-            cursor_begin,
-            cursor_end,
-        ) {
+        if (plan.had_preedit || !preedit_text.is_empty())
+            && !push_preedit_string_to(
+                &mut transaction,
+                guest_id,
+                &preedit_text,
+                cursor_begin,
+                cursor_end,
+            )
+        {
             return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -4740,7 +4744,7 @@ mod tests {
             (
                 "a reset without a preedit commits nothing",
                 |f| vec![f.preedit("", "stale fallback")],
-                vec![no_preedit(), DONE],
+                vec![DONE],
             ),
             (
                 "a commit clears the preedit",
@@ -5234,8 +5238,43 @@ mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// An empty preedit reaches the guest only to clear the one it shows.
+    /// Over none, the transaction is its `done` alone, since clients tell
+    /// an empty preedit from none:
+    /// - GTK emits `preedit-start` for an empty preedit over none
+    ///   (`text_input_preedit_apply`, `gtk/gtkimcontextwayland.c` 241-244,
+    ///   GTK 92348cd4), on which GTK4's `GtkText` deletes the selection
+    ///   (`gtk_text_preedit_start_cb`, `gtk/gtktext.c` 4491), as does
+    ///   `GtkTextView`.
+    /// - Chromium applies one that differs from the preedit it last
+    ///   applied, as one with a hidden cursor does
+    ///   (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 466,
+    ///   revision ffb4f13519), and an empty composition over none deletes
+    ///   the selection (`UpdateCompositionIfTextSelected`,
+    ///   `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
+    ///
+    /// Either way the user's selected text would go.
+    #[tokio::test]
+    async fn an_empty_preedit_reaches_only_a_guest_that_shows_one() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([
+            f.preedit("", ""),
+            f.preedit("", "stale fallback"),
+            v1::preedit_cursor(f.host, -1),
+            f.preedit("", ""),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), f.events([done(), done(), done()]));
+
+        f.s.host([f.preedit("가", ""), f.preedit("", "")]).await;
+        let expected = [preedit("가"), done(), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// An empty preedit region deletes nothing, so it sends no
-    /// `delete_surrounding_text`, only the preedit it leaves. Chromium
+    /// `delete_surrounding_text`, only the empty preedit that clears a
+    /// shown one ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`]). Chromium
     /// applies an empty delete too (`ZwpTextInputV3Impl::OnDone`,
     /// `ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 440, revision
     /// ffb4f13519), and while nothing is composed it deletes the selection
@@ -5247,7 +5286,7 @@ mod tests {
         let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
         let done = || V3::Done { serial: 2 };
         f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
-        assert_eq!(f.s.guest_received(), f.events([no_preedit(), done()]));
+        assert_eq!(f.s.guest_received(), f.events([done()]));
 
         f.s.host([
             f.preedit("가", ""),
