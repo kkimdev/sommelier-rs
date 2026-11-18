@@ -141,6 +141,7 @@ pub(super) fn v1_content_type(hint: u32, purpose: u32) -> ContentType {
 }
 
 /// One host `zwp_text_input_v1`.
+#[derive(Debug)]
 struct TextInput {
     /// `surface_`: the surface of the last `activate`, until a `deactivate`
     /// or the surface loses the focus or is destroyed.
@@ -234,7 +235,7 @@ impl TextInput {
 }
 
 /// Exo's seat and its text inputs, as far as the model goes.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(super) struct Exo {
     /// The seat's focused surface.
     focus: Option<u32>,

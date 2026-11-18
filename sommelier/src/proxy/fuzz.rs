@@ -40,7 +40,10 @@ limitations under the License.
 //! - when its framing is intact, either answer the stream's closing
 //!   `wl_display.sync` (the connection stayed healthy) or send the guest a
 //!   `wl_display.error` before closing it;
-//! - send the guest at most one `wl_display.error`, and nothing after it;
+//! - send the guest at most one `wl_display.error`, and nothing after it, and
+//!   never the one for `SessionEnd::Internal`: the proxy failing is a bug the
+//!   case's seed reproduces, never a rejection of the guest (no reason is
+//!   exempt today; one that is would be named here and matched exactly);
 //! - leave no state behind an ended object after any batch that keeps the
 //!   session (`Context::assert_no_orphans`);
 //! - send the host only what a real compositor accepts: requests from live
@@ -80,6 +83,7 @@ mod typing;
 
 use super::{Client, Direction};
 use crate::connection::{WaylandConnection, MAX_FDS_PER_SEND};
+use crate::handler::display::INTERNAL_ERROR_MESSAGE;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::{
@@ -124,9 +128,7 @@ const SERVER_ID_START: u32 = 0xff00_0000;
 fn guest_streams_cannot_crash_hang_or_leak() {
     in_own_process(|| {
         // `RUST_LOG` shows the proxy's view of a failing seed.
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
-            .is_test(true)
-            .try_init();
+        install_logger();
         let cases = env_u64("SOMMELIER_FUZZ_CASES", DEFAULT_CASES);
         let first_seed = env_u64("SOMMELIER_FUZZ_SEED", 0);
         let protocols = Arc::new(Protocols::load());
@@ -209,6 +211,55 @@ fn guest_streams_cannot_crash_hang_or_leak() {
              {remote_surfaces} facade windows got a remote surface"
         );
     });
+}
+
+/// The proxy's `error!` messages since the last [`take_proxy_errors`]: the
+/// reasons behind a `SessionEnd::Internal`, which the guest is not told.
+static PROXY_ERRORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A logger that keeps the error messages and passes everything to
+/// `env_logger`, which `RUST_LOG` configures.
+struct CaptureErrors(env_logger::Logger);
+
+impl log::Log for CaptureErrors {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Error || self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        if record.level() == log::Level::Error {
+            PROXY_ERRORS
+                .lock()
+                .expect("the error list")
+                .push(record.args().to_string());
+        }
+        self.0.log(record);
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+fn install_logger() {
+    let inner = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("off"))
+        .is_test(true)
+        .build();
+    let level = inner.filter().max(log::LevelFilter::Error);
+    if log::set_boxed_logger(Box::new(CaptureErrors(inner))).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
+fn take_proxy_errors() -> Vec<String> {
+    std::mem::take(&mut *PROXY_ERRORS.lock().expect("the error list"))
+}
+
+/// Whether `payload` of a `wl_display.error` carries `message`.
+fn payload_names(payload: &[u8], message: &str) -> bool {
+    payload
+        .windows(message.len())
+        .any(|window| window == message.as_bytes())
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -1061,6 +1112,7 @@ enum Outcome {
 fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed: u64) -> Outcome {
     let case = Case::generate(protocols, globals, seed);
     let framed = case.framed;
+    take_proxy_errors();
     let (events, host) = exchange(
         protocols,
         config,
@@ -1082,6 +1134,19 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
         "the guest received {errors} wl_display.error events"
     );
     let rejected = errors == 1;
+    // `SessionEnd::Internal` is the proxy failing, never a rejection of a
+    // guest: its bookkeeping disagreed with itself or the host. A fuzz case
+    // is made only of what a guest and a compositor may do, so each one is
+    // a bug in the proxy or an input to exempt by its exact reason.
+    for (header, payload) in frames(&events) {
+        if (header.sender_id, header.opcode) == error {
+            assert!(
+                !payload_names(payload, INTERNAL_ERROR_MESSAGE),
+                "seed {seed} ended with SessionEnd::Internal; the proxy logged: {:?}",
+                take_proxy_errors()
+            );
+        }
+    }
     assert!(
         !rejected || headers.last() == Some(&error),
         "the guest received {:?} after its wl_display.error",
@@ -1109,7 +1174,7 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
             assert_eq!(
                 host.focused_fields(),
                 expected,
-                "Exo's text fields on the focused surface differ from what the guest committed"
+                "Exo's text fields on the focused surface differ from what the guest committed: {host:?}"
             );
             FIELDS_CHECKED.fetch_add(expected.len() as u64, Ordering::Relaxed);
             DEFERRED_ACTIVATIONS.fetch_add(typed.deferred_activations, Ordering::Relaxed);
