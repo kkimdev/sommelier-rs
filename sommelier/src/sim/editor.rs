@@ -61,8 +61,10 @@ pub(super) enum Target {
     Start,
     /// After the last character.
     End,
-    /// Just before the first occurrence of this digit, a marker seeded into
-    /// the field's text; after the last character if the text has none.
+    /// Just before the first occurrence of this digit (0 to 9), a marker
+    /// seeded into the field's text; after the last character if the text
+    /// has none. A generator must not type digits, so that each marker
+    /// stays one place.
     BeforeMarker(u8),
 }
 
@@ -145,11 +147,13 @@ impl TextModel {
 
     /// Moves the cursor to `target`. The preedit moves with the cursor.
     pub fn click(&mut self, target: Target) {
-        let marker = |digit: u8| char::from_digit(digit.into(), 10);
         let at = match target {
             Target::Start => Some(0),
             Target::End => None,
-            Target::BeforeMarker(digit) => marker(digit).and_then(|m| self.text.find(m)),
+            Target::BeforeMarker(digit) => {
+                assert!(digit < 10, "a marker is a digit, not {digit}");
+                self.text.find(char::from(b'0' + digit))
+            }
         };
         self.cursor = at.unwrap_or(self.text.len());
     }
@@ -191,6 +195,13 @@ impl TextModel {
 ///   focused field changes nothing.
 ///
 /// Field 0 has the focus at the start.
+///
+/// This is the user's intent only for actions the system can follow in
+/// order: each `Click` and `Tap` must have a `Settle` before and after it,
+/// and each `Focus` a `Settle` before it. Otherwise Exo can hand a key to
+/// the engine before the press's reset, and the proxy drops that key's
+/// late result by design (INVARIANTS, "A pointer press ends the
+/// composition on its surface").
 #[derive(Clone, Debug)]
 pub(super) struct Reference {
     /// One model per field.
@@ -245,6 +256,11 @@ impl Reference {
         &self.fields
     }
 
+    /// The field with the keyboard focus.
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
     /// Commits the composition, if any, into the focused field.
     fn commit_composition(&mut self) {
         let commit = self.composer.confirm();
@@ -272,11 +288,17 @@ mod tests {
     /// The fields after the reference editor applies `actions` to fields
     /// holding `texts`.
     fn intended(texts: &[&str], actions: &[UserAction]) -> Vec<TextModel> {
+        reference(texts, actions).fields().to_vec()
+    }
+
+    /// The reference editor after it applies `actions` to fields holding
+    /// `texts`.
+    fn reference(texts: &[&str], actions: &[UserAction]) -> Reference {
         let mut editor = Reference::new(texts.iter().map(|t| TextModel::new(t)).collect());
         for &action in actions {
             editor.apply(action);
         }
-        editor.fields().to_vec()
+        editor
     }
 
     /// The actions that type `script` (see [`keys`]).
@@ -385,6 +407,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "a marker is a digit")]
+    fn a_marker_that_is_not_a_digit_panics() {
+        model("0ab1cd2", 0, "").click(Target::BeforeMarker(10));
+    }
+
+    #[test]
     fn keys_commit_and_compose_at_the_cursor_of_the_focused_field() {
         assert_eq!(
             intended(&["0ab1cd2", "x"], &typing("rkskdk")),
@@ -454,30 +482,27 @@ mod tests {
             at: Target::Start,
         };
         let actions = [typing("rk"), vec![click], typing("sk")].concat();
-        assert_eq!(
-            intended(&["0", "1"], &actions),
-            [model("0가", 4, ""), model("1", 0, "나")]
-        );
+        let editor = reference(&["0", "1"], &actions);
+        assert_eq!(editor.fields(), [model("0가", 4, ""), model("1", 0, "나")]);
+        assert_eq!(editor.focus(), 1);
     }
 
     #[test]
     fn a_focus_move_commits_in_the_field_it_leaves() {
         let actions = [typing("rk"), vec![UserAction::Focus(1)], typing("sk")].concat();
-        assert_eq!(
-            intended(&["0", "1"], &actions),
-            [model("0가", 4, ""), model("1", 1, "나")]
-        );
+        let editor = reference(&["0", "1"], &actions);
+        assert_eq!(editor.fields(), [model("0가", 4, ""), model("1", 1, "나")]);
+        assert_eq!(editor.focus(), 1);
     }
 
     #[test]
     fn focusing_the_focused_field_or_settling_keeps_the_composition() {
         for pause in [UserAction::Focus(0), UserAction::Settle] {
             let actions = [typing("rk"), vec![pause], typing("r")].concat();
-            assert_eq!(
-                intended(&["0", "1"], &actions),
-                [model("0", 1, "각"), model("1", 1, "")],
-                "{pause:?}"
-            );
+            let editor = reference(&["0", "1"], &actions);
+            let fields = [model("0", 1, "각"), model("1", 1, "")];
+            assert_eq!(editor.fields(), fields, "{pause:?}");
+            assert_eq!(editor.focus(), 0, "{pause:?}");
         }
     }
 }
