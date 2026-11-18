@@ -16,36 +16,38 @@ limitations under the License.
 
 //! Models of the `zwp_text_input_v3` clients the simulation types into.
 //!
-//! A model plays one guest application at the wire level. It takes the v3
-//! events the proxy sends, decoded, and what else the application learns
-//! from the proxy: the keyboard focus, the keys the input method passed
-//! (each mapped back to a [`Key`]) and the pointer presses and touches
-//! (each mapped to a [`Target`]). It returns the requests the application
-//! sends in reply, encoded. It holds one [`TextModel`] per field, applies
-//! transactions through [`TextModel::apply_txn`] as far as the client's
-//! rules allow, and logs every part of an event it drops, with the reason.
+//! A model plays one guest application at the wire level. It takes the
+//! decoded v3 events the proxy sends and the rest of what the application
+//! learns from it: the keyboard focus, the keys the input method passed
+//! (as [`Key`]s) and presses (as [`Target`]s). It returns the requests the
+//! application sends, encoded. It holds a [`TextModel`] per field, changes
+//! it through [`TextModel::apply_txn`] as far as the client's rules allow,
+//! and logs every part of an event it drops, with the reason.
 //!
-//! A model also checks the v3 protocol as events arrive, and panics on a
-//! violation, which fails the case:
+//! A model panics on output no correct proxy sends, which fails the case:
 //!
-//! - every event comes from the model's text input;
-//! - `enter` names a field's surface while none is entered, and `leave`
-//!   the entered one;
-//! - the other events arrive only between `enter` and `leave`;
-//! - a `done` serial is at most the number of commits the model made;
-//! - a delete fits the text ([`TextModel::delete_range`]).
+//! - an event from another object, or naming a surface it lacks;
+//! - a string that is not UTF-8;
+//! - a `done` serial past the commits it made;
+//! - a delete that fits none of the surrounding texts it sent since it
+//!   last enabled ([`TextModel::delete_range`]); a delete that fits one is
+//!   applied as the client applies it, clamped to its current text;
+//! - `enter` while entered, `leave` of a surface not entered, and other
+//!   events outside `enter` and `leave`. The protocol does not forbid
+//!   these, but the proxy never sends them: it sends `leave` before the
+//!   next `enter` and composes only for an entered field.
 //!
 //! The models never hold a selection, as [`TextModel`] has none, so where
 //! a client counts from the selection it counts from the cursor here.
 //!
-//! The facts each model implements are those of the design's section 2.5,
-//! C1 to C9, each cited to the client's source where it is implemented.
+//! Each fact of the design's section 2.5 (C1 to C9) is cited to the
+//! client's source where it is implemented.
 
 pub(super) mod chromium;
 pub(super) mod gtk;
 
 use super::clock::Micros;
-use super::editor::{Target, TextModel};
+use super::editor::{Target, TextModel, Txn};
 use super::hangul::Key;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, req, Event};
 use crate::wire::{IndexedString, Outgoing};
@@ -64,29 +66,58 @@ pub(super) struct Field {
 pub(super) struct Dropped {
     /// When it dropped it.
     pub at: Micros,
-    /// What it dropped, and why.
+    /// What it dropped.
+    pub part: Part,
+    /// Why.
     pub reason: DropReason,
 }
 
-/// What a client dropped, and why.
+/// A part of a v3 transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum DropReason {
-    /// Chromium: a delete while a composition is shown (C3).
-    DeleteWhileComposing {
+pub(super) enum Part {
+    /// `preedit_string`.
+    Preedit(String),
+    /// `commit_string`.
+    Commit(String),
+    /// `delete_surrounding_text`.
+    Delete {
         /// The bytes before the cursor.
         before: u32,
         /// The bytes after the cursor.
         after: u32,
     },
-    /// Chromium: a commit within 100 ms of a reset that ended a
-    /// composition (C4).
-    CommitInGuard(String),
-    /// Chromium: a preedit within 100 ms of a reset that ended a
-    /// composition (C4).
-    PreeditInGuard(String),
-    /// GTK: an event while no field has the keyboard focus, so that no
-    /// input method context is current.
+}
+
+/// Why a client dropped a part of a transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DropReason {
+    /// Chromium: a delete while a composition is shown (C3).
+    DeleteWhileComposing,
+    /// Chromium: a delete whose range splits a character of the text it
+    /// predicts.
+    DeleteSplitsCharacter,
+    /// Chromium: a commit or preedit within 100 ms of a reset that ended
+    /// a composition in the field's window (C4).
+    InGuard,
+    /// Chromium: the transaction's window has no keyboard focus, so its
+    /// input method has no text input client.
+    NoTextInputClient,
+    /// Chromium: held when the text input reset or enabled.
+    DiscardedByReset,
+    /// Chromium: held when the text input disabled.
+    DiscardedByDisable,
+    /// GTK: no field has the keyboard focus, so no input method context
+    /// is current.
     NoFocusedField,
+}
+
+/// How a press reached the application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PressKind {
+    /// A primary `wl_pointer.button` press.
+    Button,
+    /// A `wl_touch.down`.
+    Touch,
 }
 
 /// A `zwp_text_input_v3` client: one application with one text input on
@@ -94,6 +125,9 @@ pub(super) enum DropReason {
 pub(super) trait Client {
     /// The fields, in the order the model was given them.
     fn fields(&self) -> &[Field];
+
+    /// The field with the keyboard focus.
+    fn focused_field(&self) -> Option<usize>;
 
     /// What the client dropped, in order.
     fn drops(&self) -> &[Dropped];
@@ -108,11 +142,11 @@ pub(super) trait Client {
     /// A key the input method passed reached the keyboard focus.
     fn key(&mut self, now: Micros, key: Key) -> Vec<Outgoing>;
 
-    /// A primary button press or a touch-down at `at` on `surface`.
-    fn press(&mut self, now: Micros, surface: u32, at: Target) -> Vec<Outgoing>;
+    /// A press at `at` on `surface`.
+    fn press(&mut self, now: Micros, surface: u32, at: Target, kind: PressKind) -> Vec<Outgoing>;
 
-    /// The release that ends the last press; `dragged` if the pointer
-    /// moved past the drag threshold in between.
+    /// The release or lift that ends the last press; `dragged` if it moved
+    /// past the drag threshold in between.
     fn release(&mut self, now: Micros, dragged: bool) -> Vec<Outgoing>;
 }
 
@@ -129,6 +163,9 @@ struct Protocol {
     text_input: u32,
     /// The field whose surface the text input entered.
     entered: Option<usize>,
+    /// The surrounding texts the client sent since it last enabled, as
+    /// text and cursor.
+    sent: Vec<(String, usize)>,
 }
 
 impl Protocol {
@@ -136,6 +173,7 @@ impl Protocol {
         Self {
             text_input,
             entered: None,
+            sent: Vec::new(),
         }
     }
 
@@ -144,7 +182,7 @@ impl Protocol {
     ///
     /// # Panics
     ///
-    /// On a violation of the protocol.
+    /// On output no correct proxy sends (see the module's documentation).
     fn check(&mut self, fields: &[Field], sender: u32, event: &Event, commits: u32) {
         assert_eq!(
             sender, self.text_input,
@@ -171,14 +209,48 @@ impl Protocol {
                     self.entered.is_some(),
                     "protocol violation: {event:?} outside enter and leave"
                 );
-                if let Event::Done { serial } = *event {
-                    assert!(
-                        serial <= commits,
+                match *event {
+                    // The count wraps, as Chromium's and GTK's do.
+                    Event::Done { serial } => assert!(
+                        commits.wrapping_sub(serial) <= u32::MAX / 2,
                         "protocol violation: done({serial}) after {commits} commits"
-                    );
+                    ),
+                    Event::DeleteSurroundingText {
+                        before_length,
+                        after_length,
+                    } => self.check_delete(before_length, after_length),
+                    _ => {}
                 }
             }
         }
+    }
+
+    /// `set_surrounding_text(text, cursor, cursor)`, recorded as sent.
+    fn surrounding_text(&mut self, text: &str, cursor: usize) -> Outgoing {
+        self.sent.push((text.to_owned(), cursor));
+        let at = i32::try_from(cursor).expect("a short text");
+        req::set_surrounding_text(self.text_input, text, at, at)
+            .expect("the surrounding text fits a message")
+    }
+
+    /// Checks that `delete_surrounding_text(before, after)` fits a
+    /// surrounding text the client sent since it last enabled. The proxy
+    /// measures each delete against the text the client last committed,
+    /// and a delete may cross a newer one in flight.
+    fn check_delete(&self, before: u32, after: u32) {
+        let fits = self.sent.iter().any(|(text, cursor)| {
+            let sent = TextModel {
+                text: text.clone(),
+                cursor: *cursor,
+                preedit: String::new(),
+            };
+            sent.delete_range(before as usize, after as usize).is_some()
+        });
+        assert!(
+            fits,
+            "protocol violation: delete ({before}, {after}) fits no text sent: {:?}",
+            self.sent
+        );
     }
 }
 
@@ -194,32 +266,57 @@ fn field_on(fields: &[Field], surface: u32) -> usize {
         .unwrap_or_else(|| panic!("protocol violation: surface {surface} has no field"))
 }
 
-/// The text of a v3 string event; empty if null.
+/// The text of a v3 string event; `None` if null.
 ///
 /// # Panics
 ///
 /// If it is not UTF-8, which the proxy never forwards.
-fn utf8(text: Option<IndexedString>) -> String {
-    match text {
-        None => String::new(),
-        Some(IndexedString::Utf8(text)) => text,
-        Some(IndexedString::NotUtf8(bytes)) => {
+fn utf8(text: Option<IndexedString>) -> Option<String> {
+    match text? {
+        IndexedString::Utf8(text) => Some(text),
+        IndexedString::NotUtf8(bytes) => {
             panic!("protocol violation: a string that is not UTF-8: {bytes:?}")
         }
     }
 }
 
-/// Checks that `delete_surrounding_text(before, after)` fits `model`.
-///
-/// # Panics
-///
-/// If it does not.
-fn check_delete(model: &TextModel, before: u32, after: u32) {
-    let fits = model.delete_range(before as usize, after as usize);
-    assert!(
-        fits.is_some(),
-        "protocol violation: delete ({before}, {after}) does not fit {model:?}"
-    );
+/// The characters in the bytes `before` the cursor and `after` it, each
+/// range clamped to `text` and shrunk to whole characters.
+fn chars_around(text: &str, cursor: usize, before: u32, after: u32) -> (usize, usize) {
+    let mut start = cursor.saturating_sub(before as usize);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = cursor.saturating_add(after as usize).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let count = |range: &str| range.chars().count();
+    (count(&text[start..cursor]), count(&text[cursor..end]))
+}
+
+/// Deletes `before` characters before the cursor and `after` after it,
+/// as many as there are, keeping the preedit.
+fn delete_chars(model: &mut TextModel, before: usize, after: usize) {
+    let bytes = |chars: &mut dyn Iterator<Item = char>, n| -> usize {
+        chars.take(n).map(char::len_utf8).sum()
+    };
+    let before = bytes(&mut model.text[..model.cursor].chars().rev(), before);
+    let after = bytes(&mut model.text[model.cursor..].chars(), after);
+    model.apply_txn(&Txn {
+        delete: (before, after),
+        preedit: model.preedit.clone(),
+        ..Txn::default()
+    });
+}
+
+/// Ends the composition `model` shows, keeping its text.
+fn confirm(model: &mut TextModel) {
+    let commit = std::mem::take(&mut model.preedit);
+    model.apply_txn(&Txn {
+        commit,
+        ..Txn::default()
+    });
 }
 
 /// Where a field draws its caret, as `x, y, width, height`: one 8-pixel
@@ -228,13 +325,6 @@ fn caret_rect(model: &TextModel) -> [i32; 4] {
     let cells = model.text[..model.cursor].chars().count() + model.preedit.chars().count();
     let x = i32::try_from(cells * 8).expect("a short text");
     [x, 0, 1, 16]
-}
-
-/// `set_surrounding_text` of `model`'s text, with no selection.
-fn surrounding_text(text_input: u32, model: &TextModel) -> Outgoing {
-    let cursor = i32::try_from(model.cursor).expect("a short text");
-    req::set_surrounding_text(text_input, &model.text, cursor, cursor)
-        .expect("the surrounding text fits a message")
 }
 
 /// `set_cursor_rectangle` of `rect`.
@@ -249,8 +339,8 @@ fn content_type(text_input: u32) -> Outgoing {
 
 #[cfg(test)]
 mod script {
-    //! What the models' tests share: the objects of a scripted case and
-    //! a decoder for what a model sends.
+    //! What the models' tests share: the objects of a scripted case, the
+    //! events they send and the requests they expect.
 
     use super::*;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::Request;
@@ -261,13 +351,31 @@ mod script {
     /// The surfaces of field 0 and field 1.
     pub const SURFACES: [u32; 2] = [20, 21];
 
-    /// A field on surface `SURFACES[index]` holding `text`, the cursor at
-    /// its end.
-    pub fn field(index: usize, text: &str) -> Field {
-        Field {
-            surface: SURFACES[index],
-            model: TextModel::new(text),
-        }
+    /// Fields holding `texts`, field `i` on `SURFACES[i]`, each cursor at
+    /// the end.
+    pub fn fields(texts: &[&str]) -> Vec<Field> {
+        texts
+            .iter()
+            .zip(SURFACES)
+            .map(|(text, surface)| Field {
+                surface,
+                model: TextModel::new(text),
+            })
+            .collect()
+    }
+
+    /// The requests `client` sends for each of `events` at `now`, each
+    /// checked to come from the text input.
+    pub fn send(
+        client: &mut impl Client,
+        now: Micros,
+        events: impl IntoIterator<Item = Event>,
+    ) -> Vec<Request> {
+        let out = events
+            .into_iter()
+            .flat_map(|event| client.event(now, TEXT_INPUT, event))
+            .collect::<Vec<_>>();
+        requests(out)
     }
 
     /// The requests in `out`, each checked to come from the text input.
@@ -279,6 +387,50 @@ mod script {
                 request
             })
             .collect()
+    }
+
+    /// `enter` of field `index`'s surface.
+    pub fn enter(index: usize) -> Event {
+        Event::Enter {
+            surface: SURFACES[index],
+        }
+    }
+
+    /// `leave` of field `index`'s surface.
+    pub fn leave(index: usize) -> Event {
+        Event::Leave {
+            surface: SURFACES[index],
+        }
+    }
+
+    /// `done(serial)`.
+    pub fn done(serial: u32) -> Event {
+        Event::Done { serial }
+    }
+
+    /// `preedit_string` of `text`, the cursor at its end.
+    pub fn preedit(text: &str) -> Event {
+        let end = i32::try_from(text.len()).expect("a short preedit");
+        Event::PreeditString {
+            text: Some(text.into()),
+            cursor_begin: end,
+            cursor_end: end,
+        }
+    }
+
+    /// `commit_string` of `text`.
+    pub fn commit(text: &str) -> Event {
+        Event::CommitString {
+            text: Some(text.to_owned()),
+        }
+    }
+
+    /// `delete_surrounding_text` of `before` and `after` bytes.
+    pub fn delete(before: u32, after: u32) -> Event {
+        Event::DeleteSurroundingText {
+            before_length: before,
+            after_length: after,
+        }
     }
 
     /// `set_surrounding_text` of `text`, the cursor at byte `cursor` and
@@ -309,31 +461,6 @@ mod script {
         }
     }
 
-    /// A `preedit_string` event of `text`, the cursor at its end.
-    pub fn preedit(text: &str) -> Event {
-        let end = i32::try_from(text.len()).expect("a short preedit");
-        Event::PreeditString {
-            text: Some(text.into()),
-            cursor_begin: end,
-            cursor_end: end,
-        }
-    }
-
-    /// A `commit_string` event of `text`.
-    pub fn commit(text: &str) -> Event {
-        Event::CommitString {
-            text: Some(text.to_owned()),
-        }
-    }
-
-    /// A `delete_surrounding_text` event of `before` and `after` bytes.
-    pub fn delete(before: u32, after: u32) -> Event {
-        Event::DeleteSurroundingText {
-            before_length: before,
-            after_length: after,
-        }
-    }
-
     /// A model holding `text`, the cursor at `cursor` and `preedit` shown.
     pub fn model(text: &str, cursor: usize, preedit: &str) -> TextModel {
         TextModel {
@@ -341,5 +468,21 @@ mod script {
             cursor,
             preedit: preedit.to_owned(),
         }
+    }
+
+    /// A drop at `at`.
+    pub fn dropped(at: Micros, part: Part, reason: DropReason) -> Dropped {
+        Dropped { at, part, reason }
+    }
+
+    #[test]
+    fn a_delete_counts_whole_characters_and_clamps_to_the_text() {
+        // "a가b" with the cursor after 가: one byte before splits it.
+        assert_eq!(chars_around("a가b", 4, 1, 1), (0, 1));
+        assert_eq!(chars_around("a가b", 4, 3, 9), (1, 1));
+        assert_eq!(chars_around("a가b", 4, 9, 0), (2, 0));
+        let mut field = model("a가b", 4, "ㄴ");
+        delete_chars(&mut field, 1, 5);
+        assert_eq!(field, model("a", 1, "ㄴ"));
     }
 }

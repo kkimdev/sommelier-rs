@@ -40,8 +40,8 @@ limitations under the License.
 use std::mem;
 
 use super::{
-    caret_rect, check_delete, content_type, cursor_rectangle, field_on, surrounding_text, utf8,
-    Client, DropReason, Dropped, Field, Protocol,
+    caret_rect, content_type, cursor_rectangle, field_on, utf8, Client, DropReason, Dropped, Field,
+    Part, PressKind, Protocol,
 };
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::{self, req, Event};
 use crate::sim::clock::Micros;
@@ -129,7 +129,7 @@ impl Gtk {
         let model = &self.fields[field].model;
         let ti = self.text_input();
         let mut out = vec![
-            surrounding_text(ti, model),
+            self.protocol.surrounding_text(&model.text, model.cursor),
             req::set_text_change_cause(ti, cause),
             content_type(ti),
             cursor_rectangle(ti, caret_rect(model)),
@@ -182,7 +182,6 @@ impl Gtk {
         let (before, after) = events.delete;
         if before > 0 || after > 0 {
             let model = &mut self.fields[field].model;
-            check_delete(model, before, after);
             model.apply_txn(&Txn {
                 delete: (before as usize, after as usize),
                 preedit: model.preedit.clone(),
@@ -211,13 +210,15 @@ impl Gtk {
 
     /// Holds an event part for `done` with `hold`, or drops it if no
     /// context is current (`text_input_preedit` and the others).
-    fn hold(&mut self, now: Micros, hold: impl FnOnce(&mut Events)) -> Vec<Outgoing> {
+    fn hold(&mut self, now: Micros, part: Part, hold: impl FnOnce(&mut Events)) -> Vec<Outgoing> {
         if self.current.is_some() {
             hold(&mut self.events);
         } else {
+            let reason = DropReason::NoFocusedField;
             self.drops.push(Dropped {
                 at: now,
-                reason: DropReason::NoFocusedField,
+                part,
+                reason,
             });
         }
         Vec::new()
@@ -227,6 +228,10 @@ impl Gtk {
 impl Client for Gtk {
     fn fields(&self) -> &[Field] {
         &self.fields
+    }
+
+    fn focused_field(&self) -> Option<usize> {
+        self.current
     }
 
     fn drops(&self) -> &[Dropped] {
@@ -266,14 +271,26 @@ impl Client for Gtk {
             Event::Leave { .. } if self.current.is_some() => self.disable(),
             Event::Enter { .. } | Event::Leave { .. } => Vec::new(),
             Event::PreeditString { text, .. } => {
-                let text = text.map(|text| utf8(Some(text)));
-                self.hold(now, |events| events.preedit = text)
+                let text = utf8(text);
+                let part = Part::Preedit(text.clone().unwrap_or_default());
+                self.hold(now, part, |events| events.preedit = text)
             }
-            Event::CommitString { text } => self.hold(now, |events| events.commit = text),
+            Event::CommitString { text } => {
+                let part = Part::Commit(text.clone().unwrap_or_default());
+                self.hold(now, part, |events| events.commit = text)
+            }
             Event::DeleteSurroundingText {
                 before_length,
                 after_length,
-            } => self.hold(now, |events| events.delete = (before_length, after_length)),
+            } => {
+                let part = Part::Delete {
+                    before: before_length,
+                    after: after_length,
+                };
+                self.hold(now, part, |events| {
+                    events.delete = (before_length, after_length)
+                })
+            }
             Event::Done { serial } => self.done(serial),
         }
     }
@@ -304,7 +321,7 @@ impl Client for Gtk {
     /// reset is the state and a `commit` with cause `other`, from the
     /// current context only (`gtk_im_context_wayland_reset`); the preedit
     /// stays.
-    fn press(&mut self, _now: Micros, surface: u32, at: Target) -> Vec<Outgoing> {
+    fn press(&mut self, _now: Micros, surface: u32, at: Target, _kind: PressKind) -> Vec<Outgoing> {
         let field = field_on(&self.fields, surface);
         let model = &self.fields[field].model;
         let mut clicked = model.clone();
@@ -351,12 +368,7 @@ mod tests {
     /// GTK4 if `v4`, else GTK3, with fields holding `texts`, the keyboard
     /// focus on field 0 and the text input entered there.
     fn entered(v4: bool, texts: &[&str]) -> Gtk {
-        let fields = texts
-            .iter()
-            .enumerate()
-            .map(|(index, text)| field(index, text))
-            .collect();
-        let mut gtk = Gtk::new(v4, TEXT_INPUT, fields);
+        let mut gtk = Gtk::new(v4, TEXT_INPUT, fields(texts));
         assert_eq!(
             requests(gtk.keyboard_focus(Micros(0), Some(SURFACES[0]))),
             []
@@ -454,7 +466,7 @@ mod tests {
 
     #[test]
     fn c7_gtk3_enables_on_enter_focus_and_a_release_where_the_caret_stays() {
-        let mut gtk = Gtk::new(false, TEXT_INPUT, vec![field(0, "ab1"), field(1, "")]);
+        let mut gtk = Gtk::new(false, TEXT_INPUT, fields(&["ab1", ""]));
         let enter = Event::Enter {
             surface: SURFACES[0],
         };
@@ -463,23 +475,34 @@ mod tests {
         let focus = gtk.keyboard_focus(Micros(0), Some(SURFACES[0]));
         assert_eq!(requests(focus), enabled("ab1", 3, 3));
         // A click where the caret is enables again.
-        assert_eq!(requests(gtk.press(Micros(0), SURFACES[0], Target::End)), []);
+        assert_eq!(
+            requests(gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button)),
+            []
+        );
         let release = gtk.release(Micros(0), false);
         assert_eq!(requests(release), enabled("ab1", 3, 3));
         // So does one a character away, which moves the caret less than
         // its height. The focus left the entry needing a reset, which the
         // press sends before the cursor moves.
-        let press = gtk.press(Micros(0), SURFACES[0], Target::BeforeMarker(1));
+        let press = gtk.press(
+            Micros(0),
+            SURFACES[0],
+            Target::BeforeMarker(1),
+            PressKind::Button,
+        );
         let reset = state("ab1", 3, 3, zwp_text_input_v3::CHANGE_CAUSE_OTHER);
         assert_eq!(requests(press), reset);
         let release = gtk.release(Micros(0), false);
         assert_eq!(requests(release), enabled("ab1", 2, 2));
         // A drag does not enable.
-        assert_eq!(requests(gtk.press(Micros(0), SURFACES[0], Target::End)), []);
+        assert_eq!(
+            requests(gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button)),
+            []
+        );
         assert_eq!(requests(gtk.release(Micros(0), true)), []);
         // Nor does a click that makes the caret jump.
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start)),
+            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
             []
         );
         assert_eq!(requests(gtk.release(Micros(0), false)), []);
@@ -496,11 +519,11 @@ mod tests {
     #[test]
     fn c7_gtk4_enables_on_any_single_click_release() {
         let mut gtk = entered(true, &["ab"]);
-        let press = gtk.press(Micros(0), SURFACES[0], Target::Start);
+        let press = gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button);
         let reset = state("ab", 2, 2, zwp_text_input_v3::CHANGE_CAUSE_OTHER);
         assert_eq!(requests(press), reset);
         assert_eq!(requests(gtk.release(Micros(0), false)), enabled("ab", 0, 0));
-        gtk.press(Micros(0), SURFACES[0], Target::End);
+        gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
         assert_eq!(requests(gtk.release(Micros(0), true)), []);
     }
 
@@ -512,7 +535,7 @@ mod tests {
         let mut gtk = entered(true, &["0"]);
         send(&mut gtk, [commit("가"), Event::Done { serial: 1 }]);
         send(&mut gtk, [preedit("ㄴ"), Event::Done { serial: 2 }]);
-        let press = gtk.press(Micros(0), SURFACES[0], Target::End);
+        let press = gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
         assert_eq!(requests(press), state("0가", 4, 3, other));
         assert_eq!(gtk.fields()[0].model, model("0가", 4, "ㄴ"));
 
@@ -521,7 +544,7 @@ mod tests {
         // commit then clears that.
         send(&mut gtk, [commit("가"), Event::Done { serial: 1 }]);
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start)),
+            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
             []
         );
         // A passed key sets it again, but a press that does not move the
@@ -529,13 +552,18 @@ mod tests {
         let key = gtk.key(Micros(0), Key::Char('a'));
         assert_eq!(requests(key), edited("a0가", 1, 1));
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::BeforeMarker(0))),
+            requests(gtk.press(
+                Micros(0),
+                SURFACES[0],
+                Target::BeforeMarker(0),
+                PressKind::Button
+            )),
             []
         );
-        let press = gtk.press(Micros(0), SURFACES[0], Target::End);
+        let press = gtk.press(Micros(0), SURFACES[0], Target::End, PressKind::Button);
         assert_eq!(requests(press), state("a0가", 1, 1, other));
         assert_eq!(
-            requests(gtk.press(Micros(0), SURFACES[0], Target::Start)),
+            requests(gtk.press(Micros(0), SURFACES[0], Target::Start, PressKind::Button)),
             []
         );
     }
@@ -544,8 +572,16 @@ mod tests {
     fn c9_a_delete_counts_from_the_cursor_and_ignores_the_preedit() {
         for v4 in [false, true] {
             let mut gtk = entered(v4, &["0ab1cd"]);
-            gtk.press(Micros(0), SURFACES[0], Target::BeforeMarker(1));
-            send(&mut gtk, [preedit("가"), Event::Done { serial: 0 }]);
+            gtk.press(
+                Micros(0),
+                SURFACES[0],
+                Target::BeforeMarker(1),
+                PressKind::Button,
+            );
+            // The answer reports the moved cursor, which the delete counts
+            // from.
+            let serial = gtk.commits;
+            send(&mut gtk, [preedit("가"), Event::Done { serial }]);
             let out = send(
                 &mut gtk,
                 [preedit("가"), delete(1, 1), Event::Done { serial: 0 }],
@@ -583,6 +619,7 @@ mod tests {
         assert_eq!(gtk.fields()[0].model, model("0", 1, ""));
         let dropped = Dropped {
             at,
+            part: Part::Commit("가".to_owned()),
             reason: DropReason::NoFocusedField,
         };
         assert_eq!(gtk.drops(), [dropped]);
