@@ -25,9 +25,9 @@ use crate::protocols::wayland::{wl_keyboard, wl_seat};
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
-    HostContentType, HostId, HostPreeditContext, HostTarget, InternalCallback, Link,
-    SeatFocusChange, TextInputState,
+    reconcile, ActivationStep, ConfirmPreeditPlan, Context, CursorRect, GuestKeyDelivery,
+    GuestKeyEvent, HostApplied, HostContentType, HostId, HostPreeditContext, HostTarget,
+    InternalCallback, Link, SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
@@ -1320,26 +1320,38 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             plan.preedit_text,
             plan.done_serial
         );
-        let mut transaction = Vec::new();
-        if !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
+        if !commit_shown_preedit(ctx, guest_id, plan) {
             return drop_host_preedit(ctx, guest_id);
         }
-
-        if !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text) {
-            return drop_host_preedit(ctx, guest_id);
-        }
-        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
-
-        let state = ctx
-            .text_inputs
-            .get_mut(&guest_id)
-            .expect("active text input disappeared while confirming preedit");
-        let guest_seat = plan.guest_seat;
-        state.finish_confirm_preedit(plan);
-        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        ctx.host_to_client_queue.extend(transaction);
         Action::Drop
     }
+}
+
+/// Commit the preedit text input `guest_id` shows, as one v3 transaction
+/// that clears the preedit, commits its text and ends with a `done`, and
+/// close the composition ([`TextInputState::finish_confirm_preedit`]).
+///
+/// # Returns
+///
+/// Whether the transaction was queued; if not, nothing changed.
+fn commit_shown_preedit(ctx: &mut Context, guest_id: u32, plan: ConfirmPreeditPlan) -> bool {
+    let mut transaction = Vec::new();
+    if !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
+        || !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text)
+    {
+        return false;
+    }
+    transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
+
+    let state = ctx
+        .text_inputs
+        .get_mut(&guest_id)
+        .expect("active text input disappeared while committing its preedit");
+    let guest_seat = plan.guest_seat;
+    state.finish_confirm_preedit(plan);
+    end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+    ctx.host_to_client_queue.extend(transaction);
+    true
 }
 
 pub struct TextInputManagerV3Handler;
