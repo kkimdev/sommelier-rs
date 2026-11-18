@@ -50,17 +50,14 @@ pub struct BufferState {
     pub height: i32,
     pub stride: u32,
     pub format: u32,
-    #[allow(dead_code)]
-    pub bo: Option<gbm::BufferObject<()>>,
-    #[allow(dead_code)]
     pub dmabuf_fd: Option<OwnedFd>,
-    pub bo_stride: u32,
+    pub dest_stride: u32,
     /// Destination offset of the second plane in the mapped output buffer.
     /// Zero means the format is single-plane; for NV12 this is the host
     /// allocator's returned plane-1 offset relative to plane 0.
     pub dmabuf_plane1_offset: usize,
     /// Destination stride of the second plane. Kept separate from
-    /// `bo_stride` because host dma-buf allocators may pad planes
+    /// `dest_stride` because host dma-buf allocators may pad planes
     /// independently.
     pub dmabuf_plane1_stride: usize,
     /// Whether the output descriptor requires VirtWL dma-buf begin/end

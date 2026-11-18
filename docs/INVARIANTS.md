@@ -481,6 +481,15 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `pool_backing_must_be_a_long_enough_regular_file`,
   `create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd`,
   `a_pool_resize_must_keep_or_grow_its_size_within_its_file`.
+- **Without VirtWL, guest SHM is a memfd.** With no VirtWL channel
+  (`--local-compositor`), each guest `wl_buffer` gets a memfd of its size,
+  which the host imports as a `wl_shm` pool, with or without
+  `--gpu-accel`; the guest's linux-dmabuf buffers are unaffected. The
+  guest's `wl_shm` then offers an optional format only once the host's
+  `wl_shm` lists it, not when only the host's linux-dmabuf does, or a
+  strict host fails the buffer with `wl_shm.invalid_format`.
+  Tests: `without_virtwl_a_buffer_is_backed_by_a_memfd_of_its_size`,
+  `without_virtwl_guest_shm_offers_only_the_host_wl_shm_formats`.
 - **Damage-only commits copy from a buffer the host holds.** A commit
   without a new `attach` still damages the surface's current buffer, which
   the host samples again, so its damaged pixels MUST be copied before the
@@ -493,7 +502,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   copied at its next attach. Exo releases a buffer only after it is
   detached, so with Exo every damage-only commit copies. A commit with
   nothing to copy (no damage, or damage outside the buffer) skips the copy
-  path entirely (no dma-buf sync or BO map), so a damage-free commit, such
+  path entirely (no dma-buf sync), so a damage-free commit, such
   as one acknowledging a configure, is never dropped by a host storage
   failure.
   Known limit: a release carries no serial. If a surface is destroyed while

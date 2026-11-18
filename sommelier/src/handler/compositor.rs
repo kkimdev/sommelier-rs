@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::{Allocator, DmabufFence};
+use crate::allocator::DmabufFence;
 use crate::handler::aura_objects;
 use crate::handler::shm::{copy_shm_damage, damage_reaches_buffer, ShmCopyError, ShmCopyLayout};
 use crate::handler::window_placement;
@@ -41,7 +41,7 @@ pub struct CompositorHandler;
 
 /// RAII guard for the VirtWL dma-buf CPU-write interval.
 ///
-/// A copy path can fail while mapping a BO or while validating a damage
+/// A copy can fail while reading the guest pool or while validating a damage
 /// rectangle. Keeping the matching END ioctl in `Drop` prevents a panic or a
 /// future early-return path from leaving the host dma-buf permanently locked.
 struct DmabufWriteSync<'a> {
@@ -301,14 +301,14 @@ fn copy_surface_buffer(
     };
     let buffer = resources.buffer;
     let damage = buffer.stale.to_copy_on(surface_id);
-    // Nothing to copy needs no dma-buf sync or BO map either. Skipping them
-    // also keeps a commit without damage, such as one that acknowledges a
-    // configure, from being dropped when the host storage misbehaves.
+    // Nothing to copy needs no dma-buf sync either. Skipping it also keeps
+    // a commit without damage, such as one that acknowledges a configure,
+    // from being dropped when the host storage misbehaves.
     if !damage_reaches_buffer(&damage, buffer) {
         buffer.stale.copied_on(surface_id);
         return Ok(());
     }
-    let result = copy_to_host_storage(buffer, resources.allocator, resources.channel, &damage);
+    let result = copy_to_host_storage(buffer, resources.channel, &damage);
     match &result {
         Ok(()) => {
             buffer.stale.copied_on(surface_id);
@@ -318,7 +318,7 @@ fn copy_surface_buffer(
                 "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
                  width={}, height={}, format={:#010x}, buffer.offset={}, \
                  dest_size={}",
-                buffer.bo_stride,
+                buffer.dest_stride,
                 buffer.stride,
                 buffer.width,
                 buffer.height,
@@ -339,7 +339,6 @@ fn copy_surface_buffer(
 /// VirtWL dma-buf CPU-write interval when the storage needs one.
 fn copy_to_host_storage(
     buffer: &mut BufferState,
-    allocator: Option<&Allocator>,
     channel: Option<&Arc<VirtWaylandChannel>>,
     damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {
@@ -358,42 +357,9 @@ fn copy_to_host_storage(
     };
     let result = if !buffer.dest_ptr.is_null() {
         copy_shm_damage(&buffer.pool_file, buffer.dest_ptr, layout, damage)
-    } else if let (Some(allocator), Some(bo)) = (allocator, buffer.bo.as_mut()) {
-        // `layout` holds the buffer's non-negative i32 dimensions, which fit
-        // in u32.
-        match bo.map_mut(
-            &allocator.device,
-            0,
-            0,
-            layout.width as u32,
-            layout.height as u32,
-            |mapped| {
-                let layout = ShmCopyLayout {
-                    dest_size: mapped.buffer().len(),
-                    dst_stride: mapped.stride() as usize,
-                    ..layout
-                };
-                copy_shm_damage(
-                    &buffer.pool_file,
-                    mapped.buffer_mut().as_mut_ptr(),
-                    layout,
-                    damage,
-                )
-            },
-        ) {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => {
-                log::warn!("GBM BO map failed: {}", error);
-                Err(ShmCopyError::Destination)
-            }
-            Err(_) => {
-                log::warn!("GBM BO belongs to a different allocator device");
-                Err(ShmCopyError::Destination)
-            }
-        }
     } else {
-        // No destination mapping is available. This can happen only for a
-        // malformed or unsupported allocation path.
+        // Both backings map their storage when the buffer is created, so
+        // only a test fixture without a mapping reaches this.
         Err(ShmCopyError::Destination)
     };
     let sync_ended = sync_guard.is_none_or(DmabufWriteSync::end);
@@ -704,8 +670,8 @@ impl WlSurfaceHandler for CompositorHandler {
 
         // A SHM-backed buffer is copied into host storage before the host
         // commit is queued. Forwarding the commit first would let the host
-        // compositor sample stale or uninitialised pixels if dma-buf sync,
-        // mmap, or GBM mapping fails. A failed copy stales the whole host
+        // compositor sample stale or uninitialised pixels if dma-buf sync
+        // or the copy fails. A failed copy stales the whole host
         // copy, so a later commit retries the complete image.
         if let Some(buffer_id) = copied_buffer_id {
             if let Err(error) = copy_surface_buffer(ctx, surface_id, buffer_id) {
