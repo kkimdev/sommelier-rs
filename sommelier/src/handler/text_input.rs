@@ -632,11 +632,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return Action::Drop;
         };
         let Some(plan) = state.prepare_host_preedit() else {
-            log::debug!(
-                "Ignoring stale preedit_string for inactive text input {}",
-                guest_id
-            );
-            return Action::Drop;
+            log::debug!("Ignoring stale preedit_string for text input {guest_id}");
+            return drop_host_preedit(ctx, guest_id);
         };
         // The preedit_cursor and preedit_styling before it are byte offsets
         // into it, which replacing an invalid sequence would move.
@@ -723,11 +720,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return Action::Drop;
         };
         let Some(plan) = state.prepare_host_commit() else {
-            log::debug!(
-                "Ignoring stale commit_string for inactive text input {}",
-                guest_id
-            );
-            return Action::Drop;
+            log::debug!("Ignoring stale commit_string for text input {guest_id}");
+            return drop_host_commit(ctx, guest_id);
         };
         if serial != plan.done_serial {
             log::debug!(
@@ -1914,7 +1908,35 @@ pub(crate) fn end_composition_on_press(ctx: &mut Context, surface: u32) -> bool 
     log::debug!("A pointer press ended the composition of text input {guest_id}");
     ctx.client_to_host_queue
         .push(zwp_text_input_v1::req::reset(host_v1_id));
+    let callback = queue_internal_sync(
+        ctx,
+        InternalCallback::TextInputResetFence {
+            text_input: guest_id,
+            host_text_input: host_v1_id,
+        },
+    );
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.fence_reset(callback);
+    }
     true
+}
+
+/// Complete the fence ([`InternalCallback::TextInputResetFence`]) of the
+/// `reset` a pointer press sent host text input `host_v1_id` of guest
+/// `guest_id`.
+pub(crate) fn complete_reset_fence(
+    ctx: &mut Context,
+    callback_id: HostId,
+    guest_id: u32,
+    host_v1_id: u32,
+) {
+    if let Some(state) = ctx
+        .text_inputs
+        .get_mut(&guest_id)
+        .filter(|state| state.host_v1_id == host_v1_id)
+    {
+        state.complete_reset_fence(callback_id);
+    }
 }
 
 /// Answer the guest's latest commit on text input `guest_id` with a
@@ -4049,10 +4071,15 @@ mod tests {
 
         let pressed = wl_pointer::BUTTON_STATE_PRESSED;
         f.s.host([Field::button(pointer, pressed)]).await;
-        assert_eq!(f.s.host_received(), [f.v1(V1::Reset {})]);
+        // The reset goes behind a fence: Exo's events sent before it
+        // handled the reset belong to the dropped composition.
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
+        f.drain(fence).await;
 
         // The composition ended: the release changes nothing, and the
         // input method's next commit replaces no preedit.
@@ -4064,6 +4091,78 @@ mod tests {
         );
         f.s.host([f.commit("나")]).await;
         let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// The events Exo sent before it handled the press's `reset` still
+    /// arrive, and its commits belong to the composition the press
+    /// committed: the input method's own commit of the syllable, as when
+    /// Space ends it just before the click, or of the syllable it became
+    /// after the preedit the press committed. The guest gets neither, so
+    /// no syllable reaches it twice. Commits after the reset's fence reach
+    /// the guest.
+    #[tokio::test]
+    async fn a_commit_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("각", "각")]).await;
+        let expected = [preedit("각"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("각"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // In flight: the input method's commit of the syllable, with its
+        // cursor, and of the syllable it became.
+        let cursor = v1::cursor_position(f.host, 3, 3);
+        f.s.host([cursor, f.commit("각"), f.commit("갂")]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        f.drain(fence).await;
+        f.s.host([f.commit("나")]).await;
+        let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A preedit Exo sent before it handled the press's `reset` belongs to
+    /// the composition the reset dropped: the guest never shows it, so a
+    /// second press commits nothing, and the guest does not end up with
+    /// `가간`. Preedits after the reset's fence reach the guest.
+    #[tokio::test]
+    async fn a_preedit_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // In flight: the syllable the next jamo made, with its cursor.
+        f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("간", "간")])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        f.s.host([Field::button(pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, pressed)]
+        );
+
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        // The dropped preedit's cursor went with it.
+        f.drain(fence).await;
+        f.s.host([f.preedit("나다", "나다")]).await;
+        let expected = [preedit("나다"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -4165,7 +4264,10 @@ mod tests {
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
         expected.push(Field::guest_button(pointer, pressed));
         assert_eq!(f.s.guest_received(), expected);
-        assert_eq!(f.s.host_received(), [f.v1(V1::Reset {})]);
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        f.drain(fence).await;
     }
 
     /// An input method that replaces text deletes, then commits, each a

@@ -1015,7 +1015,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `InputMethodAsh::CancelComposition`
   (`ui/base/ime/ash/input_method_ash.cc` 410-415). That resets the engine
   without confirming or clearing anything on the client. Revision Chromium
-  faf801e427d0. So the guest's commit is the only commit of that text.
+  faf801e427d0. So the `reset` itself commits nothing, and the guest's
+  commit is the only commit of that text that the reset causes.
 
   The commit is an input-method edit the guest has yet to report
   (`unreported_host_edit`), and it ends the Backspace repeat leased to
@@ -1026,13 +1027,41 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   pointer's end or the surface's end. A `leave` of another surface,
   which a host can deliver late, changes nothing, as for a keyboard. The
   dispatcher drops an `enter` or `leave` naming a surface the guest
-  destroyed (`ShadowTable::event_object`). Events Exo sent before it
-  handled the `reset` still arrive, as part of the active generation: a
-  key typed within that round trip can leave a preedit Exo no longer
-  composes, until its next event. Touch is not handled.
+  destroyed (`ShadowTable::event_object`). Touch is not handled.
+
+  Events Exo sent before it handled the `reset` still arrive, and they
+  belong to the composition the press committed. So the `reset` goes
+  behind a fence, a `wl_display.sync`
+  (`InternalCallback::TextInputResetFence`, kept in
+  `TextInputState::reset_fence`). Exo handles requests in order. So the
+  sync's `done` comes after every event Exo sent before it handled the
+  `reset`, and before any event of a request sent later, a later
+  `activate` included, so the fence needs no generation of its own.
+  Until the fence returns, the proxy drops the field's host preedits and
+  commits:
+  - A preedit would show text Exo no longer composes, which a second
+    press would commit again.
+  - A commit of the pressed text is the input method's own commit of
+    that composition, as when Space ended the syllable just before the
+    click.
+  - A commit of other text was made for that composition too: it changed
+    after the preedit the press committed, as from `가` to `각`, and was
+    then committed. Forwarding it would add the syllable a second time.
+
+  The proxy cannot tell those commits from a commit of new text typed
+  within the round trip, such as a `.`, so that text is lost, as is any
+  key the input method took within it. Losing a keystroke typed during
+  the click was preferred to inserting text twice. The fence cannot be a
+  drain barrier: `deactivate` makes Exo confirm the composition itself,
+  and until the next `activate` attaches the input method, keys would
+  reach the guest without it. Preedit regions, deletes and confirmations
+  in flight are not fenced.
+
   Tests: `a_press_on_the_composing_surface_commits_the_preedit`,
   `a_press_elsewhere_or_without_a_composition_changes_nothing`,
   `a_leave_of_another_surface_keeps_the_pointer_on_its_surface`,
+  `a_commit_in_flight_at_a_press_is_dropped`,
+  `a_preedit_in_flight_at_a_press_is_dropped`,
   `pointer_focus_ends_with_its_surface_or_pointer`.
 
 ## Process

@@ -41,6 +41,13 @@ pub(crate) enum InternalCallback {
         text_input: u32,
         host_text_input: u32,
     },
+    /// Host text-input-v1 object `host_text_input` of guest `text_input`
+    /// has delivered every event it sent before it handled the `reset` a
+    /// pointer press sent it (`TextInputState::reset_fence`).
+    TextInputResetFence {
+        text_input: u32,
+        host_text_input: u32,
+    },
     /// Exo has processed the `set_window_bounds` that placement sent to this
     /// host `zaura_toplevel`.
     WindowBoundsBarrier { zaura_toplevel: u32 },
