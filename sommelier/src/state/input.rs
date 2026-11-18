@@ -465,6 +465,14 @@ impl TextInputState {
         self.pending_preedit_selection = None;
     }
 
+    /// Drop the delete_surrounding_text and cursor_position recorded for a
+    /// host commit_string that does not reach the guest, so that the next
+    /// one does not apply them at a cursor that has moved.
+    pub(crate) fn discard_pending_commit_state(&mut self) {
+        self.pending_deletes.clear();
+        self.pending_cursor_position = None;
+    }
+
     pub fn record_cursor_position(&mut self, index: i32, anchor: i32) {
         self.pending_cursor_position = Some((index, anchor));
     }
