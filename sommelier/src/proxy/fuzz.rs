@@ -771,7 +771,7 @@ impl<'a> Guest<'a> {
             }
             Arg::Number { .. } => payload.write_u32(self.number()),
             Arg::Str { nullable } if *nullable && self.rng.one_in(4) => payload.write_u32(0),
-            Arg::Str { .. } => payload.write_string(&self.string()),
+            Arg::Str { .. } => payload.write_string_bytes(&self.string()),
             Arg::Array => {
                 let len = self.rng.below(33);
                 payload.write_array(&self.rng.bytes(len));
@@ -810,16 +810,28 @@ impl<'a> Guest<'a> {
         }
     }
 
-    fn string(&mut self) -> String {
-        match self.rng.below(4) {
-            0 => String::new(),
-            1 => self.rng.pick(self.globals).interface.clone(),
+    /// The bytes of a string, which carry no NUL and are not always
+    /// UTF-8.
+    fn string(&mut self) -> Vec<u8> {
+        match self.rng.below(5) {
+            0 => Vec::new(),
+            1 => self.rng.pick(self.globals).interface.clone().into_bytes(),
             // Rarely, about as long as a whole message can be, so that a
-            // request lands on either side of the limit.
-            2 if self.rng.one_in(8) => "x".repeat(MessageHeader::MAX_LEN - 24 + self.rng.below(24)),
-            2 => "x".repeat(self.rng.below(300)),
+            // request lands on either side of the limit. The proxy replaces
+            // each 0xff with the three bytes of U+FFFD, which can push the
+            // forward over it.
+            2 if self.rng.one_in(8) => {
+                let byte = if self.rng.one_in(2) { 0xff } else { b'x' };
+                vec![byte; MessageHeader::MAX_LEN - 24 + self.rng.below(24)]
+            }
+            2 => vec![b'x'; self.rng.below(300)],
+            // High bytes, mostly not UTF-8, as from a client that sends
+            // Latin-1.
+            3 => (0..self.rng.below(16))
+                .map(|_| 0x80 | self.rng.below(128) as u8)
+                .collect(),
             _ => (0..self.rng.below(16))
-                .map(|_| char::from(b'a' + self.rng.below(26) as u8))
+                .map(|_| b'a' + self.rng.below(26) as u8)
                 .collect(),
         }
     }

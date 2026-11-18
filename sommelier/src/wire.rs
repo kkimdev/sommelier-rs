@@ -495,8 +495,9 @@ impl MessageBuilder {
         self.write_string_bytes(val.as_bytes());
     }
 
-    /// A string argument of `bytes`, which carry no NUL.
-    fn write_string_bytes(&mut self, val: &[u8]) {
+    /// A string argument of `bytes`, which carry no NUL; for a string
+    /// that is not UTF-8, which the fuzzer sends.
+    pub(crate) fn write_string_bytes(&mut self, val: &[u8]) {
         let len = val.len() as u32 + 1; // +1 for null terminator
         self.write_u32(len);
 

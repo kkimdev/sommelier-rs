@@ -91,7 +91,9 @@ assert_eq!(
 
 `proxy::fuzz` feeds a whole proxy client random, protocol-shaped guest
 request streams built from the vendored XML, some of them damaged, over
-real sockets. Half the cases end like a client typing into text fields
+real sockets. Their strings are sometimes not UTF-8, and sometimes
+nearly as long as a message, so that replacing their invalid bytes can
+make a forward too long. Half the cases end like a client typing into text fields
 (`proxy::fuzz::typing`): it moves the focus between its surfaces, waits
 for each move with a roundtrip, and enables, edits and disables the
 field; now and then it releases its seat while the field is enabled,
