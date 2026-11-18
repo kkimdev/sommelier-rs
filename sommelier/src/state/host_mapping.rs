@@ -134,13 +134,25 @@ impl HostMapping {
         Ok(())
     }
 
-    /// A copy of the mapped bytes.
+    /// A copy of the mapped bytes, which the kernel reads from the mapping
+    /// into a memfd, as it writes the mapping in `pread_into`.
     #[cfg(test)]
     pub fn to_vec(&self) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let copy = crate::test_support::shm_pool_file(&[]);
+        // SAFETY: the mapping, which lives as long as `self`, is readable
+        // for `len` bytes. Only the kernel reads through the pointer.
+        let written =
+            unsafe { libc::pwrite(copy.as_raw_fd(), self.ptr.as_ptr().cast(), self.len, 0) };
+        assert_eq!(
+            usize::try_from(written).ok(),
+            Some(self.len),
+            "copy the mapping into a memfd: {}",
+            io::Error::last_os_error()
+        );
         let mut bytes = vec![0; self.len];
-        // SAFETY: the mapping is readable for `len` bytes, and `bytes` is a
-        // distinct allocation of that length.
-        unsafe { ptr::copy_nonoverlapping(self.ptr.as_ptr(), bytes.as_mut_ptr(), self.len) };
+        copy.read_exact_at(&mut bytes, 0)
+            .expect("read the memfd back");
         bytes
     }
 }
