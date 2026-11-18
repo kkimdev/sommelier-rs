@@ -94,7 +94,9 @@ impl HostMapping {
     ///
     /// A range that does not lie inside the mapping fails with `EFAULT`,
     /// as a fault in the mapping does, and writes nothing. A file that ends
-    /// before the range is full fails with `UnexpectedEof`.
+    /// before the range is full fails with `UnexpectedEof`, and an offset
+    /// past `off_t` with `EOVERFLOW`. A fault, the end of the file or an
+    /// I/O error part way through leaves a prefix of the range written.
     pub fn pread_into(&self, dst: Range<usize>, file: &File, mut offset: u64) -> io::Result<()> {
         if dst.start > dst.end || dst.end > self.len {
             return Err(io::Error::from_raw_os_error(libc::EFAULT));
@@ -175,7 +177,14 @@ fn file_offset(offset: u64) -> io::Result<libc::off_t> {
 mod tests {
     use super::HostMapping;
     use crate::test_support::shm_pool_file;
+    use std::ops::Range;
     use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+
+    // The EINTR retry in `pread_into` cannot practically be unit-tested: it
+    // needs a signal to land during a `pread` of a memfd. A short read
+    // before the end of a regular file happens only at a fault, which
+    // `a_fault_part_way_leaves_the_prefix_written` provokes.
 
     /// A mapping of `len` zero bytes.
     fn zeroed(len: usize) -> HostMapping {
@@ -205,6 +214,74 @@ mod tests {
         mapping.pread_into(4..4, &source, 0).unwrap();
     }
 
+    /// A reversed range, and an empty one past the end, are refused like
+    /// any range outside the mapping.
+    #[test]
+    fn pread_into_refuses_reversed_and_empty_ranges_outside_the_mapping() {
+        let mapping = zeroed(4);
+        let source = shm_pool_file(&[0x11; 8]);
+        for range in [Range { start: 3, end: 2 }, 5..5] {
+            let error = mapping.pread_into(range.clone(), &source, 0).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EFAULT), "{range:?}");
+        }
+        assert_eq!(mapping.to_vec(), [0; 4], "nothing is written");
+    }
+
+    #[test]
+    fn pread_into_refuses_an_offset_past_off_t() {
+        let error = zeroed(4)
+            .pread_into(0..4, &shm_pool_file(&[0x11; 4]), u64::MAX)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EOVERFLOW));
+    }
+
+    /// The kernel writes the file the mapping shares, not a private copy:
+    /// the host reads the host copy through its own descriptor.
+    #[test]
+    fn pread_into_writes_the_shared_file() {
+        let file = shm_pool_file(&[0; 4]);
+        let mapping = HostMapping::map_shared(file.as_fd(), 4, 0).unwrap();
+        mapping
+            .pread_into(0..4, &shm_pool_file(&[1, 2, 3, 4]), 0)
+            .unwrap();
+        let mut bytes = [0; 4];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+
+    fn page_size() -> usize {
+        // SAFETY: sysconf has no preconditions.
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap()
+    }
+
+    /// A mapping whose second page lies past the end of its file faults
+    /// there. The kernel reports the fault as `EFAULT` instead of raising
+    /// SIGBUS, so the process survives.
+    #[test]
+    fn a_fault_past_the_end_of_the_file_is_an_efault() {
+        let page = page_size();
+        let file = shm_pool_file(&vec![0; page]);
+        let mapping = HostMapping::map_shared(file.as_fd(), 2 * page, 0).unwrap();
+        let error = mapping
+            .pread_into(page..page + 4, &shm_pool_file(&[0x11; 4]), 0)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EFAULT));
+    }
+
+    #[test]
+    fn a_fault_part_way_leaves_the_prefix_written() {
+        let page = page_size();
+        let file = shm_pool_file(&vec![0; page]);
+        let mapping = HostMapping::map_shared(file.as_fd(), 2 * page, 0).unwrap();
+        let error = mapping
+            .pread_into(page - 4..page + 4, &shm_pool_file(&[0x11; 8]), 0)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EFAULT));
+        let mut prefix = [0; 4];
+        file.read_exact_at(&mut prefix, (page - 4) as u64).unwrap();
+        assert_eq!(prefix, [0x11; 4], "the bytes before the fault are written");
+    }
+
     #[test]
     fn pread_into_past_the_end_of_the_file_is_an_eof() {
         let mapping = zeroed(4);
@@ -219,5 +296,11 @@ mod tests {
         let file = shm_pool_file(&[0; 4]);
         let error = HostMapping::map_shared(file.as_fd(), 0, 0).err().unwrap();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn an_unaligned_offset_is_refused() {
+        let file = shm_pool_file(&[0; 8]);
+        assert!(HostMapping::map_shared(file.as_fd(), 4, 1).is_err());
     }
 }
