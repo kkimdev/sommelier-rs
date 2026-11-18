@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 use super::guest::{GuestTxn, Preedit, TooLong};
-use super::host::{self, HostSteps};
+use super::host;
 use super::serial::{CommitCount, Serial};
 use super::{BarrierToken, Env, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
 use crate::state::{HostContentType, V3Committed, V3Pending};
@@ -346,12 +346,38 @@ impl TextInput {
         !std::mem::replace(&mut self.warned.delete_range, true)
     }
 
-    /// I1a, I1b and I2 of design 3.1.
+    /// The barriers this text input waits for: its drain and its fence.
+    pub(super) fn barriers(&self) -> impl Iterator<Item = BarrierToken> {
+        let drain = match self.link {
+            LinkState::Draining { barrier } => Some(barrier),
+            LinkState::Detached | LinkState::Attached { .. } => None,
+        };
+        drain.into_iter().chain(self.fence)
+    }
+
+    /// I1a, I1b and I2 of design 3.1, and that an unfocused text input has
+    /// nothing pending.
     pub(super) fn assert_invariants(&self, ti: TiId, env: &impl Env) {
         let attached = self.is_attached();
         assert!(!attached || self.is_enabled(), "I1a: {ti:?} {self:?}");
-        let steps = host::reconcile(&host::target(self, env), self.link);
-        assert_eq!(steps, HostSteps::default(), "I1b: {ti:?} {self:?}");
+        // I1b: the link matches the target, but while it drains, while an
+        // activation waits for a live seat (R2), or while it is attached
+        // with a dead seat.
+        let target = host::target(self, env);
+        match (target.surface, self.link) {
+            (_, LinkState::Draining { .. }) | (None, LinkState::Detached) => {}
+            (Some(_), LinkState::Detached) => {
+                assert_eq!(target.seat, None, "I1b: {ti:?} can activate: {self:?}")
+            }
+            (Some(_), LinkState::Attached { content_type }) => assert_eq!(
+                content_type,
+                Some(target.content_type),
+                "I1b: {ti:?} lacks its content type"
+            ),
+            (None, LinkState::Attached { .. }) => {
+                panic!("I1b: {ti:?} is attached with no target: {self:?}")
+            }
+        }
         let Composition { shown, assembly } = &self.composition;
         if shown.is_some() || *assembly != Assembly::default() {
             assert!(attached, "I2: {ti:?} composes while not attached");
@@ -361,6 +387,9 @@ impl TextInput {
                 self.fence.is_none(),
                 "I2: {ti:?} shows a preedit behind a fence"
             );
+        }
+        if matches!(self.field, Field::Unfocused) {
+            assert_eq!(self.pending, V3Pending::default(), "{ti:?} is unfocused");
         }
     }
 }

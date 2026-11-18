@@ -1310,13 +1310,26 @@ fn row_F6_a_host_deleted_text_input_sends_nothing_to_its_v1_object() {
 fn row_R1_a_dead_seat_abandons_the_link_and_keeps_the_fence() {
     let mut ime = Ime::enabled();
     ime.compose("가");
-    // The field's surface goes while its seat is dead: the composition
-    // ends with the link, and the commit's answer repeats none.
+    // The focus moves while the seat is dead: no deactivate can go, and the
+    // link ends locally with its composition (I2).
     ime.world.seats.clear();
-    ime.world.surfaces.remove(&SURFACE);
-    let out = ime.step(Input::SeatBound(SeatId(6)));
-    assert!(out.host.is_empty() && out.guest.is_empty());
-    assert_eq!(ime.step(Input::Commit(TI)).guest, [done(2)]);
+    let out = ime.step(Input::FocusChanged {
+        seat: SEAT,
+        surface: Some(OTHER),
+    });
+    assert_eq!(out.host, []);
+    // The link is detached, so the field activates again once the seat is
+    // back.
+    ime.world.seats.insert(SEAT, HOST_SEAT);
+    let mut host = activation(TI, 2);
+    host[0] = req(
+        v1(TI),
+        V1::Activate {
+            seat: HOST_SEAT,
+            surface: HOST_OTHER,
+        },
+    );
+    assert_eq!(ime.enable(TI).host, host);
 
     let mut ime = Ime::enabled();
     ime.compose("가");

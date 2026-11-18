@@ -231,6 +231,12 @@ pub enum KeyEffect {
 
 /// Read-only facts the core needs and does not own. The adapter answers
 /// them from the object table and the keyboard focus; tests use maps.
+///
+/// Precondition: every change of an answer that can deactivate a target,
+/// a surface's end or a focus change, reaches the core as an [`Input`] in
+/// the same message, so that the reconcile ending that step sees it. A
+/// seat's end is the one exception: the core notices it at its next step
+/// (R1), and an attached link with a dead seat is legal until then (I1b).
 pub trait Env {
     /// The host ID of a live guest surface.
     fn host_surface(&self, surface: SurfaceId) -> Option<u32>;
@@ -262,16 +268,27 @@ impl ImeCore {
     }
 
     /// Check the invariants of design 3.1 (I1a to I4) that hold between
-    /// steps. I5 is the adapter's.
+    /// steps, and that every pending barrier is one the core numbered,
+    /// once. I5 is the adapter's.
     pub fn assert_invariants(&self, env: &impl Env) {
         let mut enabled = Vec::new();
+        let mut barriers = Vec::new();
         for (&ti, t) in &self.inputs {
             t.assert_invariants(ti, env);
             if t.is_enabled() {
                 enabled.push(ti);
             }
+            barriers.extend(t.barriers());
         }
         assert!(enabled.len() <= 1, "I3: {enabled:?} are all enabled");
+        let count = barriers.len();
+        barriers.sort();
+        barriers.dedup();
+        assert_eq!(barriers.len(), count, "a barrier is pending twice");
+        assert!(
+            barriers.iter().all(|b| b.0 < self.next_barrier),
+            "{barriers:?} holds a barrier the core never numbered"
+        );
         let extensions: BTreeMap<u32, TiId> = self
             .inputs
             .iter()
