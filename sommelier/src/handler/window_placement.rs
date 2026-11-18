@@ -86,14 +86,15 @@ const PLACEMENT_SHELL_SINCE: u32 = EVT_INSETS_SINCE;
 /// it all.
 static OLD_SHELL_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Warn, once per process, that placement is disabled because the host
+/// Warn, once per `warned` (the process's [`OLD_SHELL_WARNED`], or a
+/// test's own flag), that placement is disabled because the host
 /// `zaura_shell` is older than [`PLACEMENT_SHELL_SINCE`].
 ///
 /// # Returns
 ///
 /// Whether this call logged the warning.
-fn warn_if_shell_cannot_place(shell_version: u32) -> bool {
-    if shell_version >= PLACEMENT_SHELL_SINCE || OLD_SHELL_WARNED.swap(true, Ordering::Relaxed) {
+fn warn_if_shell_cannot_place(warned: &AtomicBool, shell_version: u32) -> bool {
+    if shell_version >= PLACEMENT_SHELL_SINCE || warned.swap(true, Ordering::Relaxed) {
         return false;
     }
     log::warn!(
@@ -123,7 +124,7 @@ pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
         WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
         WindowPlacementState::Arc(_) => arc::attach_recorded_toplevels(ctx),
     }
-    warn_if_shell_cannot_place(shell_version);
+    warn_if_shell_cannot_place(&OLD_SHELL_WARNED, shell_version);
 }
 
 // ── The remote shell ──────────────────────────────────────────────────────
@@ -1108,10 +1109,18 @@ mod tests {
 
     #[test]
     fn an_old_shell_is_reported_once_per_process() {
-        OLD_SHELL_WARNED.store(false, Ordering::Relaxed);
-        assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE));
-        assert!(warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE - 1));
-        assert!(!warn_if_shell_cannot_place(PLACEMENT_SHELL_SINCE - 1));
+        // The test's own flag: the process's belongs to the sessions that
+        // other tests run in parallel.
+        let warned = AtomicBool::new(false);
+        assert!(!warn_if_shell_cannot_place(&warned, PLACEMENT_SHELL_SINCE));
+        assert!(warn_if_shell_cannot_place(
+            &warned,
+            PLACEMENT_SHELL_SINCE - 1
+        ));
+        assert!(!warn_if_shell_cannot_place(
+            &warned,
+            PLACEMENT_SHELL_SINCE - 1
+        ));
     }
 
     /// With placement off, the default, the proxy sends either peer what it
