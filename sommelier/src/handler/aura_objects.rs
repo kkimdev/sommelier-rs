@@ -65,19 +65,30 @@ impl AuraChild {
     };
 }
 
-/// The version [`create`] recorded for a live Aura child: its shell's.
-/// A missing one is a bookkeeping bug; release builds then use version 0
-/// rather than crash the proxy, so the child is sent no request that needs
-/// a version. The current shell's version would not do: it may be newer
-/// than the shell generation that created the child, and a request the
-/// child lacks is a protocol error that ends the session.
-pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
-    let version = ctx.shadow_table.host_object_version(aura_object_host_id);
+/// The version [`create`] recorded for `child_host_id` while it is a live
+/// Aura child of kind `child`: its shell's.
+///
+/// `None` when it is not one: the ID is retired or untracked, or was
+/// recycled for an object of another interface, whose requests have other
+/// opcodes. Association owners forget a child before it ends, so that is a
+/// bookkeeping bug, which debug builds assert against.
+fn live_child_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> Option<u32> {
+    let version = (ctx.shadow_table.get_host_interface(child_host_id) == Some(child.interface))
+        .then(|| ctx.shadow_table.host_object_version(child_host_id))
+        .flatten();
     debug_assert!(
         version.is_some(),
-        "Aura child {aura_object_host_id} has no recorded version"
+        "host ID {child_host_id} is not a live {}",
+        child.interface
     );
-    version.unwrap_or(0)
+    version
+}
+
+/// The version of `child_host_id` as a live Aura child of kind `child`
+/// (see [`live_child_version`]). An ID that is not one gets version 0,
+/// which sends it no request that needs a version.
+pub(crate) fn aura_object_version(ctx: &Context, child: AuraChild, child_host_id: u32) -> u32 {
+    live_child_version(ctx, child, child_host_id).unwrap_or(0)
 }
 
 /// Create a host Aura child that extends `parent_host_id`.
@@ -108,8 +119,14 @@ pub(crate) fn create(ctx: &mut Context, child: AuraChild, parent_host_id: u32) -
 ///
 /// Callers release a child before they queue the destructor of the object
 /// it extends, so the host never holds an Aura child whose parent is gone.
+///
+/// An ID that is not a live child of kind `child` (see
+/// [`live_child_version`]) is left alone: a retired or untracked one has
+/// nothing left to release, and a recycled one belongs to another object.
 pub(crate) fn release(ctx: &mut Context, child: AuraChild, child_host_id: u32) {
-    let version = aura_object_version(ctx, child_host_id);
+    let Some(version) = live_child_version(ctx, child, child_host_id) else {
+        return;
+    };
     release_host_only(
         ctx,
         child_host_id,
@@ -160,14 +177,18 @@ fn release_host_only(
 /// # Returns
 ///
 /// `None` when the wl_surface has no host object or no `zaura_shell` is
-/// bound.
+/// bound, and, in release builds, when the Aura surface recorded for it is
+/// no longer live.
 pub(crate) fn ensure_host_zaura_surface(
     ctx: &mut Context,
     wl_surface_guest_id: u32,
 ) -> Option<u32> {
     let wl_surface_host_id = ctx.shadow_table.get_host_id(wl_surface_guest_id)?;
     if let Some(zaura_surface_host_id) = ctx.aura_surfaces.get(wl_surface_host_id) {
-        return Some(zaura_surface_host_id);
+        // A recorded surface that is no longer live is a bookkeeping bug
+        // (see `live_child_version`), and nothing may be sent to it.
+        return live_child_version(ctx, AuraChild::SURFACE, zaura_surface_host_id)
+            .map(|_| zaura_surface_host_id);
     }
     let zaura_surface_host_id = create(ctx, AuraChild::SURFACE, wl_surface_host_id)?;
     ctx.aura_surfaces
@@ -256,7 +277,7 @@ mod tests {
                 ctx.shadow_table.get_host_interface(id),
                 Some(child.interface)
             );
-            assert_eq!(aura_object_version(&ctx, id), version);
+            assert_eq!(aura_object_version(&ctx, child, id), version);
         }
     }
 
