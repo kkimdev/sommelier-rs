@@ -17,7 +17,8 @@ limitations under the License.
 //! The deterministic simulation test of the IME bridge.
 //!
 //! It types into simulated clients through the real proxy and checks that
-//! they end with the text the user intended. So far it has the Hangul
-//! composer that both the simulated input method and that text use.
+//! they end with the text the user intended. So far it has the pieces that
+//! define that text: a Hangul composer and the reference editor.
 
+mod editor;
 mod hangul;
