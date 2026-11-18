@@ -93,7 +93,7 @@ fn clear_window_state(ctx: &mut Context, host_xdg_toplevel_id: u32, zaura_surfac
         xdg_toplevel::req::unset_fullscreen(host_xdg_toplevel_id),
         xdg_toplevel::req::unset_maximized(host_xdg_toplevel_id),
     ]);
-    if aura_object_version(ctx, zaura_surface_id) >= REQ_UNSET_SNAP_SINCE {
+    if aura_object_version(ctx, AuraChild::SURFACE, zaura_surface_id) >= REQ_UNSET_SNAP_SINCE {
         ctx.client_to_host_queue
             .push(zaura_surface::req::unset_snap(zaura_surface_id));
     }

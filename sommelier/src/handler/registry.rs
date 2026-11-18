@@ -67,9 +67,21 @@ const TEXT_INPUT_MANAGER_VERSION: u32 =
 /// same reason.
 const TEXT_INPUT_EXTENSION_VERSION: u32 =
     crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1::VERSION;
+/// The `wl_compositor` ceiling, at which a host of
+/// [`WL_COMPOSITOR_HOST_VERSION`] or newer is offered, as ChromiumOS
+/// Sommelier offers it with `--support-damage-buffer`: v4 adds only
+/// `wl_surface.damage_buffer`, which the proxy records and sends the host
+/// as `wl_surface.damage` at commit. The proxy does not implement the v5
+/// and v6 surface semantics; v5's `wl_surface.offset`, for one, is
+/// forwarded, and would have to stay local too.
 const WL_COMPOSITOR_VERSION: u32 = 4;
 /// v3 provides buffer scale/transform; damage_buffer (v4) is emulated locally.
 const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
+/// The `xdg_wm_base` ceiling, ChromiumOS Sommelier's
+/// (`SL_XDG_SHELL_MAX_VERSION` in `sommelier-xdg-shell.h`). The vendored
+/// XML is newer: v4 to v7 add configure bounds, window manager
+/// capabilities, and the suspended and constrained states, which the proxy
+/// has not been checked against.
 const XDG_SHELL_VERSION: u32 = 3;
 /// The `wl_shm` version the proxy offers the guest and binds on the host.
 /// The proxy implements the guest's `wl_shm` itself, as a v1 compatibility
