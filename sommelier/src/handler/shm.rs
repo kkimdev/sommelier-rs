@@ -2036,7 +2036,7 @@ mod tests {
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
-    use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm, wl_shm_pool};
+    use crate::protocols::wayland::{wl_buffer, wl_display, wl_registry, wl_shm, wl_shm_pool};
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion};
@@ -2671,10 +2671,32 @@ mod tests {
     }
 
     /// Without VirtWL the host is a local compositor (`--local-compositor`),
-    /// which maps a memfd as the buffer's wl_shm pool.
+    /// which maps a memfd as the buffer's wl_shm pool, with `--gpu-accel`
+    /// and a host linux-dmabuf too. This pins the rule: a test context has
+    /// no render node, so it cannot reach a backing that needs one.
     #[tokio::test]
     async fn without_virtwl_a_buffer_is_backed_by_a_memfd_of_its_size() {
-        let (mut s, shm) = session_with_shm().await;
+        for gpu_accel in [false, true] {
+            without_virtwl_a_buffer_is_backed_by_a_memfd(gpu_accel).await;
+        }
+    }
+
+    async fn without_virtwl_a_buffer_is_backed_by_a_memfd(gpu_accel: bool) {
+        let mut s = Session::with_context(Context::new_for_test(gpu_accel, false, vec![]));
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        // With `--gpu-accel` the proxy binds the host linux-dmabuf for
+        // itself. Only that bind matters here, not what else either peer
+        // gets for the global.
+        s.advertise("zwp_linux_dmabuf_v1", 3).await;
+        let bound_dmabuf = s.host_received().iter().any(|(_, request)| {
+            matches!(
+                request,
+                AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })
+                    if id.0 == "zwp_linux_dmabuf_v1"
+            )
+        });
+        assert_eq!(bound_dmabuf, gpu_accel);
+        s.guest_received();
         let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
         let buffer = s.new_id();
         let (width, height, stride) = (8, 4, 32);
