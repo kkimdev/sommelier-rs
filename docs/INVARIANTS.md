@@ -916,10 +916,21 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   No transaction has both a delete and a commit yet, since Exo's deletes
   stand alone (next rule). One order also gives each transaction one wire
   form, which a recorded trace can compare byte for byte.
+
+  A transaction carries no event that changes nothing, since some
+  clients do not read one as nothing and would delete the user's
+  selected text:
+  - no `delete_surrounding_text(0, 0)`, such as an empty preedit region
+    would make. Chromium applies it (`zwp_text_input_v3.cc` 440 tests
+    that a delete arrived, not its lengths), and while nothing is
+    composed `InputMethodAuraLinux::OnDeleteSurroundingText` deletes the
+    selection (`ui/base/ime/linux/input_method_auralinux.cc` 518).
+
   Tests: `host_ime_events_become_v3_transactions`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `on_set_preedit_region_translates_correctly`,
-  `exo_deletes_become_v3_deletes_around_the_cursor`.
+  `exo_deletes_become_v3_deletes_around_the_cursor`,
+  `an_empty_preedit_region_sends_no_delete`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`
   a byte offset from the start of the surrounding text, not from the

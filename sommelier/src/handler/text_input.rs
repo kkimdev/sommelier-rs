@@ -1168,14 +1168,17 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
-        // The new preedit goes after the delete
-        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        // The delete goes first and the new preedit last; an empty region
+        // deletes nothing (docs/INVARIANTS.md, "A v3 transaction's events
+        // go in one order").
         let mut transaction = Vec::new();
-        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-            guest_id,
-            before_length,
-            after_length,
-        ));
+        if (before_length, after_length) != (0, 0) {
+            transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+                guest_id,
+                before_length,
+                after_length,
+            ));
+        }
         if !push_preedit_string_to(
             &mut transaction,
             guest_id,
@@ -5229,6 +5232,30 @@ mod tests {
 
         f.s.host([f.delete_range(2, 1)]).await;
         assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// An empty preedit region deletes nothing, so it sends no
+    /// `delete_surrounding_text`, only the preedit it leaves. Chromium
+    /// applies an empty delete too (`ZwpTextInputV3Impl::OnDone`,
+    /// `ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 440, revision
+    /// ffb4f13519), and while nothing is composed it deletes the selection
+    /// (`InputMethodAuraLinux::OnDeleteSurroundingText`,
+    /// `ui/base/ime/linux/input_method_auralinux.cc` 518): the user's
+    /// selected text would go.
+    #[tokio::test]
+    async fn an_empty_preedit_region_sends_no_delete() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
+        assert_eq!(f.s.guest_received(), f.events([no_preedit(), done()]));
+
+        f.s.host([
+            f.preedit("가", ""),
+            ext::set_preedit_region(f.host_ext, 0, 0),
+        ])
+        .await;
+        let expected = [preedit("가"), done(), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
     /// A preedit region makes committed surrounding text around the cursor
