@@ -332,7 +332,11 @@ impl Context {
         }
         for (&params, create) in &self.pending_native_creates {
             assert_eq!(
-                table.event_object(params.0, "zwp_linux_buffer_params_v1"),
+                table.event_object(
+                    params.0,
+                    "zwp_linux_buffer_params_v1",
+                    "zwp_linux_buffer_params_v1.created"
+                ),
                 Some(create.guest_params_id),
                 "asynchronous dma-buf create outlived host params {}",
                 params.0

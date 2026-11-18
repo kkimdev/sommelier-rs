@@ -744,7 +744,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 
                 let decodes = generate_reads(&evt.items);
                 let field_names = generate_field_names(&evt.items);
-                let event_validations = generate_event_validations(&evt.items);
+                let event_validations = generate_event_validations(
+                    &format!("{}.{}", interface.name, evt.name),
+                    &evt.items,
+                );
                 let event_version_validation = generate_version_validation(evt.since, true);
                 event_decoders.push(quote! {
                     #evt_idx => {
@@ -1535,8 +1538,9 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
 /// must name a live object with a guest counterpart, or the event is
 /// dropped; it is validated and translated to the guest ID in one lookup,
 /// bound to [`translated_object_ident`]. An object of no interface is
-/// resolved only when the event is forwarded.
-fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
+/// resolved only when the event is forwarded. `event` names the event
+/// (`interface.event`) in what the lookup logs.
+fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
     for arg in args(items) {
         let name = sanitize_ident(&arg.name);
@@ -1556,7 +1560,7 @@ fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                     continue;
                 };
                 let guest = translated_object_ident(arg);
-                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface) };
+                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface, #event) };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
                         let #guest = if #name == 0 {
