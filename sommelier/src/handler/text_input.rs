@@ -1187,11 +1187,11 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         // The region's preedit is the text it takes.
         let empty = preedit_text.is_empty();
         debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
-        // The guest no longer has the bytes the shown preedit took, if a
-        // region made it and the guest has not reported its text since:
-        // they are not deleted again. A region that does not cover them
-        // would leave them lost or shown twice, so it is dropped.
-        let deleted = match plan.shown_region {
+        // The guest no longer has the bytes earlier regions took, if it has
+        // not reported its text since: they are not deleted again. A region
+        // that does not cover them would leave them lost or shown twice, so
+        // it is dropped.
+        let deleted = match plan.unreported_taken {
             None => (before_length, after_length),
             Some((shown_before, shown_after)) => match (
                 before_length.checked_sub(shown_before),
@@ -5507,6 +5507,26 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
         let expected = [no_preedit(), delete(1, 0), preedit_at("b", 1, 1), done(3)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A host `preedit_string` after a region replaces the preedit but not
+    /// what the guest lost: the bytes the region took stay out of its text
+    /// until it reports, so a later region still deletes only the rest.
+    #[tokio::test]
+    async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([f.preedit("x", "")]).await;
+        let _ = f.s.guest_received();
+
+        // The guest's text is "abc|ef": of "cd", only "c" is left.
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
