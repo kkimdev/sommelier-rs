@@ -33,6 +33,10 @@ limitations under the License.
 //! - A jamo that is not part of a syllable is shown alone, as a Hangul
 //!   compatibility jamo (U+3131 to U+3163). A consonant after a lone vowel
 //!   starts a new syllable rather than becoming the vowel's initial.
+//! - Two lone consonants that make a compound final show as that compound
+//!   (ㄱ + ㅅ = ㄳ), as libhangul's default `non_choseong_combi` option and
+//!   the Microsoft IME do; a vowel then commits the first and takes the
+//!   second as its initial (ㄳ + ㅏ = ㄱ + 사).
 //! - Shift with Q, W, E, R, T, O or P types the double consonant or the
 //!   other vowel on that key (ㅃ ㅉ ㄸ ㄲ ㅆ ㅒ ㅖ); Shift with any other
 //!   letter types the same jamo as without it.
@@ -43,7 +47,7 @@ limitations under the License.
 //!
 //! Assumptions only a real ChromeOS host can confirm: that its Korean
 //! input method, with default settings, composes and deletes jamo by jamo
-//! as above; and that Space, Enter, the arrows and punctuation commit the
+//! as above, lone compound consonants included; and that Space, Enter, the arrows and punctuation commit the
 //! syllable and then reach the application, rather than being consumed.
 
 /// A key the user presses.
@@ -95,8 +99,9 @@ pub(super) struct Output {
 /// Backspace can take back one keystroke at a time.
 ///
 /// Keystrokes arrive in the order initial, medials, finals, so Backspace
-/// removes from the end of that order. A final needs an initial and a
-/// medial; a lone medial takes no consonant.
+/// removes from the end of that order. A final without a medial is the
+/// second of two lone consonants, which make a compound with the initial;
+/// a lone medial takes no consonant.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Composer {
     /// The initial consonant.
@@ -220,12 +225,12 @@ impl Composer {
     /// The composition, as the user sees it; empty if none.
     pub fn preedit(&self) -> String {
         let medial = joined(&self.medial, &COMPOUND_MEDIALS);
-        let final_ = joined(&self.final_, &COMPOUND_FINALS);
-        match (self.initial, medial) {
-            (Some(l), Some(v)) => syllable(l, v, final_).to_string(),
-            (Some(lone), None) | (None, Some(lone)) => lone.to_string(),
-            (None, None) => String::new(),
-        }
+        let shown = match (self.initial, medial) {
+            (Some(l), Some(v)) => Some(syllable(l, v, joined(&self.final_, &COMPOUND_FINALS))),
+            (Some(l), None) => joined(&[&[l], &self.final_[..]].concat(), &COMPOUND_FINALS),
+            (None, medial) => medial,
+        };
+        shown.map(String::from).unwrap_or_default()
     }
 
     /// Discards the composition, as an input method's reset (cancel) does.
@@ -273,6 +278,7 @@ impl Composer {
     /// Feeds a consonant; returns the text it finished.
     fn consonant(&mut self, c: char) -> String {
         let fits = match (self.initial, &*self.medial, &*self.final_) {
+            (Some(first), [], []) => compound(first, c, &COMPOUND_FINALS).is_some(),
             (Some(_), [_, ..], []) => index(FINALS, c).is_some(),
             (Some(_), [_, ..], [first]) => compound(*first, c, &COMPOUND_FINALS).is_some(),
             _ => false,
@@ -439,10 +445,26 @@ mod tests {
             ("hk", "", "ㅘ"),
             // A consonant after a lone vowel does not become its initial.
             ("kr", "ㅏ", "ㄱ"),
-            // Two initials do not combine; Shift types the double one.
+            // Shift types a double consonant; two keystrokes do not.
             ("rr", "ㄱ", "ㄱ"),
-            ("rt", "ㄱ", "ㅅ"),
             ("R", "", "ㄲ"),
+        ]);
+    }
+
+    #[test]
+    fn two_lone_consonants_make_a_compound() {
+        check(&[
+            ("rt", "", "ㄳ"),
+            ("fr", "", "ㄺ"),
+            ("qt ", "ㅄ ", ""),
+            // Only a pair from the compound finals combines, and no third.
+            ("rs", "ㄱ", "ㄴ"),
+            ("rtt", "ㄳ", "ㅅ"),
+            // A vowel takes the second consonant as its initial.
+            ("rtk", "ㄱ", "사"),
+            ("frk", "ㄹ", "가"),
+            ("rt⌫", "", "ㄱ"),
+            ("rt⌫⌫", "", ""),
         ]);
     }
 
