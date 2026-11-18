@@ -125,6 +125,20 @@ pub(crate) enum SessionEnd {
     Internal,
 }
 
+impl SessionEnd {
+    /// The proxy failed ([`Self::Internal`]). Every internal end is made
+    /// here, and logged under [`INTERNAL_END_TARGET`], so that a test can
+    /// tell it from a rejection of the guest even when a later protocol
+    /// error replaces it ([`Context::end_session`]) or the guest has gone.
+    pub(crate) fn internal() -> Self {
+        error!(target: INTERNAL_END_TARGET, "the session ended internally");
+        Self::Internal
+    }
+}
+
+/// The log target of [`SessionEnd::internal`].
+pub(crate) const INTERNAL_END_TARGET: &str = "sommelier::internal_end";
+
 /// What dispatching one message produced besides its forward
 /// ([`Context::take_effects`]). The proxy commits it whole, or, when the
 /// message ends the session, sends none of it.
@@ -597,7 +611,7 @@ impl Context {
     #[must_use = "a handler returns the Action::Drop"]
     pub(crate) fn fail(&mut self, why: impl std::fmt::Display) -> Action {
         error!("{why}");
-        self.end_session(SessionEnd::Internal);
+        self.end_session(SessionEnd::internal());
         Action::Drop
     }
 
