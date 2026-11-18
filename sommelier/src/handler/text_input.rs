@@ -1988,7 +1988,9 @@ mod tests {
     use super::*;
     use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
+    use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
+    use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
@@ -2001,7 +2003,9 @@ mod tests {
     use crate::proxy::harness::{Object, Session};
     use crate::test_support::decoded;
     use crate::wire::WL_DISPLAY_ID;
+    use std::os::fd::OwnedFd;
     use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
+    use zcr_keyboard_extension_v1::Request as KeyboardExtension;
     use zcr_text_input_extension_v1::Request as ExtManager;
     use zwp_text_input_manager_v1::Request as V1Manager;
     use zwp_text_input_v1::{evt as v1, Request as V1};
@@ -2022,10 +2026,26 @@ mod tests {
         surface: Object,
         /// The guest's `zwp_text_input_manager_v3`.
         manager: u32,
+        /// The host `zcr_extended_keyboard_v1` of the keyboard, 0 without
+        /// one.
+        extended_keyboard: u32,
     }
 
     /// The text-input extension version the proxy binds.
     const EXTENSION: Option<u32> = Some(zcr_text_input_extension_v1::VERSION);
+
+    /// What the host offers a [`Field`] besides its seat, keyboard and
+    /// text-input manager.
+    #[derive(Clone, Copy)]
+    struct Host {
+        /// The text-input extension's version, if the host has one.
+        text_input_extension: Option<u32>,
+        /// Whether the host advertises the keyboard extension, which
+        /// reports each key before the input method takes it (`peek_key`)
+        /// and takes the proxy's `ack_key`, and sends the keyboard the
+        /// default keymap, whose keys repeat.
+        keyboard_extension_with_keymap: bool,
+    }
 
     /// A guest text input and the host objects behind it, which a
     /// [`Field`] drives one at a time.
@@ -2050,6 +2070,15 @@ mod tests {
         /// A disabled text input whose host has the text-input extension at
         /// version `extension`, if any.
         async fn new(extension: Option<u32>) -> Self {
+            Self::offered(Host {
+                text_input_extension: extension,
+                keyboard_extension_with_keymap: false,
+            })
+            .await
+        }
+
+        /// A disabled text input with what `host` offers.
+        async fn offered(host: Host) -> Self {
             let mut s = Session::new();
             // Offset the guest's IDs from the host's, so that a request
             // that names a guest object where its host object belongs
@@ -2072,7 +2101,7 @@ mod tests {
                     zwp_text_input_manager_v1::VERSION,
                 )
                 .await;
-            if let Some(version) = extension {
+            if let Some(version) = host.text_input_extension {
                 s.advertise("zcr_text_input_extension_v1", version).await;
                 // The proxy binds it for itself.
                 s.host_received();
@@ -2086,8 +2115,29 @@ mod tests {
                 keyboard,
                 surface,
                 manager,
+                extended_keyboard: 0,
+            };
+            let keyboard_extension = match host.keyboard_extension_with_keymap {
+                true => Some(f.offer_keyboard_extension_with_keymap().await),
+                false => None,
             };
             assert_eq!(f.enter_surface().await, []);
+            if let Some(extension) = keyboard_extension {
+                // The keyboard's first enter gets it its extended keyboard.
+                let host = f.s.host_received();
+                let [(
+                    sender,
+                    AnyRequest::ZcrKeyboardExtensionV1(KeyboardExtension::GetExtendedKeyboard {
+                        id,
+                        keyboard,
+                    }),
+                )] = host[..]
+                else {
+                    panic!("the host got no extended keyboard: {host:?}");
+                };
+                assert_eq!((sender, keyboard), (extension, f.keyboard.host));
+                f.extended_keyboard = id;
+            }
             let ti = f.s.new_id();
             f.create_text_input(ti).await;
             // The offset still keeps every guest ID above every host ID.
@@ -2097,6 +2147,7 @@ mod tests {
                 f.surface.host,
                 f.host,
                 f.host_ext,
+                f.extended_keyboard,
             ];
             let guest = [f.seat.id, f.keyboard.id, f.surface.id, f.manager, f.ti];
             assert!(
@@ -2117,6 +2168,88 @@ mod tests {
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.enable_requests(1));
             f
+        }
+
+        /// A text input the guest enabled with the surrounding text "가",
+        /// which the host activated, on a keyboard whose keys the host
+        /// reports to the proxy before its input method takes them
+        /// ([`Host::keyboard_extension_with_keymap`]).
+        async fn typing() -> Self {
+            let mut f = Self::offered(Host {
+                text_input_extension: EXTENSION,
+                keyboard_extension_with_keymap: true,
+            })
+            .await;
+            f.s.guest([
+                v3::enable(f.ti),
+                v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
+                v3::commit(f.ti),
+            ])
+            .await;
+            // The default content type, spelled out: the traces' other
+            // expectations take it from `map_v3_content_type`.
+            let input_type = Ext::SetInputType {
+                input_type: zcr_extended_text_input_v1::INPUT_TYPE_TEXT,
+                input_mode: zcr_extended_text_input_v1::INPUT_MODE_DEFAULT,
+                input_flags: zcr_extended_text_input_v1::INPUT_FLAGS_NONE,
+                learning_mode: zcr_extended_text_input_v1::LEARNING_MODE_ENABLED,
+                inline_composition_support:
+                    zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+            };
+            let expected = [
+                f.activate(),
+                f.surrounding_text("가", 3, 3),
+                f.ext(Ext::SetSurroundingTextSupport { support: 1 }),
+                f.ext(input_type),
+                f.no_cursor_rectangle(),
+                f.commit_state(1),
+            ];
+            assert_eq!(f.s.host_received(), expected);
+            f
+        }
+
+        /// The host advertises the keyboard extension, which the proxy
+        /// binds, and sends the keyboard the default keymap, which the
+        /// guest gets; returns the extension's host object.
+        async fn offer_keyboard_extension_with_keymap(&mut self) -> u32 {
+            self.s
+                .advertise(
+                    "zcr_keyboard_extension_v1",
+                    zcr_keyboard_extension_v1::VERSION,
+                )
+                .await;
+            let host = self.s.host_received();
+            let [(
+                _,
+                AnyRequest::WlRegistry(wl_registry::Request::Bind {
+                    id: (_, _, extension),
+                    ..
+                }),
+            )] = host[..]
+            else {
+                panic!("the proxy did not bind the keyboard extension: {host:?}");
+            };
+
+            let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+            let flags = xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS;
+            let keymap =
+                xkbcommon::xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags)
+                    .expect("the default keymap");
+            let mut keymap = keymap
+                .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1)
+                .into_bytes();
+            // The size counts the terminating NUL.
+            keymap.push(0);
+            let size = keymap.len() as u32;
+            let file = crate::test_support::shm_pool_file(&keymap);
+            let fd = OwnedFd::from(file.try_clone().expect("duplicate the keymap file"));
+            let format = wl_keyboard::KEYMAP_FORMAT_XKB_V1;
+            let event = wl_keyboard::evt::keymap(self.keyboard.host, format, fd, size);
+            self.s.host([event]).await;
+            let fd = OwnedFd::from(file);
+            let keymap = wl_keyboard::Event::Keymap { format, fd, size };
+            assert_eq!(self.s.guest_received(), [(self.keyboard.id, keymap.into())]);
+            extension
         }
 
         /// The guest creates text input `ti` for the seat, which the
@@ -2388,6 +2521,13 @@ mod tests {
             events
         }
 
+        /// The host's keyboard focus enters a new surface, which the field
+        /// follows from now on.
+        async fn keyboard_enter_new_surface(&mut self) {
+            self.surface = self.s.surface().await;
+            self.keyboard_enter().await;
+        }
+
         /// The host's keyboard focus enters the surface again.
         async fn keyboard_enter(&mut self) {
             let surface = self.surface.id;
@@ -2423,7 +2563,128 @@ mod tests {
         fn commit(&self, text: &str) -> Outgoing {
             v1::commit_string(self.host, 0, text).unwrap()
         }
+
+        /// The host input method's `confirm_preedit`.
+        fn confirm(&self) -> Outgoing {
+            ext::confirm_preedit(self.host_ext, 1)
+        }
+
+        /// The extended keyboard's `peek_key` of `k`, which the host
+        /// sends before its input method can take the key.
+        fn peek(&self, k: Stroke) -> Outgoing {
+            let peek_key = zcr_extended_keyboard_v1::evt::peek_key;
+            peek_key(self.extended_keyboard, k.serial, k.time, k.key, k.state)
+        }
+
+        /// The host keyboard's `key` of `k`.
+        fn key(&self, k: Stroke) -> Outgoing {
+            wl_keyboard::evt::key(self.keyboard.host, k.serial, k.time, k.key, k.state)
+        }
+
+        /// The host input method's `keysym` `sym` of `k`, whose serial
+        /// and time Exo sends in each other's arguments.
+        fn keysym(&self, sym: u32, k: Stroke) -> Outgoing {
+            v1::keysym(self.host, k.time, k.serial, sym, k.state, 0)
+        }
+
+        /// The `key` of `k` the guest keyboard gets.
+        fn guest_key(&self, k: Stroke) -> (u32, AnyEvent) {
+            key(self.keyboard.id, k.key, k.state, k.serial, k.time)
+        }
+
+        /// What the guest gets when an empty confirmation stands for the
+        /// held key `held`: a press and a release with the proxy's own
+        /// `serial` and the next, at the time of the press, and `done`.
+        /// The proxy numbers the key events it makes up from 1 per session,
+        /// so a session's n-th recovered pair has serials 2n - 1 and 2n.
+        fn recovered(&self, held: Stroke, serial: u32) -> Vec<(u32, AnyEvent)> {
+            let press = Stroke {
+                state: PRESSED,
+                serial,
+                ..held
+            };
+            let release = Stroke {
+                state: RELEASED,
+                serial: serial + 1,
+                ..held
+            };
+            let mut events = vec![self.guest_key(press), self.guest_key(release)];
+            events.extend(self.events([DONE]));
+            events
+        }
+
+        /// The proxy's `ack_key` of key `serial`, which the guest
+        /// `handled`.
+        fn ack(&self, serial: u32, handled: bool) -> (u32, AnyRequest) {
+            let handled = match handled {
+                true => zcr_extended_keyboard_v1::HANDLED_STATE_HANDLED,
+                false => zcr_extended_keyboard_v1::HANDLED_STATE_NOT_HANDLED,
+            };
+            let ack = zcr_extended_keyboard_v1::Request::AckKey { serial, handled };
+            (self.extended_keyboard, ack.into())
+        }
+
+        /// The IME repeat lease of `key` on the host keyboard, which no
+        /// peer sees until the key's next confirmation.
+        fn repeat_owner(&mut self, key: u32) -> Option<u32> {
+            let keyboard = HostId(self.keyboard.host);
+            self.s.ctx().key_generations.ime_repeat_owner(keyboard, key)
+        }
+
+        /// The owner the proxy assigned the guest's press of `key` on the
+        /// host keyboard, which no peer sees.
+        fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
+            let keyboard = HostId(self.keyboard.host);
+            self.s.ctx().guest_key_owner(keyboard, key)
+        }
+
+        /// The proxy's state of the text input, for state no peer sees.
+        fn state(&mut self) -> &TextInputState {
+            let ti = self.ti;
+            &self.s.ctx().text_inputs[&ti]
+        }
+
+        /// The host gives the held Backspace to its input method, which
+        /// empties a preedit: the proxy leases Backspace's repeat to the
+        /// text input. Returns the press.
+        async fn lease_backspace_repeat(&mut self) -> Stroke {
+            let press = Stroke {
+                key: BACKSPACE,
+                state: PRESSED,
+                serial: 700,
+                time: 1_234,
+            };
+            let events = [
+                self.peek(press),
+                self.preedit("가", ""),
+                self.preedit("", ""),
+            ];
+            self.s.host(events).await;
+            let expected = [preedit("가"), DONE, no_preedit(), DONE];
+            assert_eq!(self.s.guest_received(), self.events(expected));
+            assert_eq!(self.repeat_owner(BACKSPACE), Some(self.ti));
+            press
+        }
+
+        /// Whether the proxy holds `key` of the host keyboard, which no peer
+        /// sees until the key's next event.
+        fn held(&mut self, key: u32) -> bool {
+            let keyboard = HostId(self.keyboard.host);
+            self.s.ctx().key_generations.physically_held(keyboard, key)
+        }
     }
+
+    /// A key event of the host keyboard.
+    #[derive(Clone, Copy, Debug)]
+    struct Stroke {
+        key: u32,
+        state: u32,
+        serial: u32,
+        time: u32,
+    }
+
+    /// The evdev code of the space bar.
+    const SPACE: u32 = 57;
 
     /// The `wl_display.sync` that creates drain barrier `callback`.
     fn sync(callback: u32) -> (u32, AnyRequest) {
@@ -2499,8 +2760,7 @@ mod tests {
         // The focus enters another surface, where the guest enables the
         // field while the barrier drains: its state reaches the host first,
         // without an activation.
-        f.surface = f.s.surface().await;
-        f.keyboard_enter().await;
+        f.keyboard_enter_new_surface().await;
         f.s.guest([
             v3::enable(f.ti),
             v3::set_surrounding_text(f.ti, "new", 3, 3).unwrap(),
@@ -2758,8 +3018,7 @@ mod tests {
         // disables it.
         for serial in [3, 4] {
             f.keyboard_leave().await;
-            f.surface = f.s.surface().await;
-            f.keyboard_enter().await;
+            f.keyboard_enter_new_surface().await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
         }
@@ -3524,6 +3783,27 @@ mod tests {
                     DONE,
                 ],
             ),
+            (
+                "a confirm keeps the edits for the next commit",
+                |f| {
+                    vec![
+                        f.preedit("가", ""),
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        f.confirm(),
+                        f.commit("나"),
+                    ]
+                },
+                vec![
+                    preedit("가"),
+                    DONE,
+                    no_preedit(),
+                    commit("가"),
+                    DONE,
+                    delete(3, 0),
+                    commit("나"),
+                    DONE,
+                ],
+            ),
         ];
         for (case, events, expected) in cases {
             let mut f = Field::enabled().await;
@@ -3642,6 +3922,557 @@ mod tests {
         assert_eq!(host, expected);
         f.s.host([f.commit("나")]).await;
         assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
+    }
+
+    // Traces of real IME and key bugs, step by step.
+
+    /// Exo can give a key's peek release the serial of its press. The
+    /// release still ends the press, so that a next press with that
+    /// serial starts a generation an empty confirmation recovers.
+    #[tokio::test]
+    async fn a_peek_release_with_the_press_serial_ends_the_press() {
+        let mut f = Field::typing().await;
+        let press = Stroke {
+            key: BACKSPACE,
+            state: PRESSED,
+            serial: 18_857,
+            time: 100,
+        };
+        let release = Stroke {
+            state: RELEASED,
+            time: 110,
+            ..press
+        };
+        f.s.host([f.peek(press), f.peek(release)]).await;
+        assert!(!f.held(BACKSPACE));
+
+        let again = Stroke { time: 120, ..press };
+        f.s.host([f.peek(again), f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(again, 1));
+        assert_eq!(f.repeat_owner(BACKSPACE), Some(f.ti));
+    }
+
+    /// A sibling text input's rejected enable, or its destroy, whether it
+    /// ever committed or not, ends no repeat lease of the enabled one,
+    /// whose empty confirmations go on recovering the held Backspace.
+    #[tokio::test]
+    async fn a_sibling_text_input_keeps_the_active_repeat_lease() {
+        let mut f = Field::typing().await;
+        let backspace = f.lease_backspace_repeat().await;
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(backspace, 1));
+
+        // A sibling whose enable is rejected, then one that never commits.
+        let field = f.text_input();
+        for enables in [true, false] {
+            let id = f.s.new_id();
+            // Creating a text input makes the fixture drive it.
+            f.create_text_input(id).await;
+            let sibling = f.text_input();
+            if enables {
+                f.s.guest([v3::enable(sibling.ti), v3::commit(sibling.ti)])
+                    .await;
+                assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
+            }
+            f.s.guest([v3::destroy(sibling.ti)]).await;
+            assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+            let deleted = wl_display::Event::DeleteId { id: sibling.ti };
+            assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        }
+        f.select(field);
+
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(backspace, 3));
+    }
+
+    /// A text input's destroy ends its repeat lease, which a new text
+    /// input under its ID does not inherit; the next physical press can
+    /// lease the new one.
+    #[tokio::test]
+    async fn a_text_input_recreated_under_its_id_does_not_inherit_the_repeat_lease() {
+        let mut f = Field::typing().await;
+        f.lease_backspace_repeat().await;
+        f.s.guest([v3::destroy(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(
+            host,
+            [f.deactivate(), sync(callback), f.ext(Ext::Destroy {})]
+        );
+        let deleted = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        assert_eq!(f.repeat_owner(BACKSPACE), None);
+
+        let old_host = f.host;
+        f.create_text_input(f.ti).await;
+        assert_ne!(f.host, old_host);
+        assert_eq!(f.repeat_owner(BACKSPACE), None);
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+
+        let release = Stroke {
+            key: BACKSPACE,
+            state: RELEASED,
+            serial: 701,
+            time: 1_300,
+        };
+        let press = Stroke {
+            state: PRESSED,
+            serial: 702,
+            time: 1_400,
+            ..release
+        };
+        f.s.host([
+            f.peek(release),
+            f.peek(press),
+            f.preedit("나", ""),
+            f.preedit("", ""),
+        ])
+        .await;
+        let expected = [preedit("나"), DONE, no_preedit(), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        assert_eq!(f.repeat_owner(BACKSPACE), Some(f.ti));
+    }
+
+    /// Held Space after a Korean commit, then held Backspace over an
+    /// emptied preedit, each held twice. Every empty confirmation while
+    /// the key is held stands for one press and release, the key's other
+    /// channels (keysyms and the delayed `wl_keyboard.key`) duplicate none,
+    /// and no confirmation after the release recovers it.
+    #[tokio::test]
+    async fn held_keys_repeat_through_confirmations_after_korean_input() {
+        use xkbcommon::xkb::keysyms::{KEY_BackSpace, KEY_space};
+        let mut f = Field::typing().await;
+
+        // The input method commits the syllable with Space, whose keysyms
+        // reach the proxy before the delayed wl_keyboard press: this
+        // overlap once ended held Space after its first commit.
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let keysym_release = Stroke {
+            state: RELEASED,
+            serial: 701,
+            time: 1_235,
+            ..space
+        };
+        f.s.host([
+            f.keysym(KEY_space, space),
+            f.keysym(KEY_space, keysym_release),
+            f.key(space),
+        ])
+        .await;
+        assert_eq!(
+            f.s.guest_received(),
+            [f.guest_key(space), f.guest_key(keysym_release)]
+        );
+        assert_eq!(f.s.host_received(), [f.ack(700, false)]);
+
+        // Each recovered pair takes the proxy's next two key serials, so
+        // they run on from 1 through the Space and Backspace holds below.
+        f.s.host([f.confirm(), f.confirm(), f.confirm()]).await;
+        let mut expected = f.recovered(space, 1);
+        expected.extend(f.recovered(space, 3));
+        expected.extend(f.recovered(space, 5));
+        assert_eq!(f.s.guest_received(), expected);
+
+        let release = Stroke {
+            state: RELEASED,
+            serial: 701,
+            time: 1_300,
+            ..space
+        };
+        f.s.host([f.peek(release), f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        // A second hold starts a new generation, which repeats the same:
+        // nothing of the first leaks across its release.
+        let space = Stroke {
+            serial: 702,
+            time: 1_400,
+            ..space
+        };
+        f.s.host([f.peek(space), f.preedit("나", ""), f.commit("나 ")])
+            .await;
+        let expected = [preedit("나"), DONE, no_preedit(), commit("나 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.confirm(), f.confirm()]).await;
+        let mut expected = f.recovered(space, 7);
+        expected.extend(f.recovered(space, 9));
+        assert_eq!(f.s.guest_received(), expected);
+        let release = Stroke {
+            state: RELEASED,
+            serial: 703,
+            time: 1_500,
+            ..space
+        };
+        f.s.host([f.peek(release)]).await;
+        assert!(!f.held(SPACE));
+        // No peer sees the peek a later confirmation could recover.
+        let keyboard = HostId(f.keyboard.host);
+        assert_eq!(f.s.ctx().key_generations.peek(keyboard, SPACE), None);
+
+        // Backspace held over a preedit the input method empties.
+        let backspace = Stroke {
+            key: BACKSPACE,
+            state: PRESSED,
+            serial: 800,
+            time: 1_600,
+        };
+        f.s.host([f.peek(backspace), f.preedit("가", ""), f.preedit("", "")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.confirm(), f.confirm()]).await;
+        let mut expected = f.recovered(backspace, 11);
+        expected.extend(f.recovered(backspace, 13));
+        assert_eq!(f.s.guest_received(), expected);
+        let keysym_release = Stroke {
+            state: RELEASED,
+            serial: 801,
+            time: 1_601,
+            ..backspace
+        };
+        f.s.host([
+            f.keysym(KEY_BackSpace, backspace),
+            f.keysym(KEY_BackSpace, keysym_release),
+            f.key(backspace),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), []);
+        assert_eq!(f.s.host_received(), [f.ack(800, false)]);
+
+        // Its release reaches the proxy on both channels.
+        let release = Stroke {
+            state: RELEASED,
+            serial: 801,
+            time: 1_700,
+            ..backspace
+        };
+        f.s.host([f.peek(release), f.key(release), f.confirm()])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        assert_eq!(f.s.host_received(), [f.ack(801, false)]);
+
+        let backspace = Stroke {
+            serial: 810,
+            time: 1_800,
+            ..backspace
+        };
+        f.s.host([f.peek(backspace), f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(backspace, 15));
+    }
+
+    /// A text input destroyed while its deactivation drains sends nothing
+    /// more: its host's late events reach no one, and the proxy's drain
+    /// callback ends without reaching the guest, its host ID free for
+    /// another object only after the host's `delete_id`.
+    #[tokio::test]
+    async fn a_text_input_destroyed_while_draining_ends_its_barrier_unseen() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+        f.s.guest([v3::destroy(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        let deleted = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        f.s.host([f.preedit("stale", ""), f.commit("stale")]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.drain(callback).await;
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert!(![f.host, f.host_ext].contains(&callback));
+        f.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, callback)])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert_eq!(f.host, callback);
+    }
+
+    /// A focus change drains the old generation: the input method's
+    /// composition, commit and confirmation sent while it drains reach no
+    /// one, while the guest's enable on the new surface waits for the
+    /// drain and then composes.
+    #[tokio::test]
+    async fn a_focus_change_drops_the_old_composition_and_held_key() {
+        let mut f = Field::typing().await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_000,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(space, 1));
+
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+        f.keyboard_enter_new_surface().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(
+            f.s.host_received(),
+            [
+                f.surrounding_text("", 0, 0),
+                f.no_cursor_rectangle(),
+                f.commit_state(2)
+            ]
+        );
+
+        f.s.host([
+            f.preedit("오래된 조합", ""),
+            f.commit("오래된 확정"),
+            f.confirm(),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.drain(callback).await;
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([f.preedit("새 조합", "")]).await;
+        let expected = [preedit("새 조합"), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A text input recreated under the ID of one whose deactivation
+    /// drains is activated at once, and the old drain neither reconciles
+    /// nor reaches it, nor moves it off its own host object.
+    #[tokio::test]
+    async fn a_text_input_recreated_under_its_id_ignores_the_old_barrier() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+        f.s.guest([v3::destroy(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        let deleted = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        let old_host = f.host;
+        f.create_text_input(f.ti).await;
+        assert_ne!(f.host, old_host);
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.s.guest_received(), []);
+        f.s.host([f.preedit("새 객체", "")]).await;
+        let expected = [preedit("새 객체"), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // The replacement keeps its own host text input, which its disable
+        // deactivates.
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        assert_eq!(host, f.disable_requests(barrier(&host), 2));
+    }
+
+    /// An enable or a disable the guest has not committed when the focus
+    /// leaves dies with that focus: its commit after the next enter
+    /// activates nothing.
+    #[tokio::test]
+    async fn an_uncommitted_enable_or_disable_dies_with_its_focus() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti)]).await;
+        assert_eq!(f.s.host_received(), []);
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+        f.keyboard_enter_new_surface().await;
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+
+        f.s.guest([v3::enable(f.ti)]).await;
+        f.keyboard_leave().await;
+        assert_eq!(f.s.host_received(), []);
+        f.keyboard_enter_new_surface().await;
+        // No peer sees that the enter dropped the pending enable before
+        // the commit below shows it.
+        assert_eq!(f.state().pending.enabled, None);
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
+    }
+
+    /// A release delayed past a wrapped serial's next press ends only its
+    /// own generation: the new press stays held and owned, repeats, and
+    /// gets its own release, and every key gets one `ack_key`. Then a key
+    /// is held as the focus leaves, which drains the field: a confirmation
+    /// recovers nothing.
+    #[tokio::test]
+    async fn a_delayed_release_ends_only_its_generation() {
+        let mut f = Field::typing().await;
+        let old_press = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: u32::MAX - 2,
+            time: 100,
+        };
+        let old_release = Stroke {
+            state: RELEASED,
+            serial: u32::MAX,
+            time: 110,
+            ..old_press
+        };
+        let new_press = Stroke {
+            serial: 1,
+            time: 200,
+            ..old_press
+        };
+        f.s.host([f.peek(old_press), f.key(old_press)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(old_press)]);
+        assert_eq!(f.s.host_received(), [f.ack(old_press.serial, true)]);
+        f.s.host([f.peek(old_release), f.peek(new_press), f.key(new_press)])
+            .await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(new_press)]);
+        assert_eq!(f.s.host_received(), [f.ack(new_press.serial, true)]);
+
+        f.s.host([f.key(old_release)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(old_release)]);
+        assert_eq!(f.s.host_received(), [f.ack(old_release.serial, true)]);
+        assert!(f.held(SPACE));
+        assert_eq!(f.owner(SPACE), Some(GuestKeyOwner::Physical));
+
+        let repeat = Stroke {
+            state: REPEATED,
+            serial: 2,
+            time: 210,
+            ..old_press
+        };
+        f.s.host([f.key(repeat)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(repeat)]);
+        assert_eq!(f.s.host_received(), [f.ack(repeat.serial, true)]);
+        let new_release = Stroke {
+            state: RELEASED,
+            serial: 3,
+            time: 220,
+            ..old_press
+        };
+        f.s.host([f.peek(new_release), f.key(new_release)]).await;
+        assert_eq!(f.s.guest_received(), [f.guest_key(new_release)]);
+        assert_eq!(f.s.host_received(), [f.ack(new_release.serial, true)]);
+        assert!(!f.held(SPACE));
+        assert_eq!(f.owner(SPACE), None);
+
+        let held = Stroke {
+            serial: 4,
+            time: 300,
+            ..old_press
+        };
+        f.s.host([f.peek(held)]).await;
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        assert_eq!(host, [f.deactivate(), sync(barrier(&host))]);
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), []);
+    }
+
+    /// Each keyboard of a seat gets one `enter` and one `leave` for each
+    /// focus it is given, whatever order the host's events take, and the
+    /// seat's focus, which its text input follows, is the focus of the
+    /// keyboard that entered last.
+    #[tokio::test]
+    async fn each_keyboard_focus_is_entered_and_left_once() {
+        // Keyboard `a` has entered the surface with serial 1.
+        let mut f = Field::disabled().await;
+        let (a, surface) = (f.keyboard, f.surface);
+        let id = f.s.new_id();
+        let host = f.s.create(wl_seat::req::get_keyboard(f.seat.id, id)).await;
+        let b = Object { id, host };
+        let replacement = f.s.surface().await;
+        let enter = |keyboard: Object, serial, surface: Object| {
+            wl_keyboard::evt::enter(keyboard.host, serial, surface.host, &[]).unwrap()
+        };
+        let leave = |keyboard: Object, serial, surface: Object| {
+            wl_keyboard::evt::leave(keyboard.host, serial, surface.host)
+        };
+        let entered = |keyboard: Object, serial, surface: Object| {
+            let enter = wl_keyboard::Event::Enter {
+                serial,
+                surface: surface.id,
+                keys: Vec::new(),
+            };
+            let modifiers = wl_keyboard::Event::Modifiers {
+                serial,
+                mods_depressed: 0,
+                mods_latched: 0,
+                mods_locked: 0,
+                group: 0,
+            };
+            [(keyboard.id, enter.into()), (keyboard.id, modifiers.into())]
+        };
+        let left = |keyboard: Object, serial, surface: Object| {
+            let leave = wl_keyboard::Event::Leave {
+                serial,
+                surface: surface.id,
+            };
+            (keyboard.id, leave.into())
+        };
+
+        // A second keyboard needs its own enter; a duplicate is dropped.
+        f.s.host([enter(b, 2, surface), enter(b, 3, surface)]).await;
+        assert_eq!(f.s.guest_received(), entered(b, 2, surface));
+        // The seat keeps its focus through `b`.
+        f.s.host([leave(a, 4, surface), leave(a, 5, surface)]).await;
+        assert_eq!(f.s.guest_received(), [left(a, 4, surface)]);
+        f.s.host([leave(b, 6, surface)]).await;
+        let mut expected = vec![left(b, 6, surface)];
+        expected.extend(f.events([V3::Leave {
+            surface: surface.id,
+        }]));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // `b` takes the seat's focus elsewhere before `a` leaves: that
+        // leave still balances `a`'s enter, once, and moves no focus.
+        f.s.host([enter(a, 7, surface)]).await;
+        let mut expected = Vec::from(entered(a, 7, surface));
+        expected.extend(f.events([V3::Enter {
+            surface: surface.id,
+        }]));
+        assert_eq!(f.s.guest_received(), expected);
+        f.s.host([enter(b, 8, replacement)]).await;
+        let mut expected = Vec::from(entered(b, 8, replacement));
+        expected.extend(f.events([
+            V3::Leave {
+                surface: surface.id,
+            },
+            V3::Enter {
+                surface: replacement.id,
+            },
+        ]));
+        assert_eq!(f.s.guest_received(), expected);
+        f.s.host([leave(a, 9, surface), leave(a, 10, surface)])
+            .await;
+        assert_eq!(f.s.guest_received(), [left(a, 9, surface)]);
     }
 
     /// The fixture's guest text input, its host text input and extension.
@@ -4155,38 +4986,6 @@ mod tests {
             ime.ctx.host_to_client_queue.is_empty(),
             "synthetic Backspace must require a mapped host keyboard"
         );
-    }
-
-    /// A sibling text input's rejected enable, or its destroy, ends no
-    /// repeat lease of the enabled one.
-    #[test]
-    fn a_sibling_text_input_keeps_the_active_repeat_lease() {
-        const SIBLING: u32 = 21;
-        for destroy in [false, true] {
-            let mut ime = Ime::with_keyboard();
-            ime.ctx
-                .shadow_table
-                .insert_paired_for_test(SIBLING, 11, "zwp_text_input_v3");
-            let sibling = TextInputState::new(11, None, SEAT, Some(SURFACE));
-            ime.ctx.text_inputs.insert(SIBLING, sibling);
-            ime.lease_backspace_repeat(TI);
-
-            ime.ctx.last_sender_id = SIBLING;
-            if destroy {
-                TextInputV3Handler.on_destroy(&mut ime.ctx);
-            } else {
-                TextInputV3Handler.on_enable(&mut ime.ctx);
-                TextInputV3Handler.on_commit(&mut ime.ctx);
-                assert!(!ime.ctx.text_inputs[&SIBLING].committed.enabled);
-            }
-            assert_eq!(
-                ime.ctx
-                    .key_generations
-                    .ime_repeat_owner(HOST_KEYBOARD, BACKSPACE),
-                Some(TI),
-                "destroy: {destroy}"
-            );
-        }
     }
 
     #[test]

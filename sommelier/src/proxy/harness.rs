@@ -76,7 +76,9 @@ impl Session {
         }
     }
 
-    /// The proxy's state, for a test that injects a fault no peer can cause.
+    /// The proxy's state: `ctx()` reads state no peer can observe, or
+    /// injects a fault no peer can cause; each use says which, in a
+    /// comment.
     pub(crate) fn ctx(&mut self) -> &mut Context {
         &mut self.client.ctx
     }
