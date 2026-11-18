@@ -659,9 +659,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
-        // The preedit goes first: the guest applies a transaction at its
-        // `done`, in the v3 order (delete, commit, preedit), whatever the
-        // order of its events on the wire
+        // An empty preedit clears the shown one before its reset commit;
+        // a new preedit carries no commit, so it is last
         // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
         if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
@@ -1118,7 +1117,7 @@ impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for TextInputEx
 pub struct ExtendedTextInputV1Handler;
 impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
     // Translates zcr_extended_text_input_v1::set_preedit_region (cursor-relative index/length)
-    // into zwp_text_input_v3::preedit_string + delete_surrounding_text + done.
+    // into zwp_text_input_v3::delete_surrounding_text + preedit_string + done.
     fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
         let host_ext_id = ctx.last_sender_id;
         log::trace!(
@@ -1169,9 +1168,14 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
-        // The preedit goes before the delete
+        // The new preedit goes after the delete
         // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
+        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+            guest_id,
+            before_length,
+            after_length,
+        ));
         if !push_preedit_string_to(
             &mut transaction,
             guest_id,
@@ -1181,11 +1185,6 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         ) {
             return drop_host_preedit(ctx, guest_id);
         }
-        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-            guest_id,
-            before_length,
-            after_length,
-        ));
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
 
         let state = ctx
@@ -5072,8 +5071,8 @@ mod tests {
                     ]
                 },
                 vec![
-                    preedit_at("나", 3, 3),
                     delete(3, 0),
+                    preedit_at("나", 3, 3),
                     DONE_2,
                     no_preedit(),
                     DONE_2,
@@ -5259,7 +5258,7 @@ mod tests {
 
         f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
         let done = || V3::Done { serial: 2 };
-        let expected = [preedit_at("나", 3, 3), delete(3, 0), done()];
+        let expected = [delete(3, 0), preedit_at("나", 3, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
         // The region is the preedit now.
         f.s.host([f.commit("나")]).await;
@@ -5272,14 +5271,14 @@ mod tests {
             ext::set_preedit_region(f.host_ext, -3, 3),
         ])
         .await;
-        let expected = [preedit_at("나", 0, 0), delete(3, 0), done()];
+        let expected = [delete(3, 0), preedit_at("나", 0, 0), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
         ])
         .await;
-        let expected = [preedit_at("가나", 0, 3), delete(6, 0), done()];
+        let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // The `done` of the guest's next commit repeats the region's
