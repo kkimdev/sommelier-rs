@@ -19,20 +19,27 @@ use crate::handler::linux_dmabuf::GUEST_DMABUF_VERSION;
 use crate::handler::shm::{
     clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, register_guest_shm,
 };
+use crate::protocols::aura_shell::zaura_shell;
 use crate::protocols::fractional_scale_v1::ALLOWED_INTERFACES as FRACTIONAL_SCALE_ALLOWED;
 use crate::protocols::gtk::{gtk_shell1, ALLOWED_INTERFACES as GTK_ALLOWED};
+use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
 use crate::protocols::linux_dmabuf_v1::{
     zwp_linux_dmabuf_v1, ALLOWED_INTERFACES as DMABUF_ALLOWED,
 };
+use crate::protocols::remote_shell_unstable_v2::zcr_remote_shell_v2;
+use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
+use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v3::{
     zwp_text_input_manager_v3, ALLOWED_INTERFACES as TEXT_INPUT_ALLOWED,
 };
 use crate::protocols::viewporter::ALLOWED_INTERFACES as VIEWPORTER_ALLOWED;
 use crate::protocols::wayland::ALLOWED_INTERFACES as WL_ALLOWED;
-use crate::protocols::wayland::{wl_display, wl_fixes, wl_registry};
+use crate::protocols::wayland::{
+    wl_compositor, wl_display, wl_fixes, wl_output, wl_registry, wl_seat, wl_shm,
+};
 use crate::protocols::xdg_decoration_unstable_v1::ALLOWED_INTERFACES as XDG_DECORATION_ALLOWED;
 use crate::protocols::xdg_output_unstable_v1::ALLOWED_INTERFACES as XDG_OUTPUT_ALLOWED;
-use crate::protocols::xdg_shell::ALLOWED_INTERFACES as XDG_ALLOWED;
+use crate::protocols::xdg_shell::{xdg_wm_base, ALLOWED_INTERFACES as XDG_ALLOWED};
 use crate::state::{
     Context, GlobalBinding, GtkShellState, HostAuraShell, HostGlobal, HostId, InternalCallback,
     PendingDmabufGlobal, INERT_BIND_INTERFACE,
@@ -154,17 +161,17 @@ fn forwarded_global_version(ctx: &Context, interface: &str, host_version: u32) -
     // damage request, so a v3 host compositor is offered as v4. Hosts below
     // v3 retain their original version; the proxy does not expose v5/v6
     // surface semantics.
-    let host_version = if interface == "wl_compositor" && host_version >= WL_COMPOSITOR_HOST_VERSION
-    {
-        WL_COMPOSITOR_VERSION
-    } else {
-        host_version
-    };
+    let host_version =
+        if interface == wl_compositor::NAME && host_version >= WL_COMPOSITOR_HOST_VERSION {
+            WL_COMPOSITOR_VERSION
+        } else {
+            host_version
+        };
     let ceiling = match interface {
-        "wl_compositor" => WL_COMPOSITOR_VERSION,
-        "wl_output" => WL_OUTPUT_VERSION,
-        "wl_seat" => WL_SEAT_VERSION,
-        "xdg_wm_base" => XDG_SHELL_VERSION,
+        wl_compositor::NAME => WL_COMPOSITOR_VERSION,
+        wl_output::NAME => WL_OUTPUT_VERSION,
+        wl_seat::NAME => WL_SEAT_VERSION,
+        xdg_wm_base::NAME => XDG_SHELL_VERSION,
         _ => xml_version,
     };
     Some(host_version.min(ceiling).min(xml_version))
@@ -380,7 +387,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
         ctx.host_globals.insert(
             pending.name,
             HostGlobal {
-                interface: "zwp_linux_dmabuf_v1".to_string(),
+                interface: zwp_linux_dmabuf_v1::NAME.to_string(),
                 version: pending.version,
             },
         );
@@ -388,7 +395,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
             ctx,
             pending.registry_host_id,
             pending.name,
-            "zwp_linux_dmabuf_v1",
+            zwp_linux_dmabuf_v1::NAME,
             pending.version,
         );
         ctx.registry_global_visibility
@@ -466,11 +473,11 @@ impl Singleton {
 
     fn interface(self) -> &'static str {
         match self {
-            Self::Dmabuf => "zwp_linux_dmabuf_v1",
-            Self::KeyboardExtension => "zcr_keyboard_extension_v1",
-            Self::AuraShell => "zaura_shell",
-            Self::Shm => "wl_shm",
-            Self::RemoteShell => "zcr_remote_shell_v2",
+            Self::Dmabuf => zwp_linux_dmabuf_v1::NAME,
+            Self::KeyboardExtension => zcr_keyboard_extension_v1::NAME,
+            Self::AuraShell => zaura_shell::NAME,
+            Self::Shm => wl_shm::NAME,
+            Self::RemoteShell => zcr_remote_shell_v2::NAME,
         }
     }
 
@@ -771,7 +778,7 @@ fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
 /// Advertise the synthetic `zwp_text_input_manager_v3` that the host
 /// `zwp_text_input_manager_v1` global `name` stands behind.
 fn advertise_text_input_manager_v3(ctx: &mut Context, name: u32) {
-    let interface = "zwp_text_input_manager_v3";
+    let interface = zwp_text_input_manager_v3::NAME;
     let version = zwp_text_input_manager_v3::VERSION;
     ctx.host_globals.insert(
         name,
@@ -964,7 +971,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // advertisement.
         ctx.removed_host_globals.remove(&name);
 
-        if interface == "zaura_shell" && version < ZAURA_SHELL_MIN_VERSION {
+        if interface == zaura_shell::NAME && version < ZAURA_SHELL_MIN_VERSION {
             log::debug!(
                 "Ignoring zaura_shell v{}; minimum supported version is {}",
                 version,
@@ -974,7 +981,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             return Action::Drop;
         }
 
-        if interface == "zwp_linux_dmabuf_v1" {
+        if interface == zwp_linux_dmabuf_v1::NAME {
             let generation = ctx
                 .global_generations
                 .get(&name)
@@ -1049,7 +1056,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // Drop the original global event so we don't send the host's
             // uncapped advertisement.
             return Action::Drop;
-        } else if interface == "zwp_text_input_manager_v1" {
+        } else if interface == zwp_text_input_manager_v1::NAME {
             let bound_version = version.min(TEXT_INPUT_MANAGER_VERSION);
             if ctx.host_text_input_manager_v1_id.is_some() {
                 advertise_text_input_manager_v3(ctx, name);
@@ -1076,7 +1083,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
 
             return Action::Drop;
-        } else if interface == "zcr_text_input_extension_v1" {
+        } else if interface == zcr_text_input_extension_v1::NAME {
             if ctx.host_text_input_extension_v1_id.is_some() {
                 ctx.hidden_host_globals.insert(name, interface.clone());
                 record_registry_global_visibility(ctx, name, false);
@@ -1103,7 +1110,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
 
             return Action::Drop;
-        } else if interface == "zcr_remote_shell_v2"
+        } else if interface == zcr_remote_shell_v2::NAME
             && crate::handler::window_placement::wants_remote_shell(ctx, version)
         {
             // Bound for the remote-shell-v2 placement backend and never
@@ -1116,7 +1123,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 return end;
             }
             return Action::Drop;
-        } else if interface == "zcr_keyboard_extension_v1" {
+        } else if interface == zcr_keyboard_extension_v1::NAME {
             ctx.hidden_host_globals.insert(name, interface.clone());
             record_registry_global_visibility(ctx, name, false);
             add_candidate(ctx, Singleton::KeyboardExtension, name, version);
@@ -1124,18 +1131,18 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 return end;
             }
             return Action::Drop;
-        } else if interface == "zaura_shell" {
+        } else if interface == zaura_shell::NAME {
             // The host-specific global is replaced at the guest boundary
             // with gtk_shell1, using the same numeric registry name so its
             // global_remove lifecycle remains paired.
             ctx.host_globals.insert(
                 name,
                 HostGlobal {
-                    interface: "gtk_shell1".to_string(),
+                    interface: gtk_shell1::NAME.to_string(),
                     version: gtk_shell1::VERSION,
                 },
             );
-            let visible = queue_synthetic_global(ctx, name, "gtk_shell1", gtk_shell1::VERSION);
+            let visible = queue_synthetic_global(ctx, name, gtk_shell1::NAME, gtk_shell1::VERSION);
             record_registry_global_visibility(ctx, name, visible);
             // The host compositor sends the same global list to every
             // wl_registry object, and the proxy has one internal aura shell
@@ -1145,7 +1152,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 return end;
             }
             return Action::Drop;
-        } else if interface == "wl_shm" {
+        } else if interface == wl_shm::NAME {
             ctx.host_globals.insert(
                 name,
                 HostGlobal {
@@ -1315,7 +1322,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             }
         };
 
-        if interface == "wl_shm" {
+        if interface == wl_shm::NAME {
             // Do NOT forward wl_shm to host. We emulate it.
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
@@ -1330,7 +1337,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // observed. Binding the synthetic guest global must not issue a
             // second host bind or create a guest→host alias.
             return Action::Drop;
-        } else if interface == "zwp_text_input_manager_v3" {
+        } else if interface == zwp_text_input_manager_v3::NAME {
             // This is a synthetic guest-only manager. Every guest manager
             // shares the one internal host v1 manager, so mapping each guest
             // ID to that host ID would overwrite the previous manager's
@@ -1339,7 +1346,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             return Action::Drop;
-        } else if interface == "gtk_shell1" {
+        } else if interface == gtk_shell1::NAME {
             ctx.shadow_table
                 .create_local(*guest_new_id, interface, *version);
             ctx.gtk_shells
@@ -1360,9 +1367,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // guest metadata at v4 so feedback requests are accepted locally,
         // but clamp the paired host object to v3 so registry.bind does not
         // request an unsupported host version.
-        let host_version = if interface == "zwp_linux_dmabuf_v1" {
+        let host_version = if interface == zwp_linux_dmabuf_v1::NAME {
             (*version).min(LINUX_DMABUF_CAPABILITY_VERSION)
-        } else if interface == "wl_compositor" {
+        } else if interface == wl_compositor::NAME {
             // Every guest v4 request missing from host v3 is handled locally.
             (*version).min(WL_COMPOSITOR_HOST_VERSION)
         } else {
@@ -1393,7 +1400,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 "Failed to bind host {interface} for the guest"
             ));
         }
-        if interface == "wl_output" {
+        if interface == wl_output::NAME {
             // Register the output only once its bind is queued, so the
             // failure paths above have no output state to undo.
             ctx.outputs.bind(
@@ -1405,11 +1412,11 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             // insets).
             crate::handler::window_placement::output_bound(ctx, host_new_id);
         }
-        if interface == "zwp_linux_dmabuf_v1" {
+        if interface == zwp_linux_dmabuf_v1::NAME {
             ctx.dmabuf_guest_generations
                 .insert(*guest_new_id, generation);
         }
-        if interface == "wl_seat" {
+        if interface == wl_seat::NAME {
             // A text input whose seat had no host object can activate now.
             crate::handler::text_input::reconcile_seat(ctx, *guest_new_id);
         }

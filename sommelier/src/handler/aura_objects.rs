@@ -46,19 +46,19 @@ pub(crate) struct AuraChild {
 
 impl AuraChild {
     pub(crate) const SURFACE: Self = Self {
-        interface: "zaura_surface",
+        interface: zaura_surface::NAME,
         get: zaura_shell::req::get_aura_surface,
         release: zaura_surface::req::release,
         release_since: zaura_surface::REQ_RELEASE_SINCE,
     };
     pub(crate) const TOPLEVEL: Self = Self {
-        interface: "zaura_toplevel",
+        interface: zaura_toplevel::NAME,
         get: zaura_shell::req::get_aura_toplevel_for_xdg_toplevel,
         release: zaura_toplevel::req::release,
         release_since: zaura_toplevel::REQ_RELEASE_SINCE,
     };
     pub(crate) const OUTPUT: Self = Self {
-        interface: "zaura_output",
+        interface: zaura_output::NAME,
         get: zaura_shell::req::get_aura_output,
         release: zaura_output::req::release,
         release_since: zaura_output::REQ_RELEASE_SINCE,

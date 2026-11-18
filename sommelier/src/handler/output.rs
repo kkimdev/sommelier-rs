@@ -27,6 +27,7 @@ use crate::handler::aura_objects;
 use crate::protocols::aura_shell::zaura_output::{self, ZauraOutputHandler};
 use crate::protocols::wayland::wl_output;
 use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::ZxdgOutputManagerV1Handler;
+use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1;
 use crate::state::{is_valid_transform, Context};
 use crate::wire::Action;
 
@@ -215,7 +216,8 @@ impl ZxdgOutputManagerV1Handler for OutputHandler {
         let version = ctx
             .shadow_table
             .guest_object_version_or_unknown(ctx.last_sender_id);
-        ctx.shadow_table.create_local(id, "zxdg_output_v1", version);
+        ctx.shadow_table
+            .create_local(id, zxdg_output_v1::NAME, version);
         Action::Drop
     }
 }

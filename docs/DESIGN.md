@@ -129,6 +129,8 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   proxy implements itself, and `zaura_shell` has a v6 floor.
   `forwarded_global_version` never offers a forwarded global above its
   generated `VERSION`.
+- A `NAME` constant, the interface's name. Handlers name an interface
+  by it, never by a copied literal.
 
 `generate_routing` derives the interface-to-protocol routing table, and
 `interface_version`, each interface's `VERSION` by name, from the same

@@ -531,6 +531,7 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
 fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String)>) -> TokenStream {
     let mod_name = format_ident!("{}", interface.name);
     let mut constant_names = ConstantNames::new(&interface.name);
+    constant_names.claim("NAME");
     constant_names.claim("VERSION");
     let handler_trait_name = format_ident!("{}Handler", snake_to_camel(&interface.name));
 
@@ -903,6 +904,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
         }
     }
 
+    // Handlers name the interface by its module's `NAME`, as the wire and
+    // the shadow table do, rather than spelling it again.
+    let interface_name = &interface.name;
     // The XML owns the newest version of each interface, as it owns each
     // message's since-version; nothing newer can be decoded.
     let interface_version = interface.version;
@@ -912,6 +916,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
         pub mod #mod_name {
             use super::*;
 
+            pub const NAME: &str = #interface_name;
             pub const VERSION: u32 = #interface_version;
             #(#request_opcodes)*
             #(#event_opcodes)*
@@ -1301,8 +1306,9 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
 
 /// The flat constant names of one interface module.
 ///
-/// Opcodes, their `_SINCE` versions, `VERSION` and enum entries share one
-/// namespace, so an enum named after a message could produce a name twice.
+/// Opcodes, their `_SINCE` versions, `NAME`, `VERSION` and enum entries
+/// share one namespace, so an enum named after a message could produce a
+/// name twice.
 /// Generation stops instead of emitting a module that does not compile, or
 /// one where the name means something else than its XML.
 struct ConstantNames<'a> {

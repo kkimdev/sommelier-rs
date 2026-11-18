@@ -19,7 +19,7 @@ use crate::handler::compositor::native_wayland_app_id;
 use crate::handler::window_placement::set_aura_application_id;
 use crate::protocols::aura_shell::zaura_surface;
 use crate::protocols::gtk::gtk_shell1::{self, GtkShell1Handler};
-use crate::protocols::gtk::gtk_surface1::GtkSurface1Handler;
+use crate::protocols::gtk::gtk_surface1::{self, GtkSurface1Handler};
 use crate::state::{Context, GtkSurfaceState};
 use crate::wire::{queue_or_drop, Action};
 
@@ -77,7 +77,7 @@ impl GtkShell1Handler for GtkShellHandler {
         // A new object takes its parent's version.
         let version = ctx.shadow_table.guest_object_version_or_unknown(shell_id);
         ctx.shadow_table
-            .create_local(gtk_surface_id, "gtk_surface1", version);
+            .create_local(gtk_surface_id, gtk_surface1::NAME, version);
         ctx.gtk_surfaces.insert(
             gtk_surface_id,
             GtkSurfaceState {

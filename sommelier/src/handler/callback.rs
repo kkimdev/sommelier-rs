@@ -32,7 +32,7 @@ pub struct CallbackHandler;
 pub(crate) fn queue_internal_sync(ctx: &mut Context, waits_for: InternalCallback) -> HostId {
     let callback = HostId(
         ctx.shadow_table
-            .create_host_only("wl_callback", wl_callback::VERSION),
+            .create_host_only(wl_callback::NAME, wl_callback::VERSION),
     );
     ctx.internal_callbacks.register(callback, waits_for);
     ctx.client_to_host_queue

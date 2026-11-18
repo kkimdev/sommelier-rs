@@ -239,8 +239,17 @@ mod tests {
             .expect("zaura_shell module");
         assert!(
             compact[zaura_shell_start..]
-                .starts_with("pubmodzaura_shell{usesuper::*;pubconstVERSION:u32=38u32;"),
+                .starts_with("pubmodzaura_shell{usesuper::*;pubconstNAME:&str=\"zaura_shell\";pubconstVERSION:u32=38u32;"),
             "an interface's XML version must become its VERSION constant"
+        );
+    }
+
+    #[test]
+    fn test_generate_interface_name_from_protocol_xml() {
+        let gtk = generate_compact("gtk-shell.xml");
+        assert!(
+            gtk.contains("pubmodgtk_shell1{usesuper::*;pubconstNAME:&str=\"gtk_shell1\";"),
+            "an interface module names its interface"
         );
     }
 

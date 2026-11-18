@@ -249,7 +249,7 @@ impl ShadowTable {
     /// Create `wl_display`, the object a connection starts with, under the
     /// ID it has on both sides.
     pub fn create_display(&mut self) {
-        let interface = || Interface::new("wl_display", wl_display::VERSION);
+        let interface = || Interface::new(wl_display::NAME, wl_display::VERSION);
         self.insert_pair(
             GuestId(WL_DISPLAY_ID),
             interface(),

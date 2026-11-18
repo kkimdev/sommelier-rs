@@ -61,7 +61,9 @@ use super::{PlacementSkip, PlacementTarget};
 use crate::protocols::remote_shell_unstable_v2::{
     self, zcr_remote_shell_v2, zcr_remote_surface_v2,
 };
-use crate::protocols::xdg_decoration_unstable_v1::zxdg_decoration_manager_v1;
+use crate::protocols::xdg_decoration_unstable_v1::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use crate::protocols::xdg_shell::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
 use crate::state::{Context, RemoteShellManager, RemoteShellPlacementState};
 use crate::wire::{queue_or_drop, Action, Outgoing, ProtocolError, WireMessage};
@@ -140,7 +142,7 @@ pub(super) fn bind_manager(
     let version = version.min(zcr_remote_shell_v2::VERSION);
     let host_id = ctx
         .shadow_table
-        .create_host_only("zcr_remote_shell_v2", version);
+        .create_host_only(zcr_remote_shell_v2::NAME, version);
     log::info!("Bound zcr_remote_shell_v2 v{version} (host_id={host_id}) for window placement");
     let manager = RemoteShellManager {
         global_name,
@@ -208,7 +210,7 @@ pub(super) fn claim_xdg_surface(
         .shadow_table
         .guest_object_version_or_unknown(ctx.last_sender_id);
     ctx.shadow_table
-        .create_local(xdg_surface_guest_id, "xdg_surface", version);
+        .create_local(xdg_surface_guest_id, xdg_surface::NAME, version);
     Some(Action::Drop)
 }
 
@@ -225,7 +227,7 @@ pub(super) fn dispatch_facade_request(
     let mut facade = Facade;
     // The manager is the host's, but a decoration for a facade toplevel
     // could not name it on the host.
-    if interface == "zxdg_decoration_manager_v1" {
+    if interface == zxdg_decoration_manager_v1::NAME {
         return Some(zxdg_decoration_manager_v1::dispatch_request(
             msg,
             &mut facade,
@@ -236,9 +238,9 @@ pub(super) fn dispatch_facade_request(
         return None;
     }
     Some(match interface {
-        "xdg_surface" => xdg_surface::dispatch_request(msg, &mut facade, ctx),
-        "xdg_toplevel" => xdg_toplevel::dispatch_request(msg, &mut facade, ctx),
-        "xdg_popup" => xdg_popup::dispatch_request(msg, &mut facade, ctx),
+        xdg_surface::NAME => xdg_surface::dispatch_request(msg, &mut facade, ctx),
+        xdg_toplevel::NAME => xdg_toplevel::dispatch_request(msg, &mut facade, ctx),
+        xdg_popup::NAME => xdg_popup::dispatch_request(msg, &mut facade, ctx),
         _ => return None,
     })
 }
@@ -265,7 +267,7 @@ fn create_remote_surface(ctx: &mut Context, xdg_toplevel_guest_id: u32, wl_surfa
     };
     let remote_surface = ctx
         .shadow_table
-        .create_host_only("zcr_remote_surface_v2", manager.version);
+        .create_host_only(zcr_remote_surface_v2::NAME, manager.version);
     ctx.client_to_host_queue.extend([
         zcr_remote_shell_v2::req::get_remote_surface(
             manager.host_id,
@@ -536,7 +538,8 @@ impl xdg_surface::XdgSurfaceHandler for Facade {
             return reject_second_role(ctx, xdg_surface_guest_id);
         }
         let version = facade_version(ctx);
-        ctx.shadow_table.create_local(id, "xdg_toplevel", version);
+        ctx.shadow_table
+            .create_local(id, xdg_toplevel::NAME, version);
         if let Some(wl_surface_guest_id) = ctx.xdg_roles.add_toplevel(xdg_surface_guest_id, id) {
             create_remote_surface(ctx, id, wl_surface_guest_id);
         }
@@ -557,7 +560,7 @@ impl xdg_surface::XdgSurfaceHandler for Facade {
             return reject_second_role(ctx, xdg_surface_guest_id);
         }
         let version = facade_version(ctx);
-        ctx.shadow_table.create_local(id, "xdg_popup", version);
+        ctx.shadow_table.create_local(id, xdg_popup::NAME, version);
         state_mut(ctx).remember_popup(id, xdg_surface_guest_id);
         // Exo parents a popup only to an XDG surface, and the host has no
         // XDG surface here: dismiss it as a compositor would.
@@ -634,7 +637,7 @@ impl zxdg_decoration_manager_v1::ZxdgDecorationManagerV1Handler for Facade {
         // never configures, and completes its own destructor.
         let version = facade_version(ctx);
         ctx.shadow_table
-            .create_local(id, "zxdg_toplevel_decoration_v1", version);
+            .create_local(id, zxdg_toplevel_decoration_v1::NAME, version);
         Action::Drop
     }
 }
