@@ -1726,6 +1726,8 @@ mod tests {
                     _ => None,
                 })
                 .expect("the host activates the text input");
+            let done = zwp_text_input_v3::Event::Done { serial: 1 };
+            assert_eq!(self.s.guest_received(), [(id, done.into())]);
             Ime {
                 id,
                 host: host_id,
@@ -2105,7 +2107,7 @@ mod tests {
             .text_inputs
             .get_mut(&PLACED_TEXT_INPUT.guest)
             .unwrap()
-            .current_preedit = "한".to_string();
+            .current_preedit = crate::state::ShownPreedit::at_end("한");
     }
 
     /// A matched chord belongs to Sommelier while the policy is active, so
@@ -2638,7 +2640,7 @@ mod tests {
             .draining_callback()
             .expect("focus leave must drain the host IME generation");
         assert_ne!(ime_barrier.0, placement_barrier);
-        assert!(p.ctx.text_inputs[&t.guest].current_preedit.is_empty());
+        assert!(!p.ctx.text_inputs[&t.guest].current_preedit.has_text());
         assert_eq!(p.enter(PLACING, PLACED_HOST_SURFACE, &[]), Action::Forward);
         p.ctx.last_sender_id = t.guest;
         let mut v3 = crate::handler::text_input::TextInputV3Handler;
@@ -3778,7 +3780,7 @@ mod tests {
             state.committed.enabled = true;
             state.pending.surrounding_text = Some(Some(("stale".to_string(), 5, 5)));
             state.committed.surrounding_text = Some(("stale".to_string(), 5, 5));
-            state.current_preedit = "한".to_string();
+            state.current_preedit = crate::state::ShownPreedit::at_end("한");
             state.set_guest_commits(9);
             state.pending_cursor_position = Some((1, 1));
             state.host = crate::state::HostApplied::Active { content_type: None };
@@ -3794,7 +3796,7 @@ mod tests {
         assert!(!state.committed.enabled);
         assert!(!state.host_is_active());
         assert!(state.committed.surrounding_text.is_none());
-        assert!(state.current_preedit.is_empty());
+        assert!(!state.current_preedit.has_text());
         assert_eq!(state.pending_cursor_position, None);
         assert_eq!(state.guest_commit_serial(), 9);
         assert!(p.ctx.client_to_host_queue.iter().any(|(message, _)| {
@@ -3965,7 +3967,7 @@ mod tests {
                 && state.pending.enabled.is_none()
                 && !state.committed.enabled
                 && !state.host_is_active()
-                && state.current_preedit.is_empty()
+                && !state.current_preedit.has_text()
         }));
         assert_eq!(
             p.ctx.host_to_client_queue.len(),

@@ -85,13 +85,36 @@
   proxy drops deletes until the guest commits its surrounding text after
   such an edit, but a guest commit that crosses an edit in flight still
   counts as caught up, so the next delete can land wrong
-  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). For a
-  Chromium or Electron v3 guest this is deterministic after a delete
-  then a commit, as when a suggestion is accepted: Chromium answers the
-  delete's `done` with its text, which clears the gate, its commit count
-  moves on, and it reports the text after the commit only at the next
-  input-method event. Mirroring Exo's `SurroundingTextTracker` would
-  close this; no host has shown it.
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). A Chromium
+  or Electron v3 guest crosses one after a delete then a commit, as when
+  a suggestion is accepted: it answers the delete's `done` with its text,
+  which clears the gate, before it applies the commit. The `done` that
+  answers that report lets it report the text after the commit at once
+  (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
+  only a delete within that round trip can land wrong. Mirroring Exo's
+  `SurroundingTextTracker` would close this; no host has shown it.
+- A Chromium or Electron v3 guest can show a stale syllable again after
+  a click. Clicking during a composition makes Chromium commit the
+  syllable and `Reset()` its own composition, but Exo is never told:
+  text-input-v1 has no `reset` the proxy could send, so Exo keeps
+  composing, and the next answered `done` shows the old preedit again at
+  the click point. After a reset with a composition open, Chromium
+  ignores input-method text that no key brought for 100 ms
+  (`kIgnoreCommitsDuration`, `ui/base/ime/linux/input_method_auralinux.cc`),
+  which usually hides this; a busy Electron window can take longer. To
+  check: in VS Code, click, and click again, while a Korean syllable is
+  composing. The fix is to end Exo's composition on a pointer press on
+  the focused surface, as mutter and KWin end theirs; it is a tracked
+  follow-up.
+- The `done` that answers each guest text-input-v3 commit has not been
+  checked on a host. In Chrome or VS Code started with
+  `--enable-wayland-ime --wayland-text-input-version=3`, type Korean and
+  check that the candidate window follows the caret after a click or an
+  arrow key, before the next keystroke, and that a composition survives
+  the caret-rectangle updates it causes, with no syllable dropped or
+  doubled. In a GTK3 app such as Firefox, click in the field while a
+  syllable is composing: the syllable stays shown, and the next jamo
+  joins it.
 - Deletes are dropped while the guest has a selection, because GTK and Qt
   count v3 delete lengths from the cursor and Chromium's v3 client from
   the selection's ends; no lengths serve both. An input method that

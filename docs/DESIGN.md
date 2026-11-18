@@ -466,8 +466,9 @@ commits, so each guest commit forwards the ones it states. In the other
 direction, the edits of Exo's input method reach the guest as v3
 transactions, each closed by a `done`; a delete, which Exo counts from the
 start of the surrounding text, is measured against the text the guest last
-committed. The rules are under
-[Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
+committed. A guest commit that leaves the field enabled is answered
+with a `done`, which Chromium waits for before it sends more. The rules
+are under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical

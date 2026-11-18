@@ -812,7 +812,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   method lacks it: after every `activate`, including one a drain barrier
   or a seat without a host object deferred, when the guest changes it,
   when the field's surrounding text appears or goes, and when an enable
-  starts a new field. It sends none while no input method is attached and
+  or a disable starts a new field (an enable of an enabled field does
+  not). It sends none while no input method is attached and
   none the host already has: with a v8 extension Exo ignores an unchanged
   type, but before v8 `set_content_type` and `deprecated_set_input_type`
   map flags differently, so a resend changes the type twice, and each
@@ -912,8 +913,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     ends (`ui/ozone/platform/wayland/host/wayland_input_method_context.cc`
     802-825), so no lengths delete Exo's range in both;
   - for a non-negative index, while an edit of the input method that the
-    proxy forwarded (a non-empty commit, a confirmation, a preedit region
-    or a delete) is not yet in a surrounding text the guest committed
+    proxy forwarded (a non-empty commit, the reset commit of a cleared
+    preedit, a confirmation, a preedit region or a delete) is not yet in
+    a surrounding text the guest committed
     (`TextInputState::unreported_host_edit`), since Exo measures against
     its prediction of the text, which includes the edit;
   - if the range does not contain the cursor, does not fit that text on
@@ -929,8 +931,48 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   take its text from the guest's last report.
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
   `a_delete_waits_for_the_guest_to_report_the_input_methods_edits`,
+  `a_reset_commit_waits_for_the_guest_to_report_it`,
   `delete_lengths_read_both_conventions`,
   `an_unconvertible_delete_is_warned_of_once`.
+- **Every commit that leaves a field enabled gets a `done`.** The proxy
+  answers each such v3 `commit` with a `done` that carries its serial, as
+  mutter and KWin do. The protocol has a client send its surrounding text,
+  content type and cursor rectangle only once a `done` names its latest
+  commit, and Chromium does so: without this `done` it would hold them
+  until the input method's next event, and Exo's input method would place
+  its candidate window and compose against a stale caret and text. A
+  `done` applies the preedit sent since the one before, or none, so the
+  proxy first repeats the preedit the guest shows, with the cursor it was
+  sent with (`TextInputState::current_preedit`); GTK, Qt and Chromium
+  would otherwise drop the composition. That preedit must be the one the
+  host is still composing, so only a commit that changes whether the
+  field is enabled, or an enable the proxy ignores, starts a new field,
+  which ends the composition and the Backspace repeat leased to it and
+  tells the host its content type again. GTK3 enables an enabled field
+  again on every click in it, and mutter and KWin keep the preedit across
+  that too; the host keeps the content type, since before the v8
+  extension a resend would reset its composition. A commit that disables
+  the field, and a commit while unfocused, get no `done`, as from mutter;
+  nor does an enable ignored because another text input on the
+  connection is enabled, which leaves the field disabled. Nor do the
+  commits of a field whose focus a repair reset without telling the
+  guest (`repair_destroyed_surface_focus` finding the seat on the same
+  surface, which sends no `leave` and `enter`): the field counts as
+  disabled until the guest enables it again. A preedit the answer cannot
+  repeat is forgotten, since its bare `done` clears it. Host IME events reach the
+  guest as whole transactions, so this `done` never splits one, and it
+  leaves `unreported_host_edit` alone: only the surrounding text a commit
+  states clears that. Unlike mutter and KWin, the proxy cannot end the
+  host's composition when the guest resets its own (see HANDOVER).
+  Tests: `every_commit_of_an_enabled_field_gets_a_done`,
+  `a_commit_during_composition_keeps_the_preedit`,
+  `reenabling_an_enabled_field_keeps_its_composition`,
+  `only_an_enable_that_changes_the_field_closes_its_composition`,
+  `an_answer_that_cannot_repeat_the_preedit_forgets_it`,
+  `a_client_that_waits_for_done_reports_the_text_an_edit_leaves`,
+  `on_set_preedit_region_translates_correctly`,
+  `second_text_input_enable_on_the_connection_is_ignored`,
+  `oversized_surrounding_commit_does_not_partially_advance_state`.
 
 ## Process
 
