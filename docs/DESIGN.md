@@ -429,8 +429,8 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
-  `handler/buffer.rs` handles every guest `wl_buffer`, SHM or dma-buf:
-  its destroy and release, and its deferred retirement.
+  `BufferHandler` (`handler/buffer.rs`) handles every guest `wl_buffer`,
+  SHM or dma-buf: its destroy and release, and its deferred retirement.
 
 `handler/shm.rs` holds a submodule per concern, and re-exports what other
 handlers call:

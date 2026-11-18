@@ -1889,10 +1889,10 @@ mod tests {
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
 
-        let mut shm = crate::handler::shm::ShmHandler;
+        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = host_buffer_id;
         assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
             Action::Forward
         );
         assert!(ctx.buffer_is_released(buffer_id));
@@ -1909,7 +1909,7 @@ mod tests {
         // the host destructor immediately instead of waiting forever for an
         // event that cannot arrive.
         ctx.last_sender_id = buffer_id;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
         assert_eq!(
             host_requests(&ctx).last(),
             Some(&(host_buffer_id, wl_buffer::Request::Destroy {}.into())),
@@ -1941,10 +1941,10 @@ mod tests {
             "the ordered surface destructor ends the buffer's use"
         );
 
-        let mut shm = crate::handler::shm::ShmHandler;
+        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = host_buffer_id;
         assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
+            WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
             Action::Forward,
             "the guest still gets its wl_buffer.release"
         );
@@ -1967,10 +1967,10 @@ mod tests {
             set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
             assert!(ctx.mark_buffer_submitted(buffer));
 
-            let mut shm = crate::handler::shm::ShmHandler;
+            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
                 Action::Forward
             );
             ctx.last_sender_id = TEST_SURFACE;
@@ -1984,7 +1984,7 @@ mod tests {
             // could race the queued destructor.
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
@@ -2020,9 +2020,9 @@ mod tests {
                 CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
                 Action::Forward
             );
-            let mut shm = crate::handler::shm::ShmHandler;
+            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = buffer;
-            assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+            assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
 
             // This release belongs to the old committed interval. It must not
@@ -2030,7 +2030,7 @@ mod tests {
             // commit.
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
@@ -2046,7 +2046,7 @@ mod tests {
             // permits the host destructor.
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
@@ -2070,9 +2070,9 @@ mod tests {
                 CompositorHandler.on_attach(&mut ctx, old_buffer, 0, 0),
                 Action::Forward
             );
-            let mut shm = crate::handler::shm::ShmHandler;
+            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = old_buffer;
-            assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+            assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
             assert!(
                 buffer_is_guest_destroyed(&ctx, old_buffer),
                 "a pending attach keeps the {kind:?} buffer alive until replaced"
@@ -2545,9 +2545,9 @@ mod tests {
         // Wayland permits destroying the guest object after attach and before
         // commit. The host attach is already queued, so the local backing and
         // pending surface reference must survive until commit.
-        let mut shm = crate::handler::shm::ShmHandler;
+        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = buffer_id;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(buffer_handler.on_destroy(&mut ctx), Action::Drop);
         assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
         assert_eq!(
             ctx.surfaces
@@ -3640,10 +3640,10 @@ mod tests {
         // its surface. Once it eventually destroys the buffer, host teardown
         // must be ordered after the already-queued surface destructor instead
         // of waiting forever for a release that may never arrive.
-        let mut shm = crate::handler::shm::ShmHandler;
+        let mut buffer_handler = crate::handler::buffer::BufferHandler;
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
-            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+            WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
             Action::Drop
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
@@ -3723,10 +3723,10 @@ mod tests {
                 "{kind:?}"
             );
 
-            let mut shm = crate::handler::shm::ShmHandler;
+            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             ctx.client_to_host_queue.clear();
@@ -3754,7 +3754,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert!(
@@ -3786,10 +3786,10 @@ mod tests {
                 CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
                 Action::Forward
             );
-            let mut shm = crate::handler::shm::ShmHandler;
+            let mut buffer_handler = crate::handler::buffer::BufferHandler;
             ctx.last_sender_id = buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                WlBufferHandler::on_destroy(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert_eq!(buffer_lifecycle(&ctx, buffer), awaiting_release, "{kind:?}");
@@ -3813,7 +3813,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                WlBufferHandler::on_release(&mut buffer_handler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");

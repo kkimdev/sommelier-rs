@@ -945,8 +945,8 @@ mod tests {
         maybe_reclaim_capability_generation, LinuxDmabufHandler, DRM_FORMAT_MOD_INVALID,
         MAX_FEEDBACK_FORMATS,
     };
+    use crate::handler::buffer::BufferHandler;
     use crate::handler::display::DisplayHandler;
-    use crate::handler::shm::ShmHandler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::{
         self, evt, ZwpLinuxBufferParamsV1Handler,
     };
@@ -1605,7 +1605,7 @@ mod tests {
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = first_guest_buffer;
         let mut destroy = WireMessage::new(first_guest_buffer, wl_buffer::REQ_DESTROY, &[]);
-        let dispatched = wl_buffer::dispatch_request(&mut destroy, &mut ShmHandler, &mut ctx);
+        let dispatched = wl_buffer::dispatch_request(&mut destroy, &mut BufferHandler, &mut ctx);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(ctx.shadow_table.get_host_id(first_guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(HOST_BUFFER), None);
