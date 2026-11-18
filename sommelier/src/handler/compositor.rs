@@ -2427,6 +2427,73 @@ mod tests {
         );
     }
 
+    /// Surface damage of more rectangles than the proxy keeps damages the
+    /// whole surface, so a damage-only commit copies the whole buffer, not
+    /// just the buffer damage, which here is none.
+    #[tokio::test]
+    async fn overflowing_surface_damage_copies_the_whole_buffer() {
+        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        let pool_file = shm_pool_file(&[0x11; 8]);
+        let pool = s.shm_pool(shm, pool_file.try_clone().unwrap()).await;
+        let buffer = s.new_id();
+        s.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            0,
+            2,
+            1,
+            8,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let received = s.host_received();
+        let Some(host_pool) = received.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, .. }) => Some(fd),
+            _ => None,
+        }) else {
+            panic!("the host got no pool: {received:?}");
+        };
+        let host_pool = std::fs::File::from(host_pool.try_clone().unwrap());
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
+            wl_surface::req::damage(surface.id, 0, 0, 2, 1),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
+
+        // The client redraws both pixels, and damages only the first, in
+        // more rectangles than the proxy keeps (256).
+        pool_file.write_all_at(&[0x22; 8], 0).unwrap();
+        let damage = (0..=256).map(|_| wl_surface::req::damage(surface.id, 0, 0, 1, 1));
+        s.guest(damage.chain([wl_surface::req::commit(surface.id)]))
+            .await;
+        assert_eq!(
+            s.host_received(),
+            [
+                (
+                    surface.host,
+                    wl_surface::Request::Damage {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1
+                    }
+                    .into()
+                ),
+                (surface.host, wl_surface::Request::Commit {}.into()),
+            ]
+        );
+
+        let mut host_pixels = [0; 8];
+        host_pool.read_exact_at(&mut host_pixels, 0).unwrap();
+        assert_eq!(host_pixels, [0x22; 8]);
+        assert_eq!(s.guest_received(), []);
+    }
+
     #[test]
     fn damage_only_commit_does_not_read_a_released_shm_buffer() {
         // After wl_buffer.release the client owns the storage and may be
