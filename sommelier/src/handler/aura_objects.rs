@@ -66,17 +66,18 @@ impl AuraChild {
 }
 
 /// The version [`create`] recorded for a live Aura child: its shell's.
-/// A missing one is a bookkeeping bug; release builds then guess the
-/// current shell's version (0 without one) rather than crash the proxy.
+/// A missing one is a bookkeeping bug; release builds then use version 0
+/// rather than crash the proxy, so the child is sent no request that needs
+/// a version. The current shell's version would not do: it may be newer
+/// than the shell generation that created the child, and a request the
+/// child lacks is a protocol error that ends the session.
 pub(crate) fn aura_object_version(ctx: &Context, aura_object_host_id: u32) -> u32 {
     let version = ctx.shadow_table.host_object_version(aura_object_host_id);
     debug_assert!(
         version.is_some(),
         "Aura child {aura_object_host_id} has no recorded version"
     );
-    version
-        .or(ctx.host_zaura_shell.map(|shell| shell.version))
-        .unwrap_or_default()
+    version.unwrap_or(0)
 }
 
 /// Create a host Aura child that extends `parent_host_id`.
