@@ -166,6 +166,9 @@ impl GtkSurface1Handler for GtkShellHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::test_support::{
+        add_surface, bind_shell, toplevel_ctx_with, SHELL, SURFACE,
+    };
     use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
     use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
     use crate::state::GtkShellState;
@@ -174,31 +177,35 @@ mod tests {
 
     const GTK_SHELL: u32 = 10;
     const GTK_SURFACE: u32 = 11;
-    const WL_SURFACE_GUEST: u32 = 20;
-    const WL_SURFACE_HOST: u32 = 120;
-    const ZAURA_SHELL_HOST: u32 = 200;
+
+    /// Give `ctx` the gtk_shell1 [`GTK_SHELL`].
+    fn add_gtk_shell(ctx: &mut Context) {
+        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
+        ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
+    }
+
+    /// [`toplevel_ctx_with`] `placement` and [`add_gtk_shell`].
+    fn setup_ctx_with(placement: crate::placement_config::PlacementConfig) -> Context {
+        let mut ctx = toplevel_ctx_with(placement);
+        add_gtk_shell(&mut ctx);
+        ctx
+    }
+
+    /// [`setup_ctx`], but [`SURFACE`] has no role.
+    fn roleless_ctx() -> Context {
+        let mut ctx = Context::with_placement_for_test(
+            crate::placement_config::PlacementConfig::for_test(Vec::new()),
+        );
+        add_surface(&mut ctx);
+        bind_shell(&mut ctx);
+        add_gtk_shell(&mut ctx);
+        ctx
+    }
 
     fn setup_ctx() -> Context {
         setup_ctx_with(crate::placement_config::PlacementConfig::for_test(
             Vec::new(),
         ))
-    }
-
-    /// [`setup_ctx`] with an explicit placement configuration.
-    fn setup_ctx_with(placement: crate::placement_config::PlacementConfig) -> Context {
-        let mut ctx = Context::with_placement_for_test(placement);
-        ctx.shadow_table.create_local(GTK_SHELL, "gtk_shell1", 1);
-        ctx.gtk_shells.insert(GTK_SHELL, GtkShellState::default());
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            WL_SURFACE_GUEST,
-            WL_SURFACE_HOST,
-            "wl_surface",
-            4,
-        );
-        ctx.bind_aura_shell_for_test(ZAURA_SHELL_HOST);
-        ctx.shadow_table
-            .insert_host_only_for_test(ZAURA_SHELL_HOST, "zaura_shell", 38);
-        ctx
     }
 
     fn nullable_string(message: &[u8]) -> Option<String> {
@@ -216,22 +223,19 @@ mod tests {
             Action::Drop
         );
         assert_eq!(
-            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST),
+            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest),
             Action::Drop
         );
 
         assert_eq!(ctx.client_to_host_queue.len(), 2);
         let get_aura_surface = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_sender(get_aura_surface), ZAURA_SHELL_HOST);
+        assert_eq!(msg_sender(get_aura_surface), SHELL);
         assert_eq!(msg_opcode(get_aura_surface), REQ_GET_AURA_SURFACE);
         let startup_id = &ctx.client_to_host_queue[1].0;
         assert_eq!(msg_opcode(startup_id), zaura_surface::REQ_SET_STARTUP_ID);
         assert_eq!(nullable_string(startup_id).as_deref(), Some("launch-token"));
         assert!(ctx.shadow_table.is_local(GTK_SURFACE));
-        assert_eq!(
-            ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id,
-            WL_SURFACE_GUEST
-        );
+        assert_eq!(ctx.gtk_surfaces[&GTK_SURFACE].wl_surface_id, SURFACE.guest);
     }
 
     #[test]
@@ -243,7 +247,7 @@ mod tests {
         ctx.shadow_table
             .set_guest_version_for_test(GTK_SHELL, shell_version);
         ctx.last_sender_id = GTK_SHELL;
-        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         assert_eq!(
             ctx.shadow_table.guest_object_version(GTK_SURFACE),
             Some(shell_version)
@@ -255,8 +259,8 @@ mod tests {
         let mut ctx = setup_ctx();
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE + 1, WL_SURFACE_GUEST);
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE + 1, SURFACE.guest);
         ctx.client_to_host_queue.clear();
 
         handler.on_set_startup_id(&mut ctx, &Some("next-token".to_string()));
@@ -276,40 +280,44 @@ mod tests {
         assert_eq!(nullable_string(&ctx.client_to_host_queue[0].0), None);
     }
 
+    /// GTK names the application of a surface with or without a role.
     #[test]
     fn dbus_application_id_is_namespaced_on_aura_surface() {
-        let mut ctx = setup_ctx();
-        ctx.last_sender_id = GTK_SHELL;
-        let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
-        ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = GTK_SURFACE;
+        for (case, mut ctx) in [("toplevel", setup_ctx()), ("no role", roleless_ctx())] {
+            ctx.last_sender_id = GTK_SHELL;
+            let mut handler = GtkShellHandler;
+            handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
+            ctx.client_to_host_queue.clear();
+            ctx.last_sender_id = GTK_SURFACE;
 
-        assert_eq!(
-            handler.on_set_dbus_properties(
-                &mut ctx,
-                &Some("com.example.Terminal".to_string()),
-                &None,
-                &None,
-                &None,
-                &None,
-                &None,
-            ),
-            Action::Drop
-        );
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        let message = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID);
-        assert_eq!(
-            nullable_string(message).as_deref(),
-            Some(
-                format!(
-                    "org.chromium.guest_os.{}.wayland.com.example.Terminal",
-                    ctx.vm_identifier
-                )
-                .as_str()
-            )
-        );
+            assert_eq!(
+                handler.on_set_dbus_properties(
+                    &mut ctx,
+                    &Some("com.example.Terminal".to_string()),
+                    &None,
+                    &None,
+                    &None,
+                    &None,
+                    &None,
+                ),
+                Action::Drop,
+                "{case}"
+            );
+            assert_eq!(ctx.client_to_host_queue.len(), 1, "{case}");
+            let message = &ctx.client_to_host_queue[0].0;
+            assert_eq!(msg_opcode(message), REQ_SET_APPLICATION_ID, "{case}");
+            assert_eq!(
+                nullable_string(message).as_deref(),
+                Some(
+                    format!(
+                        "org.chromium.guest_os.{}.wayland.com.example.Terminal",
+                        ctx.vm_identifier
+                    )
+                    .as_str()
+                ),
+                "{case}"
+            );
+        }
     }
 
     /// A GTK surface created between a `zaura_shell`'s `global_remove` and
@@ -347,9 +355,9 @@ mod tests {
         RegistryHandler.on_global_remove(&mut ctx, SHELL_NAME);
         assert_eq!(ctx.host_zaura_shell, None);
         ctx.last_sender_id = GTK_SHELL;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         set_application_id(&mut ctx);
-        assert_eq!(ctx.aura_surfaces.get(WL_SURFACE_HOST), None);
+        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
 
         ctx.last_sender_id = REGISTRY;
         RegistryHandler.on_global(&mut ctx, SHELL_NAME, &shell, 38);
@@ -361,7 +369,7 @@ mod tests {
 
         let zaura_surface = ctx
             .aura_surfaces
-            .get(WL_SURFACE_HOST)
+            .get(SURFACE.host)
             .expect("set_startup_id creates the Aura surface");
         let queued = queued_headers(&ctx.client_to_host_queue);
         assert_eq!(
@@ -379,7 +387,7 @@ mod tests {
         let mut ctx =
             setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         ctx.last_sender_id = GTK_SHELL;
-        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        GtkShellHandler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         assert!(
             !ctx.window_placement
                 .arc()
@@ -394,7 +402,7 @@ mod tests {
             setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = GTK_SURFACE;
 
@@ -425,7 +433,7 @@ mod tests {
             Some(application_id.as_str()),
             ctx.window_placement
                 .arc_mut()
-                .and_then(|arc| arc.arc_application_id(WL_SURFACE_GUEST))
+                .and_then(|arc| arc.arc_application_id(SURFACE.guest))
                 .as_deref()
         );
     }
@@ -437,10 +445,10 @@ mod tests {
         let mut ctx = setup_ctx();
         ctx.last_sender_id = GTK_SHELL;
         let mut handler = GtkShellHandler;
-        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, WL_SURFACE_GUEST);
+        handler.on_get_gtk_surface(&mut ctx, GTK_SURFACE, SURFACE.guest);
         assert!(ctx.gtk_shells[&GTK_SHELL].surfaces.contains(&GTK_SURFACE));
 
-        ctx.last_sender_id = WL_SURFACE_GUEST;
+        ctx.last_sender_id = SURFACE.guest;
         let mut compositor = crate::handler::compositor::CompositorHandler;
         assert_eq!(compositor.on_destroy(&mut ctx), Action::Drop);
         assert!(!ctx.gtk_surfaces.contains_key(&GTK_SURFACE));
@@ -450,6 +458,6 @@ mod tests {
             "gtk_surface1 has no destroy request, so its client ID stays reserved"
         );
         assert!(!ctx.shadow_table.is_guest_id_available(GTK_SURFACE));
-        assert_eq!(ctx.aura_surfaces.get(WL_SURFACE_HOST), None);
+        assert_eq!(ctx.aura_surfaces.get(SURFACE.host), None);
     }
 }
