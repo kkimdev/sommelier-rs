@@ -42,11 +42,12 @@ limitations under the License.
 //! composing (`ResetContext`), and the engine reaches that reset after
 //! every key handed over before it.
 //!
-//! In Korean mode the engine composes with [`Composer`], except that Space
-//! ending a composition is part of the commit and handled, as the ChromeOS
-//! Korean engine does in the host trace that the proxy's test
-//! `held_space_repeats_after_ime_commit_until_physical_release` records. In
-//! Latin mode it handles no key, and it handles no release in either.
+//! The engine is the Korean one: it composes with [`Composer`], except that
+//! Space ending a composition is part of the commit and handled, as the
+//! ChromeOS Korean engine does in the host trace that the proxy's test
+//! `held_space_repeats_after_ime_commit_until_physical_release` records,
+//! and it handles no release. A Latin layout has no engine
+//! ([`Exo::latin`](super::exo::Exo)), and its keys never come here.
 
 use super::clock::Micros;
 use super::hangul::{Composer, Key, Output};
@@ -78,15 +79,6 @@ pub(super) enum TextAction {
     Commit(String),
     /// Show this composition; an empty one ends it.
     Preedit(String),
-}
-
-/// What the engine does with keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Mode {
-    /// The Korean two-set input method.
-    Korean,
-    /// An input method that handles no key, as for English.
-    Latin,
 }
 
 /// How long the engine takes over a key, drawn once per case.
@@ -135,7 +127,6 @@ struct InService {
 
 /// The engine, with what Exo handed it that it has not answered yet.
 pub(super) struct Engine {
-    mode: Mode,
     lag: Lag,
     composer: Composer,
     /// What the engine has not reached yet, in order.
@@ -144,9 +135,8 @@ pub(super) struct Engine {
 }
 
 impl Engine {
-    pub fn new(mode: Mode, lag: Lag) -> Self {
+    pub fn new(lag: Lag) -> Self {
         Self {
-            mode,
             lag,
             composer: Composer::default(),
             queue: VecDeque::new(),
@@ -208,7 +198,7 @@ impl Engine {
     /// composition if it differs from the one shown, which a commit ends;
     /// and whether the engine handled the key.
     fn answer(&mut self, key: Key, pressed: bool) -> (Vec<TextAction>, bool) {
-        if !pressed || self.mode == Mode::Latin {
+        if !pressed {
             return (Vec::new(), false);
         }
         let shown = self.composer.preedit();
@@ -240,10 +230,10 @@ mod tests {
     use super::*;
     use crate::sim::hangul::keys;
 
-    /// The answers of an engine in `mode`, with no lag, to `script` (see
+    /// The answers of the engine, with no lag, to `script` (see
     /// [`keys`]): each press's text and whether the engine handled it.
-    fn answers(mode: Mode, script: &str) -> Vec<(Vec<TextAction>, bool)> {
-        let mut engine = Engine::new(mode, Lag::Fast);
+    fn answers(script: &str) -> Vec<(Vec<TextAction>, bool)> {
+        let mut engine = Engine::new(Lag::Fast);
         let mut answers = Vec::new();
         for (id, key) in (0..).zip(keys(script)) {
             engine.send(Micros(0), press(key, id), &mut |_| 0);
@@ -284,7 +274,7 @@ mod tests {
     #[test]
     fn korean_mode_composes_and_sends_only_what_changed() {
         assert_eq!(
-            answers(Mode::Korean, "rkrk⌫⌫⌫"),
+            answers("rkrk⌫⌫⌫"),
             [
                 (vec![preedit("ㄱ")], true),
                 (vec![preedit("가")], true),
@@ -302,7 +292,7 @@ mod tests {
     #[test]
     fn space_ending_a_composition_is_committed_with_it() {
         assert_eq!(
-            answers(Mode::Korean, "rk  ⏎"),
+            answers("rk  ⏎"),
             [
                 (vec![preedit("ㄱ")], true),
                 (vec![preedit("가")], true),
@@ -312,16 +302,12 @@ mod tests {
                 (vec![], false),
             ]
         );
-        assert_eq!(answers(Mode::Korean, "r⏎")[1], (vec![commit("ㄱ")], false));
+        assert_eq!(answers("r⏎")[1], (vec![commit("ㄱ")], false));
     }
 
     #[test]
-    fn latin_mode_and_every_release_are_unhandled() {
-        assert_eq!(
-            answers(Mode::Latin, "rk"),
-            [(vec![], false), (vec![], false)]
-        );
-        let mut engine = Engine::new(Mode::Korean, Lag::Fast);
+    fn every_release_is_unhandled() {
+        let mut engine = Engine::new(Lag::Fast);
         let release = EngineIn::Key {
             key: Key::Char('r'),
             pressed: false,
@@ -356,7 +342,7 @@ mod tests {
 
     #[test]
     fn the_text_comes_after_the_service_time_and_the_callback_a_gap_later() {
-        let mut engine = Engine::new(Mode::Korean, Lag::Normal);
+        let mut engine = Engine::new(Lag::Normal);
         // Every service time and gap at its largest.
         let mut choices = |n: u32| n - 1;
         for (id, key) in (0..).zip(keys("rk")) {
@@ -383,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_reset_cancels_no_key_handed_over_before_it() {
-        let mut engine = Engine::new(Mode::Korean, Lag::Fast);
+        let mut engine = Engine::new(Lag::Fast);
         let mut choices = |_| 0;
         for (id, key) in (0..).zip(keys("rk")) {
             engine.send(Micros(0), press(key, id), &mut choices);

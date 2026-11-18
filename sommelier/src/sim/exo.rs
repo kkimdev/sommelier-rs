@@ -378,6 +378,10 @@ pub(crate) struct Exo {
     /// it, and the `wl_keyboard.key` that uses it frees it.
     key_serial: Option<u32>,
     ima: Ima,
+    /// Whether the case's input method is a Latin layout, which has no
+    /// engine: IMA then dispatches every key at once, with no callback, no
+    /// confirmation and no lag (`DispatchKeyEvent` without `GetEngine()`).
+    pub(super) latin: bool,
     /// What Exo handed the engine and no one has taken yet, in order.
     to_engine: Vec<EngineIn>,
     /// The keys the engine has yet to answer, in order.
@@ -421,14 +425,15 @@ impl Exo {
     }
 
     /// The user presses or releases `key` at `now`, as `state` says. While
-    /// the input method serves a text input, Exo hands the key to the
-    /// engine and sends its events with the engine's callback
-    /// ([`Exo::answer`]). Otherwise the input method has no client and
-    /// passes the key, which reaches the keyboard at once (E7).
+    /// the input method serves a text input and has an engine, Exo hands
+    /// the key to the engine and sends its events with the engine's
+    /// callback ([`Exo::answer`]). Otherwise the input method has no client
+    /// or no engine ([`Exo::latin`]) and passes the key, which reaches the
+    /// keyboard at once (E7).
     pub(super) fn key(&mut self, now: Micros, key: Key, state: u32) {
         let pressed = state == wl_keyboard::KEY_STATE_PRESSED;
         let time = millis(now);
-        if self.ima.client.is_none() {
+        if self.ima.client.is_none() || self.latin {
             let consumed = if pressed {
                 self.pressed.insert(keymap::keycode(key).0, false);
                 false
@@ -1555,6 +1560,24 @@ mod tests {
         assert!(!exo.in_engine[0].late);
         assert!(exo.ima.composing);
         assert_eq!(exo.ima.client, None);
+    }
+
+    #[test]
+    fn a_latin_layout_has_no_engine_and_its_keys_go_out_at_once() {
+        let mut exo = active(V11);
+        exo.latin = true;
+        exo.key(NOW, k('r'), DOWN);
+        exo.key(NOW, k('r'), UP);
+        assert_eq!(exo.take_engine(), []);
+        // No `confirm_preedit` before an unhandled press, no callback.
+        let raw = [
+            peek(1, 'r', DOWN),
+            key(1, 'r', DOWN),
+            peek(2, 'r', UP),
+            key(2, 'r', UP),
+        ];
+        assert_eq!(events(&mut exo), raw);
+        assert!(exo.in_engine.is_empty());
     }
 
     #[test]
