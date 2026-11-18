@@ -1406,22 +1406,6 @@ impl KeyGenerationRegistry {
             .is_some_and(|generation| generation.host_accelerator_suppressed)
     }
 
-    pub(crate) fn clear_accelerator_suppressions(&mut self, keyboard: HostId) {
-        let keys = self
-            .entries
-            .get(&keyboard)
-            .map(|keys| keys.keys().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if let Some(generations) = self.entries.get_mut(&keyboard) {
-            for generation in generations.values_mut() {
-                generation.host_accelerator_suppressed = false;
-            }
-        }
-        for key in keys {
-            self.prune_key(keyboard, key);
-        }
-    }
-
     /// Route a `wl_keyboard` event to the channel that owns its generation.
     ///
     /// This applies [`GuestKeyOwner::admits_compositor_shortcut`] inside the

@@ -327,15 +327,26 @@ impl KeyboardHandler {
         class
     }
 
+    /// Forget the keyboard's keymap and all that was derived from it: its
+    /// XKB state and its keysym and repeat tables.
+    ///
+    /// The keys held and their generations stay, including the suppression
+    /// of a held accelerator's key, which its press set and its release
+    /// takes. Wayland may send a keymap, usable or not, while keys are held,
+    /// as Exo does when Ctrl+Space switches the layout; ending their
+    /// generations would send their releases to the host instead of the
+    /// guest that got their presses, and leave the guest with stuck keys,
+    /// and ending a suppression would let the IME hand the accelerator's
+    /// key to the guest.
     fn clear_host_keyboard_keymap(ctx: &mut Context, host_keyboard_id: HostId) {
         ctx.keyboard_keymaps.remove(&host_keyboard_id);
         ctx.keyboard_xkb_states.remove(&host_keyboard_id);
         ctx.keyboard_repeatable_keys.remove(&host_keyboard_id);
+        ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
     }
 
     fn clear_host_keyboard_keymap_and_state(ctx: &mut Context, host_keyboard_id: HostId) {
         Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-        ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
         Self::clear_host_keyboard_state(ctx, host_keyboard_id);
     }
 
@@ -481,27 +492,27 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
     ) -> Action {
         let host_keyboard_id = HostId::from_event_sender(ctx);
         if format == KEYMAP_FORMAT_NO_KEYMAP {
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         }
         // Only handle XKB_V1 format keymaps.
         if format != KEYMAP_FORMAT_XKB_V1 {
             log::warn!("on_keymap: unsupported keymap format {}, ignoring", format);
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         }
 
         // A zero-size keymap is malformed; mmap(len=0) is UB per POSIX.
         if size == 0 {
             log::warn!("on_keymap: received zero-size keymap from host, ignoring");
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         }
         if size > MAX_KEYMAP_SIZE {
             log::warn!(
                 "on_keymap: keymap of {size} bytes exceeds the {MAX_KEYMAP_SIZE}-byte limit, ignoring"
             );
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         }
 
@@ -513,7 +524,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 fd.as_raw_fd(),
                 size
             );
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         };
         let slice = mapping.as_bytes();
@@ -525,7 +536,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             log::error!(
                 "on_keymap: keymap data is missing the trailing NUL required by the Wayland spec"
             );
-            Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             return Action::Forward;
         }
         let len = slice.len() - 1;
@@ -533,12 +544,7 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
         match std::str::from_utf8(&slice[..len]) {
             Err(e) => {
                 log::error!("on_keymap: keymap bytes are not valid UTF-8: {}", e);
-                // Clear keymap, state, and drop set together: all three must
-                // remain mutually consistent. Leaving `keymap` set while `state`
-                // is None creates a split where future code reading `keymap`
-                // operates on stale data with no active XKB state to validate
-                // against.
-                Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+                Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
             }
             Ok(s) => match xkb::Keymap::new_from_string(
                 &self.context,
@@ -551,20 +557,10 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
             ) {
                 None => {
                     log::error!("on_keymap: xkbcommon failed to compile the keymap string");
-                    // Clear keymap, state, and drop set together for the same
-                    // consistency reason as the UTF-8 error case above: all
-                    // three must remain in sync.
-                    Self::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+                    Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
                 }
                 Some(keymap) => {
-                    // Replacing the XKB keymap must not end the current
-                    // physical-key session. Wayland may resend a keymap while
-                    // keys are held; clearing the forwarded/pressed sets here
-                    // would make the later releases disappear and leave the
-                    // guest with stuck keys. Reset only XKB interpretation
-                    // state and accelerator drop bookkeeping.
                     Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-                    ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
                     let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
                     let repeatable_keys = Self::repeatable_evdev_keycodes(&keymap);
                     let mut state = xkb::State::new(&keymap);
@@ -579,11 +575,6 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                         .insert(host_keyboard_id, keysym_map);
                     ctx.keyboard_repeatable_keys
                         .insert(host_keyboard_id, repeatable_keys);
-                    // Clear stale drop state: a key dropped under the old
-                    // keymap may map to a different keysym under the new one,
-                    // and a forgotten drop entry would cause a stuck key.
-                    ctx.key_generations
-                        .clear_accelerator_suppressions(host_keyboard_id);
                     log::info!("XKB keymap loaded successfully");
                 }
             },
@@ -1644,6 +1635,16 @@ mod tests {
                 host: self.k.host,
             };
             self.s.keymap(k).await;
+        }
+
+        /// `k`'s host sends a keymap of `format` and `size` in a file
+        /// holding `bytes`, which the guest gets.
+        async fn keymap_of(&mut self, format: u32, bytes: &[u8], size: u32) {
+            let k = Object {
+                id: self.k.id,
+                host: self.k.host,
+            };
+            self.s.keymap_of(k, format, bytes, size).await;
         }
 
         /// A guest text input of the seat, which the guest enables on the
@@ -2729,41 +2730,45 @@ mod tests {
         );
     }
 
-    /// A keymap the proxy cannot use replaces the loaded one: it is
-    /// forwarded, and the keyboard's XKB and key state go, so that no chord
-    /// is classified until a usable keymap arrives. The keyboard's
-    /// modifiers, which Exo does not send again, and another keyboard's
-    /// keymap stay.
-    #[test]
-    fn an_unusable_keymap_clears_the_loaded_one_and_is_forwarded() {
+    /// A keymap the proxy cannot use for each way `on_keymap` rejects one:
+    /// what the case is, and the keymap's format, file contents and size.
+    fn unusable_keymaps() -> [(&'static str, u32, Vec<u8>, u32); 8] {
         let xkb_v1 = KEYMAP_FORMAT_XKB_V1;
-        let not_xkb = b"this is not a valid xkb keymap\0";
+        let not_xkb = b"this is not a valid xkb keymap\0".to_vec();
+        let not_xkb_size = not_xkb.len() as u32;
         // A keymap only its format makes unusable.
         let usable = crate::proxy::harness::default_keymap();
-        let cases: [(&str, u32, &[u8], u32); 8] = [
-            ("no keymap", KEYMAP_FORMAT_NO_KEYMAP, b"", 100),
-            ("an unsupported format", 99, &usable, usable.len() as u32),
+        let usable_size = usable.len() as u32;
+        [
+            ("no keymap", KEYMAP_FORMAT_NO_KEYMAP, Vec::new(), 100),
+            ("an unsupported format", 99, usable, usable_size),
             // mmap(len=0) is undefined.
-            ("an empty keymap", xkb_v1, b"", 0),
+            ("an empty keymap", xkb_v1, Vec::new(), 0),
             // The size is refused before the descriptor is mapped.
             (
                 "a keymap over the size limit",
                 xkb_v1,
-                b"",
+                Vec::new(),
                 MAX_KEYMAP_SIZE + 1,
             ),
             // Mapping past the end of the file would raise SIGBUS.
-            ("a size beyond the file", xkb_v1, b"\0", 2),
-            ("no trailing NUL", xkb_v1, b"xkb_keymap", 10),
-            ("invalid UTF-8", xkb_v1, &[0xFF, 0xFE, 0xFD, 0], 4),
-            (
-                "an invalid XKB keymap",
-                xkb_v1,
-                not_xkb,
-                not_xkb.len() as u32,
-            ),
-        ];
-        for (case, format, bytes, size) in cases {
+            ("a size beyond the file", xkb_v1, b"\0".to_vec(), 2),
+            ("no trailing NUL", xkb_v1, b"xkb_keymap".to_vec(), 10),
+            ("invalid UTF-8", xkb_v1, vec![0xFF, 0xFE, 0xFD, 0], 4),
+            ("an invalid XKB keymap", xkb_v1, not_xkb, not_xkb_size),
+        ]
+    }
+
+    /// A keymap the proxy cannot use replaces the loaded one: it is
+    /// forwarded, and the keyboard's XKB state goes, so that no chord is
+    /// classified until a usable keymap arrives. The keys held and their
+    /// generations, with their accelerator suppressions, the keyboard's
+    /// modifiers, which Exo does not send again, and another keyboard's
+    /// keymap stay.
+    #[test]
+    fn an_unusable_keymap_clears_the_loaded_one_and_is_forwarded() {
+        for (case, format, bytes, size) in unusable_keymaps() {
+            let bytes = &bytes[..];
             let mut p = Proxy::new();
             p.keymap(KEYBOARD);
             p.keymap(OTHER_KEYBOARD);
@@ -2792,15 +2797,15 @@ mod tests {
                 !ctx.keyboard_repeatable_keys.contains_key(&keyboard),
                 "{case}"
             );
-            assert!(!p.held(KEYBOARD, BACKSPACE), "{case}");
-            assert!(!p.cancelled(KEYBOARD), "{case}");
+            assert!(p.held(KEYBOARD, BACKSPACE), "{case}");
+            assert!(p.cancelled(KEYBOARD), "{case}");
             assert!(
-                ctx.key_generations.peek(keyboard, BACKSPACE).is_none(),
+                ctx.key_generations.peek(keyboard, BACKSPACE).is_some(),
                 "{case}"
             );
-            assert_eq!(p.owner(KEYBOARD, BACKSPACE), None, "{case}");
+            assert_eq!(p.owner(KEYBOARD, BACKSPACE), Some(ImeRecovery), "{case}");
             assert!(
-                !ctx.key_generations
+                ctx.key_generations
                     .host_accelerator_suppressed(keyboard, KEY_A),
                 "{case}"
             );
@@ -3042,9 +3047,9 @@ mod tests {
         assert_eq!(kb.key(6, KEY_A, PRESSED).await, Route::Host);
     }
 
-    /// A new keymap keeps the keys held under the old one and the modifiers
-    /// Exo sent before it, which it does not send again; it ends the
-    /// suppression of accelerators, whose keys may mean others now.
+    /// A new keymap keeps the keys held under the old one, with the
+    /// suppression of a held accelerator's key, and the modifiers Exo sent
+    /// before it, which it does not send again.
     #[tokio::test]
     async fn a_new_keymap_keeps_held_keys_and_modifiers() {
         let mut kb = Kb::with_accelerators("<Control>a").await;
@@ -3067,7 +3072,69 @@ mod tests {
             "the accelerator's key stays suppressed"
         );
         kb.keymap().await;
-        assert_eq!(kb.key(7, KEY_A, PRESSED).await, Route::Guest);
+        assert_eq!(
+            kb.key(7, KEY_A, PRESSED).await,
+            Route::Host,
+            "the suppression survives the keymap"
+        );
+    }
+
+    /// Exo switches the layout on Ctrl+Space, a ChromeOS accelerator, so
+    /// the keymap arrives while Space is held. The accelerator's key stays
+    /// the host's: a peek that trails it, once Control is up, gives the IME
+    /// nothing to recover.
+    #[tokio::test]
+    async fn an_accelerator_held_across_a_keymap_is_not_recovered() {
+        let mut kb = Kb::with_accelerators("<Control>space").await;
+        let ime = kb.text_input().await;
+        kb.modifiers(CONTROL).await;
+        assert_eq!(kb.key(2, KEY_SPACE, PRESSED).await, Route::Host);
+
+        kb.keymap().await;
+        kb.modifiers(0).await;
+        kb.peek(4, 501, KEY_SPACE, PRESSED).await;
+        kb.confirm(ime).await;
+        assert_eq!(kb.s.guest_received(), []);
+    }
+
+    /// [`an_accelerator_held_across_a_keymap_is_not_recovered`], when the
+    /// host IME sends the key as a keysym.
+    #[tokio::test]
+    async fn an_accelerator_held_across_a_keymap_takes_no_keysym() {
+        let mut kb = Kb::with_accelerators("<Control>space").await;
+        let ime = kb.text_input().await;
+        kb.modifiers(CONTROL).await;
+        assert_eq!(kb.key(2, KEY_SPACE, PRESSED).await, Route::Host);
+
+        kb.keymap().await;
+        kb.keysym(ime, 10, 2, keysyms::KEY_space, PRESSED).await;
+        assert_eq!(kb.s.guest_received(), []);
+        assert_eq!(kb.s.host_received(), []);
+    }
+
+    /// A keymap the proxy cannot use ends the chords of the one before it
+    /// but, like a new keymap, keeps the keys held under it, so their
+    /// releases reach the guest that got their presses.
+    #[tokio::test]
+    async fn a_rejected_keymap_keeps_held_keys() {
+        for (case, format, bytes, size) in unusable_keymaps() {
+            let mut kb = Kb::with_accelerators("<Control>a").await;
+            kb.modifiers(CONTROL).await;
+            assert_eq!(kb.key(2, KEY_B, PRESSED).await, Route::Guest, "{case}");
+
+            kb.keymap_of(format, &bytes, size).await;
+            assert_eq!(
+                kb.key(3, KEY_B, RELEASED).await,
+                Route::Guest,
+                "{case}: the held key's release"
+            );
+            assert_eq!(
+                kb.key(4, KEY_A, PRESSED).await,
+                Route::Guest,
+                "{case}: no chord without a keymap"
+            );
+            assert_eq!(kb.key(5, KEY_A, RELEASED).await, Route::Guest, "{case}");
+        }
     }
 
     // -----------------------------------------------------------------------
