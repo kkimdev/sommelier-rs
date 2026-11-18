@@ -659,22 +659,24 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
+        // The preedit goes first: the guest applies a transaction at its
+        // `done`, in the v3 order (delete, commit, preedit), whatever the
+        // order of its events on the wire.
+        let mut transaction = Vec::new();
+        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+            return drop_host_preedit(ctx, guest_id);
+        }
         // The v1 `commit` argument is the replacement text to use if this
         // preedit is reset, not text to insert alongside every live preedit
         // update. Exo commonly sends identical non-empty `text` and `commit`
         // values while composing Korean; forwarding both would insert every
         // intermediate syllable. Apply the fallback only when the host
         // actually clears the preedit (notably on reset/unfocus).
-        let mut transaction = Vec::new();
         if plan.had_preedit
             && text.is_empty()
             && !commit.is_empty()
             && !push_commit_string_to(&mut transaction, guest_id, commit)
         {
-            return drop_host_preedit(ctx, guest_id);
-        }
-
-        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
             return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -3407,7 +3409,7 @@ mod tests {
         f.s.host([f.preedit("간", "간")]).await;
         assert_eq!(f.s.guest_received(), f.events([preedit("간"), done()]));
         f.s.host([f.preedit("", "간")]).await;
-        let expected = [commit("간"), no_preedit(), done()];
+        let expected = [no_preedit(), commit("간"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -4728,7 +4730,7 @@ mod tests {
             (
                 "a preedit reset commits its fallback",
                 |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
-                vec![preedit("미완성"), DONE, commit("확정"), no_preedit(), DONE],
+                vec![preedit("미완성"), DONE, no_preedit(), commit("확정"), DONE],
             ),
             (
                 "a reset without a preedit commits nothing",
@@ -5220,7 +5222,7 @@ mod tests {
         let mut f = Field::with_surrounding_text("abc", 3, 3).await;
         f.s.host([f.preedit("가", "가"), f.preedit("", "가")]).await;
         let done = || V3::Done { serial: 2 };
-        let expected = [preedit("가"), done(), commit("가"), no_preedit(), done()];
+        let expected = [preedit("가"), done(), no_preedit(), commit("가"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         f.s.host([f.delete_range(2, 1)]).await;
