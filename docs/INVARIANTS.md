@@ -233,7 +233,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `clippy::disallowed_types` errors. So the same messages always make the
   same bytes, and a session can be replayed exactly.
   Tests: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`,
-  `a_host_format_reaches_every_guest_shm_in_id_order`.
+  `a_host_format_reaches_every_guest_shm_in_id_order`,
+  `keys_held_at_an_enter_are_numbered_in_the_hosts_order`.
 
 ## Protocol errors
 

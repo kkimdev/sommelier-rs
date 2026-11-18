@@ -2407,6 +2407,14 @@ mod tests {
                 keyboard_extension_with_keymap: true,
             })
             .await;
+            f.start_typing().await;
+            f
+        }
+
+        /// The guest enables the field with the surrounding text "가",
+        /// and the host activates it, as for [`Self::typing`].
+        async fn start_typing(&mut self) {
+            let f = self;
             f.s.guest([
                 v3::enable(f.ti),
                 v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
@@ -2433,7 +2441,6 @@ mod tests {
             ];
             assert_eq!(f.s.host_received(), expected);
             f.answered(1);
-            f
         }
 
         /// The host advertises the keyboard extension, which the proxy
@@ -5667,6 +5674,72 @@ mod tests {
         };
         f.s.host([f.peek(backspace), f.confirm()]).await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace));
+    }
+
+    /// The keys a `wl_keyboard.enter` reports held are numbered in the
+    /// host's order, each at its first listing, and a peek of such a key
+    /// takes its number. So when the host lists S, then A, then S again,
+    /// and peeks S, then A, an empty confirmation stands for A, the key
+    /// numbered last and peeked last: the order follows the host, not the
+    /// keycodes. The guest holds A since the enter, so it gets no key
+    /// pair, only the `done` that closes the transaction. Numbered by
+    /// keycode, A would come first, the latest peek would not be the
+    /// newest key, and the confirmation would stand for nothing.
+    #[tokio::test]
+    async fn keys_held_at_an_enter_are_numbered_in_the_hosts_order() {
+        const KEY_S: u32 = 31;
+        const KEY_A: u32 = 30;
+        let mut f = Field::offered(Host {
+            text_input_extension: EXTENSION,
+            keyboard_extension_with_keymap: true,
+        })
+        .await;
+        f.keyboard_leave().await;
+        let keys: Vec<u8> = [KEY_S, KEY_A, KEY_S]
+            .iter()
+            .flat_map(|key| key.to_ne_bytes())
+            .collect();
+        let enter = wl_keyboard::evt::enter(f.keyboard.host, 3, f.surface.host, &keys);
+        f.s.host([enter.unwrap()]).await;
+        let (keyboard, surface) = (f.keyboard.id, f.surface.id);
+        let modifiers = wl_keyboard::Event::Modifiers {
+            serial: 3,
+            mods_depressed: 0,
+            mods_latched: 0,
+            mods_locked: 0,
+            group: 0,
+        };
+        let mut expected: Vec<(u32, AnyEvent)> = vec![
+            (
+                keyboard,
+                wl_keyboard::Event::Enter {
+                    serial: 3,
+                    surface,
+                    keys,
+                }
+                .into(),
+            ),
+            (keyboard, modifiers.into()),
+        ];
+        expected.extend(f.events([V3::Enter { surface }]));
+        assert_eq!(f.s.guest_received(), expected);
+        assert_eq!(f.s.host_received(), []);
+        f.start_typing().await;
+
+        let s = Stroke {
+            key: KEY_S,
+            state: PRESSED,
+            serial: 800,
+            time: 2_000,
+        };
+        let a = Stroke {
+            key: KEY_A,
+            serial: 801,
+            time: 2_001,
+            ..s
+        };
+        f.s.host([f.peek(s), f.peek(a), f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.events([DONE]));
     }
 
     /// A text input destroyed while its deactivation drains sends nothing

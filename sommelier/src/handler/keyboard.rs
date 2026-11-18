@@ -221,12 +221,15 @@ impl KeyboardHandler {
         keys: &[u8],
     ) {
         let (chunks, remainder) = keys.as_chunks::<4>();
-        // Ordered: each key's generation is numbered in this order, and a
-        // peek of a key held since the enter takes its number.
-        let pressed_keys: std::collections::BTreeSet<_> = chunks
-            .iter()
-            .map(|chunk| u32::from_ne_bytes(*chunk))
-            .collect();
+        // The host's order, each key at its first listing: each key's
+        // generation is numbered in this order, and a peek of a key held
+        // since the enter takes its number.
+        let mut pressed_keys = Vec::with_capacity(chunks.len());
+        for key in chunks.iter().map(|chunk| u32::from_ne_bytes(*chunk)) {
+            if !pressed_keys.contains(&key) {
+                pressed_keys.push(key);
+            }
+        }
         if !remainder.is_empty() {
             log::warn!(
                 "wl_keyboard.enter keys array has {} trailing byte(s)",
