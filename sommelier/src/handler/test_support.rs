@@ -18,6 +18,8 @@ limitations under the License.
 
 use crate::placement_config::PlacementConfig;
 use crate::protocols::aura_shell::zaura_shell;
+use crate::protocols::wayland::wl_shm;
+use crate::proxy::harness::Session;
 use crate::state::{Context, HostId, RenderBufferLifecycle};
 
 /// A guest object and the host object it is paired with.
@@ -102,4 +104,11 @@ pub(crate) fn buffer_host_destroy_is_queued(ctx: &Context, guest_id: u32) -> boo
 pub(crate) fn mark_test_buffer_guest_destroyed(ctx: &mut Context, guest_id: u32) {
     assert!(ctx.mark_buffer_guest_destroyed(guest_id));
     ctx.guest_destroyed_in_use(guest_id);
+}
+
+/// A session whose guest has bound `wl_shm`, which the proxy implements.
+pub(crate) async fn session_with_shm() -> (Session, u32) {
+    let mut s = Session::new();
+    let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+    (s, shm)
 }

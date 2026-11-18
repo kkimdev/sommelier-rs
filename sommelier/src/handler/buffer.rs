@@ -18,7 +18,7 @@ limitations under the License.
 //! the host's release, and retiring a destroyed buffer once the host is
 //! done with it.
 
-use super::ShmHandler;
+use crate::handler::shm::ShmHandler;
 use crate::protocols;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
@@ -230,8 +230,8 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shm::ShmHandler;
     use super::retire_eligible_buffers;
-    use super::ShmHandler;
     use crate::handler::test_support::{
         buffer_host_destroy_is_queued, buffer_is_guest_destroyed, mark_test_buffer_guest_destroyed,
     };

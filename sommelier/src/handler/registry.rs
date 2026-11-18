@@ -85,7 +85,7 @@ const WL_COMPOSITOR_HOST_VERSION: u32 = 3;
 const XDG_SHELL_VERSION: u32 = 3;
 /// The `wl_shm` version the proxy offers the guest and binds on the host.
 /// The proxy implements the guest's `wl_shm` itself, as a v1 compatibility
-/// shim (`handler/shm.rs`), so a newer host or XML version is not offered.
+/// shim (`handler/shm/`), so a newer host or XML version is not offered.
 const WL_SHM_VERSION: u32 = 1;
 /// The `wl_output` ceiling; [`forwarded_global_version`] says why. The
 /// vendored XML is newer: v4 adds the `name` and `description` events.

@@ -20,6 +20,7 @@ limitations under the License.
 //! they end with the text the user intended. So far it has the pieces that
 //! define that text: a Hangul composer and the reference editor.
 
+mod client;
 mod clock;
 mod editor;
 mod engine;

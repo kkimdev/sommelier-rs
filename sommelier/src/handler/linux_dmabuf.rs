@@ -828,7 +828,7 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
                 // The host created it with a server ID, which it frees as
                 // soon as it processes the destructor, so the proxy keeps
                 // nothing for it.
-                crate::handler::shm::queue_host_buffer_destroy(ctx, buffer);
+                crate::handler::buffer::queue_host_buffer_destroy(ctx, buffer);
                 ctx.pending_native_creates.remove(&HostId(host_params_id));
                 return Action::Drop;
             }

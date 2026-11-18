@@ -266,8 +266,9 @@ pub struct ShownPreedit {
 }
 
 impl ShownPreedit {
-    /// Whether the guest shows a composition. Empty text is always sent
-    /// with the cursor `(0, 0)`, so the text alone decides.
+    /// Whether the guest shows a composition, which the text alone
+    /// decides: empty text is always sent, and kept, with the cursor
+    /// `(0, 0)` (the handler's `resolve_preedit_cursor`).
     pub fn has_text(&self) -> bool {
         !self.text.is_empty()
     }
@@ -314,11 +315,11 @@ pub struct TextInputState {
     /// it.
     pub pending_cursor_position: Option<(i32, i32)>,
     /// Whether the proxy has forwarded an edit of the host input method (a
-    /// non-empty commit, confirmation, preedit region or delete) since the
-    /// guest last committed its surrounding text. Exo measures its deletes
-    /// against its prediction of the text, which includes such an edit, so
-    /// until the guest reports the result, the committed text is not what
-    /// Exo measured.
+    /// non-empty commit, confirmation, non-empty preedit region or delete)
+    /// since the guest last committed its surrounding text. Exo measures
+    /// its deletes against its prediction of the text, which includes such
+    /// an edit, so until the guest reports the result, the committed text
+    /// is not what Exo measured.
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
@@ -383,6 +384,7 @@ pub(crate) struct PreeditRegionPlan {
     pub surrounding_text: String,
     pub surrounding_cursor: i32,
     pub done_serial: u32,
+    pub had_preedit: bool,
     pub selection: Option<(u32, u32)>,
     pub cursor: Option<i32>,
 }
@@ -604,7 +606,7 @@ impl TextInputState {
     }
 
     /// Close a host commit or delete, which `edited` the text unless it
-    /// changed nothing (an empty commit with no preedit to replace).
+    /// changed nothing (an empty commit).
     pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan, edited: bool) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);
@@ -626,6 +628,7 @@ impl TextInputState {
             surrounding_text: surrounding_text.clone(),
             surrounding_cursor: *surrounding_cursor,
             done_serial: self.guest_commit_serial,
+            had_preedit: self.current_preedit.has_text(),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
@@ -638,15 +641,18 @@ impl TextInputState {
         cursor: (i32, i32),
     ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
+        debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
         debug_assert_eq!(plan.selection, self.pending_preedit_selection);
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         self.pending_preedit_selection = None;
         self.pending_preedit_cursor = None;
+        // An empty region deletes nothing and leaves no preedit, so the
+        // guest has no edit to report.
+        self.unreported_host_edit |= !preedit_text.is_empty();
         self.current_preedit = ShownPreedit {
             text: preedit_text,
             cursor,
         };
-        self.unreported_host_edit = true;
     }
 
     /// A pointer button or a touch pressed on guest surface `surface`. A
