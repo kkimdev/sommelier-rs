@@ -505,8 +505,8 @@ fn ime_is_isolated() {
     };
     for (file, source) in SOURCES {
         let mut source = source;
-        while let Some(start) = source.find("\nuse crate::") {
-            let rest = &source[start + "\nuse crate::".len()..];
+        while let Some(start) = source.find("use crate::") {
+            let rest = &source[start + "use crate::".len()..];
             let end = rest.find(';').expect("a use ends");
             let path: String = rest[..end].split_whitespace().collect();
             let allowed = path.starts_with("protocols::")
@@ -847,7 +847,13 @@ fn row_G7_a_content_type_takes_one_host_request_per_extension_version() {
             Some(8) => vec![set_input_type()],
             _ => vec![support, set_input_type()],
         };
-        assert_eq!(out.host[2..out.host.len() - 2], content_type, "{version:?}");
+        // The activation's other requests surround the content type's.
+        let mut around = activation(TI, 1);
+        let tail = around.split_off(around.len() - 2);
+        around.truncate(2);
+        around.extend(content_type);
+        let expected: Vec<Host> = around.into_iter().chain(tail).collect();
+        assert_eq!(out.host, expected, "{version:?}");
     }
 }
 

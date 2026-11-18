@@ -77,8 +77,9 @@ impl GuestTxn {
     /// they arrive: winit drops a preedit that precedes a commit, and SDL3
     /// ignores a delete while a preedit shows. An empty preedit over none
     /// makes GTK4 delete the selection, as do a zero-length delete in
-    /// Chromium and an empty commit in GTK, so none of them is ever sent. A new preedit equal to the
-    /// shown one is still sent: a `done` without one clears it.
+    /// Chromium and an empty commit in GTK, so none of them is ever sent.
+    /// A new preedit equal to the shown one is still sent: a `done`
+    /// without one clears it.
     pub(super) fn encode(
         &self,
         ti: TiId,

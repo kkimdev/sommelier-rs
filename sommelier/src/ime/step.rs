@@ -407,10 +407,10 @@ impl ImeCore {
             // F4 takes the assembly, whatever becomes of the commit.
             cur.take_assembly();
             let fence = BarrierToken(self.next_barrier);
-            self.next_barrier += 1;
             let planned = cur.press_commit(fence);
             match planned.apply() {
                 Ok((events, lease)) => {
+                    self.next_barrier += 1;
                     log::debug!("A press ended the composition of text input {}", ti.0);
                     fx.to_guest.extend(events);
                     fx.to_guest.push(resend);
