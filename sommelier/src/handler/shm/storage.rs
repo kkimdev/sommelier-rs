@@ -19,7 +19,7 @@ limitations under the License.
 
 use super::dmabuf::{allocate_virtwl_dmabuf, map_dmabuf, DmabufAllocation};
 use super::dmabuf_layout::DmabufLayout;
-use super::ShmHandler;
+use super::formats::wl_shm_format_to_drm_format;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool};
 use crate::state::{BufferState, Context, StalePixels};
@@ -471,7 +471,7 @@ pub(super) fn create_dmabuf_buffer(
             host_buffer_id,
             width,
             height,
-            ShmHandler::wl_shm_format_to_drm_format(format),
+            wl_shm_format_to_drm_format(format),
             0,
         ));
     // create_immed is processed before this destructor in the ordered
@@ -508,10 +508,10 @@ fn register_shm_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::ShmHandler;
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::shm::dmabuf_layout::validate_dmabuf_layout;
     use crate::handler::shm::tests::session_with_shm;
+    use crate::handler::shm::ShmHandler;
     use crate::handler::shm::{copy_shm_damage, ShmCopyLayout};
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;

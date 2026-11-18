@@ -18,7 +18,7 @@ limitations under the License.
 //! one, and mapping it for the copy.
 
 use super::dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
-use super::ShmHandler;
+use super::formats::wl_shm_format_to_drm_format;
 use crate::state::Context;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -116,7 +116,7 @@ pub(super) fn allocate_virtwl_dmabuf(
             "VirtWL dma-buf allocation is unavailable",
         ));
     };
-    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
+    let drm_format = wl_shm_format_to_drm_format(format);
     let (fd, metadata) = channel.allocate_dmabuf(
         u32::try_from(width)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf width"))?,
