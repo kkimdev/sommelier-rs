@@ -26,12 +26,14 @@ limitations under the License.
 //! once per process by `crate::placement_config::PlacementConfig`.
 
 mod arc;
+mod remote_shell;
 
 #[cfg(test)]
 pub(crate) use self::arc::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::arc::{
     ArcPlacementState, PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure,
 };
+pub(crate) use self::remote_shell::{RemoteShellManager, RemoteShellPlacementState};
 
 use crate::placement_config::PlacementBackend;
 
@@ -44,6 +46,9 @@ pub(crate) enum WindowPlacementState {
     /// The ARC backend: `zaura_toplevel.set_window_bounds` on a surface
     /// that carries an ARC policy identity.
     Arc(Box<ArcPlacementState>),
+    /// The remote-shell-v2 backend: a host `zcr_remote_surface_v2` role,
+    /// placed with `set_bounds_in_output`, under proxy-local XDG objects.
+    RemoteShellV2(Box<RemoteShellPlacementState>),
 }
 
 impl WindowPlacementState {
@@ -58,6 +63,7 @@ impl WindowPlacementState {
             Some(PlacementBackend::Arc(allocator)) => {
                 Self::Arc(Box::new(ArcPlacementState::new(allocator)))
             }
+            Some(PlacementBackend::RemoteShellV2) => Self::RemoteShellV2(Box::default()),
             None => Self::Off,
         }
     }
@@ -71,7 +77,7 @@ impl WindowPlacementState {
     pub(crate) fn arc(&self) -> Option<&ArcPlacementState> {
         match self {
             Self::Arc(state) => Some(state),
-            Self::Off => None,
+            Self::Off | Self::RemoteShellV2(_) => None,
         }
     }
 
@@ -79,7 +85,23 @@ impl WindowPlacementState {
     pub(crate) fn arc_mut(&mut self) -> Option<&mut ArcPlacementState> {
         match self {
             Self::Arc(state) => Some(state),
-            Self::Off => None,
+            Self::Off | Self::RemoteShellV2(_) => None,
+        }
+    }
+
+    /// The remote-shell-v2 backend's state, while it is the active backend.
+    pub(crate) fn remote_shell(&self) -> Option<&RemoteShellPlacementState> {
+        match self {
+            Self::RemoteShellV2(state) => Some(state),
+            Self::Off | Self::Arc(_) => None,
+        }
+    }
+
+    /// The remote-shell-v2 backend's state, while it is the active backend.
+    pub(crate) fn remote_shell_mut(&mut self) -> Option<&mut RemoteShellPlacementState> {
+        match self {
+            Self::RemoteShellV2(state) => Some(state),
+            Self::Off | Self::Arc(_) => None,
         }
     }
 
@@ -94,6 +116,7 @@ impl WindowPlacementState {
         match self {
             Self::Off => {}
             Self::Arc(state) => state.assert_no_orphans(guest, host_only),
+            Self::RemoteShellV2(state) => state.assert_no_orphans(guest, host_only),
         }
     }
 }

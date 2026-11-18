@@ -396,6 +396,12 @@ impl Client {
         interface: &str,
         msg: &mut WireMessage,
     ) -> DispatchResult {
+        // XDG objects a placement backend implements never reach the host.
+        if let Some(result) =
+            crate::handler::window_placement::dispatch_facade_request(ctx, interface, msg)
+        {
+            return result;
+        }
         let Some(family) = protocols::classify_interface(interface) else {
             return Ok(None);
         };

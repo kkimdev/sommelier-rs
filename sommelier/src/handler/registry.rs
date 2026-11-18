@@ -450,14 +450,18 @@ enum Singleton {
     KeyboardExtension,
     AuraShell,
     Shm,
+    /// The remote-shell-v2 placement backend's manager; a candidate only
+    /// while that backend is active (`window_placement::wants_remote_shell`).
+    RemoteShell,
 }
 
 impl Singleton {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Dmabuf,
         Self::KeyboardExtension,
         Self::AuraShell,
         Self::Shm,
+        Self::RemoteShell,
     ];
 
     fn interface(self) -> &'static str {
@@ -466,6 +470,7 @@ impl Singleton {
             Self::KeyboardExtension => "zcr_keyboard_extension_v1",
             Self::AuraShell => "zaura_shell",
             Self::Shm => "wl_shm",
+            Self::RemoteShell => "zcr_remote_shell_v2",
         }
     }
 
@@ -476,6 +481,7 @@ impl Singleton {
             Self::KeyboardExtension => ctx.host_keyboard_extension_global_name,
             Self::AuraShell => ctx.host_zaura_shell.map(|shell| shell.global_name),
             Self::Shm => ctx.host_shm_global_name,
+            Self::RemoteShell => crate::handler::window_placement::remote_shell_name(ctx),
         }
     }
 
@@ -566,6 +572,21 @@ impl Singleton {
                 crate::handler::window_placement::shell_bound(ctx, bound_version);
                 log::debug!("Bound {interface} internally (host_id={host_id})");
             }
+            Self::RemoteShell => {
+                let Some(manager) =
+                    crate::handler::window_placement::remote_shell_bound(ctx, name, version)
+                else {
+                    return Ok(());
+                };
+                bind_internally(
+                    ctx,
+                    registry_host_id,
+                    name,
+                    interface,
+                    manager.version,
+                    manager.host_id,
+                )?;
+            }
             Self::Shm => {
                 // wl_shm is emulated: on_bind drops the guest request and
                 // sends synthetic format events, so the host never sends
@@ -648,6 +669,7 @@ fn internal_binding_matches(ctx: &Context, name: u32) -> bool {
         || ctx
             .host_zaura_shell
             .is_some_and(|shell| shell.global_name == name)
+        || crate::handler::window_placement::remote_shell_name(ctx) == Some(name)
 }
 
 /// Drop proxy state associated with one host global generation.
@@ -723,6 +745,9 @@ fn reset_internal_binding_for_global(ctx: &mut Context, name: u32) {
         // shell global is advertised and rebound.
         crate::handler::aura_objects::release_shell(ctx, shell);
     }
+    // A remote surface keeps its role through its manager, so the manager
+    // is retired without a destructor, as the keyboard extension is.
+    crate::handler::window_placement::remote_shell_retired(ctx, name);
     ctx.hidden_host_globals.remove(&name);
 }
 
@@ -1077,6 +1102,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 return end;
             }
 
+            return Action::Drop;
+        } else if interface == "zcr_remote_shell_v2"
+            && crate::handler::window_placement::wants_remote_shell(ctx, version)
+        {
+            // Bound for the remote-shell-v2 placement backend and never
+            // advertised to the guest; without that backend it is dropped
+            // like any global the proxy does not know.
+            ctx.hidden_host_globals.insert(name, interface.clone());
+            record_registry_global_visibility(ctx, name, false);
+            add_candidate(ctx, Singleton::RemoteShell, name, version);
+            if let Err(end) = ensure_bound(ctx, Singleton::RemoteShell) {
+                return end;
+            }
             return Action::Drop;
         } else if interface == "zcr_keyboard_extension_v1" {
             ctx.hidden_host_globals.insert(name, interface.clone());
@@ -1594,6 +1632,11 @@ mod tests {
             Singleton::KeyboardExtension => ctx.host_keyboard_extension_id.map(|id| id.0),
             Singleton::AuraShell => ctx.host_zaura_shell.map(|shell| shell.id),
             Singleton::Shm => ctx.host_shm_id,
+            Singleton::RemoteShell => ctx
+                .window_placement
+                .remote_shell()
+                .and_then(|state| state.manager())
+                .map(|manager| manager.host_id),
         }
     }
 

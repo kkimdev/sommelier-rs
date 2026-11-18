@@ -219,7 +219,7 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
-| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The experimental window placement backend, `arc` or `off`; off by default. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
+| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The experimental window placement backend, `arc`, `remote-shell-v2` or `off`; off by default. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
 | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Legacy switch for the `arc` placement backend, used while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |

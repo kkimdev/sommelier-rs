@@ -109,6 +109,7 @@ pub(super) fn apply_bounds(
         wl_surface_guest_id: guest_wl_surface_id,
         output_host_id,
         bounds,
+        ..
     } = target;
     // `record_xdg_toplevel` records only mapped toplevels, and every path
     // that unmaps one removes its record first, so the lookup cannot miss.

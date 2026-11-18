@@ -65,7 +65,7 @@ pub(crate) use self::render::{
 pub(crate) use self::window_placement::ARC_APPLICATION_ID_PREFIX;
 pub(crate) use self::window_placement::{
     ArcPlacementState, PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure,
-    WindowPlacementState,
+    RemoteShellManager, RemoteShellPlacementState, WindowPlacementState,
 };
 pub(crate) use self::xdg_roles::XdgRoles;
 use crate::placement_config::PlacementConfig;

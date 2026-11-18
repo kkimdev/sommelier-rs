@@ -3,15 +3,15 @@
 Compositor-owned window placement shortcuts move the focused XDG toplevel
 to a configured region of its output's work area when a configured chord is
 pressed. A placement backend moves it: the ARC backend with one
-`zaura_toplevel.set_window_bounds` request (see
-[Backends](#backends)). This document is the single owner of their contract; the README
+`zaura_toplevel.set_window_bounds` request, the remote-shell-v2 backend with
+`zcr_remote_surface_v2.set_bounds_in_output` (see [Backends](#backends)). This document is the single owner of their contract; the README
 and the code link here instead of restating it.
 
 ## Settings
 
 | Setting | Meaning |
 | --- | --- |
-| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The placement backend: `arc` or `off` (case-insensitive, surrounding whitespace ignored). Unset or blank, `SOMMELIER_WINDOW_BOUNDS_AS_ARC` decides. `off` wins over that gate. Any other value, or a value that is not UTF-8, is a configuration problem (see [Resolution at startup](#resolution-at-startup)). |
+| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The placement backend: `arc`, `remote-shell-v2` or `off` (case-insensitive, surrounding whitespace ignored). Unset or blank, `SOMMELIER_WINDOW_BOUNDS_AS_ARC` decides. `off` wins over that gate. Any other value, a value that is not UTF-8, or `remote-shell-v2` while that gate is on is a configuration problem (see [Resolution at startup](#resolution-at-startup)). |
 | `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | The legacy gate, kept for compatibility: while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset, it chooses the ARC backend when on. On for `1`, `true`, `yes` or `on` (case-insensitive, surrounding whitespace ignored); off for anything else, including a value that is not UTF-8. |
 | `SOMMELIER_ACCELERATORS` | Chords the host compositor keeps. A binding may not use one of them. |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Binding source: a `CHORD=ACTION` list with named actions only. It never reloads. |
@@ -92,6 +92,47 @@ is moved.
   bounds. Before the bounds, the window leaves fullscreen, maximized and
   snapped state; a host barrier holds the configures Exo sends until it has
   applied them.
+- **`remote-shell-v2`** gives each toplevel's surface a host
+  `zcr_remote_surface_v2` role from a host `zcr_remote_shell_v2` (v4 or
+  newer), which the proxy binds for itself and never advertises to the
+  guest. Exo gives a surface one shell role, so while that global is bound
+  the guest's `xdg_surface`, `xdg_toplevel` and `xdg_popup` are implemented
+  by the proxy and never reach the host. A placement sends
+  `set_bounds_in_output`, relative to the output, and the guest a configure
+  of the new size; the guest's next commit applies the bounds. The remote
+  surface's scale factor is 1.0, so its coordinates are DIPs, like the work
+  area. The surface keeps the Guest OS application ID, so none of the ARC
+  side effects apply. The backend has these limits:
+  - Stock Crostini does not advertise `zcr_remote_shell_v2`: Exo offers it
+    only to a server whose security delegate allows remote shell, and
+    Crostini's does not. Without it, windows take the normal XDG path,
+    one warning is logged, and every placement is skipped.
+  - XDG popups (menus, tooltips) are dismissed at once with `popup_done`:
+    Exo parents a popup only to an XDG surface. Since nothing reaches the
+    host, their parent and positioner are not checked as Exo would.
+  - Window states (maximize, fullscreen, minimize), interactive move and
+    resize, and size limits are not bridged; the guest's configures carry
+    no states. `xdg_surface.set_window_geometry` is dropped, since a remote
+    surface has no window geometry, so the bounds of a client-side
+    decorated window include its shadow margin, and windows placed side by
+    side show a gap between their visible edges.
+  - Exo maps a remote surface without a frame (its default frame type is
+    none), so a client that draws no decorations has none. It would also
+    map it at the output's origin and send it no bounds request until its
+    client sets bounds, so the commit that first shows a toplevel sets its
+    bounds, centred in the work area at the committed size. If that
+    output's Aura metadata is not complete yet, the window waits at the
+    origin until it is, and then gets those bounds with a configure.
+  - Exo's own bounds requests (`bounds_changed_in_output`, in the display's
+    pixels, scaled by the display zoom and the device scale factor) are
+    accepted, converted to DIPs. Aura reports both factors in truncated
+    thousandths, so at a scale such as 16/9 a converted edge can be one
+    DIP off. A close request reaches the guest.
+  - With `--xdg-decoration`, a decoration for one of these toplevels is
+    the proxy's own and never configures, so the client keeps its own
+    decorations: the host has no XDG toplevel to decorate.
+  - A toplevel created while no remote shell is bound stays an XDG
+    toplevel and is never placed, even after one is bound.
 
 ## Chord handling
 
@@ -104,8 +145,10 @@ consumes is neither placed nor delivered.
 
 Every skip is logged with its reason. A skip that persists until the
 configuration or the proxy changes is logged at `info`, which the default
-log filter shows: a rectangle the output cannot represent, or no Aura
-toplevel (ARC identities exhausted, or `zaura_shell` missing or too old).
+log filter shows: a rectangle the output cannot represent, no Aura
+toplevel (ARC identities exhausted, or `zaura_shell` missing or too old), or
+no remote surface (remote-shell-v2 with no usable `zcr_remote_shell_v2`
+when the toplevel was created).
 The other skips (no focused toplevel, no usable output yet, no Aura surface)
 are logged at `debug`; set `RUST_LOG=debug` to see them.
 `PlacementSkip::log_level` in `sommelier/src/handler/window_placement.rs`
@@ -344,6 +387,8 @@ that task ends, an error says reloads have stopped.
 | `sommelier/src/state/outputs.rs` | `OutputRegistry`: live outputs, their committed metadata, and the output a surface is placed on; `OutputState::work_area`. |
 | `sommelier/src/handler/keyboard.rs` | `classify_key` turns a chord into host accelerator, placement, or guest input; a consumed placement chord calls `window_placement::place_focused`. |
 | `sommelier/src/handler/window_placement.rs` | The placement boundary: the focused toplevel, its output and the bounds (shared by every backend), `set_aura_application_id` (the guest's ID, or the one the backend chooses, for XDG and GTK), and one entry point per protocol event (listed in its module docs), each of which dispatches to the connection's backend. |
+| `sommelier/src/handler/window_placement/remote_shell.rs` | The remote-shell-v2 backend: the proxy-local XDG objects, the remote surface and `set_bounds_in_output`, and the host's remote-shell events. |
+| `sommelier/src/state/window_placement/remote_shell.rs` | `RemoteShellPlacementState`, its per-connection state: the bound manager, each toplevel's remote surface, and the configure serial. |
 | `sommelier/src/handler/window_placement/arc.rs` | The ARC backend: the ARC identity, the placement Aura toplevel, `set_window_bounds` and its barrier, and the configures held behind it. |
 | `sommelier/src/handler/aura_objects.rs` | Creates, versions and releases every host Aura child (`AuraChild` table, `ensure_host_zaura_surface`, `ensure_zaura_output`), and releases the `zaura_shell` binding. |
 | `sommelier/src/handler/callback.rs` | `queue_internal_sync` issues the placement barrier, and `wl_callback.done` dispatches it to `window_placement::complete_barrier`. |

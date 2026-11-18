@@ -27,6 +27,9 @@ limitations under the License.
 //!
 //! - [`arc`]: `zaura_toplevel.set_window_bounds` on a surface that carries
 //!   an ARC policy identity.
+//! - [`remote_shell`]: a host `zcr_remote_surface_v2` role in place of the
+//!   XDG role, placed with `set_bounds_in_output`, under proxy-local XDG
+//!   objects.
 //!
 //! Protocol handlers translate wire events and call in here, one entry
 //! point per event. Each entry point dispatches to the active backend and
@@ -36,8 +39,14 @@ limitations under the License.
 //! | :--- | :--- |
 //! | consumed placement chord (`wl_keyboard.key`) | [`place_focused`] |
 //! | `zaura_shell` bound (`wl_registry.global`) | [`shell_bound`] |
+//! | `zcr_remote_shell_v2` advertised, bound, retired | [`wants_remote_shell`], [`remote_shell_bound`], [`remote_shell_name`], [`remote_shell_retired`] |
 //! | guest `wl_output` bound | [`output_bound`] |
+//! | `wl_output.done` | [`output_committed`] |
+//! | `xdg_wm_base.get_xdg_surface` | [`claim_xdg_surface`] |
+//! | a guest request from a local XDG object, or to the decoration manager | [`dispatch_facade_request`] |
 //! | `xdg_surface.get_toplevel`, after dispatch | [`attach_toplevel`] |
+//! | `wl_surface.commit` that shows a buffer, before its forward | [`surface_shown`] |
+//! | facade `xdg_popup` end | [`forget_xdg_popup`] |
 //! | XDG role teardown | [`release_toplevel`] |
 //! | `wl_surface` end | [`forget_surface`] |
 //! | XDG and GTK application IDs | [`set_aura_application_id`] |
@@ -59,9 +68,9 @@ pub(crate) use self::remote_shell::RemoteShellHandler;
 use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
 use crate::protocols::aura_shell::zaura_surface;
-use crate::state::{Context, HostId, OutputState, WindowPlacementState};
+use crate::state::{Context, HostId, OutputState, RemoteShellManager, WindowPlacementState};
 use crate::window_layout::{Rect, WindowLayoutAction};
-use crate::wire::queue_or_drop;
+use crate::wire::{queue_or_drop, Action, Outgoing, ProtocolError, WireMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The `zaura_shell` version placement needs.
@@ -111,10 +120,50 @@ pub(crate) fn shell_bound(ctx: &mut Context, shell_version: u32) {
         aura_objects::ensure_zaura_output(ctx, output_host_id);
     }
     match ctx.window_placement {
-        WindowPlacementState::Off => {}
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
         WindowPlacementState::Arc(_) => arc::attach_recorded_toplevels(ctx),
     }
     warn_if_shell_cannot_place(shell_version);
+}
+
+// ── The remote shell ──────────────────────────────────────────────────────
+
+/// Whether the registry binds a host `zcr_remote_shell_v2` advertised at
+/// `version`: only the remote-shell-v2 backend uses one.
+pub(crate) fn wants_remote_shell(ctx: &Context, version: u32) -> bool {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::wants_manager(version),
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => false,
+    }
+}
+
+/// Create and record the host `zcr_remote_shell_v2` the registry binds
+/// from global `global_name`, advertised at `version`.
+///
+/// # Returns
+///
+/// The manager, with the host ID and version to bind it at, or `None`
+/// without the remote-shell-v2 backend, which alone wants one.
+pub(crate) fn remote_shell_bound(
+    ctx: &mut Context,
+    global_name: u32,
+    version: u32,
+) -> Option<RemoteShellManager> {
+    ctx.window_placement.remote_shell()?;
+    Some(remote_shell::bind_manager(ctx, global_name, version))
+}
+
+/// The registry name of the bound `zcr_remote_shell_v2`, if any.
+pub(crate) fn remote_shell_name(ctx: &Context) -> Option<u32> {
+    ctx.window_placement.remote_shell()?;
+    remote_shell::manager_name(ctx)
+}
+
+/// Retire the `zcr_remote_shell_v2` bound from global `global_name`, if any.
+pub(crate) fn remote_shell_retired(ctx: &mut Context, global_name: u32) {
+    if ctx.window_placement.remote_shell().is_some() {
+        remote_shell::manager_retired(ctx, global_name);
+    }
 }
 
 /// Create the host-only Aura output of a newly bound guest `wl_output`,
@@ -145,6 +194,9 @@ pub(crate) enum PlacementSkip {
     NoAuraToplevel,
     /// The host Aura surface is unavailable (no zaura_shell).
     NoAuraSurface,
+    /// The toplevel has no host remote surface: it was created while no
+    /// `zcr_remote_shell_v2` was bound, so it took the XDG path.
+    NoRemoteSurface,
 }
 
 impl PlacementSkip {
@@ -155,7 +207,9 @@ impl PlacementSkip {
     /// focus or output state and stay at debug.
     pub(crate) fn log_level(self) -> log::Level {
         match self {
-            Self::RectNotRepresentable | Self::NoAuraToplevel => log::Level::Info,
+            Self::RectNotRepresentable | Self::NoAuraToplevel | Self::NoRemoteSurface => {
+                log::Level::Info
+            }
             Self::NoFocusedToplevel | Self::NoUsableOutput | Self::NoAuraSurface => {
                 log::Level::Debug
             }
@@ -207,6 +261,8 @@ struct PlacementTarget {
     wl_surface_guest_id: u32,
     /// The host `wl_output` the window is placed on.
     output_host_id: u32,
+    /// That output's state.
+    output: OutputState,
     /// The window's new bounds in screen coordinates, inside `output`'s
     /// work area.
     bounds: Rect,
@@ -235,6 +291,7 @@ fn resolve_target(
         xdg_toplevel_guest_id,
         wl_surface_guest_id,
         output_host_id,
+        output,
         bounds,
     })
 }
@@ -269,6 +326,7 @@ pub(crate) fn place_focused(
         // Bindings exist only while a backend is active.
         WindowPlacementState::Off => Ok(()),
         WindowPlacementState::Arc(_) => arc::apply_bounds(ctx, target),
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::apply_bounds(ctx, target),
     }
 }
 
@@ -284,7 +342,7 @@ pub(crate) fn attach_toplevel(
     wl_surface_guest_id: u32,
 ) {
     match ctx.window_placement {
-        WindowPlacementState::Off => {}
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
         WindowPlacementState::Arc(_) => {
             arc::attach_toplevel(ctx, xdg_toplevel_guest_id, wl_surface_guest_id);
         }
@@ -299,6 +357,78 @@ pub(crate) fn release_toplevel(ctx: &mut Context, xdg_toplevel_guest_id: u32) {
     match ctx.window_placement {
         WindowPlacementState::Off => {}
         WindowPlacementState::Arc(_) => arc::release_toplevel(ctx, xdg_toplevel_guest_id),
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::release_toplevel(ctx, xdg_toplevel_guest_id);
+        }
+    }
+}
+
+/// Claim a new guest `xdg_surface` for the backend, which then implements
+/// it and its role objects.
+///
+/// # Returns
+///
+/// The action of the guest's `xdg_wm_base.get_xdg_surface` when it must
+/// not reach the host: the remote-shell-v2 backend made the xdg_surface a
+/// local object, because Exo gives a surface one role, or rejected it.
+/// `None` when it is forwarded.
+pub(crate) fn claim_xdg_surface(
+    ctx: &mut Context,
+    xdg_surface_guest_id: u32,
+    wl_surface_guest_id: u32,
+) -> Option<Action> {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::claim_xdg_surface(ctx, xdg_surface_guest_id, wl_surface_guest_id)
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => None,
+    }
+}
+
+/// Dispatch a guest request to an XDG object that the backend claimed.
+///
+/// # Returns
+///
+/// `None` for every other request, which the caller dispatches as usual.
+pub(crate) fn dispatch_facade_request(
+    ctx: &mut Context,
+    interface: &str,
+    msg: &mut WireMessage,
+) -> Option<Result<Option<Outgoing>, ProtocolError>> {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::dispatch_facade_request(ctx, interface, msg)
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => None,
+    }
+}
+
+/// Let the backend act on an output whose metadata a `wl_output.done`
+/// committed: one may now place a window shown before it could.
+pub(crate) fn output_committed(ctx: &mut Context) {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => remote_shell::output_committed(ctx),
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => {}
+    }
+}
+
+/// Let the backend act on a `wl_surface.commit` that shows a buffer of
+/// `size` surface units, before the commit is forwarded, so that what it
+/// sends applies with the commit.
+pub(crate) fn surface_shown(ctx: &mut Context, wl_surface_guest_id: u32, size: (i32, i32)) {
+    match ctx.window_placement {
+        WindowPlacementState::RemoteShellV2(_) => {
+            remote_shell::first_bounds(ctx, wl_surface_guest_id, size);
+        }
+        WindowPlacementState::Off | WindowPlacementState::Arc(_) => {}
+    }
+}
+
+/// Forget a guest `xdg_popup` that ended: a facade popup is its
+/// xdg_surface's role.
+pub(crate) fn forget_xdg_popup(ctx: &mut Context, xdg_popup_guest_id: u32) {
+    if ctx.window_placement.remote_shell().is_some() {
+        remote_shell::forget_popup(ctx, xdg_popup_guest_id);
     }
 }
 
@@ -340,7 +470,7 @@ pub(crate) fn set_aura_application_id(
             zaura_surface_host_id,
             native_application_id,
         ),
-        WindowPlacementState::Off => {
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {
             if queue_or_drop(
                 &mut ctx.client_to_host_queue,
                 zaura_surface::req::set_application_id(
@@ -370,7 +500,7 @@ pub(crate) fn complete_barrier(
     zaura_toplevel_host_id: u32,
 ) {
     match ctx.window_placement {
-        WindowPlacementState::Off => {}
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
         WindowPlacementState::Arc(_) => {
             arc::complete_barrier(ctx, callback_host_id, zaura_toplevel_host_id);
         }
@@ -389,7 +519,7 @@ pub(crate) fn hold_surface_configure(
     serial: u32,
 ) -> bool {
     match ctx.window_placement {
-        WindowPlacementState::Off => false,
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => false,
         WindowPlacementState::Arc(_) => {
             arc::hold_surface_configure(ctx, guest_xdg_surface_id, serial)
         }
@@ -410,7 +540,7 @@ pub(crate) fn hold_toplevel_configure(
     states: &[u8],
 ) -> bool {
     match ctx.window_placement {
-        WindowPlacementState::Off => false,
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => false,
         WindowPlacementState::Arc(_) => {
             arc::hold_toplevel_configure(ctx, guest_xdg_toplevel_id, width, height, states)
         }
@@ -429,7 +559,7 @@ pub(crate) fn translate_aura_configure(
     states: &[u8],
 ) {
     match ctx.window_placement {
-        WindowPlacementState::Off => {}
+        WindowPlacementState::Off | WindowPlacementState::RemoteShellV2(_) => {}
         WindowPlacementState::Arc(_) => {
             arc::translate_aura_configure(ctx, zaura_toplevel_host_id, x, y, width, height, states)
         }
@@ -685,6 +815,8 @@ mod fixture {
         /// The host `zaura_shell` the proxy bound.
         pub(super) shell: u32,
         pub(super) output: Object,
+        /// The host-only `zaura_output` of `output`.
+        pub(super) aura_output: u32,
         pub(super) wm_base: Object,
         pub(super) keyboard: Object,
         pub(super) surface: Object,
@@ -698,6 +830,73 @@ mod fixture {
         /// output gets its Aura output, whose metadata the host sends.
         /// What either peer gets for this is checked and not kept.
         pub(super) async fn new(placement: PlacementConfig) -> Self {
+            Self::with_output(placement, 0, 1000).await
+        }
+
+        /// [`Self::new`] with the output's left edge at `origin_x` and a
+        /// device scale factor of `device_scale` thousandths.
+        pub(super) async fn with_output(
+            placement: PlacementConfig,
+            origin_x: i32,
+            device_scale: u32,
+        ) -> Self {
+            Self::with_output_zoom(placement, origin_x, 1000, device_scale).await
+        }
+
+        /// [`Self::with_output`] with a display zoom of `current_scale`
+        /// thousandths, which Aura sends as the output's current
+        /// `zaura_output.scale`.
+        pub(super) async fn with_output_zoom(
+            placement: PlacementConfig,
+            origin_x: i32,
+            current_scale: u32,
+            device_scale: u32,
+        ) -> Self {
+            let mut d = Self::unmeasured(placement).await;
+            assert_eq!(d.measure(origin_x, current_scale, device_scale).await, []);
+            assert_eq!(d.s.host_received(), []);
+            d
+        }
+
+        /// The host sends the output's metadata, its mode at `origin_x`
+        /// and Aura's `current_scale` and `device_scale` thousandths and
+        /// insets, which the guest gets as its output's events first; returns
+        /// what else the guest gets. What the proxy sends the host is kept.
+        pub(super) async fn measure(
+            &mut self,
+            origin_x: i32,
+            current_scale: u32,
+            device_scale: u32,
+        ) -> Vec<(u32, AnyEvent)> {
+            let (output, aura_output) = (self.output, self.aura_output);
+            self.s
+                .host([
+                    wl_output::evt::geometry(output.host, origin_x, 0, 0, 0, 0, "", "", 0).unwrap(),
+                    wl_output::evt::mode(output.host, wl_output::MODE_CURRENT, 1920, 1080, 60),
+                    zaura_output::evt::scale(
+                        aura_output,
+                        zaura_output::SCALE_PROPERTY_CURRENT,
+                        current_scale,
+                    ),
+                    zaura_output::evt::device_scale_factor(aura_output, device_scale),
+                    zaura_output::evt::insets(aura_output, 0, 0, 1080 - DESK_WORK_AREA.1, 0),
+                    wl_output::evt::done(output.host),
+                ])
+                .await;
+            let mut guest = self.s.guest_received();
+            let others = guest.split_off(
+                guest
+                    .iter()
+                    .position(|(sender, _)| *sender != output.id)
+                    .unwrap_or(guest.len()),
+            );
+            assert!(!guest.is_empty(), "the guest gets its output's events");
+            others
+        }
+
+        /// [`Self::new`] whose host has not sent the output's metadata, so
+        /// that the output cannot place a window yet.
+        pub(super) async fn unmeasured(placement: PlacementConfig) -> Self {
             let mut s = Session::with_context(Context::with_placement_for_test(placement));
             let registry = s.registry().await;
             s.advertise("zaura_shell", zaura_shell::VERSION).await;
@@ -736,22 +935,6 @@ mod fixture {
             assert_eq!((*aura_shell, *aura_of), (shell, bound.2));
             let output = Object { id, host: bound.2 };
             let aura_output = *aura_output;
-            s.host([
-                wl_output::evt::geometry(output.host, 0, 0, 0, 0, 0, "", "", 0).unwrap(),
-                wl_output::evt::mode(output.host, wl_output::MODE_CURRENT, 1920, 1080, 60),
-                zaura_output::evt::scale(aura_output, zaura_output::SCALE_PROPERTY_CURRENT, 1000),
-                zaura_output::evt::device_scale_factor(aura_output, 1000),
-                zaura_output::evt::insets(aura_output, 0, 0, 1080 - DESK_WORK_AREA.1, 0),
-                wl_output::evt::done(output.host),
-            ])
-            .await;
-            assert!(
-                s.guest_received()
-                    .iter()
-                    .all(|(sender, _)| *sender == output.id),
-                "the guest gets only its output's events"
-            );
-            assert_eq!(s.host_received(), []);
 
             let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
             let (_, keyboard) = s.keyboard().await;
@@ -760,6 +943,7 @@ mod fixture {
                 s,
                 shell,
                 output,
+                aura_output,
                 wm_base,
                 keyboard,
                 surface,
