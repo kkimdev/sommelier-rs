@@ -3996,7 +3996,10 @@ pub async fn run(
             log::error!("Cannot claim the Wayland socket {display}: {error}");
             std::process::exit(1);
         });
-    let listener = UnixListener::bind(display).expect("Failed to bind socket");
+    let listener = UnixListener::bind(display).unwrap_or_else(|error| {
+        log::error!("Cannot bind the Wayland socket {display}: {error}");
+        std::process::exit(1);
+    });
     log::info!("Listening on {}", display);
 
     let config = ClientConfig {
