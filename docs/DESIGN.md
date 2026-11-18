@@ -201,7 +201,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -467,8 +467,11 @@ direction, the edits of Exo's input method reach the guest as v3
 transactions, each closed by a `done`; a delete, which Exo counts from the
 start of the surrounding text, is measured against the text the guest last
 committed. A guest commit that leaves the field enabled is answered
-with a `done`, which Chromium waits for before it sends more. The rules
-are under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
+with a `done`, which Chromium waits for before it sends more. A pointer
+press on the surface of a composition ends it before the guest gets the
+press, as mutter and KWin do: `pointer.rs` follows each pointer's surface,
+the guest commits the preedit it shows, and Exo is told to `reset`. The
+rules are under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical

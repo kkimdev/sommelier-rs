@@ -1887,14 +1887,45 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     }
 }
 
+/// A pointer pressed on guest surface `surface`, a press the guest has yet
+/// to get: end the composition of the text input that
+/// [`TextInputState::prepare_press_commit`] says the press ends. Only one
+/// can be: one text input on a connection is enabled at a time. The guest
+/// commits the preedit it shows, and the host `reset`s, which drops Exo's
+/// composition without an event back.
+///
+/// # Returns
+///
+/// Whether a composition ended, so that the press must follow the guest
+/// events queued.
+pub(crate) fn end_composition_on_press(ctx: &mut Context, surface: u32) -> bool {
+    let Some((guest_id, host_v1_id, plan)) =
+        ctx.text_inputs.iter().find_map(|(&guest_id, state)| {
+            let plan = state.prepare_press_commit(surface)?;
+            Some((guest_id, state.host_v1_id, plan))
+        })
+    else {
+        return false;
+    };
+    // The preedit reached the guest, so its commit fits a message.
+    if !commit_shown_preedit(ctx, guest_id, plan) {
+        return false;
+    }
+    log::debug!("A pointer press ended the composition of text input {guest_id}");
+    ctx.client_to_host_queue
+        .push(zwp_text_input_v1::req::reset(host_v1_id));
+    true
+}
+
 /// Answer the guest's latest commit on text input `guest_id` with a
 /// `done`, if the commit left the field enabled, as mutter and KWin do. The
 /// protocol numbers each `done` by the commits so far, and a client may
 /// hold its surrounding text and cursor rectangle until a `done` names its
 /// latest commit, as Chromium does. A `done` applies the preedit sent since
 /// the previous one, or none, so this one repeats the preedit the guest
-/// shows. Unlike mutter and KWin, the proxy cannot end the host's
-/// composition when the guest resets its own (see HANDOVER).
+/// shows. Unlike mutter and KWin, the proxy does not end the host's
+/// composition when the guest resets its own; only a pointer press does
+/// ([`end_composition_on_press`]).
 fn answer_guest_commit(ctx: &mut Context, guest_id: u32) {
     let Some(state) = ctx
         .text_inputs
@@ -2157,7 +2188,7 @@ mod tests {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
+    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::test_support::{decoded, respell};
@@ -2735,6 +2766,23 @@ mod tests {
             assert_eq!(self.enter_surface().await, []);
         }
 
+        /// The host's `button` event of `pointer`, of the left button in
+        /// `state`.
+        fn button(pointer: Object, state: u32) -> Outgoing {
+            wl_pointer::evt::button(pointer.host, 4, 500, BTN_LEFT, state)
+        }
+
+        /// The `button` event `pointer` gets for [`Self::button`].
+        fn guest_button(pointer: Object, state: u32) -> (u32, AnyEvent) {
+            let button = wl_pointer::Event::Button {
+                serial: 4,
+                time: 500,
+                button: BTN_LEFT,
+                state,
+            };
+            (pointer.id, button.into())
+        }
+
         /// The host completes the drain barrier `callback`.
         async fn drain(&mut self, callback: u32) {
             self.s.host([wl_callback::evt::done(callback, 0)]).await;
@@ -2873,6 +2921,8 @@ mod tests {
 
     /// The evdev code of the space bar.
     const SPACE: u32 = 57;
+    /// The evdev code of the left mouse button.
+    const BTN_LEFT: u32 = 0x110;
 
     /// The `wl_display.sync` that creates drain barrier `callback`.
     fn sync(callback: u32) -> (u32, AnyRequest) {
@@ -3981,6 +4031,141 @@ mod tests {
         f.s.host([f.preedit("가낙", "가낙")]).await;
         let expected = [preedit("가낙"), V3::Done { serial: 2 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A pointer press on the surface of a composition ends it before the
+    /// press reaches the guest, as mutter
+    /// (`meta_wayland_text_input_handle_event`) and KWin
+    /// (`InputMethodEventFilter::pointerButton`) do: the guest commits the
+    /// preedit it shows, and Exo, told to `reset`, drops the composition,
+    /// so the next key starts a new syllable instead of joining the old one.
+    #[tokio::test]
+    async fn a_press_on_the_composing_surface_commits_the_preedit() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        assert_eq!(f.s.host_received(), [f.v1(V1::Reset {})]);
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // The composition ended: the release changes nothing, and the
+        // input method's next commit replaces no preedit.
+        let released = wl_pointer::BUTTON_STATE_RELEASED;
+        f.s.host([Field::button(pointer, released)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, released)]
+        );
+        f.s.host([f.commit("나")]).await;
+        let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Only a press on the surface of a composition ends it: a press with
+    /// no composition, a press on another surface and a release change
+    /// nothing, and the composition goes on.
+    #[tokio::test]
+    async fn a_press_elsewhere_or_without_a_composition_changes_nothing() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        let (pressed, released) = (
+            wl_pointer::BUTTON_STATE_PRESSED,
+            wl_pointer::BUTTON_STATE_RELEASED,
+        );
+
+        // No composition.
+        f.s.host([Field::button(pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, pressed)]
+        );
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // A release.
+        f.s.host([Field::button(pointer, released)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, released)]
+        );
+
+        // A press on another surface, or after the pointer left.
+        let other = f.s.surface().await;
+        let other_pointer = f.s.pointer_on(f.seat.id, other).await;
+        f.s.host([Field::button(other_pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(other_pointer, pressed)]
+        );
+        let leave = wl_pointer::evt::leave(pointer.host, 5, f.surface.host);
+        f.s.host([leave, Field::button(pointer, pressed)]).await;
+        let leave = wl_pointer::Event::Leave {
+            serial: 5,
+            surface: f.surface.id,
+        };
+        assert_eq!(
+            f.s.guest_received(),
+            [
+                (pointer.id, leave.into()),
+                Field::guest_button(pointer, pressed)
+            ]
+        );
+
+        // The host was told nothing, and the composition goes on.
+        assert_eq!(f.s.host_received(), []);
+        f.s.host([f.commit("각")]).await;
+        let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A `leave` names the surface it leaves. One that names a surface
+    /// other than the pointer's, as from a host that delivers a `leave`
+    /// late, leaves the pointer where it is, so a press there still ends
+    /// the composition.
+    #[tokio::test]
+    async fn a_leave_of_another_surface_keeps_the_pointer_on_its_surface() {
+        let mut f = Field::enabled().await;
+        let other = f.s.surface().await;
+        let pointer = f.s.pointer_on(f.seat.id, other).await;
+        let leave = wl_pointer::evt::leave(pointer.host, 2, other.host);
+        let enter = wl_pointer::evt::enter(pointer.host, 3, f.surface.host, 0, 0);
+        let late_leave = wl_pointer::evt::leave(pointer.host, 4, other.host);
+        f.s.host([leave, enter, late_leave]).await;
+        let leave = |serial| wl_pointer::Event::Leave {
+            serial,
+            surface: other.id,
+        };
+        let enter = wl_pointer::Event::Enter {
+            serial: 3,
+            surface: f.surface.id,
+            surface_x: 0,
+            surface_y: 0,
+        };
+        assert_eq!(
+            f.s.guest_received(),
+            [
+                (pointer.id, leave(2).into()),
+                (pointer.id, enter.into()),
+                (pointer.id, leave(4).into()),
+            ]
+        );
+
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        assert_eq!(f.s.host_received(), [f.v1(V1::Reset {})]);
     }
 
     /// An input method that replaces text deletes, then commits, each a

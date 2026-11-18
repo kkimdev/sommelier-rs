@@ -623,6 +623,22 @@ impl TextInputState {
         self.unreported_host_edit = true;
     }
 
+    /// A pointer pressed on guest surface `surface`. A press on the
+    /// surface this text input is focused on, while the guest shows a
+    /// preedit of the active host generation, ends that composition before
+    /// the press reaches the guest, as mutter and KWin end theirs: the guest
+    /// commits the preedit it shows, and the host is told to `reset`
+    /// (INVARIANTS "A pointer press ends the composition on its surface").
+    ///
+    /// Returns the plan of that commit, or `None` if the press leaves the
+    /// composition alone.
+    pub(crate) fn prepare_press_commit(&self, surface: u32) -> Option<ConfirmPreeditPlan> {
+        if self.active_surface != Some(surface) || !self.current_preedit.has_text() {
+            return None;
+        }
+        self.prepare_confirm_preedit()
+    }
+
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
         self.host_is_active().then(|| ConfirmPreeditPlan {
             guest_seat: self.guest_seat,
@@ -1790,6 +1806,48 @@ pub struct KeyboardFocus {
     pub guest_seat: u32,
     pub guest_surface: u32,
     pub host_surface: u32,
+}
+
+/// The guest surface each host `wl_pointer` has entered. A
+/// `wl_pointer.button` names no surface, and a press on the surface of a
+/// composition ends it ([`TextInputState::prepare_press_commit`]).
+#[derive(Debug, Default)]
+pub struct PointerFocus(HashMap<HostId, u32>);
+
+impl PointerFocus {
+    /// `pointer` entered guest surface `surface`.
+    pub fn enter(&mut self, pointer: HostId, surface: u32) {
+        self.0.insert(pointer, surface);
+    }
+
+    /// `pointer` left guest surface `surface`. A `leave` of a surface it
+    /// is not on, which a host can deliver late, changes nothing, as for
+    /// a keyboard ([`KeyboardFocusRegistry::leave`]).
+    pub fn leave(&mut self, pointer: HostId, surface: u32) {
+        if self.surface(pointer) == Some(surface) {
+            self.0.remove(&pointer);
+        }
+    }
+
+    /// `pointer` ended.
+    pub fn forget_pointer(&mut self, pointer: HostId) {
+        self.0.remove(&pointer);
+    }
+
+    /// The surface `pointer` is on, if any.
+    pub fn surface(&self, pointer: HostId) -> Option<u32> {
+        self.0.get(&pointer).copied()
+    }
+
+    /// Guest surface `surface` ended: no pointer is on it.
+    pub fn forget_surface(&mut self, surface: u32) {
+        self.0.retain(|_, &mut entered| entered != surface);
+    }
+
+    #[cfg(test)]
+    pub(super) fn focuses_for_test(&self) -> impl Iterator<Item = (HostId, u32)> + '_ {
+        self.0.iter().map(|(&pointer, &surface)| (pointer, surface))
+    }
 }
 
 /// One authoritative seat focus transition.
