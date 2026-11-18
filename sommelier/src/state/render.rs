@@ -63,6 +63,9 @@ pub struct BufferState {
     /// Whether the output descriptor requires VirtWL dma-buf begin/end
     /// synchronization around CPU writes.
     pub dmabuf_sync: bool,
+    /// The host copy, mapped for `dest_size` bytes, or null without one.
+    /// The state owns the mapping, which it unmaps when it drops; whoever
+    /// sets these fields keeps that true.
     pub dest_ptr: *mut u8,
     pub dest_size: usize,
     /// The pixels the host copy lacks, which the next copy covers.

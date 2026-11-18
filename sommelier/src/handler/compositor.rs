@@ -356,7 +356,13 @@ fn copy_to_host_storage(
         None
     };
     let result = if !buffer.dest_ptr.is_null() {
-        copy_shm_damage(&buffer.pool_file, buffer.dest_ptr, layout, damage)
+        // SAFETY: a non-null `dest_ptr` maps `dest_size` bytes that the
+        // `BufferState` owns until it drops (see its fields). `buffer` is
+        // borrowed mutably here, so nothing else in the proxy references
+        // the mapping during the copy.
+        let destination =
+            unsafe { std::slice::from_raw_parts_mut(buffer.dest_ptr, buffer.dest_size) };
+        copy_shm_damage(&buffer.pool_file, destination, layout, damage)
     } else {
         // Both backings map their storage when the buffer is created, so
         // only a test fixture without a mapping reaches this.

@@ -518,12 +518,24 @@ mod tests {
     use crate::protocols::wayland::{wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface};
     use crate::protocols::AnyRequest;
     use crate::proxy::harness::Session;
-    use crate::state::{Context, DamageRegion, ShmPool};
+    use crate::state::{BufferState, Context, DamageRegion, ShmPool};
     use crate::test_support::{decode, protocol_error_code, shm_pool_file};
     use crate::wire::{Action, WL_DISPLAY_ID};
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::sync::Arc;
+
+    /// Copy every pixel of `buffer` into its host copy, as its first commit
+    /// does.
+    fn copy_every_pixel(buffer: &BufferState) {
+        let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
+        assert!(!buffer.dest_ptr.is_null());
+        // SAFETY: the buffer's host copy maps `dest_size` bytes that the
+        // state owns, and the test holds no other reference to them.
+        let destination =
+            unsafe { std::slice::from_raw_parts_mut(buffer.dest_ptr, buffer.dest_size) };
+        copy_shm_damage(&buffer.pool_file, destination, layout, &DamageRegion::Full).unwrap();
+    }
 
     /// A buffer whose host copy is shared memory, which the host imports
     /// as a `wl_shm` pool of the guest buffer's layout, copies each plane
@@ -555,15 +567,7 @@ mod tests {
             Action::Drop
         );
         assert!(!ctx.is_fatal());
-        let buffer = ctx.local_buffer(30).expect("the buffer's state");
-        let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
-        copy_shm_damage(
-            &buffer.pool_file,
-            buffer.dest_ptr,
-            layout,
-            &DamageRegion::Full,
-        )
-        .unwrap();
+        copy_every_pixel(ctx.local_buffer(30).expect("the buffer's state"));
         let mut pixels = [0; 12];
         host_copy.read_exact_at(&mut pixels, 0).unwrap();
         assert_eq!(pixels, [1, 2, 0, 0, 3, 4, 0, 0, 5, 6, 0, 0]);
@@ -639,16 +643,7 @@ mod tests {
             .collect();
         assert_eq!(planes, [(0, 0, 4), (1, 16, 8)]);
 
-        // Copy every pixel, as the buffer's first commit does.
-        let buffer = ctx.local_buffer(30).expect("the buffer's state");
-        let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
-        copy_shm_damage(
-            &buffer.pool_file,
-            buffer.dest_ptr,
-            layout,
-            &DamageRegion::Full,
-        )
-        .unwrap();
+        copy_every_pixel(ctx.local_buffer(30).expect("the buffer's state"));
         let mut pixels = [0; 24];
         host_copy.read_exact_at(&mut pixels, 0).unwrap();
         assert_eq!(
