@@ -1988,7 +1988,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd() {
-        let (pipe, _writer) = nix::unistd::pipe().expect("pipe");
+        let (pipe, _writer) = crate::test_support::pipe();
         for fd in [pipe, shm_pool_file(&[0; 4095]).into()] {
             let (mut s, shm) = session_with_shm().await;
             let pool = s.new_id();
@@ -2669,7 +2669,7 @@ mod tests {
         assert!(regular_file_has_size(&file, 4096));
 
         // `pread` cannot read a pool from a pipe or a device.
-        let (pipe_read, _pipe_write) = nix::unistd::pipe().expect("pipe");
+        let (pipe_read, _pipe_write) = crate::test_support::pipe();
         assert!(!regular_file_has_size(&File::from(pipe_read), 0));
     }
 

@@ -1264,14 +1264,13 @@ mod tests {
 
         // The guest asks for the selection once per descriptor, in one write
         // the proxy dispatches as one batch.
-        let mut pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
         let mut receive = MessageBuilder::new();
         receive.write_string("text/plain");
         let receive =
             receive.build_message(GUEST_OFFER, protocols::wayland::wl_data_offer::REQ_RECEIVE);
         let requests = receive.repeat(RECEIVES);
-        let fds = [pipe[1]; RECEIVES];
+        let fds = [pipe_write.as_raw_fd(); RECEIVES];
         let sent = nix::sys::socket::sendmsg::<()>(
             guest_peer.as_raw_fd(),
             &[std::io::IoSlice::new(&requests)],
@@ -1281,10 +1280,7 @@ mod tests {
         )
         .expect("send the guest requests");
         assert_eq!(sent, requests.len());
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        drop((pipe_read, pipe_write));
         assert_eq!(
             client
                 .client_conn
@@ -1597,16 +1593,13 @@ mod tests {
             Context::new_for_test(false, false, Vec::new()),
         );
 
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let pending_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
+        let pending_fd =
+            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(pending_fd >= 1000, "fd duplication should succeed");
         let pending_target =
             fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        drop((pipe_read, pipe_write));
 
         // Sender 77 is complete but deliberately untracked. The four bytes
         // after it are only a partial header for the next message. There is no
@@ -1657,16 +1650,13 @@ mod tests {
             Context::new_for_test(false, false, Vec::new()),
         );
 
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let pending_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
+        let pending_fd =
+            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(pending_fd >= 1000, "fd duplication should succeed");
         let pending_target =
             fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        drop((pipe_read, pipe_write));
 
         let stale_event = MessageBuilder::new().build_message(77, 0);
         client.host_conn.read_buf.extend_from_slice(&stale_event);
@@ -1716,16 +1706,13 @@ mod tests {
             Context::new_for_test(false, false, Vec::new()),
         );
 
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let pending_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
+        let pending_fd =
+            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(pending_fd >= 1000, "fd duplication should succeed");
         let pending_target =
             fs::read_link(format!("/proc/self/fd/{pending_fd}")).expect("pending fd target");
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        drop((pipe_read, pipe_write));
 
         // Both messages are complete, but the first sender is untracked. The
         // descriptor arrived on the ordered stream with these bytes and
@@ -2421,7 +2408,7 @@ mod tests {
             "wl_buffer",
             1,
         );
-        let (fence, signal) = nix::unistd::pipe().expect("create the fence pipe");
+        let (fence, signal) = crate::test_support::pipe();
         let planes = (0..planes)
             .map(|_| fence.try_clone().expect("share the fence"))
             .collect();
@@ -2548,7 +2535,7 @@ mod tests {
         let (buffer, callback) = (s.new_id(), s.new_id());
         // A native buffer whose one plane the guest GPU writes until
         // `signal` is written.
-        let (plane, signal) = nix::unistd::pipe().expect("create the fence pipe");
+        let (plane, signal) = crate::test_support::pipe();
         let fence = fd_identity(signal.as_raw_fd());
         let ctx = s.ctx();
         ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);

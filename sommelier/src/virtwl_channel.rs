@@ -773,15 +773,12 @@ mod tests {
 
     #[test]
     fn virtwl_fd_array_converts_packed_descriptors_to_owned_fds() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let raw = [pipe_fds[1], -1];
+        let (_read, write) = crate::test_support::pipe();
+        // The array hands the descriptor over, as the kernel does.
+        let write = std::os::fd::IntoRawFd::into_raw_fd(write);
+        let raw = [write, -1];
         let owned = owned_fds_from_txn(&raw).expect("packed fd array");
         assert_eq!(owned.len(), 1);
-        assert_eq!(owned[0].as_raw_fd(), pipe_fds[1]);
-        drop(owned);
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
+        assert_eq!(owned[0].as_raw_fd(), write);
     }
 }

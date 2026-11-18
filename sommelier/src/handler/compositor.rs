@@ -1295,10 +1295,7 @@ mod tests {
     }
 
     fn unsupported_dmabuf_sync_fd() -> OwnedFd {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::close(pipe_fds[1]) }, 0);
-        unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) }
+        crate::test_support::pipe().0
     }
 
     fn invalid_ioctl_fd() -> OwnedFd {
@@ -1384,7 +1381,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         ctx.plane_fences_for_test = Some(crate::state::PlaneFenceForTest::SyncFile);
         let buffer = 50;
-        let (fence, signal) = nix::unistd::pipe().unwrap();
+        let (fence, signal) = crate::test_support::pipe();
         register_test_native_with_sync_fds(&mut ctx, buffer, (1, 1), vec![fence]);
         let mut handler = CompositorHandler;
         ctx.last_sender_id = TEST_SURFACE;

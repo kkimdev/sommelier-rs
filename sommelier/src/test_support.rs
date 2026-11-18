@@ -266,12 +266,19 @@ pub fn fds_with_identity(identity: TestFdIdentity) -> usize {
         .count()
 }
 
+/// A new pipe's read and write ends. They close on exec, so the child
+/// copies of the test binary that some tests start (see
+/// [`in_own_process`]) do not inherit them.
+pub fn pipe() -> (OwnedFd, OwnedFd) {
+    nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("create a pipe")
+}
+
 /// A memfd holding `bytes`, as a guest client creates a `wl_shm` pool file.
 pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
     use std::io::Write;
     let fd = nix::sys::memfd::memfd_create(
         c"sommelier-test-shm-pool",
-        nix::sys::memfd::MFdFlags::empty(),
+        nix::sys::memfd::MFdFlags::MFD_CLOEXEC,
     )
     .expect("memfd_create");
     let mut file = std::fs::File::from(fd);

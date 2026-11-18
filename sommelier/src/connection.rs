@@ -541,7 +541,7 @@ mod tests {
     use std::fs;
     use std::io::IoSlice;
     use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -707,11 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_unconsumed_received_fds() {
-        let mut pipe_fds: [RawFd; 2] = [-1; 2];
-        let result = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-        assert_eq!(result, 0, "pipe should be created");
-
-        let read_fd = pipe_fds[0];
+        let (read, _write) = crate::test_support::pipe();
         // Use a memfd for the received descriptor so its `(device, inode)`
         // identity is not shared with the connection's pipe peer or another
         // anonymous-inode object. Eventfds all report one inode on Linux.
@@ -719,12 +715,7 @@ mod tests {
         let pending_fd =
             memfd_create(name.as_c_str(), MFdFlags::MFD_CLOEXEC).expect("memfd_create");
         let pending_identity = fd_identity(pending_fd.as_raw_fd());
-        unsafe {
-            libc::close(pipe_fds[1]);
-        }
-        let mut connection =
-            WaylandConnection::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) })
-                .expect("register test pipe");
+        let mut connection = WaylandConnection::new(read).expect("register test pipe");
         connection.read_fds.push_back(pending_fd);
         drop(connection);
 
@@ -738,16 +729,13 @@ mod tests {
 
     #[test]
     fn truncated_scm_rights_closes_descriptors_recovered_from_control_buffer() {
-        let mut pipe_fds: [RawFd; 2] = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let received_fd = unsafe { libc::fcntl(pipe_fds[1], libc::F_DUPFD_CLOEXEC, 1000) };
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
+        let received_fd =
+            unsafe { libc::fcntl(pipe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 1000) };
         assert!(received_fd >= 1000);
         let received_target =
             fs::read_link(format!("/proc/self/fd/{received_fd}")).expect("received fd target");
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
-        }
+        drop((pipe_read, pipe_write));
 
         let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
         let mut control = vec![0u8; control_len];
@@ -812,11 +800,10 @@ mod tests {
         let sender_fd = sender.into_raw_fd();
         let receiver_fd = receiver.into_raw_fd();
 
-        let mut pipe_fds: [RawFd; 2] = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let pipe_target = fs::read_link(format!("/proc/self/fd/{}", pipe_fds[0]))
+        let (pipe_read, pipe_write) = crate::test_support::pipe();
+        let pipe_target = fs::read_link(format!("/proc/self/fd/{}", pipe_read.as_raw_fd()))
             .expect("pipe descriptor should be visible through procfs");
-        let sent_fds = [pipe_fds[0]; 4];
+        let sent_fds = [pipe_read.as_raw_fd(); 4];
 
         let sent = sendmsg::<()>(
             sender_fd,
@@ -840,9 +827,8 @@ mod tests {
         // Close the sender's originals. Any descriptor still referring to the
         // pipe after this point was installed by recvmsg and leaked past the
         // truncation cleanup path.
+        drop((pipe_read, pipe_write));
         unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
             libc::close(sender_fd);
             libc::close(receiver_fd);
         }

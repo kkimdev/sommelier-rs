@@ -2747,7 +2747,7 @@ mod tests {
 
         let fd = memfd_create(
             CString::new("test-keymap-private").unwrap().as_c_str(),
-            MFdFlags::empty(),
+            MFdFlags::MFD_CLOEXEC,
         )
         .expect("memfd_create failed");
         nix::unistd::ftruncate(&fd, 4096).expect("ftruncate failed");

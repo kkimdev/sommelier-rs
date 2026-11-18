@@ -868,7 +868,7 @@ mod tests {
     /// A sync_file is readable once its fence signals; a pipe stands in.
     #[test]
     fn a_sync_file_fence_is_checked_without_waiting() {
-        let (fence, signal) = nix::unistd::pipe().unwrap();
+        let (fence, signal) = crate::test_support::pipe();
         let fence = match sync_file_fence(fence).unwrap() {
             DmabufFence::Pending(PendingFence::SyncFile(fence)) => fence,
             other => panic!("an unreadable sync_file is pending, not {other:?}"),
@@ -896,7 +896,7 @@ mod tests {
 
     #[test]
     fn dmabuf_fence_without_allocator_uses_implicit_sync_when_ioctl_is_missing() {
-        let (not_a_dmabuf, _writer) = nix::unistd::pipe().unwrap();
+        let (not_a_dmabuf, _writer) = crate::test_support::pipe();
         assert!(matches!(
             dmabuf_fence(not_a_dmabuf.as_fd(), None).unwrap(),
             DmabufFence::ImplicitSyncFallback
