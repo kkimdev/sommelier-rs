@@ -24,3 +24,4 @@ mod clock;
 mod editor;
 pub(crate) mod exo;
 mod hangul;
+mod keymap;
