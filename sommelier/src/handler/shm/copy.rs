@@ -261,6 +261,10 @@ pub(crate) fn copy_shm_damage(
         for chunk in 0..chunks {
             let src_offset = plane.src_offset + chunk * plane.src_stride;
             let dst_offset = plane.dst_offset + chunk * plane.dst_stride;
+            debug_assert!(
+                dst_offset + chunk_bytes <= dest_size,
+                "valid_plane_copy admitted a chunk past the destination"
+            );
             // The read fails, instead of raising SIGBUS like a mapping
             // would, if the client truncated the pool file. EFAULT is the
             // destination mapping's fault, not the client's; it is also how
