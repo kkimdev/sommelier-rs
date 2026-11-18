@@ -1112,7 +1112,7 @@ fn row_H9_a_delete_that_cannot_be_measured_is_dropped() {
     type Case = (&'static str, Option<(&'static str, i32, i32)>, i32, u32);
     let cases: [Case; 5] = [
         ("no surrounding text", None, 0, 1),
-        ("a selection", Some(("abcd", 2, 0)), 0, 1),
+        ("a selection", Some(("abcd", 2, 0)), -1, 2),
         ("not around the cursor", Some(("abcd", 2, 2)), 3, 1),
         ("off a character boundary", Some(("가", 3, 3)), 1, 2),
         ("empty", Some(("ab", 1, 1)), 1, 0),
