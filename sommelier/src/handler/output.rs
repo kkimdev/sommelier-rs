@@ -353,68 +353,113 @@ mod tests {
         REQ_RELEASE as REQ_RELEASE_AURA_OUTPUT, REQ_RELEASE_SINCE as REQ_RELEASE_AURA_OUTPUT_SINCE,
     };
     use crate::protocols::wayland::wl_output::WlOutputHandler;
-    use crate::test_support::{msg_opcode, msg_sender, queued_headers};
+    use crate::state::{GlobalBinding, OutputState};
+    use crate::test_support::queued_headers;
     use crate::window_layout::Rect;
 
     const OUTPUT_HOST: u32 = 20;
     const AURA_OUTPUT_HOST: u32 = 21;
+    /// The global [`OUTPUT_HOST`] is bound from.
+    const GLOBAL: GlobalBinding = GlobalBinding {
+        name: 7,
+        generation: 1,
+    };
 
-    /// Bind host output 20 at `version` with `committed` metadata, and give
-    /// it the v38 Aura output 21.
-    fn bind_output_with_aura(
-        ctx: &mut Context,
-        version: u32,
-        committed: crate::state::OutputState,
-    ) {
-        bind_output_with_aura_version(ctx, version, committed, 38);
+    /// Host output [`OUTPUT_HOST`] and its Aura output [`AURA_OUTPUT_HOST`].
+    /// Each method delivers one host event, as the proxy dispatches it.
+    struct Output(Context);
+
+    impl Output {
+        /// The output bound at `version` with `committed` metadata, and an
+        /// Aura output at the vendored version.
+        fn new(version: u32, committed: OutputState) -> Self {
+            Self::with_aura_version(version, committed, zaura_output::VERSION)
+        }
+
+        /// [`Self::new`] with an Aura output of `aura_version`.
+        fn with_aura_version(version: u32, committed: OutputState, aura_version: u32) -> Self {
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            ctx.outputs.bind(OUTPUT_HOST, version, GLOBAL);
+            ctx.outputs.update(OUTPUT_HOST, |state| *state = committed);
+            ctx.outputs.commit(OUTPUT_HOST);
+            ctx.outputs
+                .remember_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
+            ctx.shadow_table.insert_host_only_for_test(
+                AURA_OUTPUT_HOST,
+                "zaura_output",
+                aura_version,
+            );
+            Self(ctx)
+        }
+
+        fn output(&mut self) -> &mut Context {
+            self.0.last_sender_id = OUTPUT_HOST;
+            &mut self.0
+        }
+
+        fn aura(&mut self) -> &mut Context {
+            self.0.last_sender_id = AURA_OUTPUT_HOST;
+            &mut self.0
+        }
+
+        /// `wl_output.geometry` at `origin`, with the panel `transform`.
+        fn geometry(&mut self, origin: (i32, i32), transform: i32) -> Action {
+            let name = String::new();
+            let (x, y) = origin;
+            OutputHandler.on_geometry(self.output(), x, y, 0, 0, 0, &name, &name, transform)
+        }
+
+        /// The current `wl_output.mode`.
+        fn mode(&mut self, width: i32, height: i32) -> Action {
+            OutputHandler.on_mode(self.output(), wl_output::MODE_CURRENT, width, height, 60)
+        }
+
+        fn done(&mut self) -> Action {
+            WlOutputHandler::on_done(&mut OutputHandler, self.output())
+        }
+
+        /// `zaura_output.scale` with `flags`.
+        fn scale(&mut self, flags: u32, scale: u32) -> Action {
+            ZauraOutputHandler::on_scale(&mut OutputHandler, self.aura(), flags, scale)
+        }
+
+        fn device_scale(&mut self, factor: u32) -> Action {
+            OutputHandler.on_device_scale_factor(self.aura(), factor)
+        }
+
+        fn insets(&mut self, top: i32, left: i32, bottom: i32, right: i32) -> Action {
+            OutputHandler.on_insets(self.aura(), top, left, bottom, right)
+        }
+
+        fn logical_transform(&mut self, transform: i32) -> Action {
+            ZauraOutputHandler::on_logical_transform(&mut OutputHandler, self.aura(), transform)
+        }
+
+        fn committed(&self) -> Option<OutputState> {
+            self.0.outputs.committed_for_test(OUTPUT_HOST)
+        }
+
+        fn work_area(&self) -> Option<Rect> {
+            self.committed().expect("live output").work_area()
+        }
+
+        fn has_pending(&self) -> bool {
+            self.0.outputs.has_pending_for_test()
+        }
     }
 
-    /// Like [`bind_output_with_aura`], with an Aura output of `aura_version`.
-    fn bind_output_with_aura_version(
-        ctx: &mut Context,
-        version: u32,
-        committed: crate::state::OutputState,
-        aura_version: u32,
-    ) {
-        ctx.outputs.bind(
-            OUTPUT_HOST,
-            version,
-            crate::state::GlobalBinding {
-                name: 7,
-                generation: 1,
-            },
-        );
-        ctx.outputs.update(OUTPUT_HOST, |state| *state = committed);
-        ctx.outputs.commit(OUTPUT_HOST);
-        ctx.outputs
-            .remember_aura_output(OUTPUT_HOST, AURA_OUTPUT_HOST);
-        ctx.shadow_table
-            .insert_host_only_for_test(AURA_OUTPUT_HOST, "zaura_output", aura_version);
-    }
-
-    fn committed_work_area(ctx: &Context) -> Option<Rect> {
-        ctx.outputs
-            .committed_for_test(OUTPUT_HOST)
-            .expect("live output")
-            .work_area()
-    }
+    use zaura_output::{SCALE_PROPERTY_CURRENT as CURRENT, SCALE_PROPERTY_PREFERRED as PREFERRED};
 
     #[test]
     fn fractional_aura_scale_defines_logical_work_area() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_output_with_aura(&mut ctx, 3, Default::default());
-        let mut handler = OutputHandler;
-
-        ctx.last_sender_id = OUTPUT_HOST;
-        handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        handler.on_device_scale_factor(&mut ctx, 1250);
-        ctx.last_sender_id = OUTPUT_HOST;
-        WlOutputHandler::on_done(&mut handler, &mut ctx);
+        let mut output = Output::new(3, OutputState::default());
+        output.mode(3840, 2160);
+        output.scale(CURRENT, 1000);
+        output.device_scale(1250);
+        output.done();
 
         assert_eq!(
-            committed_work_area(&ctx),
+            output.work_area(),
             Some(Rect::new(0, 0, 3072, 1728)),
             "Aura bounds use fractional DP scale, not rounded wl_output.scale"
         );
@@ -422,226 +467,127 @@ mod tests {
 
     #[test]
     fn aura_scale_updates_wait_for_done_and_ignore_preferred_or_zero_factors() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_output_with_aura(
-            &mut ctx,
+        let mut output = Output::new(
             3,
-            crate::state::OutputState {
+            OutputState {
                 mode_width: 3840,
                 mode_height: 2160,
                 ..Default::default()
             },
         );
-        let mut handler = OutputHandler;
 
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        assert_eq!(handler.on_device_scale_factor(&mut ctx, 0), Action::Drop);
-        assert_eq!(
-            ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0),
-            Action::Drop
-        );
-        assert!(!ctx.outputs.has_pending_for_test());
-        assert_eq!(committed_work_area(&ctx), None);
+        assert_eq!(output.device_scale(0), Action::Drop);
+        assert_eq!(output.scale(CURRENT, 0), Action::Drop);
+        assert!(!output.has_pending());
+        assert_eq!(output.work_area(), None);
 
-        handler.on_device_scale_factor(&mut ctx, 1250);
-        ctx.last_sender_id = OUTPUT_HOST;
-        WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(committed_work_area(&ctx), None);
+        output.device_scale(1250);
+        output.done();
+        assert_eq!(output.work_area(), None);
 
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        assert_eq!(committed_work_area(&ctx), None);
-        ctx.last_sender_id = OUTPUT_HOST;
-        WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
+        output.scale(CURRENT, 1000);
+        assert_eq!(output.work_area(), None);
+        output.done();
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 3072, 1728)));
 
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 2, 1200);
-        handler.on_device_scale_factor(&mut ctx, 0);
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 0);
-        assert!(!ctx.outputs.has_pending_for_test());
-        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
+        output.scale(PREFERRED, 1200);
+        output.device_scale(0);
+        output.scale(CURRENT, 0);
+        assert!(!output.has_pending());
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 3072, 1728)));
 
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 3, 1200);
-        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
-        ctx.last_sender_id = OUTPUT_HOST;
-        WlOutputHandler::on_done(&mut handler, &mut ctx);
-        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 2560, 1440)));
+        output.scale(PREFERRED | CURRENT, 1200);
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 3072, 1728)));
+        output.done();
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 2560, 1440)));
     }
 
     #[test]
     fn aura_scale_events_ignore_unknown_removed_and_released_outputs() {
-        let global = crate::state::GlobalBinding {
-            name: 7,
-            generation: 1,
-        };
-        for retired in 0..3 {
-            let mut ctx = Context::new_for_test(false, false, vec![]);
-            if retired != 0 {
-                bind_output_with_aura(&mut ctx, 3, Default::default());
-                if retired == 1 {
-                    assert_eq!(ctx.outputs.remove_global(global), [AURA_OUTPUT_HOST]);
-                } else {
-                    ctx.outputs.release(OUTPUT_HOST);
+        #[derive(Debug)]
+        enum Retired {
+            Unknown,
+            Removed,
+            Released,
+        }
+        for retired in [Retired::Unknown, Retired::Removed, Retired::Released] {
+            let mut output = Output::new(3, OutputState::default());
+            match retired {
+                Retired::Unknown => output = Output(Context::new_for_test(false, false, vec![])),
+                Retired::Removed => {
+                    assert_eq!(output.0.outputs.remove_global(GLOBAL), [AURA_OUTPUT_HOST])
                 }
+                Retired::Released => assert_eq!(
+                    output.0.outputs.release(OUTPUT_HOST),
+                    Some(AURA_OUTPUT_HOST)
+                ),
             }
-            ctx.last_sender_id = AURA_OUTPUT_HOST;
-            let mut handler = OutputHandler;
-            assert_eq!(handler.on_device_scale_factor(&mut ctx, 1250), Action::Drop);
-            assert_eq!(
-                ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000),
-                Action::Drop
-            );
-            assert!(!ctx.outputs.has_pending_for_test());
-            assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), None);
+            assert_eq!(output.device_scale(1250), Action::Drop, "{retired:?}");
+            assert_eq!(output.scale(CURRENT, 1000), Action::Drop, "{retired:?}");
+            assert!(!output.has_pending(), "{retired:?}");
+            assert_eq!(output.committed(), None, "{retired:?}");
         }
     }
 
     #[test]
     fn aura_scale_events_publish_immediately_for_version_one_output() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_output_with_aura(&mut ctx, 1, Default::default());
-        let mut handler = OutputHandler;
-        ctx.last_sender_id = OUTPUT_HOST;
-        handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        assert_eq!(committed_work_area(&ctx), None);
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        handler.on_device_scale_factor(&mut ctx, 1250);
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        assert_eq!(committed_work_area(&ctx), Some(Rect::new(0, 0, 3072, 1728)));
-        assert!(!ctx.outputs.has_pending_for_test());
+        let mut output = Output::new(1, OutputState::default());
+        output.mode(3840, 2160);
+        assert_eq!(output.work_area(), None);
+        output.device_scale(1250);
+        output.scale(CURRENT, 1000);
+        assert_eq!(output.work_area(), Some(Rect::new(0, 0, 3072, 1728)));
+        assert!(!output.has_pending());
     }
 
     #[test]
     fn output_geometry_and_aura_insets_define_logical_work_area() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_output_with_aura(&mut ctx, 3, Default::default());
-        let mut handler = OutputHandler;
+        let mut output = Output::new(3, OutputState::default());
 
-        ctx.last_sender_id = OUTPUT_HOST;
-        assert_eq!(
-            handler.on_geometry(
-                &mut ctx,
-                1920,
-                16,
-                600,
-                340,
-                0,
-                &"make".to_string(),
-                &"model".to_string(),
-                0,
-            ),
-            Action::Forward
-        );
-        handler.on_mode(&mut ctx, 1, 3840, 2160, 60);
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        assert_eq!(handler.on_insets(&mut ctx, 24, 8, 48, 16), Action::Drop);
-        ZauraOutputHandler::on_scale(&mut handler, &mut ctx, 1, 1000);
-        handler.on_device_scale_factor(&mut ctx, 2000);
-        assert_eq!(
-            ctx.outputs
-                .committed_for_test(OUTPUT_HOST)
-                .map(|state| state.mode_width),
-            Some(0)
-        );
-        ctx.last_sender_id = OUTPUT_HOST;
-        assert_eq!(
-            WlOutputHandler::on_done(&mut handler, &mut ctx),
-            Action::Forward
-        );
+        assert_eq!(output.geometry((1920, 16), 0), Action::Forward);
+        assert_eq!(output.mode(3840, 2160), Action::Forward);
+        assert_eq!(output.insets(24, 8, 48, 16), Action::Drop);
+        output.scale(CURRENT, 1000);
+        output.device_scale(2000);
+        assert_eq!(output.committed().map(|state| state.mode_width), Some(0));
+        assert_eq!(output.done(), Action::Forward);
 
-        assert_eq!(
-            committed_work_area(&ctx),
-            Some(Rect::new(1928, 40, 1896, 1008))
-        );
+        assert_eq!(output.work_area(), Some(Rect::new(1928, 40, 1896, 1008)));
     }
 
     #[test]
     fn negative_aura_insets_are_rejected_without_mutating_output_state() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let insets = crate::state::OutputState {
+        let insets = OutputState {
             insets_top: 1,
             insets_left: 2,
             insets_bottom: 3,
             insets_right: 4,
             ..Default::default()
         };
-        bind_output_with_aura(&mut ctx, 3, insets);
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
+        let mut output = Output::new(3, insets);
 
-        assert_eq!(
-            ZauraOutputHandler::on_insets(&mut OutputHandler, &mut ctx, -1, 2, 3, 4),
-            Action::Drop
-        );
-        assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), Some(insets));
-        assert!(!ctx.outputs.has_pending_for_test());
+        assert_eq!(output.insets(-1, 2, 3, 4), Action::Drop);
+        assert_eq!(output.committed(), Some(insets));
+        assert!(!output.has_pending());
     }
 
     #[test]
     fn removed_output_ignores_late_wl_output_and_aura_events() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_output_with_aura(&mut ctx, 3, Default::default());
-        let global = crate::state::GlobalBinding {
-            name: 7,
-            generation: 1,
-        };
-        assert_eq!(ctx.outputs.remove_global(global), [AURA_OUTPUT_HOST]);
-        let mut handler = OutputHandler;
+        let mut output = Output::new(3, OutputState::default());
+        assert_eq!(output.0.outputs.remove_global(GLOBAL), [AURA_OUTPUT_HOST]);
 
         // The guest still owns a valid wl_output, so its events are
         // forwarded, but they must not repopulate retired metadata.
-        ctx.last_sender_id = OUTPUT_HOST;
+        assert_eq!(output.mode(3840, 2160), Action::Forward);
+        assert_eq!(output.done(), Action::Forward);
+        assert_eq!(output.insets(10, 20, 30, 40), Action::Drop);
+        assert!(!output.has_pending());
+        assert_eq!(output.committed(), None);
         assert_eq!(
-            handler.on_mode(&mut ctx, 1, 3840, 2160, 60),
-            Action::Forward
-        );
-        assert_eq!(
-            WlOutputHandler::on_done(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        assert_eq!(
-            ZauraOutputHandler::on_insets(&mut handler, &mut ctx, 10, 20, 30, 40),
-            Action::Drop
-        );
-        assert!(!ctx.outputs.has_pending_for_test());
-        assert_eq!(ctx.outputs.committed_for_test(OUTPUT_HOST), None);
-        assert_eq!(
-            ctx.outputs.release(OUTPUT_HOST),
+            output.0.outputs.release(OUTPUT_HOST),
             None,
             "the removal already handed over the Aura child"
         );
-    }
-
-    /// Send one Exo display-metrics group: `wl_output.geometry` (panel
-    /// transform) and `mode` (native panel pixels), the Aura factors and
-    /// `logical_transform`, then `wl_output.done`.
-    fn send_rotated_output_metrics(
-        ctx: &mut Context,
-        mode: (i32, i32),
-        panel_transform: i32,
-        logical_transform: i32,
-    ) {
-        let mut handler = OutputHandler;
-        ctx.last_sender_id = OUTPUT_HOST;
-        handler.on_geometry(
-            ctx,
-            0,
-            0,
-            0,
-            0,
-            0,
-            &"make".to_string(),
-            &"model".to_string(),
-            panel_transform,
-        );
-        handler.on_mode(ctx, 1, mode.0, mode.1, 60);
-        ctx.last_sender_id = AURA_OUTPUT_HOST;
-        ZauraOutputHandler::on_scale(&mut handler, ctx, 1, 1000);
-        handler.on_device_scale_factor(ctx, 1000);
-        ZauraOutputHandler::on_logical_transform(&mut handler, ctx, logical_transform);
-        ctx.last_sender_id = OUTPUT_HOST;
-        WlOutputHandler::on_done(&mut handler, ctx);
     }
 
     #[test]
@@ -661,98 +607,72 @@ mod tests {
             // logical ROTATE_90 (wire value 3).
             ((1600, 2560), 2, 3, Rect::new(0, 0, 1600, 2560)),
         ] {
-            let mut ctx = Context::new_for_test(false, false, vec![]);
-            bind_output_with_aura(&mut ctx, 3, Default::default());
-            send_rotated_output_metrics(&mut ctx, mode, panel, logical);
+            // One Exo display-metrics group.
+            let mut output = Output::new(3, OutputState::default());
+            output.geometry((0, 0), panel);
+            output.mode(mode.0, mode.1);
+            output.scale(CURRENT, 1000);
+            output.device_scale(1000);
+            output.logical_transform(logical);
+            output.done();
             assert_eq!(
-                committed_work_area(&ctx),
+                output.work_area(),
                 Some(expected),
                 "mode {mode:?}, panel {panel}, logical {logical}"
             );
         }
     }
 
+    /// Releasing a wl_output forgets it, so placement no longer picks it,
+    /// and releases its Aura output first. Before `zaura_output.release` the
+    /// Aura output has no destructor: it is retired without a request.
     #[test]
     fn releasing_output_removes_it_from_placement_selection() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_guest = 10;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            output_guest,
-            OUTPUT_HOST,
-            "wl_output",
-            3,
-        );
-        bind_output_with_aura(
-            &mut ctx,
-            3,
-            crate::state::OutputState {
+        for (aura_version, aura_release) in [
+            (REQ_RELEASE_AURA_OUTPUT_SINCE, true),
+            (REQ_RELEASE_AURA_OUTPUT_SINCE - 1, false),
+        ] {
+            let placeable = OutputState {
                 mode_width: 1920,
                 mode_height: 1080,
                 aura_current_scale: Some(1000),
                 aura_device_scale_factor: Some(1000),
                 ..Default::default()
-            },
-        );
-        assert!(ctx.outputs.primary().is_some());
-        let mut handler = OutputHandler;
-        // wl_output.release is a client request, so the sender is the guest
-        // object ID even though the queued destructor targets the host ID.
-        ctx.last_sender_id = output_guest;
-        assert_eq!(
-            WlOutputHandler::on_release(&mut handler, &mut ctx),
-            Action::Drop
-        );
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[0].0), AURA_OUTPUT_HOST);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[0].0),
-            REQ_RELEASE_AURA_OUTPUT
-        );
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), OUTPUT_HOST);
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[1].0),
-            wl_output::REQ_RELEASE
-        );
-        assert!(ctx.outputs.primary().is_none());
-        assert!(ctx.outputs.is_empty_for_test());
-        assert!(ctx.shadow_table.is_pending_destroy_guest(output_guest));
-        assert!(ctx.shadow_table.is_retired_host(AURA_OUTPUT_HOST));
-    }
-
-    /// Before `zaura_output.release` the Aura output has no destructor: it is
-    /// retired without a request, and only the wl_output is released.
-    #[test]
-    fn aura_output_without_release_is_retired_silently() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let output_guest = 10;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            output_guest,
-            OUTPUT_HOST,
-            "wl_output",
-            3,
-        );
-        bind_output_with_aura_version(
-            &mut ctx,
-            3,
-            Default::default(),
-            REQ_RELEASE_AURA_OUTPUT_SINCE - 1,
-        );
-        ctx.last_sender_id = output_guest;
-        assert_eq!(
-            WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
-            Action::Drop
-        );
-        let queued = queued_headers(&ctx.client_to_host_queue);
-        assert_eq!(queued, vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)]);
-        assert!(ctx.shadow_table.is_retired_host(AURA_OUTPUT_HOST));
-        assert_eq!(ctx.shadow_table.get_host_interface(AURA_OUTPUT_HOST), None);
-        assert!(!ctx.shadow_table.is_host_id_available(AURA_OUTPUT_HOST));
+            };
+            let Output(mut ctx) = Output::with_aura_version(3, placeable, aura_version);
+            let output_guest = 10;
+            ctx.shadow_table.insert_paired_with_version_for_test(
+                output_guest,
+                OUTPUT_HOST,
+                "wl_output",
+                3,
+            );
+            assert!(ctx.outputs.primary().is_some());
+            // wl_output.release is a client request, so the sender is the
+            // guest object ID even though the queued destructor targets the
+            // host ID.
+            ctx.last_sender_id = output_guest;
+            assert_eq!(
+                WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
+                Action::Drop
+            );
+            let mut expected = vec![(OUTPUT_HOST, wl_output::REQ_RELEASE)];
+            if aura_release {
+                expected.insert(0, (AURA_OUTPUT_HOST, REQ_RELEASE_AURA_OUTPUT));
+            }
+            assert_eq!(queued_headers(&ctx.client_to_host_queue), expected);
+            assert!(ctx.outputs.primary().is_none());
+            assert!(ctx.outputs.is_empty_for_test());
+            assert!(ctx.shadow_table.is_pending_destroy_guest(output_guest));
+            assert!(ctx.shadow_table.is_retired_host(AURA_OUTPUT_HOST));
+            assert_eq!(ctx.shadow_table.get_host_interface(AURA_OUTPUT_HOST), None);
+            assert!(!ctx.shadow_table.is_host_id_available(AURA_OUTPUT_HOST));
+        }
     }
 
     #[test]
     fn released_outputs_leave_no_record() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = OutputHandler;
         // Output 20 lost its global before release; output 30 did not.
         for (output_guest, output_host) in [(10, 20), (11, 30)] {
             ctx.shadow_table.insert_paired_with_version_for_test(
@@ -763,7 +683,7 @@ mod tests {
             );
             ctx.outputs.bind_for_test(output_host, Default::default());
         }
-        let removed_aura_outputs = ctx.outputs.remove_global(crate::state::GlobalBinding {
+        let removed_aura_outputs = ctx.outputs.remove_global(GlobalBinding {
             name: 20,
             generation: 1,
         });
@@ -771,7 +691,7 @@ mod tests {
         for output_guest in [10, 11] {
             ctx.last_sender_id = output_guest;
             assert_eq!(
-                WlOutputHandler::on_release(&mut handler, &mut ctx),
+                WlOutputHandler::on_release(&mut OutputHandler, &mut ctx),
                 Action::Drop
             );
         }
@@ -781,149 +701,176 @@ mod tests {
         );
     }
 
-    /// A bound output's release reaches the host, which acknowledges it; the
-    /// proxy sends no `delete_id` of its own.
-    #[test]
-    fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
-        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
-        ctx.outputs.bind_for_test(OUTPUT_HOST, Default::default());
+    mod session {
+        use crate::protocols::wayland::{wl_display, wl_output, wl_registry};
+        use crate::protocols::xdg_output_unstable_v1::{zxdg_output_manager_v1, zxdg_output_v1};
+        use crate::proxy::harness::{Object, Session};
+        use crate::wire::WL_DISPLAY_ID;
 
-        ctx.last_sender_id = 10;
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
-        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(OUTPUT_HOST, wl_output::REQ_RELEASE)]
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
-    }
+        /// How many IDs the guest skips before its first object. The proxy
+        /// allocates host IDs densely from the bottom, so without the gap
+        /// each guest object could get its own ID on the host too, and a
+        /// forward that kept the guest ID would pass for a translated one.
+        const GUEST_ID_LEAD: u32 = 10;
 
-    /// An inert output (its bind crossed its global's removal) has no host
-    /// object, so its release completes in the proxy with one `delete_id`.
-    #[test]
-    fn inert_output_release_completes_locally() {
-        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
-        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.create_local(10, "wl_output", 3);
+        /// A session whose guest IDs run [`GUEST_ID_LEAD`] ahead of the
+        /// host's.
+        fn session() -> Session {
+            let mut s = Session::new();
+            for _ in 0..GUEST_ID_LEAD {
+                s.new_id();
+            }
+            s
+        }
 
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
-        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(1, EVT_DELETE_ID)]
-        );
-        assert_eq!(ctx.shadow_table.get_interface(10), None);
-        assert!(!ctx.is_fatal());
-    }
+        /// The host advertises global `interface` at `version`, which the
+        /// guest is told of; returns its name.
+        async fn advertise(s: &mut Session, interface: &str, version: u32) -> u32 {
+            let name = s.advertise(interface, version).await;
+            let registry = s.registry().await;
+            let global = wl_registry::Event::Global {
+                name,
+                interface: interface.to_string(),
+                version,
+            };
+            assert_eq!(s.guest_received(), [(registry.id, global.into())]);
+            assert_eq!(s.host_received(), []);
+            name
+        }
 
-    /// Forwards every `zxdg_output_v1` message, as the proxy's dispatcher
-    /// does for an interface without a custom handler.
-    struct ForwardXdgOutput;
-    impl crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::ZxdgOutputV1Handler
-        for ForwardXdgOutput
-    {
-    }
+        /// The guest binds global `interface` at `version`, which the host
+        /// advertises first; returns the guest object and its host object.
+        async fn bind(s: &mut Session, interface: &str, version: u32) -> Object {
+            let name = advertise(s, interface, version).await;
+            let registry = s.registry().await;
+            let id = s.new_id();
+            let bind = wl_registry::req::bind(registry.id, name, interface, version, id).unwrap();
+            let host = s.create(bind).await;
+            assert_ne!(host, id);
+            Object { id, host }
+        }
 
-    /// Guest `zxdg_output_manager_v1` 30 on host 31 at `version`.
-    fn bind_xdg_output_manager(ctx: &mut Context, version: u32) {
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            30,
-            31,
-            "zxdg_output_manager_v1",
-            version,
-        );
-    }
+        /// A `wl_output` the guest binds after the host removed its global,
+        /// as when the bind and the removal cross: an inert output.
+        async fn inert_output(s: &mut Session) -> u32 {
+            let name = advertise(s, "wl_output", 3).await;
+            let registry = s.registry().await;
+            s.host([wl_registry::evt::global_remove(registry.host, name)])
+                .await;
+            let removed = wl_registry::Event::GlobalRemove { name };
+            assert_eq!(s.guest_received(), [(registry.id, removed.into())]);
+            let output = s.new_id();
+            s.guest([wl_registry::req::bind(registry.id, name, "wl_output", 3, output).unwrap()])
+                .await;
+            assert_eq!(s.host_received(), []);
+            output
+        }
 
-    /// Dispatch `get_xdg_output(40, output_guest)` from manager 30.
-    fn get_xdg_output(ctx: &mut Context, output_guest: u32) -> Option<Vec<u8>> {
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::{
-            dispatch_request, REQ_GET_XDG_OUTPUT,
-        };
-        let payload = [40u32.to_ne_bytes(), output_guest.to_ne_bytes()].concat();
-        let mut request = crate::wire::WireMessage::new(30, REQ_GET_XDG_OUTPUT, &payload);
-        ctx.last_sender_id = 30;
-        let dispatched = dispatch_request(&mut request, &mut OutputHandler, ctx);
-        dispatched
-            .expect("valid request")
-            .map(|(message, _)| message)
-    }
+        /// A bound output's release reaches the host, which acknowledges it;
+        /// the proxy sends no `delete_id` of its own.
+        #[tokio::test]
+        async fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
+            let mut s = session();
+            let output = bind(&mut s, "wl_output", 3).await;
 
-    /// The xdg_output of a live output gets a host object; its events
-    /// reach the guest translated, at its manager's version.
-    #[test]
-    fn xdg_output_passes_through_with_translated_ids_and_versions() {
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            self, dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
-        };
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_xdg_output_manager(&mut ctx, 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
+            s.guest([wl_output::req::release(output.id)]).await;
+            assert_eq!(
+                s.host_received(),
+                [(output.host, wl_output::Request::Release {}.into())]
+            );
+            assert_eq!(s.guest_received(), []);
 
-        let request = get_xdg_output(&mut ctx, 10).expect("forwarded");
-        let host_xdg_output = ctx.shadow_table.get_host_id(40).expect("host object");
-        assert_eq!(msg_sender(&request), 31);
-        assert_eq!(
-            request[8..],
-            [host_xdg_output.to_ne_bytes(), OUTPUT_HOST.to_ne_bytes()].concat()
-        );
+            s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, output.host)])
+                .await;
+            let deleted = wl_display::Event::DeleteId { id: output.id };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        }
 
-        // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
-        let size = [1600i32.to_ne_bytes(), 1000i32.to_ne_bytes()].concat();
-        let mut event = crate::wire::WireMessage::new(host_xdg_output, EVT_LOGICAL_SIZE, &size);
-        let (event, _) = dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx)
-            .expect("valid event")
-            .expect("forwarded");
-        assert_eq!(msg_sender(&event), 40);
-        assert_eq!(event[8..], size);
+        /// An inert output (its bind crossed its global's removal) has no
+        /// host object, so its release completes in the proxy with one
+        /// `delete_id`, which frees its ID.
+        #[tokio::test]
+        async fn inert_output_release_completes_locally() {
+            let mut s = session();
+            let output = inert_output(&mut s).await;
 
-        // `description` is a v2 event, which a v1 xdg_output never gets.
-        let (description, _) =
-            zxdg_output_v1::evt::description(host_xdg_output, "Built-in display").unwrap();
-        let mut event =
-            crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..]);
-        assert!(matches!(
-            dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx),
-            Err(crate::wire::ProtocolError::UnsupportedVersion { .. })
-        ));
-    }
+            s.guest([wl_output::req::release(output)]).await;
+            assert_eq!(s.host_received(), []);
+            let deleted = wl_display::Event::DeleteId { id: output };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
 
-    /// The xdg_output of an inert output is inert too: nothing reaches the
-    /// host, and its destroy completes in the proxy with one `delete_id`.
-    #[test]
-    fn xdg_output_of_an_inert_output_is_inert() {
-        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            dispatch_request, REQ_DESTROY,
-        };
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_xdg_output_manager(&mut ctx, 3);
-        ctx.shadow_table.create_local(10, "wl_output", 3);
+            // The ID is free for the guest's next object.
+            s.create(wl_display::req::sync(WL_DISPLAY_ID, output)).await;
+        }
 
-        assert_eq!(get_xdg_output(&mut ctx, 10), None);
-        assert_eq!(ctx.shadow_table.get_host_id(40), None);
-        assert!(ctx
-            .shadow_table
-            .request_object(40, "zxdg_output_v1")
-            .is_some());
-        assert_eq!(ctx.shadow_table.guest_object_version(40), Some(3));
+        /// The xdg_output of a live output gets a host object; its events
+        /// reach the guest translated, at its manager's version.
+        #[tokio::test]
+        async fn xdg_output_passes_through_with_translated_ids_and_versions() {
+            let mut s = session();
+            let manager = bind(&mut s, "zxdg_output_manager_v1", 1).await;
+            let output = bind(&mut s, "wl_output", 3).await;
+            let xdg_output = s.new_id();
 
-        let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[]);
-        let dispatched = dispatch_request(&mut destroy, &mut ForwardXdgOutput, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(1, EVT_DELETE_ID)]
-        );
+            let get = zxdg_output_manager_v1::req::get_xdg_output;
+            s.guest([get(manager.id, xdg_output, output.id)]).await;
+            let forwarded = s.host_received();
+            let [(_, forward)] = &forwarded[..] else {
+                panic!("the host did not get one request: {forwarded:?}");
+            };
+            let host_xdg_output = forward.new_object().expect("an xdg_output").0;
+            assert_ne!(host_xdg_output, xdg_output);
+            let get = zxdg_output_manager_v1::Request::GetXdgOutput {
+                id: host_xdg_output,
+                output: output.host,
+            };
+            assert_eq!(forwarded, [(manager.host, get.into())]);
+
+            // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
+            s.host([zxdg_output_v1::evt::logical_size(
+                host_xdg_output,
+                1600,
+                1000,
+            )])
+            .await;
+            let size = zxdg_output_v1::Event::LogicalSize {
+                width: 1600,
+                height: 1000,
+            };
+            assert_eq!(s.guest_received(), [(xdg_output, size.into())]);
+
+            // `description` is a v2 event, which a v1 xdg_output never gets:
+            // a host that sends it breaks the protocol.
+            let description = zxdg_output_v1::evt::description(host_xdg_output, "Built-in display");
+            s.host_fatal([description.unwrap()]).await;
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+            );
+        }
+
+        /// The xdg_output of an inert output is inert too: nothing reaches
+        /// the host, and its destroy completes in the proxy with one
+        /// `delete_id`.
+        #[tokio::test]
+        async fn xdg_output_of_an_inert_output_is_inert() {
+            let mut s = session();
+            let manager = bind(&mut s, "zxdg_output_manager_v1", 3).await;
+            let output = inert_output(&mut s).await;
+            let xdg_output = s.new_id();
+
+            let get = zxdg_output_manager_v1::req::get_xdg_output;
+            s.guest([get(manager.id, xdg_output, output)]).await;
+            // No event can show an inert object's version.
+            let table = &s.ctx().shadow_table;
+            assert_eq!(table.get_interface(xdg_output), Some("zxdg_output_v1"));
+            assert_eq!(table.guest_object_version(xdg_output), Some(3));
+
+            s.guest([zxdg_output_v1::req::destroy(xdg_output)]).await;
+            assert_eq!(s.host_received(), []);
+            let deleted = wl_display::Event::DeleteId { id: xdg_output };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        }
     }
 
     /// Dock the panel and an external monitor, move a window onto the

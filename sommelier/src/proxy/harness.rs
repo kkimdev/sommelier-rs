@@ -41,13 +41,13 @@ use std::os::unix::net::UnixStream;
 
 /// A guest object and the host object the proxy paired it with.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Object {
-    pub(super) id: u32,
-    pub(super) host: u32,
+pub(crate) struct Object {
+    pub(crate) id: u32,
+    pub(crate) host: u32,
 }
 
 /// A [`Client`] whose guest and host are played by the test.
-pub(super) struct Session {
+pub(crate) struct Session {
     client: Client,
     guest: Peer<AnyEvent>,
     host: Peer<AnyRequest>,
@@ -59,7 +59,7 @@ pub(super) struct Session {
 
 impl Session {
     /// A session whose proxy has a plain test context.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ctx = Context::new_for_test(false, false, Vec::new());
         let (guest, guest_socket) = UnixStream::pair().expect("a guest socket pair");
         let (host, host_socket) = UnixStream::pair().expect("a host socket pair");
@@ -77,12 +77,12 @@ impl Session {
     }
 
     /// The proxy's state, for a test that injects a fault no peer can cause.
-    pub(super) fn ctx(&mut self) -> &mut Context {
+    pub(crate) fn ctx(&mut self) -> &mut Context {
         &mut self.client.ctx
     }
 
     /// The guest sends `requests`, which must not end the session.
-    pub(super) async fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
         assert!(
             self.send(Direction::ClientToHost, requests).await,
             "the guest's requests ended the session"
@@ -98,7 +98,7 @@ impl Session {
     }
 
     /// The host sends `events`, which must not end the session.
-    pub(super) async fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn host(&mut self, events: impl IntoIterator<Item = Outgoing>) {
         assert!(
             self.send(Direction::HostToClient, events).await,
             "the host's events ended the session"
@@ -106,7 +106,7 @@ impl Session {
     }
 
     /// The host sends `events`, which must end the session.
-    pub(super) async fn host_fatal(&mut self, events: impl IntoIterator<Item = Outgoing>) {
+    pub(crate) async fn host_fatal(&mut self, events: impl IntoIterator<Item = Outgoing>) {
         assert!(
             !self.send(Direction::HostToClient, events).await,
             "the host's events did not end the session"
@@ -138,13 +138,13 @@ impl Session {
 
     /// What the proxy sent the host since the last call, with the sender of
     /// each request.
-    pub(super) fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
+    pub(crate) fn host_received(&mut self) -> Vec<(u32, AnyRequest)> {
         std::mem::take(&mut self.host.received)
     }
 
     /// What the proxy sent the guest since the last call, with the sender
     /// of each event.
-    pub(super) fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
+    pub(crate) fn guest_received(&mut self) -> Vec<(u32, AnyEvent)> {
         std::mem::take(&mut self.guest.received)
     }
 
@@ -152,7 +152,7 @@ impl Session {
     /// `wl_display.error` that ended the session, and that error's object
     /// and code. The error must be the guest's one error and its last
     /// event, and carry a diagnostic.
-    pub(super) fn guest_received_and_error(&mut self) -> (Vec<(u32, AnyEvent)>, (u32, u32)) {
+    pub(crate) fn guest_received_and_error(&mut self) -> (Vec<(u32, AnyEvent)>, (u32, u32)) {
         let (events, error, _) = self.guest_received_and_diagnosed_error();
         (events, error)
     }
@@ -186,7 +186,7 @@ impl Session {
     }
 
     /// A guest object ID no object has had.
-    pub(super) fn new_id(&mut self) -> u32 {
+    pub(crate) fn new_id(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -195,7 +195,7 @@ impl Session {
     /// The guest sends `request`, which creates one object; returns the host
     /// ID of the object its forward creates. The forward is not kept for
     /// [`Self::host_received`].
-    pub(super) async fn create(&mut self, request: Outgoing) -> u32 {
+    pub(crate) async fn create(&mut self, request: Outgoing) -> u32 {
         let (_, interface) = self
             .guest
             .objects
@@ -218,7 +218,7 @@ impl Session {
     /// The host advertises global `interface` at `version` on the guest's
     /// registry, which the guest creates on first use; returns the global's
     /// name. What the proxy sends either peer is kept.
-    pub(super) async fn advertise(&mut self, interface: &str, version: u32) -> u32 {
+    pub(crate) async fn advertise(&mut self, interface: &str, version: u32) -> u32 {
         let registry = self.registry().await;
         let name = self.next_global_name;
         self.next_global_name += 1;
@@ -291,7 +291,7 @@ impl Session {
     }
 
     /// The guest's `wl_registry`, which it creates on first use.
-    pub(super) async fn registry(&mut self) -> Object {
+    pub(crate) async fn registry(&mut self) -> Object {
         if let Some(registry) = self.registry {
             return registry;
         }

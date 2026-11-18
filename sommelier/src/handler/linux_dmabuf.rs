@@ -936,8 +936,6 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
 }
 
 #[cfg(test)]
-// Tests build and close raw descriptors to check who owns them.
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
         build_synthetic_feedback_messages, feedback_pairs, is_supported_drm_format,
@@ -946,40 +944,136 @@ mod tests {
     };
     use crate::handler::display::DisplayHandler;
     use crate::handler::shm::ShmHandler;
-    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
-    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::{
+        self, evt, ZwpLinuxBufferParamsV1Handler,
+    };
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1 as feedback;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1Handler;
-    use crate::protocols::wayland::wl_display;
-    use crate::protocols::wayland::wl_display::WlDisplayHandler;
-    use crate::protocols::wayland::wl_shm;
+    use crate::protocols::wayland::wl_display::{self, WlDisplayHandler};
+    use crate::protocols::wayland::{wl_buffer, wl_shm};
     use crate::state::{Context, HostId, PendingNativeCreate, PendingParam, SessionEnd};
     use crate::test_support::{
-        any_fd_has_identity, fd_identity, protocol_error, protocol_error_code,
+        any_fd_has_identity, decoded, fd_identity, msg_opcode, msg_sender, protocol_error,
+        TestFdIdentity,
     };
-    use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use crate::wire::{Action, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
-    use crate::test_support::msg_opcode as message_opcode;
+    const XRGB8888: u32 = 0x3432_5258;
 
-    fn pending_native_create(guest_params_id: u32, dimensions: (i32, i32)) -> PendingNativeCreate {
-        // A descriptor number from `/dev/null` can be reused by another
-        // parallel test after the owning generation is dropped. A per-test
-        // pipe read end gives the ownership assertions a descriptor that no
-        // unrelated test can accidentally keep open.
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(
-            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
-            0,
-            "create test synchronization pipe"
-        );
-        assert_eq!(unsafe { libc::close(pipe_fds[1]) }, 0);
-        PendingNativeCreate {
-            guest_params_id,
-            dimensions,
-            // Safety: the read end was returned by `pipe` and is transferred
-            // into `File`, which owns it until the pending generation drops.
-            sync_fds: vec![unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) }.into()],
+    /// A guest `zwp_linux_buffer_params_v1` and the host object it is
+    /// paired with.
+    #[derive(Clone, Copy)]
+    struct Params {
+        guest: u32,
+        host: u32,
+    }
+
+    const PARAMS: Params = Params { guest: 7, host: 8 };
+    /// The `wl_buffer` the guest's `create_immed` names.
+    const BUFFER: u32 = 90;
+    /// The `wl_buffer` the host's `created` event creates, a server ID.
+    const HOST_BUFFER: u32 = 0xff00_0042;
+
+    /// One end of a new pipe: a descriptor whose file no other test shares.
+    fn pipe_fd() -> OwnedFd {
+        let (reader, _writer) = std::io::pipe().expect("a pipe");
+        reader.into()
+    }
+
+    /// Plane `plane_idx` at `offset` with `stride` bytes per row, on `fd`.
+    fn plane_on(fd: OwnedFd, plane_idx: u32, offset: u32, stride: u32) -> PendingParam {
+        PendingParam {
+            fd,
+            plane_idx,
+            offset,
+            stride,
+            modifier_hi: 0,
+            modifier_lo: 0,
         }
+    }
+
+    /// [`plane_on`] a new pipe.
+    fn plane(plane_idx: u32, offset: u32, stride: u32) -> PendingParam {
+        plane_on(pipe_fd(), plane_idx, offset, stride)
+    }
+
+    /// Pair `params` at version 4 and give it `planes`, as the sender of
+    /// the next request.
+    fn add_params(ctx: &mut Context, params: Params, planes: Vec<PendingParam>) {
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            params.guest,
+            params.host,
+            "zwp_linux_buffer_params_v1",
+            4,
+        );
+        ctx.pending_params.insert(params.guest, planes);
+        ctx.last_sender_id = params.guest;
+    }
+
+    /// A context whose [`PARAMS`] hold `planes`.
+    fn params_with(planes: Vec<PendingParam>) -> Context {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        add_params(&mut ctx, PARAMS, planes);
+        ctx
+    }
+
+    /// The guest's asynchronous `create` of a 16x8 XRGB8888 buffer from
+    /// `params`, with one plane.
+    fn create(ctx: &mut Context, params: Params) {
+        add_params(ctx, params, vec![plane(0, 0, 64)]);
+        assert_eq!(
+            LinuxDmabufHandler.on_create(ctx, 16, 8, XRGB8888, 0),
+            Action::Drop
+        );
+    }
+
+    /// The host sends params event `event`, which the proxy dispatches;
+    /// returns what it forwards.
+    fn params_event(ctx: &mut Context, (event, _): Outgoing) -> Option<Outgoing> {
+        ctx.last_sender_id = msg_sender(&event);
+        let mut event = WireMessage::new(
+            ctx.last_sender_id,
+            msg_opcode(&event),
+            &event[MessageHeader::LEN..],
+        );
+        zwp_linux_buffer_params_v1::dispatch_event(&mut event, &mut LinuxDmabufHandler, ctx)
+            .expect("the event decodes")
+    }
+
+    /// `forward` is the `created` of guest buffer `buffer`, from `params`.
+    fn forwarded_created(forward: Option<Outgoing>, params: Params, buffer: u32) {
+        let forward = forward.expect("created reaches the guest");
+        assert_eq!(
+            decoded(&[forward], zwp_linux_buffer_params_v1::Event::from_wire),
+            [(
+                params.guest,
+                zwp_linux_buffer_params_v1::Event::Created { buffer }
+            )]
+        );
+    }
+
+    /// Give [`PARAMS`] (paired, without planes) the 16x8 asynchronous create
+    /// the host still owes an answer, as `on_create` leaves it, with a fence
+    /// descriptor no other test shares; returns that descriptor's identity.
+    fn pending_create(ctx: &mut Context) -> TestFdIdentity {
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            PARAMS.guest,
+            PARAMS.host,
+            "zwp_linux_buffer_params_v1",
+            4,
+        );
+        let fence = pipe_fd();
+        let identity = fd_identity(fence.as_raw_fd());
+        let pending = PendingNativeCreate {
+            guest_params_id: PARAMS.guest,
+            dimensions: (16, 8),
+            sync_fds: vec![fence],
+        };
+        ctx.pending_native_creates
+            .insert(HostId(PARAMS.host), pending);
+        ctx.last_sender_id = PARAMS.guest;
+        identity
     }
 
     #[test]
@@ -1005,31 +1099,27 @@ mod tests {
 
     #[test]
     fn synthetic_feedback_messages_are_atomic_sealed_and_protocol_ordered() {
-        let pairs = [(0x3432_5258, 0), (0x3432_5241, DRM_FORMAT_MOD_INVALID)];
+        let pairs = [(XRGB8888, 0), (0x3432_5241, DRM_FORMAT_MOD_INVALID)];
         let device = 0x1234_5678_u64.to_ne_bytes();
         let messages =
             build_synthetic_feedback_messages(77, &pairs, &device).expect("feedback messages");
 
-        let opcodes = messages
+        let headers = messages
             .iter()
-            .map(|(message, _)| message_opcode(message))
+            .map(|(message, fds)| (msg_sender(message), msg_opcode(message), fds.len()))
             .collect::<Vec<_>>();
         assert_eq!(
-            opcodes,
-            vec![
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_FORMAT_TABLE,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_MAIN_DEVICE,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_TARGET_DEVICE,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FLAGS,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_DONE,
-                crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_DONE,
+            headers,
+            [
+                (77, feedback::EVT_FORMAT_TABLE, 1),
+                (77, feedback::EVT_MAIN_DEVICE, 0),
+                (77, feedback::EVT_TRANCHE_TARGET_DEVICE, 0),
+                (77, feedback::EVT_TRANCHE_FLAGS, 0),
+                (77, feedback::EVT_TRANCHE_FORMATS, 0),
+                (77, feedback::EVT_TRANCHE_DONE, 0),
+                (77, feedback::EVT_DONE, 0),
             ]
         );
-        assert!(messages
-            .iter()
-            .all(|(message, _)| { crate::test_support::msg_sender(message) == 77 }));
-        assert_eq!(messages.iter().map(|(_, fds)| fds.len()).sum::<usize>(), 1);
 
         let table_fd = messages[0].1[0].as_raw_fd();
         let expected_seals =
@@ -1037,56 +1127,63 @@ mod tests {
         let seals = unsafe { libc::fcntl(table_fd, libc::F_GET_SEALS) };
         assert_eq!(seals & expected_seals, expected_seals);
 
+        // Each entry is a u32 format, 4 bytes of padding and a u64 modifier.
         let mut table = [0u8; 32];
         assert_eq!(
             unsafe { libc::pread(table_fd, table.as_mut_ptr().cast(), table.len(), 0) },
             table.len() as isize
         );
-        assert_eq!(crate::test_support::msg_sender(&table), pairs[0].0);
+        let modifier = |at: usize| u64::from_ne_bytes(table[at..at + 8].try_into().unwrap());
         assert_eq!(
-            u64::from_ne_bytes(table[8..16].try_into().unwrap()),
-            pairs[0].1
+            u32::from_ne_bytes(table[..4].try_into().unwrap()),
+            pairs[0].0
         );
-        assert_eq!(
-            u64::from_ne_bytes(table[24..32].try_into().unwrap()),
-            pairs[1].1
-        );
-
-        drop(messages);
+        assert_eq!(modifier(8), pairs[0].1);
+        assert_eq!(modifier(24), pairs[1].1);
     }
 
     #[test]
     fn large_synthetic_feedback_splits_tranche_indices_at_wire_limit() {
         let pairs = (0..MAX_FEEDBACK_FORMATS)
-            .map(|index| (0x3432_5258, index as u64))
+            .map(|index| (XRGB8888, index as u64))
             .collect::<Vec<_>>();
         let messages = build_synthetic_feedback_messages(77, &pairs, &[0; 8])
             .expect("maximum-size feedback should be representable");
         assert!(messages
             .iter()
-            .all(|(message, _)| message.len() <= crate::wire::MessageHeader::MAX_LEN));
+            .all(|(message, _)| message.len() <= MessageHeader::MAX_LEN));
         // The tranche_formats events together list every table index once,
         // in order.
-        let indices = messages
-            .iter()
-            .filter(|(message, _)| {
-                message_opcode(message)
-                    == crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::EVT_TRANCHE_FORMATS
+        let indices = decoded(&messages, feedback::Event::from_wire)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                feedback::Event::TrancheFormats { indices } => Some(indices),
+                _ => None,
             })
-            .flat_map(|(message, _)| {
-                let mut event = WireMessage::new(77, 0, &message[8..]);
-                let array = event.read_array().expect("a tranche_formats array");
-                let (indices, rest) = array.as_chunks::<2>();
+            .flat_map(|indices| {
+                let (indices, rest) = indices.as_chunks::<2>();
                 assert!(rest.is_empty(), "uint16 indices");
                 indices
                     .iter()
                     .map(|index| usize::from(u16::from_ne_bytes(*index)))
                     .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert!(indices.iter().copied().eq(0..MAX_FEEDBACK_FORMATS));
+            });
+        assert!(indices.eq(0..MAX_FEEDBACK_FORMATS));
+    }
 
-        drop(messages);
+    /// Guest factory 7 asks for its default feedback 90.
+    fn get_default_feedback(ctx: &mut Context) -> Action {
+        ctx.last_sender_id = 7;
+        ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, ctx, 90)
+    }
+
+    /// A context, with `gpu_accel`, whose guest factory 7 holds capability
+    /// generation 42, `ready` or not.
+    fn factory(gpu_accel: bool, ready: bool) -> Context {
+        let mut ctx = Context::new_for_test(gpu_accel, false, vec![]);
+        ctx.dmabuf_guest_generations.insert(7, 42);
+        ctx.dmabuf_capabilities.entry(42).or_default().ready = ready;
+        ctx
     }
 
     /// A factory without a capability generation is the proxy's own
@@ -1095,12 +1192,7 @@ mod tests {
     #[test]
     fn feedback_from_an_untracked_factory_is_an_implementation_error() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 7;
-
-        assert_eq!(
-            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
-            Action::Drop
-        );
+        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
         assert_eq!(
             protocol_error(&ctx),
             (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)
@@ -1112,15 +1204,8 @@ mod tests {
     /// error: libwayland reports that as `wl_display.no_memory`.
     #[test]
     fn unallocatable_feedback_is_a_no_memory_error() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.dmabuf_guest_generations.insert(7, 42);
-        ctx.dmabuf_capabilities.entry(42).or_default().ready = true;
-        ctx.last_sender_id = 7;
-
-        assert_eq!(
-            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut LinuxDmabufHandler, &mut ctx, 90),
-            Action::Drop
-        );
+        let mut ctx = factory(false, true);
+        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
         assert_eq!(
             protocol_error(&ctx),
             (WL_DISPLAY_ID, wl_display::ERROR_NO_MEMORY)
@@ -1129,16 +1214,8 @@ mod tests {
 
     #[test]
     fn synthetic_feedback_waits_for_capability_barrier() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.dmabuf_guest_generations.insert(7, 42);
-        ctx.dmabuf_capabilities.entry(42).or_default();
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-
-        assert_eq!(
-            ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut handler, &mut ctx, 90),
-            Action::Drop
-        );
+        let mut ctx = factory(true, false);
+        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
         assert_eq!(ctx.synthetic_feedback_objects.get(&90), Some(&42));
         assert!(
             ctx.host_to_client_queue.is_empty(),
@@ -1149,28 +1226,21 @@ mod tests {
 
     #[test]
     fn synthetic_feedback_destroy_completes_locally() {
-        use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1::{
-            dispatch_request, REQ_DESTROY,
-        };
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.dmabuf_guest_generations.insert(7, 42);
-        ctx.dmabuf_capabilities.entry(42).or_default();
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-        ZwpLinuxDmabufV1Handler::on_get_default_feedback(&mut handler, &mut ctx, 90);
+        let mut ctx = factory(true, false);
+        assert_eq!(get_default_feedback(&mut ctx), Action::Drop);
         // With its factory gone, the feedback holds the last reference to
         // the capability snapshot.
         ctx.dmabuf_guest_generations.remove(&7);
 
         ctx.last_sender_id = 90;
-        let mut destroy = WireMessage::new(90, REQ_DESTROY, &[]);
-        let dispatched = dispatch_request(&mut destroy, &mut handler, &mut ctx);
+        let mut destroy = WireMessage::new(90, feedback::REQ_DESTROY, &[]);
+        let dispatched =
+            feedback::dispatch_request(&mut destroy, &mut LinuxDmabufHandler, &mut ctx);
         assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
         assert_eq!(
-            message_opcode(&ctx.host_to_client_queue[0].0),
-            wl_display::EVT_DELETE_ID
+            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
+            [(WL_DISPLAY_ID, wl_display::Event::DeleteId { id: 90 })]
         );
         assert!(!ctx.synthetic_feedback_objects.contains_key(&90));
         assert!(!ctx.dmabuf_capabilities.contains_key(&42));
@@ -1179,150 +1249,136 @@ mod tests {
     #[test]
     fn capability_snapshots_remain_isolated_by_global_generation() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.dmabuf_capabilities
-            .entry(1)
-            .or_default()
-            .format_modifiers
-            .push((0x3432_5258, 1));
-        ctx.dmabuf_capabilities
-            .entry(2)
-            .or_default()
-            .format_modifiers
-            .push((0x3432_5258, 2));
+        for generation in [1, 2] {
+            ctx.dmabuf_capabilities
+                .entry(generation)
+                .or_default()
+                .format_modifiers
+                .push((XRGB8888, generation));
+        }
 
-        assert_eq!(feedback_pairs(&ctx, 1), vec![(0x3432_5258, 1)]);
-        assert_eq!(feedback_pairs(&ctx, 2), vec![(0x3432_5258, 2)]);
+        assert_eq!(feedback_pairs(&ctx, 1), vec![(XRGB8888, 1)]);
+        assert_eq!(feedback_pairs(&ctx, 2), vec![(XRGB8888, 2)]);
     }
 
     #[test]
     fn legacy_capability_events_are_hidden_from_synthetic_v4_factory() {
         let mut ctx = Context::new_for_test(true, false, vec![]);
+        let capabilities = |ctx: &mut Context, host| {
+            ctx.last_sender_id = host;
+            [
+                LinuxDmabufHandler.on_format(ctx, XRGB8888),
+                LinuxDmabufHandler.on_modifier(ctx, XRGB8888, 0, 0),
+            ]
+        };
         ctx.shadow_table
             .insert_paired_with_version_for_test(10, 20, "zwp_linux_dmabuf_v1", 4);
-        ctx.last_sender_id = 20;
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(handler.on_format(&mut ctx, 0x3432_5258), Action::Drop);
-        assert_eq!(
-            handler.on_modifier(&mut ctx, 0x3432_5258, 0, 0),
-            Action::Drop
-        );
+        assert_eq!(capabilities(&mut ctx, 20), [Action::Drop; 2]);
 
         ctx.release_deleted_host_id(20);
         ctx.shadow_table
             .insert_paired_with_version_for_test(11, 21, "zwp_linux_dmabuf_v1", 3);
-        ctx.last_sender_id = 21;
-        assert_eq!(handler.on_format(&mut ctx, 0x3432_5258), Action::Forward);
-        assert_eq!(
-            handler.on_modifier(&mut ctx, 0x3432_5258, 0, 0),
-            Action::Forward
-        );
+        assert_eq!(capabilities(&mut ctx, 21), [Action::Forward; 2]);
     }
 
     #[test]
     fn supported_formats_match_chromiumos_format_table() {
-        assert!(is_supported_drm_format(wl_shm::FORMAT_NV12)); // NV12
-        assert!(is_supported_drm_format(0x3631_4752)); // RGB565
-        assert!(is_supported_drm_format(0x3432_5258)); // XRGB8888
-        assert!(is_supported_drm_format(0x3432_5241)); // ARGB8888
-        assert!(is_supported_drm_format(0x3432_4258)); // XBGR8888
-        assert!(is_supported_drm_format(0x3432_4241)); // ABGR8888
+        for format in [
+            wl_shm::FORMAT_NV12,
+            0x3631_4752, // RGB565
+            XRGB8888,
+            0x3432_5241, // ARGB8888
+            0x3432_4258, // XBGR8888
+            0x3432_4241, // ABGR8888
+        ] {
+            assert!(is_supported_drm_format(format), "{format:#010x}");
+        }
         assert!(!is_supported_drm_format(0xdead_beef));
     }
 
     #[test]
     fn create_immed_without_tracked_params_does_not_map_buffer() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(7, 8, "zwp_linux_buffer_params_v1");
-        ctx.last_sender_id = 7;
+        let mut ctx = params_with(Vec::new());
+        ctx.pending_params.remove(&PARAMS.guest);
 
-        let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_create_immed(&mut ctx, 90, 16, 16, 0x3432_5258, 0),
+            LinuxDmabufHandler.on_create_immed(&mut ctx, BUFFER, 16, 16, XRGB8888, 0),
             Action::Drop
         );
-        assert_eq!(ctx.shadow_table.get_host_id(90), None);
+        assert_eq!(ctx.shadow_table.get_host_id(BUFFER), None);
         assert!(ctx.client_to_host_queue.is_empty());
+        assert!(!ctx.is_fatal());
     }
 
     #[test]
     fn create_immed_registers_one_complete_buffer_generation() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let params_id = 7;
-        let host_params_id = 8;
-        let buffer_id = 90;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        ctx.pending_params.insert(
-            params_id,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = params_id;
+        let fd = pipe_fd();
+        let added = fd.try_clone().expect("duplicate the plane");
+        let mut ctx = params_with(vec![plane_on(fd, 0, 0, 64)]);
 
-        let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_create_immed(&mut ctx, buffer_id, 16, 8, 0x3432_5258, 0),
+            LinuxDmabufHandler.on_create_immed(&mut ctx, BUFFER, 16, 8, XRGB8888, 0),
             Action::Drop
         );
 
-        let host_buffer_id = ctx.shadow_table.get_host_id(buffer_id).unwrap();
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
+        let host_buffer = ctx.shadow_table.get_host_id(BUFFER).expect("a host buffer");
+        assert_ne!(host_buffer, BUFFER);
         assert_eq!(
-            message_opcode(&ctx.client_to_host_queue[0].0),
-            zwp_linux_buffer_params_v1::REQ_ADD
+            decoded(
+                &ctx.client_to_host_queue,
+                zwp_linux_buffer_params_v1::Request::from_wire
+            ),
+            [
+                (
+                    PARAMS.host,
+                    zwp_linux_buffer_params_v1::Request::Add {
+                        fd: added,
+                        plane_idx: 0,
+                        offset: 0,
+                        stride: 64,
+                        modifier_hi: 0,
+                        modifier_lo: 0,
+                    }
+                ),
+                (
+                    PARAMS.host,
+                    zwp_linux_buffer_params_v1::Request::CreateImmed {
+                        buffer_id: host_buffer,
+                        width: 16,
+                        height: 8,
+                        format: XRGB8888,
+                        flags: 0,
+                    }
+                ),
+            ]
         );
+        assert_eq!(ctx.buffer_dimensions(BUFFER), Some((16, 8)));
         assert_eq!(
-            message_opcode(&ctx.client_to_host_queue[1].0),
-            zwp_linux_buffer_params_v1::REQ_CREATE_IMMED
-        );
-        assert_eq!(ctx.buffer_dimensions(buffer_id), Some((16, 8)));
-        assert_eq!(
-            ctx.native_buffer_sync_fds(buffer_id)
+            ctx.native_buffer_sync_fds(BUFFER)
                 .map(|sync_fds| sync_fds.len()),
             Some(1)
         );
-        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
-        assert!(ctx.used_dmabuf_params.contains(&params_id));
-
-        drop(ctx);
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
+        assert!(ctx.has_render_buffer_host(HostId(host_buffer)));
+        assert!(ctx.used_dmabuf_params.contains(&PARAMS.guest));
     }
 
     #[test]
     fn reused_params_report_already_used_without_mapping_a_buffer() {
-        let params_id = 7;
-        let buffer_id = 90;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(params_id, 8, "zwp_linux_buffer_params_v1");
-        ctx.used_dmabuf_params.insert(params_id);
-        ctx.last_sender_id = params_id;
+        let mut ctx = params_with(Vec::new());
+        ctx.pending_params.remove(&PARAMS.guest);
+        ctx.used_dmabuf_params.insert(PARAMS.guest);
 
-        let mut handler = LinuxDmabufHandler;
         assert_eq!(
-            handler.on_create_immed(&mut ctx, buffer_id, 16, 8, 0x3432_5258, 0),
+            LinuxDmabufHandler.on_create_immed(&mut ctx, BUFFER, 16, 8, XRGB8888, 0),
             Action::Drop
         );
 
-        assert!(ctx.is_fatal());
-        assert_eq!(ctx.shadow_table.get_host_id(buffer_id), None);
+        assert_eq!(
+            protocol_error(&ctx),
+            (PARAMS.guest, zwp_linux_buffer_params_v1::ERROR_ALREADY_USED)
+        );
+        assert_eq!(ctx.shadow_table.get_host_id(BUFFER), None);
         assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(protocol_error_code(&ctx), 0);
     }
 
     /// A plane the proxy cannot duplicate, here because the process may
@@ -1368,702 +1424,298 @@ mod tests {
         assert!(ctx.pending_params[&7].is_empty());
     }
 
+    /// An `add` or `create` the params cannot take ends the session with
+    /// the params' declared error, and nothing reaches the host.
     #[test]
     fn invalid_plane_requests_queue_declared_protocol_errors() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(7, Vec::new());
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-
-        assert_eq!(
-            handler.on_add(
-                &mut ctx,
-                unsafe { BorrowedFd::borrow_raw(pipe_fds[1]) },
-                2,
-                0,
-                64,
-                0,
-                0
-            ),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(protocol_error_code(&ctx), 1);
-        unsafe {
-            libc::close(pipe_fds[0]);
-            libc::close(pipe_fds[1]);
+        use zwp_linux_buffer_params_v1::{
+            ERROR_INCOMPLETE, ERROR_INVALID_DIMENSIONS, ERROR_OUT_OF_BOUNDS, ERROR_PLANE_IDX,
+            ERROR_PLANE_SET,
+        };
+        enum Request {
+            Add {
+                plane_idx: u32,
+            },
+            Create {
+                width: i32,
+                height: i32,
+                format: u32,
+            },
         }
-
-        let mut first_pipe = [-1; 2];
-        let mut second_pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(
-            7,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            handler.on_add(
-                &mut ctx,
-                unsafe { BorrowedFd::borrow_raw(second_pipe[1]) },
-                0,
-                4096,
-                64,
-                0,
-                0
+        let cases: [(&str, Vec<PendingParam>, Request, u32); 6] = [
+            (
+                "an add past the last plane",
+                vec![],
+                Request::Add { plane_idx: 2 },
+                ERROR_PLANE_IDX,
             ),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(protocol_error_code(&ctx), 2);
-        // The context owns the first plane's descriptor and closes it; a
-        // second close here would close whatever a parallel test had just
-        // opened under that number.
-        drop(ctx);
-        unsafe {
-            libc::close(first_pipe[0]);
-            libc::close(second_pipe[0]);
-            libc::close(second_pipe[1]);
-        }
-    }
-
-    #[test]
-    fn invalid_dmabuf_create_queues_dimensions_error() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(
-            7,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = 7;
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            handler.on_create(&mut ctx, 0, 16, 0x3432_5258, 0),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(protocol_error_code(&ctx), 5);
-        unsafe {
-            libc::close(pipe_fds[0]);
+            (
+                "an add of a plane already set",
+                vec![plane(0, 0, 64)],
+                Request::Add { plane_idx: 0 },
+                ERROR_PLANE_SET,
+            ),
+            (
+                "a zero width",
+                vec![plane(0, 0, 64)],
+                Request::Create {
+                    width: 0,
+                    height: 16,
+                    format: XRGB8888,
+                },
+                ERROR_INVALID_DIMENSIONS,
+            ),
+            (
+                "two planes for a one-plane format",
+                vec![plane(0, 0, 64), plane(0, 4096, 64)],
+                Request::Create {
+                    width: 16,
+                    height: 16,
+                    format: XRGB8888,
+                },
+                ERROR_INCOMPLETE,
+            ),
+            (
+                "plane 0 twice for a two-plane format",
+                vec![plane(0, 0, 16), plane(0, 128, 16)],
+                Request::Create {
+                    width: 16,
+                    height: 8,
+                    format: wl_shm::FORMAT_NV12,
+                },
+                ERROR_PLANE_SET,
+            ),
+            (
+                // XRGB8888 needs four bytes per pixel.
+                "a stride shorter than one row",
+                vec![plane(0, 0, 4 * 3)],
+                Request::Create {
+                    width: 4,
+                    height: 4,
+                    format: XRGB8888,
+                },
+                ERROR_OUT_OF_BOUNDS,
+            ),
+        ];
+        for (case, planes, request, code) in cases {
+            let mut ctx = params_with(planes);
+            let action = match request {
+                Request::Add { plane_idx } => {
+                    let fd = pipe_fd();
+                    LinuxDmabufHandler.on_add(&mut ctx, fd.as_fd(), plane_idx, 0, 64, 0, 0)
+                }
+                Request::Create {
+                    width,
+                    height,
+                    format,
+                } => LinuxDmabufHandler.on_create(&mut ctx, width, height, format, 0),
+            };
+            assert_eq!(action, Action::Drop, "{case}");
+            assert_eq!(protocol_error(&ctx), (PARAMS.guest, code), "{case}");
+            assert!(ctx.client_to_host_queue.is_empty(), "{case}");
         }
     }
 
     #[test]
     fn async_dmabuf_created_event_moves_dimensions_to_host_buffer() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-        );
-        ctx.pending_params.insert(
-            guest_params_id,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = guest_params_id;
-        let mut handler = LinuxDmabufHandler;
-
+        create(&mut ctx, PARAMS);
+        let pending = &ctx.pending_native_creates[&HostId(PARAMS.host)];
         assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.pending_native_creates
-                .get(&HostId(host_params_id))
-                .map(|pending| pending.dimensions),
-            Some((16, 8)),
+            pending.dimensions,
+            (16, 8),
             "async create must retain dimensions until the host emits created"
         );
-        assert!(
-            ctx.pending_native_creates
-                .contains_key(&HostId(host_params_id)),
+        assert_eq!(
+            pending.sync_fds.len(),
+            1,
             "async create must retain a dma-buf fence descriptor until created"
         );
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
 
-        let payload = host_buffer_id.to_ne_bytes();
-        ctx.last_sender_id = host_params_id;
-        let mut message = WireMessage::new(
-            host_params_id,
-            crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-        );
-        let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
-            &mut message,
-            &mut handler,
-            &mut ctx,
-        )
-        .expect("created event should decode");
-        assert!(
-            result.is_some(),
-            "created must still be forwarded to the guest"
-        );
-        assert!(!ctx
-            .pending_native_creates
-            .contains_key(&HostId(host_params_id)));
+        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
+        let guest_buffer = ctx
+            .shadow_table
+            .get_guest_id(HOST_BUFFER)
+            .expect("generated created event must map the host buffer");
+        forwarded_created(forward, PARAMS, guest_buffer);
+        assert!(ctx.pending_native_creates.is_empty());
         assert_eq!(
-            ctx.buffer_dimensions_for_host(HostId(host_buffer_id)),
+            ctx.buffer_dimensions_for_host(HostId(HOST_BUFFER)),
             Some((16, 8))
         );
-        let guest_buffer_id = ctx
-            .shadow_table
-            .get_guest_id(host_buffer_id)
-            .expect("generated created event must map the host buffer");
         assert!(
-            ctx.native_buffer_sync_fds(guest_buffer_id)
+            ctx.native_buffer_sync_fds(guest_buffer)
                 .is_some_and(|sync_fds| !sync_fds.is_empty()),
             "created must move the retained fence descriptor to the host buffer"
         );
-        assert!(
-            ctx.buffer_dimensions(guest_buffer_id) == Some((16, 8)),
+        assert_eq!(
+            ctx.buffer_dimensions(guest_buffer),
+            Some((16, 8)),
             "guest lookup must resolve the canonical host-ID keyed generation"
         );
         assert_eq!(ctx.render_buffer_count(), 1);
-
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
     }
 
+    /// Every plane of a multi-plane create keeps a fence descriptor of its
+    /// own, whether the planes are distinct dma-bufs or descriptors of one.
     #[test]
-    fn multi_plane_create_retains_each_distinct_backing_fence() {
-        let mut first_pipe = [-1; 2];
-        let mut second_pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-        );
-        ctx.pending_params.insert(
-            guest_params_id,
-            vec![
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
-                    plane_idx: 0,
-                    offset: 0,
-                    stride: 16,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
-                    plane_idx: 1,
-                    offset: 128,
-                    stride: 16,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-            ],
-        );
-        ctx.last_sender_id = guest_params_id;
-
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.pending_native_creates[&HostId(host_params_id)]
-                .sync_fds
-                .len(),
-            2,
-            "every distinct plane backing must retain its own compositor fence"
-        );
-
-        drop(ctx);
-        unsafe {
-            libc::close(first_pipe[0]);
-            libc::close(second_pipe[0]);
-        }
-    }
-
-    #[test]
-    fn multi_plane_create_retains_each_shared_backing_plane() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let duplicate = unsafe { libc::dup(pipe_fds[1]) };
-        assert!(duplicate >= 0);
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-        );
-        ctx.pending_params.insert(
-            guest_params_id,
-            vec![
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                    plane_idx: 0,
-                    offset: 0,
-                    stride: 16,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(duplicate) },
-                    plane_idx: 1,
-                    offset: 128,
-                    stride: 16,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-            ],
-        );
-        ctx.last_sender_id = guest_params_id;
-
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
-            Action::Drop
-        );
-        assert_eq!(
-            ctx.pending_native_creates[&HostId(host_params_id)]
-                .sync_fds
-                .len(),
-            2,
-            "descriptor identity must not incorrectly merge distinct dma-buf planes"
-        );
-
-        drop(ctx);
-        unsafe {
-            libc::close(pipe_fds[0]);
+    fn multi_plane_create_retains_a_fence_for_every_plane() {
+        for shared in [false, true] {
+            let first = pipe_fd();
+            let second = if shared {
+                first.try_clone().expect("duplicate the plane")
+            } else {
+                pipe_fd()
+            };
+            let mut ctx = params_with(vec![
+                plane_on(first, 0, 0, 16),
+                plane_on(second, 1, 128, 16),
+            ]);
+            assert_eq!(
+                LinuxDmabufHandler.on_create(&mut ctx, 16, 8, wl_shm::FORMAT_NV12, 0),
+                Action::Drop
+            );
+            assert_eq!(
+                ctx.pending_native_creates[&HostId(PARAMS.host)]
+                    .sync_fds
+                    .len(),
+                2,
+                "shared backing: {shared}"
+            );
         }
     }
 
     #[test]
     fn async_created_buffer_destroy_allows_ordered_host_id_reuse() {
-        let mut first_pipe = [-1; 2];
-        let mut second_pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
-        let first_guest_params = 7;
-        let first_host_params = 8;
-        let second_guest_params = 9;
-        let second_host_params = 10;
-        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = LinuxDmabufHandler;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            first_guest_params,
-            first_host_params,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        ctx.pending_params.insert(
-            first_guest_params,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = first_guest_params;
-        assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
-            Action::Drop
-        );
-
-        let payload = host_buffer_id.to_ne_bytes();
-        ctx.last_sender_id = first_host_params;
-        let mut created = WireMessage::new(
-            first_host_params,
-            zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-        );
-        assert!(
-            zwp_linux_buffer_params_v1::dispatch_event(&mut created, &mut handler, &mut ctx)
-                .expect("first created event should decode")
-                .is_some()
-        );
+        create(&mut ctx, PARAMS);
+        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
         let first_guest_buffer = ctx
             .shadow_table
-            .get_guest_id(host_buffer_id)
+            .get_guest_id(HOST_BUFFER)
             .expect("created must allocate a guest server ID");
+        forwarded_created(forward, PARAMS, first_guest_buffer);
         assert!(ctx.shadow_table.is_guest_server_id(first_guest_buffer));
-        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
 
-        let queued_before_destroy = ctx.client_to_host_queue.len();
+        ctx.client_to_host_queue.clear();
         ctx.last_sender_id = first_guest_buffer;
-        let mut destroy = WireMessage::new(first_guest_buffer, 0, &[]);
-        assert!(crate::protocols::wayland::wl_buffer::dispatch_request(
-            &mut destroy,
-            &mut ShmHandler,
-            &mut ctx,
-        )
-        .expect("server-created wl_buffer.destroy should decode")
-        .is_none());
+        let mut destroy = WireMessage::new(first_guest_buffer, wl_buffer::REQ_DESTROY, &[]);
+        let dispatched = wl_buffer::dispatch_request(&mut destroy, &mut ShmHandler, &mut ctx);
+        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
         assert_eq!(ctx.shadow_table.get_host_id(first_guest_buffer), None);
-        assert_eq!(ctx.shadow_table.get_guest_id(host_buffer_id), None);
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
-        assert!(ctx.shadow_table.is_host_id_available(host_buffer_id));
+        assert_eq!(ctx.shadow_table.get_guest_id(HOST_BUFFER), None);
+        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
+        assert!(ctx.shadow_table.is_host_id_available(HOST_BUFFER));
         assert!(!ctx
             .shadow_table
             .is_pending_destroy_guest(first_guest_buffer));
-        assert!(!ctx.shadow_table.is_retired_host(host_buffer_id));
+        assert!(!ctx.shadow_table.is_retired_host(HOST_BUFFER));
         assert!(ctx.host_to_client_queue.is_empty());
         assert_eq!(
-            ctx.client_to_host_queue.len(),
-            queued_before_destroy + 1,
+            decoded(&ctx.client_to_host_queue, wl_buffer::Request::from_wire),
+            [(HOST_BUFFER, wl_buffer::Request::Destroy {})],
             "destroy must queue exactly one host wl_buffer destructor"
         );
-        let (destroy_message, destroy_fds) = ctx.client_to_host_queue.last().unwrap();
-        assert_eq!(
-            crate::test_support::msg_sender(destroy_message),
-            host_buffer_id
-        );
-        assert_eq!(crate::test_support::msg_opcode(destroy_message), 0);
-        assert!(destroy_fds.is_empty());
 
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            second_guest_params,
-            second_host_params,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        ctx.pending_params.insert(
-            second_guest_params,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = second_guest_params;
-        assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
-            Action::Drop
-        );
-
-        ctx.last_sender_id = second_host_params;
-        let mut reused = WireMessage::new(
-            second_host_params,
-            zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-        );
-        assert!(
-            zwp_linux_buffer_params_v1::dispatch_event(&mut reused, &mut handler, &mut ctx)
-                .expect("reused host buffer ID should decode")
-                .is_some()
-        );
+        let next_params = Params { guest: 9, host: 10 };
+        create(&mut ctx, next_params);
+        let reused = params_event(&mut ctx, evt::created(next_params.host, HOST_BUFFER));
         let second_guest_buffer = ctx
             .shadow_table
-            .get_guest_id(host_buffer_id)
+            .get_guest_id(HOST_BUFFER)
             .expect("reused host buffer ID must map to a new guest server ID");
+        forwarded_created(reused, next_params, second_guest_buffer);
         assert_eq!(
             second_guest_buffer, first_guest_buffer,
             "a destroyed server-created buffer's guest ID is reused first"
         );
         assert!(ctx.shadow_table.is_guest_server_id(second_guest_buffer));
-        assert!(ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
         assert!(!ctx.is_fatal());
-
-        unsafe {
-            libc::close(first_pipe[0]);
-            libc::close(second_pipe[0]);
-        }
     }
 
     #[test]
     fn async_dmabuf_failed_event_discards_pending_dimensions() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let guest_params_id = 7;
-        let host_params_id = 8;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-        );
-        ctx.pending_params.insert(
-            guest_params_id,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                plane_idx: 0,
-                offset: 0,
-                stride: 64,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-        ctx.last_sender_id = guest_params_id;
-        let mut handler = LinuxDmabufHandler;
-        assert_eq!(
-            handler.on_create(&mut ctx, 16, 8, 0x3432_5258, 0),
-            Action::Drop
-        );
+        create(&mut ctx, PARAMS);
         assert!(ctx
             .pending_native_creates
-            .contains_key(&HostId(host_params_id)));
+            .contains_key(&HostId(PARAMS.host)));
 
-        ctx.last_sender_id = host_params_id;
-        let mut message = WireMessage::new(
-            host_params_id,
-            crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED,
-            &[],
-        );
-        let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
-            &mut message,
-            &mut handler,
-            &mut ctx,
-        )
-        .expect("failed event should decode");
-        assert!(
-            result.is_some(),
-            "failed must still be forwarded to the guest"
+        let forward = params_event(&mut ctx, evt::failed(PARAMS.host));
+        assert_eq!(
+            decoded(
+                &[forward.expect("failed must still be forwarded to the guest")],
+                zwp_linux_buffer_params_v1::Event::from_wire
+            ),
+            [(PARAMS.guest, zwp_linux_buffer_params_v1::Event::Failed {})]
         );
         assert!(ctx.pending_native_creates.is_empty());
         assert_eq!(ctx.render_buffer_count(), 0);
-
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
-    }
-
-    #[test]
-    fn destroying_async_params_discards_pending_generation() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        ctx.shadow_table.insert_paired_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-        );
-        ctx.pending_native_creates.insert(
-            HostId(host_params_id),
-            pending_native_create(guest_params_id, (16, 8)),
-        );
-        ctx.last_sender_id = guest_params_id;
-
-        ctx.guest_destroyed(guest_params_id);
-        assert!(ctx.pending_native_creates.is_empty());
     }
 
     #[test]
     fn orphaned_async_created_buffer_is_destroyed_locally() {
-        let guest_params_id = 7;
-        let host_params_id = 8;
-        let host_buffer_id: u32 = 0xff00_0042;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        ctx.pending_native_creates.insert(
-            HostId(host_params_id),
-            pending_native_create(guest_params_id, (16, 8)),
-        );
-        let mut handler = LinuxDmabufHandler;
-        ctx.last_sender_id = guest_params_id;
+        pending_create(&mut ctx);
         // This is what the generated params.destroy dispatcher records after
         // forwarding a destroy request, before the delayed created event can
         // arrive from the host.
-        ctx.guest_destroyed(guest_params_id);
+        ctx.guest_destroyed(PARAMS.guest);
 
-        ctx.last_sender_id = host_params_id;
-        let payload = host_buffer_id.to_ne_bytes();
-        let mut message = WireMessage::new(
-            host_params_id,
-            crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED,
-            &payload,
-        );
-        let result = crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::dispatch_event(
-            &mut message,
-            &mut handler,
-            &mut ctx,
-        )
-        .expect("orphaned created event should decode");
-
+        let forward = params_event(&mut ctx, evt::created(PARAMS.host, HOST_BUFFER));
         assert!(
-            result.is_none(),
+            forward.is_none(),
             "orphaned buffer must not be exposed to guest"
         );
         assert!(ctx.pending_native_creates.is_empty());
-        assert!(!ctx.has_render_buffer_host(HostId(host_buffer_id)));
+        assert!(!ctx.has_render_buffer_host(HostId(HOST_BUFFER)));
         assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| crate::test_support::msg_sender(message)),
-            Some(host_buffer_id)
-        );
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| crate::test_support::msg_opcode(message)),
-            Some(crate::protocols::wayland::wl_buffer::REQ_DESTROY)
+            decoded(&ctx.client_to_host_queue, wl_buffer::Request::from_wire),
+            [(HOST_BUFFER, wl_buffer::Request::Destroy {})]
         );
         assert!(
-            ctx.shadow_table.accepts_host_new_id(host_buffer_id),
+            ctx.shadow_table.accepts_host_new_id(HOST_BUFFER),
             "the host frees a server ID once the object is destroyed"
         );
     }
 
     #[test]
     fn params_delete_id_ends_an_orphaned_async_create() {
-        let guest_params_id = 7;
-        let host_params_id = 8;
         let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_params_id,
-            host_params_id,
-            "zwp_linux_buffer_params_v1",
-            4,
-        );
-        let pending = pending_native_create(guest_params_id, (16, 8));
-        let sync_identity = fd_identity(pending.sync_fds[0].as_raw_fd());
-        ctx.pending_native_creates
-            .insert(HostId(host_params_id), pending);
-        ctx.last_sender_id = guest_params_id;
-        ctx.guest_destroyed(guest_params_id);
+        let fence = pending_create(&mut ctx);
+        ctx.guest_destroyed(PARAMS.guest);
+        assert!(ctx.pending_native_creates.is_empty());
         assert!(
-            !any_fd_has_identity(sync_identity),
+            !any_fd_has_identity(fence),
             "destroying the params must close its generation's synchronization descriptor"
         );
         // The generated dispatcher records the guest destructor after the
         // handler returns.
-        ctx.guest_destroyed(guest_params_id);
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
+        ctx.guest_destroyed(PARAMS.guest);
+        assert!(ctx.shadow_table.is_pending_destroy_guest(PARAMS.guest));
 
         // The host destroyed the params object before emitting created or
         // failed, so it can no longer emit either: nothing waits for them,
         // and the host ID is free for the next object.
-        let mut display = DisplayHandler;
+        ctx.last_sender_id = WL_DISPLAY_ID;
         assert_eq!(
-            WlDisplayHandler::on_delete_id(&mut display, &mut ctx, host_params_id),
+            WlDisplayHandler::on_delete_id(&mut DisplayHandler, &mut ctx, PARAMS.host),
             Action::Drop
         );
-        assert!(!ctx.shadow_table.is_pending_destroy_guest(guest_params_id));
-        assert_eq!(ctx.shadow_table.get_guest_id(host_params_id), None);
-        assert_eq!(ctx.shadow_table.get_host_interface(host_params_id), None);
-        assert!(ctx.shadow_table.is_host_id_available(host_params_id));
+        assert!(!ctx.shadow_table.is_pending_destroy_guest(PARAMS.guest));
+        assert_eq!(ctx.shadow_table.get_guest_id(PARAMS.host), None);
+        assert_eq!(ctx.shadow_table.get_host_interface(PARAMS.host), None);
+        assert!(ctx.shadow_table.is_host_id_available(PARAMS.host));
         assert_eq!(
-            crate::test_support::queued_headers(&ctx.host_to_client_queue),
-            vec![(1, crate::protocols::wayland::wl_display::EVT_DELETE_ID)],
+            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
+            [(
+                WL_DISPLAY_ID,
+                wl_display::Event::DeleteId { id: PARAMS.guest }
+            )],
             "params delete_id must still reach the guest"
         );
-        assert_eq!(
-            &ctx.host_to_client_queue[0].0[8..],
-            &guest_params_id.to_ne_bytes()
-        );
-    }
-
-    #[test]
-    fn dmabuf_params_require_unique_planes_for_the_format() {
-        let mut first_pipe = [-1; 2];
-        let mut second_pipe = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(first_pipe.as_mut_ptr()) }, 0);
-        assert_eq!(unsafe { libc::pipe(second_pipe.as_mut_ptr()) }, 0);
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(
-            7,
-            vec![
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(first_pipe[1]) },
-                    plane_idx: 0,
-                    offset: 0,
-                    stride: 64,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-                PendingParam {
-                    fd: unsafe { OwnedFd::from_raw_fd(second_pipe[1]) },
-                    plane_idx: 0,
-                    offset: 4096,
-                    stride: 64,
-                    modifier_hi: 0,
-                    modifier_lo: 0,
-                },
-            ],
-        );
-        assert!(!LinuxDmabufHandler::valid_params(
-            &ctx,
-            7,
-            16,
-            16,
-            0x3432_5258
-        ));
-        drop(ctx);
-        unsafe {
-            libc::close(first_pipe[0]);
-            libc::close(second_pipe[0]);
-        }
-    }
-
-    #[test]
-    fn dmabuf_params_reject_stride_that_cannot_cover_one_row() {
-        let mut pipe_fds = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.pending_params.insert(
-            7,
-            vec![PendingParam {
-                fd: unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) },
-                plane_idx: 0,
-                offset: 0,
-                // XRGB8888 needs four bytes per pixel.
-                stride: 4 * 3,
-                modifier_hi: 0,
-                modifier_lo: 0,
-            }],
-        );
-
-        assert!(
-            !LinuxDmabufHandler::valid_params(&ctx, 7, 4, 4, 0x3432_5258),
-            "a dmabuf stride shorter than width × bytes-per-pixel must be rejected"
-        );
-        drop(ctx);
-        unsafe {
-            libc::close(pipe_fds[0]);
-        }
     }
 }
