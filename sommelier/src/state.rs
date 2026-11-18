@@ -366,8 +366,6 @@ pub struct Context {
     /// The fence the message being dispatched waits for, if it does; see
     /// [`Self::wait_for_fence`].
     fence_wait: Option<FenceWait>,
-    /// Monotonic serial source for synthetic keyboard compatibility events.
-    pub synthetic_keyboard_serial: u32,
     pub allocator: Option<Allocator>,
     /// Test-only capability override for exercising synthetic dma-buf
     /// feedback lifecycle without depending on the runner's `/dev/dri`.
@@ -1018,7 +1016,6 @@ impl Context {
             session_end: None,
             post_dispatch: Vec::new(),
             fence_wait: None,
-            synthetic_keyboard_serial: 0,
             allocator,
             #[cfg(test)]
             synthetic_feedback_available_for_test: false,

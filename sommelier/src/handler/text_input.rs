@@ -247,6 +247,9 @@ struct HeldRepeatKey {
     guest_keyboard_id: u32,
     host_keyboard_id: HostId,
     key: u32,
+    /// The serial of the key's latest `peek_key`.
+    serial: u32,
+    /// The time of the key's latest `peek_key`.
     time: u32,
 }
 
@@ -329,6 +332,7 @@ fn held_repeat_key_for_seat(ctx: &Context, guest_seat: u32) -> Option<HeldRepeat
         guest_keyboard_id,
         host_keyboard_id,
         key,
+        serial: press.serial,
         time: press.time,
     })
 }
@@ -434,6 +438,12 @@ fn keyboard_for_keysym(ctx: &Context, guest_seat: u32, sym: u32) -> Option<(u32,
     keyboard_for_seat(ctx, guest_seat).or_else(|| candidates.into_iter().next())
 }
 
+/// Send the guest a press and a release of the held key the host input
+/// method consumed, unless another channel already delivered it.
+///
+/// Both carry the serial and time of the key's latest `peek_key`, which
+/// are those of the `wl_keyboard.key` Exo would have sent; see
+/// INVARIANTS "A recovered key carries the host's serial".
 fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> bool {
     let decision =
         ctx.transition_guest_key(held.host_keyboard_id, held.key, GuestKeyEvent::RecoverIme);
@@ -452,10 +462,9 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         wl_keyboard::KEY_STATE_PRESSED,
         wl_keyboard::KEY_STATE_RELEASED,
     ] {
-        ctx.synthetic_keyboard_serial = ctx.synthetic_keyboard_serial.wrapping_add(1).max(1);
         ctx.host_to_client_queue.push(wl_keyboard::evt::key(
             held.guest_keyboard_id,
-            ctx.synthetic_keyboard_serial,
+            held.serial,
             held.time,
             held.key,
             state,
@@ -2634,19 +2643,15 @@ mod tests {
         }
 
         /// What the guest gets when an empty confirmation stands for the
-        /// held key `held`: a press and a release with the proxy's own
-        /// `serial` and the next, at the time of the press, and `done`.
-        /// The proxy numbers the key events it makes up from 1 per session,
-        /// so a session's n-th recovered pair has serials 2n - 1 and 2n.
-        fn recovered(&self, held: Stroke, serial: u32) -> Vec<(u32, AnyEvent)> {
+        /// held key `held`, the key's latest peek: a press and a release,
+        /// both with the serial and time of that peek, and `done`.
+        fn recovered(&self, held: Stroke) -> Vec<(u32, AnyEvent)> {
             let press = Stroke {
                 state: PRESSED,
-                serial,
                 ..held
             };
             let release = Stroke {
                 state: RELEASED,
-                serial: serial + 1,
                 ..held
             };
             let mut events = vec![self.guest_key(press), self.guest_key(release)];
@@ -4069,6 +4074,39 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
     }
 
+    /// The key an empty confirmation recovers reaches the guest as a
+    /// press and a release that both carry the serial and time of the
+    /// held key's latest `peek_key`: the serial Exo gave the key event its
+    /// input method consumed.
+    #[tokio::test]
+    async fn a_recovered_key_carries_the_latest_peek_serial() {
+        let mut f = Field::typing().await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        let repeat = Stroke {
+            state: REPEATED,
+            serial: 705,
+            time: 1_300,
+            ..space
+        };
+        for held in [space, repeat] {
+            if held.state == REPEATED {
+                f.s.host([f.peek(held)]).await;
+            }
+            f.s.host([f.confirm()]).await;
+            assert_eq!(f.s.guest_received(), f.recovered(held), "{held:?}");
+        }
+    }
+
     // Traces of real IME and key bugs, step by step.
 
     /// Exo can give a key's peek release the serial of its press. The
@@ -4093,7 +4131,7 @@ mod tests {
 
         let again = Stroke { time: 120, ..press };
         f.s.host([f.peek(again), f.confirm()]).await;
-        assert_eq!(f.s.guest_received(), f.recovered(again, 1));
+        assert_eq!(f.s.guest_received(), f.recovered(again));
         assert_eq!(f.repeat_owner(BACKSPACE), Some(f.ti));
     }
 
@@ -4105,7 +4143,7 @@ mod tests {
         let mut f = Field::typing().await;
         let backspace = f.lease_backspace_repeat().await;
         f.s.host([f.confirm()]).await;
-        assert_eq!(f.s.guest_received(), f.recovered(backspace, 1));
+        assert_eq!(f.s.guest_received(), f.recovered(backspace));
 
         // A sibling whose enable is rejected, then one that never commits.
         let field = f.text_input();
@@ -4127,7 +4165,7 @@ mod tests {
         f.select(field);
 
         f.s.host([f.confirm()]).await;
-        assert_eq!(f.s.guest_received(), f.recovered(backspace, 3));
+        assert_eq!(f.s.guest_received(), f.recovered(backspace));
     }
 
     /// A text input's destroy ends its repeat lease, which a new text
@@ -4220,12 +4258,10 @@ mod tests {
         );
         assert_eq!(f.s.host_received(), [f.ack(700, false)]);
 
-        // Each recovered pair takes the proxy's next two key serials, so
-        // they run on from 1 through the Space and Backspace holds below.
         f.s.host([f.confirm(), f.confirm(), f.confirm()]).await;
-        let mut expected = f.recovered(space, 1);
-        expected.extend(f.recovered(space, 3));
-        expected.extend(f.recovered(space, 5));
+        let mut expected = f.recovered(space);
+        expected.extend(f.recovered(space));
+        expected.extend(f.recovered(space));
         assert_eq!(f.s.guest_received(), expected);
 
         let release = Stroke {
@@ -4249,8 +4285,8 @@ mod tests {
         let expected = [preedit("나"), DONE, no_preedit(), commit("나 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm(), f.confirm()]).await;
-        let mut expected = f.recovered(space, 7);
-        expected.extend(f.recovered(space, 9));
+        let mut expected = f.recovered(space);
+        expected.extend(f.recovered(space));
         assert_eq!(f.s.guest_received(), expected);
         let release = Stroke {
             state: RELEASED,
@@ -4276,8 +4312,8 @@ mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm(), f.confirm()]).await;
-        let mut expected = f.recovered(backspace, 11);
-        expected.extend(f.recovered(backspace, 13));
+        let mut expected = f.recovered(backspace);
+        expected.extend(f.recovered(backspace));
         assert_eq!(f.s.guest_received(), expected);
         let keysym_release = Stroke {
             state: RELEASED,
@@ -4312,7 +4348,7 @@ mod tests {
             ..backspace
         };
         f.s.host([f.peek(backspace), f.confirm()]).await;
-        assert_eq!(f.s.guest_received(), f.recovered(backspace, 15));
+        assert_eq!(f.s.guest_received(), f.recovered(backspace));
     }
 
     /// A text input destroyed while its deactivation drains sends nothing
@@ -4366,7 +4402,7 @@ mod tests {
         let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
         assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.host([f.confirm()]).await;
-        assert_eq!(f.s.guest_received(), f.recovered(space, 1));
+        assert_eq!(f.s.guest_received(), f.recovered(space));
 
         f.keyboard_leave().await;
         let host = f.s.host_received();
@@ -4973,21 +5009,21 @@ mod tests {
     }
 
     /// Exo consumes a held Backspace over committed text and confirms an
-    /// empty preedit for each repeat: each becomes a key pair, each key
-    /// event with a serial of its own, and the repeat stays leased.
+    /// empty preedit for each repeat: each becomes a key pair with the
+    /// serial of the held key's peek, and the repeat stays leased.
     #[test]
     fn held_backspace_repeats_over_committed_korean_without_preedit() {
         let mut ime = Ime::with_keyboard();
         ime.hold_peeked(HOST_KEYBOARD, BACKSPACE, 700, 100);
         ime.state().committed.surrounding_text = Some(("가나다라".to_string(), 12, 12));
 
-        for serial in [1, 3, 5] {
+        for _ in 0..3 {
             ime.confirm();
             assert_eq!(
                 ime.events(),
                 [
-                    key(KEYBOARD, BACKSPACE, PRESSED, serial, 100),
-                    key(KEYBOARD, BACKSPACE, RELEASED, serial + 1, 100),
+                    key(KEYBOARD, BACKSPACE, PRESSED, 700, 100),
+                    key(KEYBOARD, BACKSPACE, RELEASED, 700, 100),
                     uncommitted_done(),
                 ]
             );
@@ -5008,8 +5044,8 @@ mod tests {
             assert_eq!(
                 ime.events(),
                 [
-                    key(KEYBOARD, held, PRESSED, 1, 100),
-                    key(KEYBOARD, held, RELEASED, 2, 100),
+                    key(KEYBOARD, held, PRESSED, 700, 100),
+                    key(KEYBOARD, held, RELEASED, 700, 100),
                     uncommitted_done(),
                 ]
             );
@@ -5053,8 +5089,8 @@ mod tests {
         assert_eq!(
             ime.events(),
             [
-                key(KEYBOARD, 57, PRESSED, 1, 100),
-                key(KEYBOARD, 57, RELEASED, 2, 100),
+                key(KEYBOARD, 57, PRESSED, 700, 100),
+                key(KEYBOARD, 57, RELEASED, 700, 100),
                 uncommitted_done(),
             ]
         );
@@ -5087,13 +5123,13 @@ mod tests {
         ime.preedit("", "");
         ime.events();
 
-        for serial in [1, 3] {
+        for _ in 0..2 {
             ime.confirm();
             assert_eq!(
                 ime.events(),
                 [
-                    key(KEYBOARD, BACKSPACE, PRESSED, serial, 101),
-                    key(KEYBOARD, BACKSPACE, RELEASED, serial + 1, 101),
+                    key(KEYBOARD, BACKSPACE, PRESSED, 701, 101),
+                    key(KEYBOARD, BACKSPACE, RELEASED, 701, 101),
                     (TI, V3::Done { serial: 2 }.into()),
                 ]
             );

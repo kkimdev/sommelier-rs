@@ -711,6 +711,44 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
   `an_empty_confirmation_recovers_the_latest_eligible_held_key`,
   `keysym_prefers_keyboard_with_current_surface_focus`.
+- **A recovered key carries the host's serial.** When an empty IME
+  confirmation stands for a held key the input method consumed, the guest
+  gets a `wl_keyboard.key` press and release the host never sent. Both
+  carry the serial and time of the key's latest `peek_key`. The extension
+  defines a peek's arguments, serial included, as those of the
+  `wl_keyboard.key` it announces, and Exo caches that serial
+  (`MaybeNextKeySerial`) until it sends a `wl_keyboard.key`, so Exo's
+  next real key event carries it too. The release has no host serial of
+  its own, since the key is still held, so it reuses the press's. A
+  request that quotes the serial, such as
+  `wl_data_device.set_selection`, is accepted: Exo checks only that a
+  serial is among the last 1024 it issued (`kMaxEventsTracked`). A
+  counter of the proxy's own, starting from 1, falls outside that window
+  once Exo has issued more serials, and Exo ignores such a request.
+  Tests: `a_recovered_key_carries_the_latest_peek_serial`,
+  `an_empty_confirmation_recovers_the_latest_eligible_held_key`.
+- **A key waits for at most one late release per channel.** When a key
+  is pressed again before the channel that gave the guest its previous
+  press (`wl_keyboard` or an IME keysym) has released it, the proxy keeps
+  that retired release pending beside the new generation, so a late
+  `wl_keyboard` release still closes the old press. It keeps at most one
+  retired release per key and channel, plus the current generation's: a
+  newer retired release replaces an older one. For `wl_keyboard` this drops
+  nothing Exo sends: Exo sends each `wl_keyboard.key` right after its
+  `peek_key`, and a release only for a key it sent pressed, so the one
+  retired release already tolerates a host that delays a release past
+  the key's next press. For keysyms the bound is only defensive, and a
+  late release is not supported: a keysym release that arrives after the
+  key's next press does not close the retired press, since the proxy
+  bounds the retired press by a peek serial while Exo numbers each keysym
+  when it sends it. Exo sends keysym presses only (its one `SendKey`
+  caller, `InsertChar`, handles presses), so a retired keysym release
+  waits for an event Exo never sends, and the bound only keeps such
+  entries from piling up; making a late keysym release close its press is
+  a known follow-up. A host that never sends a release leaves one pending release
+  per key and channel, not one per press.
+  Tests: `a_channel_keeps_one_pending_release_per_key`,
+  `a_delayed_release_ends_only_its_generation`.
 - **Host modifiers last as long as their keyboard.** Exo sends
   `wl_keyboard.modifiers` only when they differ from the last it sent that
   keyboard, and again after each Num Lock press; it sends them before
