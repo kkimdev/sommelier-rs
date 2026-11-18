@@ -1145,7 +1145,11 @@ mod tests {
         let served = tokio::task::LocalSet::new()
             .run_until(tokio::time::timeout(
                 window,
-                serve(listener, test_client_config(), None),
+                serve(
+                    listener,
+                    test_client_config(),
+                    None::<tokio::signal::unix::Signal>,
+                ),
             ))
             .await;
         let cpu = thread_cpu_time() - cpu_before;
@@ -3939,14 +3943,14 @@ fn claim_display_socket(display: &std::path::Path) -> io::Result<nix::fcntl::Flo
 }
 
 /// Accept guest clients for the life of the process, and reload the
-/// shortcut configuration on each `reload_signal`.
+/// shortcut configuration on each of `reload_signal`'s requests.
 ///
 /// A failure concerning one client is logged and ends only that client.
 /// Must run inside a `LocalSet`, like the clients it spawns.
 async fn serve(
     listener: UnixListener,
     config: ClientConfig,
-    reload_signal: Option<tokio::signal::unix::Signal>,
+    reload_signal: Option<impl ReloadRequests>,
 ) {
     if let Some(signal) = reload_signal {
         let reloads =
@@ -4056,17 +4060,35 @@ pub(crate) fn install_reload_signal() -> Option<tokio::signal::unix::Signal> {
         .ok()
 }
 
-/// Reload the shortcut configuration on each `signal`.
+/// Where requests to reload the shortcut configuration come from: the
+/// process's `SIGHUP`, or, in tests, a channel, since a signal reaches
+/// every test in the process.
+trait ReloadRequests: 'static {
+    /// Wait for the next request; `None` once no more can come.
+    async fn recv(&mut self) -> Option<()>;
+}
+
+impl ReloadRequests for tokio::signal::unix::Signal {
+    async fn recv(&mut self) -> Option<()> {
+        tokio::signal::unix::Signal::recv(self).await
+    }
+}
+
+#[cfg(test)]
+impl ReloadRequests for tokio::sync::mpsc::Receiver<()> {
+    async fn recv(&mut self) -> Option<()> {
+        tokio::sync::mpsc::Receiver::recv(self).await
+    }
+}
+
+/// Reload the shortcut configuration on each of `signal`'s requests.
 ///
 /// A task of its own, so a reload never waits behind the accept loop (its
 /// retry pause, or a client's host connection). It runs on the proxy's one
 /// thread between other tasks' steps, so it never races a key event.
 /// `PlacementConfig::reload_and_log` owns what a reload means, including
 /// the logged no-op when there is no file.
-async fn reload_on_signal(
-    mut signal: tokio::signal::unix::Signal,
-    placement: Arc<PlacementConfig>,
-) {
+async fn reload_on_signal(mut signal: impl ReloadRequests, placement: Arc<PlacementConfig>) {
     while signal.recv().await.is_some() {
         placement.reload_and_log();
     }
