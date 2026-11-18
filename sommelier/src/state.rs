@@ -25,7 +25,7 @@ mod render;
 mod window_placement;
 mod xdg_roles;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ use crate::placement_config::PlacementConfig;
 /// for a [`HostId`]. Handlers and the table's query methods pass raw `u32`
 /// IDs, so at those call sites the direction is a naming convention
 /// (`guest_*`, `host_*`), not a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestId(pub(crate) u32);
 
 /// A Wayland object ID on the **host** connection.
@@ -282,7 +282,7 @@ pub struct GtkShellState {
     /// shell binding. ChromeOS validates the token before granting focus.
     pub startup_id: Option<String>,
     /// Synthetic gtk_surface1 objects created from this shell binding.
-    pub surfaces: HashSet<u32>,
+    pub surfaces: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,46 +465,46 @@ pub struct Context {
     placement: Arc<PlacementConfig>,
     pub supported_formats: BTreeSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
-    pub host_globals: HashMap<u32, HostGlobal>,
+    pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
     /// the host's interface and version, while a registry lists it; see
     /// `handler::registry::Singleton`.
-    pub(crate) singleton_candidates: HashMap<u32, HostGlobal>,
+    pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
     /// Host globals consumed internally by the proxy and therefore never
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
-    pub hidden_host_globals: HashMap<u32, String>,
+    pub hidden_host_globals: BTreeMap<u32, String>,
     /// Global names already emitted by each host registry object. A single
     /// Wayland client may create more than one wl_registry; the compositor
     /// sends the complete global list to each one, so this must not be a
     /// connection-wide set keyed only by global name. Ordered, because a
     /// registry's end retires the globals it alone listed in that order.
-    pub registry_global_names: HashMap<u32, BTreeSet<u32>>,
+    pub registry_global_names: BTreeMap<u32, BTreeSet<u32>>,
     /// Names removed from each registry. A subsequent global event for a
     /// removed name represents a new advertisement generation; a bind of a
     /// removed name crossed its removal on the wire. Each name keeps the
     /// version the guest saw if it can be bound inert (see
     /// `INERT_BIND_INTERFACE`), and `None` otherwise.
-    pub registry_global_removed: HashMap<u32, HashMap<u32, Option<u32>>>,
-    pub registry_global_generations: HashMap<u32, HashMap<u32, u64>>,
+    pub registry_global_removed: BTreeMap<u32, BTreeMap<u32, Option<u32>>>,
+    pub registry_global_generations: BTreeMap<u32, BTreeMap<u32, u64>>,
     /// Whether each registry's current advertisement for a name was visible
     /// to the guest. This is kept per registry/generation so a delayed
     /// global_remove for an old hidden/visible generation cannot be classified
     /// using replacement metadata.
-    pub registry_global_visibility: HashMap<u32, HashMap<u32, bool>>,
-    pub global_generations: HashMap<u32, u64>,
+    pub registry_global_visibility: BTreeMap<u32, BTreeMap<u32, bool>>,
+    pub global_generations: BTreeMap<u32, u64>,
     pub next_global_generation: u64,
     /// The generation of each global whose current advertisement the host
     /// removed, from the first registry's `global_remove` until the global
     /// is retired or advertised anew. It outlives the registries that saw
     /// the removal, which a guest may destroy before the last registry that
     /// lists the global sees it.
-    pub removed_global_generations: HashMap<u32, u64>,
+    pub removed_global_generations: BTreeMap<u32, u64>,
     /// Globals that have been removed from the host registry. Keep their
     /// metadata until every registry has observed the removal so a second
     /// registry can still receive its own global_remove event, while blocking
     /// new binds in the meantime.
-    pub removed_host_globals: HashSet<u32>,
+    pub removed_host_globals: BTreeSet<u32>,
     pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
@@ -554,9 +554,9 @@ pub struct Context {
     /// it owns).
     pub(crate) outputs: OutputRegistry,
     /// Synthetic GTK shell bindings and their activation token state.
-    pub gtk_shells: HashMap<u32, GtkShellState>,
+    pub gtk_shells: BTreeMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
-    pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
+    pub gtk_surfaces: BTreeMap<u32, GtkSurfaceState>,
     /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
     pub(crate) aura_surfaces: AuraSurfaces,
     /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
@@ -1058,17 +1058,17 @@ impl Context {
             keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
             supported_formats: BTreeSet::new(),
-            host_globals: HashMap::new(),
-            singleton_candidates: HashMap::new(),
-            hidden_host_globals: HashMap::new(),
-            registry_global_names: HashMap::new(),
-            registry_global_removed: HashMap::new(),
-            registry_global_generations: HashMap::new(),
-            registry_global_visibility: HashMap::new(),
-            global_generations: HashMap::new(),
+            host_globals: BTreeMap::new(),
+            singleton_candidates: BTreeMap::new(),
+            hidden_host_globals: BTreeMap::new(),
+            registry_global_names: BTreeMap::new(),
+            registry_global_removed: BTreeMap::new(),
+            registry_global_generations: BTreeMap::new(),
+            registry_global_visibility: BTreeMap::new(),
+            global_generations: BTreeMap::new(),
             next_global_generation: 1,
-            removed_global_generations: HashMap::new(),
-            removed_host_globals: HashSet::new(),
+            removed_global_generations: BTreeMap::new(),
+            removed_host_globals: BTreeSet::new(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
@@ -1084,8 +1084,8 @@ impl Context {
             vm_identifier,
             window_placement,
             outputs: OutputRegistry::default(),
-            gtk_shells: HashMap::new(),
-            gtk_surfaces: HashMap::new(),
+            gtk_shells: BTreeMap::new(),
+            gtk_surfaces: BTreeMap::new(),
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
             viewport_to_wl_surface: BTreeMap::new(),

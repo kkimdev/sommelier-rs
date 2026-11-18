@@ -35,7 +35,7 @@ use crate::protocols::{AnyEvent, AnyRequest};
 use crate::state::Context;
 use crate::test_support::decode;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage, WL_DISPLAY_ID};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -492,7 +492,7 @@ impl<M: Message> Peer<M> {
     fn new(connection: WaylandConnection) -> Self {
         Self {
             connection,
-            objects: Objects(HashMap::from([(WL_DISPLAY_ID, "wl_display".to_string())])),
+            objects: Objects(BTreeMap::from([(WL_DISPLAY_ID, "wl_display".to_string())])),
             received: Vec::new(),
         }
     }
@@ -524,7 +524,7 @@ impl<M: Message> Peer<M> {
 }
 
 /// The interface of each object a peer knows, by ID.
-struct Objects(HashMap<u32, String>);
+struct Objects(BTreeMap<u32, String>);
 
 impl Objects {
     /// Decode `message`, sent by an object this peer knows, and learn the

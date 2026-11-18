@@ -24,7 +24,7 @@ limitations under the License.
 //! and their links are in `crate::state::XdgRoles` like every XDG role's.
 //! Wire encoding stays in `crate::handler::window_placement::remote_shell`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// The host `zcr_remote_shell_v2` the proxy bound for its own use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,16 +43,16 @@ pub(crate) struct RemoteShellPlacementState {
     /// bound.
     manager: Option<RemoteShellManager>,
     /// Guest xdg_toplevel ID → its host zcr_remote_surface_v2.
-    remote_surface_by_toplevel: HashMap<u32, u32>,
+    remote_surface_by_toplevel: BTreeMap<u32, u32>,
     /// Reverse of `remote_surface_by_toplevel`, for host events.
-    toplevel_by_remote_surface: HashMap<u32, u32>,
+    toplevel_by_remote_surface: BTreeMap<u32, u32>,
     /// Guest toplevels whose remote surface has no bounds yet, with the
     /// size of the commit that showed each, once one did while no output
     /// could place it. Ordered, because an output that can place them
     /// places them in that order.
     unplaced: BTreeMap<u32, Option<(i32, i32)>>,
     /// Guest facade xdg_popup ID → its xdg_surface, whose role it is.
-    popups: HashMap<u32, u32>,
+    popups: BTreeMap<u32, u32>,
     /// The serial of the last `xdg_surface.configure` the proxy sent.
     last_configure_serial: u32,
 }
