@@ -2029,34 +2029,28 @@ mod tests {
         record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
         regular_file_has_size, retire_eligible_buffers, same_dma_buf_object, valid_buffer_layout,
         valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout, ShmCopyError,
+        ShmCopyLayout,
     };
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-    use crate::protocols::wayland::wl_shm;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
+    use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
+    use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm};
     use crate::state::{BufferRect, DamageRegion};
-    use crate::state::{BufferState, Context, HostId, RenderBufferLifecycle, ShmPool, StalePixels};
+    use crate::state::{Context, HostId, RenderBufferLifecycle, ShmPool};
     use crate::test_support::{
-        msg_sender, protocol_error, protocol_error_code, queued_headers, raw_dispatch,
-        shm_pool_file,
+        decoded, msg_sender, protocol_error, protocol_error_code, queued_headers, raw_dispatch,
+        register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
     };
-    use crate::wire::{Action, WireMessage};
+    use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd};
     use std::sync::Arc;
 
-    fn register_test_local(ctx: &mut Context, guest_id: u32, host_id: u32, backing: BufferState) {
-        assert!(ctx.register_local_buffer(guest_id, host_id, backing));
-    }
-
-    fn register_test_native(ctx: &mut Context, host_id: u32) {
-        assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
-    }
-
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
         let guest_id = ctx.shadow_table.adopt_host_created(host_id, "wl_buffer", 1);
-        register_test_native(ctx, host_id);
+        assert!(ctx.register_native_buffer(host_id, (1, 1), Vec::new()));
         guest_id
     }
 
@@ -2251,14 +2245,17 @@ mod tests {
         assert_eq!(valid_buffer_layout(4096, 0, 0, 32, 128, 0), None);
         assert_eq!(valid_buffer_layout(4096, 0, 32, 32, -128, 0), None);
         assert_eq!(valid_buffer_layout(4096, 1, 32, 32, 128, 0), None);
-    }
-
-    #[test]
-    fn rejects_buffer_size_overflow() {
+        // A size that overflows is no layout.
         assert_eq!(
             valid_buffer_layout(usize::MAX, 0, i32::MAX, i32::MAX, i32::MAX, 0),
             None
         );
+        // NV12 has a half-height UV plane after its Y plane, and an even
+        // height.
+        let nv12 = wl_shm::FORMAT_NV12;
+        assert_eq!(valid_buffer_layout(24, 0, 4, 4, 4, nv12), Some(24));
+        assert_eq!(valid_buffer_layout(23, 0, 4, 4, 4, nv12), None);
+        assert_eq!(valid_buffer_layout(24, 0, 4, 3, 4, nv12), None);
     }
 
     #[test]
@@ -2301,41 +2298,38 @@ mod tests {
 
     #[test]
     fn validates_shm_format_stride() {
+        // A stride, which GBM may choose too, must cover the guest format's
+        // row, or the copy would truncate every row.
         assert!(valid_shm_stride(0, 10, 40));
+        assert!(!valid_shm_stride(0, 10, 39));
         assert!(valid_shm_stride(0x3631_4752, 10, 20));
+        assert!(!valid_shm_stride(0x3631_4752, 10, 19));
         assert!(valid_shm_stride(wl_shm::FORMAT_NV12, 10, 10));
         assert!(!valid_shm_stride(wl_shm::FORMAT_NV12, 11, 11));
-        assert!(!valid_shm_stride(0, 10, 39));
         assert!(!valid_shm_stride(0xdead_beef, 10, 40));
     }
 
-    #[test]
-    fn gbm_stride_must_cover_the_guest_row() {
-        // GBM may choose a backend-specific stride. It is still invalid to
-        // expose a host buffer whose row is shorter than the guest format's
-        // minimum row width, because the copy path would silently truncate
-        // every row.
-        assert!(!valid_shm_stride(0, 10, 39));
-        assert!(valid_shm_stride(0, 10, 40));
-        assert!(!valid_shm_stride(0x3631_4752, 10, 19));
-        assert!(valid_shm_stride(0x3631_4752, 10, 20));
-    }
+    /// A 4x4 NV12 frame, copied into a packed destination of 24 bytes.
+    const NV12_4X4: ShmCopyLayout = ShmCopyLayout {
+        dest_size: 24,
+        format: wl_shm::FORMAT_NV12,
+        offset: 0,
+        width: 4,
+        src_stride: 4,
+        dst_stride: 4,
+        dst_plane1_offset: 0,
+        dst_plane1_stride: 0,
+        height: 4,
+    };
 
-    #[test]
-    fn validates_nv12_two_plane_pool_layout() {
-        assert_eq!(
-            valid_buffer_layout(24, 0, 4, 4, 4, wl_shm::FORMAT_NV12),
-            Some(24)
-        );
-        assert_eq!(
-            valid_buffer_layout(23, 0, 4, 4, 4, wl_shm::FORMAT_NV12),
-            None
-        );
-        assert_eq!(
-            valid_buffer_layout(24, 0, 4, 3, 4, wl_shm::FORMAT_NV12),
-            None,
-        );
-    }
+    /// One ARGB8888 pixel, copied into a destination of 4 bytes.
+    const ARGB8888_1X1: ShmCopyLayout = ShmCopyLayout {
+        dest_size: 4,
+        format: 0,
+        width: 1,
+        height: 1,
+        ..NV12_4X4
+    };
 
     #[test]
     fn copies_both_nv12_planes_only_after_validating_all_spans() {
@@ -2347,16 +2341,9 @@ mod tests {
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
-            super::ShmCopyLayout {
+            ShmCopyLayout {
                 dest_size: destination.len(),
-                format: wl_shm::FORMAT_NV12,
-                offset: 0,
-                width: 4,
-                src_stride: 4,
-                dst_stride: 4,
-                dst_plane1_offset: 0,
-                dst_plane1_stride: 0,
-                height: 4,
+                ..NV12_4X4
             },
             &DamageRegion::Full,
         )
@@ -2369,16 +2356,9 @@ mod tests {
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
-            super::ShmCopyLayout {
+            ShmCopyLayout {
                 dest_size: 23,
-                format: wl_shm::FORMAT_NV12,
-                offset: 0,
-                width: 4,
-                src_stride: 4,
-                dst_stride: 4,
-                dst_plane1_offset: 0,
-                dst_plane1_stride: 0,
-                height: 4,
+                ..NV12_4X4
             },
             &DamageRegion::Full,
         )
@@ -2392,17 +2372,7 @@ mod tests {
     #[test]
     fn copy_rejects_null_or_failed_destinations_before_pointer_arithmetic() {
         let source = shm_pool_file(&[0u8; 4]);
-        let layout = super::ShmCopyLayout {
-            dest_size: 4,
-            format: 0,
-            offset: 0,
-            width: 1,
-            src_stride: 4,
-            dst_stride: 4,
-            dst_plane1_offset: 0,
-            dst_plane1_stride: 0,
-            height: 1,
-        };
+        let layout = ARGB8888_1X1;
         let damage = DamageRegion::from(vec![BufferRect::new(0, 0, 1, 1)]);
         for destination in [std::ptr::null_mut(), libc::MAP_FAILED.cast()] {
             assert!(matches!(
@@ -2419,16 +2389,10 @@ mod tests {
         let source = shm_pool_file(&[0x11; 8]);
         source.set_len(4).unwrap();
         let mut destination = [0u8; 8];
-        let layout = super::ShmCopyLayout {
+        let layout = ShmCopyLayout {
             dest_size: destination.len(),
-            format: 0,
-            offset: 0,
-            width: 1,
-            src_stride: 4,
-            dst_stride: 4,
-            dst_plane1_offset: 0,
-            dst_plane1_stride: 0,
             height: 2,
+            ..ARGB8888_1X1
         };
         assert!(matches!(
             copy_shm_damage(&source, destination.as_mut_ptr(), layout, &DamageRegion::Full),
@@ -2452,17 +2416,7 @@ mod tests {
             )
         };
         assert_ne!(destination, libc::MAP_FAILED);
-        let layout = super::ShmCopyLayout {
-            dest_size: 4,
-            format: 0,
-            offset: 0,
-            width: 1,
-            src_stride: 4,
-            dst_stride: 4,
-            dst_plane1_offset: 0,
-            dst_plane1_stride: 0,
-            height: 1,
-        };
+        let layout = ARGB8888_1X1;
         let result = copy_shm_damage(&source, destination.cast(), layout, &DamageRegion::Full);
         unsafe { libc::munmap(destination, 4096) };
         assert!(matches!(result, Err(ShmCopyError::Destination)));
@@ -2478,16 +2432,11 @@ mod tests {
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
-            super::ShmCopyLayout {
+            ShmCopyLayout {
                 dest_size: destination.len(),
-                format: wl_shm::FORMAT_NV12,
-                offset: 0,
-                width: 4,
-                src_stride: 4,
-                dst_stride: 4,
                 dst_plane1_offset: 20,
                 dst_plane1_stride: 4,
-                height: 4,
+                ..NV12_4X4
             },
             &DamageRegion::Full,
         )
@@ -2509,16 +2458,11 @@ mod tests {
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
             destination.as_mut_ptr(),
-            super::ShmCopyLayout {
+            ShmCopyLayout {
                 dest_size: destination.len(),
-                format: wl_shm::FORMAT_NV12,
-                offset: 0,
-                width: 4,
-                src_stride: 4,
-                dst_stride: 4,
                 dst_plane1_offset: 20,
                 dst_plane1_stride: 8,
-                height: 4,
+                ..NV12_4X4
             },
             &DamageRegion::from(vec![BufferRect::new(0, 2, 4, 2)]),
         )
@@ -2595,16 +2539,7 @@ mod tests {
 
     #[test]
     fn rejects_regular_dmabuf_backing_shorter_than_metadata() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let fd = memfd_create(
-            CString::new("sommelier-short-dmabuf").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
-
+        let fd = shm_pool_file(&[0; 4096]);
         assert!(
             map_dmabuf(
                 fd.as_raw_fd(),
@@ -2621,7 +2556,13 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         register_guest_shm(&mut ctx, 20, 10);
 
-        assert_eq!(ctx.host_to_client_queue.len(), 2);
+        assert_eq!(
+            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
+            [
+                (20, wl_shm::Event::Format { format: 0 }),
+                (20, wl_shm::Event::Format { format: 1 })
+            ]
+        );
         assert!(guest_shm_format_available(&ctx, 0));
         assert!(guest_shm_format_available(&ctx, 1));
         assert!(!guest_shm_format_available(&ctx, 0x3631_4752));
@@ -2647,10 +2588,16 @@ mod tests {
         record_host_shm_format(&mut ctx, 0x3631_4752);
         record_host_shm_format(&mut ctx, 0x3631_4752);
 
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
+        assert_eq!(
+            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
+            [(
+                20,
+                wl_shm::Event::Format {
+                    format: 0x3631_4752
+                }
+            )]
+        );
         assert!(guest_shm_format_available(&ctx, 0x3631_4752));
-        let format = u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap());
-        assert_eq!(format, 0x3631_4752);
     }
 
     #[test]
@@ -2683,8 +2630,8 @@ mod tests {
         assert!(!ctx.stale_shm_guest_objects.contains(&guest_shm));
         assert!(ctx.shadow_table.get_interface(guest_shm).is_none());
         assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
+            decoded(&ctx.host_to_client_queue, wl_display::Event::from_wire),
+            [(WL_DISPLAY_ID, wl_display::Event::DeleteId { id: guest_shm })],
             "local wl_shm.release must emit one guest delete_id"
         );
 
@@ -2733,11 +2680,8 @@ mod tests {
         );
         register_guest_shm(&mut ctx, guest_shm + 1, 10);
         assert!(
-            ctx.host_to_client_queue
-                .iter()
-                .any(
-                    |(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()) == format
-                ),
+            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire)
+                .contains(&(guest_shm + 1, wl_shm::Event::Format { format })),
             "a replacement synthetic object must receive the re-advertised format"
         );
     }
@@ -2768,16 +2712,7 @@ mod tests {
 
     #[test]
     fn identifies_dup_fds_for_one_dma_buf_object() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let fd = memfd_create(
-            CString::new("sommelier-dmabuf-identity")
-                .unwrap()
-                .as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
+        let fd = shm_pool_file(&[]);
         let duplicate = fd.try_clone().expect("duplicate fd");
         assert!(same_dma_buf_object(fd.as_raw_fd(), duplicate.as_raw_fd()));
 
@@ -2847,25 +2782,13 @@ mod tests {
     /// no trace of the buffer behind.
     #[test]
     fn failed_host_storage_is_fatal_without_creating_a_ghost_buffer() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let fd = memfd_create(
-            CString::new("sommelier-allocation-failure")
-                .unwrap()
-                .as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
-
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let pool_id = 20;
         let buffer_id = 30;
         ctx.pools.insert(
             pool_id,
             ShmPool {
-                file: Arc::new(File::from(fd)),
+                file: Arc::new(shm_pool_file(&[0; 4096])),
                 size: 4096,
                 shm: 10,
             },
@@ -2873,18 +2796,8 @@ mod tests {
         ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
         ctx.last_sender_id = pool_id;
 
-        let mut handler = ShmHandler;
         assert_eq!(
-            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(
-                &mut handler,
-                &mut ctx,
-                buffer_id,
-                0,
-                1,
-                1,
-                4,
-                0,
-            ),
+            WlShmPoolHandler::on_create_buffer(&mut ShmHandler, &mut ctx, buffer_id, 0, 1, 1, 4, 0),
             Action::Drop
         );
 
@@ -2903,9 +2816,6 @@ mod tests {
 
     #[test]
     fn removed_host_shm_creates_only_inert_pools_and_buffers() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_shm = 20;
         ctx.shadow_table.create_local(guest_shm, "wl_shm", 1);
@@ -2926,12 +2836,7 @@ mod tests {
             Action::Forward
         );
 
-        let fd = memfd_create(
-            CString::new("sommelier-removed-shm").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
+        let fd = shm_pool_file(&[0; 4096]);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_shm;
@@ -2951,16 +2856,7 @@ mod tests {
 
         ctx.last_sender_id = 30;
         assert_eq!(
-            crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_create_buffer(
-                &mut handler,
-                &mut ctx,
-                31,
-                0,
-                1,
-                1,
-                4,
-                0
-            ),
+            WlShmPoolHandler::on_create_buffer(&mut handler, &mut ctx, 31, 0, 1, 1, 4, 0),
             Action::Drop
         );
         assert!(ctx.shadow_table.is_local(31));
@@ -2979,7 +2875,6 @@ mod tests {
     fn only_objects_bound_from_a_retired_shm_global_go_inert() {
         use crate::handler::registry::RegistryHandler;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-        use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
 
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
@@ -3082,7 +2977,6 @@ mod tests {
     fn a_re_advertised_shm_name_retires_only_its_old_generation() {
         use crate::handler::registry::RegistryHandler;
         use crate::protocols::wayland::wl_registry::WlRegistryHandler;
-        use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
 
         fn create_pool(ctx: &mut Context, shm: u32, pool: u32) {
             ctx.last_sender_id = shm;
@@ -3180,22 +3074,19 @@ mod tests {
         record_host_shm_format(&mut ctx, 0x3631_4752);
 
         assert_eq!(
-            ctx.host_to_client_queue.len(),
-            1,
+            decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
+            [(
+                new_guest_shm,
+                wl_shm::Event::Format {
+                    format: 0x3631_4752
+                }
+            )],
             "replacement capability must be sent only to the replacement guest object"
-        );
-        let message = &ctx.host_to_client_queue[0].0;
-        assert_eq!(
-            u32::from_ne_bytes(message[0..4].try_into().unwrap()),
-            new_guest_shm
         );
     }
 
     #[test]
     fn removed_host_shm_ignores_requests_from_existing_pool_until_destroy() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.last_sender_id = 1;
         ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
@@ -3208,12 +3099,7 @@ mod tests {
         let guest_shm = 20;
         register_guest_shm(&mut ctx, guest_shm, 10);
 
-        let fd = memfd_create(
-            CString::new("sommelier-stale-shm-pool").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create");
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
+        let fd = shm_pool_file(&[0; 4096]);
 
         let mut handler = ShmHandler;
         ctx.last_sender_id = guest_shm;
@@ -3232,11 +3118,7 @@ mod tests {
 
         ctx.last_sender_id = 30;
         assert_eq!(
-            crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_resize(
-                &mut handler,
-                &mut ctx,
-                8192
-            ),
+            WlShmPoolHandler::on_resize(&mut handler, &mut ctx, 8192),
             Action::Drop
         );
         assert_eq!(
@@ -3245,16 +3127,7 @@ mod tests {
             "a stale pool must not resize"
         );
         assert_eq!(
-            crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler::on_create_buffer(
-                &mut handler,
-                &mut ctx,
-                31,
-                0,
-                1,
-                1,
-                4,
-                0
-            ),
+            WlShmPoolHandler::on_create_buffer(&mut handler, &mut ctx, 31, 0, 1, 1, 4, 0),
             Action::Drop
         );
         assert!(
@@ -3269,220 +3142,125 @@ mod tests {
     }
 
     #[test]
-    fn destroyed_attached_shm_buffer_stays_mapped_until_host_release() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_buffer = 20;
-        let host_buffer = 30;
-        let surface = 40;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        let mut surface_state = crate::state::SurfaceState::default();
-        surface_state.set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
-        ctx.surfaces.insert(surface, surface_state);
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            host_buffer,
-            BufferState {
-                pool_file: Arc::new(shm_pool_file(&[])),
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: 4,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: 4,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: std::ptr::null_mut(),
-                dest_size: 0,
-                stale: StalePixels::all(),
-            },
-        );
-        ctx.mark_buffer_submitted(guest_buffer);
+    fn destroying_a_submitted_buffer_defers_its_host_destroy_until_release() {
+        let (guest_buffer, host_buffer, surface) = (20, 30, 40);
+        for (kind, shown) in BUFFER_KINDS
+            .into_iter()
+            .flat_map(|kind| [(kind, false), (kind, true)])
+        {
+            let case = format!("{kind:?}, shown on a surface: {shown}");
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
+            if shown {
+                ctx.surface_mut(surface)
+                    .set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
+            }
+            assert!(ctx.mark_buffer_submitted(guest_buffer));
 
-        let mut handler = ShmHandler;
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(
-            buffer_is_guest_destroyed(&ctx, host_buffer),
-            "destroy must retain backing state while the surface still references it"
-        );
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer),
-            "host mapping must remain reserved until release"
-        );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            0,
-            "the host buffer must stay alive until its release event"
-        );
+            ctx.last_sender_id = guest_buffer;
+            assert_eq!(
+                WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_is_guest_destroyed(&ctx, host_buffer), "{case}");
+            assert!(ctx.buffer_is_submitted(guest_buffer), "{case}");
+            assert_eq!(
+                ctx.shadow_table.get_host_id(guest_buffer),
+                Some(host_buffer),
+                "the host mapping stays reserved until release ({case})"
+            );
+            assert!(
+                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
+                "{case}"
+            );
+            assert_eq!(
+                ctx.client_to_host_queue.len(),
+                0,
+                "the host buffer stays alive until its release ({case})"
+            );
 
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer)
-        );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface)
-                .and_then(crate::state::SurfaceState::current_buffer_id),
-            None
-        );
-        assert_eq!(
-            ctx.surfaces
-                .get(&surface)
-                .and_then(crate::state::SurfaceState::current_buffer_dimensions),
-            Some((1, 1)),
-            "destroying a released wl_buffer must preserve committed content metadata"
-        );
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            1,
-            "release must enqueue the deferred host destroy request exactly once"
-        );
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut ShmHandler, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, host_buffer), "{case}");
+            assert!(!ctx.buffer_is_submitted(guest_buffer), "{case}");
+            assert_eq!(
+                ctx.shadow_table.get_host_id(guest_buffer),
+                Some(host_buffer),
+                "{case}"
+            );
+            assert!(
+                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
+                "{case}"
+            );
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue),
+                [(host_buffer, wl_buffer::REQ_DESTROY)],
+                "release queues the deferred host destroy once ({case})"
+            );
+            if shown {
+                let surface = &ctx.surfaces[&surface];
+                assert_eq!(surface.current_buffer_id(), None, "{case}");
+                assert_eq!(
+                    surface.current_buffer_dimensions(),
+                    Some((1, 1)),
+                    "destroying a released wl_buffer must preserve committed \
+                     content metadata ({case})"
+                );
+            }
+        }
     }
 
     #[test]
-    fn release_marks_live_buffer_idle_and_allows_immediate_destroy() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_buffer = 20;
-        let host_buffer = 30;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            host_buffer,
-            BufferState {
-                pool_file: Arc::new(shm_pool_file(&[])),
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: 4,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: 4,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: std::ptr::null_mut(),
-                dest_size: 0,
-                stale: StalePixels::all(),
-            },
-        );
-        ctx.mark_buffer_submitted(guest_buffer);
+    fn a_release_before_guest_destroy_is_recorded_and_destroy_is_immediate() {
+        let (guest_buffer, host_buffer, surface) = (20, 30, 40);
+        for (kind, shown) in BUFFER_KINDS
+            .into_iter()
+            .flat_map(|kind| [(kind, false), (kind, true)])
+        {
+            let case = format!("{kind:?}, shown on a surface: {shown}");
+            let mut ctx = Context::new_for_test(false, false, vec![]);
+            register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
+            assert!(ctx.mark_buffer_submitted(guest_buffer));
 
-        let mut handler = ShmHandler;
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        assert!(!ctx.buffer_is_submitted(guest_buffer));
-        assert!(ctx.buffer_is_released(guest_buffer));
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut ShmHandler, &mut ctx),
+                Action::Forward
+            );
+            assert!(ctx.buffer_is_released(guest_buffer), "{case}");
 
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer)
-        );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-    }
-
-    #[test]
-    fn destroying_submitted_non_shm_buffer_defers_until_release() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_buffer = 20;
-        let host_buffer = 30;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-
-        let mut handler = ShmHandler;
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(
-            buffer_is_guest_destroyed(&ctx, host_buffer),
-            "a submitted native buffer must stay alive until host release"
-        );
-        assert!(ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(ctx.client_to_host_queue.len(), 0);
-
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
-        assert!(!ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(
-            ctx.shadow_table.get_host_id(guest_buffer),
-            Some(host_buffer)
-        );
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
-    }
-
-    #[test]
-    fn native_release_before_guest_destroy_is_recorded() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let guest_buffer = 20;
-        let host_buffer = 30;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, host_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-
-        let mut handler = ShmHandler;
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut handler, &mut ctx),
-            Action::Forward
-        );
-        assert!(ctx.buffer_is_released(guest_buffer));
-        assert!(!ctx.buffer_is_submitted(guest_buffer));
-
-        // The surface can still retain the released buffer as its current
-        // content. Destroying the guest object must use the recorded release
-        // edge instead of waiting for a second event that cannot arrive.
-        ctx.surface_mut(100)
-            .set_current_buffer_for_test(Some(guest_buffer), None);
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
-        assert!(buffer_host_destroy_is_queued(&ctx, host_buffer));
-        assert!(ctx.host_buffer_use(guest_buffer).is_none());
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert!(ctx.shadow_table.is_pending_destroy_guest(guest_buffer));
+            // The surface may still show the released buffer. Destroying the
+            // guest object uses the recorded release instead of waiting for
+            // a second one that cannot arrive.
+            if shown {
+                ctx.surface_mut(surface)
+                    .set_current_buffer_for_test(Some(guest_buffer), None);
+            }
+            ctx.last_sender_id = guest_buffer;
+            assert_eq!(
+                WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, host_buffer), "{case}");
+            assert!(ctx.host_buffer_use(guest_buffer).is_none(), "{case}");
+            assert_eq!(
+                queued_headers(&ctx.client_to_host_queue),
+                [(host_buffer, wl_buffer::REQ_DESTROY)],
+                "{case}"
+            );
+            assert_eq!(
+                ctx.shadow_table.get_host_id(guest_buffer),
+                Some(host_buffer),
+                "{case}"
+            );
+            assert!(
+                ctx.shadow_table.is_pending_destroy_guest(guest_buffer),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -3493,7 +3271,10 @@ mod tests {
         let mut handler = ShmHandler;
 
         ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert_eq!(ctx.shadow_table.get_guest_id(host_buffer), None);
         assert!(!ctx.shadow_table.is_retired_host(host_buffer));
@@ -3526,7 +3307,10 @@ mod tests {
         let mut handler = ShmHandler;
 
         ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
         assert_eq!(
             ctx.shadow_table.get_host_id(guest_buffer),
             Some(host_buffer),
@@ -3564,7 +3348,10 @@ mod tests {
         assert!(ctx.buffer_is_released(guest_buffer));
 
         ctx.last_sender_id = guest_buffer;
-        assert_eq!(handler.on_destroy(&mut ctx), Action::Drop);
+        assert_eq!(
+            WlBufferHandler::on_destroy(&mut handler, &mut ctx),
+            Action::Drop
+        );
         assert_eq!(ctx.shadow_table.get_host_id(guest_buffer), None);
         assert!(!ctx.shadow_table.is_retired_host(host_buffer));
         assert!(!ctx.has_render_buffer_host(HostId(host_buffer)));
@@ -3580,33 +3367,8 @@ mod tests {
         let native_buffer = 21;
         let native_host = 31;
 
-        for (guest_id, host_id) in [(local_buffer, local_host), (native_buffer, native_host)] {
-            ctx.shadow_table
-                .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-        }
-        register_test_local(
-            &mut ctx,
-            local_buffer,
-            local_host,
-            BufferState {
-                pool_file: Arc::new(shm_pool_file(&[])),
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: 4,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: 4,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: std::ptr::null_mut(),
-                dest_size: 0,
-                stale: StalePixels::all(),
-            },
-        );
-        register_test_native(&mut ctx, native_host);
+        register_test_buffer(&mut ctx, BufferKind::Shm, local_buffer, local_host);
+        register_test_buffer(&mut ctx, BufferKind::Native, native_buffer, native_host);
         for guest_id in [local_buffer, native_buffer] {
             mark_test_buffer_guest_destroyed(&mut ctx, guest_id);
             assert!(ctx.mark_buffer_submitted(guest_id));
@@ -3649,34 +3411,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_buffer = 20;
         let host_buffer = 30;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            host_buffer,
-            BufferState {
-                pool_file: Arc::new(shm_pool_file(&[])),
-                offset: 0,
-                width: 1,
-                height: 1,
-                stride: 4,
-                format: 0,
-                bo: None,
-                dmabuf_fd: None,
-                bo_stride: 4,
-                dmabuf_plane1_offset: 0,
-                dmabuf_plane1_stride: 0,
-                dmabuf_sync: false,
-                dest_ptr: std::ptr::null_mut(),
-                dest_size: 0,
-                stale: StalePixels::all(),
-            },
-        );
+        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
 
