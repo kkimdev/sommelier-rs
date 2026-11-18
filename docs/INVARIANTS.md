@@ -967,7 +967,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   leaves `unreported_host_edit` alone: only the surrounding text a commit
   states clears that. Unlike mutter and KWin, the proxy does not end the
   host's composition when the guest resets its own; only a pointer press
-  does (next rule).
+  or a touch-down does (next rule).
   Tests: `every_commit_of_an_enabled_field_gets_a_done`,
   `a_commit_during_composition_keeps_the_preedit`,
   `reenabling_an_enabled_field_keeps_its_composition`,
@@ -977,23 +977,29 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `on_set_preedit_region_translates_correctly`,
   `second_text_input_enable_on_the_connection_is_ignored`,
   `oversized_surrounding_commit_does_not_partially_advance_state`.
-- **A pointer press ends the composition on its surface.** When a host
+- **A press ends the composition on its surface.** When a host
   `wl_pointer.button` press comes from a pointer whose `enter` named the
-  surface an active text input is focused on, while the guest shows a
-  preedit, the proxy ends that composition before the guest gets the
-  press (`text_input::end_composition_on_press`, decided by
+  surface an active text input is focused on, or a host `wl_touch.down`
+  names that surface, while the guest shows a preedit, the proxy ends
+  that composition before the guest gets the press or the down
+  (`text_input::end_composition_on_press`, the one entry point of both
+  `pointer.rs` and `touch.rs`, decided by
   `TextInputState::prepare_press_commit`). The guest gets one transaction
   that clears the preedit, commits its text and ends with `done` carrying
-  the current commit count, then the press; the host gets
+  the current commit count, then the press or the down; the host gets
   `zwp_text_input_v1.reset`. Otherwise Exo keeps composing: the next jamo
-  joins the old syllable, or the old preedit reappears at the click point.
-  A press with no composition, on another surface (a subsurface
-  included), and a release change nothing. This is what the reference
-  compositors do:
+  joins the old syllable, or the old preedit reappears at the click or
+  tap point. A press or touch-down with no composition, or on another
+  surface (a subsurface included), and a release change nothing. The
+  rule assumes a single seat: a press on any seat ends the composition of
+  the text input focused on the pressed surface, whatever that text
+  input's seat. Exo exposes one seat. mutter matches the press's seat to
+  the text input's, which with one seat comes to the same. This is what
+  the reference compositors do:
   - mutter handles a button press or touch-begin before delivering it
-    (`src/wayland/meta-wayland-seat.c` 507-511). If the picked surface is
-    the text input's, it calls `clutter_input_focus_reset` and
-    `meta_wayland_text_input_focus_flush_done`
+    (`src/wayland/meta-wayland-seat.c` 507-511). If the surface picked
+    under the pointer or the touch point is the text input's, it calls
+    `clutter_input_focus_reset` and `meta_wayland_text_input_focus_flush_done`
     (`src/wayland/meta-wayland-text-input.c` 1208-1238). That reset
     commits the preedit when the input method composes in commit mode, as
     ibus-hangul does, then clears it and resets the input method
@@ -1002,8 +1008,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     mutter fe9693a72c78.
   - KWin, on a button press on the active window
     (`InputMethodEventFilter::pointerButton`, `src/input.cpp` 2060-2073),
-    commits the preedit's commit text with a preedit clear and `done`, then
-    sends the input method `reset` (`InputMethod::commitPendingText`,
+    or a touch-down whose toplevel is the active window
+    (`InputMethodEventFilter::touchDown`, 2077-2089), commits the
+    preedit's commit text with a preedit clear and `done`, then sends the
+    input method `reset` (`InputMethod::commitPendingText`,
     `src/inputmethod.cpp` 225-235). Revision KWin f213b9afd80b.
 
   The proxy commits the preedit the guest shows, because Exo sends the
@@ -1022,12 +1030,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   (`unreported_host_edit`), and it ends the Backspace repeat leased to
   the field, as a confirmation does. The press is re-sent after the
   transaction rather than forwarded, since a forward precedes its
-  message's other events. The proxy tracks each host pointer's surface in
-  `PointerFocus` from its `enter` until a `leave` of that surface, the
-  pointer's end or the surface's end. A `leave` of another surface,
-  which a host can deliver late, changes nothing, as for a keyboard. The
-  dispatcher drops an `enter` or `leave` naming a surface the guest
-  destroyed (`ShadowTable::event_object`). Touch is not handled.
+  message's other events; the rest of its host batch follows it in order
+  and unchanged. So the transaction may land inside a `wl_touch.frame`
+  group, after touch events of that group the guest already got. That is
+  legal: a frame groups only `wl_touch` events. The proxy tracks each
+  host pointer's surface in `PointerFocus` from its `enter` until a
+  `leave` of that surface, the pointer's end or the surface's end. A
+  `leave` of another surface, which a host can deliver late, changes
+  nothing, as for a keyboard. The dispatcher drops an `enter` or
+  `leave` naming a surface the guest destroyed
+  (`ShadowTable::event_object`). A `wl_touch.down` names its surface, so
+  touch needs no such tracking.
 
   Events Exo sent before it handled the `reset` still arrive, and they
   belong to the composition the press committed. So the `reset` goes
@@ -1078,6 +1091,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 
   Tests: `a_press_on_the_composing_surface_commits_the_preedit`,
   `a_press_elsewhere_or_without_a_composition_changes_nothing`,
+  `a_press_keeps_its_place_in_its_batch`,
   `a_leave_of_another_surface_keeps_the_pointer_on_its_surface`,
   `a_commit_in_flight_at_a_press_is_dropped`,
   `a_preedit_in_flight_at_a_press_is_dropped`,
@@ -1086,7 +1100,11 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `a_confirm_in_flight_at_a_press_is_dropped`,
   `a_reset_fence_ends_before_the_next_generation`,
   `a_reset_fence_ends_with_its_text_input`,
-  `pointer_focus_ends_with_its_surface_or_pointer`.
+  `pointer_focus_ends_with_its_surface_or_pointer`,
+  `a_touch_down_on_the_composing_surface_commits_the_preedit`,
+  `a_touch_down_elsewhere_or_without_a_composition_changes_nothing`,
+  `a_touch_down_during_a_reset_fence_sends_no_second_reset`,
+  `a_touch_down_keeps_its_place_in_its_batch`.
 
 ## Process
 

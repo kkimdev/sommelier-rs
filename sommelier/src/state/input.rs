@@ -322,12 +322,12 @@ pub struct TextInputState {
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
-    /// The `wl_display.sync` queued after the `reset` a pointer press sent
-    /// the host ([`Self::prepare_press_commit`]), until it returns. Exo
-    /// sends nothing in answer to the `reset`, but the events it sent
-    /// before it handled the `reset` still arrive, and they belong to the
-    /// composition the press committed (INVARIANTS "A pointer press ends
-    /// the composition on its surface").
+    /// The `wl_display.sync` queued after the `reset` a press sent the
+    /// host ([`Self::prepare_press_commit`]), until it returns. Exo sends
+    /// nothing in answer to the `reset`, but the events it sent before it
+    /// handled the `reset` still arrive, and they belong to the
+    /// composition the press committed (INVARIANTS "A press ends the
+    /// composition on its surface").
     pub(crate) reset_fence: Option<HostId>,
     /// Whether the proxy warned that the guest seat cannot carry an
     /// activation, which every later reconcile would repeat. It is never
@@ -649,12 +649,13 @@ impl TextInputState {
         self.unreported_host_edit = true;
     }
 
-    /// A pointer pressed on guest surface `surface`. A press on the
-    /// surface this text input is focused on, while the guest shows a
-    /// preedit of the active host generation, ends that composition before
-    /// the press reaches the guest, as mutter and KWin end theirs: the guest
-    /// commits the preedit it shows, and the host is told to `reset`
-    /// (INVARIANTS "A pointer press ends the composition on its surface").
+    /// A pointer button or a touch pressed on guest surface `surface`. A
+    /// press on the surface this text input is focused on, while the guest
+    /// shows a preedit of the active host generation, ends that
+    /// composition before the press reaches the guest, as mutter and KWin
+    /// end theirs: the guest commits the preedit it shows, and the host is
+    /// told to `reset` (INVARIANTS "A press ends the composition on its
+    /// surface").
     ///
     /// Returns the plan of that commit, or `None` if the press leaves the
     /// composition alone.

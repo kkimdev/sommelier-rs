@@ -54,7 +54,7 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
     }
 
     /// A press on the surface of a composition ends it before the guest
-    /// gets the press, so the press follows the events that end it.
+    /// gets the press.
     fn on_button(
         &mut self,
         ctx: &mut Context,
@@ -73,17 +73,9 @@ impl wl_pointer::WlPointerHandler for PointerHandler {
         ) else {
             return Action::Forward;
         };
-        if !crate::handler::text_input::end_composition_on_press(ctx, surface) {
-            return Action::Forward;
-        }
-        ctx.host_to_client_queue.push(wl_pointer::evt::button(
-            guest_pointer,
-            serial,
-            time,
-            button,
-            state,
-        ));
-        Action::Drop
+        crate::handler::text_input::end_composition_on_press(ctx, surface, || {
+            wl_pointer::evt::button(guest_pointer, serial, time, button, state)
+        })
     }
 }
 
