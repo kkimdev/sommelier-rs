@@ -226,8 +226,8 @@ fn global_removal_seen(ctx: &Context, name: u32, generation: u64) -> bool {
 
 /// Retire global `name`, whose current advertisement the host removed,
 /// once no registry still lists it ([`global_still_seen`]): reset the
-/// internal binding it backed, and tombstone its connection-wide metadata,
-/// which blocks new binds.
+/// internal binding it backed, and drop its connection-wide metadata,
+/// whose absence refuses new binds.
 ///
 /// `wl_registry.global_remove` invalidates only the *global name*. Any
 /// object that was already bound remains valid until its own destructor
@@ -239,11 +239,8 @@ fn retire_unseen_global(ctx: &mut Context, name: u32) {
     reset_internal_binding_for_global(ctx, name);
     crate::handler::shm::retire_guest_shms(ctx, name);
     ctx.singleton_candidates.remove(&name);
-    let hidden = ctx.hidden_host_globals.remove(&name).is_some();
-    let advertised = ctx.host_globals.remove(&name).is_some();
-    if hidden || advertised {
-        ctx.removed_host_globals.insert(name);
-    }
+    ctx.hidden_host_globals.remove(&name);
+    ctx.host_globals.remove(&name);
     if ensure_all_bound(ctx).is_err() {
         // The failed bind ended the session in `ctx`, which is all its
         // result says; the message's handler cannot do more.
@@ -758,7 +755,6 @@ fn replace_global_metadata_for_generation(ctx: &mut Context, name: u32) {
     ctx.singleton_candidates.remove(&name);
     ctx.host_globals.remove(&name);
     ctx.hidden_host_globals.remove(&name);
-    ctx.removed_host_globals.remove(&name);
 }
 
 /// Advertise the synthetic `zwp_text_input_manager_v3` that the host
@@ -871,9 +867,6 @@ fn admit_guest_bind(
     }
 
     let global = ctx.host_globals.get(&name)?;
-    if ctx.removed_host_globals.contains(&name) {
-        return None;
-    }
     if let Some(record) = ctx.registries.get(&registry_host_id) {
         if !record.lists(name) {
             return None;
@@ -956,11 +949,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 return end;
             }
         }
-        // A global that disappeared may later be re-advertised with the same
-        // numeric name. Its metadata is retained while other registry objects
-        // receive global_remove, so clear the tombstone when this is a new
-        // advertisement.
-        ctx.removed_host_globals.remove(&name);
 
         if interface == zaura_shell::NAME && version < ZAURA_SHELL_MIN_VERSION {
             log::debug!(
@@ -1224,7 +1212,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // Host registries are independent Wayland objects and their events can
         // be interleaved. A global name may be removed from one registry and
         // re-advertised there before another registry delivers the old remove.
-        // Do not tombstone the connection-wide metadata until every registry
+        // Do not retire the connection-wide metadata until every registry
         // has observed the removal; otherwise that stale remove invalidates a
         // newly advertised generation.
         let current_generation = ctx.global_generations.get(&name).copied();
@@ -2911,7 +2899,6 @@ mod tests {
         assert_eq!(B.destroy(&mut ctx), Action::Forward);
 
         assert!(!ctx.host_globals.contains_key(&7));
-        assert!(ctx.removed_host_globals.contains(&7));
     }
 
     /// The removal stays on record when the only registry that saw it is
@@ -2926,7 +2913,6 @@ mod tests {
         assert_eq!(B.destroy(&mut ctx), Action::Forward);
 
         assert!(!ctx.host_globals.contains_key(&7));
-        assert!(ctx.removed_host_globals.contains(&7));
         assert!(ctx.removed_global_generations.is_empty());
     }
 
@@ -2940,7 +2926,6 @@ mod tests {
         assert_eq!(A.destroy(&mut ctx), Action::Forward);
 
         assert!(ctx.host_globals.contains_key(&7));
-        assert!(!ctx.removed_host_globals.contains(&7));
     }
 
     #[test]
@@ -2955,10 +2940,10 @@ mod tests {
         assert_eq!(A.global(&mut ctx, 7, "wl_seat", 5), Action::Forward);
 
         // B's delayed remove belongs to generation 1. It must be forwarded to
-        // B, but must not tombstone generation 2 advertised to A.
+        // B, but must not retire generation 2 advertised to A.
         assert_eq!(B.remove(&mut ctx, 7), Action::Forward);
         assert!(
-            !ctx.removed_host_globals.contains(&7),
+            ctx.host_globals.contains_key(&7),
             "an old registry remove must not invalidate the replacement"
         );
         ctx.assert_no_orphans();

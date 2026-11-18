@@ -460,8 +460,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
 - **A removed global waits for every registry that lists it.** Its
   connection-wide metadata, and the internal binding it backs, stay until
   every registry that listed it has seen its `global_remove`, so each can
-  still be sent its own; then the name is tombstoned and new binds of it
-  are refused. A registry destroyed through `wl_fixes` before it sees the
+  still be sent its own; then the metadata goes, and a new bind of the
+  name is refused through any registry. A registry destroyed through `wl_fixes` before it sees the
   removal no longer counts, and if it was the last, its destruction
   retires the global. The removal is on record connection-wide from the
   first `global_remove` until the global is retired or advertised anew,
@@ -481,6 +481,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   it would for a native client.
   Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
   `a_removal_outlives_the_registry_that_saw_it`,
+  `an_invalid_bind_is_a_protocol_error`,
   `the_removal_of_a_dropped_global_waits_for_every_registry`,
   `destroying_a_registry_keeps_a_global_no_registry_saw_removed`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`.

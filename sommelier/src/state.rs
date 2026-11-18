@@ -489,11 +489,6 @@ pub struct Context {
     /// the removal, which a guest may destroy before the last registry that
     /// lists the global sees it.
     pub removed_global_generations: BTreeMap<u32, u64>,
-    /// Globals that have been removed from the host registry. Keep their
-    /// metadata until every registry has observed the removal so a second
-    /// registry can still receive its own global_remove event, while blocking
-    /// new binds in the meantime.
-    pub removed_host_globals: BTreeSet<u32>,
     pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
@@ -1060,7 +1055,6 @@ impl Context {
             global_generations: BTreeMap::new(),
             next_global_generation: 1,
             removed_global_generations: BTreeMap::new(),
-            removed_host_globals: BTreeSet::new(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
