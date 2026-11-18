@@ -18,11 +18,13 @@ limitations under the License.
 //! the host's release, and retiring a destroyed buffer once the host is
 //! done with it.
 
-use crate::handler::shm::ShmHandler;
 use crate::protocols;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
 use std::collections::BTreeSet;
+
+/// The `wl_buffer` handler: the guest's SHM and native buffers alike.
+pub struct BufferHandler;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
 pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
@@ -156,7 +158,7 @@ pub(crate) fn clear_buffer_uses_after_surface_destroy(
     }
 }
 
-impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
+impl protocols::wayland::wl_buffer::WlBufferHandler for BufferHandler {
     fn on_destroy(&mut self, ctx: &mut Context) -> Action {
         let guest_id = ctx.last_sender_id;
         let host_id = ctx.shadow_table.get_host_id(guest_id);
@@ -230,8 +232,7 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shm::ShmHandler;
-    use super::retire_eligible_buffers;
+    use super::{retire_eligible_buffers, BufferHandler};
     use crate::handler::test_support::{
         buffer_host_destroy_is_queued, buffer_is_guest_destroyed, mark_test_buffer_guest_destroyed,
     };
@@ -258,14 +259,14 @@ mod tests {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
             if shown {
-                ctx.surface_mut(surface)
+                ctx.surface_for_test(surface)
                     .set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
             }
             assert!(ctx.mark_buffer_submitted(guest_buffer));
 
             ctx.last_sender_id = guest_buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
+                WlBufferHandler::on_destroy(&mut BufferHandler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_is_guest_destroyed(&ctx, guest_buffer), "{case}");
@@ -287,7 +288,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut ShmHandler, &mut ctx),
+                WlBufferHandler::on_release(&mut BufferHandler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
@@ -333,7 +334,7 @@ mod tests {
 
             ctx.last_sender_id = host_buffer;
             assert_eq!(
-                WlBufferHandler::on_release(&mut ShmHandler, &mut ctx),
+                WlBufferHandler::on_release(&mut BufferHandler, &mut ctx),
                 Action::Forward
             );
             assert!(ctx.buffer_is_released(guest_buffer), "{case}");
@@ -342,12 +343,12 @@ mod tests {
             // guest object uses the recorded release instead of waiting for
             // a second one that cannot arrive.
             if shown {
-                ctx.surface_mut(surface)
+                ctx.surface_for_test(surface)
                     .set_current_buffer_for_test(Some(guest_buffer), None);
             }
             ctx.last_sender_id = guest_buffer;
             assert_eq!(
-                WlBufferHandler::on_destroy(&mut ShmHandler, &mut ctx),
+                WlBufferHandler::on_destroy(&mut BufferHandler, &mut ctx),
                 Action::Drop
             );
             assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer), "{case}");
@@ -374,7 +375,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
-        let mut handler = ShmHandler;
+        let mut handler = BufferHandler;
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
@@ -410,7 +411,7 @@ mod tests {
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
-        let mut handler = ShmHandler;
+        let mut handler = BufferHandler;
 
         ctx.last_sender_id = guest_buffer;
         assert_eq!(
@@ -444,7 +445,7 @@ mod tests {
         let host_buffer = 0xff00_0030;
         let guest_buffer = register_test_server_native(&mut ctx, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
-        let mut handler = ShmHandler;
+        let mut handler = BufferHandler;
 
         ctx.last_sender_id = host_buffer;
         assert_eq!(
@@ -480,9 +481,9 @@ mod tests {
             assert!(ctx.mark_buffer_submitted(guest_id));
             assert!(ctx.mark_buffer_released(guest_id));
         }
-        ctx.surface_mut(40).pending.attachment =
+        ctx.surface_for_test(40).pending.attachment =
             crate::state::SurfaceAttachment::Attach(local_buffer);
-        ctx.surface_mut(41).pending.attachment =
+        ctx.surface_for_test(41).pending.attachment =
             crate::state::SurfaceAttachment::Attach(native_buffer);
 
         retire_eligible_buffers(&mut ctx);

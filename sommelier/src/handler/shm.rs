@@ -28,8 +28,8 @@ mod storage;
 pub(crate) use self::copy::{copy_shm_damage, ShmCopyError, ShmCopyLayout};
 pub(crate) use self::damage::{coalesce_damage_rects, damage_reaches_buffer};
 pub(crate) use self::formats::{
-    clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, record_host_shm_drm_format,
-    register_guest_shm,
+    clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, is_supported_drm_format,
+    record_host_shm_drm_format, register_guest_shm,
 };
 pub(crate) use self::pool::{forget_pool, forget_shm, retire_guest_shms};
 

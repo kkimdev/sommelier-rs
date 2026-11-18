@@ -130,6 +130,7 @@ struct SommelierHandler {
     remote_shell: crate::handler::window_placement::RemoteShellHandler,
     callback: crate::handler::callback::CallbackHandler,
     shm: crate::handler::shm::ShmHandler,
+    buffer: crate::handler::buffer::BufferHandler,
     linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
     data_device: crate::handler::data_device::DataDeviceHandler,
     text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
@@ -155,6 +156,7 @@ impl SommelierHandler {
             remote_shell: crate::handler::window_placement::RemoteShellHandler,
             callback: crate::handler::callback::CallbackHandler,
             shm: crate::handler::shm::ShmHandler,
+            buffer: crate::handler::buffer::BufferHandler,
             linux_dmabuf: crate::handler::linux_dmabuf::LinuxDmabufHandler,
             data_device: crate::handler::data_device::DataDeviceHandler,
             text_input_manager_v1: crate::handler::text_input::TextInputManagerV1Handler,
@@ -2349,6 +2351,7 @@ mod tests {
             "wl_surface",
             4,
         );
+        client.ctx.create_surface(SURFACE);
         (client, guest_peer, host_peer)
     }
 
@@ -3724,6 +3727,11 @@ mod tests {
         );
         assert_eq!(ctx.shadow_table.guest_object_version(30), Some(4));
         assert_eq!(ctx.shadow_table.host_object_version(host_surface), Some(3));
+        assert!(
+            ctx.surfaces.contains_key(&30),
+            "a surface has its state from its creation"
+        );
+        ctx.assert_no_orphans();
     }
 
     #[test]
@@ -3872,7 +3880,7 @@ protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
     wl_region: compositor,
     wl_shm: shm,
     wl_shm_pool: shm,
-    wl_buffer: shm,
+    wl_buffer: buffer,
     wl_data_device_manager: data_device,
     wl_data_device: data_device,
     wl_data_source: data_device,
