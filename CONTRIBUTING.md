@@ -76,9 +76,10 @@ assert_eq!(
 - Read everything each peer received: a `Session` dropped with output
   the test never read fails.
 - Learn host IDs from what the proxy forwards (`create`, `surface`), not
-  from the object table, and reach into the `Context` (`Session::ctx`)
-  only for a fault no peer can cause. Every batch that keeps the session
-  checks that no state outlives its object.
+  from the object table. `Session::ctx()` reads state no peer can
+  observe, or injects a fault no peer can cause; each use says which, in
+  a comment. Every batch that keeps the session checks that no state
+  outlives its object.
 - A handler test decodes a queue with `test_support::decoded`.
 - Use `MessageBuilder` only for frames no encoder builds, such as
   malformed ones.

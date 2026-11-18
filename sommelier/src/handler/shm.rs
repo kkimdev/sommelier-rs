@@ -2138,6 +2138,7 @@ mod tests {
                 (vec![], (shm, wl_shm::ERROR_INVALID_FD)),
                 "a pool must be a regular file of at least its size"
             );
+            // No peer sees the proxy's pool table; the session has ended.
             assert!(s.ctx().pools.is_empty());
         }
     }
@@ -2170,6 +2171,7 @@ mod tests {
             if valid {
                 s.guest([resize]).await;
                 assert_eq!(s.guest_received(), [], "resize to {size}");
+                // No peer sees the size the proxy records for the pool.
                 assert_eq!(s.ctx().pools[&pool].size, size as usize);
             } else {
                 s.guest_fatal([resize]).await;
@@ -2178,6 +2180,7 @@ mod tests {
                     (vec![], (pool, wl_shm::ERROR_INVALID_FD)),
                     "resize to {size}"
                 );
+                // No peer sees the size the proxy records for the pool.
                 assert_eq!(s.ctx().pools[&pool].size, 4096);
             }
             assert_eq!(s.host_received(), []);
@@ -2694,6 +2697,7 @@ mod tests {
             panic!("the host got {received:?}");
         };
         let (host_buffer, _) = received[1].1.new_object().expect("a host buffer");
+        // The proxy's own wl_shm binding has no guest ID to compare with.
         assert_eq!(Some(*host_shm), s.ctx().host_shm_id);
         assert_eq!(*size, stride * height);
         let pool_size = nix::sys::stat::fstat(fd).expect("fstat the pool").st_size;
