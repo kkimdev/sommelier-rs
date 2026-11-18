@@ -109,18 +109,40 @@ fn resolve_preedit_cursor(
     (end, end)
 }
 
-fn convert_delete_range(index: i32, length: u32) -> Option<(u32, u32)> {
-    // v1 specifies a byte range beginning at cursor + index. v3 splits the
-    // same range into bytes immediately before and after the cursor. A range
-    // separated from the cursor cannot be represented without deleting the
-    // intervening text, so reject it rather than corrupting client state.
-    // i64 prevents overflow for i32::MIN and for `start + length`.
-    let start = i64::from(index);
-    let end = start + i64::from(length);
-    if start > 0 || end < 0 {
+/// Split the `length` bytes of `text` from byte `start` into the
+/// text-input-v3 lengths before and after `cursor`, the only form in which
+/// v3 can delete them.
+///
+/// # Returns
+///
+/// `None` if the range does not contain the cursor or does not lie on
+/// character boundaries of `text`.
+fn lengths_around_cursor(text: &str, cursor: i32, start: i64, length: u32) -> Option<(u32, u32)> {
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(usize::try_from(length).ok()?)?;
+    let cursor = usize::try_from(cursor).ok()?;
+    if !(start <= cursor && cursor <= end) || text.get(start..end).is_none() {
         return None;
     }
-    Some((start.unsigned_abs() as u32, end as u32))
+    // Both lengths are at most `length`.
+    Some(((cursor - start) as u32, (end - cursor) as u32))
+}
+
+/// The text-input-v3 lengths of a v1 `delete_surrounding_text(index,
+/// length)` in `text` around `cursor`. A negative `index` can only mean the
+/// v1 XML's reading, relative to the cursor; Exo sends it non-negative,
+/// counted from the start of the text (docs/INVARIANTS.md, "Exo's deletes
+/// are absolute and stand alone").
+///
+/// # Returns
+///
+/// `None` as [`lengths_around_cursor`] does.
+fn delete_lengths(text: &str, cursor: i32, index: i32, length: u32) -> Option<(u32, u32)> {
+    let start = match index {
+        ..0 => i64::from(cursor) + i64::from(index),
+        _ => i64::from(index),
+    };
+    lengths_around_cursor(text, cursor, start, length)
 }
 
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
@@ -581,8 +603,7 @@ fn drop_host_preedit(ctx: &mut Context, guest_id: u32) -> Action {
 }
 
 /// Drop a host `commit_string` for active text input `guest_id` that does
-/// not reach the guest, with the delete_surrounding_text and
-/// cursor_position that were part of it.
+/// not reach the guest, with the cursor_position that was part of it.
 fn drop_host_commit(ctx: &mut Context, guest_id: u32) -> Action {
     if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
         state.discard_pending_commit_state();
@@ -724,15 +745,6 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return drop_host_commit(ctx, guest_id);
         }
 
-        // v1 requires delete_surrounding_text and cursor_position to be
-        // applied as part of the following commit_string. Preserve that
-        // transaction boundary when translating to v3.
-        for &(before, after) in &plan.deletes {
-            transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-                guest_id, before, after,
-            ));
-        }
-
         if !push_commit_string_to(&mut transaction, guest_id, text) {
             return drop_host_commit(ctx, guest_id);
         }
@@ -744,7 +756,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             .expect("active text input disappeared while encoding commit");
         let pending_cursor_position = plan.cursor_position;
         let guest_seat = plan.guest_seat;
-        state.finish_host_commit(plan);
+        // An empty commit with no preedit to replace changes no text.
+        let edited = plan.had_preedit || !text.is_empty();
+        state.finish_host_commit(plan, edited);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
 
         if let Some((index, anchor)) = pending_cursor_position {
@@ -987,33 +1001,89 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
 
     fn on_delete_surrounding_text(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
         let host_id = ctx.last_sender_id;
-        let Some(guest_id) = active_guest_for_host_text_input(ctx, host_id) else {
+        let Some(guest_id) = ctx.shadow_table.get_guest_id(host_id) else {
+            return Action::Drop;
+        };
+        let Some(state) = ctx.text_inputs.get(&guest_id) else {
+            return Action::Drop;
+        };
+        // A delete ends the composition, as a commit does.
+        let Some(plan) = state.prepare_host_commit() else {
+            log::debug!(
+                "Ignoring stale delete_surrounding_text for inactive text input {}",
+                guest_id
+            );
             return Action::Drop;
         };
         log::trace!(
-            ">>> on_delete_surrounding_text: host_id={}, guest_id={:?}, index={}, length={}",
-            host_id,
-            guest_id,
+            ">>> on_delete_surrounding_text: index={}, length={}, guest_id={}",
             index,
-            length
+            length,
+            guest_id
         );
-        if let Some(delete) = convert_delete_range(index, length) {
+        // Exo counts `index` from the start of the surrounding text, against
+        // the v1 XML, and sends no commit_string with the delete, so it
+        // becomes a v3 transaction of its own (docs/INVARIANTS.md, "Exo's
+        // deletes are absolute and stand alone").
+        let Some((text, cursor, anchor)) = &state.committed.surrounding_text else {
+            log::debug!("Ignoring v1 delete range {index}+{length}: no surrounding text");
+            return Action::Drop;
+        };
+        if cursor != anchor {
+            log::debug!("Ignoring v1 delete range {index}+{length}: the guest has a selection");
+            return Action::Drop;
+        }
+        // Only Exo's absolute index is measured against its prediction of
+        // the text.
+        if index >= 0 && state.unreported_host_edit {
+            log::debug!(
+                "Ignoring v1 delete range {index}+{length}: the guest has not reported \
+                 the input method's last edit"
+            );
+            return Action::Drop;
+        }
+        let Some((before, after)) = delete_lengths(text, *cursor, index, length) else {
+            // The delete is lost, which only the log shows: warn once per
+            // text input.
+            let (text_length, cursor) = (text.len(), *cursor);
             let state = ctx
                 .text_inputs
                 .get_mut(&guest_id)
-                .expect("active text input disappeared while handling host event");
-            // Per text-input-v1 this event is part of the following
-            // commit_string, not a standalone edit.
-            if !state.record_delete(delete.0, delete.1) {
-                log::warn!("Ignoring text-input delete beyond the pending transaction limit");
-            }
-        } else {
-            log::warn!(
-                "Ignoring unrepresentable v1 delete range: index={}, length={}",
-                index,
-                length
+                .expect("active text input disappeared while dropping delete");
+            let level = match std::mem::replace(&mut state.warned_delete_range, true) {
+                false => log::Level::Warn,
+                true => log::Level::Debug,
+            };
+            log::log!(
+                level,
+                "Ignoring v1 delete range {index}+{length}, which is not around cursor \
+                 {cursor} of the {text_length}-byte surrounding text"
             );
+            return Action::Drop;
+        };
+        if (before, after) == (0, 0) {
+            log::debug!("Ignoring empty v1 delete range {index}+{length}");
+            return Action::Drop;
         }
+
+        let mut transaction = Vec::new();
+        if plan.had_preedit && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
+            return Action::Drop;
+        }
+        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+            guest_id, before, after,
+        ));
+        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
+
+        let guest_seat = plan.guest_seat;
+        // This also drops a pending cursor_position, which Exo always
+        // follows with its commit_string, never with a delete.
+        ctx.text_inputs
+            .get_mut(&guest_id)
+            .expect("active text input disappeared while encoding delete")
+            .finish_host_commit(plan, true);
+        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+        ctx.host_to_client_queue.extend(transaction);
         Action::Drop
     }
 
@@ -1079,40 +1149,26 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         };
 
         let text = &plan.surrounding_text;
-        let cursor_i64 = plan.surrounding_cursor as i64;
-        let index_i64 = index as i64;
-        let start_idx = cursor_i64 + index_i64;
-        let length_i64 = length as i64;
-
-        if !(start_idx >= 0
-            && start_idx + length_i64 <= text.len() as i64
-            && text.is_char_boundary(start_idx as usize)
-            && text.is_char_boundary((start_idx + length_i64) as usize)
-            && start_idx <= cursor_i64
-            && start_idx + length_i64 >= cursor_i64)
-        {
+        let cursor = plan.surrounding_cursor;
+        let start = i64::from(cursor) + i64::from(index);
+        let Some((before_length, after_length)) =
+            lengths_around_cursor(text, cursor, start, length)
+        else {
             log::warn!(
-                "on_set_preedit_region: range [{}, {}] is invalid, non-adjacent to cursor {}, or out of bounds for text length {}",
-                start_idx,
-                start_idx + length_i64,
-                cursor_i64,
+                "on_set_preedit_region: range {}+{} is invalid, non-adjacent to cursor {}, or out of bounds for text length {}",
+                start,
+                length,
+                cursor,
                 text.len()
             );
             return drop_host_preedit(ctx, guest_id);
-        }
+        };
 
-        let preedit_text = text[start_idx as usize..(start_idx + length_i64) as usize].to_string();
-        let before_length = if start_idx < cursor_i64 {
-            (cursor_i64 - start_idx) as u32
-        } else {
-            0
-        };
-        let after_length = if start_idx + length_i64 > cursor_i64 {
-            (start_idx + length_i64 - cursor_i64) as u32
-        } else {
-            0
-        };
-        let default_cursor = (cursor_i64 - start_idx) as i32;
+        // The cursor is a character boundary of `text`, at most its length.
+        let cursor = cursor as usize;
+        let preedit_text =
+            text[cursor - before_length as usize..cursor + after_length as usize].to_string();
+        let default_cursor = before_length as i32;
         let pending_cursor = plan.cursor.or(Some(default_cursor));
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
@@ -2220,6 +2276,23 @@ mod tests {
             f
         }
 
+        /// A text input the host activated, whose guest then committed the
+        /// surrounding text `text` with `cursor` and `anchor`, so that each
+        /// `done` is numbered 2.
+        async fn with_surrounding_text(text: &str, cursor: i32, anchor: i32) -> Self {
+            let mut f = Self::enabled().await;
+            f.s.guest([
+                v3::set_surrounding_text(f.ti, text, cursor, anchor).unwrap(),
+                v3::commit(f.ti),
+            ])
+            .await;
+            let mut expected = vec![f.surrounding_text(text, cursor as u32, anchor as u32)];
+            expected.extend(f.content_type((0, 0), true));
+            expected.push(f.commit_state(2));
+            assert_eq!(f.s.host_received(), expected);
+            f
+        }
+
         /// A text input the guest enabled with the surrounding text "가",
         /// which the host activated, on a keyboard whose keys the host
         /// reports to the proxy before its input method takes them
@@ -2612,6 +2685,12 @@ mod tests {
         /// The host input method's `commit_string`.
         fn commit(&self, text: &str) -> Outgoing {
             v1::commit_string(self.host, 0, text).unwrap()
+        }
+
+        /// The host input method's `delete_surrounding_text` of the bytes
+        /// `index..index + length`, as Exo sends it.
+        fn delete_range(&self, index: i32, length: u32) -> Outgoing {
+            v1::delete_surrounding_text(self.host, index, length)
         }
 
         /// The host input method's `confirm_preedit`.
@@ -3135,7 +3214,8 @@ mod tests {
     }
 
     /// An enable starts a new field: it closes the composition the input
-    /// method left, with its pending preedit cursor, selection and edits.
+    /// method left, with its pending preedit cursor, selection and cursor
+    /// position.
     #[tokio::test]
     async fn committed_enable_resets_previous_ime_event_transaction() {
         for preedit_first in [true, false] {
@@ -3144,7 +3224,6 @@ mod tests {
                 f.preedit("이전", ""),
                 v1::preedit_styling(f.host, 0, 3, 6),
                 v1::preedit_cursor(f.host, 3),
-                v1::delete_surrounding_text(f.host, -3, 3),
                 v1::cursor_position(f.host, 1, 1),
             ])
             .await;
@@ -3177,7 +3256,7 @@ mod tests {
                     f.events([preedit_at("가나", 6, 6), done])
                 );
             } else {
-                // No preedit to clear and no edit to apply.
+                // No preedit to clear.
                 f.s.host([f.commit("새")]).await;
                 assert_eq!(f.s.guest_received(), f.events([commit("새"), done]));
             }
@@ -3815,44 +3894,17 @@ mod tests {
             ),
             (
                 // Each 0xff becomes the three bytes of U+FFFD, too long for
-                // the guest's message.
-                "a commit too long once replaced takes its deletes with it",
+                // the guest's message. The cursor position it takes with it
+                // reaches no guest event; the state test
+                // `oversized_host_text_does_not_partially_advance_state`
+                // reads it.
+                "a commit too long once replaced is dropped",
                 |f| {
                     let text = "x".repeat(4_000);
                     let latin1 = respell(f.commit(&text), &text, &[0xff; 4_000]);
-                    vec![
-                        v1::delete_surrounding_text(f.host, -3, 3),
-                        latin1,
-                        f.commit("나"),
-                    ]
+                    vec![v1::cursor_position(f.host, 1, 1), latin1, f.commit("나")]
                 },
                 vec![commit("나"), DONE],
-            ),
-            (
-                "a delete waits for its commit",
-                |f| vec![v1::delete_surrounding_text(f.host, -3, 5)],
-                vec![],
-            ),
-            (
-                "a delete spans the cursor",
-                |f| vec![v1::delete_surrounding_text(f.host, -3, 5), f.commit("")],
-                vec![delete(3, 2), commit(""), DONE],
-            ),
-            (
-                "a delete apart from the cursor would delete the text between",
-                |f| vec![v1::delete_surrounding_text(f.host, -5, 3), f.commit("")],
-                vec![commit(""), DONE],
-            ),
-            (
-                "deletes accumulate until the commit",
-                |f| {
-                    vec![
-                        v1::delete_surrounding_text(f.host, -3, 3),
-                        v1::delete_surrounding_text(f.host, 0, 2),
-                        f.commit("한"),
-                    ]
-                },
-                vec![delete(3, 0), delete(0, 2), commit("한"), DONE],
             ),
             (
                 "a preedit cursor is a byte offset",
@@ -3897,15 +3949,13 @@ mod tests {
                 vec![preedit("가"), DONE, no_preedit(), DONE],
             ),
             (
-                // Its selection and cursor go with it, while the edits stay
-                // for the next commit.
+                // Its selection and cursor go with it.
                 "a confirm commits the preedit",
                 |f| {
                     vec![
                         f.preedit("나", ""),
                         v1::preedit_styling(f.host, 0, 3, 6),
                         v1::preedit_cursor(f.host, 3),
-                        v1::delete_surrounding_text(f.host, -3, 3),
                         ext::confirm_preedit(f.host_ext, 0),
                         f.preedit("다라", ""),
                         f.commit("다"),
@@ -3921,31 +3971,9 @@ mod tests {
                     preedit_at("다라", 6, 6),
                     DONE,
                     no_preedit(),
-                    delete(3, 0),
                     commit("다"),
                     DONE,
                     commit("라"),
-                    DONE,
-                ],
-            ),
-            (
-                "a confirm keeps the edits for the next commit",
-                |f| {
-                    vec![
-                        f.preedit("가", ""),
-                        v1::delete_surrounding_text(f.host, -3, 3),
-                        f.confirm(),
-                        f.commit("나"),
-                    ]
-                },
-                vec![
-                    preedit("가"),
-                    DONE,
-                    no_preedit(),
-                    commit("가"),
-                    DONE,
-                    delete(3, 0),
-                    commit("나"),
                     DONE,
                 ],
             ),
@@ -3956,6 +3984,316 @@ mod tests {
             f.s.host(events).await;
             assert_eq!(f.s.guest_received(), f.events(expected), "{case}");
         }
+    }
+
+    /// Exo's `delete_surrounding_text(index, length)` deletes the bytes
+    /// `index..index + length` of the surrounding text, counted from its
+    /// start, and no `commit_string` closes it. The guest gets it at once,
+    /// in bytes before and after its cursor. A delete is dropped where v3
+    /// cannot carry it to every client (a range the cursor is not in, a
+    /// selection) and where the text Exo measured may not be the text the
+    /// guest committed (a range that text does not have, an edit of the
+    /// input method the guest has not reported since).
+    #[tokio::test]
+    async fn exo_deletes_become_v3_deletes_around_the_cursor() {
+        type Events = fn(&Field) -> Vec<Outgoing>;
+        /// The guest's surrounding text, cursor and anchor, if it has any.
+        type Surrounding = Option<(&'static str, i32, i32)>;
+        /// The `done` after the guest's second commit, which stated the
+        /// surrounding text.
+        const DONE_2: V3 = V3::Done { serial: 2 };
+        let cases: Vec<(&str, Surrounding, Events, Vec<V3>)> = vec![
+            (
+                // The input method replaces "tom" with the suggestion.
+                "an accepted suggestion deletes, then commits",
+                Some(("see you tom", 11, 11)),
+                |f| vec![f.delete_range(8, 3), f.commit("tomorrow")],
+                vec![delete(3, 0), DONE_2, commit("tomorrow"), DONE_2],
+            ),
+            (
+                // A long press on "e" offers its diacritics.
+                "a chosen diacritic deletes, then commits",
+                Some(("e", 1, 1)),
+                |f| vec![f.delete_range(0, 1), f.commit("é")],
+                vec![delete(1, 0), DONE_2, commit("é"), DONE_2],
+            ),
+            (
+                // "하세요" is three syllables of three bytes each.
+                "a delete alone counts UTF-8 bytes",
+                Some(("안녕하세요", 15, 15)),
+                |f| vec![f.delete_range(6, 9)],
+                vec![delete(9, 0), DONE_2],
+            ),
+            (
+                "a delete around the cursor",
+                Some(("가나다", 3, 3)),
+                |f| vec![f.delete_range(0, 6)],
+                vec![delete(3, 3), DONE_2],
+            ),
+            (
+                // Exo deletes the selection "cd" and one byte either side,
+                // which v3 clients count from different places.
+                "a delete with a selection is dropped",
+                Some(("abcdef", 4, 2)),
+                |f| vec![f.delete_range(1, 4), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                "a delete with a selection whose cursor is its start is dropped",
+                Some(("abcdef", 2, 4)),
+                |f| vec![f.delete_range(1, 4), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                "a range apart from the cursor is dropped, not kept",
+                Some(("가나다", 9, 9)),
+                |f| vec![f.delete_range(0, 3), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                "a range past the text is dropped",
+                Some(("가", 3, 3)),
+                |f| vec![f.delete_range(0, 6), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                "a range inside a character is dropped",
+                Some(("가나", 6, 6)),
+                |f| vec![f.delete_range(1, 5), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                "a delete without surrounding text is dropped",
+                None,
+                |f| vec![f.delete_range(0, 3), f.commit("x")],
+                vec![commit("x"), DONE],
+            ),
+            (
+                // Exo deletes only without a composition; were one shown,
+                // the delete would end it, as a commit does.
+                "a delete ends the preedit",
+                Some(("가", 3, 3)),
+                |f| vec![f.preedit("나", ""), f.delete_range(0, 3), f.confirm()],
+                vec![preedit("나"), DONE_2, no_preedit(), delete(3, 0), DONE_2],
+            ),
+            (
+                // The v1 XML's reading, relative to the cursor, which only
+                // a negative index can mean.
+                "a negative index counts from the cursor",
+                Some(("abc", 3, 3)),
+                |f| vec![f.delete_range(-1, 1)],
+                vec![delete(1, 0), DONE_2],
+            ),
+            (
+                "a negative index with a length past the cursor",
+                Some(("abc", 1, 1)),
+                |f| vec![f.delete_range(-1, 3)],
+                vec![delete(1, 2), DONE_2],
+            ),
+            (
+                "a negative index whose range ends before the cursor is dropped",
+                Some(("abc", 3, 3)),
+                |f| vec![f.delete_range(-2, 1), f.commit("x")],
+                vec![commit("x"), DONE_2],
+            ),
+            (
+                // Its range is the guest's own, around its cursor.
+                "a negative index needs no report of the last edit",
+                Some(("abc", 3, 3)),
+                |f| vec![f.commit("X"), f.delete_range(-1, 1)],
+                vec![commit("X"), DONE_2, delete(1, 0), DONE_2],
+            ),
+            (
+                // Exo sends one when the input method deletes nothing.
+                "an empty delete is not forwarded, and edits nothing",
+                Some(("abc", 3, 3)),
+                |f| vec![f.delete_range(3, 0), f.delete_range(2, 1)],
+                vec![delete(1, 0), DONE_2],
+            ),
+            (
+                "an empty commit without a preedit edits nothing",
+                Some(("abc", 3, 3)),
+                |f| vec![f.commit(""), f.delete_range(2, 1)],
+                vec![commit(""), DONE_2, delete(1, 0), DONE_2],
+            ),
+            (
+                // Exo deletes "cX" of its "abcX|def"; in the guest's
+                // "abc|def", the same bytes are "c" and "d".
+                "a delete after a commit the guest has not reported is dropped",
+                Some(("abcdef", 3, 3)),
+                |f| vec![f.commit("X"), f.delete_range(2, 2)],
+                vec![commit("X"), DONE_2],
+            ),
+            (
+                // Exo deletes "bd" of its "ab|def"; in "abc|def", the same
+                // bytes are "ab".
+                "a delete after a delete the guest has not reported is dropped",
+                Some(("abcdef", 3, 3)),
+                |f| vec![f.delete_range(2, 1), f.delete_range(1, 2)],
+                vec![delete(1, 0), DONE_2],
+            ),
+            (
+                // Exo deletes "b" of its "ab|cd"; in "a|cd", the same byte
+                // is "c".
+                "a delete after a confirmation the guest has not reported is dropped",
+                Some(("acd", 1, 1)),
+                |f| vec![f.preedit("b", ""), f.confirm(), f.delete_range(1, 1)],
+                vec![preedit("b"), DONE_2, no_preedit(), commit("b"), DONE_2],
+            ),
+            (
+                // The region "나" becomes a preedit and is cleared, so Exo
+                // deletes "다" of its "가|다"; in "가나다|", the same bytes
+                // are "나".
+                "a delete after a preedit region the guest has not reported is dropped",
+                Some(("가나다", 6, 6)),
+                |f| {
+                    vec![
+                        ext::set_preedit_region(f.host_ext, -3, 3),
+                        f.preedit("", ""),
+                        f.delete_range(3, 3),
+                    ]
+                },
+                vec![
+                    delete(3, 0),
+                    preedit_at("나", 3, 3),
+                    DONE_2,
+                    no_preedit(),
+                    DONE_2,
+                ],
+            ),
+        ];
+        for (case, surrounding_text, events, expected) in cases {
+            let mut f = match surrounding_text {
+                Some((text, cursor, anchor)) => {
+                    Field::with_surrounding_text(text, cursor, anchor).await
+                }
+                None => Field::enabled().await,
+            };
+            let events = events(&f);
+            f.s.host(events).await;
+            assert_eq!(f.s.guest_received(), f.events(expected), "{case}");
+        }
+    }
+
+    /// A v1 delete's index is Exo's, counted from the start of the text,
+    /// unless it is negative, which only the v1 XML's cursor-relative
+    /// reading can mean; either way the range must contain the cursor and
+    /// lie on character boundaries.
+    #[test]
+    fn delete_lengths_read_both_conventions() {
+        /// A delete's surrounding text, cursor, index and length.
+        type Delete = (&'static str, i32, i32, u32);
+        /// The lengths before and after the cursor, if any.
+        type Lengths = Option<(u32, u32)>;
+        let cases: [(&str, Delete, Lengths); 12] = [
+            (
+                "absolute, before the cursor",
+                ("abcdef", 3, 1, 2),
+                Some((2, 0)),
+            ),
+            (
+                "absolute, from the cursor",
+                ("abcdef", 3, 3, 2),
+                Some((0, 2)),
+            ),
+            (
+                "absolute, around the cursor",
+                ("abcdef", 3, 1, 4),
+                Some((2, 2)),
+            ),
+            ("absolute, apart from the cursor", ("abcdef", 3, 0, 2), None),
+            ("absolute, past the text", ("abc", 3, 1, 3), None),
+            ("absolute, inside a character", ("가나", 6, 1, 5), None),
+            (
+                "relative, before the cursor",
+                ("abc", 3, -1, 1),
+                Some((1, 0)),
+            ),
+            (
+                "relative, ending before the cursor",
+                ("abc", 3, -2, 1),
+                None,
+            ),
+            ("relative, before the text", ("abc", 1, -2, 2), None),
+            ("empty, at the cursor", ("abc", 3, 3, 0), Some((0, 0))),
+            (
+                "overflowing a relative index",
+                ("abc", 3, i32::MIN, u32::MAX),
+                None,
+            ),
+            (
+                "overflowing a length",
+                ("abc", i32::MAX, i32::MAX, u32::MAX),
+                None,
+            ),
+        ];
+        for (case, (text, cursor, index, length), expected) in cases {
+            assert_eq!(
+                delete_lengths(text, cursor, index, length),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// A delete whose range is not around the cursor is lost, which only
+    /// the log shows, so the first per text input is a warning; one that
+    /// waits for the guest's report is expected, and is not.
+    #[tokio::test]
+    async fn an_unconvertible_delete_is_warned_of_once() {
+        let mut f = Field::with_surrounding_text("abc", 3, 3).await;
+        // Only the log shows the warning, so read the flag that makes it
+        // once.
+        let warned = |f: &mut Field| f.s.ctx().text_inputs[&f.ti].warned_delete_range;
+        f.s.host([f.commit("X"), f.delete_range(2, 2)]).await;
+        let done = |serial| V3::Done { serial };
+        assert_eq!(f.s.guest_received(), f.events([commit("X"), done(2)]));
+        assert!(!warned(&mut f));
+
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abcX", 4, 4).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("abcX", 4, 4), f.commit_state(3)];
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([f.delete_range(0, 1)]).await;
+        assert_eq!(f.s.guest_received(), []);
+        assert!(warned(&mut f));
+    }
+
+    /// After an edit of the input method, Exo measures deletes against
+    /// text the guest has not committed yet; a guest commit that states its
+    /// surrounding text, and only such a commit, catches the proxy up.
+    #[tokio::test]
+    async fn a_delete_waits_for_the_guest_to_report_the_input_methods_edits() {
+        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        f.s.host([f.commit("X"), f.delete_range(2, 2)]).await;
+        let done = |serial| V3::Done { serial };
+        assert_eq!(f.s.guest_received(), f.events([commit("X"), done(2)]));
+
+        // A commit without surrounding text reports nothing.
+        f.s.guest([v3::set_cursor_rectangle(f.ti, 1, 2, 3, 4), v3::commit(f.ti)])
+            .await;
+        let rectangle = f.v1(V1::SetCursorRectangle {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        });
+        assert_eq!(f.s.host_received(), [rectangle, f.commit_state(3)]);
+        f.s.host([f.delete_range(2, 2)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abcXdef", 4, 4).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("abcXdef", 4, 4), f.commit_state(4)];
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([f.delete_range(2, 2)]).await;
+        assert_eq!(f.s.guest_received(), f.events([delete(2, 0), done(4)]));
     }
 
     /// A preedit region makes committed surrounding text around the cursor
@@ -4050,7 +4388,7 @@ mod tests {
         assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
         f.s.host([
             f.preedit("가", ""),
-            v1::delete_surrounding_text(f.host, -3, 3),
+            f.delete_range(0, 3),
             f.commit("가"),
             v1::keysym(
                 f.host,
@@ -4910,8 +5248,8 @@ mod tests {
     /// nothing, and the text input and its repeat lease stay as they were,
     /// except that the event takes what the host recorded for it: a
     /// preedit, preedit region or confirmation the preedit cursor and
-    /// styling, a commit the deletes and cursor position. Otherwise the next
-    /// one would apply them, a delete at a cursor that has moved. Only host
+    /// styling, a commit the cursor position. Otherwise the next one would
+    /// apply them. Only host
     /// text the proxy lengthened by replacing invalid UTF-8 fits the host's
     /// message but not the guest's (`host_ime_events_become_v3_transactions`
     /// sends such a commit); this test reaches every such drop directly.
@@ -4932,12 +5270,10 @@ mod tests {
             state.current_preedit = oversized.clone();
             state.record_preedit_cursor(1);
             state.record_preedit_selection(0, 1);
-            assert!(state.record_delete(3, 0));
             state.record_cursor_position(1, 1);
             ime.lease_backspace_repeat(TI);
             let mut expected = ime.state().clone();
             if case == "commit" {
-                expected.pending_deletes.clear();
                 expected.pending_cursor_position = None;
             } else {
                 expected.pending_preedit_cursor = None;

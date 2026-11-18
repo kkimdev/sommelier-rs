@@ -455,8 +455,12 @@ drain barrier's completion, Exo detaching the input method on its own (a
 host `leave` while active), a `wl_seat` bind and the object's destroy.
 The surrounding text and cursor rectangle are not reconciled: Exo keeps
 both regardless and edits its copy of the text as the input method
-commits, so each guest commit forwards the ones it states. The rules are
-under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
+commits, so each guest commit forwards the ones it states. In the other
+direction, the edits of Exo's input method reach the guest as v3
+transactions, each closed by a `done`; a delete, which Exo counts from the
+start of the surrounding text, is measured against the text the guest last
+committed. The rules are under
+[Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical

@@ -80,6 +80,22 @@
   bytes still ends the session as too large
   ([Wire messages](docs/INVARIANTS.md#wire-messages)). No client is known
   to send one.
+- Exo measures a `delete_surrounding_text` against its predicted text,
+  which includes input-method edits the guest has not yet reported. The
+  proxy drops deletes until the guest commits its surrounding text after
+  such an edit, but a guest commit that crosses an edit in flight still
+  counts as caught up, so the next delete can land wrong
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)). For a
+  Chromium or Electron v3 guest this is deterministic after a delete
+  then a commit, as when a suggestion is accepted: Chromium answers the
+  delete's `done` with its text, which clears the gate, its commit count
+  moves on, and it reports the text after the commit only at the next
+  input-method event. Mirroring Exo's `SurroundingTextTracker` would
+  close this; no host has shown it.
+- Deletes are dropped while the guest has a selection, because GTK and Qt
+  count v3 delete lengths from the cursor and Chromium's v3 client from
+  the selection's ends; no lengths serve both. An input method that
+  replaces selected text through a delete loses the delete.
 - The `zxdg_output_manager_v1` passthrough has not been checked on a host.
   That Exo advertises the global is inferred from ChromiumOS Sommelier,
   whose direct-scale mode binds it and assumes it is present.

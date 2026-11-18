@@ -1217,7 +1217,6 @@ mod tests {
         state.set_guest_commits(1);
         state.pending_preedit_cursor = Some(1);
         state.pending_preedit_selection = Some((0, 1));
-        state.pending_deletes = vec![(1, 1)];
         state.pending_cursor_position = Some((1, 1));
         state.host = crate::state::HostApplied::Active { content_type: None };
         state
