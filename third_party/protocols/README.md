@@ -16,13 +16,13 @@ the listed commit of this repository.
 | `viewporter.xml` | wayland-protocols `stable/viewporter/` | wayland-protocols 1.45 | `16463fc` |
 | `fractional-scale-v1.xml` | wayland-protocols `staging/fractional-scale/` | wayland-protocols 1.45 | `16463fc` |
 | `xdg-decoration-unstable-v1.xml` | wayland-protocols `unstable/xdg-decoration/` | wayland-protocols 1.45 | `16463fc` |
-| `xdg-output-unstable-v1.xml` | wayland-protocols `unstable/xdg-output/` | wayland-protocols 1.45, unchanged through 1.49 (`zxdg_output_manager_v1` v3) | The `zxdg_output_manager_v1` passthrough |
+| `xdg-output-unstable-v1.xml` | wayland-protocols `unstable/xdg-output/` | wayland-protocols 1.45, unchanged through 1.49 (`zxdg_output_manager_v1` v3) | `02b6691` |
 | `text-input-unstable-v3.xml` | wayland-protocols `unstable/text-input/` | wayland-protocols 1.45 | `16463fc` |
 | `text-input-unstable-v1.xml` | wayland-protocols `unstable/text-input/` | Unknown (predates the `bitfield` and `enum` attributes) | `16463fc` |
 | `keyboard-extension-unstable-v1.xml` | Chromium Exo (`zcr_keyboard_extension_v1`) | Unknown (v2) | `16463fc` |
 | `text-input-extension-unstable-v1.xml` | Chromium Exo (`zcr_text_input_extension_v1`) | Unknown (v11) | `16463fc` |
 | `aura-shell.xml` | Chromium Exo (`zaura_shell`) | Unknown (v38) | `439a872` |
-| `remote-shell-unstable-v2.xml` | Chromium `third_party/wayland-protocols/unstable/remote-shell/` (`zcr_remote_shell_v2`), trimmed to `zcr_remote_shell_v2` and `zcr_remote_surface_v2` without descriptions or enums, every request and event kept in order so the opcodes match | Unknown (v6; fetched 2026-08-23, re-checked 2026-11-18) | The remote-shell-v2 placement backend; bound host-side only, never advertised to guests |
+| `remote-shell-unstable-v2.xml` | Chromium `third_party/wayland-protocols/unstable/remote-shell/` (`zcr_remote_shell_v2`), trimmed to `zcr_remote_shell_v2` and `zcr_remote_surface_v2` without descriptions or enums, every request and event kept in order so the opcodes match | Unknown (v6; fetched 2026-08-23, re-checked 2026-11-18) | `70a1744`; bound host-side only, never advertised to guests |
 | `gtk-shell.xml` | Subset of GTK's `gtk_shell1`, as ChromiumOS Sommelier carries it | Unknown (v1) | `600fdf7` |
 
 ChromiumOS Sommelier carries copies of the Chromium and GTK files in
