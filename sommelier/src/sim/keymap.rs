@@ -32,6 +32,10 @@ const KEY_SPACE: u32 = 57;
 const KEY_LEFT: u32 = 105;
 const KEY_RIGHT: u32 = 106;
 
+/// Shift's bit in `wl_keyboard.modifiers`, as the default xkb keymap
+/// numbers its modifiers.
+pub(super) const SHIFT: u32 = 1;
+
 /// The evdev keycode of `key`, and whether it needs Shift.
 ///
 /// # Panics

@@ -64,6 +64,9 @@ pub(super) enum TextAction {
     Commit(String),
     /// Show this composition; an empty one ends it.
     Preedit(String),
+    /// Delete bytes before and after the cursor, which the engine does only
+    /// while it composes nothing. No key makes one yet.
+    Delete { before: usize, after: usize },
 }
 
 /// What the engine does with keys.
