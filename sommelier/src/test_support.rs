@@ -37,9 +37,19 @@ const OWN_PROCESS_ENV: &str = "SOMMELIER_TEST_OWN_PROCESS";
 ///
 /// In the test's own process, the child's standard output once the test
 /// passed there; in the child, which runs `body`, nothing.
+pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
+    in_own_process_with_env(test_path, &[], body)
+}
+
+/// [`in_own_process`], with the environment variables `env` set in the
+/// child, for a test of what the process reads from its environment.
 // A test may wait for its child; no client runs on the test's thread.
 #[allow(clippy::disallowed_methods)]
-pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
+pub fn in_own_process_with_env(
+    test_path: &str,
+    env: &[(&str, &str)],
+    body: impl FnOnce(),
+) -> String {
     if std::env::var_os(OWN_PROCESS_ENV).is_some() {
         body();
         return String::new();
@@ -47,6 +57,7 @@ pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
     let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args([test_path, "--exact", "--test-threads=1", "--nocapture"])
         .env(OWN_PROCESS_ENV, "1")
+        .envs(env.iter().copied())
         .output()
         .expect("run the test binary");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
