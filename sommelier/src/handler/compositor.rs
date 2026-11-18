@@ -1068,8 +1068,9 @@ mod tests {
     use crate::protocols::AnyRequest;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::{
-        decode, decoded, msg_opcode, msg_sender, protocol_error, protocol_error_code,
-        queued_headers, shm_pool_file,
+        decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error,
+        protocol_error_code, queued_headers, register_test_buffer, shm_pool_file, BufferKind,
+        BUFFER_KINDS,
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
@@ -1245,47 +1246,6 @@ mod tests {
         state
     }
 
-    fn mapped_test_buffer(
-        _guest_buffer_id: u32,
-        width: i32,
-        height: i32,
-        stride: u32,
-        stale: StalePixels,
-    ) -> BufferState {
-        let source_size = usize::try_from(height)
-            .unwrap()
-            .checked_mul(stride as usize)
-            .unwrap();
-        let destination_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                source_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(destination_ptr, libc::MAP_FAILED);
-        BufferState {
-            pool_file: Arc::new(shm_pool_file(&vec![0; source_size])),
-            offset: 0,
-            width,
-            height,
-            stride,
-            format: 0,
-            bo: None,
-            dmabuf_fd: None,
-            bo_stride: stride,
-            dmabuf_plane1_offset: 0,
-            dmabuf_plane1_stride: 0,
-            dmabuf_sync: false,
-            dest_ptr: destination_ptr as *mut u8,
-            dest_size: source_size,
-            stale,
-        }
-    }
-
     /// The pool file of local-copy buffer `guest_id`, which a test writes
     /// as the client would draw.
     fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<std::fs::File> {
@@ -1325,31 +1285,6 @@ mod tests {
             host_id
         });
         assert!(ctx.register_native_buffer(host_id, size, sync_fds));
-    }
-
-    /// How the host gets a test buffer's pixels: a copy of a guest SHM
-    /// buffer, or the guest's dma-buf itself.
-    #[derive(Clone, Copy, Debug)]
-    enum BufferKind {
-        Shm,
-        Native,
-    }
-
-    const BUFFER_KINDS: [BufferKind; 2] = [BufferKind::Shm, BufferKind::Native];
-
-    /// Register a 1x1 `kind` buffer `guest_id`, paired with host buffer
-    /// `host_id`. An SHM buffer's host copy is stale, as a new one is.
-    fn register_test_buffer(ctx: &mut Context, kind: BufferKind, guest_id: u32, host_id: u32) {
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
-        match kind {
-            BufferKind::Shm => register_test_local(
-                ctx,
-                guest_id,
-                mapped_test_buffer(guest_id, 1, 1, 4, StalePixels::all()),
-            ),
-            BufferKind::Native => register_test_native(ctx, guest_id, (1, 1)),
-        }
     }
 
     /// The requests queued for the host, decoded by their senders'
@@ -1505,7 +1440,7 @@ mod tests {
         register_test_local(
             ctx,
             buffer,
-            mapped_test_buffer(buffer, side, side, FRAME_STRIDE as u32, StalePixels::all()),
+            mapped_test_buffer(side, side, FRAME_STRIDE as u32, StalePixels::all()),
         );
         attach_and_commit(ctx, surface, buffer);
     }
@@ -2273,8 +2208,7 @@ mod tests {
             Action::Drop
         );
         assert!(!ctx.is_fatal());
-        let mut buffer =
-            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all());
+        let mut buffer = mapped_test_buffer(1, 1, BUFFER_BYTES as u32, StalePixels::all());
         buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
         register_test_local(&mut ctx, buffer_id, buffer);
 
@@ -2467,7 +2401,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             46,
-            mapped_test_buffer(46, 2, 2, 8, StalePixels::all()),
+            mapped_test_buffer(2, 2, 8, StalePixels::all()),
         );
         attach_and_commit(&mut ctx, TEST_SURFACE, 46);
 
@@ -2805,7 +2739,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all()),
+            mapped_test_buffer(8, 6, 32, StalePixels::all()),
         );
 
         ctx.last_sender_id = surface_id;
@@ -2828,7 +2762,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all());
+        let mut buffer = mapped_test_buffer(8, 6, 32, StalePixels::all());
         let destination_ptr = buffer.dest_ptr;
         buffer.dest_ptr = std::ptr::null_mut();
         buffer.dest_size = 0;
@@ -3072,7 +3006,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
 
         ctx.last_sender_id = surface_id;
@@ -3117,7 +3051,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending.offset = Some((3, 0));
@@ -3144,7 +3078,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending.offset = Some((3, 0));
@@ -3240,7 +3174,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             42,
-            mapped_test_buffer(42, 2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(

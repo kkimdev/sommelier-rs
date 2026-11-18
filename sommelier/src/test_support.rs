@@ -262,6 +262,78 @@ pub fn shm_pool_file(bytes: &[u8]) -> std::fs::File {
     file
 }
 
+/// How the host gets a test buffer's pixels: a copy of a guest SHM
+/// buffer, or the guest's dma-buf itself.
+#[derive(Clone, Copy, Debug)]
+pub enum BufferKind {
+    Shm,
+    Native,
+}
+
+pub const BUFFER_KINDS: [BufferKind; 2] = [BufferKind::Shm, BufferKind::Native];
+
+/// Register a 1x1 `kind` buffer `guest_id`, paired with host buffer
+/// `host_id`. An SHM buffer's host copy is wholly stale, as a new one's
+/// is, so a commit of it copies its pixels.
+pub fn register_test_buffer(
+    ctx: &mut crate::state::Context,
+    kind: BufferKind,
+    guest_id: u32,
+    host_id: u32,
+) {
+    use crate::state::StalePixels;
+    ctx.shadow_table
+        .insert_paired_with_version_for_test(guest_id, host_id, "wl_buffer", 1);
+    assert!(match kind {
+        BufferKind::Shm => ctx.register_local_buffer(
+            guest_id,
+            host_id,
+            mapped_test_buffer(1, 1, 4, StalePixels::all())
+        ),
+        BufferKind::Native => ctx.register_native_buffer(host_id, (1, 1), Vec::new()),
+    });
+}
+
+/// The state of a `width`x`height` local-copy buffer with rows of `stride`
+/// bytes, from a pool of zeros, whose host copy is a private mapping a test
+/// can read.
+pub fn mapped_test_buffer(
+    width: i32,
+    height: i32,
+    stride: u32,
+    stale: crate::state::StalePixels,
+) -> crate::state::BufferState {
+    let size = usize::try_from(height).unwrap() * stride as usize;
+    let destination = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(destination, libc::MAP_FAILED);
+    crate::state::BufferState {
+        pool_file: std::sync::Arc::new(shm_pool_file(&vec![0; size])),
+        offset: 0,
+        width,
+        height,
+        stride,
+        format: 0,
+        bo: None,
+        dmabuf_fd: None,
+        bo_stride: stride,
+        dmabuf_plane1_offset: 0,
+        dmabuf_plane1_stride: 0,
+        dmabuf_sync: false,
+        dest_ptr: destination.cast(),
+        dest_size: size,
+        stale,
+    }
+}
+
 /// A seeded pseudo-random generator (SplitMix64) for randomized tests.
 ///
 /// Small and dependency-free; the same seed always yields the same values,
