@@ -365,8 +365,8 @@ impl KeyboardHandler {
         ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
     }
 
-    fn keysym_to_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::HashMap<u32, u32> {
-        let mut keycodes = std::collections::HashMap::new();
+    fn keysym_to_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::BTreeMap<u32, u32> {
+        let mut keycodes = std::collections::BTreeMap::new();
         for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
             if keycode_raw < 8 {
                 // XKB keycodes are evdev keycodes plus eight. Do not
@@ -390,7 +390,7 @@ impl KeyboardHandler {
         keycodes
     }
 
-    fn repeatable_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::HashSet<u32> {
+    fn repeatable_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::BTreeSet<u32> {
         (keymap.min_keycode().raw()..=keymap.max_keycode().raw())
             .filter_map(|keycode_raw| {
                 (keycode_raw >= 8 && keymap.key_repeats(xkb::Keycode::new(keycode_raw)))

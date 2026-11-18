@@ -147,7 +147,7 @@ fn delete_lengths(text: &str, cursor: i32, index: i32, length: u32) -> Option<(u
 }
 
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
-    static KEYCODES: std::sync::OnceLock<std::collections::HashMap<u32, u32>> =
+    static KEYCODES: std::sync::OnceLock<std::collections::BTreeMap<u32, u32>> =
         std::sync::OnceLock::new();
     KEYCODES
         .get_or_init(|| {
@@ -162,10 +162,10 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
                 xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
             ) else {
                 log::error!("Could not initialize the fallback XKB keysym map");
-                return std::collections::HashMap::new();
+                return std::collections::BTreeMap::new();
             };
 
-            let mut keycodes = std::collections::HashMap::new();
+            let mut keycodes = std::collections::BTreeMap::new();
             for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
                 if keycode_raw < 8 {
                     // Wayland exposes evdev keycodes (XKB code minus 8);

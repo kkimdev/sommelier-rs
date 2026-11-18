@@ -353,7 +353,7 @@ pub struct Context {
     /// reaches them in that order (INVARIANTS "Output order does not
     /// depend on hashing").
     pub text_inputs: BTreeMap<u32, TextInputState>,
-    pub keyboard_to_seat: HashMap<u32, u32>,
+    pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
     pub last_sender_id: u32,
@@ -431,34 +431,34 @@ pub struct Context {
     /// by mistake is a **compile error**, preventing the direction bug where a
     /// client→host request handler reads `ctx.last_sender_id` (a guest ID) and
     /// uses it to look up a host-keyed map.
-    pub keyboard_to_extended_keyboard: HashMap<HostId, HostId>,
+    pub keyboard_to_extended_keyboard: BTreeMap<HostId, HostId>,
     /// Reverse lookup for keyboard-extension v2 events. `peek_key` is sent by
     /// the extended-keyboard object, while the physical-key state belongs to
     /// the corresponding host `wl_keyboard`.
-    pub extended_keyboard_to_keyboard: HashMap<HostId, HostId>,
+    pub extended_keyboard_to_keyboard: BTreeMap<HostId, HostId>,
     /// Physical, peek, repeat-recovery, and guest-delivery state for every
     /// keyboard/key generation.
     pub key_generations: KeyGenerationRegistry,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
-    pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
+    pub keyboard_repeatable_keys: BTreeMap<HostId, BTreeSet<u32>>,
     /// Parsed keymap for each host keyboard. Keymap updates and failures are
     /// scoped to their sender so one seat cannot invalidate another seat.
-    pub(crate) keyboard_keymaps: HashMap<HostId, xkb::Keymap>,
+    pub(crate) keyboard_keymaps: BTreeMap<HostId, xkb::Keymap>,
     /// XKB state for each host keyboard. A client can bind keyboards from
     /// multiple seats, whose modifier and layout-group state must not leak.
     /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
     /// interior mutation, so a connection stays on its one thread.
-    pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
+    pub(crate) keyboard_xkb_states: BTreeMap<HostId, xkb::State>,
     /// The modifiers each host keyboard last sent, kept until the keyboard
     /// ends. Exo sends them only when they change, before `enter` rather
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
-    pub(crate) keyboard_modifiers: HashMap<HostId, KeyboardModifiers>,
+    pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
     /// synthesizes a wl_keyboard event.
-    pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
+    pub keyboard_keysym_to_keycode: BTreeMap<HostId, BTreeMap<u32, u32>>,
     /// The process-wide placement configuration: host accelerators, the
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
@@ -1017,7 +1017,7 @@ impl Context {
             pending_native_creates: HashMap::new(),
             surfaces: HashMap::new(),
             text_inputs: BTreeMap::new(),
-            keyboard_to_seat: HashMap::new(),
+            keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             last_sender_id: 0,
@@ -1048,14 +1048,14 @@ impl Context {
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
-            keyboard_to_extended_keyboard: HashMap::new(),
-            extended_keyboard_to_keyboard: HashMap::new(),
+            keyboard_to_extended_keyboard: BTreeMap::new(),
+            extended_keyboard_to_keyboard: BTreeMap::new(),
             key_generations: KeyGenerationRegistry::default(),
-            keyboard_repeatable_keys: HashMap::new(),
-            keyboard_keymaps: HashMap::new(),
-            keyboard_xkb_states: HashMap::new(),
-            keyboard_modifiers: HashMap::new(),
-            keyboard_keysym_to_keycode: HashMap::new(),
+            keyboard_repeatable_keys: BTreeMap::new(),
+            keyboard_keymaps: BTreeMap::new(),
+            keyboard_xkb_states: BTreeMap::new(),
+            keyboard_modifiers: BTreeMap::new(),
+            keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
