@@ -1461,13 +1461,7 @@ fn create_shared_buffer(
         dest_size,
         stale: StalePixels::all(),
     };
-    register_shm_buffer(
-        ctx,
-        &request,
-        host_buffer_id,
-        state,
-        "unable to register wl_shm buffer",
-    )
+    register_shm_buffer(ctx, &request, host_buffer_id, state)
 }
 
 /// Create a guest SHM buffer backed by a dma-buf, which the host imports
@@ -1603,27 +1597,23 @@ fn create_dmabuf_buffer(
         dest_size,
         stale: StalePixels::all(),
     };
-    register_shm_buffer(
-        ctx,
-        &request,
-        host_buffer_id,
-        state,
-        "unable to register wl_shm dma-buf buffer",
-    )
+    register_shm_buffer(ctx, &request, host_buffer_id, state)
 }
 
 /// Register the storage of the guest `wl_buffer` paired with host buffer
-/// `host_buffer_id`. A duplicate host generation reports `failure`.
+/// `host_buffer_id`. The proxy just allocated that ID, so render state
+/// already held for it is the proxy's own divergence, as for a native
+/// buffer, not the guest's error.
 fn register_shm_buffer(
     ctx: &mut Context,
     request: &ShmBufferRequest,
     host_buffer_id: u32,
     state: BufferState,
-    failure: &'static str,
 ) -> Action {
     if !ctx.register_local_buffer(request.id, host_buffer_id, state) {
-        error!("Duplicate render buffer host ID {}", host_buffer_id);
-        return reject_buffer_creation(ctx, request.pool_id, failure);
+        return ctx.fail(format_args!(
+            "Duplicate render buffer host ID {host_buffer_id}"
+        ));
     }
     Action::Drop
 }
@@ -2669,6 +2659,38 @@ mod tests {
         assert!(ctx.shadow_table.is_guest_id_available(buffer_id));
         assert_eq!(ctx.render_buffer_count(), 0);
         assert!(ctx.client_to_host_queue.is_empty());
+    }
+
+    /// A host buffer ID that already has render state is the proxy's own
+    /// divergence, not the guest's error: the session ends with an
+    /// `implementation` error, as for a native buffer.
+    #[tokio::test]
+    async fn a_duplicate_render_buffer_host_id_is_an_internal_failure() {
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+        let first = s.shm_buffer(pool, 1, 1).await;
+        // Injects a fault no peer can cause: render state already holds the
+        // next two host IDs, which the next buffer's temporary pool and the
+        // buffer itself take.
+        for host_id in [first.host + 1, first.host + 2] {
+            assert!(s.ctx().register_native_buffer(host_id, (1, 1), Vec::new()));
+        }
+        let second = s.new_id();
+        s.guest_fatal([wl_shm_pool::req::create_buffer(
+            pool,
+            second,
+            0,
+            1,
+            1,
+            4,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+        );
+        assert_eq!(s.host_received(), []);
     }
 
     #[test]
