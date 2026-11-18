@@ -621,7 +621,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   file, and the proxy copies a keymap to compile it, so a size near 4 GiB
   would otherwise abort every client.
   Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
-  `an_oversized_keymap_clears_the_loaded_one_and_is_forwarded`.
+  `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
   flags and focus markers used to bridge ChromeOS IME events belong to the
   originating keyboard or seat, never to the process. Synthetic
@@ -629,7 +629,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   domain of the real keyboard events, never wall-clock time. Host keysyms
   go to the keyboard whose surface has the seat's current focus.
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
-  `synthetic_ime_key_uses_the_host_compositor_time_domain`,
+  `an_empty_confirmation_recovers_the_latest_eligible_held_key`,
   `keysym_prefers_keyboard_with_current_surface_focus`.
 - **Host modifiers last as long as their keyboard.** Exo sends
   `wl_keyboard.modifiers` only when they differ from the last it sent that

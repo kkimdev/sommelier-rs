@@ -354,6 +354,70 @@ impl Session {
     }
 }
 
+/// Sessions with a configured proxy, and keyboards.
+impl Session {
+    /// A session whose proxy has the test context `ctx`, for a test that
+    /// configures what the process would read at startup, such as
+    /// accelerators.
+    pub(crate) fn with_context(mut ctx: Context) -> Self {
+        let mut s = Self::new();
+        ctx.shadow_table.create_display();
+        s.client.ctx = ctx;
+        s
+    }
+
+    /// A `wl_keyboard` the guest gets from a `wl_seat` it binds, with the
+    /// [`default_keymap`] the host sends it, which the guest gets; returns
+    /// the seat and the keyboard.
+    pub(crate) async fn keyboard(&mut self) -> (u32, Object) {
+        use crate::protocols::wayland::wl_seat;
+        let seat = self.bind("wl_seat", wl_seat::VERSION).await;
+        (seat, self.keyboard_of(seat).await)
+    }
+
+    /// [`Self::keyboard`] of `seat`, which the guest has bound.
+    pub(crate) async fn keyboard_of(&mut self, seat: u32) -> Object {
+        use crate::protocols::wayland::wl_seat;
+        let id = self.new_id();
+        let host = self.create(wl_seat::req::get_keyboard(seat, id)).await;
+        let keyboard = Object { id, host };
+        self.keymap(keyboard).await;
+        keyboard
+    }
+
+    /// The host sends `keyboard` the [`default_keymap`], which the guest
+    /// gets.
+    pub(crate) async fn keymap(&mut self, keyboard: Object) {
+        use crate::protocols::wayland::wl_keyboard;
+        let keymap = default_keymap();
+        let size = keymap.len() as u32;
+        // The memfd's offset stays at its end, as a host may leave it.
+        let file = crate::test_support::shm_pool_file(&keymap);
+        let fd = OwnedFd::from(file.try_clone().expect("duplicate the keymap file"));
+        let format = wl_keyboard::KEYMAP_FORMAT_XKB_V1;
+        self.host([wl_keyboard::evt::keymap(keyboard.host, format, fd, size)])
+            .await;
+        let fd = OwnedFd::from(file);
+        let keymap = wl_keyboard::Event::Keymap { format, fd, size };
+        assert_eq!(self.guest_received(), [(keyboard.id, keymap.into())]);
+    }
+}
+
+/// The default XKB keymap as a host sends it: its text and the NUL that
+/// the size in `wl_keyboard.keymap` counts.
+pub(crate) fn default_keymap() -> Vec<u8> {
+    use xkbcommon::xkb;
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let flags = xkb::KEYMAP_COMPILE_NO_FLAGS;
+    let keymap = xkb::Keymap::new_from_names(&context, "", "", "", "", None, flags)
+        .expect("the default keymap");
+    let mut text = keymap
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        .into_bytes();
+    text.push(0);
+    text
+}
+
 impl Drop for Session {
     /// A test reads all the proxy sent, so that nothing it did not expect
     /// goes unnoticed.
