@@ -74,15 +74,8 @@ pub struct HostExt {
     /// Its version; an unknown one is the largest, which allows every
     /// request.
     pub version: u32,
-}
-
-/// The host managers a text input's host objects are created from.
-#[derive(Clone, Copy, Debug)]
-pub struct HostManagers {
-    /// The host `zwp_text_input_manager_v1`.
-    pub v1: u32,
-    /// The host `zcr_text_input_extension_v1`, if bound.
-    pub ext: Option<u32>,
+    /// The host `zcr_text_input_extension_v1` it is created from.
+    pub manager: u32,
 }
 
 /// One message the core handles. Every trigger of an IME change is one of
@@ -90,12 +83,14 @@ pub struct HostManagers {
 #[derive(Debug)]
 pub enum Input {
     // Guest zwp_text_input_manager_v3 and zwp_text_input_v3 (G1 to G10).
-    /// G1. The adapter has allocated `host`'s IDs from `managers`.
+    /// G1. The adapter has allocated `host`'s IDs: its v1 object from the
+    /// host `zwp_text_input_manager_v1` `manager`, and its extension from
+    /// the extension's manager.
     Create {
         ti: TiId,
         seat: SeatId,
         host: HostTi,
-        managers: HostManagers,
+        manager: u32,
     },
     Enable(TiId),
     Disable(TiId),
@@ -217,15 +212,20 @@ pub enum KeyEffect {
         seat: SeatId,
         outcome: LeaseOutcome,
     },
-    /// X2': recover the seat's held key the input method took. If one is
-    /// found, send its press and release unless another channel delivered
-    /// it, then `done`, and arm the lease if it was Backspace or end it
-    /// otherwise. If none is held, end the lease and send nothing.
+    /// X2': recover the seat's latest eligible held key, which the input
+    /// method took. If one is held, send its press and release unless
+    /// another channel already delivered it, then `done`, whether or not
+    /// the pair went. The lease:
+    /// - a held Backspace whose pair is sent arms it;
+    /// - a held Backspace whose pair is skipped ends it;
+    /// - another held key whose pair is sent ends it;
+    /// - another held key whose pair is skipped leaves it alone;
+    /// - with no held key, it ends, and nothing is sent.
     RecoverHeldKey {
         ti: TiId,
         seat: SeatId,
-        /// The bare transaction: one `done`.
-        done: Vec<Outgoing>,
+        /// The bare transaction, a lone `done`.
+        done: Outgoing,
     },
 }
 

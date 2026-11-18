@@ -47,10 +47,8 @@ const OTHER: SurfaceId = SurfaceId(21);
 const HOST_OTHER: u32 = 121;
 /// The guest pointer whose press [`Ime::press`] re-sends.
 const POINTER: u32 = 40;
-const MANAGERS: HostManagers = HostManagers {
-    v1: 2,
-    ext: Some(3),
-};
+/// The host `zwp_text_input_manager_v1`; the extension's manager is 3.
+const MANAGER: u32 = 2;
 
 /// The host `zwp_text_input_v1` of `ti`.
 fn v1(ti: TiId) -> u32 {
@@ -68,6 +66,7 @@ fn hosts(ti: TiId) -> HostTi {
         ext: Some(HostExt {
             id: ext_id(ti),
             version: ext::VERSION,
+            manager: 3,
         }),
     }
 }
@@ -174,7 +173,7 @@ fn decode(fx: Effects) -> Out {
             }
             KeyEffect::RecoverHeldKey { ti, seat, done } => {
                 assert_eq!(seat, SEAT);
-                Key::Recover(ti, guest_events(&done))
+                Key::Recover(ti, guest_events(&[done]))
             }
         })
         .collect();
@@ -218,7 +217,7 @@ impl Ime {
             ti,
             seat: SEAT,
             host: hosts(ti),
-            managers: MANAGERS,
+            manager: MANAGER,
         })
     }
 
@@ -518,7 +517,7 @@ fn row_G1_create_makes_the_host_objects_and_enters_the_focus() {
             v1: v1(TI2),
             ext: None,
         },
-        managers: HostManagers { v1: 2, ext: None },
+        manager: MANAGER,
     });
     assert_eq!(
         out.host,

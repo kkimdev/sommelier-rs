@@ -105,6 +105,17 @@ pub(super) struct Assembly {
 struct Warned {
     seat_missing: bool,
     delete_range: bool,
+    /// The deferral last logged.
+    deferral: Option<Deferral>,
+}
+
+/// Why an activation the target needs waits (R2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Deferral {
+    /// The previous activation still drains.
+    Draining,
+    /// No live host seat can carry it.
+    NoSeat,
 }
 
 impl TextInput {
@@ -228,7 +239,7 @@ impl TextInput {
                 ti.0
             );
             self.composition.shown = None;
-            bare_done(ti, serial)
+            vec![bare_done(ti, serial)]
         })
     }
 
@@ -335,6 +346,13 @@ impl TextInput {
         }
     }
 
+    /// Note the activation's current deferral, and whether it started or
+    /// changed, which is when it is logged.
+    pub(super) fn deferral_changed(&mut self, deferral: Option<Deferral>) -> bool {
+        let last = std::mem::replace(&mut self.warned.deferral, deferral);
+        deferral.is_some() && deferral != last
+    }
+
     /// Whether R2's missing seat is warned of now: once per text input.
     pub(super) fn first_seat_warning(&mut self) -> bool {
         !std::mem::replace(&mut self.warned.seat_missing, true)
@@ -407,11 +425,13 @@ impl Field {
     }
 }
 
-/// The transaction of a recovered key (X2'): a lone `done`.
-fn bare_done(ti: TiId, serial: Serial) -> Vec<Outgoing> {
-    GuestTxn::default()
+/// A lone `done`: the transaction of a recovered key (X2').
+fn bare_done(ti: TiId, serial: Serial) -> Outgoing {
+    let mut txn = GuestTxn::default()
         .encode(ti, false, serial)
-        .expect("a bare done has no string")
+        .expect("a bare done has no string");
+    debug_assert_eq!(txn.len(), 1);
+    txn.remove(0)
 }
 
 /// Proof that a text input's composition is current (the gate of
@@ -559,34 +579,39 @@ impl<'a> Current<'a> {
     /// X2 commits the shown preedit; X2', with none shown, recovers the
     /// key the input method took.
     pub(super) fn confirm(self) -> Confirm<'a> {
-        match self.commit_shown() {
-            Ok(planned) => Confirm::Commit(planned),
-            Err(cur) => Confirm::RecoverHeldKey(KeyEffect::RecoverHeldKey {
-                ti: cur.ti,
-                seat: cur.seat,
-                done: bare_done(cur.ti, cur.serial),
-            }),
+        if self.shown().is_none() {
+            return Confirm::RecoverHeldKey(KeyEffect::RecoverHeldKey {
+                ti: self.ti,
+                seat: self.seat,
+                done: bare_done(self.ti, self.serial),
+            });
         }
+        Confirm::Commit(self.commit_shown())
     }
 
-    /// F4: a press commits the shown preedit, takes the assembly, and
-    /// fences the host's `reset` with `fence`. `None` if nothing is shown.
-    pub(super) fn press_commit(self, fence: BarrierToken) -> Option<Planned<'a>> {
-        let mut planned = self.commit_shown().ok()?;
-        planned.cur.composition.assembly = Assembly::default();
+    /// F4's assembly, which the press takes whatever becomes of its
+    /// commit.
+    pub(super) fn take_assembly(&mut self) {
+        self.composition.assembly = Assembly::default();
+    }
+
+    /// F4: a press commits the shown preedit, and fences the host's
+    /// `reset` with `fence`.
+    pub(super) fn press_commit(self, fence: BarrierToken) -> Planned<'a> {
+        debug_assert!(self.shown().is_some(), "a press commits a shown preedit");
+        let mut planned = self.commit_shown();
         planned.fence = Some(fence);
-        Some(planned)
+        planned
     }
 
-    fn commit_shown(self) -> Result<Planned<'a>, Self> {
-        let Some(text) = self.shown().map(|shown| shown.text().to_string()) else {
-            return Err(self);
-        };
+    /// The commit of the shown preedit (X2, F4).
+    fn commit_shown(self) -> Planned<'a> {
+        let text = self.shown().map(|shown| shown.text().to_string());
         let txn = GuestTxn {
-            commit: Some(text),
+            commit: text,
             ..GuestTxn::default()
         };
-        Ok(self.plan(txn, true, LeaseOutcome::End))
+        self.plan(txn, true, LeaseOutcome::End)
     }
 }
 

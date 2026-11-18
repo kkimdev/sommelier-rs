@@ -20,10 +20,10 @@ limitations under the License.
 
 use super::guest::{GuestTxn, TooLong};
 use super::host::{self, ActivationStep};
-use super::state::{Confirm, DeleteDrop, LinkState, TextInput};
+use super::state::{Confirm, Deferral, DeleteDrop, LinkState, TextInput};
 use super::{
-    BarrierToken, Effects, Env, HostIme, HostManagers, HostOut, HostTi, ImeCore, Input, KeyEffect,
-    LeaseOutcome, SeatId, SurfaceId, TiId,
+    BarrierToken, Effects, Env, HostIme, HostOut, HostTi, ImeCore, Input, KeyEffect, LeaseOutcome,
+    SeatId, SurfaceId, TiId,
 };
 use crate::protocols::text_input_extension_unstable_v1::{
     zcr_extended_text_input_v1, zcr_text_input_extension_v1,
@@ -62,8 +62,8 @@ impl ImeCore {
                 ti,
                 seat,
                 host,
-                managers,
-            } => self.create(ti, seat, host, managers, env, &mut fx),
+                manager,
+            } => self.create(ti, seat, host, manager, env, &mut fx),
             Input::Enable(ti) => self.update_pending(ti, |p| *p = V3Pending::reset(true)),
             Input::Disable(ti) => self.update_pending(ti, |p| *p = V3Pending::reset(false)),
             Input::SurroundingText(ti, text, cursor, anchor) => {
@@ -107,18 +107,21 @@ impl ImeCore {
         ti: TiId,
         seat: SeatId,
         host: HostTi,
-        managers: HostManagers,
+        manager: u32,
         env: &impl Env,
         fx: &mut Effects,
     ) {
         debug_assert!(!self.inputs.contains_key(&ti), "{ti:?} exists already");
-        debug_assert_eq!(managers.ext.is_some(), host.ext.is_some());
         fx.to_host.push(HostOut::Request(
-            zwp_text_input_manager_v1::req::create_text_input(managers.v1, host.v1),
+            zwp_text_input_manager_v1::req::create_text_input(manager, host.v1),
         ));
-        if let (Some(manager), Some(ext)) = (managers.ext, host.ext) {
+        if let Some(ext) = host.ext {
             fx.to_host.push(HostOut::Request(
-                zcr_text_input_extension_v1::req::get_extended_text_input(manager, ext.id, host.v1),
+                zcr_text_input_extension_v1::req::get_extended_text_input(
+                    ext.manager,
+                    ext.id,
+                    host.v1,
+                ),
             ));
             self.by_ext.insert(ext.id, ti);
         }
@@ -392,14 +395,14 @@ impl ImeCore {
             if t.focused_surface() != Some(surface) {
                 continue;
             }
-            let Some(cur) = t.current(ti) else {
+            let Some(mut cur) = t.current(ti).filter(|cur| cur.shown().is_some()) else {
                 continue;
             };
+            // F4 takes the assembly, whatever becomes of the commit.
+            cur.take_assembly();
             let fence = BarrierToken(self.next_barrier);
-            let Some(planned) = cur.press_commit(fence) else {
-                continue;
-            };
             self.next_barrier += 1;
+            let planned = cur.press_commit(fence);
             match planned.apply() {
                 Ok((events, lease)) => {
                     log::debug!("A press ended the composition of text input {}", ti.0);
@@ -428,6 +431,13 @@ impl ImeCore {
         for (&ti, t) in &mut self.inputs {
             let target = host::target(t, env);
             let steps = host::reconcile(&target, t.link());
+            // R2: an activation the target needs and the link cannot take
+            // yet.
+            let deferral = match (steps.activation, target.surface, t.link()) {
+                (None, Some(_), LinkState::Draining { .. }) => Some(Deferral::Draining),
+                (None, Some(_), LinkState::Detached) => Some(Deferral::NoSeat),
+                _ => None,
+            };
             let host = t.host();
             match steps.activation {
                 Some(ActivationStep::Activate { seat, surface }) => {
@@ -452,14 +462,16 @@ impl ImeCore {
                     log::debug!("Text input {} lost its host seat while active", ti.0);
                     t.abandoned();
                 }
-                // R2: an activation the target needs and the link cannot
-                // take yet.
-                None if target.surface.is_some() => match t.link() {
-                    LinkState::Draining { .. } => log::debug!(
+                None => {}
+            }
+            // R2, logged when it starts.
+            if t.deferral_changed(deferral) {
+                match deferral {
+                    Some(Deferral::Draining) => log::debug!(
                         "Deferring text input {} activation until the previous one drains",
                         ti.0
                     ),
-                    LinkState::Detached => {
+                    Some(Deferral::NoSeat) => {
                         let level = match t.first_seat_warning() {
                             true => log::Level::Warn,
                             false => log::Level::Debug,
@@ -471,9 +483,8 @@ impl ImeCore {
                             t.seat().0
                         );
                     }
-                    LinkState::Attached { .. } => {}
-                },
-                None => {}
+                    None => {}
+                }
             }
             let (guest_commit, surrounding_text, cursor_rect) =
                 match commit.take_if(|commit| commit.ti == ti) {
