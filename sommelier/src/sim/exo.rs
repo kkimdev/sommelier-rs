@@ -386,8 +386,8 @@ struct PendingKey {
     time: u32,
     /// Whether the engine sent the key's text.
     answered: bool,
-    /// Whether IMA reset after Exo handed the engine the key and before its
-    /// text came.
+    /// Whether IMA reset the engine after Exo handed it the key and before
+    /// its text came.
     late: bool,
     /// Whether IMA dropped the key's buffered text, after the text came and
     /// before the callback.
@@ -1003,10 +1003,10 @@ impl Exo {
         if dropped {
             self.mark_dropped();
         }
-        for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
-            key.late = true;
-        }
         if std::mem::take(&mut self.ima.composing) {
+            for key in self.in_engine.iter_mut().filter(|key| !key.answered) {
+                key.late = true;
+            }
             self.to_engine.push(EngineIn::Reset);
         }
     }
@@ -1608,6 +1608,18 @@ mod tests {
     }
 
     #[test]
+    fn e5_a_reset_that_leaves_the_engine_alone_makes_no_answer_late() {
+        // IMA composed nothing, so its reset does not reset the engine, and
+        // the key in flight is answered from the composition it had.
+        let mut exo = active(V10);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
+        assert_eq!(exo.take_engine(), []);
+        assert_eq!(answer(&mut exo, 0, vec![shows("ㅏ")]), Answer::Normal);
+    }
+
+    #[test]
     fn e5_a_reset_is_silent_and_drops_the_text_of_a_key_only_once_it_came() {
         let reset = || zwp_text_input_v1::Request::Reset {};
         // Before the engine sends a key's text, the reset cancels nothing
@@ -1650,22 +1662,28 @@ mod tests {
 
     #[test]
     fn an_unhandled_press_shows_the_late_text_that_its_confirmation_shows() {
-        // The reset falls before the key's text, which comes after it and
-        // is shown by the confirmation, not by the flush.
+        // The reset, of an engine that composed, falls before the key's
+        // text, which comes after it and is shown by the confirmation, not
+        // by the flush.
         let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("ㄱ")], true);
         exo.key(NOW, k('a'), DOWN);
         exo.take_engine();
         send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
         let actions = vec![shows("ㅎ")];
         assert_eq!(
-            exo.answer(&EngineOut::Text { id: 0, actions }),
+            exo.answer(&EngineOut::Text { id: 1, actions }),
             Answer::Normal
         );
+        let late = EngineOut::Done {
+            id: 1,
+            handled: false,
+        };
+        assert_eq!(exo.answer(&late), Answer::Late);
         let done = EngineOut::Done {
             id: 0,
             handled: false,
         };
-        assert_eq!(exo.answer(&done), Answer::Late);
         // A key whose text came before the reset is not late.
         let mut exo = active(V10);
         exo.key(NOW, k('a'), DOWN);
