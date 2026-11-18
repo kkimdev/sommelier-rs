@@ -76,7 +76,7 @@ pub(super) struct ShmBufferRequest {
     pub(super) stride: i32,
     pub(super) format: u32,
     /// The buffer's size in bytes, as
-    /// [`valid_buffer_layout`](super::valid_buffer_layout) returned it.
+    /// [`valid_buffer_layout`](super::pool::valid_buffer_layout) returned it.
     pub(super) size: i32,
 }
 
