@@ -882,6 +882,44 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   outside tests it does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
+- **A v3 transaction's events go in one order.** Every transaction the
+  proxy sends a guest text input puts its events in this order, each one
+  it has: a `preedit_string("")` that clears the preedit the guest shows,
+  `delete_surrounding_text`, `commit_string`, a new non-empty
+  `preedit_string`, then `done`. It is the order of mutter, which sends
+  a delete when the input method makes it, a commit right after a
+  preedit clear, and the new preedit last, with the `done`
+  (`src/wayland/meta-wayland-text-input.c` 317, 336-337 and 195-224,
+  revision b766717a), and of KWin (`src/wayland/textinput_v3.cpp`
+  268-323, revision f213b9af). Clients that store each event and apply
+  the transaction at its `done`, in the protocol's order (delete, commit,
+  then preedit), do not depend on it: Chromium's
+  `ZwpTextInputV3Impl::OnDone`
+  (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc`, revision
+  ffb4f13519), GTK3's `text_input_done` (`modules/input/imwayland.c`,
+  revision c780332c), GTK4's (`gtk/gtkimcontextwayland.c`, revision
+  92348cd4), Qt's `QWaylandTextInputv3::zwp_text_input_v3_done`
+  (qtbase `src/plugins/platforms/wayland/qwaylandtextinputv3.cpp` 188,
+  revision 8a98cde366ff) and kitty's `text_input_done`
+  (`glfw/wl_text_input.c` 103, revision 32f3f1dc71e8). Other clients
+  depend on it:
+  - winit drops the pending preedit at a `commit_string`
+    (`winit-wayland/src/seat/text_input/mod.rs` 117-119, master
+    f0abec90a3f9; `src/platform_impl/linux/wayland/seat/text_input/mod.rs`
+    114-116 in 0.30.12), so a new preedit before a commit is lost.
+  - SDL3 acts on each event as it arrives and turns a delete into a
+    Backspace (`src/video/wayland/SDL_waylandevents.c` 2649-2710, main
+    1fc62260fc81), which its `testime` ignores while a preedit is shown
+    (`test/testime.c` 1084-1086), so a delete after a new preedit deletes
+    nothing.
+
+  No transaction has both a delete and a commit yet, since Exo's deletes
+  stand alone (next rule). One order also gives each transaction one wire
+  form, which a recorded trace can compare byte for byte.
+  Tests: `host_ime_events_become_v3_transactions`,
+  `a_reset_commit_waits_for_the_guest_to_report_it`,
+  `on_set_preedit_region_translates_correctly`,
+  `exo_deletes_become_v3_deletes_around_the_cursor`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`
   a byte offset from the start of the surrounding text, not from the
