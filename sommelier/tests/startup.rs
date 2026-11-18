@@ -19,10 +19,16 @@
 //! device check, so the failure comes from the step under test.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long the proxy may take to fail. One that starts instead would
+/// serve until killed.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The proxy's output once it exits, run with `args` and `runtime_dir`
-/// as `XDG_RUNTIME_DIR`, or with none.
+/// as `XDG_RUNTIME_DIR`, or with none. A proxy still running after
+/// [`TIMEOUT`] is killed, and the test fails.
 // A plain test thread, with no event loop, waits for the proxy.
 #[allow(clippy::disallowed_methods)]
 fn run_proxy(runtime_dir: Option<&Path>, args: &[&str]) -> Output {
@@ -31,11 +37,26 @@ fn run_proxy(runtime_dir: Option<&Path>, args: &[&str]) -> Output {
         .args(["--virtio-wl", "/dev/null"])
         .args(args)
         .env("RUST_LOG", "error")
-        .env_remove("XDG_RUNTIME_DIR");
+        .env_remove("XDG_RUNTIME_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(dir) = runtime_dir {
         command.env("XDG_RUNTIME_DIR", dir);
     }
-    command.output().expect("run the proxy")
+    let mut proxy = command.spawn().expect("start the proxy");
+    let deadline = Instant::now() + TIMEOUT;
+    while proxy.try_wait().expect("poll the proxy").is_none() {
+        if Instant::now() >= deadline {
+            proxy.kill().expect("kill the proxy");
+            let output = proxy.wait_with_output().expect("reap the proxy");
+            panic!(
+                "the proxy started instead of failing:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    proxy.wait_with_output().expect("read the proxy's output")
 }
 
 /// Assert that the proxy exited with status 1 and logged `error`, without
