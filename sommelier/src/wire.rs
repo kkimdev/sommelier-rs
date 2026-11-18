@@ -274,7 +274,9 @@ impl<'a> WireMessage<'a> {
         self.read_i32()
     }
 
-    fn read_string_value(&mut self, nullable: bool) -> Result<Option<String>, ProtocolError> {
+    /// The bytes of a string argument, without its terminating NUL, or
+    /// `None` for a null `nullable` one.
+    fn read_string_bytes(&mut self, nullable: bool) -> Result<Option<&'a [u8]>, ProtocolError> {
         let len = self.read_u32()? as usize;
         if len == 0 {
             return if nullable {
@@ -315,21 +317,26 @@ impl<'a> WireMessage<'a> {
         if text.contains(&0) {
             return Err(ProtocolError::InvalidString);
         }
-        let s = std::str::from_utf8(text)
-            .map_err(|_| ProtocolError::InvalidString)?
-            .to_owned();
 
         self.offset = end;
-        Ok(Some(s))
+        Ok(Some(text))
+    }
+
+    fn utf8(bytes: &[u8]) -> Result<String, ProtocolError> {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| ProtocolError::InvalidString)
     }
 
     pub fn read_string(&mut self) -> Result<String, ProtocolError> {
-        self.read_string_value(false)?
-            .ok_or(ProtocolError::InvalidString)
+        let bytes = self
+            .read_string_bytes(false)?
+            .ok_or(ProtocolError::InvalidString)?;
+        Self::utf8(bytes)
     }
 
     pub fn read_nullable_string(&mut self) -> Result<Option<String>, ProtocolError> {
-        self.read_string_value(true)
+        self.read_string_bytes(true)?.map(Self::utf8).transpose()
     }
 
     pub fn read_array(&mut self) -> Result<Vec<u8>, ProtocolError> {
@@ -416,10 +423,15 @@ impl MessageBuilder {
     }
 
     pub fn write_string(&mut self, val: &str) {
+        self.write_string_bytes(val.as_bytes());
+    }
+
+    /// A string argument of `bytes`, which carry no NUL.
+    fn write_string_bytes(&mut self, val: &[u8]) {
         let len = val.len() as u32 + 1; // +1 for null terminator
         self.write_u32(len);
 
-        self.payload.extend_from_slice(val.as_bytes());
+        self.payload.extend_from_slice(val);
         self.payload.push(0); // null terminator
 
         // padding
