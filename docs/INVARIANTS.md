@@ -870,6 +870,56 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   outside tests it does so only in `TextInputState::count_guest_commit`.
   Tests: `v3_done_serial_counts_commits_made_while_unfocused`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
+- **Exo's deletes are absolute and stand alone.** Exo sends
+  `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`
+  a byte offset from the start of the surrounding text, not from the
+  cursor as the v1 XML says, and its comment admits it
+  (`components/exo/wayland/zwp_text_input_manager.cc` 201-213, Chromium
+  revision ec0a1c15afb2, 2026-11-18). Chrome's own v1 client read it that
+  way until crrev.com/c/8769988 (2026-11-11), which changed only the
+  client. Exo derives the range from the input method's
+  `ExtendSelectionAndDelete(before, after)`, so it always contains the
+  selection (`components/exo/text_input.cc` 434-449), and sends no
+  `commit_string` with it: an input method that replaces text, as when
+  the user accepts a suggestion or picks a long-press diacritic, commits
+  it separately. Autocorrect's undo replaces text through
+  `ExtendSelectionAndReplace`, which Exo does not implement, so it sends
+  nothing. The input method deletes only while nothing is composed
+  (`ui/base/ime/ash/input_method_ash.cc` 1090-1102). So the proxy sends
+  each delete at once, as a v3 transaction of its own with a `done` that
+  ends any preedit, never holding it for a later commit, which might
+  never come or might follow a cursor move. It measures the range against
+  the surrounding text the guest last committed and turns it into bytes
+  before and after the cursor. A negative index can only mean the v1
+  XML's reading, which a host that follows it sends, so it counts from the
+  cursor instead; a non-negative one is Exo's. An empty range is not
+  forwarded. The proxy drops a delete rather than delete the wrong text,
+  with a debug log, except that the first drop of a range not around the
+  cursor on each text input is a warning:
+  - while the guest has a selection: GTK and Qt count v3 lengths from the
+    cursor, while Chromium's v3 client counts them from the selection's
+    ends (`ui/ozone/platform/wayland/host/wayland_input_method_context.cc`
+    802-825), so no lengths delete Exo's range in both;
+  - for a non-negative index, while an edit of the input method that the
+    proxy forwarded (a non-empty commit, a confirmation, a preedit region
+    or a delete) is not yet in a surrounding text the guest committed
+    (`TextInputState::unreported_host_edit`), since Exo measures against
+    its prediction of the text, which includes the edit;
+  - if the range does not contain the cursor, does not fit that text on
+    character boundaries, or the guest stated no surrounding text, which
+    means the two texts differ.
+
+  The texts can still differ the other way: a guest commit that crosses
+  an edit in flight states text without it, which the proxy takes as
+  caught up while Exo replays the edit onto it, so the next delete may
+  land wrong (see HANDOVER). Preedit regions are deliberately not gated
+  by `unreported_host_edit`: dropping one would leave Exo composing text
+  the guest does not show, so a region right after an unreported edit may
+  take its text from the guest's last report.
+  Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
+  `a_delete_waits_for_the_guest_to_report_the_input_methods_edits`,
+  `delete_lengths_read_both_conventions`,
+  `an_unconvertible_delete_is_warned_of_once`.
 
 ## Process
 

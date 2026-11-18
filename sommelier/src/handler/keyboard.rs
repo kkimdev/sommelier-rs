@@ -3780,7 +3780,7 @@ mod tests {
             state.committed.surrounding_text = Some(("stale".to_string(), 5, 5));
             state.current_preedit = "한".to_string();
             state.set_guest_commits(9);
-            state.pending_deletes = vec![(3, 0)];
+            state.pending_cursor_position = Some((1, 1));
             state.host = crate::state::HostApplied::Active { content_type: None };
             state
         };
@@ -3795,7 +3795,7 @@ mod tests {
         assert!(!state.host_is_active());
         assert!(state.committed.surrounding_text.is_none());
         assert!(state.current_preedit.is_empty());
-        assert!(state.pending_deletes.is_empty());
+        assert_eq!(state.pending_cursor_position, None);
         assert_eq!(state.guest_commit_serial(), 9);
         assert!(p.ctx.client_to_host_queue.iter().any(|(message, _)| {
             msg_sender(message) == TEXT_INPUT.host

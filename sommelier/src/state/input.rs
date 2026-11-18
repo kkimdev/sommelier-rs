@@ -18,8 +18,6 @@ use std::collections::HashMap;
 
 use super::{serial_is_after, HostId};
 
-const MAX_PENDING_IME_DELETES: usize = 256;
-
 /// A text-input-v3 content type: `(hint, purpose)`.
 pub type ContentType = (u32, u32);
 /// Text-input-v3 surrounding text: `(text, cursor, anchor)`.
@@ -283,10 +281,17 @@ pub struct TextInputState {
     /// Cursor/selection metadata accumulated before the next v1 preedit event.
     pub pending_preedit_cursor: Option<i32>,
     pub pending_preedit_selection: Option<(u32, u32)>,
-    /// Edits accumulated by v1 and applied atomically by the following
-    /// `commit_string` event.
-    pub pending_deletes: Vec<(u32, u32)>,
+    /// A v1 `cursor_position`, which applies to the following
+    /// `commit_string`. A delete also ends the pending commit and discards
+    /// it.
     pub pending_cursor_position: Option<(i32, i32)>,
+    /// Whether the proxy has forwarded an edit of the host input method (a
+    /// non-empty commit, confirmation, preedit region or delete) since the
+    /// guest last committed its surrounding text. Exo measures its deletes
+    /// against its prediction of the text, which includes such an edit, so
+    /// until the guest reports the result, the committed text is not what
+    /// Exo measured.
+    pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
     /// Whether the proxy warned that the guest seat cannot carry an
@@ -294,6 +299,9 @@ pub struct TextInputState {
     /// reset, so the proxy warns once per text input, not once per seat it
     /// loses.
     pub(crate) warned_seat_missing: bool,
+    /// Whether the proxy warned that it dropped a host delete whose range
+    /// is not around the cursor. Later ones are logged at debug.
+    pub(crate) warned_delete_range: bool,
 }
 
 /// What a v3 commit asks of the host beyond its committed state.
@@ -313,12 +321,13 @@ pub(crate) struct HostPreeditPlan {
     pub cursor: Option<i32>,
 }
 
+/// A host `commit_string` or `delete_surrounding_text`, either of which
+/// ends the composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostCommitPlan {
     pub guest_seat: u32,
     pub done_serial: u32,
     pub had_preedit: bool,
-    pub deletes: Vec<(u32, u32)>,
     pub cursor_position: Option<(i32, i32)>,
 }
 
@@ -357,10 +366,11 @@ impl TextInputState {
             guest_commit_serial: 0,
             pending_preedit_cursor: None,
             pending_preedit_selection: None,
-            pending_deletes: Vec::new(),
             pending_cursor_position: None,
+            unreported_host_edit: false,
             host: HostApplied::default(),
             warned_seat_missing: false,
+            warned_delete_range: false,
         }
     }
 
@@ -386,6 +396,7 @@ impl TextInputState {
     pub fn apply_focus(&mut self, active_surface: Option<u32>) -> Option<u32> {
         self.pending = V3Pending::default();
         self.committed = V3Committed::default();
+        self.unreported_host_edit = false;
         self.clear_host_composition();
         std::mem::replace(&mut self.active_surface, active_surface)
     }
@@ -439,6 +450,7 @@ impl TextInputState {
         }
         if let Some(surrounding_text) = surrounding_text {
             self.committed.surrounding_text = surrounding_text;
+            self.unreported_host_edit = false;
         }
         if let Some(content_type) = content_type {
             self.committed.content_type = content_type;
@@ -465,24 +477,14 @@ impl TextInputState {
         self.pending_preedit_selection = None;
     }
 
-    /// Drop the delete_surrounding_text and cursor_position recorded for a
-    /// host commit_string that does not reach the guest, so that the next
-    /// one does not apply them at a cursor that has moved.
+    /// Drop the cursor_position recorded for a host commit_string that does
+    /// not reach the guest, so that it does not apply to the next one.
     pub(crate) fn discard_pending_commit_state(&mut self) {
-        self.pending_deletes.clear();
         self.pending_cursor_position = None;
     }
 
     pub fn record_cursor_position(&mut self, index: i32, anchor: i32) {
         self.pending_cursor_position = Some((index, anchor));
-    }
-
-    pub fn record_delete(&mut self, before: u32, after: u32) -> bool {
-        if self.pending_deletes.len() >= MAX_PENDING_IME_DELETES {
-            return false;
-        }
-        self.pending_deletes.push((before, after));
-        true
     }
 
     pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
@@ -516,21 +518,22 @@ impl TextInputState {
     }
 
     pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
-        self.host_is_active().then(|| HostCommitPlan {
+        self.host_is_active().then_some(HostCommitPlan {
             guest_seat: self.guest_seat,
             done_serial: self.guest_commit_serial,
             had_preedit: !self.current_preedit.is_empty(),
-            deletes: self.pending_deletes.clone(),
             cursor_position: self.pending_cursor_position,
         })
     }
 
-    pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan) {
+    /// Close a host commit or delete, which `edited` the text unless it
+    /// changed nothing (an empty commit with no preedit to replace).
+    pub(crate) fn finish_host_commit(&mut self, plan: HostCommitPlan, edited: bool) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
-        debug_assert_eq!(plan.deletes, self.pending_deletes);
         debug_assert_eq!(plan.cursor_position, self.pending_cursor_position);
         debug_assert_eq!(plan.had_preedit, !self.current_preedit.is_empty());
         self.clear_host_composition();
+        self.unreported_host_edit |= edited;
     }
 
     pub(crate) fn prepare_preedit_region(&self) -> Option<PreeditRegionPlan> {
@@ -555,6 +558,7 @@ impl TextInputState {
         self.pending_preedit_selection = None;
         self.pending_preedit_cursor = None;
         self.current_preedit = preedit_text;
+        self.unreported_host_edit = true;
     }
 
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
@@ -573,6 +577,7 @@ impl TextInputState {
         self.current_preedit.clear();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
+        self.unreported_host_edit = true;
     }
 
     /// Exo detached the input method on its own: end the host generation
@@ -596,7 +601,6 @@ impl TextInputState {
         self.current_preedit.clear();
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
-        self.pending_deletes.clear();
         self.pending_cursor_position = None;
     }
 }
@@ -1983,25 +1987,23 @@ mod tests {
 
     /// A text input after 7 commits whose host is `ACTIVE` (attached, no
     /// known content type), composing the preedit "가" with every kind of
-    /// IME metadata pending: preedit selection (0, 3), preedit cursor 3, one
-    /// delete of (3, 0) and cursor position (1, 1). Offsets count bytes, as
-    /// in `zwp_text_input_v1`, and "가" is three.
+    /// IME metadata pending: preedit selection (0, 3), preedit cursor 3 and
+    /// cursor position (1, 1). Offsets count bytes, as in
+    /// `zwp_text_input_v1`, and "가" is three.
     fn composing() -> TextInputState {
         let mut state = text_input(ACTIVE);
         state.set_guest_commits(7);
         state.current_preedit = "가".to_string();
         state.record_preedit_selection(0, 3);
         state.record_preedit_cursor(3);
-        assert!(state.record_delete(3, 0));
         state.record_cursor_position(1, 1);
         assert_eq!(
             (
                 state.pending_preedit_selection,
                 state.pending_preedit_cursor,
-                &state.pending_deletes[..],
                 state.pending_cursor_position,
             ),
-            (Some((0, 3)), Some(3), &[(3, 0)][..], Some((1, 1))),
+            (Some((0, 3)), Some(3), Some((1, 1))),
             "the recorders store what they are given"
         );
         state
@@ -2372,14 +2374,15 @@ mod tests {
                 guest_seat: 12,
                 done_serial: 7,
                 had_preedit: true,
-                deletes: vec![(3, 0)],
                 cursor_position: Some((1, 1)),
             }
         );
 
-        state.finish_host_commit(plan);
+        state.finish_host_commit(plan, true);
         let mut expected = text_input(ACTIVE);
         expected.set_guest_commits(7);
+        // The guest has yet to report the text the commit left.
+        expected.unreported_host_edit = true;
         assert_eq!(state, expected);
         assert_eq!(
             state.prepare_host_commit(),
@@ -2387,7 +2390,6 @@ mod tests {
                 guest_seat: 12,
                 done_serial: 7,
                 had_preedit: false,
-                deletes: Vec::new(),
                 cursor_position: None,
             }),
             "the next commit string finds nothing of the last"
@@ -2402,26 +2404,13 @@ mod tests {
         assert_eq!(state, before);
 
         state.finish_confirm_preedit(plan);
-        // The edits stay for the next commit string.
+        // The cursor position stays for the next commit string.
         let mut expected = before;
         expected.current_preedit.clear();
         expected.pending_preedit_selection = None;
         expected.pending_preedit_cursor = None;
+        expected.unreported_host_edit = true;
         assert_eq!(state, expected);
-    }
-
-    #[test]
-    fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
-        let mut state = text_input(ACTIVE);
-        for index in 0..MAX_PENDING_IME_DELETES {
-            assert!(state.record_delete(index as u32, 0));
-        }
-        assert!(!state.record_delete(u32::MAX, u32::MAX));
-
-        let plan = state.prepare_host_commit().expect("active host input");
-        assert_eq!(plan.deletes.len(), MAX_PENDING_IME_DELETES);
-        state.finish_host_commit(plan);
-        assert!(state.pending_deletes.is_empty());
     }
 
     #[test]
@@ -2524,7 +2513,7 @@ mod tests {
                         assert_eq!(next.pending, V3Pending::default());
                         if new_field {
                             assert!(next.current_preedit.is_empty());
-                            assert!(next.pending_deletes.is_empty());
+                            assert_eq!(next.pending_cursor_position, None);
                         }
                     }
                     Step::Commit | Step::FailedCommit => {
