@@ -46,10 +46,90 @@ impl wl_seat::WlSeatHandler for SeatHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+    use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
     use crate::protocols::wayland::wl_keyboard::{self, WlKeyboardHandler};
     use crate::protocols::wayland::wl_seat::WlSeatHandler;
-    use crate::state::{Context, GuestKeyOwner, HostId, TextInputState};
-    use crate::wire::WireMessage;
+    use crate::protocols::wayland::{wl_compositor, wl_display};
+    use crate::proxy::harness::{Object, Session, TextInput};
+    use crate::state::{Context, GuestKeyOwner, HostId};
+    use crate::wire::WL_DISPLAY_ID;
+
+    /// A guest seat, a keyboard of it whose focus the host gives to a
+    /// surface, and a text input of the seat, which gets the `enter`.
+    struct Focused {
+        s: Session,
+        seat: Object,
+        keyboard: Object,
+        surface: Object,
+        text_input: TextInput,
+    }
+
+    impl Focused {
+        async fn new() -> Self {
+            let mut s = Session::new();
+            let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
+            let keyboard = s.keyboard_of(seat.id).await;
+            let surface = s.surface().await;
+            s.host([wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap()])
+                .await;
+            assert_eq!(s.guest_received().len(), 2, "the enter and its modifiers");
+            let text_input = s.text_input(seat.id).await;
+            let enter = zwp_text_input_v3::Event::Enter {
+                surface: surface.id,
+            };
+            assert_eq!(s.guest_received(), [(text_input.id, enter.into())]);
+            Self {
+                s,
+                seat,
+                keyboard,
+                surface,
+                text_input,
+            }
+        }
+
+        /// The host's keyboard focus leaves the surface; the guest gets
+        /// the keyboard's `leave` and the text input's.
+        async fn keyboard_leave(&mut self) {
+            let leave = wl_keyboard::evt::leave(self.keyboard.host, 2, self.surface.host);
+            self.s.host([leave]).await;
+            let surface = self.surface.id;
+            assert_eq!(
+                self.s.guest_received(),
+                [
+                    (
+                        self.keyboard.id,
+                        wl_keyboard::Event::Leave { serial: 2, surface }.into()
+                    ),
+                    (
+                        self.text_input.id,
+                        zwp_text_input_v3::Event::Leave { surface }.into()
+                    ),
+                ]
+            );
+        }
+
+        /// The host's input method sends the preedit `text`, which the
+        /// guest gets.
+        async fn preedit(&mut self, text: &str) {
+            let host = self.text_input.host;
+            self.s
+                .host([zwp_text_input_v1::evt::preedit_string(host, 0, text, "").unwrap()])
+                .await;
+            let end = text.len() as i32;
+            let preedit = zwp_text_input_v3::Event::PreeditString {
+                text: Some(text.into()),
+                cursor_begin: end,
+                cursor_end: end,
+            };
+            let done = zwp_text_input_v3::Event::Done { serial: 1 };
+            let id = self.text_input.id;
+            assert_eq!(
+                self.s.guest_received(),
+                [(id, preedit.into()), (id, done.into())]
+            );
+        }
+    }
 
     #[test]
     fn release_keeps_child_keyboard_routing_state() {
@@ -80,102 +160,48 @@ mod tests {
             .physically_held(HostId(host_keyboard), 14));
     }
 
-    #[test]
-    fn release_does_not_end_child_text_input_focus() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let guest_seat = 10;
-        let host_seat = 11;
-        let guest_surface = 40;
-        let host_surface = 41;
-        let guest_keyboard = 20;
-        let host_keyboard = 30;
-        let guest_text_input = 50;
-        let host_text_input = 51;
+    #[tokio::test]
+    async fn release_does_not_end_child_text_input_focus() {
+        let mut f = Focused::new().await;
+        f.s.enable(f.text_input).await;
+        f.preedit("한").await;
 
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_text_input,
-            host_text_input,
-            "zwp_text_input_v3",
-            1,
-        );
-        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_focus.set_for_test(
-            HostId(host_keyboard),
-            guest_seat,
-            guest_surface,
-            host_surface,
-        );
-        ctx.text_inputs.insert(guest_text_input, {
-            let mut state = TextInputState::new(60, None, guest_seat, Some(guest_surface));
-            state.current_preedit = crate::state::ShownPreedit::at_end("한");
-            state.host = crate::state::HostApplied::Active { content_type: None };
-            state
-        });
-
-        ctx.last_sender_id = guest_seat;
-        assert_eq!(SeatHandler.on_release(&mut ctx), Action::Forward);
-        assert!(ctx.host_to_client_queue.is_empty());
+        f.s.guest([wl_seat::req::release(f.seat.id)]).await;
         assert_eq!(
-            ctx.text_inputs[&guest_text_input].active_surface,
-            Some(guest_surface)
+            f.s.host_received(),
+            [(f.seat.host, wl_seat::Request::Release {}.into())]
         );
-        assert!(ctx.keyboard_to_seat.contains_key(&guest_keyboard));
+        assert_eq!(f.s.guest_received(), [], "the text input keeps its focus");
+
+        // Its composition goes on, and the keyboard's leave, which the
+        // keyboard still routes to its seat, ends its focus.
+        f.preedit("한글").await;
+        f.keyboard_leave().await;
+        assert_eq!(f.s.host_received(), []);
     }
 
-    #[test]
-    fn children_keep_an_ended_seat_whose_id_the_guest_reuses() {
+    #[tokio::test]
+    async fn children_keep_an_ended_seat_whose_id_the_guest_reuses() {
         // A focused keyboard and a text input outlive their seat, which the
         // guest releases and whose ID it then reuses for a surface.
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let (guest_seat, host_seat) = (10, 11);
-        let (guest_keyboard, host_keyboard) = (20, 21);
-        let (guest_surface, host_surface) = (40, 41);
-        let (guest_text_input, host_text_input) = (50, 51);
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, host_seat, "wl_seat");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_keyboard, host_keyboard, "wl_keyboard");
-        ctx.shadow_table
-            .insert_paired_for_test(guest_surface, host_surface, "wl_surface");
-        ctx.shadow_table.insert_bridged_for_test(
-            guest_text_input,
-            host_text_input,
-            "zwp_text_input_v3",
-            "zwp_text_input_v1",
-        );
-        ctx.keyboard_to_seat.insert(guest_keyboard, guest_seat);
-        ctx.keyboard_focus.set_for_test(
-            HostId(host_keyboard),
-            guest_seat,
-            guest_surface,
-            host_surface,
-        );
-        ctx.text_inputs.insert(
-            guest_text_input,
-            TextInputState::new(host_text_input, None, guest_seat, Some(guest_surface)),
-        );
-
-        ctx.last_sender_id = guest_seat;
-        let mut release = WireMessage::new(guest_seat, wl_seat::REQ_RELEASE, &[]);
-        wl_seat::dispatch_request(&mut release, &mut SeatHandler, &mut ctx)
-            .expect("wl_seat.release decodes");
-        ctx.release_deleted_host_id(host_seat);
-        ctx.shadow_table
-            .insert_paired_for_test(guest_seat, 12, "wl_surface");
-
-        ctx.assert_no_orphans();
-        assert_eq!(ctx.keyboard_to_seat[&guest_keyboard], guest_seat);
-        assert_eq!(ctx.text_inputs[&guest_text_input].guest_seat, guest_seat);
+        let mut f = Focused::new().await;
+        f.s.guest([wl_seat::req::release(f.seat.id)]).await;
         assert_eq!(
-            ctx.keyboard_focus.surface_for_seat(guest_seat),
-            Some(guest_surface)
+            f.s.host_received(),
+            [(f.seat.host, wl_seat::Request::Release {}.into())]
         );
+        f.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, f.seat.host)])
+            .await;
+        let delete_id = wl_display::Event::DeleteId { id: f.seat.id };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
+        let compositor = f.s.bind("wl_compositor", wl_compositor::VERSION).await;
+        f.s.create(wl_compositor::req::create_surface(compositor, f.seat.id))
+            .await;
+
+        // The session's check that no state outlives its object holds, and
+        // the keyboard's leave still reaches the seat's text input.
+        f.keyboard_leave().await;
+        assert_eq!(f.s.host_received(), []);
     }
 
     #[test]
