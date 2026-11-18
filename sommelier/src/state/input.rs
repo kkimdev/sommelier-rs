@@ -1935,6 +1935,48 @@ mod tests {
     /// An attached input method with no known content type.
     const ACTIVE: HostApplied = HostApplied::Active { content_type: None };
 
+    /// A deactivated input method whose events a barrier drains.
+    const DRAINING: HostApplied = HostApplied::Draining {
+        callback: HostId(100),
+    };
+
+    /// One host state of each activation.
+    const ACTIVATIONS: [HostApplied; 3] = [HostApplied::Inactive, ACTIVE, DRAINING];
+
+    /// A text input of guest seat 12, focused on surface 13, whose host has
+    /// applied `host`.
+    fn text_input(host: HostApplied) -> TextInputState {
+        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        state.host = host;
+        state
+    }
+
+    /// A text input after 7 commits whose host is `ACTIVE` (attached, no
+    /// known content type), composing the preedit "가" with every kind of
+    /// IME metadata pending: preedit selection (0, 3), preedit cursor 3, one
+    /// delete of (3, 0) and cursor position (1, 1). Offsets count bytes, as
+    /// in `zwp_text_input_v1`, and "가" is three.
+    fn composing() -> TextInputState {
+        let mut state = text_input(ACTIVE);
+        state.set_guest_commits(7);
+        state.current_preedit = "가".to_string();
+        state.record_preedit_selection(0, 3);
+        state.record_preedit_cursor(3);
+        assert!(state.record_delete(3, 0));
+        state.record_cursor_position(1, 1);
+        assert_eq!(
+            (
+                state.pending_preedit_selection,
+                state.pending_preedit_cursor,
+                &state.pending_deletes[..],
+                state.pending_cursor_position,
+            ),
+            (Some((0, 3)), Some(3), &[(3, 0)][..], Some((1, 1))),
+            "the recorders store what they are given"
+        );
+        state
+    }
+
     #[test]
     fn host_activation_transitions_match_the_model_for_all_short_sequences() {
         #[derive(Clone, Copy)]
@@ -1957,50 +1999,26 @@ mod tests {
             Operation::CompleteDrainingB,
             Operation::EndWithoutBarrier,
         ];
-        const INITIAL_STATES: [HostApplied; 4] = [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: CALLBACK_A,
-            },
-            HostApplied::Draining {
-                callback: CALLBACK_B,
-            },
-        ];
+        const DRAINING_A: HostApplied = HostApplied::Draining {
+            callback: CALLBACK_A,
+        };
+        const DRAINING_B: HostApplied = HostApplied::Draining {
+            callback: CALLBACK_B,
+        };
 
         fn model_transition(state: HostApplied, operation: Operation) -> (HostApplied, bool) {
             match (state, operation) {
                 (HostApplied::Inactive, Operation::Activate) => (ACTIVE, true),
-                (ACTIVE, Operation::BeginDrainingA) => (
-                    HostApplied::Draining {
-                        callback: CALLBACK_A,
-                    },
-                    true,
-                ),
-                (ACTIVE, Operation::BeginDrainingB) => (
-                    HostApplied::Draining {
-                        callback: CALLBACK_B,
-                    },
-                    true,
-                ),
-                (
-                    HostApplied::Draining {
-                        callback: CALLBACK_A,
-                    },
-                    Operation::CompleteDrainingA,
-                )
-                | (
-                    HostApplied::Draining {
-                        callback: CALLBACK_B,
-                    },
-                    Operation::CompleteDrainingB,
-                ) => (HostApplied::Inactive, true),
-                (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
+                (ACTIVE, Operation::BeginDrainingA) => (DRAINING_A, true),
+                (ACTIVE, Operation::BeginDrainingB) => (DRAINING_B, true),
+                (DRAINING_A, Operation::CompleteDrainingA)
+                | (DRAINING_B, Operation::CompleteDrainingB)
+                | (ACTIVE, Operation::EndWithoutBarrier) => (HostApplied::Inactive, true),
                 _ => (state, false),
             }
         }
 
-        fn assert_invariants(state: &TextInputState, expected: HostApplied) {
+        fn walk(state: TextInputState, expected: HostApplied, remaining: usize) {
             assert_eq!(state.host, expected);
             assert_eq!(state.host_is_active(), expected == ACTIVE);
             assert_eq!(
@@ -2010,10 +2028,6 @@ mod tests {
                     HostApplied::Inactive | HostApplied::Active { .. } => None,
                 }
             );
-        }
-
-        fn walk(state: TextInputState, expected: HostApplied, remaining: usize) {
-            assert_invariants(&state, expected);
             if remaining == 0 {
                 return;
             }
@@ -2034,26 +2048,20 @@ mod tests {
             }
         }
 
-        for initial in INITIAL_STATES {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = initial;
-            walk(state, initial, 5);
+        for initial in [HostApplied::Inactive, ACTIVE, DRAINING_A, DRAINING_B] {
+            walk(text_input(initial), initial, 5);
         }
     }
 
     /// Every host state a test of [`reconcile`] starts from: each
     /// activation, with each content type the host could have.
     fn host_states(content_types: &[HostContentType]) -> Vec<HostApplied> {
-        let mut states = vec![
-            HostApplied::Inactive,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ];
-        for content_type in std::iter::once(None).chain(content_types.iter().copied().map(Some)) {
-            states.push(HostApplied::Active { content_type });
-        }
-        states
+        let known = content_types
+            .iter()
+            .map(|&content_type| HostApplied::Active {
+                content_type: Some(content_type),
+            });
+        ACTIVATIONS.into_iter().chain(known).collect()
     }
 
     /// Apply `steps` to `applied` as the host does.
@@ -2077,9 +2085,10 @@ mod tests {
         next
     }
 
-    #[test]
-    fn reconcile_reaches_every_target_with_only_needed_requests() {
-        let content_types = [(1, 2), (3, 4)]
+    /// Two content types, each with unknown, absent and present
+    /// surrounding-text support.
+    fn content_types() -> Vec<HostContentType> {
+        [(1, 2), (3, 4)]
             .into_iter()
             .flat_map(|content_type| {
                 [None, Some(false), Some(true)].map(|surrounding_text_support| HostContentType {
@@ -2087,29 +2096,29 @@ mod tests {
                     surrounding_text_support,
                 })
             })
-            .collect::<Vec<_>>();
-        for applied in host_states(&content_types) {
-            for (active, seat_live, &content_type) in [false, true]
-                .into_iter()
-                .flat_map(|active| [false, true].map(|seat_live| (active, seat_live)))
-                .flat_map(|(active, seat_live)| {
-                    content_types
-                        .iter()
-                        .map(move |content_type| (active, seat_live, content_type))
-                })
-            {
-                let target = HostTarget {
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_reaches_every_target_with_only_needed_requests() {
+        let content_types = content_types();
+        let targets = [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .flat_map(|(active, seat_live)| {
+                content_types.iter().map(move |&content_type| HostTarget {
                     active,
                     seat_live,
                     content_type,
-                };
-                let steps = reconcile(&target, &applied);
-                let reached = apply_steps(&applied, steps);
-                let expected = match (applied, active, seat_live) {
+                })
+            });
+        for target in targets {
+            for applied in host_states(&content_types) {
+                let reached = apply_steps(&applied, reconcile(&target, &applied));
+                let expected = match (applied, target.active, target.seat_live) {
                     // The barrier's completion reconciles again.
                     (HostApplied::Draining { .. }, ..) => applied,
                     (_, true, true) => HostApplied::Active {
-                        content_type: Some(content_type),
+                        content_type: Some(target.content_type),
                     },
                     (HostApplied::Active { .. }, false, true) => HostApplied::Draining {
                         callback: HostId(101),
@@ -2119,7 +2128,7 @@ mod tests {
                     // as it is, with the content type it can still take.
                     (HostApplied::Inactive, true, false) => applied,
                     (HostApplied::Active { .. }, true, false) => HostApplied::Active {
-                        content_type: Some(content_type),
+                        content_type: Some(target.content_type),
                     },
                 };
                 assert_eq!(reached, expected, "{target:?} from {applied:?}");
@@ -2133,84 +2142,42 @@ mod tests {
     }
 
     #[test]
-    fn a_reached_content_type_is_resent_only_after_the_host_forgets_it() {
-        let content_type = HostContentType {
-            content_type: (1, 2),
-            surrounding_text_support: Some(false),
-        };
-        let target = HostTarget {
-            active: true,
-            seat_live: true,
-            content_type,
-        };
-        let mut applied = HostApplied::default();
-        assert_eq!(
-            reconcile(&target, &applied),
-            HostSteps {
-                activation: Some(ActivationStep::Activate),
-                content_type: Some(content_type),
-            }
-        );
-        assert!(applied.activate());
-        applied.apply_content_type(content_type);
-        assert_eq!(reconcile(&target, &applied), HostSteps::default());
-
-        // A new field is told its content type even if it is unchanged.
-        applied.new_field();
-        assert_eq!(
-            reconcile(&target, &applied).content_type,
-            Some(content_type)
-        );
-    }
-
-    #[test]
-    fn only_active_host_generation_accepts_ime_events() {
-        for activation in [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ] {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = activation;
-            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
-
-            assert_eq!(state.prepare_host_preedit().is_some(), activation == ACTIVE);
-            assert_eq!(state.prepare_host_commit().is_some(), activation == ACTIVE);
-            assert_eq!(
-                state.prepare_preedit_region().is_some(),
-                activation == ACTIVE
-            );
-            assert_eq!(
-                state.prepare_confirm_preedit().is_some(),
-                activation == ACTIVE
-            );
+    fn a_new_field_forgets_only_the_applied_content_type() {
+        for applied in host_states(&content_types()) {
+            let mut next = applied;
+            next.new_field();
+            let expected = match applied {
+                HostApplied::Active { .. } => ACTIVE,
+                HostApplied::Inactive | HostApplied::Draining { .. } => applied,
+            };
+            assert_eq!(next, expected, "{applied:?}");
         }
     }
 
     #[test]
-    fn editor_lifecycle_boundaries_preserve_host_activation_generation() {
-        for activation in [
-            HostApplied::Inactive,
-            ACTIVE,
-            HostApplied::Draining {
-                callback: HostId(100),
-            },
-        ] {
-            let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-            state.host = activation;
+    fn only_active_host_generation_accepts_ime_events() {
+        for activation in ACTIVATIONS {
+            let mut state = text_input(activation);
+            state.committed.surrounding_text = Some(("가".to_string(), 3, 3));
 
-            state.apply_focus(Some(14));
-            assert_eq!(state.host, activation);
-            state.begin_destroy();
-            assert_eq!(state.host, activation);
+            let active = activation == ACTIVE;
+            assert_eq!(state.prepare_host_preedit().is_some(), active);
+            assert_eq!(state.prepare_host_commit().is_some(), active);
+            assert_eq!(state.prepare_preedit_region().is_some(), active);
+            assert_eq!(state.prepare_confirm_preedit().is_some(), active);
         }
     }
 
     #[test]
     fn text_input_focus_boundary_resets_editor_state_only() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
+        let applied = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (5, 6),
+                surrounding_text_support: Some(true),
+            }),
+        };
+        let mut state = composing();
+        state.host = applied;
         state.pending = V3Pending {
             enabled: Some(true),
             surrounding_text: Some(Some(("pending".to_string(), 7, 7))),
@@ -2222,27 +2189,14 @@ mod tests {
             surrounding_text: Some(("committed".to_string(), 9, 9)),
             content_type: (5, 6),
         };
-        state.current_preedit = "조합".to_string();
-        state.set_guest_commits(17);
-        state.pending_preedit_cursor = Some(3);
-        state.pending_preedit_selection = Some((0, 3));
-        state.pending_deletes.push((3, 0));
-        state.pending_cursor_position = Some((1, 1));
-        let applied = HostApplied::Active {
-            content_type: Some(HostContentType {
-                content_type: (5, 6),
-                surrounding_text_support: Some(true),
-            }),
-        };
-        state.host = applied;
 
         assert_eq!(state.apply_focus(Some(14)), Some(13));
 
         // What the host applied is the host's, so it survives: reconciling
         // the reset target deactivates it and forgets the content type.
-        let mut expected = TextInputState::new(10, Some(11), 12, Some(14));
-        expected.set_guest_commits(17);
-        expected.host = applied;
+        let mut expected = text_input(applied);
+        expected.active_surface = Some(14);
+        expected.set_guest_commits(7);
         assert_eq!(state, expected);
         let target = HostTarget {
             active: state.committed.enabled,
@@ -2263,16 +2217,17 @@ mod tests {
 
     #[test]
     fn commit_applies_every_pending_field_and_starts_a_new_field() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(state.host.activate());
         let content_type = HostContentType {
             content_type: (3, 4),
             surrounding_text_support: Some(true),
         };
+        let target = HostTarget {
+            active: true,
+            seat_live: true,
+            content_type,
+        };
+        let mut state = composing();
         state.host.apply_content_type(content_type);
-        state.current_preedit = "이전".to_string();
-        state.pending_preedit_cursor = Some(3);
-        state.pending_deletes.push((3, 0));
         state.pending = V3Pending {
             surrounding_text: Some(Some(("가나다".to_string(), 9, 9))),
             content_type: Some((3, 4)),
@@ -2288,26 +2243,16 @@ mod tests {
                 cursor_rect: Some((1, 2, 3, 4)),
             }
         );
-        assert_eq!(state.guest_commit_serial(), 1);
-        assert_eq!(state.pending, V3Pending::default());
-        assert_eq!(
-            state.committed,
-            V3Committed {
-                enabled: true,
-                surrounding_text: Some(("가나다".to_string(), 9, 9)),
-                content_type: (3, 4),
-            }
-        );
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_preedit_cursor.is_none());
-        assert!(state.pending_deletes.is_empty());
-        // The new field is told its content type even though it is the old
-        // field's.
-        let target = HostTarget {
-            active: true,
-            seat_live: true,
-            content_type,
+        // The commit closes the composition, and the new field is told its
+        // content type even though it is the old field's.
+        let mut expected = text_input(ACTIVE);
+        expected.set_guest_commits(8);
+        expected.committed = V3Committed {
+            enabled: true,
+            surrounding_text: Some(("가나다".to_string(), 9, 9)),
+            content_type: (3, 4),
         };
+        assert_eq!(state, expected);
         assert_eq!(
             reconcile(&target, &state.host).content_type,
             Some(content_type)
@@ -2322,21 +2267,34 @@ mod tests {
 
     #[test]
     fn rejected_enable_closes_composition_but_stays_disabled() {
-        let mut state = TextInputState::new(10, Some(11), 12, Some(13));
-        state.current_preedit = "가".to_string();
-        state.pending_deletes.push((3, 0));
-        state.pending = V3Pending::reset(true);
+        let known = HostApplied::Active {
+            content_type: Some(HostContentType {
+                content_type: (3, 4),
+                surrounding_text_support: Some(false),
+            }),
+        };
+        // Another text input holds the activation, so the host is usually
+        // inactive, but the commit starts a new field whatever it applied.
+        for (applied, expected_host) in [
+            (HostApplied::Inactive, HostApplied::Inactive),
+            (ACTIVE, ACTIVE),
+            (DRAINING, DRAINING),
+            (known, ACTIVE),
+        ] {
+            let mut state = composing();
+            state.host = applied;
+            state.pending = V3Pending::reset(true);
 
-        assert!(state.commit(true).new_field);
-        assert_eq!(state.pending, V3Pending::default());
-        assert!(!state.committed.enabled);
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_deletes.is_empty());
+            assert!(state.commit(true).new_field, "{applied:?}");
+            let mut expected = text_input(expected_host);
+            expected.set_guest_commits(7);
+            assert_eq!(state, expected, "{applied:?}");
+        }
     }
 
     #[test]
     fn guest_commit_serial_wraps_to_zero() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
+        let mut state = text_input(HostApplied::Inactive);
         state.set_guest_commits(u32::MAX);
 
         assert_eq!(state.count_guest_commit(), 0);
@@ -2344,89 +2302,87 @@ mod tests {
         assert_eq!(state.guest_commit_serial(), 0);
     }
 
+    // Each host IME event is planned without changing the state, and
+    // finishing the plan consumes exactly the metadata the event used.
+
     #[test]
     fn host_preedit_metadata_is_consumed_only_after_finish() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.prepare_host_preedit().is_none());
-        assert!(state.host.activate());
-        state.set_guest_commits(7);
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
+        let mut state = composing();
         let before = state.clone();
-
         let plan = state.prepare_host_preedit().expect("active host input");
         assert_eq!(state, before);
-        assert_eq!(plan.done_serial, 7);
-        assert!(plan.had_preedit);
-        assert_eq!(plan.selection, Some((0, 3)));
-        assert_eq!(plan.cursor, Some(3));
+        assert_eq!(
+            plan,
+            HostPreeditPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: true,
+                selection: Some((0, 3)),
+                cursor: Some(3),
+            }
+        );
 
         state.finish_host_preedit(plan, "각".to_string(), true, true);
-        assert_eq!(state.current_preedit, "각");
-        assert!(state.pending_preedit_selection.is_none());
-        assert!(state.pending_preedit_cursor.is_none());
+        let mut expected = before;
+        expected.current_preedit = "각".to_string();
+        expected.pending_preedit_selection = None;
+        expected.pending_preedit_cursor = None;
+        assert_eq!(state, expected);
     }
 
     #[test]
     fn host_commit_edits_are_atomic_and_consumed_exactly_once() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
-        state.set_guest_commits(7);
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
-        assert!(state.record_delete(3, 0));
-        state.record_cursor_position(1, 1);
+        let mut state = composing();
         let before = state.clone();
-
         let plan = state.prepare_host_commit().expect("active host input");
+        assert_eq!(state, before);
         assert_eq!(
-            state, before,
-            "preparing an event must not consume metadata"
+            plan,
+            HostCommitPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: true,
+                deletes: vec![(3, 0)],
+                cursor_position: Some((1, 1)),
+            }
         );
-        assert_eq!(plan.deletes, vec![(3, 0)]);
-        assert_eq!(plan.cursor_position, Some((1, 1)));
 
         state.finish_host_commit(plan);
-        assert!(state.current_preedit.is_empty());
-        assert!(state.pending_preedit_selection.is_none());
-        assert!(state.pending_preedit_cursor.is_none());
-        assert!(state.pending_deletes.is_empty());
-        assert!(state.pending_cursor_position.is_none());
-
-        let next = state.prepare_host_commit().expect("still active");
-        assert!(!next.had_preedit);
-        assert!(next.deletes.is_empty());
-        assert!(next.cursor_position.is_none());
+        let mut expected = text_input(ACTIVE);
+        expected.set_guest_commits(7);
+        assert_eq!(state, expected);
+        assert_eq!(
+            state.prepare_host_commit(),
+            Some(HostCommitPlan {
+                guest_seat: 12,
+                done_serial: 7,
+                had_preedit: false,
+                deletes: Vec::new(),
+                cursor_position: None,
+            }),
+            "the next commit string finds nothing of the last"
+        );
     }
 
     #[test]
     fn confirming_preedit_closes_only_preedit_metadata() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
-        state.current_preedit = "가".to_string();
-        state.record_preedit_selection(0, 3);
-        state.record_preedit_cursor(3);
-        assert!(state.record_delete(3, 0));
-        state.record_cursor_position(1, 1);
-
+        let mut state = composing();
+        let before = state.clone();
         let plan = state.prepare_confirm_preedit().expect("active host input");
-        state.finish_confirm_preedit(plan);
+        assert_eq!(state, before);
 
-        let next_preedit = state.prepare_host_preedit().expect("still active");
-        assert!(!next_preedit.had_preedit);
-        assert!(next_preedit.selection.is_none());
-        assert!(next_preedit.cursor.is_none());
-        let next_commit = state.prepare_host_commit().expect("still active");
-        assert_eq!(next_commit.deletes, vec![(3, 0)]);
-        assert_eq!(next_commit.cursor_position, Some((1, 1)));
+        state.finish_confirm_preedit(plan);
+        // The edits stay for the next commit string.
+        let mut expected = before;
+        expected.current_preedit.clear();
+        expected.pending_preedit_selection = None;
+        expected.pending_preedit_cursor = None;
+        assert_eq!(state, expected);
     }
 
     #[test]
     fn pending_host_deletes_are_bounded_and_next_commit_still_completes() {
-        let mut state = TextInputState::new(10, None, 12, Some(13));
-        assert!(state.host.activate());
+        let mut state = text_input(ACTIVE);
         for index in 0..MAX_PENDING_IME_DELETES {
             assert!(state.record_delete(index as u32, 0));
         }
@@ -2471,6 +2427,7 @@ mod tests {
         #[derive(Clone, Copy)]
         enum Step {
             Focus,
+            Refocus,
             Leave,
             Enable,
             Disable,
@@ -2482,8 +2439,9 @@ mod tests {
             Destroy,
         }
 
-        const STEPS: [Step; 10] = [
+        const STEPS: [Step; 11] = [
             Step::Focus,
+            Step::Refocus,
             Step::Leave,
             Step::Enable,
             Step::Disable,
@@ -2502,10 +2460,14 @@ mod tests {
             for step in STEPS {
                 let mut next = state.clone();
                 match step {
-                    Step::Focus | Step::Leave => {
+                    Step::Focus | Step::Refocus | Step::Leave => {
                         let serial = next.guest_commit_serial;
                         let host_activation = next.host;
-                        let surface = matches!(step, Step::Focus).then_some(13);
+                        let surface = match step {
+                            Step::Focus => Some(13),
+                            Step::Refocus => Some(14),
+                            _ => None,
+                        };
                         next.apply_focus(surface);
                         let mut expected = TextInputState::new(10, Some(11), 12, surface);
                         expected.guest_commit_serial = serial;
@@ -2558,155 +2520,156 @@ mod tests {
             }
         }
 
-        let mut initial = TextInputState::new(10, Some(11), 12, Some(13));
-        assert!(initial.host.activate());
-        walk(initial, 4);
+        // Neither focus, onto either surface or none, nor destroy changes
+        // what the host applied.
+        for activation in ACTIVATIONS {
+            walk(text_input(activation), 4);
+        }
+    }
+
+    const KEYBOARD_A: HostId = HostId(10);
+    const KEYBOARD_B: HostId = HostId(11);
+
+    /// Seat 1's focus on guest surface 20, host surface 200.
+    const ON_20: KeyboardFocus = KeyboardFocus {
+        guest_seat: 1,
+        guest_surface: 20,
+        host_surface: 200,
+    };
+    /// Seat 1's focus on guest surface 21, host surface 201.
+    const ON_21: KeyboardFocus = KeyboardFocus {
+        guest_seat: 1,
+        guest_surface: 21,
+        host_surface: 201,
+    };
+
+    fn accepted(
+        seat_changes: Vec<SeatFocusChange>,
+        retired_keyboards: Vec<HostId>,
+    ) -> KeyboardFocusUpdate {
+        KeyboardFocusUpdate {
+            accepted: true,
+            seat_changes,
+            retired_keyboards,
+        }
     }
 
     #[test]
     fn keyboard_focus_registry_balances_replacement_and_delayed_leave() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
         let mut registry = KeyboardFocusRegistry::default();
 
         assert_eq!(
-            registry.enter(keyboard_a, focus_a),
-            KeyboardFocusUpdate {
-                accepted: true,
-                seat_changes: vec![SeatFocusChange {
+            registry.enter(KEYBOARD_A, ON_20),
+            accepted(
+                vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: None,
                     current_surface: Some(20),
                 }],
-                retired_keyboards: Vec::new(),
-            }
+                Vec::new()
+            )
         );
         assert_eq!(
-            registry.enter(keyboard_b, focus_b),
-            KeyboardFocusUpdate {
-                accepted: true,
-                seat_changes: vec![SeatFocusChange {
+            registry.enter(KEYBOARD_B, ON_21),
+            accepted(
+                vec![SeatFocusChange {
                     guest_seat: 1,
                     previous_surface: Some(20),
                     current_surface: Some(21),
                 }],
-                retired_keyboards: vec![keyboard_a],
-            }
+                vec![KEYBOARD_A]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), Some(21));
         assert_eq!(
-            registry.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate {
-                accepted: true,
-                ..KeyboardFocusUpdate::default()
-            },
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
+            accepted(Vec::new(), Vec::new()),
             "a delayed leave must balance the retired guest enter once"
         );
         assert_eq!(
-            registry.leave(keyboard_a, focus_a.host_surface),
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
             KeyboardFocusUpdate::default(),
             "a duplicate delayed leave must be rejected"
         );
         assert_eq!(registry.surface_for_seat(1), Some(21));
     }
 
+    /// A delayed leave answers an enter the guest saw. Once that enter is
+    /// gone, superseded by a newer enter on the same keyboard, released or
+    /// destroyed, the leave changes nothing.
     #[test]
-    fn keyboard_focus_registry_rejects_old_leave_after_same_keyboard_reenter() {
-        let keyboard = HostId(10);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
-        let mut registry = KeyboardFocusRegistry::default();
+    fn keyboard_focus_registry_rejects_a_leave_for_a_superseded_or_ended_enter() {
+        struct Case {
+            what_ended_the_enter: &'static str,
+            end_the_enter: fn(&mut KeyboardFocusRegistry),
+            expected_focus_of_a: Option<KeyboardFocus>,
+        }
+        let cases = [
+            Case {
+                what_ended_the_enter: "a newer enter on the same keyboard",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_A, ON_21);
+                },
+                expected_focus_of_a: Some(ON_21),
+            },
+            Case {
+                what_ended_the_enter: "a release, after another keyboard took the seat",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_B, ON_21);
+                    registry.release(KEYBOARD_A);
+                },
+                expected_focus_of_a: None,
+            },
+            Case {
+                what_ended_the_enter: "a destroy, after another keyboard took the seat",
+                end_the_enter: |registry| {
+                    registry.enter(KEYBOARD_B, ON_21);
+                    registry.destroy_surface(ON_20.guest_surface);
+                },
+                expected_focus_of_a: None,
+            },
+        ];
+        for case in cases {
+            let mut registry = KeyboardFocusRegistry::default();
+            registry.enter(KEYBOARD_A, ON_20);
+            (case.end_the_enter)(&mut registry);
 
-        registry.enter(keyboard, focus_a);
-        registry.enter(keyboard, focus_b);
-        assert_eq!(
-            registry.leave(keyboard, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "an old leave on the same resource must not clear its newer enter"
-        );
-        assert_eq!(registry.focus_for_keyboard(keyboard), Some(focus_b));
-    }
-
-    #[test]
-    fn keyboard_focus_registry_release_and_destroy_discard_retired_enters() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus_a = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
-        let focus_b = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 21,
-            host_surface: 201,
-        };
-
-        let mut released = KeyboardFocusRegistry::default();
-        released.enter(keyboard_a, focus_a);
-        released.enter(keyboard_b, focus_b);
-        released.release(keyboard_a);
-        assert_eq!(
-            released.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "a released keyboard resource cannot receive a delayed leave"
-        );
-
-        let mut destroyed = KeyboardFocusRegistry::default();
-        destroyed.enter(keyboard_a, focus_a);
-        destroyed.enter(keyboard_b, focus_b);
-        destroyed.destroy_surface(focus_a.guest_surface);
-        assert_eq!(
-            destroyed.leave(keyboard_a, focus_a.host_surface),
-            KeyboardFocusUpdate::default(),
-            "a destroyed guest surface cannot receive a delayed leave"
-        );
+            let what = case.what_ended_the_enter;
+            assert_eq!(
+                registry.leave(KEYBOARD_A, ON_20.host_surface),
+                KeyboardFocusUpdate::default(),
+                "{what}"
+            );
+            assert_eq!(
+                registry.focus_for_keyboard(KEYBOARD_A),
+                case.expected_focus_of_a,
+                "{what}"
+            );
+            assert_eq!(registry.surface_for_seat(1), Some(21), "{what}");
+        }
     }
 
     #[test]
     fn keyboard_focus_registry_keeps_shared_surface_until_last_owner() {
-        let keyboard_a = HostId(10);
-        let keyboard_b = HostId(11);
-        let focus = KeyboardFocus {
-            guest_seat: 1,
-            guest_surface: 20,
-            host_surface: 200,
-        };
         let mut registry = KeyboardFocusRegistry::default();
-        registry.enter(keyboard_a, focus);
-        registry.enter(keyboard_b, focus);
+        registry.enter(KEYBOARD_A, ON_20);
+        registry.enter(KEYBOARD_B, ON_20);
 
-        let first_leave = registry.leave(keyboard_a, focus.host_surface);
-        assert!(first_leave.accepted);
-        assert!(first_leave.seat_changes.is_empty());
-        assert_eq!(registry.surface_for_seat(1), Some(20));
-
-        let last_leave = registry.leave(keyboard_b, focus.host_surface);
         assert_eq!(
-            last_leave.seat_changes,
-            vec![SeatFocusChange {
-                guest_seat: 1,
-                previous_surface: Some(20),
-                current_surface: None,
-            }]
+            registry.leave(KEYBOARD_A, ON_20.host_surface),
+            accepted(Vec::new(), vec![KEYBOARD_A])
+        );
+        assert_eq!(registry.surface_for_seat(1), Some(20));
+        assert_eq!(
+            registry.leave(KEYBOARD_B, ON_20.host_surface),
+            accepted(
+                vec![SeatFocusChange {
+                    guest_seat: 1,
+                    previous_surface: Some(20),
+                    current_surface: None,
+                }],
+                vec![KEYBOARD_B]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), None);
     }
@@ -2714,20 +2677,12 @@ mod tests {
     #[test]
     fn keyboard_focus_registry_destroys_surface_across_seats_without_fallback() {
         let mut registry = KeyboardFocusRegistry::default();
+        registry.enter(KEYBOARD_A, ON_20);
         registry.enter(
-            HostId(10),
-            KeyboardFocus {
-                guest_seat: 1,
-                guest_surface: 20,
-                host_surface: 200,
-            },
-        );
-        registry.enter(
-            HostId(11),
+            KEYBOARD_B,
             KeyboardFocus {
                 guest_seat: 2,
-                guest_surface: 20,
-                host_surface: 200,
+                ..ON_20
             },
         );
         registry.enter(
@@ -2739,22 +2694,23 @@ mod tests {
             },
         );
 
-        let update = registry.destroy_surface(20);
-        assert_eq!(update.retired_keyboards, vec![HostId(10), HostId(11)]);
         assert_eq!(
-            update.seat_changes,
-            vec![
-                SeatFocusChange {
-                    guest_seat: 1,
-                    previous_surface: Some(20),
-                    current_surface: None,
-                },
-                SeatFocusChange {
-                    guest_seat: 2,
-                    previous_surface: Some(20),
-                    current_surface: None,
-                },
-            ]
+            registry.destroy_surface(20),
+            accepted(
+                vec![
+                    SeatFocusChange {
+                        guest_seat: 1,
+                        previous_surface: Some(20),
+                        current_surface: None,
+                    },
+                    SeatFocusChange {
+                        guest_seat: 2,
+                        previous_surface: Some(20),
+                        current_surface: None,
+                    },
+                ],
+                vec![KEYBOARD_A, KEYBOARD_B]
+            )
         );
         assert_eq!(registry.surface_for_seat(1), None);
         assert_eq!(registry.surface_for_seat(2), None);
@@ -2765,42 +2721,23 @@ mod tests {
     fn keyboard_focus_registry_preserves_invariants_for_all_short_sequences() {
         #[derive(Clone, Copy)]
         enum Operation {
-            EnterA20,
-            EnterA21,
-            EnterB20,
-            EnterB21,
-            LeaveA20,
-            LeaveA21,
-            LeaveB20,
-            LeaveB21,
-            ReleaseA,
-            ReleaseB,
-            Destroy20,
-            Destroy21,
-        }
-
-        #[derive(Clone, Copy)]
-        enum GuestDelivery {
             Enter(HostId, KeyboardFocus),
-            Leave(HostId, u32),
+            /// The keyboard leaves the focus's host surface.
+            Leave(HostId, KeyboardFocus),
             Release(HostId),
-            Destroy(u32),
+            /// The focus's guest surface is destroyed.
+            Destroy(KeyboardFocus),
         }
 
-        let operations = [
-            Operation::EnterA20,
-            Operation::EnterA21,
-            Operation::EnterB20,
-            Operation::EnterB21,
-            Operation::LeaveA20,
-            Operation::LeaveA21,
-            Operation::LeaveB20,
-            Operation::LeaveB21,
-            Operation::ReleaseA,
-            Operation::ReleaseB,
-            Operation::Destroy20,
-            Operation::Destroy21,
-        ];
+        let mut operations = Vec::new();
+        for keyboard in [KEYBOARD_A, KEYBOARD_B] {
+            for focus in [ON_20, ON_21] {
+                operations.push(Operation::Enter(keyboard, focus));
+                operations.push(Operation::Leave(keyboard, focus));
+            }
+            operations.push(Operation::Release(keyboard));
+        }
+        operations.extend([Operation::Destroy(ON_20), Operation::Destroy(ON_21)]);
         let sequence_len = 5;
         let sequence_count = operations.len().pow(sequence_len);
 
@@ -2812,107 +2749,37 @@ mod tests {
             // account for this model exactly.
             let mut guest_focus = HashMap::new();
             for _ in 0..sequence_len {
-                let (update, delivery) = match operations[encoded % operations.len()] {
-                    Operation::EnterA20 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 20,
-                            host_surface: 200,
-                        };
-                        (
-                            registry.enter(HostId(10), focus),
-                            GuestDelivery::Enter(HostId(10), focus),
-                        )
-                    }
-                    Operation::EnterA21 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 21,
-                            host_surface: 201,
-                        };
-                        (
-                            registry.enter(HostId(10), focus),
-                            GuestDelivery::Enter(HostId(10), focus),
-                        )
-                    }
-                    Operation::EnterB20 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 20,
-                            host_surface: 200,
-                        };
-                        (
-                            registry.enter(HostId(11), focus),
-                            GuestDelivery::Enter(HostId(11), focus),
-                        )
-                    }
-                    Operation::EnterB21 => {
-                        let focus = KeyboardFocus {
-                            guest_seat: 1,
-                            guest_surface: 21,
-                            host_surface: 201,
-                        };
-                        (
-                            registry.enter(HostId(11), focus),
-                            GuestDelivery::Enter(HostId(11), focus),
-                        )
-                    }
-                    Operation::LeaveA20 => (
-                        registry.leave(HostId(10), 200),
-                        GuestDelivery::Leave(HostId(10), 200),
-                    ),
-                    Operation::LeaveA21 => (
-                        registry.leave(HostId(10), 201),
-                        GuestDelivery::Leave(HostId(10), 201),
-                    ),
-                    Operation::LeaveB20 => (
-                        registry.leave(HostId(11), 200),
-                        GuestDelivery::Leave(HostId(11), 200),
-                    ),
-                    Operation::LeaveB21 => (
-                        registry.leave(HostId(11), 201),
-                        GuestDelivery::Leave(HostId(11), 201),
-                    ),
-                    Operation::ReleaseA => (
-                        registry.release(HostId(10)),
-                        GuestDelivery::Release(HostId(10)),
-                    ),
-                    Operation::ReleaseB => (
-                        registry.release(HostId(11)),
-                        GuestDelivery::Release(HostId(11)),
-                    ),
-                    Operation::Destroy20 => {
-                        (registry.destroy_surface(20), GuestDelivery::Destroy(20))
-                    }
-                    Operation::Destroy21 => {
-                        (registry.destroy_surface(21), GuestDelivery::Destroy(21))
-                    }
-                };
+                let operation = operations[encoded % operations.len()];
                 encoded /= operations.len();
-
-                match delivery {
-                    GuestDelivery::Enter(keyboard, focus) => {
+                let update = match operation {
+                    Operation::Enter(keyboard, focus) => {
+                        let update = registry.enter(keyboard, focus);
                         if update.accepted {
                             guest_focus.insert(keyboard, focus);
                         }
+                        update
                     }
-                    GuestDelivery::Leave(keyboard, host_surface) => {
+                    Operation::Leave(keyboard, focus) => {
+                        let update = registry.leave(keyboard, focus.host_surface);
                         if update.accepted {
                             assert_eq!(
                                 guest_focus.get(&keyboard).map(|focus| focus.host_surface),
-                                Some(host_surface),
+                                Some(focus.host_surface),
                                 "only a guest-visible enter can accept a leave"
                             );
                             guest_focus.remove(&keyboard);
                         }
+                        update
                     }
-                    GuestDelivery::Release(keyboard) => {
+                    Operation::Release(keyboard) => {
                         guest_focus.remove(&keyboard);
+                        registry.release(keyboard)
                     }
-                    GuestDelivery::Destroy(surface) => {
-                        guest_focus.retain(|_, focus| focus.guest_surface != surface);
+                    Operation::Destroy(focus) => {
+                        guest_focus.retain(|_, guest| guest.guest_surface != focus.guest_surface);
+                        registry.destroy_surface(focus.guest_surface)
                     }
-                }
+                };
 
                 for change in &update.seat_changes {
                     assert_ne!(change.previous_surface, change.current_surface);
@@ -2964,33 +2831,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn guest_key_owner_is_exclusive_and_source_checked() {
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        let keyboard = HostId(10);
-        let key = 57;
-
-        assert!(ctx.claim_guest_key(keyboard, key, GuestKeyOwner::Physical));
-        for competing_owner in [GuestKeyOwner::TextInputKeysym, GuestKeyOwner::ImeRecovery] {
-            assert!(
-                !ctx.claim_guest_key(keyboard, key, competing_owner),
-                "a second source must not overwrite the live owner"
-            );
-        }
-        assert_eq!(
-            ctx.guest_key_owner(keyboard, key),
-            Some(GuestKeyOwner::Physical)
-        );
-        assert!(!ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        assert_eq!(
-            ctx.guest_key_owner(keyboard, key),
-            Some(GuestKeyOwner::Physical),
-            "a mismatched release must not steal another source's key"
-        );
-        assert!(ctx.take_guest_key_if(keyboard, key, GuestKeyOwner::Physical));
-        assert!(ctx.guest_key_owner(keyboard, key).is_none());
     }
 
     #[test]
@@ -3047,17 +2887,89 @@ mod tests {
 
     #[test]
     fn compositor_shortcut_arbitration_admits_only_unowned_or_shortcut_keys() {
-        assert!(GuestKeyOwner::admits_compositor_shortcut(None));
-        assert!(GuestKeyOwner::admits_compositor_shortcut(Some(
-            GuestKeyOwner::CompositorShortcut
-        )));
-        for owner in [
-            GuestKeyOwner::Physical,
-            GuestKeyOwner::TextInputKeysym,
-            GuestKeyOwner::ImeRecovery,
+        for (owner, admitted) in [
+            (None, true),
+            (Some(GuestKeyOwner::CompositorShortcut), true),
+            (Some(GuestKeyOwner::Physical), false),
+            (Some(GuestKeyOwner::TextInputKeysym), false),
+            (Some(GuestKeyOwner::ImeRecovery), false),
         ] {
-            assert!(!GuestKeyOwner::admits_compositor_shortcut(Some(owner)));
+            assert_eq!(
+                GuestKeyOwner::admits_compositor_shortcut(owner),
+                admitted,
+                "{owner:?}"
+            );
         }
+    }
+
+    const PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: false,
+        host_accelerator: false,
+        ime_repeat_active: false,
+    };
+    const REPEAT: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: true,
+        host_accelerator: false,
+        ime_repeat_active: false,
+    };
+    const ACCELERATOR_PRESS: GuestKeyEvent = GuestKeyEvent::PhysicalPress {
+        repeated: false,
+        host_accelerator: true,
+        ime_repeat_active: false,
+    };
+
+    fn forwarded(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+        GuestKeyDecision {
+            delivery: GuestKeyDelivery::Forward,
+            ack_handled,
+            ends_repeat,
+        }
+    }
+
+    fn dropped(ack_handled: Option<bool>, ends_repeat: bool) -> GuestKeyDecision {
+        GuestKeyDecision {
+            delivery: GuestKeyDelivery::Drop,
+            ack_handled,
+            ends_repeat,
+        }
+    }
+
+    /// Give `key` of keyboard A `event`, and check the reducer's decision.
+    fn assert_decision(
+        registry: &mut KeyGenerationRegistry,
+        key: u32,
+        event: GuestKeyEvent,
+        expected: GuestKeyDecision,
+    ) {
+        assert_eq!(
+            registry.transition_guest_key(KEYBOARD_A, key, event),
+            expected,
+            "{event:?} of key {key}"
+        );
+    }
+
+    /// [`assert_decision`] for each event of `steps` in turn.
+    fn assert_decisions(
+        registry: &mut KeyGenerationRegistry,
+        key: u32,
+        steps: &[(GuestKeyEvent, GuestKeyDecision)],
+    ) {
+        for &(event, expected) in steps {
+            assert_decision(registry, key, event, expected);
+        }
+    }
+
+    /// A registry whose compositor shortcut consumed the held `key`.
+    fn shortcut_consumed(key: u32) -> KeyGenerationRegistry {
+        let mut registry = KeyGenerationRegistry::default();
+        registry.observe_physical_state(KEYBOARD_A, key, 1);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::CompositorShortcutPress,
+            dropped(Some(true), false),
+        );
+        registry
     }
 
     /// The reducer used to ack a shortcut press or release as handled
@@ -3065,357 +2977,218 @@ mod tests {
     /// is now rejected: it is decided as the owner's physical event.
     #[test]
     fn compositor_shortcut_press_is_rejected_for_another_owner() {
-        let keyboard = HostId(10);
         let key = 16;
         for owner in [
             GuestKeyOwner::Physical,
             GuestKeyOwner::TextInputKeysym,
             GuestKeyOwner::ImeRecovery,
         ] {
-            let mut registry = KeyGenerationRegistry::default();
-            registry.observe_physical_state(keyboard, key, 1);
-            assert!(registry.claim_guest_owner(keyboard, key, owner));
-            let mut reference = KeyGenerationRegistry::default();
-            reference.observe_physical_state(keyboard, key, 1);
-            assert!(reference.claim_guest_owner(keyboard, key, owner));
+            // `reference` gets the physical events the shortcut stands for.
+            let owned = || {
+                let mut registry = KeyGenerationRegistry::default();
+                registry.observe_physical_state(KEYBOARD_A, key, 1);
+                assert!(registry.claim_guest_owner(KEYBOARD_A, key, owner));
+                registry
+            };
+            let (mut registry, mut reference) = (owned(), owned());
 
             let decision = registry.transition_guest_key(
-                keyboard,
+                KEYBOARD_A,
                 key,
                 GuestKeyEvent::CompositorShortcutPress,
             );
-            let duplicate = reference.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            );
-            assert_eq!(decision, duplicate, "{owner:?}");
-            assert_eq!(decision.delivery, GuestKeyDelivery::Drop, "{owner:?}");
             assert_eq!(
-                decision.ack_handled,
-                Some(owner != GuestKeyOwner::ImeRecovery),
+                decision,
+                reference.transition_guest_key(KEYBOARD_A, key, PRESS),
                 "{owner:?}"
             );
-            assert_eq!(registry.guest_owner(keyboard, key), Some(owner));
+            assert_eq!(
+                decision,
+                dropped(Some(owner != GuestKeyOwner::ImeRecovery), false),
+                "{owner:?}"
+            );
+            assert_eq!(registry.guest_owner(KEYBOARD_A, key), Some(owner));
 
             // A shortcut release of that generation is a physical release.
-            let release = registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::CompositorShortcutRelease,
-            );
             assert_eq!(
-                release,
-                reference.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
+                registry.transition_guest_key(
+                    KEYBOARD_A,
+                    key,
+                    GuestKeyEvent::CompositorShortcutRelease
+                ),
+                reference.transition_guest_key(KEYBOARD_A, key, GuestKeyEvent::PhysicalRelease),
                 "{owner:?}"
             );
             assert_eq!(
-                registry.guest_owner(keyboard, key),
-                reference.guest_owner(keyboard, key)
+                registry.guest_owner(KEYBOARD_A, key),
+                reference.guest_owner(KEYBOARD_A, key)
             );
         }
     }
 
     #[test]
     fn physical_events_of_a_consumed_shortcut_stay_with_the_shortcut() {
-        let keyboard = HostId(10);
         let key = 16;
-        let mut registry = KeyGenerationRegistry::default();
-        registry.observe_physical_state(keyboard, key, 1);
-        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
-        let consumed = GuestKeyDecision {
-            delivery: GuestKeyDelivery::Drop,
-            ack_handled: Some(true),
-            ends_repeat: false,
-        };
-        for repeated in [false, true] {
+        let mut registry = shortcut_consumed(key);
+        for event in [PRESS, REPEAT] {
+            assert_decision(&mut registry, key, event, dropped(Some(true), false));
             assert_eq!(
-                registry.transition_guest_key(
-                    keyboard,
-                    key,
-                    GuestKeyEvent::PhysicalPress {
-                        repeated,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
-                ),
-                consumed,
-                "repeated: {repeated}"
-            );
-            assert_eq!(
-                registry.guest_owner(keyboard, key),
+                registry.guest_owner(KEYBOARD_A, key),
                 Some(GuestKeyOwner::CompositorShortcut)
             );
         }
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
-            GuestKeyDecision {
-                ends_repeat: true,
-                ..consumed
-            }
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::PhysicalRelease,
+            dropped(Some(true), true),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
 
     #[test]
     fn ime_recovery_does_not_replay_a_compositor_shortcut_key() {
-        let keyboard = HostId(10);
         let key = 16;
-        let mut registry = KeyGenerationRegistry::default();
-        registry.observe_physical_state(keyboard, key, 1);
-        registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+        let mut registry = shortcut_consumed(key);
 
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::RecoverIme),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "a consumed shortcut key must not reach the guest as a recovered pair"
+        // A consumed shortcut key must not reach the guest as a recovered
+        // pair, and recovery must leave its ownership for the release.
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::RecoverIme,
+            dropped(None, false),
         );
         assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::CompositorShortcut),
-            "recovery must leave shortcut ownership intact for the release"
+            registry.guest_owner(KEYBOARD_A, key),
+            Some(GuestKeyOwner::CompositorShortcut)
         );
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(true),
-                ends_repeat: true,
-            }
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::CompositorShortcutRelease,
+            dropped(Some(true), true),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
     }
 
     #[test]
     fn guest_key_reducer_couples_delivery_ack_and_generation_ownership() {
-        let keyboard = HostId(10);
-        let physical_key = 30;
-        let accelerator_key = 31;
-        let keysym_key = 32;
         let mut registry = KeyGenerationRegistry::default();
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::TextInputPress { serial: 1 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "a second protocol channel cannot duplicate the physical press"
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: true,
-                    host_accelerator: false,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::PhysicalRelease,),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: Some(true),
-                ends_repeat: true,
-            }
+        let physical_key = 30;
+        assert_decisions(
+            &mut registry,
+            physical_key,
+            &[
+                (PRESS, forwarded(Some(true), false)),
+                // A second protocol channel cannot duplicate the press.
+                (
+                    GuestKeyEvent::TextInputPress { serial: 1 },
+                    dropped(None, false),
+                ),
+                (REPEAT, forwarded(Some(true), false)),
+                (GuestKeyEvent::PhysicalRelease, forwarded(Some(true), true)),
+                (
+                    GuestKeyEvent::RecoverIme,
+                    GuestKeyDecision {
+                        delivery: GuestKeyDelivery::EmitBalancedPair,
+                        ack_handled: None,
+                        ends_repeat: false,
+                    },
+                ),
+                // A delayed physical press cannot duplicate the recovered
+                // pair.
+                (
+                    GuestKeyEvent::PhysicalPress {
+                        repeated: false,
+                        host_accelerator: false,
+                        ime_repeat_active: true,
+                    },
+                    dropped(Some(false), false),
+                ),
+            ],
         );
 
-        assert_eq!(
-            registry.transition_guest_key(keyboard, physical_key, GuestKeyEvent::RecoverIme,),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::EmitBalancedPair,
-                ack_handled: None,
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                physical_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: false,
-                    ime_repeat_active: true,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            },
-            "delayed physical delivery cannot duplicate a recovered pair"
+        // An accelerator release cannot escape without a guest press.
+        let accelerator_key = 31;
+        assert_decisions(
+            &mut registry,
+            accelerator_key,
+            &[
+                (ACCELERATOR_PRESS, dropped(Some(false), false)),
+                (GuestKeyEvent::PhysicalRelease, dropped(Some(false), true)),
+            ],
         );
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                accelerator_key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: true,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                accelerator_key,
-                GuestKeyEvent::PhysicalRelease,
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: true,
-            },
-            "an accelerator release cannot escape without a guest press"
-        );
-
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                keysym_key,
-                GuestKeyEvent::TextInputPress { serial: 10 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: None,
-                ends_repeat: false,
-            }
-        );
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, keysym_key, GuestKeyEvent::TextInputRepeat,)
-                .delivery,
-            GuestKeyDelivery::Forward
-        );
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                keysym_key,
-                GuestKeyEvent::TextInputRelease { serial: 11 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Forward,
-                ack_handled: None,
-                ends_repeat: true,
-            }
-        );
-        assert_eq!(
-            registry
-                .transition_guest_key(
-                    keyboard,
-                    keysym_key,
+        // Each synthetic press has exactly one releasable owner.
+        let keysym_key = 32;
+        assert_decisions(
+            &mut registry,
+            keysym_key,
+            &[
+                (
+                    GuestKeyEvent::TextInputPress { serial: 10 },
+                    forwarded(None, false),
+                ),
+                (GuestKeyEvent::TextInputRepeat, forwarded(None, false)),
+                (
+                    GuestKeyEvent::TextInputRelease { serial: 11 },
+                    forwarded(None, true),
+                ),
+                (
                     GuestKeyEvent::TextInputRelease { serial: 12 },
-                )
-                .delivery,
-            GuestKeyDelivery::Drop,
-            "each synthetic press has exactly one releasable owner"
+                    dropped(None, false),
+                ),
+            ],
         );
     }
 
     #[test]
     fn guest_key_reducer_prevents_keysym_from_bypassing_accelerator_generation() {
-        let keyboard = HostId(10);
         let key = 57;
         let mut registry = KeyGenerationRegistry::default();
 
-        registry.observe_peek_press(keyboard, key, 10, 100, false);
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::TextInputPress { serial: 10 },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: None,
-                ends_repeat: false,
-            },
-            "an ineligible held peek generation is already known to be a host accelerator"
+        // An ineligible held peek generation is already known to be a host
+        // accelerator.
+        registry.observe_peek_press(KEYBOARD_A, key, 10, 100, false);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::TextInputPress { serial: 10 },
+            dropped(None, false),
         );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
 
-        assert_eq!(
-            registry.transition_guest_key(
-                keyboard,
-                key,
-                GuestKeyEvent::PhysicalPress {
-                    repeated: false,
-                    host_accelerator: true,
-                    ime_repeat_active: false,
-                },
-            ),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: false,
-            }
+        // The text-input channel must also honor explicit accelerator
+        // suppression.
+        assert_decisions(
+            &mut registry,
+            key,
+            &[
+                (ACCELERATOR_PRESS, dropped(Some(false), false)),
+                (
+                    GuestKeyEvent::TextInputPress { serial: 11 },
+                    dropped(None, false),
+                ),
+            ],
         );
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 11 },)
-                .delivery,
-            GuestKeyDelivery::Drop,
-            "the text-input channel must also honor explicit accelerator suppression"
+        registry.observe_peek_release(KEYBOARD_A, key, 12);
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::PhysicalRelease,
+            dropped(Some(false), true),
         );
-        registry.observe_peek_release(keyboard, key, 12);
-        assert_eq!(
-            registry.transition_guest_key(keyboard, key, GuestKeyEvent::PhysicalRelease),
-            GuestKeyDecision {
-                delivery: GuestKeyDelivery::Drop,
-                ack_handled: Some(false),
-                ends_repeat: true,
-            }
-        );
-        assert_eq!(registry.guest_owner(keyboard, key), None);
-        assert_eq!(
-            registry
-                .transition_guest_key(keyboard, key, GuestKeyEvent::TextInputPress { serial: 13 },)
-                .delivery,
-            GuestKeyDelivery::Forward,
-            "accelerator suppression must not leak into the next released generation"
+        assert_eq!(registry.guest_owner(KEYBOARD_A, key), None);
+
+        // Accelerator suppression must not leak into the next released
+        // generation.
+        assert_decision(
+            &mut registry,
+            key,
+            GuestKeyEvent::TextInputPress { serial: 13 },
+            forwarded(None, false),
         );
     }
 
@@ -3460,16 +3233,8 @@ mod tests {
                 encoded /= operations.len();
                 serial = serial.wrapping_add(1);
                 let event = match operation {
-                    Operation::PhysicalPress => GuestKeyEvent::PhysicalPress {
-                        repeated: false,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
-                    Operation::PhysicalRepeat => GuestKeyEvent::PhysicalPress {
-                        repeated: true,
-                        host_accelerator: false,
-                        ime_repeat_active: false,
-                    },
+                    Operation::PhysicalPress => PRESS,
+                    Operation::PhysicalRepeat => REPEAT,
                     Operation::PhysicalRelease => GuestKeyEvent::PhysicalRelease,
                     Operation::TextPress => GuestKeyEvent::TextInputPress { serial },
                     Operation::TextRepeat => GuestKeyEvent::TextInputRepeat,
@@ -4115,38 +3880,32 @@ mod tests {
         assert!(peek.eligible);
     }
 
+    /// A physical press that reaches the proxy after the IME's keysym press
+    /// of the same key joins that press's generation.
     #[test]
-    fn delayed_keyboard_press_preserves_keysym_release_owner() {
-        let keyboard = HostId(10);
+    fn delayed_physical_press_preserves_keysym_release_owner() {
+        type ObservePress = fn(&mut KeyGenerationRegistry, u32);
+        let channels: [(&str, ObservePress); 2] = [
+            ("wl_keyboard", |registry, key| {
+                registry.observe_physical_state(KEYBOARD_A, key, 1)
+            }),
+            ("peek", |registry, key| {
+                registry.observe_peek_press(KEYBOARD_A, key, 1, 10, true);
+            }),
+        ];
         let key = 30;
-        let mut registry = KeyGenerationRegistry::default();
+        for (channel, observe_press) in channels {
+            let mut registry = KeyGenerationRegistry::default();
+            assert!(registry.claim_guest_owner(KEYBOARD_A, key, GuestKeyOwner::TextInputKeysym));
+            observe_press(&mut registry, key);
 
-        assert!(registry.claim_guest_owner(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        registry.observe_physical_state(keyboard, key, 1);
-
-        assert!(registry.physically_held(keyboard, key));
-        assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::TextInputKeysym),
-            "the duplicate keyboard channel must not orphan the synthetic press"
-        );
-    }
-
-    #[test]
-    fn delayed_peek_press_preserves_keysym_release_owner() {
-        let keyboard = HostId(10);
-        let key = 30;
-        let mut registry = KeyGenerationRegistry::default();
-
-        assert!(registry.claim_guest_owner(keyboard, key, GuestKeyOwner::TextInputKeysym));
-        registry.observe_peek_press(keyboard, key, 1, 10, true);
-
-        assert!(registry.physically_held(keyboard, key));
-        assert_eq!(
-            registry.guest_owner(keyboard, key),
-            Some(GuestKeyOwner::TextInputKeysym),
-            "a delayed peek must not orphan the synthetic press"
-        );
+            assert!(registry.physically_held(KEYBOARD_A, key), "{channel}");
+            assert_eq!(
+                registry.guest_owner(KEYBOARD_A, key),
+                Some(GuestKeyOwner::TextInputKeysym),
+                "a delayed {channel} press must not orphan the synthetic press"
+            );
+        }
     }
 
     #[test]
