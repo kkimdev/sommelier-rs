@@ -22,6 +22,7 @@ limitations under the License.
 
 mod client;
 mod clock;
+mod display;
 mod editor;
 mod engine;
 pub(crate) mod exo;
