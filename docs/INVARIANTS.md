@@ -924,7 +924,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     alone leaves it without one. GTK tells an empty preedit from none
     and emits `preedit-start` for one over none
     (`gtk/gtkimcontextwayland.c` 241-244), on which GTK4's `GtkText`
-    deletes the selection (`gtk/gtktext.c` 4491), as does `GtkTextView`.
+    deletes the selection (`gtk_text_preedit_start_cb`, `gtk/gtktext.c`
+    4491), as does `GtkTextView` (`gtk_text_view_preedit_start_handler`,
+    `gtk/gtktextview.c` 8834).
     Chromium applies one that differs from the preedit it last applied
     (`zwp_text_input_v3.cc` 466), and an empty composition over none
     deletes the selection (`ui/base/ime/linux/input_method_auralinux.cc`
@@ -934,6 +936,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     that a delete arrived, not its lengths), and while nothing is
     composed `InputMethodAuraLinux::OnDeleteSurroundingText` deletes the
     selection (`input_method_auralinux.cc` 518).
+  - no `commit_string("")`, which inserts nothing. GTK emits `commit`
+    for it all the same (`text_input_commit_apply`,
+    `gtk/gtkimcontextwayland.c` 281-282), and GTK4's `GtkText` and
+    `GtkTextView` delete the selection before they insert the text
+    (`gtk_text_enter_text`, `gtk/gtktext.c` 4592-4593;
+    `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779). Chromium
+    skips an empty commit (`zwp_text_input_v3.cc` 452).
 
   Tests: `host_ime_events_become_v3_transactions`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,

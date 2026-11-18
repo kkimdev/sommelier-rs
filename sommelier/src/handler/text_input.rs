@@ -747,7 +747,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return drop_host_commit(ctx, guest_id);
         }
 
-        if !push_commit_string_to(&mut transaction, guest_id, text) {
+        // An empty commit inserts nothing, so it goes as no event
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        if !text.is_empty() && !push_commit_string_to(&mut transaction, guest_id, text) {
             return drop_host_commit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -4747,6 +4749,17 @@ mod tests {
                 vec![DONE],
             ),
             (
+                // GTK emits `commit` for an empty commit_string too
+                // (`text_input_commit_apply`, `gtk/gtkimcontextwayland.c`
+                // 281-282, GTK 92348cd4), and GTK4's `GtkText` and
+                // `GtkTextView` delete the selection before they insert it
+                // (`gtk_text_enter_text`, `gtk/gtktext.c` 4592-4593;
+                // `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779).
+                "an empty commit sends no commit_string",
+                |f| vec![f.commit(""), f.preedit("미완성", ""), f.commit("")],
+                vec![DONE, preedit("미완성"), DONE, no_preedit(), DONE],
+            ),
+            (
                 "a commit clears the preedit",
                 |f| vec![f.preedit("미완성", ""), f.commit("確定")],
                 vec![preedit("미완성"), DONE, no_preedit(), commit("確定"), DONE],
@@ -5035,10 +5048,11 @@ mod tests {
                 vec![delete(1, 0), DONE_2],
             ),
             (
+                // It sends no commit_string either (`host_ime_events_become_v3_transactions`).
                 "an empty commit without a preedit edits nothing",
                 Some(("abc", 3, 3)),
                 |f| vec![f.commit(""), f.delete_range(2, 1)],
-                vec![commit(""), DONE_2, delete(1, 0), DONE_2],
+                vec![DONE_2, delete(1, 0), DONE_2],
             ),
             (
                 // Exo deletes "cX" of its "abcX|def"; in the guest's
