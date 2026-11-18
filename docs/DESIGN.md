@@ -410,9 +410,13 @@ under [Keyboard and IME](INVARIANTS.md#keyboard-and-ime).
 Keys can reach the guest twice: as a `wl_keyboard.key` and as a
 host-generated keysym from the IME. `state/input.rs` assigns each physical
 key a generation and an owner (guest keyboard, IME, or a compositor
-shortcut), so every press gets exactly one matching release no matter
-which path delivers it. Keymaps are compiled locally with xkbcommon to map
-keysyms back to keycodes and to classify chords; chords listed in
+shortcut), so a press is released through the path that delivered it,
+and never twice. Once the key is pressed again, only one older
+generation per path still waits for its release, and a late IME keysym
+release does not close its press; see
+[Keyboard and IME](INVARIANTS.md#keyboard-and-ime). Keymaps are
+compiled locally with xkbcommon to map keysyms back to keycodes and to
+classify chords; chords listed in
 `SOMMELIER_ACCELERATORS` are acknowledged as not handled through
 `zcr_extended_keyboard_v1.ack_key`, so Exo keeps them as accelerators.
 

@@ -634,7 +634,7 @@ struct PeekWatermark {
 /// IME recovery already emitted a balanced pair and later host events must be
 /// suppressed. Encoding these states as one enum prevents the parallel-set
 /// inconsistencies that previously caused duplicate and stuck keys.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GuestKeyOwner {
     Physical,
     TextInputKeysym,
@@ -713,7 +713,6 @@ pub struct GuestKeyDecision {
 /// wrap-aware ordering against the press serial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetiredGuestRelease {
-    owner: GuestKeyOwner,
     press_serial: Option<u32>,
     release_serial: Option<u32>,
     next_press_serial: Option<u32>,
@@ -789,7 +788,16 @@ impl KeyGeneration {
 pub struct KeyGenerationRegistry {
     next_generation: u64,
     entries: HashMap<HostId, HashMap<u32, KeyGeneration>>,
-    retired_guest_releases: HashMap<(HostId, u32), Vec<RetiredGuestRelease>>,
+    /// Releases that retired generations of each keyboard's key still owe
+    /// the guest, at most one per channel that pressed them (`Physical` or
+    /// `TextInputKeysym`); the current generation's lives in `entries`. A
+    /// newer retired release replaces the older one. Exo sends each
+    /// `wl_keyboard.key` right after its `peek_key`, so a replaced
+    /// `wl_keyboard` release is not coming; it sends no keysym releases, so
+    /// a keysym entry only waits, and the bound stops such entries piling
+    /// up. See INVARIANTS "A key waits for at most one late release per
+    /// channel".
+    retired_guest_releases: HashMap<(HostId, u32, GuestKeyOwner), RetiredGuestRelease>,
     latest_peek_sequences: HashMap<(u32, Option<u32>), PeekWatermark>,
 }
 
@@ -847,7 +855,7 @@ impl KeyGenerationRegistry {
             .chain(
                 self.retired_guest_releases
                     .keys()
-                    .map(|&(keyboard, _)| keyboard),
+                    .map(|&(keyboard, _, _)| keyboard),
             )
             .chain(
                 self.latest_peek_sequences
@@ -870,7 +878,7 @@ impl KeyGenerationRegistry {
     pub(crate) fn clear_keyboard(&mut self, keyboard: HostId) {
         self.entries.remove(&keyboard);
         self.retired_guest_releases
-            .retain(|(pending_keyboard, _), _| *pending_keyboard != keyboard);
+            .retain(|(pending_keyboard, _, _), _| *pending_keyboard != keyboard);
         self.latest_peek_sequences
             .retain(|_, watermark| watermark.keyboard != keyboard);
     }
@@ -944,8 +952,8 @@ impl KeyGenerationRegistry {
         key: u32,
         serial: u32,
     ) -> bool {
-        self.take_retired_guest_release(keyboard, key, |release| {
-            release.owner == GuestKeyOwner::Physical && release.release_serial == Some(serial)
+        self.take_retired_guest_release(keyboard, key, GuestKeyOwner::Physical, |release| {
+            release.release_serial == Some(serial)
         })
     }
 
@@ -964,11 +972,10 @@ impl KeyGenerationRegistry {
                     .guest_press_serial
                     .or(generation.peek_press_serial)
             });
-        self.take_retired_guest_release(keyboard, key, |release| {
-            release.owner == GuestKeyOwner::TextInputKeysym
-                && release
-                    .press_serial
-                    .is_some_and(|press_serial| serial_is_after(serial, press_serial))
+        self.take_retired_guest_release(keyboard, key, GuestKeyOwner::TextInputKeysym, |release| {
+            release
+                .press_serial
+                .is_some_and(|press_serial| serial_is_after(serial, press_serial))
                 && release
                     .next_press_serial
                     .or(current_press_serial)
@@ -980,20 +987,18 @@ impl KeyGenerationRegistry {
         &mut self,
         keyboard: HostId,
         key: u32,
-        predicate: impl Fn(&RetiredGuestRelease) -> bool,
+        owner: GuestKeyOwner,
+        matches: impl FnOnce(&RetiredGuestRelease) -> bool,
     ) -> bool {
-        let map_key = (keyboard, key);
-        let Some(releases) = self.retired_guest_releases.get_mut(&map_key) else {
-            return false;
-        };
-        let Some(index) = releases.iter().position(predicate) else {
-            return false;
-        };
-        releases.remove(index);
-        if releases.is_empty() {
+        let map_key = (keyboard, key, owner);
+        let taken = self
+            .retired_guest_releases
+            .get(&map_key)
+            .is_some_and(matches);
+        if taken {
             self.retired_guest_releases.remove(&map_key);
         }
-        true
+        taken
     }
 
     pub(crate) fn any_physically_held(&self, keyboard: HostId) -> bool {
@@ -1097,33 +1102,45 @@ impl KeyGenerationRegistry {
             return false;
         };
         let retired_release = match generation.guest_owner {
-            Some(GuestKeyOwner::Physical) => {
-                generation
-                    .physical_release_serial
-                    .map(|release_serial| RetiredGuestRelease {
-                        owner: GuestKeyOwner::Physical,
-                        press_serial: generation.guest_press_serial,
-                        release_serial: Some(release_serial),
-                        next_press_serial,
-                    })
+            Some(owner @ GuestKeyOwner::Physical) => {
+                generation.physical_release_serial.map(|release_serial| {
+                    (
+                        owner,
+                        RetiredGuestRelease {
+                            press_serial: generation.guest_press_serial,
+                            release_serial: Some(release_serial),
+                            next_press_serial,
+                        },
+                    )
+                })
             }
-            Some(GuestKeyOwner::TextInputKeysym) => {
-                generation
-                    .guest_press_serial
-                    .map(|press_serial| RetiredGuestRelease {
-                        owner: GuestKeyOwner::TextInputKeysym,
-                        press_serial: Some(press_serial),
-                        release_serial: None,
-                        next_press_serial,
-                    })
+            Some(owner @ GuestKeyOwner::TextInputKeysym) => {
+                generation.guest_press_serial.map(|press_serial| {
+                    (
+                        owner,
+                        RetiredGuestRelease {
+                            press_serial: Some(press_serial),
+                            release_serial: None,
+                            next_press_serial,
+                        },
+                    )
+                })
             }
             Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) | None => None,
         };
-        if let Some(retired_release) = retired_release {
-            self.retired_guest_releases
-                .entry((keyboard, key))
-                .or_default()
-                .push(retired_release);
+        if let Some((owner, retired_release)) = retired_release {
+            // Replaces the channel's older retired release, if any; see
+            // `retired_guest_releases`.
+            if let Some(replaced) = self
+                .retired_guest_releases
+                .insert((keyboard, key, owner), retired_release)
+            {
+                log::debug!(
+                    "key {key} of keyboard {}: a newer {owner:?} retired release \
+                     replaces {replaced:?}, whose release has not come",
+                    keyboard.0
+                );
+            }
         }
         if let Some(keys) = self.entries.get_mut(&keyboard) {
             keys.remove(&key);
@@ -1641,6 +1658,13 @@ impl KeyGenerationRegistry {
                             GuestKeyOwner::TextInputKeysym,
                         )
                 };
+                if !current {
+                    log::debug!(
+                        "dropping keysym release {serial} of key {key} of keyboard {}: \
+                         it matches no pending keysym press",
+                        keyboard.0
+                    );
+                }
                 GuestKeyDecision {
                     delivery: if current {
                         GuestKeyDelivery::Forward
@@ -3399,7 +3423,7 @@ mod tests {
         struct Model {
             next_generation: u64,
             keys: HashMap<u32, ModelGeneration>,
-            retired_guest_releases: HashMap<u32, Vec<RetiredGuestRelease>>,
+            retired_guest_releases: HashMap<(u32, GuestKeyOwner), RetiredGuestRelease>,
         }
 
         impl Model {
@@ -3432,35 +3456,37 @@ mod tests {
                     return false;
                 };
                 let retired_release = match generation.guest_owner {
-                    Some(GuestKeyOwner::Physical) => {
+                    Some(owner @ GuestKeyOwner::Physical) => {
                         generation.physical_release_serial.map(|release_serial| {
-                            RetiredGuestRelease {
-                                owner: GuestKeyOwner::Physical,
-                                press_serial: generation.guest_press_serial,
-                                release_serial: Some(release_serial),
-                                next_press_serial,
-                            }
+                            (
+                                owner,
+                                RetiredGuestRelease {
+                                    press_serial: generation.guest_press_serial,
+                                    release_serial: Some(release_serial),
+                                    next_press_serial,
+                                },
+                            )
                         })
                     }
-                    Some(GuestKeyOwner::TextInputKeysym) => {
-                        generation
-                            .guest_press_serial
-                            .map(|press_serial| RetiredGuestRelease {
-                                owner: GuestKeyOwner::TextInputKeysym,
-                                press_serial: Some(press_serial),
-                                release_serial: None,
-                                next_press_serial,
-                            })
+                    Some(owner @ GuestKeyOwner::TextInputKeysym) => {
+                        generation.guest_press_serial.map(|press_serial| {
+                            (
+                                owner,
+                                RetiredGuestRelease {
+                                    press_serial: Some(press_serial),
+                                    release_serial: None,
+                                    next_press_serial,
+                                },
+                            )
+                        })
                     }
                     Some(GuestKeyOwner::ImeRecovery | GuestKeyOwner::CompositorShortcut) | None => {
                         None
                     }
                 };
-                if let Some(retired_release) = retired_release {
+                if let Some((owner, retired_release)) = retired_release {
                     self.retired_guest_releases
-                        .entry(key)
-                        .or_default()
-                        .push(retired_release);
+                        .insert((key, owner), retired_release);
                 }
                 self.keys.remove(&key);
                 true
@@ -3744,25 +3770,23 @@ mod tests {
                                 .guest_press_serial
                                 .or(generation.peek_press_serial)
                         });
-                        let releases = model.retired_guest_releases.entry(key).or_default();
-                        let pending = releases.iter().position(|release| {
-                            release.owner == GuestKeyOwner::TextInputKeysym
-                                && release.press_serial.is_some_and(|press_serial| {
-                                    serial_is_after(serial, press_serial)
-                                })
-                                && release
-                                    .next_press_serial
-                                    .or(current_press_serial)
-                                    .is_none_or(|current_serial| {
-                                        !serial_is_after(serial, current_serial)
-                                    })
-                        });
-                        let expected = pending.is_some();
-                        if let Some(index) = pending {
-                            releases.remove(index);
-                        }
-                        if releases.is_empty() {
-                            model.retired_guest_releases.remove(&key);
+                        let pending = (key, GuestKeyOwner::TextInputKeysym);
+                        let expected =
+                            model
+                                .retired_guest_releases
+                                .get(&pending)
+                                .is_some_and(|release| {
+                                    release.press_serial.is_some_and(|press_serial| {
+                                        serial_is_after(serial, press_serial)
+                                    }) && release
+                                        .next_press_serial
+                                        .or(current_press_serial)
+                                        .is_none_or(|current_serial| {
+                                            !serial_is_after(serial, current_serial)
+                                        })
+                                });
+                        if expected {
+                            model.retired_guest_releases.remove(&pending);
                         }
                         assert_eq!(actual, expected);
                     }
@@ -3770,17 +3794,13 @@ mod tests {
                         let release_serial = serial.wrapping_sub(2);
                         let actual =
                             registry.take_pending_physical_release(keyboard, key, release_serial);
-                        let releases = model.retired_guest_releases.entry(key).or_default();
-                        let pending = releases.iter().position(|release| {
-                            release.owner == GuestKeyOwner::Physical
-                                && release.release_serial == Some(release_serial)
-                        });
-                        let expected = pending.is_some();
-                        if let Some(index) = pending {
-                            releases.remove(index);
-                        }
-                        if releases.is_empty() {
-                            model.retired_guest_releases.remove(&key);
+                        let pending = (key, GuestKeyOwner::Physical);
+                        let expected = model
+                            .retired_guest_releases
+                            .get(&pending)
+                            .is_some_and(|release| release.release_serial == Some(release_serial));
+                        if expected {
+                            model.retired_guest_releases.remove(&pending);
                         }
                         assert_eq!(actual, expected);
                     }
@@ -3845,8 +3865,8 @@ mod tests {
                     registry
                         .retired_guest_releases
                         .iter()
-                        .filter(|((pending_keyboard, _), _)| *pending_keyboard == keyboard)
-                        .map(|((_, key), releases)| (*key, releases.clone()))
+                        .filter(|((pending_keyboard, _, _), _)| *pending_keyboard == keyboard)
+                        .map(|(&(_, key, owner), &release)| ((key, owner), release))
                         .collect::<HashMap<_, _>>(),
                     model.retired_guest_releases
                 );
@@ -3934,8 +3954,8 @@ mod tests {
             "a release must match the retired interval immediately before it"
         );
         assert!(
-            registry.take_pending_text_input_release(keyboard, text_key, 11),
-            "an older delayed release must remain available after a newer interval closes"
+            !registry.take_pending_text_input_release(keyboard, text_key, 11),
+            "a newer retired release of the channel replaces the older one"
         );
         assert!(
             !registry.take_pending_text_input_release(keyboard, text_key, 21),
@@ -3951,6 +3971,64 @@ mod tests {
             "a physical release must survive the next generation across serial wrap"
         );
         assert!(registry.physically_held(keyboard, physical_key));
+    }
+
+    /// A host that never sends a channel's release of a key the guest got
+    /// leaves one retired release of that key pending, however often the
+    /// key is pressed again: the channel's newer retired release replaces
+    /// the older one.
+    #[test]
+    fn a_channel_keeps_one_pending_release_per_key() {
+        type Press = fn(&mut KeyGenerationRegistry, u32, u32);
+        type TakeRelease = fn(&mut KeyGenerationRegistry, u32, u32) -> bool;
+        let channels: [(&str, Press, TakeRelease); 2] = [
+            (
+                "wl_keyboard",
+                |registry, key, _| {
+                    let decision = registry.transition_guest_key(KEYBOARD_A, key, PRESS);
+                    assert_eq!(decision, forwarded(Some(true), false));
+                },
+                |registry, key, serial| {
+                    registry.take_pending_physical_release(KEYBOARD_A, key, serial)
+                },
+            ),
+            (
+                "keysym",
+                |registry, key, serial| {
+                    assert!(registry.claim_text_input_owner(KEYBOARD_A, key, serial));
+                },
+                |registry, key, serial| {
+                    registry.take_pending_text_input_release(KEYBOARD_A, key, serial)
+                },
+            ),
+        ];
+        let key = 30;
+        let generations = 100;
+        for (channel, press, take_release) in channels {
+            let mut registry = KeyGenerationRegistry::default();
+            // Generation g is pressed with serial 10g on the peek channel
+            // and on `channel`, and released with 10g + 1 on the peek
+            // channel only.
+            for generation in 1..=generations {
+                let serial = 10 * generation;
+                registry.observe_peek_press(KEYBOARD_A, key, serial, serial, true);
+                press(&mut registry, key, serial);
+                registry.observe_peek_release(KEYBOARD_A, key, serial + 1);
+            }
+            let next = 10 * (generations + 1);
+            registry.observe_peek_press(KEYBOARD_A, key, next, next, true);
+
+            for generation in 1..generations {
+                assert!(
+                    !take_release(&mut registry, key, 10 * generation + 1),
+                    "{channel}: generation {generation}'s release must not be taken"
+                );
+            }
+            assert!(
+                take_release(&mut registry, key, 10 * generations + 1),
+                "{channel}: the last generation must still take its release"
+            );
+        }
     }
 
     #[test]
