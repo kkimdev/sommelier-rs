@@ -392,6 +392,8 @@ mod tests {
             ("rkrr", "각", "ㄱ"),
             // A compound final takes no third consonant.
             ("ekfrr", "닭", "ㄱ"),
+            ("ekfrt", "닭", "ㅅ"),
+            ("dlfrt", "읽", "ㅅ"),
             // ㄸ, ㅃ and ㅉ are never finals.
             ("rkE", "가", "ㄸ"),
             ("rkQ", "가", "ㅃ"),
@@ -406,6 +408,17 @@ mod tests {
             ("rkRk", "가", "까"),
             ("rkTj", "가", "써"),
             ("rkrkr", "가", "각"),
+        ]);
+    }
+
+    #[test]
+    fn a_vowel_after_a_final_never_joins_the_medial() {
+        // ㅗ + ㅣ and ㅗ + ㅏ make compounds, and so do ㅜ + ㅣ, but the final
+        // stands between them.
+        check(&[
+            ("rhrl", "고", "기"),
+            ("rhrk", "고", "가"),
+            ("dnsl", "우", "니"),
         ]);
     }
 
