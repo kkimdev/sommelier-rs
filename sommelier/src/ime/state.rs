@@ -24,18 +24,8 @@ use super::guest::{GuestTxn, Preedit, TooLong};
 use super::host::{self, HostSteps};
 use super::serial::{CommitCount, Serial};
 use super::{BarrierToken, Env, HostTi, KeyEffect, LeaseOutcome, SeatId, SurfaceId, TiId};
-use crate::state::{HostContentType, V3Pending};
+use crate::state::{HostContentType, V3Committed, V3Pending};
 use crate::wire::Outgoing;
-
-/// The text-input-v3 state a guest has committed, but the cursor
-/// rectangle, which only the host keeps. Moved from `state/input.rs` in
-/// C3a; until then a copy of the type of the same name there.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct V3Committed {
-    pub(super) enabled: bool,
-    pub(super) surrounding_text: Option<(String, i32, i32)>,
-    pub(super) content_type: (u32, u32),
-}
 
 #[derive(Debug)]
 pub(super) struct TextInput {

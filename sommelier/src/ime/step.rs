@@ -482,7 +482,8 @@ impl ImeCore {
                 };
             fx.to_host.extend(surrounding_text.map(HostOut::Request));
             if let Some(content_type) = steps.content_type {
-                let requests = host::content_type_requests(host, content_type);
+                let ext = host.ext.map(|e| (e.id, e.version));
+                let requests = host::content_type_requests(host.v1, ext, content_type);
                 fx.to_host
                     .extend(requests.into_iter().map(HostOut::Request));
                 t.content_type_sent(content_type);

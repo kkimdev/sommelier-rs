@@ -34,6 +34,11 @@ mod step;
 #[cfg(test)]
 mod tests;
 
+// Shared with the old handlers until the staged switch deletes them.
+pub(crate) use guest::{delete_lengths, lengths_around_cursor};
+#[cfg(test)]
+pub(crate) use host::map_v3_content_type;
+pub(crate) use host::{content_type_requests, takes_surrounding_text_support};
 use state::TextInput;
 
 /// A guest `zwp_text_input_v3`.

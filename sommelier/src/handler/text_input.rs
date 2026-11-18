@@ -15,6 +15,9 @@ limitations under the License.
 */
 
 use crate::handler::callback::queue_internal_sync;
+use crate::ime::{
+    content_type_requests, delete_lengths, lengths_around_cursor, takes_surrounding_text_support,
+};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -110,42 +113,6 @@ fn resolve_preedit_cursor(
     (end, end)
 }
 
-/// Split the `length` bytes of `text` from byte `start` into the
-/// text-input-v3 lengths before and after `cursor`, the only form in which
-/// v3 can delete them.
-///
-/// # Returns
-///
-/// `None` if the range does not contain the cursor or does not lie on
-/// character boundaries of `text`.
-fn lengths_around_cursor(text: &str, cursor: i32, start: i64, length: u32) -> Option<(u32, u32)> {
-    let start = usize::try_from(start).ok()?;
-    let end = start.checked_add(usize::try_from(length).ok()?)?;
-    let cursor = usize::try_from(cursor).ok()?;
-    if !(start <= cursor && cursor <= end) || text.get(start..end).is_none() {
-        return None;
-    }
-    // Both lengths are at most `length`.
-    Some(((cursor - start) as u32, (end - cursor) as u32))
-}
-
-/// The text-input-v3 lengths of a v1 `delete_surrounding_text(index,
-/// length)` in `text` around `cursor`. A negative `index` can only mean the
-/// v1 XML's reading, relative to the cursor; Exo sends it non-negative,
-/// counted from the start of the text (docs/INVARIANTS.md, "Exo's deletes
-/// are absolute and stand alone").
-///
-/// # Returns
-///
-/// `None` as [`lengths_around_cursor`] does.
-fn delete_lengths(text: &str, cursor: i32, index: i32, length: u32) -> Option<(u32, u32)> {
-    let start = match index {
-        ..0 => i64::from(cursor) + i64::from(index),
-        _ => i64::from(index),
-    };
-    lengths_around_cursor(text, cursor, start, length)
-}
-
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
     static KEYCODES: std::sync::OnceLock<std::collections::BTreeMap<u32, u32>> =
         std::sync::OnceLock::new();
@@ -195,12 +162,6 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
         })
         .get(&sym)
         .copied()
-}
-
-fn extension_version_allows(version: u32, required: u32) -> bool {
-    // The unknown version of a test fixture is the largest, so it allows
-    // every request.
-    version >= required
 }
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -494,103 +455,6 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         ));
     }
     true
-}
-
-/// Map a v3 content type to the host's v1 `(hint, purpose)` and the
-/// extension's `(input_type, input_mode, input_flags, learning_mode)`.
-pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
-    use zcr_extended_text_input_v1 as ext;
-    use zwp_text_input_v1 as v1;
-    use zwp_text_input_v3 as v3;
-
-    // zwp_text_input_v1 has no PIN purpose and its values after PASSWORD are
-    // shifted by one compared with v3.
-    let mut v1_hint = hint;
-    let v1_purpose = match purpose {
-        v3::CONTENT_PURPOSE_NORMAL..=v3::CONTENT_PURPOSE_PASSWORD => purpose,
-        v3::CONTENT_PURPOSE_PIN => {
-            v1_hint |= v1::CONTENT_HINT_SENSITIVE_DATA;
-            v1::CONTENT_PURPOSE_DIGITS
-        }
-        v3::CONTENT_PURPOSE_DATE => v1::CONTENT_PURPOSE_DATE,
-        v3::CONTENT_PURPOSE_TIME => v1::CONTENT_PURPOSE_TIME,
-        v3::CONTENT_PURPOSE_DATETIME => v1::CONTENT_PURPOSE_DATETIME,
-        v3::CONTENT_PURPOSE_TERMINAL => v1::CONTENT_PURPOSE_TERMINAL,
-        _ => v1::CONTENT_PURPOSE_NORMAL, // Unknown values degrade to NORMAL.
-    };
-
-    // Chrome's extension uses TextInputType/TextInputMode enums rather than
-    // Wayland's content-purpose enum.
-    let multiline = hint & v3::CONTENT_HINT_MULTILINE != 0;
-    let input_type = match (purpose, multiline) {
-        (
-            v3::CONTENT_PURPOSE_NORMAL | v3::CONTENT_PURPOSE_ALPHA | v3::CONTENT_PURPOSE_NAME,
-            true,
-        ) => ext::INPUT_TYPE_TEXT_AREA,
-        (v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_NUMBER | v3::CONTENT_PURPOSE_PIN, _) => {
-            ext::INPUT_TYPE_NUMBER
-        }
-        (v3::CONTENT_PURPOSE_PHONE, _) => ext::INPUT_TYPE_TELEPHONE,
-        (v3::CONTENT_PURPOSE_URL, _) => ext::INPUT_TYPE_URL,
-        (v3::CONTENT_PURPOSE_EMAIL, _) => ext::INPUT_TYPE_EMAIL,
-        (v3::CONTENT_PURPOSE_PASSWORD, _) => ext::INPUT_TYPE_PASSWORD,
-        (v3::CONTENT_PURPOSE_DATE, _) => ext::INPUT_TYPE_DATE,
-        (v3::CONTENT_PURPOSE_TIME, _) => ext::INPUT_TYPE_TIME,
-        (v3::CONTENT_PURPOSE_DATETIME, _) => ext::INPUT_TYPE_DATE_TIME,
-        _ => ext::INPUT_TYPE_TEXT,
-    };
-    let input_mode = match purpose {
-        v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_PIN => ext::INPUT_MODE_NUMERIC,
-        v3::CONTENT_PURPOSE_NUMBER => ext::INPUT_MODE_DECIMAL,
-        v3::CONTENT_PURPOSE_PHONE => ext::INPUT_MODE_TEL,
-        v3::CONTENT_PURPOSE_URL => ext::INPUT_MODE_URL,
-        v3::CONTENT_PURPOSE_EMAIL => ext::INPUT_MODE_EMAIL,
-        _ => ext::INPUT_MODE_DEFAULT,
-    };
-
-    let mut input_flags = ext::INPUT_FLAGS_NONE;
-    if hint & v3::CONTENT_HINT_COMPLETION != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCOMPLETE_ON;
-    }
-    if hint & v3::CONTENT_HINT_SPELLCHECK != 0 {
-        // text-input-v3 calls bit 1 `spellcheck`. Chrome's extension keeps
-        // spellchecking distinct from its separate autocorrect flag.
-        input_flags |= ext::INPUT_FLAGS_SPELLCHECK_ON;
-    }
-    if hint & v3::CONTENT_HINT_AUTO_CAPITALIZATION != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_SENTENCES;
-    }
-    if hint & v3::CONTENT_HINT_LOWERCASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_NONE;
-    }
-    if hint & v3::CONTENT_HINT_UPPERCASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_CHARACTERS;
-    }
-    if hint & v3::CONTENT_HINT_TITLECASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_WORDS;
-    }
-    let secret = hint & (v3::CONTENT_HINT_HIDDEN_TEXT | v3::CONTENT_HINT_SENSITIVE_DATA) != 0
-        || matches!(
-            purpose,
-            v3::CONTENT_PURPOSE_PASSWORD | v3::CONTENT_PURPOSE_PIN
-        );
-    if secret {
-        input_flags |= ext::INPUT_FLAGS_HAS_BEEN_PASSWORD;
-    }
-
-    let learning_mode = if secret {
-        ext::LEARNING_MODE_DISABLED
-    } else {
-        ext::LEARNING_MODE_ENABLED
-    };
-    (
-        v1_hint,
-        v1_purpose,
-        input_type,
-        input_mode,
-        input_flags,
-        learning_mode,
-    )
 }
 
 /// Drop a host event that would set the preedit of active text input
@@ -1422,92 +1286,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 }
 
-/// Whether the extension `host_ext_id` takes `set_surrounding_text_support`.
-fn host_takes_surrounding_text_support(ctx: &Context, host_ext_id: Option<u32>) -> bool {
-    host_ext_id.is_some_and(|host_ext_id| {
-        extension_version_allows(
-            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
-            zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-        )
-    })
+/// The ID and version of the host extension `host_ext_id`, if any.
+fn host_ext(ctx: &Context, host_ext_id: Option<u32>) -> Option<(u32, u32)> {
+    host_ext_id.map(|id| (id, ctx.shadow_table.host_object_version_or_unknown(id)))
 }
 
-/// Push the host requests that set `content_type` on the text input
-/// `(host_v1_id, host_ext_id)`, with its surrounding-text support if it has
-/// one.
-fn push_content_type(
-    transaction: &mut Vec<Outgoing>,
-    ctx: &Context,
-    (host_v1_id, host_ext_id): (u32, Option<u32>),
-    content_type: HostContentType,
-) {
-    let (hint, purpose) = content_type.content_type;
-    let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
-        map_v3_content_type(hint, purpose);
-    let host_ext = host_ext_id.map(|host_ext_id| {
-        (
-            host_ext_id,
-            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
-        )
-    });
-    match host_ext {
-        // The extension XML says v8's set_input_type is "used in place of"
-        // v1 set_content_type. Exo applies the pending surrounding-text
-        // support to whichever of the two comes first and then resets it to
-        // supported, so sending both would always report the surrounding
-        // text as supported.
-        Some((host_ext_id, version))
-            if extension_version_allows(
-                version,
-                zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
-            ) =>
-        {
-            if let Some(supported) = content_type.surrounding_text_support {
-                transaction.push(
-                    zcr_extended_text_input_v1::req::set_surrounding_text_support(
-                        host_ext_id,
-                        if supported {
-                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
-                        } else {
-                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-                        },
-                    ),
-                );
-            }
-            // A text-input-v3 client supports inline preedit by definition.
-            transaction.push(zcr_extended_text_input_v1::req::set_input_type(
-                host_ext_id,
-                input_type,
-                input_mode,
-                input_flags,
-                learning_mode,
-                zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-            ));
-        }
-        // Before v8 the XML replaces nothing, so the four-argument request
-        // follows v1 set_content_type; v8's set_input_type would be a
-        // protocol error on v1-v7.
-        host_ext => {
-            debug_assert_eq!(content_type.surrounding_text_support, None);
-            transaction.push(zwp_text_input_v1::req::set_content_type(
-                host_v1_id, v1_hint, v1_purpose,
-            ));
-            if let Some((host_ext_id, _)) = host_ext.filter(|&(_, version)| {
-                extension_version_allows(
-                    version,
-                    zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
-                )
-            }) {
-                transaction.push(zcr_extended_text_input_v1::req::deprecated_set_input_type(
-                    host_ext_id,
-                    input_type,
-                    input_mode,
-                    input_flags,
-                    learning_mode,
-                ));
-            }
-        }
-    }
+/// The version of the host extension of text input `state`, if it has one.
+fn host_ext_version(ctx: &Context, state: &TextInputState) -> Option<u32> {
+    host_ext(ctx, state.host_ext_id).map(|(_, version)| version)
 }
 
 /// The host state the text input `state` should have.
@@ -1521,7 +1307,7 @@ fn host_target(ctx: &Context, state: &TextInputState) -> HostTarget {
         seat_live: live_host_seat(ctx, state).is_some(),
         content_type: HostContentType {
             content_type: state.committed.content_type,
-            surrounding_text_support: host_takes_surrounding_text_support(ctx, state.host_ext_id)
+            surrounding_text_support: takes_surrounding_text_support(host_ext_version(ctx, state))
                 .then_some(state.committed.surrounding_text.is_some()),
         },
     }
@@ -1665,7 +1451,8 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     } = commit.unwrap_or_default();
     let mut transaction = Vec::from_iter(surrounding_text);
     if let Some(content_type) = steps.content_type {
-        push_content_type(&mut transaction, ctx, host_ids, content_type);
+        let ext = host_ext(ctx, host_ids.1);
+        transaction.extend(content_type_requests(host_ids.0, ext, content_type));
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.host.apply_content_type(content_type);
         }
@@ -2198,6 +1985,7 @@ mod tests {
     use super::*;
     use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
+    use crate::ime::map_v3_content_type;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;

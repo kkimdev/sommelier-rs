@@ -97,18 +97,20 @@ impl GuestTxn {
     }
 }
 
-// The three helpers below are moved from handler/text_input.rs in
-// C1-move; until then they are verbatim copies of the functions of the
-// same names there.
-
+// TODO(after #80): delete the old copy in handler/text_input.rs, which
+// #80 changes to match this one.
 /// The cursor of the preedit `text` from the host's `preedit_styling`
 /// selection or `preedit_cursor`, which are byte offsets into it. An
 /// invalid one is ignored, with a warning, and the cursor goes at the end.
+/// An empty preedit's cursor is `(0, 0)`.
 pub(super) fn resolve_preedit_cursor(
     text: &str,
     selection: Option<(u32, u32)>,
     cursor: Option<i32>,
 ) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
     if let Some((index, length)) = selection {
         let end = index.saturating_add(length);
         if end <= text.len() as u32
@@ -149,7 +151,7 @@ pub(super) fn resolve_preedit_cursor(
 ///
 /// `None` if the range does not contain the cursor or does not lie on
 /// character boundaries of `text`.
-pub(super) fn lengths_around_cursor(
+pub(crate) fn lengths_around_cursor(
     text: &str,
     cursor: i32,
     start: i64,
@@ -174,7 +176,7 @@ pub(super) fn lengths_around_cursor(
 /// # Returns
 ///
 /// `None` as [`lengths_around_cursor`] does.
-pub(super) fn delete_lengths(
+pub(crate) fn delete_lengths(
     text: &str,
     cursor: i32,
     index: i32,
