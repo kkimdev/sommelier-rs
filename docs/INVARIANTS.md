@@ -403,11 +403,23 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   first `global_remove` until the global is retired or advertised anew,
   so this holds even when every registry that saw it was destroyed first.
   A registry destroyed while the global is still advertised retires
-  nothing.
+  nothing. Only a registry that lists the current advertisement keeps it
+  alive; one that still lists an older advertisement of a re-advertised
+  name neither delays retirement nor receives the proxy's bind of the
+  replacement. A guest bind through such a registry is currently a
+  protocol error; whether it should be is an open question, unpinned
+  because libwayland-server never reuses a name (see the name-reuse item
+  in HANDOVER.md). A guest bind through a registry that has not yet seen
+  the removal is forwarded. That relies on the host keeping a removed
+  global bindable until `wl_global_destroy`, as Exo does: it calls
+  `wl_global_remove` and defers `wl_global_destroy`. A host that destroyed
+  the global at once would make that bind an `INVALID_OBJECT` error, as
+  it would for a native client.
   Tests: `destroying_the_last_registry_to_list_a_removed_global_retires_it`,
   `a_removal_outlives_the_registry_that_saw_it`,
   `the_removal_of_a_dropped_global_waits_for_every_registry`,
-  `destroying_a_registry_keeps_a_global_no_registry_saw_removed`.
+  `destroying_a_registry_keeps_a_global_no_registry_saw_removed`,
+  `a_singleton_binding_moves_to_the_lowest_live_candidate`.
 - **A re-advertised name replaces its old generation.** When the host
   re-advertises a global under a previously removed numeric name, the
   connection-wide metadata for that name MUST be replaced before the new
@@ -421,9 +433,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `wl_shm`, `zwp_linux_dmabuf_v1`, `zcr_keyboard_extension_v1` and
   `zaura_shell` once per connection for its own use. A host may advertise
   one under a new name while the old name is bound; when the old one
-  retires, the proxy binds the lowest other name that a registry still
-  lists and that no registry has seen removed, since a compositor may
-  destroy a global as soon as it removes it.
+  retires, the proxy binds the lowest name (possibly the same name at a
+  new generation) that a registry still lists and that no registry has
+  seen removed, since a compositor may destroy a global as soon as it
+  removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
   `a_singleton_binding_moves_to_the_lowest_live_candidate`,
   `a_promoted_dmabuf_publishes_its_deferred_guest_global`.

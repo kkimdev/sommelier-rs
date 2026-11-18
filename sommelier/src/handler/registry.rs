@@ -838,7 +838,11 @@ fn admit_guest_bind(
         .unwrap_or(ctx.last_sender_id);
     // Once one registry has observed global_remove, a bind through it never
     // reaches the host, even while another registry is still receiving the
-    // old generation.
+    // old generation. A bind through a registry that has not seen it yet is
+    // forwarded below: that relies on the host keeping a removed global
+    // bindable until wl_global_destroy, as Exo does by deferring it after
+    // wl_global_remove. A host that destroyed it at once would answer the
+    // bind with INVALID_OBJECT, as it would a native client's.
     if let Some(inert_bind_version) = ctx
         .registry_global_removed
         .get(&registry_host_id)
@@ -2549,7 +2553,9 @@ mod tests {
         /// The registry sees the global's removal.
         Remove(Registry, u32),
         /// The registry sees the name advertised anew, for `wl_output`.
-        Reuse(Registry, u32),
+        ReuseAsOutput(Registry, u32),
+        /// The registry sees the name advertised anew, for `wl_shm` again.
+        ReadvertiseShm(Registry, u32),
         /// The guest destroys the registry through `wl_fixes`.
         Destroy(Registry),
     }
@@ -2563,12 +2569,14 @@ mod tests {
         id: u32,
     }
 
-    /// When the proxy's `wl_shm` binding retires, it binds the lowest other
-    /// name that a registry still lists and whose removal no registry has
-    /// seen, through the lowest registry that lists it.
+    /// When the proxy's `wl_shm` binding retires, it binds the lowest name
+    /// (possibly the same name at a new generation) that a registry still
+    /// lists and whose removal no registry has seen, through the lowest
+    /// registry that lists it. A registry lists a name only at the
+    /// generation it last saw advertised.
     #[test]
     fn a_singleton_binding_moves_to_the_lowest_live_candidate() {
-        use Step::{Destroy, Remove, Reuse};
+        use Step::{Destroy, ReadvertiseShm, Remove, ReuseAsOutput};
         struct Case {
             name: &'static str,
             /// The `wl_shm` names each registry lists, in the order the
@@ -2598,7 +2606,7 @@ mod tests {
                 // that has may see it advertised for another interface.
                 name: "a bound name reused by another interface hands the binding on",
                 listings: &[(A, &[10, 11]), (B, &[10])],
-                steps: &[Remove(A, 10), Reuse(A, 10)],
+                steps: &[Remove(A, 10), ReuseAsOutput(A, 10)],
                 bound: Some(11),
                 binds: &[Bind {
                     through: A,
@@ -2610,7 +2618,12 @@ mod tests {
             Case {
                 name: "a candidate name reused by another interface is no candidate",
                 listings: &[(A, &[10, 11]), (B, &[10, 11])],
-                steps: &[Remove(A, 11), Reuse(A, 11), Remove(A, 10), Remove(B, 10)],
+                steps: &[
+                    Remove(A, 11),
+                    ReuseAsOutput(A, 11),
+                    Remove(A, 10),
+                    Remove(B, 10),
+                ],
                 bound: None,
                 binds: &[],
                 candidates: &[],
@@ -2641,6 +2654,78 @@ mod tests {
                 bound: None,
                 binds: &[],
                 candidates: &[],
+            },
+            Case {
+                // Registry A lists only the old generation of name 10, so
+                // it cannot carry the bind of the new one.
+                name: "a name advertised anew is bound through a registry that lists it anew",
+                listings: &[(A, &[10]), (B, &[10])],
+                steps: &[Remove(B, 10), ReadvertiseShm(B, 10)],
+                bound: Some(10),
+                binds: &[Bind {
+                    through: B,
+                    name: 10,
+                    id: 3,
+                }],
+                candidates: &[10],
+            },
+            Case {
+                // Registry A still lists name 10, but only its old
+                // generation, so the removal of the new one retires it. A
+                // registry that lists the current generation keeps it, as
+                // in "a binding another registry lists stays" and the two
+                // rows below.
+                name: "a name advertised anew retires when only its old generation is listed",
+                listings: &[(A, &[10]), (B, &[10])],
+                steps: &[Remove(B, 10), ReadvertiseShm(B, 10), Remove(B, 10)],
+                bound: None,
+                binds: &[Bind {
+                    through: B,
+                    name: 10,
+                    id: 3,
+                }],
+                candidates: &[],
+            },
+            Case {
+                // A registry that still lists the name and sees it again
+                // after another registry advanced its generation adopts
+                // that generation, so it keeps the name alive.
+                name: "a registry listing a name anew adopts its new generation",
+                listings: &[(A, &[10]), (B, &[10])],
+                steps: &[
+                    Remove(B, 10),
+                    ReadvertiseShm(B, 10),
+                    ReadvertiseShm(A, 10),
+                    Remove(B, 10),
+                ],
+                bound: Some(10),
+                binds: &[Bind {
+                    through: B,
+                    name: 10,
+                    id: 3,
+                }],
+                candidates: &[10],
+            },
+            Case {
+                // Registry B saw the old generation removed, but A already
+                // advanced it; B's replacement joins A's generation rather
+                // than advancing it again, so A keeps the name alive.
+                name: "a lagging registry joins the generation another advanced",
+                listings: &[(A, &[10]), (B, &[10])],
+                steps: &[
+                    Remove(A, 10),
+                    ReadvertiseShm(A, 10),
+                    Remove(B, 10),
+                    ReadvertiseShm(B, 10),
+                    Remove(B, 10),
+                ],
+                bound: Some(10),
+                binds: &[Bind {
+                    through: A,
+                    name: 10,
+                    id: 3,
+                }],
+                candidates: &[10],
             },
             Case {
                 name: "a binding another registry lists stays",
@@ -2678,8 +2763,11 @@ mod tests {
                     Remove(registry, name) => {
                         registry.remove(&mut ctx, name);
                     }
-                    Reuse(registry, name) => {
+                    ReuseAsOutput(registry, name) => {
                         registry.global(&mut ctx, name, "wl_output", 3);
+                    }
+                    ReadvertiseShm(registry, name) => {
+                        registry.global(&mut ctx, name, "wl_shm", WL_SHM_VERSION);
                     }
                     Destroy(registry) => assert_eq!(registry.destroy(&mut ctx), Action::Forward),
                 }
