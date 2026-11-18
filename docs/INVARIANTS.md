@@ -884,9 +884,20 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `v3_requests_after_leave_are_ignored_until_next_enter`.
 - **A v3 transaction's events go in one order.** Every transaction the
   proxy sends a guest text input puts its events in this order, each one
-  it has: a `preedit_string("")` that clears the preedit the guest shows,
-  `delete_surrounding_text`, `commit_string`, a new non-empty
-  `preedit_string`, then `done`. It is the order of mutter, which sends
+  it has:
+  1. `preedit_string("")`, when the guest shows a preedit and the
+     transaction clears it, deletes or commits;
+  2. `delete_surrounding_text`;
+  3. `commit_string`;
+  4. `preedit_string` with the new, non-empty preedit;
+  5. `done`.
+
+  A shown preedit is thus gone before any delete or commit, and a
+  transaction that replaces it with a new one without editing text
+  sends only the new one. A client that applies the transaction at its
+  `done` keeps only the last `preedit_string`, so a clear followed by a
+  new preedit is the same to it as the new one alone. It is the order of
+  mutter, which sends
   a delete when the input method makes it, a commit right after a
   preedit clear, and the new preedit last, with the `done`
   (`src/wayland/meta-wayland-text-input.c` 317, 336-337 and 195-224,
@@ -910,8 +921,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   - SDL3 acts on each event as it arrives and turns a delete into a
     Backspace (`src/video/wayland/SDL_waylandevents.c` 2649-2710, main
     1fc62260fc81), which its `testime` ignores while a preedit is shown
-    (`test/testime.c` 1084-1086), so a delete after a new preedit deletes
-    nothing.
+    (`test/testime.c` 1084-1086), so a delete while the old or the new
+    preedit is shown deletes nothing.
 
   No transaction has both a delete and a commit yet, since Exo's deletes
   stand alone (next rule). One order also gives each transaction one wire

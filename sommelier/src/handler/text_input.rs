@@ -1179,11 +1179,19 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
-        // The delete goes first and the new preedit last; an empty region
-        // deletes nothing and clears only a shown preedit
-        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        // A shown preedit is cleared before the delete, and the new preedit
+        // goes last; an empty region deletes nothing and clears only a
+        // shown preedit (docs/INVARIANTS.md, "A v3 transaction's events go
+        // in one order").
+        let deletes = (before_length, after_length) != (0, 0);
         let mut transaction = Vec::new();
-        if (before_length, after_length) != (0, 0) {
+        if plan.had_preedit
+            && deletes
+            && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
+        {
+            return drop_host_preedit(ctx, guest_id);
+        }
+        if deletes {
             transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
                 guest_id,
                 before_length,
@@ -5404,12 +5412,18 @@ mod tests {
         .await;
         let expected = [delete(3, 0), preedit_at("나", 0, 0), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
+        // A region over the shown preedit clears it before its delete:
+        // SDL3 applies each event as it arrives and turns the delete into
+        // a Backspace (`text_input_delete_surrounding_text`,
+        // `src/video/wayland/SDL_waylandevents.c` 2683-2710, main
+        // 1fc62260fc81), which its `testime` ignores while a preedit shows
+        // (`test/testime.c` 1084-1086).
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
         ])
         .await;
-        let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
+        let expected = [no_preedit(), delete(6, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // The `done` of the guest's next commit repeats the region's
