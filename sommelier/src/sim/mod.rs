@@ -29,3 +29,4 @@ pub(crate) mod exo;
 mod hangul;
 mod keymap;
 mod sched;
+mod user;
