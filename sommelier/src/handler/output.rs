@@ -354,7 +354,7 @@ mod tests {
     };
     use crate::protocols::wayland::wl_output::WlOutputHandler;
     use crate::state::{GlobalBinding, OutputState};
-    use crate::test_support::{msg_sender, queued_headers};
+    use crate::test_support::queued_headers;
     use crate::window_layout::Rect;
 
     const OUTPUT_HOST: u32 = 20;
@@ -701,149 +701,176 @@ mod tests {
         );
     }
 
-    /// A bound output's release reaches the host, which acknowledges it; the
-    /// proxy sends no `delete_id` of its own.
-    #[test]
-    fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
-        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
-        ctx.outputs.bind_for_test(OUTPUT_HOST, Default::default());
+    mod session {
+        use crate::protocols::wayland::{wl_display, wl_output, wl_registry};
+        use crate::protocols::xdg_output_unstable_v1::{zxdg_output_manager_v1, zxdg_output_v1};
+        use crate::proxy::harness::{Object, Session};
+        use crate::wire::WL_DISPLAY_ID;
 
-        ctx.last_sender_id = 10;
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
-        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
-            [(OUTPUT_HOST, wl_output::REQ_RELEASE)]
-        );
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert!(ctx.shadow_table.is_pending_destroy_guest(10));
-    }
+        /// How many IDs the guest skips before its first object. The proxy
+        /// allocates host IDs densely from the bottom, so without the gap
+        /// each guest object could get its own ID on the host too, and a
+        /// forward that kept the guest ID would pass for a translated one.
+        const GUEST_ID_LEAD: u32 = 10;
 
-    /// An inert output (its bind crossed its global's removal) has no host
-    /// object, so its release completes in the proxy with one `delete_id`.
-    #[test]
-    fn inert_output_release_completes_locally() {
-        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
-        use crate::protocols::wayland::wl_output::{dispatch_request, REQ_RELEASE};
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table.create_local(10, "wl_output", 3);
+        /// A session whose guest IDs run [`GUEST_ID_LEAD`] ahead of the
+        /// host's.
+        fn session() -> Session {
+            let mut s = Session::new();
+            for _ in 0..GUEST_ID_LEAD {
+                s.new_id();
+            }
+            s
+        }
 
-        let mut release = crate::wire::WireMessage::new(10, REQ_RELEASE, &[]);
-        let dispatched = dispatch_request(&mut release, &mut OutputHandler, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(1, EVT_DELETE_ID)]
-        );
-        assert_eq!(ctx.shadow_table.get_interface(10), None);
-        assert!(!ctx.is_fatal());
-    }
+        /// The host advertises global `interface` at `version`, which the
+        /// guest is told of; returns its name.
+        async fn advertise(s: &mut Session, interface: &str, version: u32) -> u32 {
+            let name = s.advertise(interface, version).await;
+            let registry = s.registry().await;
+            let global = wl_registry::Event::Global {
+                name,
+                interface: interface.to_string(),
+                version,
+            };
+            assert_eq!(s.guest_received(), [(registry.id, global.into())]);
+            assert_eq!(s.host_received(), []);
+            name
+        }
 
-    /// Forwards every `zxdg_output_v1` message, as the proxy's dispatcher
-    /// does for an interface without a custom handler.
-    struct ForwardXdgOutput;
-    impl crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::ZxdgOutputV1Handler
-        for ForwardXdgOutput
-    {
-    }
+        /// The guest binds global `interface` at `version`, which the host
+        /// advertises first; returns the guest object and its host object.
+        async fn bind(s: &mut Session, interface: &str, version: u32) -> Object {
+            let name = advertise(s, interface, version).await;
+            let registry = s.registry().await;
+            let id = s.new_id();
+            let bind = wl_registry::req::bind(registry.id, name, interface, version, id).unwrap();
+            let host = s.create(bind).await;
+            assert_ne!(host, id);
+            Object { id, host }
+        }
 
-    /// Guest `zxdg_output_manager_v1` 30 on host 31 at `version`.
-    fn bind_xdg_output_manager(ctx: &mut Context, version: u32) {
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            30,
-            31,
-            "zxdg_output_manager_v1",
-            version,
-        );
-    }
+        /// A `wl_output` the guest binds after the host removed its global,
+        /// as when the bind and the removal cross: an inert output.
+        async fn inert_output(s: &mut Session) -> u32 {
+            let name = advertise(s, "wl_output", 3).await;
+            let registry = s.registry().await;
+            s.host([wl_registry::evt::global_remove(registry.host, name)])
+                .await;
+            let removed = wl_registry::Event::GlobalRemove { name };
+            assert_eq!(s.guest_received(), [(registry.id, removed.into())]);
+            let output = s.new_id();
+            s.guest([wl_registry::req::bind(registry.id, name, "wl_output", 3, output).unwrap()])
+                .await;
+            assert_eq!(s.host_received(), []);
+            output
+        }
 
-    /// Dispatch `get_xdg_output(40, output_guest)` from manager 30.
-    fn get_xdg_output(ctx: &mut Context, output_guest: u32) -> Option<Vec<u8>> {
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::{
-            dispatch_request, REQ_GET_XDG_OUTPUT,
-        };
-        let payload = [40u32.to_ne_bytes(), output_guest.to_ne_bytes()].concat();
-        let mut request = crate::wire::WireMessage::new(30, REQ_GET_XDG_OUTPUT, &payload);
-        ctx.last_sender_id = 30;
-        let dispatched = dispatch_request(&mut request, &mut OutputHandler, ctx);
-        dispatched
-            .expect("valid request")
-            .map(|(message, _)| message)
-    }
+        /// A bound output's release reaches the host, which acknowledges it;
+        /// the proxy sends no `delete_id` of its own.
+        #[tokio::test]
+        async fn bound_output_release_reaches_the_host_without_a_local_delete_id() {
+            let mut s = session();
+            let output = bind(&mut s, "wl_output", 3).await;
 
-    /// The xdg_output of a live output gets a host object; its events
-    /// reach the guest translated, at its manager's version.
-    #[test]
-    fn xdg_output_passes_through_with_translated_ids_and_versions() {
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            self, dispatch_event, EVT_DESCRIPTION, EVT_LOGICAL_SIZE,
-        };
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_xdg_output_manager(&mut ctx, 1);
-        ctx.shadow_table
-            .insert_paired_with_version_for_test(10, OUTPUT_HOST, "wl_output", 3);
+            s.guest([wl_output::req::release(output.id)]).await;
+            assert_eq!(
+                s.host_received(),
+                [(output.host, wl_output::Request::Release {}.into())]
+            );
+            assert_eq!(s.guest_received(), []);
 
-        let request = get_xdg_output(&mut ctx, 10).expect("forwarded");
-        let host_xdg_output = ctx.shadow_table.get_host_id(40).expect("host object");
-        assert_eq!(msg_sender(&request), 31);
-        assert_eq!(
-            request[8..],
-            [host_xdg_output.to_ne_bytes(), OUTPUT_HOST.to_ne_bytes()].concat()
-        );
+            s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, output.host)])
+                .await;
+            let deleted = wl_display::Event::DeleteId { id: output.id };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        }
 
-        // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
-        let size = [1600i32.to_ne_bytes(), 1000i32.to_ne_bytes()].concat();
-        let mut event = crate::wire::WireMessage::new(host_xdg_output, EVT_LOGICAL_SIZE, &size);
-        let (event, _) = dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx)
-            .expect("valid event")
-            .expect("forwarded");
-        assert_eq!(msg_sender(&event), 40);
-        assert_eq!(event[8..], size);
+        /// An inert output (its bind crossed its global's removal) has no
+        /// host object, so its release completes in the proxy with one
+        /// `delete_id`, which frees its ID.
+        #[tokio::test]
+        async fn inert_output_release_completes_locally() {
+            let mut s = session();
+            let output = inert_output(&mut s).await;
 
-        // `description` is a v2 event, which a v1 xdg_output never gets.
-        let (description, _) =
-            zxdg_output_v1::evt::description(host_xdg_output, "Built-in display").unwrap();
-        let mut event =
-            crate::wire::WireMessage::new(host_xdg_output, EVT_DESCRIPTION, &description[8..]);
-        assert!(matches!(
-            dispatch_event(&mut event, &mut ForwardXdgOutput, &mut ctx),
-            Err(crate::wire::ProtocolError::UnsupportedVersion { .. })
-        ));
-    }
+            s.guest([wl_output::req::release(output)]).await;
+            assert_eq!(s.host_received(), []);
+            let deleted = wl_display::Event::DeleteId { id: output };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
 
-    /// The xdg_output of an inert output is inert too: nothing reaches the
-    /// host, and its destroy completes in the proxy with one `delete_id`.
-    #[test]
-    fn xdg_output_of_an_inert_output_is_inert() {
-        use crate::protocols::wayland::wl_display::EVT_DELETE_ID;
-        use crate::protocols::xdg_output_unstable_v1::zxdg_output_v1::{
-            dispatch_request, REQ_DESTROY,
-        };
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        bind_xdg_output_manager(&mut ctx, 3);
-        ctx.shadow_table.create_local(10, "wl_output", 3);
+            // The ID is free for the guest's next object.
+            s.create(wl_display::req::sync(WL_DISPLAY_ID, output)).await;
+        }
 
-        assert_eq!(get_xdg_output(&mut ctx, 10), None);
-        assert_eq!(ctx.shadow_table.get_host_id(40), None);
-        assert!(ctx
-            .shadow_table
-            .request_object(40, "zxdg_output_v1")
-            .is_some());
-        assert_eq!(ctx.shadow_table.guest_object_version(40), Some(3));
+        /// The xdg_output of a live output gets a host object; its events
+        /// reach the guest translated, at its manager's version.
+        #[tokio::test]
+        async fn xdg_output_passes_through_with_translated_ids_and_versions() {
+            let mut s = session();
+            let manager = bind(&mut s, "zxdg_output_manager_v1", 1).await;
+            let output = bind(&mut s, "wl_output", 3).await;
+            let xdg_output = s.new_id();
 
-        let mut destroy = crate::wire::WireMessage::new(40, REQ_DESTROY, &[]);
-        let dispatched = dispatch_request(&mut destroy, &mut ForwardXdgOutput, &mut ctx);
-        assert!(matches!(dispatched, Ok(None)), "{dispatched:?}");
-        assert!(ctx.client_to_host_queue.is_empty());
-        assert_eq!(
-            queued_headers(&ctx.host_to_client_queue),
-            [(1, EVT_DELETE_ID)]
-        );
+            let get = zxdg_output_manager_v1::req::get_xdg_output;
+            s.guest([get(manager.id, xdg_output, output.id)]).await;
+            let forwarded = s.host_received();
+            let [(_, forward)] = &forwarded[..] else {
+                panic!("the host did not get one request: {forwarded:?}");
+            };
+            let host_xdg_output = forward.new_object().expect("an xdg_output").0;
+            assert_ne!(host_xdg_output, xdg_output);
+            let get = zxdg_output_manager_v1::Request::GetXdgOutput {
+                id: host_xdg_output,
+                output: output.host,
+            };
+            assert_eq!(forwarded, [(manager.host, get.into())]);
+
+            // A 2560x1600 panel at 1.6x is 1600x1000 in surface coordinates.
+            s.host([zxdg_output_v1::evt::logical_size(
+                host_xdg_output,
+                1600,
+                1000,
+            )])
+            .await;
+            let size = zxdg_output_v1::Event::LogicalSize {
+                width: 1600,
+                height: 1000,
+            };
+            assert_eq!(s.guest_received(), [(xdg_output, size.into())]);
+
+            // `description` is a v2 event, which a v1 xdg_output never gets:
+            // a host that sends it breaks the protocol.
+            let description = zxdg_output_v1::evt::description(host_xdg_output, "Built-in display");
+            s.host_fatal([description.unwrap()]).await;
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+            );
+        }
+
+        /// The xdg_output of an inert output is inert too: nothing reaches
+        /// the host, and its destroy completes in the proxy with one
+        /// `delete_id`.
+        #[tokio::test]
+        async fn xdg_output_of_an_inert_output_is_inert() {
+            let mut s = session();
+            let manager = bind(&mut s, "zxdg_output_manager_v1", 3).await;
+            let output = inert_output(&mut s).await;
+            let xdg_output = s.new_id();
+
+            let get = zxdg_output_manager_v1::req::get_xdg_output;
+            s.guest([get(manager.id, xdg_output, output)]).await;
+            // No event can show an inert object's version.
+            let table = &s.ctx().shadow_table;
+            assert_eq!(table.get_interface(xdg_output), Some("zxdg_output_v1"));
+            assert_eq!(table.guest_object_version(xdg_output), Some(3));
+
+            s.guest([zxdg_output_v1::req::destroy(xdg_output)]).await;
+            assert_eq!(s.host_received(), []);
+            let deleted = wl_display::Event::DeleteId { id: xdg_output };
+            assert_eq!(s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+        }
     }
 
     /// Dock the panel and an external monitor, move a window onto the

@@ -34,7 +34,7 @@ use tokio::time::Instant;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]
-mod harness;
+pub(crate) mod harness;
 
 type DispatchResult = Result<Option<Outgoing>, ProtocolError>;
 
