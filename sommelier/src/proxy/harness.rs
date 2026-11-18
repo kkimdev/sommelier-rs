@@ -405,6 +405,14 @@ impl Session {
         Object { id, host }
     }
 
+    /// A `wl_touch` the guest gets from `seat`.
+    pub(crate) async fn touch(&mut self, seat: u32) -> Object {
+        use crate::protocols::wayland::wl_seat;
+        let id = self.new_id();
+        let host = self.create(wl_seat::req::get_touch(seat, id)).await;
+        Object { id, host }
+    }
+
     /// The host sends `keyboard` the [`default_keymap`], which the guest
     /// gets.
     pub(crate) async fn keymap(&mut self, keyboard: Object) {

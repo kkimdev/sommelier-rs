@@ -1877,12 +1877,12 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     }
 }
 
-/// A press on guest surface `surface`, a press the guest has yet to get:
-/// end the composition of the text input that
-/// [`TextInputState::prepare_press_commit`] says the press ends. Only one
-/// can be: one text input on a connection is enabled at a time. The guest
-/// commits the preedit it shows, and the host `reset`s, which drops Exo's
-/// composition without an event back.
+/// A press on guest surface `surface`, a pointer button's or a
+/// touch-down, that the guest has yet to get: end the composition of the
+/// text input that [`TextInputState::prepare_press_commit`] says the press
+/// ends. Only one can be: one text input on a connection is enabled at a
+/// time. The guest commits the preedit it shows, and the host `reset`s,
+/// which drops Exo's composition without an event back.
 ///
 /// # Returns
 ///
@@ -1907,7 +1907,7 @@ pub(crate) fn end_composition_on_press(
     if !commit_shown_preedit(ctx, guest_id, plan) {
         return Action::Forward;
     }
-    log::debug!("A pointer press ended the composition of text input {guest_id}");
+    log::debug!("A press ended the composition of text input {guest_id}");
     ctx.client_to_host_queue
         .push(zwp_text_input_v1::req::reset(host_v1_id));
     let callback = queue_internal_sync(
@@ -1924,7 +1924,7 @@ pub(crate) fn end_composition_on_press(
 }
 
 /// Complete the fence ([`InternalCallback::TextInputResetFence`]) of the
-/// `reset` a pointer press sent for guest text input `guest_id`. The
+/// `reset` a press sent for guest text input `guest_id`. The
 /// callback names the fence alone: a pending callback's ID is in no other
 /// use, so a text input that reuses the guest ID cannot hold it.
 pub(crate) fn complete_reset_fence(ctx: &mut Context, callback_id: HostId, guest_id: u32) {
@@ -1940,8 +1940,8 @@ pub(crate) fn complete_reset_fence(ctx: &mut Context, callback_id: HostId, guest
 /// latest commit, as Chromium does. A `done` applies the preedit sent since
 /// the previous one, or none, so this one repeats the preedit the guest
 /// shows. Unlike mutter and KWin, the proxy does not end the host's
-/// composition when the guest resets its own; only a pointer press does
-/// ([`end_composition_on_press`]).
+/// composition when the guest resets its own; only a pointer press or a
+/// touch-down does ([`end_composition_on_press`]).
 fn answer_guest_commit(ctx: &mut Context, guest_id: u32) {
     let Some(state) = ctx
         .text_inputs
@@ -2204,7 +2204,9 @@ mod tests {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat};
+    use crate::protocols::wayland::{
+        wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_touch,
+    };
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::test_support::{decoded, respell};
@@ -2797,6 +2799,24 @@ mod tests {
                 state,
             };
             (pointer.id, button.into())
+        }
+
+        /// A host `wl_touch.down` of `touch` on `surface`.
+        fn down(touch: Object, surface: Object) -> Outgoing {
+            wl_touch::evt::down(touch.host, 6, 600, surface.host, 0, 256, 512)
+        }
+
+        /// The `down` event `touch` gets for [`Self::down`].
+        fn guest_down(touch: Object, surface: Object) -> (u32, AnyEvent) {
+            let down = wl_touch::Event::Down {
+                serial: 6,
+                time: 600,
+                surface: surface.id,
+                id: 0,
+                x: 256,
+                y: 512,
+            };
+            (touch.id, down.into())
         }
 
         /// The host completes the drain barrier `callback`.
@@ -4359,6 +4379,88 @@ mod tests {
         f.s.host([f.commit("각")]).await;
         let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A touch-down on the surface of a composition ends it as a pointer
+    /// press does, before the guest gets the down, as mutter
+    /// (`meta_wayland_text_input_handle_event` on a touch-begin) and KWin
+    /// (`InputMethodEventFilter::touchDown`) do.
+    #[tokio::test]
+    async fn a_touch_down_on_the_composing_surface_commits_the_preedit() {
+        let mut f = Field::enabled().await;
+        let touch = f.s.touch(f.seat.id).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([Field::down(touch, f.surface)]).await;
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_down(touch, f.surface));
+        assert_eq!(f.s.guest_received(), expected);
+        f.drain(fence).await;
+
+        // The composition ended: the input method's next commit replaces
+        // no preedit.
+        f.s.host([f.commit("나")]).await;
+        let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Only a touch-down on the surface of a composition ends it: one with
+    /// no composition or on another surface changes nothing, and the
+    /// composition goes on.
+    #[tokio::test]
+    async fn a_touch_down_elsewhere_or_without_a_composition_changes_nothing() {
+        let mut f = Field::enabled().await;
+        let touch = f.s.touch(f.seat.id).await;
+
+        // No composition.
+        f.s.host([Field::down(touch, f.surface)]).await;
+        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, f.surface)]);
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // Another surface.
+        let other = f.s.surface().await;
+        f.s.host([Field::down(touch, other)]).await;
+        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other)]);
+
+        // The host was told nothing, and the composition goes on.
+        assert_eq!(f.s.host_received(), []);
+        f.s.host([f.commit("각")]).await;
+        let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A touch-down while the reset fence of an earlier one is pending,
+    /// as from a second finger, ends nothing: the preedit Exo sent before
+    /// it handled the `reset` never reached the guest, so the host gets
+    /// no second `reset` and the guest no second commit.
+    #[tokio::test]
+    async fn a_touch_down_during_a_reset_fence_sends_no_second_reset() {
+        let mut f = Field::enabled().await;
+        let touch = f.s.touch(f.seat.id).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([Field::down(touch, f.surface)]).await;
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_down(touch, f.surface));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // In flight: the syllable the next jamo made.
+        f.s.host([f.preedit("간", "간"), Field::down(touch, f.surface)])
+            .await;
+        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, f.surface)]);
+        assert_eq!(f.s.host_received(), []);
+        f.drain(fence).await;
     }
 
     /// A `leave` names the surface it leaves. One that names a surface

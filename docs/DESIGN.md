@@ -201,7 +201,7 @@ encode wire bytes ad hoc.
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
 | Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -214,7 +214,7 @@ Two mechanisms let a handler act outside its own message:
   guest's own message.
 - `callback::queue_internal_sync` issues a host-only `wl_display.sync` and
   `state::InternalCallbacks` records what it waits for, such as the
-  text-input drain, the fence after a pointer press's `reset`, or the
+  text-input drain, the fence after a press's `reset`, or the
   placement barrier.
 
 ### Window placement
@@ -469,9 +469,10 @@ transactions, each closed by a `done`; a delete, which Exo counts from the
 start of the surrounding text, is measured against the text the guest last
 committed. A guest commit that leaves the field enabled is answered
 with a `done`, which Chromium waits for before it sends more. A pointer
-press on the surface of a composition ends it before the guest gets the
-press, as mutter and KWin do: `pointer.rs` follows each pointer's surface,
-the guest commits the preedit it shows, and Exo is told to `reset`.
+press or a touch-down on the surface of a composition ends it before the
+guest gets the press, as mutter and KWin do: `pointer.rs` follows each
+pointer's surface, `touch.rs` reads a down's own, the guest commits the
+preedit it shows, and Exo is told to `reset`.
 Behind the `reset` goes a fence, a host `wl_display.sync`. Until it
 returns, the field's host composition events are dropped, because Exo
 sent them for the composition the press committed. The rules are under

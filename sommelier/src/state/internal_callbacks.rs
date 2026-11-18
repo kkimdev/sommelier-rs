@@ -42,7 +42,7 @@ pub(crate) enum InternalCallback {
         host_text_input: u32,
     },
     /// The host text input of guest `text_input` has delivered every event
-    /// it sent before it handled the `reset` a pointer press sent it
+    /// it sent before it handled the `reset` a press sent it
     /// (`TextInputState::reset_fence`).
     TextInputResetFence { text_input: u32 },
     /// Exo has processed the `set_window_bounds` that placement sent to this

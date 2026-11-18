@@ -93,7 +93,7 @@
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
   only a delete within that round trip can land wrong. Mirroring Exo's
   `SurroundingTextTracker` would close this; no host has shown it.
-- The pointer press that ends a composition
+- The pointer press or touch-down that ends a composition
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
   checked on a host. In VS Code or Chrome started with
   `--enable-wayland-ime --wayland-text-input-version=3`, and in a GTK3 app
@@ -113,7 +113,9 @@
   - A click on a subsurface, which the keyboard focus never names, does
     not end the composition. mutter also matches the exact surface; KWin
     matches the window.
-  - Touch does not end a composition yet; mutter's and KWin's do.
+  - On a touchscreen, tap elsewhere in the field while a syllable is
+    composing. The syllable must stay where it was, committed once, and
+    the next jamo must start a new syllable at the tap point.
 - The `done` that answers each guest text-input-v3 commit has not been
   checked on a host. In Chrome or VS Code started with
   `--enable-wayland-ime --wayland-text-input-version=3`, type Korean and
