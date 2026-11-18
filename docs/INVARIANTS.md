@@ -201,7 +201,7 @@ object ID, the error code and that the session ends.
 Tests: `invalid_shm_requests_are_protocol_errors`,
 `invalid_plane_requests_queue_declared_protocol_errors`,
 `invalid_viewport_values_and_dead_surface_are_fatal`,
-`invalid_bind_queues_a_display_protocol_error`,
+`an_invalid_bind_is_a_protocol_error`,
 `fatal_protocol_error_keeps_a_bounded_diagnostic`.
 
 Deliberately left unenforced, matching Exo: `wl_surface.invalid_size`, a
@@ -392,7 +392,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `bound_output_release_reaches_the_host_without_a_local_delete_id`,
   `set_fullscreen_on_an_inert_output_is_forwarded_without_an_output`,
   `xdg_output_of_an_inert_output_is_inert`,
-  `global_remove_forwards_only_visible_globals_and_invalidates_bind`.
+  `an_invalid_bind_is_a_protocol_error`.
 - **A removed global waits for every registry that lists it.** Its
   connection-wide metadata, and the internal binding it backs, stay until
   every registry that listed it has seen its `global_remove`, so each can
@@ -425,13 +425,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   lists and that no registry has seen removed, since a compositor may
   destroy a global as soon as it removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
-  `a_replacement_another_registry_saw_removed_is_not_bound`,
-  `a_replacement_removed_first_is_not_bound`,
-  `destroying_a_registry_can_promote_a_replacement`,
-  `a_promoted_dmabuf_publishes_its_deferred_guest_global`,
-  `the_lowest_candidate_is_bound_through_the_lowest_registry`,
-  `a_bound_name_reused_by_another_interface_hands_the_binding_on`,
-  `a_candidate_name_reused_by_another_interface_is_no_candidate`.
+  `a_singleton_binding_moves_to_the_lowest_live_candidate`,
+  `a_promoted_dmabuf_publishes_its_deferred_guest_global`.
 - **Versions come from the XML or a documented constant.** Since-version
   checks use the generated `*_SINCE` constants, never a copied literal. A
   global's version bound is the generated `VERSION` unless a named
