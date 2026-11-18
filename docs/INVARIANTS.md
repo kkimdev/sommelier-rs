@@ -711,6 +711,22 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   Tests: `ime_repeat_state_is_scoped_to_the_originating_keyboard`,
   `an_empty_confirmation_recovers_the_latest_eligible_held_key`,
   `keysym_prefers_keyboard_with_current_surface_focus`.
+- **A recovered key carries the host's serial.** When an empty IME
+  confirmation stands for a held key the input method consumed, the guest
+  gets a `wl_keyboard.key` press and release the host never sent. Both
+  carry the serial and time of the key's latest `peek_key`. The extension
+  defines a peek's arguments, serial included, as those of the
+  `wl_keyboard.key` it announces, and Exo caches that serial
+  (`MaybeNextKeySerial`) until it sends a `wl_keyboard.key`, so Exo's
+  next real key event carries it too. The release has no host serial of
+  its own, since the key is still held, so it reuses the press's. A
+  request that quotes the serial, such as
+  `wl_data_device.set_selection`, is accepted: Exo checks only that a
+  serial is among the last 1024 it issued (`kMaxEventsTracked`). A
+  counter of the proxy's own, starting from 1, falls outside that window
+  once Exo has issued more serials, and Exo ignores such a request.
+  Tests: `a_recovered_key_carries_the_latest_peek_serial`,
+  `an_empty_confirmation_recovers_the_latest_eligible_held_key`.
 - **A key waits for at most one late release per channel.** When a key
   is pressed again before the channel that gave the guest its previous
   press (`wl_keyboard` or an IME keysym) has released it, the proxy keeps

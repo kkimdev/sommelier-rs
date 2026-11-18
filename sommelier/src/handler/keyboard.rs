@@ -1801,13 +1801,13 @@ mod tests {
         (k.id, event.into())
     }
 
-    /// What the guest gets when IME recovery replays `key` on `k` at
-    /// `time`: a press and release with synthetic serials `serial` and
-    /// `serial + 1`, and the `done` of `ime`'s transaction.
+    /// What the guest gets when IME recovery replays `key` on `k`, whose
+    /// latest peek had `serial` and `time`: a press and release, both with
+    /// that serial and time, and the `done` of `ime`'s transaction.
     fn recovered(ime: Ime, k: Keyboard, serial: u32, time: u32, key: u32) -> [(u32, AnyEvent); 3] {
         [
             key_event(k, serial, time, key, PRESSED),
-            key_event(k, serial + 1, time, key, RELEASED),
+            key_event(k, serial, time, key, RELEASED),
             done(ime),
         ]
     }
@@ -4167,18 +4167,19 @@ mod tests {
         Modifiers(u32),
     }
 
-    /// The press and release an empty confirmation replays: of `key`, at
-    /// `time`.
+    /// The press and release an empty confirmation replays: of `key`, with
+    /// the `serial` and `time` of its latest peek.
     struct Replay {
         key: u32,
+        serial: u32,
         time: u32,
     }
 
     /// When the host IME consumes a held key, its repeat ticks arrive as
     /// empty confirmations, each of which the proxy replays to the guest
     /// as a press and release of the latest physical key the guest could
-    /// type, at the time of its latest peek: synthetic events use the host
-    /// compositor's time domain.
+    /// type, with the serial and time of its latest peek: synthetic events
+    /// use the host compositor's serials and time domain.
     #[tokio::test]
     async fn an_empty_confirmation_recovers_the_latest_eligible_held_key() {
         use Step::*;
@@ -4196,6 +4197,7 @@ mod tests {
                 vec![peek(1, 1234, BACKSPACE, PRESSED)],
                 Some(Replay {
                     key: BACKSPACE,
+                    serial: 1,
                     time: 1234,
                 }),
             ),
@@ -4207,6 +4209,7 @@ mod tests {
                 ],
                 Some(Replay {
                     key: KEY_SPACE,
+                    serial: 2,
                     time: 200,
                 }),
             ),
@@ -4218,6 +4221,7 @@ mod tests {
                 ],
                 Some(Replay {
                     key: KEY_SPACE,
+                    serial: 2,
                     time: 200,
                 }),
             ),
@@ -4226,6 +4230,7 @@ mod tests {
                 vec![Modifiers(SHIFT), peek(2, 500, KEY_SPACE, PRESSED)],
                 Some(Replay {
                     key: KEY_SPACE,
+                    serial: 2,
                     time: 500,
                 }),
             ),
@@ -4240,6 +4245,7 @@ mod tests {
                 ],
                 Some(Replay {
                     key: BACKSPACE,
+                    serial: shared,
                     time: 140,
                 }),
             ),
@@ -4291,7 +4297,9 @@ mod tests {
             }
             kb.confirm(ime).await;
             let expected = match recovery {
-                Some(Replay { key, time }) => recovered(ime, kb.k, 1, time, key).into(),
+                Some(Replay { key, serial, time }) => {
+                    recovered(ime, kb.k, serial, time, key).into()
+                }
                 None => Vec::new(),
             };
             assert_eq!(kb.s.guest_received(), expected, "{case}");
@@ -4322,11 +4330,11 @@ mod tests {
             "the first Space commits once"
         );
 
-        for serial in [1, 3, 5] {
+        for _ in 0..3 {
             kb.confirm(ime).await;
             assert_eq!(
                 kb.s.guest_received(),
-                recovered(ime, kb.k, serial, 1234, KEY_SPACE)
+                recovered(ime, kb.k, 700, 1234, KEY_SPACE)
             );
         }
 
