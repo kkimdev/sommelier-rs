@@ -2039,125 +2039,122 @@ mod tests {
         assert!(ctx.outputs.is_empty_for_test());
     }
 
+    /// A bind the proxy cannot serve is a protocol error on the guest's
+    /// registry, and creates no object.
     #[test]
-    fn invalid_bind_queues_a_display_protocol_error() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 100, "wl_registry");
-        ctx.host_globals.insert(
-            7,
-            HostGlobal {
-                interface: "wl_compositor".to_string(),
-                version: 1,
+    fn an_invalid_bind_is_a_protocol_error() {
+        struct Case {
+            name: &'static str,
+            setup: fn(&mut Context),
+            /// The registry the guest binds through.
+            through: Registry,
+            bind: (u32, &'static str, u32),
+        }
+        for case in [
+            Case {
+                name: "a global of another interface",
+                setup: |ctx| assert_eq!(A.global(ctx, 7, "wl_compositor", 1), Action::Forward),
+                through: A,
+                bind: (7, "wl_seat", 1),
             },
-        );
-        ctx.registry_global_names.entry(100).or_default().insert(7);
-        ctx.global_generations.insert(7, 1);
-        ctx.registry_global_generations
-            .entry(100)
-            .or_default()
-            .insert(7, 1);
-        ctx.last_sender_id = 10;
-
-        let mut handler = RegistryHandler;
-        let bind = ("wl_seat".to_string(), 1, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 7, &bind), Action::Drop);
-        assert_eq!(
-            crate::test_support::protocol_error(&ctx),
-            (
-                10,
-                crate::protocols::wayland::wl_display::ERROR_INVALID_OBJECT
-            ),
-            "invalid wl_registry.bind must report a fatal wl_display.error"
-        );
-    }
-
-    #[test]
-    fn bind_without_an_advertisement_generation_is_refused() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        // Reachable only through a proxy bookkeeping bug, not a guest error:
-        // a name in `host_globals` whose advertisement generation was never
-        // recorded. It is rejected like an unadvertised global.
-        ctx.host_globals.insert(
-            10,
-            HostGlobal {
-                interface: "wl_output".to_string(),
-                version: 3,
+            Case {
+                name: "a name never advertised",
+                setup: |_| {},
+                through: A,
+                bind: (42, "wl_seat", 5),
             },
-        );
+            // Defence in depth: `host_globals` only ever holds forwarded
+            // interfaces, so this bind fails at the name lookup as well and
+            // the forwarding guard cannot be isolated by a test.
+            Case {
+                name: "an interface the proxy does not forward",
+                setup: |_| {},
+                through: A,
+                bind: (42, "zcr_text_input_extension_v1", 1),
+            },
+            Case {
+                name: "a global hidden without GPU access",
+                setup: |ctx| assert_eq!(A.global(ctx, 42, "zwp_linux_dmabuf_v1", 5), Action::Drop),
+                through: A,
+                bind: (42, "zwp_linux_dmabuf_v1", 5),
+            },
+            Case {
+                name: "a version above the advertised one",
+                setup: |ctx| assert_eq!(A.global(ctx, 10, "wl_seat", 3), Action::Forward),
+                through: A,
+                bind: (10, "wl_seat", 4),
+            },
+            Case {
+                // Only an output can be bound inert after its removal (see
+                // `bind_crossing_an_output_removal_creates_an_inert_output`).
+                // The removal of a name the registry never listed is
+                // dropped.
+                name: "a removed seat",
+                setup: |ctx| {
+                    assert_eq!(A.global(ctx, 10, "wl_seat", 5), Action::Forward);
+                    assert_eq!(A.remove(ctx, 99), Action::Drop);
+                    assert_eq!(A.remove(ctx, 10), Action::Forward);
+                },
+                through: A,
+                bind: (10, "wl_seat", 5),
+            },
+            Case {
+                // A bind that crossed an output's removal is inert only as
+                // the output it was.
+                name: "a removed output bound as another interface",
+                setup: |ctx| {
+                    assert_eq!(A.global(ctx, 10, "wl_output", 3), Action::Forward);
+                    assert_eq!(A.remove(ctx, 10), Action::Forward);
+                },
+                through: A,
+                bind: (10, "wl_seat", 3),
+            },
+            Case {
+                name: "a live global the binding registry never listed",
+                setup: |ctx| {
+                    assert_eq!(A.global(ctx, 10, "wl_output", 3), Action::Forward);
+                    assert_eq!(B.global(ctx, 11, "wl_seat", 5), Action::Forward);
+                },
+                through: B,
+                bind: (10, "wl_output", 3),
+            },
+            Case {
+                // Reachable only through a proxy bookkeeping bug, not a
+                // guest error: a name in `host_globals` whose advertisement
+                // generation was never recorded.
+                name: "a global without an advertisement generation",
+                setup: |ctx| {
+                    let output = HostGlobal {
+                        interface: "wl_output".to_string(),
+                        version: 3,
+                    };
+                    ctx.host_globals.insert(10, output);
+                },
+                through: A,
+                bind: (10, "wl_output", 3),
+            },
+        ] {
+            let mut ctx = context(&[A, B]);
+            (case.setup)(&mut ctx);
+            ctx.client_to_host_queue.clear();
 
-        let bind = ("wl_output".to_string(), 3, 20);
-        assert_eq!(RegistryHandler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert!(ctx.is_fatal());
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert!(ctx.client_to_host_queue.is_empty(), "no host bind is sent");
-        assert!(ctx.outputs.is_empty_for_test());
-    }
-
-    #[test]
-    fn bind_rejects_unadvertised_interfaces_without_mapping() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        // The registry the bind arrives on, which its protocol error names.
-        ctx.last_sender_id = 1;
-        let mut handler = RegistryHandler;
-        let id = ("zcr_text_input_extension_v1".to_string(), 1, 20);
-
-        assert_eq!(
-            handler.on_bind(&mut ctx, 42, &id),
-            crate::wire::Action::Drop
-        );
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
-        assert_eq!(ctx.shadow_table.get_interface(20), None);
-    }
-
-    #[test]
-    fn hidden_global_cannot_be_bound_when_gpu_is_disabled() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let dmabuf = "zwp_linux_dmabuf_v1".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 42, &dmabuf, 5), Action::Drop);
-        let bind = (dmabuf, 5, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 42, &bind), Action::Drop);
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
-    }
-
-    /// Only an output can be bound inert after its removal (see
-    /// `bind_crossing_an_output_removal_creates_an_inert_output`); a removed
-    /// seat stays a protocol error.
-    #[test]
-    fn global_remove_forwards_only_visible_globals_and_invalidates_bind() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        // The registry the bind arrives on, which its protocol error names.
-        ctx.last_sender_id = 1;
-        let mut handler = RegistryHandler;
-        let seat = "wl_seat".to_string();
-        assert_eq!(handler.on_global(&mut ctx, 10, &seat, 5), Action::Forward);
-        assert_eq!(handler.on_global_remove(&mut ctx, 99), Action::Drop);
-        assert_eq!(handler.on_global_remove(&mut ctx, 10), Action::Forward);
-
-        let bind = (seat, 5, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert_eq!(ctx.shadow_table.get_interface(20), None);
-        assert!(ctx.is_fatal());
-    }
-
-    #[test]
-    fn bind_rejects_version_above_advertised_global() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        // The registry the bind arrives on, which its protocol error names.
-        ctx.last_sender_id = 1;
-        let mut handler = RegistryHandler;
-        let seat = "wl_seat".to_string();
-        assert_eq!(handler.on_global(&mut ctx, 10, &seat, 3), Action::Forward);
-
-        let bind = (seat, 4, 20);
-        assert_eq!(handler.on_bind(&mut ctx, 10, &bind), Action::Drop);
-        assert_eq!(ctx.shadow_table.get_host_id(20), None);
+            let (name, interface, version) = case.bind;
+            assert_eq!(
+                case.through.bind(&mut ctx, name, interface, version, 20),
+                Action::Drop
+            );
+            assert!(ctx.is_fatal(), "{} must end the session", case.name);
+            assert_eq!(
+                protocol_error(&ctx),
+                (case.through.guest, wl_display::ERROR_INVALID_OBJECT),
+                "{}",
+                case.name
+            );
+            assert_eq!(ctx.shadow_table.get_interface(20), None, "{}", case.name);
+            assert_eq!(ctx.shadow_table.get_host_id(20), None, "{}", case.name);
+            assert_eq!(host_requests(&mut ctx, &[]), [], "{}", case.name);
+            assert!(ctx.outputs.is_empty_for_test(), "{}", case.name);
+        }
     }
 
     #[test]

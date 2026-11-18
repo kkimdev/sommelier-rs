@@ -201,7 +201,7 @@ object ID, the error code and that the session ends.
 Tests: `invalid_shm_requests_are_protocol_errors`,
 `invalid_plane_requests_queue_declared_protocol_errors`,
 `invalid_viewport_values_and_dead_surface_are_fatal`,
-`invalid_bind_queues_a_display_protocol_error`,
+`an_invalid_bind_is_a_protocol_error`,
 `fatal_protocol_error_keeps_a_bounded_diagnostic`.
 
 Deliberately left unenforced, matching Exo: `wl_surface.invalid_size`, a
@@ -392,7 +392,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `bound_output_release_reaches_the_host_without_a_local_delete_id`,
   `set_fullscreen_on_an_inert_output_is_forwarded_without_an_output`,
   `xdg_output_of_an_inert_output_is_inert`,
-  `global_remove_forwards_only_visible_globals_and_invalidates_bind`.
+  `an_invalid_bind_is_a_protocol_error`.
 - **A removed global waits for every registry that lists it.** Its
   connection-wide metadata, and the internal binding it backs, stay until
   every registry that listed it has seen its `global_remove`, so each can
