@@ -4078,7 +4078,7 @@ mod tests {
         };
         // ChromeOS may share one serial among the transitions of keys.
         let shared = 18_857;
-        let cases: [(&str, Vec<Step>, Option<Replay>); 7] = [
+        let cases: [(&str, Vec<Step>, Option<Replay>); 8] = [
             (
                 "a held key",
                 vec![peek(1, 1234, BACKSPACE, PRESSED)],
@@ -4130,6 +4130,15 @@ mod tests {
                     key: BACKSPACE,
                     time: 140,
                 }),
+            ),
+            (
+                "a released key, while an older one stays held",
+                vec![
+                    peek(1, 100, KEY_A, PRESSED),
+                    peek(2, 110, KEY_SPACE, PRESSED),
+                    peek(3, 120, KEY_SPACE, RELEASED),
+                ],
+                None,
             ),
             (
                 "an accelerator, whose modifier then goes",
@@ -4321,6 +4330,42 @@ mod tests {
                 "{ordering:?}"
             );
         }
+    }
+
+    /// A keysym goes through the keyboard on the seat's focus, even when a
+    /// keyboard that left has a newer peek of its key.
+    #[tokio::test]
+    async fn a_keysym_goes_through_the_focused_keyboard() {
+        let mut kb = Kb::new().await;
+        let other = kb.another_keyboard().await;
+        let ime = kb.text_input().await;
+        let surface = kb.surface;
+        kb.s.host([wl_keyboard::evt::leave(kb.k.host, 5, surface.host)])
+            .await;
+        assert_eq!(kb.s.guest_received(), [left(kb.k, 5, surface.id)]);
+
+        kb.peek(6, 600, KEY_SPACE, PRESSED).await;
+        kb.keysym(ime, 601, 7, keysyms::KEY_space, PRESSED).await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(other, 7, 601, KEY_SPACE, PRESSED)]
+        );
+    }
+
+    /// A keysym no peek matches avoids a keyboard that holds Backspace,
+    /// which the IME's Backspace fallback may claim.
+    #[tokio::test]
+    async fn a_keysym_avoids_the_keyboard_holding_backspace() {
+        let mut kb = Kb::new().await;
+        let other = kb.another_keyboard().await;
+        let ime = kb.text_input().await;
+        kb.peek(5, 500, BACKSPACE, PRESSED).await;
+
+        kb.keysym(ime, 501, 6, keysyms::KEY_x, PRESSED).await;
+        assert_eq!(
+            kb.s.guest_received(),
+            [key_event(other, 6, 501, KEY_X, PRESSED)]
+        );
     }
 
     #[tokio::test]
