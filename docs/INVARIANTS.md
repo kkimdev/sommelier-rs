@@ -425,13 +425,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   lists and that no registry has seen removed, since a compositor may
   destroy a global as soon as it removes it.
   Tests: `a_singleton_advertised_anew_is_bound_when_the_old_name_retires`,
-  `a_replacement_another_registry_saw_removed_is_not_bound`,
-  `a_replacement_removed_first_is_not_bound`,
-  `destroying_a_registry_can_promote_a_replacement`,
-  `a_promoted_dmabuf_publishes_its_deferred_guest_global`,
-  `the_lowest_candidate_is_bound_through_the_lowest_registry`,
-  `a_bound_name_reused_by_another_interface_hands_the_binding_on`,
-  `a_candidate_name_reused_by_another_interface_is_no_candidate`.
+  `a_singleton_binding_moves_to_the_lowest_live_candidate`,
+  `a_promoted_dmabuf_publishes_its_deferred_guest_global`.
 - **Versions come from the XML or a documented constant.** Since-version
   checks use the generated `*_SINCE` constants, never a copied literal. A
   global's version bound is the generated `VERSION` unless a named

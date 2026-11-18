@@ -1592,6 +1592,16 @@ mod tests {
         .into()
     }
 
+    /// The host ID of the proxy's binding of `singleton`.
+    fn bound_host_id(singleton: Singleton, ctx: &Context) -> Option<u32> {
+        match singleton {
+            Singleton::Dmabuf => ctx.host_dmabuf_id,
+            Singleton::KeyboardExtension => ctx.host_keyboard_extension_id.map(|id| id.0),
+            Singleton::AuraShell => ctx.host_zaura_shell.map(|shell| shell.id),
+            Singleton::Shm => ctx.host_shm_id,
+        }
+    }
+
     /// A format the proxy can offer in synthetic linux-dmabuf feedback:
     /// `XRGB8888` with the linear modifier.
     const XRGB8888_LINEAR: (u32, u64) = (0x3432_5258, 0);
@@ -2621,206 +2631,240 @@ mod tests {
         );
     }
 
-    #[test]
-    fn duplicate_internal_singletons_do_not_overwrite_the_first_binding() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 1;
-        ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-        let mut handler = RegistryHandler;
-        let shm = "wl_shm".to_string();
-
-        assert_eq!(handler.on_global(&mut ctx, 10, &shm, 1), Action::Drop);
-        let first_id = ctx.host_shm_id.expect("first SHM binding");
-        let queue_len = ctx.client_to_host_queue.len();
-
-        assert_eq!(handler.on_global(&mut ctx, 11, &shm, 1), Action::Drop);
-        assert_eq!(ctx.host_shm_id, Some(first_id));
-        assert_eq!(
-            ctx.client_to_host_queue.len(),
-            queue_len,
-            "a duplicate singleton must not issue a second host bind"
-        );
-    }
-
     /// A host may advertise a singleton global under a new name before it
-    /// removes the old one.
+    /// removes the old one. The proxy keeps its binding of the old name,
+    /// and binds the new one when the old one retires.
     #[test]
     fn a_singleton_advertised_anew_is_bound_when_the_old_name_retires() {
-        for (singleton, version) in [
-            (Singleton::Dmabuf, LINUX_DMABUF_CAPABILITY_VERSION),
-            (Singleton::KeyboardExtension, KEYBOARD_EXTENSION_VERSION),
-            (Singleton::AuraShell, ZAURA_SHELL_MIN_VERSION),
-            (Singleton::Shm, WL_SHM_VERSION),
+        struct Case {
+            singleton: Singleton,
+            /// The version the host advertises both globals at, and the
+            /// one the proxy binds.
+            version: u32,
+            bound_version: u32,
+            /// The request that destroys the old binding, if its interface
+            /// has one.
+            destructor: Option<AnyRequest>,
+        }
+        for Case {
+            singleton,
+            version,
+            bound_version,
+            destructor,
+        } in [
+            Case {
+                singleton: Singleton::Dmabuf,
+                version: LINUX_DMABUF_CAPABILITY_VERSION,
+                bound_version: 3,
+                destructor: Some(zwp_linux_dmabuf_v1::Request::Destroy {}.into()),
+            },
+            Case {
+                singleton: Singleton::KeyboardExtension,
+                version: KEYBOARD_EXTENSION_VERSION,
+                bound_version: 2,
+                destructor: None,
+            },
+            // Before v38 `zaura_shell` has no destructor.
+            Case {
+                singleton: Singleton::AuraShell,
+                version: ZAURA_SHELL_MIN_VERSION,
+                bound_version: 6,
+                destructor: None,
+            },
+            Case {
+                singleton: Singleton::Shm,
+                version: WL_SHM_VERSION,
+                bound_version: 1,
+                destructor: None,
+            },
         ] {
-            // The proxy binds the host's linux-dmabuf only with GPU access.
-            let mut ctx = Context::new_for_test(true, false, vec![]);
-            ctx.last_sender_id = 1;
-            ctx.shadow_table.insert_paired_for_test(1, 1, "wl_registry");
-            let mut handler = RegistryHandler;
-            let interface = singleton.interface().to_string();
-            handler.on_global(&mut ctx, 10, &interface, version);
-            handler.on_global(&mut ctx, 11, &interface, version);
+            let mut ctx = gpu_context(&[A]);
+            let interface = singleton.interface();
+            assert_eq!(A.global(&mut ctx, 10, interface, version), Action::Drop);
+            let old = bound_host_id(singleton, &ctx).expect("a binding");
+            assert_eq!(A.global(&mut ctx, 11, interface, version), Action::Drop);
             assert_eq!(singleton.bound_name(&ctx), Some(10), "{interface}");
-            ctx.client_to_host_queue.clear();
+            assert_eq!(bound_host_id(singleton, &ctx), Some(old));
+            assert_eq!(
+                host_requests(&mut ctx, &[]),
+                [(A.host, bind_request(10, interface, bound_version, old))],
+                "{interface} is bound once"
+            );
 
-            handler.on_global_remove(&mut ctx, 10);
+            A.remove(&mut ctx, 10);
 
             assert!(!ctx.is_fatal());
             assert_eq!(singleton.bound_name(&ctx), Some(11), "{interface}");
-            assert!(
-                ctx.client_to_host_queue.iter().any(|(message, _)| {
-                    crate::test_support::msg_sender(message) == 1
-                        && crate::test_support::msg_opcode(message)
-                            == crate::protocols::wayland::wl_registry::REQ_BIND
-                        && message[8..12] == 11u32.to_ne_bytes()
-                }),
-                "the host gets a bind of {interface} 11"
+            let new = bound_host_id(singleton, &ctx).expect("a new binding");
+            let expected = destructor.map(|request| (old, request)).into_iter();
+            assert_eq!(
+                host_requests(&mut ctx, &[(old, interface)]),
+                Vec::from_iter(
+                    expected.chain([(A.host, bind_request(11, interface, bound_version, new))])
+                ),
+                "{interface}"
             );
         }
     }
 
-    /// A connection whose host registries list `wl_shm` globals:
-    /// `listings` gives each registry (host 100 or 101, guest 10 or 11) the
-    /// names it lists, in order.
-    fn shm_listed_by(listings: &[(u32, &[u32])]) -> Context {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.shadow_table
-            .insert_paired_for_test(10, 100, "wl_registry");
-        ctx.shadow_table
-            .insert_paired_for_test(11, 101, "wl_registry");
-        let shm = "wl_shm".to_string();
-        for &(registry, names) in listings {
-            ctx.last_sender_id = registry;
-            for &name in names {
-                RegistryHandler.on_global(&mut ctx, name, &shm, WL_SHM_VERSION);
-            }
+    /// A step of [`a_singleton_binding_moves_to_the_lowest_live_candidate`].
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// The registry sees the global's removal.
+        Remove(Registry, u32),
+        /// The registry sees the name advertised anew, for `wl_output`.
+        Reuse(Registry, u32),
+        /// The guest destroys the registry through `wl_fixes`.
+        Destroy(Registry),
+    }
+
+    /// A `wl_shm` bind the proxy sent `through` a registry, of global
+    /// `name` as host object `id`.
+    #[derive(Clone, Copy, Debug)]
+    struct Bind {
+        through: Registry,
+        name: u32,
+        id: u32,
+    }
+
+    /// When the proxy's `wl_shm` binding retires, it binds the lowest other
+    /// name that a registry still lists and whose removal no registry has
+    /// seen, through the lowest registry that lists it.
+    #[test]
+    fn a_singleton_binding_moves_to_the_lowest_live_candidate() {
+        use Step::{Destroy, Remove, Reuse};
+        struct Case {
+            name: &'static str,
+            /// The `wl_shm` names each registry lists, in the order the
+            /// host advertised them.
+            listings: &'static [(Registry, &'static [u32])],
+            steps: &'static [Step],
+            bound: Option<u32>,
+            /// The binds the steps sent.
+            binds: &'static [Bind],
+            candidates: &'static [u32],
         }
-        ctx.client_to_host_queue.clear();
-        ctx
-    }
+        for case in [
+            Case {
+                name: "the lowest candidate is bound through the lowest registry",
+                listings: &[(B, &[10, 12, 11]), (A, &[10, 12, 11])],
+                steps: &[Remove(B, 10), Remove(A, 10)],
+                bound: Some(11),
+                binds: &[Bind {
+                    through: A,
+                    name: 11,
+                    id: 3,
+                }],
+                candidates: &[11, 12],
+            },
+            Case {
+                // Before every registry has seen the bound name removed, one
+                // that has may see it advertised for another interface.
+                name: "a bound name reused by another interface hands the binding on",
+                listings: &[(A, &[10, 11]), (B, &[10])],
+                steps: &[Remove(A, 10), Reuse(A, 10)],
+                bound: Some(11),
+                binds: &[Bind {
+                    through: A,
+                    name: 11,
+                    id: 3,
+                }],
+                candidates: &[11],
+            },
+            Case {
+                name: "a candidate name reused by another interface is no candidate",
+                listings: &[(A, &[10, 11]), (B, &[10, 11])],
+                steps: &[Remove(A, 11), Reuse(A, 11), Remove(A, 10), Remove(B, 10)],
+                bound: None,
+                binds: &[],
+                candidates: &[],
+            },
+            Case {
+                // A compositor may destroy a global as soon as it removes
+                // it, so a bind of a name one registry saw removed could
+                // end the connection.
+                name: "a replacement another registry saw removed is not bound",
+                listings: &[(A, &[10, 11]), (B, &[10, 11])],
+                steps: &[Remove(A, 10), Remove(A, 11), Remove(B, 10)],
+                bound: None,
+                binds: &[],
+                candidates: &[11],
+            },
+            Case {
+                name: "a replacement every registry saw removed is not bound",
+                listings: &[(A, &[10, 11]), (B, &[10, 11])],
+                steps: &[Remove(A, 10), Remove(A, 11), Remove(B, 10), Remove(B, 11)],
+                bound: None,
+                binds: &[],
+                candidates: &[],
+            },
+            Case {
+                name: "a replacement removed first is not bound",
+                listings: &[(A, &[10, 11])],
+                steps: &[Remove(A, 11), Remove(A, 10)],
+                bound: None,
+                binds: &[],
+                candidates: &[],
+            },
+            Case {
+                name: "a binding another registry lists stays",
+                listings: &[(A, &[10, 11]), (B, &[10, 12])],
+                steps: &[Remove(A, 10)],
+                bound: Some(10),
+                binds: &[],
+                candidates: &[10, 11, 12],
+            },
+            Case {
+                // Destroying the last registry to list the removed binding
+                // retires it; a candidate only that registry listed is
+                // forgotten.
+                name: "destroying a registry can promote a replacement",
+                listings: &[(A, &[10, 11]), (B, &[10, 12])],
+                steps: &[Remove(A, 10), Destroy(B)],
+                bound: Some(11),
+                binds: &[Bind {
+                    through: A,
+                    name: 11,
+                    id: 3,
+                }],
+                candidates: &[11],
+            },
+        ] {
+            let mut ctx = context(&[A, B]);
+            for &(registry, names) in case.listings {
+                for &name in names {
+                    registry.global(&mut ctx, name, "wl_shm", WL_SHM_VERSION);
+                }
+            }
+            ctx.client_to_host_queue.clear();
+            for &step in case.steps {
+                match step {
+                    Remove(registry, name) => {
+                        registry.remove(&mut ctx, name);
+                    }
+                    Reuse(registry, name) => {
+                        registry.global(&mut ctx, name, "wl_output", 3);
+                    }
+                    Destroy(registry) => assert_eq!(registry.destroy(&mut ctx), Action::Forward),
+                }
+                ctx.assert_no_orphans();
+            }
 
-    /// Host registry `registry` sends `global_remove` of `name`.
-    fn remove(ctx: &mut Context, registry: u32, name: u32) {
-        ctx.last_sender_id = registry;
-        RegistryHandler.on_global_remove(ctx, name);
-    }
-
-    /// The `(registry, name)` of every `wl_registry.bind` queued for the
-    /// host.
-    fn queued_binds(ctx: &Context) -> Vec<(u32, u32)> {
-        ctx.client_to_host_queue
-            .iter()
-            .filter(|(message, _)| {
-                crate::test_support::msg_opcode(message)
-                    == crate::protocols::wayland::wl_registry::REQ_BIND
-            })
-            .map(|(message, _)| {
-                (
-                    crate::test_support::msg_sender(message),
-                    u32::from_ne_bytes(message[8..12].try_into().unwrap()),
-                )
-            })
-            .collect()
-    }
-
-    /// Of several live candidates, the lowest name is bound, through the
-    /// lowest registry that lists it.
-    #[test]
-    fn the_lowest_candidate_is_bound_through_the_lowest_registry() {
-        let mut ctx = shm_listed_by(&[(101, &[10, 12, 11]), (100, &[10, 12, 11])]);
-        remove(&mut ctx, 101, 10);
-
-        remove(&mut ctx, 100, 10);
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), Some(11));
-        assert_eq!(queued_binds(&ctx), [(100, 11)]);
-    }
-
-    /// A registry that saw the bound name removed may see the name again
-    /// for another interface before every registry has seen the removal:
-    /// the binding retires there, so another candidate takes over.
-    #[test]
-    fn a_bound_name_reused_by_another_interface_hands_the_binding_on() {
-        let mut ctx = shm_listed_by(&[(100, &[10, 11]), (101, &[10])]);
-        remove(&mut ctx, 100, 10);
-
-        ctx.last_sender_id = 100;
-        RegistryHandler.on_global(&mut ctx, 10, &"wl_output".to_string(), 3);
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), Some(11));
-        assert_eq!(queued_binds(&ctx), [(100, 11)]);
-        ctx.assert_no_orphans();
-    }
-
-    /// A candidate's name advertised again for another interface is no
-    /// longer a candidate.
-    #[test]
-    fn a_candidate_name_reused_by_another_interface_is_no_candidate() {
-        let mut ctx = shm_listed_by(&[(100, &[10, 11]), (101, &[10, 11])]);
-        remove(&mut ctx, 100, 11);
-        ctx.last_sender_id = 100;
-        RegistryHandler.on_global(&mut ctx, 11, &"wl_output".to_string(), 3);
-        ctx.client_to_host_queue.clear();
-
-        remove(&mut ctx, 100, 10);
-        remove(&mut ctx, 101, 10);
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), None);
-        assert_eq!(queued_binds(&ctx), []);
-        ctx.assert_no_orphans();
-    }
-
-    /// A compositor may destroy a global as soon as it removes it, so a
-    /// bind of a name one registry saw removed could end the connection.
-    #[test]
-    fn a_replacement_another_registry_saw_removed_is_not_bound() {
-        let mut ctx = shm_listed_by(&[(100, &[10, 11]), (101, &[10, 11])]);
-        remove(&mut ctx, 100, 10);
-        remove(&mut ctx, 100, 11);
-
-        remove(&mut ctx, 101, 10);
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), None);
-        assert_eq!(queued_binds(&ctx), []);
-        ctx.assert_no_orphans();
-        remove(&mut ctx, 101, 11);
-        assert_eq!(Singleton::Shm.bound_name(&ctx), None);
-        assert!(ctx.singleton_candidates.is_empty());
-    }
-
-    #[test]
-    fn a_replacement_removed_first_is_not_bound() {
-        let mut ctx = shm_listed_by(&[(100, &[10, 11])]);
-        remove(&mut ctx, 100, 11);
-
-        remove(&mut ctx, 100, 10);
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), None);
-        assert_eq!(queued_binds(&ctx), []);
-        assert!(ctx.singleton_candidates.is_empty());
-    }
-
-    /// Destroying the last registry to list a removed binding retires it,
-    /// so the replacement is bound through a registry that lists it, and a
-    /// candidate only the destroyed registry listed is forgotten.
-    #[test]
-    fn destroying_a_registry_can_promote_a_replacement() {
-        let mut ctx = shm_listed_by(&[(100, &[10, 11]), (101, &[10, 12])]);
-        remove(&mut ctx, 100, 10);
-        assert_eq!(Singleton::Shm.bound_name(&ctx), Some(10));
-
-        assert_eq!(
-            RegistryHandler.on_destroy_registry(&mut ctx, 11),
-            Action::Forward
-        );
-
-        assert_eq!(Singleton::Shm.bound_name(&ctx), Some(11));
-        assert_eq!(queued_binds(&ctx), [(100, 11)]);
-        assert_eq!(
-            ctx.singleton_candidates.keys().copied().collect::<Vec<_>>(),
-            [11]
-        );
-        ctx.assert_no_orphans();
+            assert_eq!(Singleton::Shm.bound_name(&ctx), case.bound, "{}", case.name);
+            let binds = case.binds.iter().map(|bind| {
+                let request = bind_request(bind.name, "wl_shm", WL_SHM_VERSION, bind.id);
+                (bind.through.host, request)
+            });
+            assert_eq!(
+                host_requests(&mut ctx, &[]),
+                Vec::from_iter(binds),
+                "{}",
+                case.name
+            );
+            let mut candidates = Vec::from_iter(ctx.singleton_candidates.keys().copied());
+            candidates.sort_unstable();
+            assert_eq!(candidates, case.candidates, "{}", case.name);
+        }
     }
 
     /// The guest global of a replacement linux-dmabuf waits, like any, for
