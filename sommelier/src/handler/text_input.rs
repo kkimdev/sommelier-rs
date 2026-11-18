@@ -1986,12 +1986,14 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler;
     use crate::protocols::text_input_unstable_v1::zwp_text_input_v1::ZwpTextInputV1Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler;
     use crate::protocols::text_input_unstable_v3::zwp_text_input_v3::ZwpTextInputV3Handler;
+    use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
     use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
@@ -2049,6 +2051,12 @@ mod tests {
         /// version `extension`, if any.
         async fn new(extension: Option<u32>) -> Self {
             let mut s = Session::new();
+            // Offset the guest's IDs from the host's, so that a request
+            // that names a guest object where its host object belongs
+            // fails.
+            for _ in 0..100 {
+                s.new_id();
+            }
             let seat = s.bind_paired("wl_seat", wl_seat::VERSION).await;
             let keyboard = s.new_id();
             let keyboard = Object {
@@ -2082,6 +2090,19 @@ mod tests {
             assert_eq!(f.enter_surface().await, []);
             let ti = f.s.new_id();
             f.create_text_input(ti).await;
+            // The offset still keeps every guest ID above every host ID.
+            let host = [
+                f.seat.host,
+                f.keyboard.host,
+                f.surface.host,
+                f.host,
+                f.host_ext,
+            ];
+            let guest = [f.seat.id, f.keyboard.id, f.surface.id, f.manager, f.ti];
+            assert!(
+                host.iter().max() < guest.iter().min(),
+                "{host:?}, {guest:?}"
+            );
             f
         }
 
@@ -2475,8 +2496,10 @@ mod tests {
         f.s.host([f.preedit("old", ""), f.commit("old")]).await;
         assert_eq!(f.s.guest_received(), []);
 
-        // The guest enables the field again while the barrier drains: its
-        // state reaches the host first, without an activation.
+        // The focus enters another surface, where the guest enables the
+        // field while the barrier drains: its state reaches the host first,
+        // without an activation.
+        f.surface = f.s.surface().await;
         f.keyboard_enter().await;
         f.s.guest([
             v3::enable(f.ti),
@@ -2682,9 +2705,14 @@ mod tests {
 
         f.s.host([v1::leave(f.host)]).await;
         assert_eq!(f.s.host_received(), []);
-        // The barrier still drains the generation, and nothing activates.
+        // The barrier still drains the generation: an enable waits for it.
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(3, Reset::default()));
         f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(3));
+        assert_eq!(f.s.host_received(), expected);
     }
 
     /// The text input's seat ends, and the guest binds a new `wl_seat`
@@ -2726,41 +2754,17 @@ mod tests {
         let callback = barrier(&host);
         assert_eq!(host, f.disable_requests(callback, 2));
 
-        f.keyboard_leave().await;
-        f.keyboard_enter().await;
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        // The guest enables the field on two other surfaces in turn, then
+        // disables it.
+        for serial in [3, 4] {
+            f.keyboard_leave().await;
+            f.surface = f.s.surface().await;
+            f.keyboard_enter().await;
+            f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
+        }
         f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let mut expected = f.reset(3, Reset::default());
-        expected.extend(f.reset(4, Reset::default()));
-        assert_eq!(f.s.host_received(), expected);
-
-        f.drain(callback).await;
-        assert_eq!(f.s.host_received(), []);
-    }
-
-    /// The guest destroys a text input while its deactivation drains and
-    /// reuses its ID for a new one: the old barrier must not reconcile it.
-    #[tokio::test]
-    async fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
-        let mut f = Field::enabled().await;
-        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
-        let host = f.s.host_received();
-        let callback = barrier(&host);
-        assert_eq!(host, f.disable_requests(callback, 2));
-        let old_ti = f.ti;
-        f.s.guest([v3::destroy(f.ti)]).await;
-        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
-        assert_eq!(
-            f.s.guest_received(),
-            [(
-                WL_DISPLAY_ID,
-                wl_display::Event::DeleteId { id: old_ti }.into()
-            )]
-        );
-
-        f.create_text_input(old_ti).await;
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        assert_eq!(f.s.host_received(), f.reset(5, Reset::default()));
 
         f.drain(callback).await;
         assert_eq!(f.s.host_received(), []);
@@ -3169,6 +3173,9 @@ mod tests {
     #[tokio::test]
     async fn destroy_drops_v3_request_and_cleans_host_extension_routing() {
         let mut f = Field::enabled().await;
+        f.s.host([f.preedit("가", "")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
         f.s.guest([v3::destroy(f.ti)]).await;
         let host = f.s.host_received();
         // The destroy is the final disable: the host extension goes after
@@ -3197,6 +3204,23 @@ mod tests {
         assert!(![old_host, old_host_ext].contains(&f.host_ext));
         f.drain(callback).await;
         assert_eq!(f.s.host_received(), []);
+
+        // A late confirm of the destroyed extension reaches no one, not even
+        // the new text input's composition.
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.s.host([f.preedit("나", ""), ext::confirm_preedit(old_host_ext, 0)])
+            .await;
+        let expected = [preedit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The host's delete_id frees the extension's ID, which the next
+        // host object takes.
+        f.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, old_host_ext)])
+            .await;
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert_eq!(f.host, old_host_ext);
     }
 
     /// A destroyed text input whose seat ended, or awaits its
@@ -3239,19 +3263,15 @@ mod tests {
         f.s.create(wl_compositor::req::create_surface(compositor, f.seat.id))
             .await;
 
-        // Neither disabling the field nor enabling it again sends the ID.
-        for request in [v3::disable(f.ti), v3::enable(f.ti)] {
+        // Neither disabling the field nor enabling it again sends the ID:
+        // each commit sends only its edits.
+        for (serial, request) in [(2, v3::disable(f.ti)), (3, v3::enable(f.ti))] {
             f.s.guest([request, v3::commit(f.ti)]).await;
-            let host = f.s.host_received();
-            assert!(
-                !host.iter().any(|(sender, request)| *sender == f.host
-                    && matches!(
-                        request,
-                        AnyRequest::ZwpTextInputV1(V1::Activate { .. } | V1::Deactivate { .. })
-                    )),
-                "{host:?}"
-            );
+            assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
         }
+        // The disable ended the host's generation: its events reach no one.
+        f.s.host([f.commit("가")]).await;
+        assert_eq!(f.s.guest_received(), []);
     }
 
     #[tokio::test]
@@ -3592,7 +3612,12 @@ mod tests {
     /// generation: none reaches the guest or edits its next transaction.
     #[tokio::test]
     async fn inactive_host_ime_events_are_ignored() {
+        // The guest enabled the field, which its released seat cannot
+        // activate.
         let mut f = Field::disabled().await;
+        f.release_seat().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.reset(1, Reset::default()));
         f.s.host([
             f.preedit("가", ""),
             v1::delete_surrounding_text(f.host, -3, 3),
@@ -3609,8 +3634,12 @@ mod tests {
         .await;
         assert_eq!(f.s.guest_received(), []);
 
-        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
-        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        // A new seat activates it.
+        let host = f.bind_seat_again().await;
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(1));
+        assert_eq!(host, expected);
         f.s.host([f.commit("나")]).await;
         assert_eq!(f.s.guest_received(), f.events([commit("나"), DONE]));
     }
@@ -3619,9 +3648,11 @@ mod tests {
     const TI: u32 = 20;
     const HOST: u32 = 10;
     const HOST_EXT: u32 = 30;
-    /// The fixture's guest seat and focused surface.
+    /// The fixture's guest seat and focused surface, and their host objects.
     const SEAT: u32 = 5;
     const SURFACE: u32 = 900;
+    const HOST_SEAT: u32 = 6;
+    const HOST_SURFACE: u32 = 901;
     /// The guest keyboard [`Ime::with_keyboard`] adds, its host keyboard
     /// and that keyboard's extended keyboard.
     const KEYBOARD: u32 = 40;
@@ -3648,9 +3679,9 @@ mod tests {
         /// or none.
         fn with_extension_version(version: Option<u32>) -> Self {
             let mut ctx = Context::new_for_test(false, false, vec![]);
-            ctx.shadow_table.insert_paired_for_test(SEAT, 6, "wl_seat");
-            ctx.shadow_table
-                .insert_paired_for_test(SURFACE, 901, "wl_surface");
+            let table = &mut ctx.shadow_table;
+            table.insert_paired_for_test(SEAT, HOST_SEAT, "wl_seat");
+            table.insert_paired_for_test(SURFACE, HOST_SURFACE, "wl_surface");
             ctx.shadow_table.insert_bridged_for_test(
                 TI,
                 HOST,
@@ -3703,7 +3734,7 @@ mod tests {
         fn focus(&mut self, keyboard: HostId) {
             self.ctx
                 .keyboard_focus
-                .set_for_test(keyboard, SEAT, SURFACE, 901);
+                .set_for_test(keyboard, SEAT, SURFACE, HOST_SURFACE);
         }
 
         fn state(&mut self) -> &mut TextInputState {
@@ -4189,22 +4220,56 @@ mod tests {
         assert_eq!(ctx.shadow_table.guest_object_version(20), Some(5));
     }
 
+    /// A drain barrier completes only the generation it drains: the guest
+    /// destroyed the text input and reused its ID for one with another
+    /// host text input, enabled and not yet active, which the old barrier
+    /// must not activate.
+    #[test]
+    fn stale_activation_callback_cannot_reconcile_reused_guest_id() {
+        let mut ime = Ime::new();
+        let state = ime.state();
+        state.committed.enabled = false;
+        state.active_surface = None;
+        reconcile_host(&mut ime.ctx, TI, None);
+        let callback = ime.state().draining_callback().expect("a barrier");
+        let mut replacement = TextInputState::new(11, None, SEAT, Some(SURFACE));
+        replacement.committed.enabled = true;
+        ime.ctx.text_inputs.insert(TI, replacement);
+        ime.ctx.client_to_host_queue.clear();
+
+        ime.ctx.last_sender_id = callback.0;
+        CallbackHandler.on_done(&mut ime.ctx, 0);
+        assert!(!ime.state().host_is_active());
+        assert!(ime.ctx.client_to_host_queue.is_empty());
+    }
+
     #[test]
     fn guest_commit_serial_wraps_and_is_forwarded_unchanged() {
         let mut ime = Ime::new();
         let state = ime.state();
         state.set_guest_commits(u32::MAX);
-        state.committed.enabled = false;
         state.host = HostApplied::Inactive;
         ime.ctx.last_sender_id = TI;
         TextInputV3Handler.on_commit(&mut ime.ctx);
 
         assert_eq!(ime.state().guest_commit_serial(), 0);
-        let requests = decoded(
-            &ime.ctx.client_to_host_queue,
-            zwp_text_input_v1::Request::from_wire,
+        let queue = std::mem::take(&mut ime.ctx.client_to_host_queue);
+        let (activate, extension, commit_state) = (&queue[..1], &queue[1..3], &queue[3..]);
+        let activate = decoded(activate, V1::from_wire);
+        assert_eq!(
+            activate,
+            [(
+                HOST,
+                V1::Activate {
+                    seat: HOST_SEAT,
+                    surface: HOST_SURFACE
+                }
+            )]
         );
-        assert_eq!(requests, [(HOST, V1::CommitState { serial: 0 })]);
+        let extension = decoded(extension, Ext::from_wire);
+        assert!(extension.iter().all(|(sender, _)| *sender == HOST_EXT));
+        let commit_state = decoded(commit_state, V1::from_wire);
+        assert_eq!(commit_state, [(HOST, V1::CommitState { serial: 0 })]);
     }
 
     /// An extension whose version the object table lacks is taken to have
