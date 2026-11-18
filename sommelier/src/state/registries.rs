@@ -23,7 +23,7 @@ limitations under the License.
 //! `handler::registry::forget_registry` drops it whole. The policy that
 //! reads and writes it is `handler::registry`'s.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What one host registry has advertised.
 #[derive(Debug, Default)]
@@ -32,6 +32,9 @@ pub(crate) struct RegistryRecord {
     /// Ordered, because a registry's end retires the globals it alone
     /// listed in that order.
     listed: BTreeSet<u32>,
+    /// The advertisement generation of each global the registry advertised,
+    /// listed or since removed.
+    generations: BTreeMap<u32, u64>,
 }
 
 impl RegistryRecord {
@@ -40,9 +43,21 @@ impl RegistryRecord {
         self.listed.contains(&name)
     }
 
-    /// The registry lists global `name`.
-    pub(crate) fn list(&mut self, name: u32) {
+    /// The generation of global `name` that the registry advertised last,
+    /// whether it still lists it or has since removed it.
+    pub(crate) fn generation(&self, name: u32) -> Option<u64> {
+        self.generations.get(&name).copied()
+    }
+
+    /// The generation of global `name`, if the registry lists it.
+    pub(crate) fn listed_generation(&self, name: u32) -> Option<u64> {
+        self.generation(name).filter(|_| self.lists(name))
+    }
+
+    /// The registry lists global `name` at `generation`.
+    pub(crate) fn list(&mut self, name: u32, generation: u64) {
         self.listed.insert(name);
+        self.generations.insert(name, generation);
     }
 
     /// The registry no longer lists global `name`.
@@ -54,8 +69,16 @@ impl RegistryRecord {
         self.listed.remove(&name)
     }
 
-    /// The names the registry lists, in order.
-    pub(crate) fn listed(&self) -> impl Iterator<Item = u32> + '_ {
-        self.listed.iter().copied()
+    /// The names the registry lists, in order, with their generations.
+    pub(crate) fn listed(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.listed
+            .iter()
+            .filter_map(|&name| Some((name, self.generation(name)?)))
+    }
+
+    /// The generation of every global the registry advertised, listed or
+    /// since removed.
+    pub(crate) fn generations(&self) -> impl Iterator<Item = u64> + '_ {
+        self.generations.values().copied()
     }
 }

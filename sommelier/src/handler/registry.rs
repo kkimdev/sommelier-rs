@@ -208,14 +208,10 @@ pub(crate) fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64
 fn registry_listing(ctx: &Context, name: u32, generation: Option<u64>) -> Option<u32> {
     ctx.registries
         .iter()
-        .filter(|(registry, record)| {
-            record.lists(name)
-                && ctx
-                    .registry_global_generations
-                    .get(registry)
-                    .and_then(|generations| generations.get(&name))
-                    .copied()
-                    == generation
+        .filter(|(_, record)| {
+            record
+                .listed_generation(name)
+                .is_some_and(|listed| Some(listed) == generation)
         })
         .map(|(&registry, _)| registry)
         .min()
@@ -265,10 +261,9 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
     let registry_id = ctx.last_sender_id;
     let current_generation = ctx.global_generations.get(&name).copied();
     let previous_generation = ctx
-        .registry_global_generations
+        .registries
         .get(&registry_id)
-        .and_then(|names| names.get(&name))
-        .copied();
+        .and_then(|record| record.generation(name));
     let already_seen = ctx
         .registries
         .get(&registry_id)
@@ -299,14 +294,13 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
         }
         (Some(current), _, _) => current,
     };
-    ctx.registries.entry(registry_id).or_default().list(name);
+    ctx.registries
+        .entry(registry_id)
+        .or_default()
+        .list(name, generation);
     if let Some(names) = ctx.registry_global_removed.get_mut(&registry_id) {
         names.remove(&name);
     }
-    ctx.registry_global_generations
-        .entry(registry_id)
-        .or_default()
-        .insert(name, generation);
     true
 }
 
@@ -378,12 +372,8 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
         let is_current = ctx
             .registries
             .get(&pending.registry_host_id)
-            .is_some_and(|record| record.lists(pending.name))
-            && ctx
-                .registry_global_generations
-                .get(&pending.registry_host_id)
-                .and_then(|generations| generations.get(&pending.name))
-                .is_some_and(|&current| current == generation)
+            .and_then(|record| record.listed_generation(pending.name))
+            == Some(generation)
             && !ctx
                 .registry_global_removed
                 .get(&pending.registry_host_id)
@@ -890,12 +880,7 @@ fn admit_guest_bind(
         if !record.lists(name) {
             return None;
         }
-        let registry_generation = ctx
-            .registry_global_generations
-            .get(&registry_host_id)
-            .and_then(|generations| generations.get(&name))
-            .copied();
-        if registry_generation != ctx.global_generations.get(&name).copied() {
+        if record.generation(name) != ctx.global_generations.get(&name).copied() {
             return None;
         }
     }
@@ -930,10 +915,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         let registry_id = ctx.last_sender_id;
         let previous_generation = ctx.global_generations.get(&name).copied();
         let registry_previous_generation = ctx
-            .registry_global_generations
+            .registries
             .get(&registry_id)
-            .and_then(|names| names.get(&name))
-            .copied();
+            .and_then(|record| record.generation(name));
         let registry_removed = ctx
             .registry_global_removed
             .get(&registry_id)
@@ -1209,10 +1193,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
     fn on_global_remove(&mut self, ctx: &mut Context, name: u32) -> Action {
         let registry_id = ctx.last_sender_id;
         let removed_generation = ctx
-            .registry_global_generations
+            .registries
             .get(&registry_id)
-            .and_then(|generations| generations.get(&name))
-            .copied();
+            .and_then(|record| record.generation(name));
         let was_visible = ctx
             .registry_global_visibility
             .get(&registry_id)
@@ -1442,26 +1425,19 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 /// registry that still lists it (see `on_global_remove`). If this was the
 /// last one, it will never see the removal, so the global is retired now.
 pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
-    let generations = ctx
-        .registry_global_generations
-        .remove(&registry_host_id)
-        .unwrap_or_default();
     let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
     ctx.registry_global_removed.remove(&registry_host_id);
     ctx.registry_global_visibility.remove(&registry_host_id);
     ctx.pending_dmabuf_globals
         .retain(|pending| pending.registry_host_id != registry_host_id);
-    for name in record.listed() {
-        let Some(&generation) = generations.get(&name) else {
-            continue;
-        };
+    for (name, generation) in record.listed() {
         if global_removal_seen(ctx, name, generation)
             && !global_still_seen(ctx, name, Some(generation))
         {
             retire_unseen_global(ctx, name);
         }
     }
-    let generations: std::collections::BTreeSet<_> = generations.into_values().collect();
+    let generations: std::collections::BTreeSet<_> = record.generations().collect();
     for generation in generations {
         crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
     }
@@ -1676,11 +1652,7 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
         let mut ctx = gpu_context(&[A]);
-        ctx.registries.entry(A.host).or_default().list(7);
-        ctx.registry_global_generations
-            .entry(A.host)
-            .or_default()
-            .insert(7, 9);
+        ctx.registries.entry(A.host).or_default().list(7, 9);
         ctx.registry_global_visibility
             .entry(A.host)
             .or_default()
@@ -1696,7 +1668,6 @@ mod tests {
 
         assert_eq!(A.destroy(&mut ctx), Action::Forward);
         assert!(!ctx.registries.contains_key(&A.host));
-        assert!(!ctx.registry_global_generations.contains_key(&A.host));
         assert!(!ctx.registry_global_visibility.contains_key(&A.host));
         assert!(ctx.pending_dmabuf_globals.is_empty());
         assert!(!ctx.dmabuf_capabilities.contains_key(&9));

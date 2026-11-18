@@ -2177,12 +2177,11 @@ mod tests {
         ctx.shadow_table
             .insert_paired_for_test(REGISTRY, HOST_REGISTRY, "wl_registry");
         ctx.bind_aura_shell_for_test(SHELL);
-        ctx.registries.entry(HOST_REGISTRY).or_default().list(SHELL);
         ctx.global_generations.insert(SHELL, 1);
-        ctx.registry_global_generations
+        ctx.registries
             .entry(HOST_REGISTRY)
             .or_default()
-            .insert(SHELL, 1);
+            .list(SHELL, 1);
         let mut remove = MessageBuilder::new();
         remove.write_u32(SHELL);
         client
