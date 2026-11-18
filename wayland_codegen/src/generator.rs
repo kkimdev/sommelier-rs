@@ -608,6 +608,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 });
 
                 // Dispatch arm
+                let mut local_object_checks = Vec::new();
                 let mut mapping_and_writing = Vec::new();
                 let mut handler_call_args = Vec::new();
                 let mut field_names_list = Vec::new();
@@ -631,17 +632,18 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 
                         match arg.typ.as_str() {
                             // The pre-handler validation translated the
-                            // object (see `generate_request_validations`).
+                            // object (see `generate_request_validations`): a
+                            // nullable one to a host ID, a non-nullable one to
+                            // a `Link`, which must name a host object.
                             "object" => {
-                                let host = translated_object_ident(arg);
-                                if arg.allow_null.unwrap_or(false) {
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(#host);
-                                    });
+                                let translated = translated_object_ident(arg);
+                                let host = if arg.allow_null.unwrap_or(false) {
+                                    translated
                                 } else {
+                                    let host = format_ident!("host_{}", arg.name);
                                     let req_name_str = &req.name;
-                                    mapping_and_writing.push(quote! {
-                                        let Link::Host(host_id) = #host else {
+                                    local_object_checks.push(quote! {
+                                        let Link::Host(#host) = #translated else {
                                             log::debug!(
                                                 "Dropping request {} naming a local object as non-nullable argument {}",
                                                 #req_name_str,
@@ -649,9 +651,12 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                             );
                                             return Ok(None);
                                         };
-                                        builder.write_u32(host_id);
                                     });
-                                }
+                                    host
+                                };
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#host);
+                                });
                             }
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
@@ -708,8 +713,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         #(#request_validations)*
                         let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
                         if handler_action == Action::Forward {
-                            // Check the sender before mapping any new_id: a
-                            // dropped request must not consume or map an ID.
+                            // Check the sender and every object argument
+                            // before mapping any new_id: a dropped request
+                            // must not consume or map an ID, since
+                            // libwayland-server refuses a gap in client IDs.
                             let Link::Host(host_sender_id) = sender else {
                                 log::debug!(
                                     "Dropping request from local object {}",
@@ -718,6 +725,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 #local_destructor_cleanup
                                 return Ok(None);
                             };
+                            #(#local_object_checks)*
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
@@ -768,6 +776,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 });
 
                 // Dispatch arm for event (Host -> Guest)
+                let mut unmapped_object_checks = Vec::new();
                 let mut mapping_and_writing = Vec::new();
                 let mut handler_call_args = Vec::new();
                 let mut field_names_list = Vec::new();
@@ -805,8 +814,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 );
                                 let evt_name_str = &evt.name;
                                 let arg_name_str = &arg.name;
-                                mapping_and_writing.push(quote! {
-                                    let Some(guest_id) = ctx.shadow_table.get_guest_id(#name) else {
+                                let guest = translated_object_ident(arg);
+                                unmapped_object_checks.push(quote! {
+                                    let Some(#guest) = ctx.shadow_table.get_guest_id(#name) else {
                                         log::debug!(
                                             "Dropping event {} naming an object with no guest counterpart as argument {}",
                                             #evt_name_str,
@@ -814,7 +824,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                         );
                                         return Ok(None);
                                     };
-                                    builder.write_u32(guest_id);
+                                });
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#guest);
                                 });
                             }
                             "new_id" => {
@@ -864,9 +876,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         // same object rather than looking it up again.
                         let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
                         if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
-                            // Check the sender before mapping any new_id: a
-                            // dropped event must not consume a guest server
-                            // ID, since libwayland-client refuses gaps.
+                            // Check the sender and every object argument
+                            // before mapping any new_id: a dropped event must
+                            // not consume a guest server ID, since
+                            // libwayland-client refuses gaps.
                             let Some(guest_sender_id) = mapped_guest_sender_id else {
                                 log::debug!(
                                     "Dropping event from unmapped sender {}",
@@ -874,6 +887,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 );
                                 return Ok(None);
                             };
+                            #(#unmapped_object_checks)*
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
