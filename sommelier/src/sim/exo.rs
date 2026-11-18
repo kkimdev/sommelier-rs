@@ -23,7 +23,7 @@ limitations under the License.
 //! compositor keeps this model of each host `zwp_text_input_v1` to compare
 //! with what the guest committed, and plays the rest of the host itself.
 //!
-//! The simulation also gives the model the seat's keyboards, the user's
+//! The simulation also gives the model the seat's keyboard, the user's
 //! keys and the answers of the input method engine ([`super::engine`]), and
 //! takes what the model hands the engine. Exo then sends a key raw while no
 //! text input is attached, or with the engine's edits once it answers, and
@@ -243,6 +243,15 @@ impl Host {
     }
 }
 
+/// The seat's `wl_keyboard`. A case has one, as a client binds one.
+#[derive(Clone, Copy)]
+struct Keyboard {
+    id: u32,
+    /// Its `zcr_extended_keyboard_v1`, which the proxy binds at v2, the
+    /// first with `peek_key`.
+    extended: Option<u32>,
+}
+
 /// A key handed to the engine that it has not answered.
 struct PendingKey {
     id: u64,
@@ -265,9 +274,9 @@ pub(crate) struct Exo {
     extensions: BTreeMap<u32, u32>,
     /// The events Exo sent and no one has taken yet, in order.
     events: Vec<Outgoing>,
-    /// Each `wl_keyboard`, with its `zcr_extended_keyboard_v1` if it has
-    /// one.
-    keyboards: BTreeMap<u32, Option<u32>>,
+    keyboard: Option<Keyboard>,
+    /// The modifiers the keyboard last sent.
+    modifiers: u32,
     /// The last serial an event took.
     serial: u32,
     /// The serial `MaybeNextKeySerial` keeps for keys: a `peek_key` takes
@@ -297,36 +306,36 @@ impl Exo {
 
     /// Move the seat's focus, as Alt-Tab or a click on another window does:
     /// each keyboard leaves the old surface and enters the new one, and the
-    /// text inputs follow as in [`Exo::set_focus`]. Whether the keyboards
+    /// text inputs follow as in [`Exo::set_text_input_focus`]. Whether the keyboard
     /// or the text inputs hear of it first is drawn per move (E12).
     pub(super) fn move_focus(&mut self, focus: Option<u32>, choices: &mut impl Choose) {
         let lost = self.focus;
         if lost == focus {
             return;
         }
-        let keyboards_first = choices.pick(2) == 0;
-        if !keyboards_first {
-            self.set_focus(focus);
+        let keyboard_first = choices.pick(2) == 0;
+        if !keyboard_first {
+            self.set_text_input_focus(focus);
         }
-        for keyboard in self.keyboards.keys().copied().collect::<Vec<_>>() {
+        if let Some(Keyboard { id, .. }) = self.keyboard {
             if let Some(surface) = lost {
                 let serial = self.next_serial();
                 self.events
-                    .push(wl_keyboard::evt::leave(keyboard, serial, surface));
+                    .push(wl_keyboard::evt::leave(id, serial, surface));
             }
             if let Some(surface) = focus {
-                self.keyboard_enter(keyboard, surface);
+                self.keyboard_enter(id, surface);
             }
         }
-        if keyboards_first {
-            self.set_focus(focus);
+        if keyboard_first {
+            self.set_text_input_focus(focus);
         }
     }
 
     /// The user presses and releases `key` at `now`. While a text input is
     /// attached, Exo hands the key to the engine and sends its events with
     /// the engine's answer ([`Exo::answer`]). Otherwise the input method
-    /// has no client and passes the key, which reaches the keyboards at
+    /// has no client and passes the key, which reaches the keyboard at
     /// once (E7).
     pub(super) fn key(&mut self, now: Micros, key: Key) {
         let time = millis(now);
@@ -377,11 +386,12 @@ impl Exo {
         self.late_answers
     }
 
-    /// Move the seat's focus for the text inputs, for a compositor that
-    /// tells the keyboards itself. `TextInput::OnSurfaceFocused` attaches
-    /// the text inputs of the surface that gains it and deactivates those
-    /// of the surface that loses it.
-    pub(crate) fn set_focus(&mut self, focus: Option<u32>) {
+    /// Move the seat's focus for the text inputs only, for a compositor
+    /// that sends the keyboard's `enter` and `leave` itself, as the
+    /// fuzzer's does. `TextInput::OnSurfaceFocused` attaches the text
+    /// inputs of the surface that gains it and deactivates those of the
+    /// surface that loses it.
+    pub(crate) fn set_text_input_focus(&mut self, focus: Option<u32>) {
         let lost = std::mem::replace(&mut self.focus, focus);
         if lost == focus {
             return;
@@ -396,16 +406,24 @@ impl Exo {
         }
     }
 
-    /// Forget the surfaces and text inputs that are no longer `live`,
-    /// destroyed by the proxy or by the compositor. A destroyed surface
-    /// loses the focus, and `TextInput::OnSurfaceDestroying` deactivates
-    /// its text inputs. An extension whose text input is gone has no
-    /// delegate, and Exo ignores its requests.
+    /// Forget the objects that are no longer `live`, destroyed by the
+    /// proxy or by the compositor. A destroyed surface loses the focus, and
+    /// `TextInput::OnSurfaceDestroying` deactivates its text inputs. An
+    /// extension whose text input is gone has no delegate, and Exo ignores
+    /// its requests.
     pub(crate) fn forget(&mut self, live: impl Fn(u32) -> bool) {
         if self.focus.is_some_and(|surface| !live(surface)) {
-            self.set_focus(None);
+            self.set_text_input_focus(None);
         }
         self.text_inputs.retain(|&id, _| live(id));
+        let text_inputs = &self.text_inputs;
+        let extended = |extension: u32, id: u32| live(extension) && text_inputs.contains_key(&id);
+        self.extensions
+            .retain(|&extension, &mut id| extended(extension, id));
+        self.keyboard = self.keyboard.filter(|keyboard| live(keyboard.id));
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.extended = keyboard.extended.filter(|&extended| live(extended));
+        }
         for id in self.ids() {
             if self.text_inputs[&id]
                 .surface
@@ -433,16 +451,19 @@ impl Exo {
             AnyRequest::ZcrExtendedTextInputV1(request) => self.extension_request(sender, request),
             AnyRequest::ZwpTextInputV1(request) => self.text_input_request(sender, request),
             AnyRequest::WlSeat(wl_seat::Request::GetKeyboard { id }) => {
-                self.keyboards.insert(*id, None);
+                let id = *id;
+                self.keyboard = Some(Keyboard { id, extended: None });
                 // A new keyboard learns the seat's focus at once.
                 if let Some(surface) = self.focus {
-                    self.keyboard_enter(*id, surface);
+                    self.keyboard_enter(id, surface);
                 }
             }
             AnyRequest::ZcrKeyboardExtensionV1(
                 zcr_keyboard_extension_v1::Request::GetExtendedKeyboard { id, keyboard },
             ) => {
-                self.keyboards.insert(*keyboard, Some(*id));
+                if let Some(bound) = self.keyboard.as_mut().filter(|bound| bound.id == *keyboard) {
+                    bound.extended = Some(*id);
+                }
             }
             _ => {}
         }
@@ -463,7 +484,10 @@ impl Exo {
         detached
     }
 
-    /// The events Exo sent since the last call, in order.
+    /// The events Exo sent since the last call, in order. Whoever plays the
+    /// display takes them after each input it hands the model, before it
+    /// answers any later `wl_display.sync`, so that the sync's `done`
+    /// follows every event of earlier requests (E11).
     pub(crate) fn take_events(&mut self) -> Vec<Outgoing> {
         std::mem::take(&mut self.events)
     }
@@ -699,58 +723,67 @@ impl Exo {
         }
     }
 
-    /// One transition of `key` for each keyboard of the focused surface:
-    /// a `peek_key` on its extension, and, unless the input method consumed
+    /// One transition of `key` on the keyboard, if it is on a surface: a
+    /// `peek_key` on its extension, and, unless the input method consumed
     /// the key, a `wl_keyboard.key` with the same serial. A run of consumed
     /// transitions shares one serial, which the next key sent frees. Shift
-    /// goes on before a shifted key's press and off after its release.
+    /// is not a key of its own here, so it sends no `peek_key` or `key`:
+    /// its modifier goes on before a shifted key's press and off after its
+    /// release.
     fn key_events(&mut self, key: Key, time: u32, state: u32, consumed: bool) {
+        let Some(Keyboard {
+            id: keyboard,
+            extended,
+        }) = self.keyboard
+        else {
+            return;
+        };
         if self.focus.is_none() {
             return;
         }
         let (code, shift) = keymap::keycode(key);
         if shift && state == wl_keyboard::KEY_STATE_PRESSED {
-            self.modifiers(keymap::SHIFT);
+            self.set_modifiers(keymap::SHIFT);
         }
         let serial = match self.key_serial {
             Some(serial) => serial,
             None => self.next_serial(),
         };
         self.key_serial = Some(serial);
-        for (&keyboard, &extended) in &self.keyboards {
-            if let Some(extended) = extended {
-                self.events.push(zcr_extended_keyboard_v1::evt::peek_key(
-                    extended, serial, time, code, state,
-                ));
-            }
-            if !consumed {
-                self.events
-                    .push(wl_keyboard::evt::key(keyboard, serial, time, code, state));
-            }
+        if let Some(extended) = extended {
+            let peek = zcr_extended_keyboard_v1::evt::peek_key(extended, serial, time, code, state);
+            self.events.push(peek);
         }
         if !consumed {
+            self.events
+                .push(wl_keyboard::evt::key(keyboard, serial, time, code, state));
             self.key_serial = None;
         }
         if shift && state == wl_keyboard::KEY_STATE_RELEASED {
-            self.modifiers(0);
+            self.set_modifiers(0);
         }
     }
 
-    /// `wl_keyboard.modifiers` with `depressed` to each keyboard.
-    fn modifiers(&mut self, depressed: u32) {
-        for keyboard in self.keyboards.keys().copied().collect::<Vec<_>>() {
+    /// `wl_keyboard.modifiers` with `depressed`, if they changed.
+    fn set_modifiers(&mut self, depressed: u32) {
+        if depressed == self.modifiers {
+            return;
+        }
+        self.modifiers = depressed;
+        if let Some(Keyboard { id, .. }) = self.keyboard {
             let serial = self.next_serial();
-            self.events.push(wl_keyboard::evt::modifiers(
-                keyboard, serial, depressed, 0, 0, 0,
-            ));
+            self.events
+                .push(wl_keyboard::evt::modifiers(id, serial, depressed, 0, 0, 0));
         }
     }
 
     /// `keyboard` enters `surface`, after the modifiers, as Exo sends them.
     fn keyboard_enter(&mut self, keyboard: u32, surface: u32) {
         let serial = self.next_serial();
-        self.events
-            .push(wl_keyboard::evt::modifiers(keyboard, serial, 0, 0, 0, 0));
+        let modifiers = self.modifiers;
+        self.events.push(wl_keyboard::evt::modifiers(
+            keyboard, serial, modifiers, 0, 0, 0,
+        ));
         let serial = self.next_serial();
         let enter = wl_keyboard::evt::enter(keyboard, serial, surface, &[]);
         self.events.push(enter.expect("an enter with no keys fits"));
@@ -844,7 +877,7 @@ mod tests {
             text_input: TI,
         };
         send(&mut exo, EXT_MANAGER, extend);
-        exo.set_focus(Some(A));
+        exo.set_text_input_focus(Some(A));
         exo
     }
 
@@ -1041,7 +1074,7 @@ mod tests {
         // does.
         send(&mut exo, TI, activate(B));
         assert_eq!(events(&mut exo), [leave()]);
-        exo.set_focus(Some(B));
+        exo.set_text_input_focus(Some(B));
         assert_eq!(events(&mut exo), [enter(B)]);
     }
 
@@ -1078,12 +1111,12 @@ mod tests {
     fn e2_exo_detaches_on_focus_loss_surface_end_and_input_method_end() {
         let mut exo = exo();
         let detaches: [fn(&mut Exo); 3] = [
-            |exo| exo.set_focus(Some(B)),
+            |exo| exo.set_text_input_focus(Some(B)),
             |exo| exo.forget(|id| id != A),
             |exo| assert!(exo.destroy_input_method()),
         ];
         for detach in detaches {
-            exo.set_focus(Some(A));
+            exo.set_text_input_focus(Some(A));
             send(&mut exo, TI, activate(A));
             assert_eq!(events(&mut exo), [enter(A)]);
             detach(&mut exo);
@@ -1097,7 +1130,7 @@ mod tests {
         // a new surface with its ID gets none.
         send(&mut exo, TI, activate(B));
         exo.forget(|id| id != B);
-        exo.set_focus(Some(B));
+        exo.set_text_input_focus(Some(B));
         assert_eq!(events(&mut exo), []);
     }
 
@@ -1336,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn e12_a_focus_move_reaches_keyboards_and_text_inputs_in_the_drawn_order() {
+    fn e12_a_focus_move_reaches_the_keyboard_and_text_inputs_in_the_drawn_order() {
         for text_inputs_first in [false, true] {
             let mut exo = active(Host::default());
             exo.move_focus(Some(B), &mut |_| u32::from(text_inputs_first));
@@ -1387,5 +1420,18 @@ mod tests {
             confirm_commits: true,
         };
         assert_eq!(Host::draw(&mut |n| n - 1), last);
+    }
+
+    #[test]
+    fn exo_forgets_the_keyboard_and_extensions_that_end() {
+        let mut exo = exo();
+        exo.forget(|id| id != PEEK && id != EXT);
+        send(&mut exo, EXT, support(false));
+        assert!(exo.text_inputs[&TI].pending_support, "an ended extension");
+        exo.key(NOW, Key::Char('r'));
+        assert_eq!(events(&mut exo), [key(1, 'r', DOWN), key(2, 'r', UP)]);
+        exo.forget(|id| id != KEYBOARD);
+        exo.key(NOW, Key::Char('r'));
+        assert_eq!(events(&mut exo), []);
     }
 }

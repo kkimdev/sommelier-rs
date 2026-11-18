@@ -1636,7 +1636,7 @@ fn compositor(
                         serial += 1;
                         reply.push(keyboard_enter(keyboard, serial, sender));
                     }
-                    exo.set_focus(Some(sender));
+                    exo.set_text_input_focus(Some(sender));
                     // Which of Exo's seat observers hears of the focus first,
                     // its keyboards or its text inputs, is not modelled.
                     let text_input_events = text_input_events(exo.take_events());
