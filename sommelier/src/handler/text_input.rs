@@ -3348,6 +3348,44 @@ mod tests {
             );
         }
     }
+
+    /// The text inputs of a seat follow its focus in ascending ID order,
+    /// whatever order the guest created them in, so what the proxy sends
+    /// never depends on how it hashes them. With eight, an order that
+    /// depends on hashing is all but certain to differ; two would match it
+    /// half the time.
+    #[tokio::test]
+    async fn the_text_inputs_of_a_seat_follow_its_focus_in_id_order() {
+        let mut f = Field::enabled().await;
+        let first = f.text_input();
+        let mut ids = vec![first.ti];
+        ids.extend((1..8).map(|_| f.s.new_id()));
+        for &id in ids[1..].iter().rev() {
+            f.create_text_input(id).await;
+        }
+        f.select(first);
+        let (keyboard, surface) = (f.keyboard, f.surface.id);
+
+        let leave = wl_keyboard::evt::leave(keyboard.host, 2, f.surface.host);
+        f.s.host([leave]).await;
+        let mut expected: Vec<(u32, AnyEvent)> = vec![(
+            keyboard.id,
+            wl_keyboard::Event::Leave { serial: 2, surface }.into(),
+        )];
+        expected.extend(ids.iter().map(|&ti| (ti, V3::Leave { surface }.into())));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+
+        let entered: Vec<(u32, AnyEvent)> = ids
+            .iter()
+            .map(|&ti| (ti, V3::Enter { surface }.into()))
+            .collect();
+        assert_eq!(f.enter_surface().await, entered);
+        assert_eq!(f.s.host_received(), []);
+    }
+
     /// A disable invalidates the surrounding text, at the host too, and
     /// deactivates it, but only at its commit.
     #[tokio::test]

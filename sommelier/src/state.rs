@@ -25,7 +25,7 @@ mod render;
 mod window_placement;
 mod xdg_roles;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -349,7 +349,10 @@ pub struct Context {
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
     pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
     pub surfaces: HashMap<u32, SurfaceState>,
-    pub text_inputs: HashMap<u32, TextInputState>,
+    /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
+    /// reaches them in that order (INVARIANTS "Output order does not
+    /// depend on hashing").
+    pub text_inputs: BTreeMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
@@ -1010,7 +1013,7 @@ impl Context {
             render_buffers: RenderBufferRegistry::default(),
             pending_native_creates: HashMap::new(),
             surfaces: HashMap::new(),
-            text_inputs: HashMap::new(),
+            text_inputs: BTreeMap::new(),
             keyboard_to_seat: HashMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),

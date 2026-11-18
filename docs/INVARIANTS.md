@@ -222,6 +222,15 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `earlier_reverse_output_reaches_the_guest_before_the_error`,
   `a_forward_that_ends_the_session_discards_its_deferred_work`,
   `an_invalid_message_length_is_reported_before_closing`.
+- **Output order does not depend on hashing.** When a message makes the
+  proxy send something for each of several objects, it visits them in
+  ascending order of a key the session's messages decide, such as an ID:
+  the state it walks is a `BTreeMap` or `BTreeSet`, or it sorts what it
+  collects first. A `HashMap` or `HashSet` is only looked up, or walked
+  where the order changes nothing sent (a search for the one match, a
+  minimum, removals). So the same messages always make the same bytes,
+  and a session can be replayed exactly.
+  Test: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`.
 
 ## Protocol errors
 
