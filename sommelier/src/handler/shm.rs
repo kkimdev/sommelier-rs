@@ -1851,24 +1851,28 @@ mod tests {
         retire_eligible_buffers, valid_buffer_layout, valid_pool_resize, valid_pool_size,
         valid_shm_stride, validate_dmabuf_layout, ShmCopyError, ShmCopyLayout,
     };
+    use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::registry::RegistryHandler;
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
-    use crate::protocols::wayland::{wl_buffer, wl_display, wl_registry, wl_shm, wl_shm_pool};
+    use crate::protocols::wayland::{
+        wl_buffer, wl_display, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    };
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion};
     use crate::state::{Context, HostId, RenderBufferLifecycle, ShmPool};
     use crate::test_support::{
-        decoded, protocol_error_code, queued_headers, raw_dispatch, register_test_buffer,
+        decode, decoded, protocol_error_code, queued_headers, raw_dispatch, register_test_buffer,
         shm_pool_file, BufferKind, BUFFER_KINDS,
     };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::fs::FileExt;
     use std::sync::Arc;
 
     fn register_test_server_native(ctx: &mut Context, host_id: u32) -> u32 {
@@ -2349,6 +2353,142 @@ mod tests {
         );
     }
 
+    /// A buffer whose host copy is shared memory, which the host imports
+    /// as a `wl_shm` pool of the guest buffer's layout, copies each plane
+    /// where that layout puts it: NV12's plane 1 right after plane 0's
+    /// rows.
+    #[test]
+    fn a_shared_host_copy_takes_each_plane_where_the_guest_layout_puts_it() {
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        ctx.host_shm_id = Some(ctx.shadow_table.create_host_only(wl_shm::NAME, 1));
+        let host_copy = shm_pool_file(&[0; 12]);
+        let request = ShmBufferRequest {
+            id: 30,
+            pool_id: 20,
+            // The 2x2 Y plane, then the one row of the UV plane, each row
+            // padded to 4 bytes.
+            pool_file: Arc::new(shm_pool_file(&[
+                1, 2, 0xee, 0xee, 3, 4, 0xee, 0xee, 5, 6, 0xee, 0xee,
+            ])),
+            offset: 0,
+            width: 2,
+            height: 2,
+            stride: 4,
+            format: wl_shm::FORMAT_NV12,
+            size: 12,
+        };
+
+        assert_eq!(
+            create_shared_buffer(&mut ctx, request, host_copy.try_clone().unwrap().into()),
+            Action::Drop
+        );
+        assert!(!ctx.is_fatal());
+        let buffer = ctx.local_buffer(30).expect("the buffer's state");
+        let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
+        copy_shm_damage(
+            &buffer.pool_file,
+            buffer.dest_ptr,
+            layout,
+            &DamageRegion::Full,
+        )
+        .unwrap();
+        let mut pixels = [0; 12];
+        host_copy.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(pixels, [1, 2, 0, 0, 3, 4, 0, 0, 5, 6, 0, 0]);
+    }
+
+    /// A buffer whose host copy is a dma-buf tells the host the
+    /// allocator's layout, and copies each plane where that layout puts it.
+    /// Plane 1 of this NV12 buffer starts after a gap past plane 0, with
+    /// rows of another stride. A memfd stands in for the VirtWL dma-buf,
+    /// which `map_dmabuf` maps the same way.
+    #[test]
+    fn a_dmabuf_host_copy_takes_each_plane_where_its_layout_puts_it() {
+        use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+        let host_dmabuf = ctx
+            .shadow_table
+            .create_host_only(zwp_linux_dmabuf_v1::NAME, 3);
+        let (width, height) = (2, 2);
+        let layout =
+            validate_dmabuf_layout(wl_shm::FORMAT_NV12, width, height, [4, 8, 0], [0, 16, 0])
+                .expect("a valid NV12 layout");
+        let host_copy = shm_pool_file(&[0; 24]);
+        let request = ShmBufferRequest {
+            id: 30,
+            pool_id: 20,
+            // The 2x2 Y plane, then the one row of the UV plane.
+            pool_file: Arc::new(shm_pool_file(&[1, 2, 3, 4, 5, 6])),
+            offset: 0,
+            width,
+            height,
+            stride: 2,
+            format: wl_shm::FORMAT_NV12,
+            size: 6,
+        };
+        let allocation = DmabufAllocation {
+            fd: host_copy.try_clone().unwrap().into(),
+            layout,
+            modifier: 0,
+            dmabuf_sync: true,
+        };
+
+        assert_eq!(
+            create_dmabuf_buffer(&mut ctx, request, host_dmabuf, allocation),
+            Action::Drop
+        );
+        assert!(!ctx.is_fatal());
+        let senders = std::iter::once(zwp_linux_dmabuf_v1::NAME)
+            .chain(std::iter::repeat(zwp_linux_buffer_params_v1::NAME));
+        let planes: Vec<_> = ctx
+            .client_to_host_queue
+            .iter()
+            .zip(senders)
+            .filter_map(|((message, fds), interface)| {
+                let mut fds = fds.iter().map(|fd| fd.try_clone().unwrap()).collect();
+                match decode(message, &mut fds, |msg| {
+                    AnyRequest::from_wire(interface, msg)
+                }) {
+                    Ok((
+                        _,
+                        AnyRequest::ZwpLinuxBufferParamsV1(
+                            zwp_linux_buffer_params_v1::Request::Add {
+                                plane_idx,
+                                offset,
+                                stride,
+                                ..
+                            },
+                        ),
+                    )) => Some((plane_idx, offset, stride)),
+                    Ok(_) => None,
+                    Err(error) => panic!("a queued request does not decode: {error}"),
+                }
+            })
+            .collect();
+        assert_eq!(planes, [(0, 0, 4), (1, 16, 8)]);
+
+        // Copy every pixel, as the buffer's first commit does.
+        let buffer = ctx.local_buffer(30).expect("the buffer's state");
+        let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
+        copy_shm_damage(
+            &buffer.pool_file,
+            buffer.dest_ptr,
+            layout,
+            &DamageRegion::Full,
+        )
+        .unwrap();
+        let mut pixels = [0; 24];
+        host_copy.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(
+            pixels,
+            [
+                1, 2, 0, 0, 3, 4, 0, 0, // Y rows, 4 bytes apart
+                0, 0, 0, 0, 0, 0, 0, 0, // the gap
+                5, 6, 0, 0, 0, 0, 0, 0, // the UV row
+            ]
+        );
+    }
+
     #[test]
     fn synthetic_shm_advertises_mandatory_formats_until_host_capabilities_arrive() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
@@ -2568,6 +2708,60 @@ mod tests {
                 ),
                 (*id, wl_shm_pool::Request::Destroy {}.into()),
             ]
+        );
+        assert_eq!(s.guest_received(), []);
+    }
+
+    /// A buffer's host copy holds the buffer's pixels: its rows from its
+    /// offset in the pool, its stride apart, laid out in the host's pool as
+    /// in the guest's, without the padding between them.
+    #[tokio::test]
+    async fn a_committed_buffer_copies_its_rows_from_its_pool_offset() {
+        let (mut s, shm) = session_with_shm().await;
+        let surface = s.surface().await;
+        let pool = s
+            .shm_pool(
+                shm,
+                shm_pool_file(&[
+                    0xee, 0xee, 0xee, 0xee, // before the buffer
+                    1, 2, 3, 4, 0xee, 0xee, 0xee, 0xee, // row 0, padding
+                    5, 6, 7, 8, 0xee, 0xee, 0xee, 0xee, // row 1, padding
+                ]),
+            )
+            .await;
+        let buffer = s.new_id();
+        s.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            4,
+            1,
+            2,
+            8,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let received = s.host_received();
+        let Some(host_pool) = received.iter().find_map(|(_, request)| match request {
+            AnyRequest::WlShm(wl_shm::Request::CreatePool { fd, .. }) => Some(fd),
+            _ => None,
+        }) else {
+            panic!("the host got no pool: {received:?}");
+        };
+
+        s.guest([
+            wl_surface::req::attach(surface.id, Some(buffer), 0, 0),
+            wl_surface::req::damage(surface.id, 0, 0, 1, 2),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
+        s.host_received();
+        let mut host_pixels = [0; 16];
+        File::from(host_pool.try_clone().unwrap())
+            .read_exact_at(&mut host_pixels, 0)
+            .unwrap();
+        assert_eq!(
+            host_pixels,
+            [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0]
         );
         assert_eq!(s.guest_received(), []);
     }
