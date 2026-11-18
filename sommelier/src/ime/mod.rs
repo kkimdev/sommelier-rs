@@ -22,10 +22,16 @@ limitations under the License.
 //! of the design (`DESIGN-ime-core.md`), whose row IDs the code and tests
 //! cite.
 
+use std::collections::BTreeMap;
+
 use crate::wire::{IndexedString, Outgoing};
 
 mod guest;
+mod host;
 mod serial;
+mod state;
+
+use state::TextInput;
 
 /// A guest `zwp_text_input_v3`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -225,4 +231,44 @@ pub trait Env {
     fn host_seat(&self, seat: SeatId) -> Option<u32>;
     /// The surface the seat's keyboard focuses now.
     fn keyboard_focus(&self, seat: SeatId) -> Option<SurfaceId>;
+}
+
+/// The text inputs of one connection.
+#[derive(Debug, Default)]
+pub struct ImeCore {
+    inputs: BTreeMap<TiId, TextInput>,
+    /// Each extension object's text input. Only `Create` and removal
+    /// change it.
+    by_ext: BTreeMap<u32, TiId>,
+    next_barrier: u64,
+}
+
+impl ImeCore {
+    /// H10: the seat of the text input whose host keysyms reach the
+    /// guest: an attached one, whatever its fence.
+    pub fn keysym_target(&self, ti: TiId) -> Option<SeatId> {
+        self.inputs
+            .get(&ti)
+            .filter(|t| t.is_attached())
+            .map(|t| t.seat())
+    }
+
+    /// Check the invariants of design 3.1 (I1a to I4) that hold between
+    /// steps. I5 is the adapter's.
+    pub fn assert_invariants(&self, env: &impl Env) {
+        let mut enabled = Vec::new();
+        for (&ti, t) in &self.inputs {
+            t.assert_invariants(ti, env);
+            if t.is_enabled() {
+                enabled.push(ti);
+            }
+        }
+        assert!(enabled.len() <= 1, "I3: {enabled:?} are all enabled");
+        let extensions: BTreeMap<u32, TiId> = self
+            .inputs
+            .iter()
+            .filter_map(|(&ti, t)| Some((t.host().ext?.id, ti)))
+            .collect();
+        assert_eq!(self.by_ext, extensions, "I4");
+    }
 }
