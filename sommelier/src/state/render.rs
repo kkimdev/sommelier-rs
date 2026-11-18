@@ -503,10 +503,13 @@ impl<S> DamageRegion<S> {
         matches!(self, Self::Full)
     }
 
-    pub fn rects(&self) -> &[Rect<S>] {
+    /// The region's rectangles, or `None` for full damage, which has none
+    /// to list.
+    pub fn rects(&self) -> Option<&[Rect<S>]> {
         match self {
-            Self::Rects(rects) => rects,
-            Self::Empty | Self::Full => &[],
+            Self::Empty => Some(&[]),
+            Self::Rects(rects) => Some(rects),
+            Self::Full => None,
         }
     }
 }
@@ -667,10 +670,6 @@ impl SurfaceCommit {
             || self.previous.viewport != self.state.viewport
     }
 
-    pub fn has_full_damage(&self) -> bool {
-        self.surface_damage.is_full() || self.buffer_damage.is_full()
-    }
-
     /// Whether an attach offset moves the new buffer against the surface,
     /// so that surface damage no longer relates to its pixels.
     pub fn moves_buffer(&self) -> bool {
@@ -684,11 +683,12 @@ impl SurfaceCommit {
     /// through `mapping` (see [`SurfaceMapping::to_buffer`]); a transform,
     /// or an attach offset, falls back to the whole buffer.
     pub fn buffer_copy_damage(&self, mapping: &SurfaceMapping) -> DamageRegion<BufferSpace> {
-        if self.has_full_damage() {
+        let Some(surface_damage) = self.surface_damage.rects() else {
             return DamageRegion::Full;
-        }
+        };
+        // Full buffer damage stays full: pushing to it adds nothing.
         let mut damage = self.buffer_damage.clone();
-        for &rect in self.surface_damage.rects() {
+        for &rect in surface_damage {
             match mapping.to_buffer(rect).filter(|_| !self.moves_buffer()) {
                 Some(rect) => damage.push(rect),
                 None => return DamageRegion::Full,

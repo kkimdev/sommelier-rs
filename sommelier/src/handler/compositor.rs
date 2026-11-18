@@ -644,15 +644,20 @@ impl WlSurfaceHandler for CompositorHandler {
         };
         let attached_full_mapping =
             attached_buffer_id.is_some() && (commit.moves_buffer() || !mapping.is_identity());
-        let surface_damage = commit.surface_damage.rects();
-        let buffer_damage = commit.buffer_damage.rects();
+        // `None`: full damage, which sends the whole surface instead of
+        // any rectangle.
+        let damage = commit
+            .surface_damage
+            .rects()
+            .zip(commit.buffer_damage.rects());
+        let (surface_damage, buffer_damage) = damage.unwrap_or_default();
         ctx.stale_surface_pixels(surface_id, &commit, &mapping);
         // A buffer that copies everything shows the host a whole new image.
         let needs_full_damage = copied_buffer_id
             .and_then(|buffer_id| ctx.local_buffer(buffer_id))
             .is_some_and(|buffer| buffer.stale.to_copy_on(surface_id).is_full());
         let force_full_damage = needs_full_damage
-            || commit.has_full_damage()
+            || damage.is_none()
             || (commit.buffer_offset != (0, 0)
                 && (!surface_damage.is_empty() || !buffer_damage.is_empty()))
             || (attached_full_mapping && surface_damage.is_empty() && buffer_damage.is_empty());

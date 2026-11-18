@@ -817,14 +817,14 @@ pub(crate) fn copy_shm_damage(
 
     let bytes_per_pixel = format_bytes_per_pixel(format).unwrap_or(0);
     let plane_count = if format == wl_shm::FORMAT_NV12 { 2 } else { 1 };
-    let merged_damage = match damage {
-        DamageRegion::Full => vec![BufferRect::new(
+    let merged_damage = match damage.rects() {
+        None => vec![BufferRect::new(
             0,
             0,
             i32::try_from(width).unwrap_or(i32::MAX),
             i32::try_from(height).unwrap_or(i32::MAX),
         )],
-        DamageRegion::Empty | DamageRegion::Rects(_) => coalesce_damage_rects(damage.rects()),
+        Some(rects) => coalesce_damage_rects(rects),
     };
     let mut spans = Vec::new();
     for rect in &merged_damage {

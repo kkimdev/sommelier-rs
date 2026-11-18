@@ -1426,7 +1426,6 @@ mod tests {
             commit.buffer_damage,
             DamageRegion::Rects(vec![BufferRect::new(5, 6, 7, 8)])
         );
-        assert!(!commit.has_full_damage());
         assert_eq!(
             commit.buffer_offset,
             (9, 10),
@@ -1448,7 +1447,6 @@ mod tests {
         assert_eq!(next.attachment, SurfaceAttachment::Unchanged);
         assert!(next.surface_damage.is_empty());
         assert!(next.buffer_damage.is_empty());
-        assert!(!next.has_full_damage());
         assert_eq!(next.buffer_offset, (0, 0));
         assert_eq!(next.state, commit.state);
     }
@@ -1547,7 +1545,6 @@ mod tests {
 
         let commit = surface.prepare_commit();
         assert_eq!(commit.buffer_damage, DamageRegion::Full);
-        assert!(commit.has_full_damage());
         assert!(surface.pending.buffer_damage.is_empty());
     }
 
