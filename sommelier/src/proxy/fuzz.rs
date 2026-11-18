@@ -183,7 +183,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
             );
             assert!(
                 press_restarts > 0,
-                "no input method restarted after a press, so a leave during the fence went untested"
+                "no input method restarted after a press that ended a composition, so a leave during the reset fence went untested"
             );
             assert!(
                 reused > 0,
@@ -1590,6 +1590,10 @@ fn compositor(
     // last request was a `reset`, whose sync is the proxy's fence.
     let mut pointers = Pointers::default();
     let mut after_reset = false;
+    // Whether the last reply restarted the input method after a press, which
+    // counts once the proxy's `reset` shows that the press ended a
+    // composition, so that its fence was pending when the `leave` arrived.
+    let mut restarted_after_press = false;
     // The seat each active host text input was activated with.
     let mut activations: BTreeMap<u32, u32> = BTreeMap::new();
     let mut server_ids = ServerIds {
@@ -1681,6 +1685,10 @@ fn compositor(
                 // The proxy's own answer to a press on a composition.
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_RESET) if !zombie => {
                     COMPOSITIONS_ENDED_BY_PRESSES.fetch_add(1, Ordering::Relaxed);
+                    if restarted_after_press {
+                        RESTARTS_AFTER_PRESSES.fetch_add(1, Ordering::Relaxed);
+                        restarted_after_press = false;
+                    }
                 }
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) if !zombie => {
                     activations.insert(sender, named[0]);
@@ -1815,6 +1823,7 @@ fn compositor(
             // A destroyed surface loses the focus without a `leave`.
             exo.forget(|id| objects.contains_key(&id));
             if sync_callback.is_some() {
+                restarted_after_press = false;
                 // The presses name only what the compositor still has, and
                 // come before the sync's `done`, which the guest may close
                 // on. So does a restart, except on the answer to the proxy's
@@ -1825,9 +1834,7 @@ fn compositor(
                 reply.extend(sent.events);
                 if !fence && rng.one_in(8) && exo.destroy_input_method() {
                     INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
-                    if sent.pressed {
-                        RESTARTS_AFTER_PRESSES.fetch_add(1, Ordering::Relaxed);
-                    }
+                    restarted_after_press = sent.pressed;
                 }
             }
             reply.extend(text_input_events(exo.take_events()));
@@ -1969,8 +1976,8 @@ fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
 /// all cases.
 static COMPOSITIONS_ENDED_BY_PRESSES: AtomicU64 = AtomicU64::new(0);
 
-/// Input method restarts that followed a press in the same reply, across
-/// all cases.
+/// Input method restarts that followed, in the same reply, a press that
+/// ended a composition (the proxy `reset` Exo), across all cases.
 static RESTARTS_AFTER_PRESSES: AtomicU64 = AtomicU64::new(0);
 
 /// The compositor's pointers and touches: what they are bound at, and
