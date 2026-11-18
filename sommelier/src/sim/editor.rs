@@ -107,15 +107,25 @@ impl TextModel {
     ///
     /// # Panics
     ///
-    /// If the delete reaches past the text or splits a character: a client
-    /// model checks the lengths it receives first.
+    /// If the delete does not fit the text: a client model checks it with
+    /// [`TextModel::delete_range`] first.
     pub fn apply_txn(&mut self, txn: &Txn) {
         let (before, after) = txn.delete;
-        if before + after > 0 {
-            self.replace(self.cursor - before..self.cursor + after, "");
-        }
+        let deleted = self
+            .delete_range(before, after)
+            .expect("the client checked the delete with delete_range");
+        self.replace(deleted, "");
         self.replace(self.cursor..self.cursor, &txn.commit);
         self.preedit.clone_from(&txn.preedit);
+    }
+
+    /// The bytes `delete_surrounding_text(before, after)` names: `before`
+    /// bytes before the cursor and `after` bytes after it. `None` if they
+    /// reach past the text or split a character.
+    pub fn delete_range(&self, before: usize, after: usize) -> Option<Range<usize>> {
+        let range = self.cursor.checked_sub(before)?..self.cursor.checked_add(after)?;
+        let fits = self.text.is_char_boundary(range.start) && self.text.is_char_boundary(range.end);
+        fits.then_some(range)
     }
 
     /// Applies a key that the input method passed to the application, as a
@@ -301,6 +311,39 @@ mod tests {
         let mut field = model("ab", 1, "가");
         field.apply_txn(&Txn::default());
         assert_eq!(field, model("ab", 1, ""));
+    }
+
+    #[test]
+    fn a_delete_must_fit_the_text_on_char_boundaries() {
+        let field = model("a가b", 4, "");
+        let table = [
+            ((0, 0), Some(4..4)),
+            ((3, 1), Some(1..5)),
+            ((4, 1), Some(0..5)),
+            // Past the start or the end.
+            ((5, 0), None),
+            ((0, 2), None),
+            ((usize::MAX, usize::MAX), None),
+            // Into 가, which is 3 bytes.
+            ((1, 0), None),
+            ((2, 1), None),
+        ];
+        for ((before, after), range) in table {
+            assert_eq!(
+                field.delete_range(before, after),
+                range,
+                "({before}, {after})"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "delete_range")]
+    fn a_transaction_whose_delete_does_not_fit_panics() {
+        model("가", 3, "").apply_txn(&Txn {
+            delete: (1, 0),
+            ..Txn::default()
+        });
     }
 
     #[test]
