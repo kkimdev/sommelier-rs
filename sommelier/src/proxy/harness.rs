@@ -387,6 +387,24 @@ impl Session {
         keyboard
     }
 
+    /// A `wl_pointer` the guest gets from `seat`, which the host's pointer
+    /// focus then enters on `surface`; the guest gets the `enter`.
+    pub(crate) async fn pointer_on(&mut self, seat: u32, surface: Object) -> Object {
+        use crate::protocols::wayland::{wl_pointer, wl_seat};
+        let id = self.new_id();
+        let host = self.create(wl_seat::req::get_pointer(seat, id)).await;
+        self.host([wl_pointer::evt::enter(host, 1, surface.host, 0, 0)])
+            .await;
+        let enter = wl_pointer::Event::Enter {
+            serial: 1,
+            surface: surface.id,
+            surface_x: 0,
+            surface_y: 0,
+        };
+        assert_eq!(self.guest_received(), [(id, enter.into())]);
+        Object { id, host }
+    }
+
     /// The host sends `keyboard` the [`default_keymap`], which the guest
     /// gets.
     pub(crate) async fn keymap(&mut self, keyboard: Object) {

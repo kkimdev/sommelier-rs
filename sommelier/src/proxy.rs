@@ -139,6 +139,7 @@ struct SommelierHandler {
     text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
     text_input_v3: crate::handler::text_input::TextInputV3Handler,
     keyboard: crate::handler::keyboard::KeyboardHandler,
+    pointer: crate::handler::pointer::PointerHandler,
     seat: crate::handler::seat::SeatHandler,
 }
 
@@ -162,6 +163,7 @@ impl SommelierHandler {
             text_input_manager_v3: crate::handler::text_input::TextInputManagerV3Handler,
             text_input_v3: crate::handler::text_input::TextInputV3Handler,
             keyboard: crate::handler::keyboard::KeyboardHandler::new(),
+            pointer: crate::handler::pointer::PointerHandler,
             seat: crate::handler::seat::SeatHandler,
         }
     }
@@ -3760,6 +3762,7 @@ protocols::wayland::impl_sommelier_delegates!(SommelierHandler, {
     wl_data_source: data_device,
     wl_data_offer: data_device,
     wl_keyboard: keyboard,
+    wl_pointer: pointer,
     wl_seat: seat,
     wl_output: output,
     wl_fixes: registry

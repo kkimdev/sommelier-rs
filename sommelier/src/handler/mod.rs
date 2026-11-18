@@ -23,6 +23,7 @@ pub mod gtk_shell;
 pub mod keyboard;
 pub mod linux_dmabuf;
 pub mod output;
+pub mod pointer;
 pub mod registry;
 pub mod seat;
 pub mod shm;

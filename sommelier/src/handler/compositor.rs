@@ -432,6 +432,7 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
         .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
     ctx.key_generations
         .clear_peek_watermarks_for_surface(wl_surface_guest_id);
+    ctx.pointer_focus.forget_surface(wl_surface_guest_id);
     // Surface destruction can race the host's wl_keyboard.leave event.
     // Transition the authoritative registry first, then emit the mandatory
     // v3 leave while the guest surface ID is still valid. A later host leave
