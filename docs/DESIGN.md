@@ -552,7 +552,10 @@ it a flag of its own, or runs in its own process
 `Client` as its guest and host, decoding what the proxy sends each into
 the generated message types; CONTRIBUTING says how to write a test with
 it. Beyond unit tests, `proxy::fuzz` feeds whole
-clients random guest streams, and `sommelier/tests/weston_e2e.rs` runs
+clients random guest streams, `sim` types into simulated text-input
+clients through a whole client on a virtual clock and checks their text
+against the specification and the user's intent, and
+`sommelier/tests/weston_e2e.rs` runs
 real clients through the proxy against a headless weston; CONTRIBUTING
 says how to run them. `sommelier_test_app` is a standalone GUI for manual
 IME and glyph checks, and `sommelier/tests/gui_smoke.rs` (ignored by
