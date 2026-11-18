@@ -1066,11 +1066,11 @@ mod tests {
     use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE};
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
     use crate::protocols::AnyRequest;
+    use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::{
-        decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error,
-        protocol_error_code, queued_headers, register_test_buffer, shm_pool_file, BufferKind,
-        BUFFER_KINDS,
+        decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error_code,
+        queued_headers, register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
@@ -2186,52 +2186,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
-        use crate::protocols::wayland::wl_shm::WlShmHandler;
-
-        const BUFFER_BYTES: usize = 4;
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let shm_id = 10;
-        let pool_id = 20;
-        let buffer_id = 42;
-        let surface_id = 100;
-        let client_file = shm_pool_file(&[0x11; BUFFER_BYTES]);
-        ctx.last_sender_id = shm_id;
-        assert_eq!(
-            crate::handler::shm::ShmHandler.on_create_pool(
-                &mut ctx,
-                pool_id,
-                client_file.as_fd(),
-                BUFFER_BYTES as i32,
-            ),
-            Action::Drop
-        );
-        assert!(!ctx.is_fatal());
-        let mut buffer = mapped_test_buffer(1, 1, BUFFER_BYTES as u32, StalePixels::all());
-        buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
-        register_test_local(&mut ctx, buffer_id, buffer);
+    #[tokio::test]
+    async fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        let client_file = shm_pool_file(&[0x11; 4]);
+        let pool = s.shm_pool(shm, client_file.try_clone().unwrap()).await;
+        let buffer = s.shm_buffer(pool, 1, 1).await;
 
         // The client shrinks its pool file behind the proxy's back. Reading
         // the pixels through a mapping of it raised SIGBUS and killed the
         // proxy with every guest GUI app.
         client_file.set_len(0).unwrap();
-        let mut handler = CompositorHandler;
-        ctx.last_sender_id = surface_id;
+        s.guest_fatal([
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            protocol_error(&ctx),
-            (buffer_id, wl_shm::ERROR_INVALID_FD),
+            s.guest_received_and_error(),
+            (vec![], (buffer.id, wl_shm::ERROR_INVALID_FD)),
             "the error names the buffer whose pool failed, as libwayland does"
         );
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "the commit must not reach the host"
+        assert_eq!(
+            s.host_received(),
+            [(
+                surface.host,
+                wl_surface::Request::Attach {
+                    buffer: buffer.host,
+                    x: 0,
+                    y: 0
+                }
+                .into()
+            )],
+            "only the attach before the failed commit reaches the host \
+             (a_rejected_request_sends_nothing_of_its_own pins the rest)"
         );
     }
 

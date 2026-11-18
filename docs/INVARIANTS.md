@@ -467,7 +467,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `create_pool` and `resize`.
   Tests: `pool_backing_must_be_a_long_enough_regular_file`,
   `create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd`,
-  `pool_resize_past_the_file_end_queues_invalid_fd_error`.
+  `a_pool_resize_must_keep_or_grow_its_size_within_its_file`.
 - **Damage-only commits copy from a buffer the host holds.** A commit
   without a new `attach` still damages the surface's current buffer, which
   the host samples again, so its damaged pixels MUST be copied before the

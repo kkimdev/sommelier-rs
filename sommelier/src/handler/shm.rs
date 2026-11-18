@@ -2036,12 +2036,14 @@ mod tests {
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
-    use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm};
+    use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm, wl_shm_pool};
+    use crate::protocols::AnyRequest;
+    use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion};
     use crate::state::{Context, HostId, RenderBufferLifecycle, ShmPool};
     use crate::test_support::{
-        decoded, msg_sender, protocol_error, protocol_error_code, queued_headers, raw_dispatch,
-        register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
+        decoded, protocol_error_code, queued_headers, raw_dispatch, register_test_buffer,
+        shm_pool_file, BufferKind, BUFFER_KINDS,
     };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
@@ -2071,6 +2073,14 @@ mod tests {
         buffer_lifecycle(ctx, host_id) == Some(RenderBufferLifecycle::HostDestroyQueued)
     }
 
+    /// A session whose guest has bound `wl_shm`, which the proxy
+    /// implements.
+    async fn session_with_shm() -> (Session, u32) {
+        let mut s = Session::new();
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        (s, shm)
+    }
+
     #[test]
     fn rejects_non_positive_pool_sizes() {
         assert_eq!(valid_pool_size(0), None);
@@ -2078,117 +2088,58 @@ mod tests {
         assert_eq!(valid_pool_size(4096), Some(4096));
     }
 
-    #[test]
-    fn invalid_shm_requests_are_protocol_errors() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let mut handler = ShmHandler;
-
-        ctx.last_sender_id = 10;
+    #[tokio::test]
+    async fn invalid_shm_requests_are_protocol_errors() {
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.new_id();
+        s.guest_fatal([wl_shm::req::create_pool(
+            shm,
+            pool,
+            shm_pool_file(&[]).into(),
+            0,
+        )])
+        .await;
         assert_eq!(
-            handler.on_create_pool(&mut ctx, 20, shm_pool_file(&[]).as_fd(), 0),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            protocol_error_code(&ctx),
-            1,
+            s.guest_received_and_error(),
+            (vec![], (shm, wl_shm::ERROR_INVALID_STRIDE)),
             "invalid pool size must use wl_shm.invalid_stride"
         );
 
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        let fd = {
-            use nix::sys::memfd::{memfd_create, MFdFlags};
-            use std::ffi::CString;
-            let fd = memfd_create(
-                CString::new("sommelier-invalid-shm-buffer")
-                    .unwrap()
-                    .as_c_str(),
-                MFdFlags::empty(),
-            )
-            .expect("memfd_create");
-            nix::unistd::ftruncate(&fd, 4096).expect("ftruncate");
-            fd
-        };
-        ctx.last_sender_id = 10;
-        assert_eq!(
-            handler.on_create_pool(&mut ctx, 20, fd.as_fd(), 4096),
-            Action::Drop
-        );
-        ctx.host_to_client_queue.clear();
-        ctx.clear_session_end_for_test();
-        ctx.last_sender_id = 20;
-        assert_eq!(
-            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(
-                &mut handler,
-                &mut ctx,
-                30,
-                0,
-                1,
-                1,
-                4,
-                0xffff_ffff,
-            ),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            protocol_error_code(&ctx),
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+        let buffer = s.new_id();
+        s.guest_fatal([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
             0,
+            1,
+            1,
+            4,
+            0xffff_ffff,
+        )])
+        .await;
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (pool, wl_shm::ERROR_INVALID_FORMAT)),
             "unsupported format must use wl_shm.invalid_format"
         );
     }
 
-    #[test]
-    fn create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd() {
-        let (pipe_read, _pipe_write) = nix::unistd::pipe().expect("pipe");
-        let short_file = shm_pool_file(&[0; 4095]);
-        for fd in [pipe_read.as_fd(), short_file.as_fd()] {
-            let mut ctx = Context::new_for_test(false, false, vec![]);
-            ctx.last_sender_id = 10;
+    #[tokio::test]
+    async fn create_pool_rejects_a_pipe_or_a_short_file_as_invalid_fd() {
+        let (pipe, _writer) = nix::unistd::pipe().expect("pipe");
+        for fd in [pipe, shm_pool_file(&[0; 4095]).into()] {
+            let (mut s, shm) = session_with_shm().await;
+            let pool = s.new_id();
+            s.guest_fatal([wl_shm::req::create_pool(shm, pool, fd, 4096)])
+                .await;
             assert_eq!(
-                ShmHandler.on_create_pool(&mut ctx, 20, fd, 4096),
-                Action::Drop
-            );
-            assert!(ctx.is_fatal());
-            assert_eq!(
-                protocol_error(&ctx),
-                (10, wl_shm::ERROR_INVALID_FD),
+                s.guest_received_and_error(),
+                (vec![], (shm, wl_shm::ERROR_INVALID_FD)),
                 "a pool must be a regular file of at least its size"
             );
-            assert!(ctx.pools.is_empty());
+            assert!(s.ctx().pools.is_empty());
         }
-    }
-
-    #[test]
-    fn pool_resize_past_the_file_end_queues_invalid_fd_error() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let pool_id = 20;
-        ctx.pools.insert(
-            pool_id,
-            ShmPool {
-                file: Arc::new(shm_pool_file(&[0; 4096])),
-                size: 4096,
-                shm: 10,
-            },
-        );
-        ctx.last_sender_id = pool_id;
-        let mut handler = ShmHandler;
-        assert_eq!(
-            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_resize(
-                &mut handler,
-                &mut ctx,
-                8192,
-            ),
-            Action::Drop
-        );
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            protocol_error_code(&ctx),
-            wl_shm::ERROR_INVALID_FD,
-            "a resize past the file's end must use wl_shm.invalid_fd"
-        );
-        assert_eq!(ctx.pools[&pool_id].size, 4096);
     }
 
     #[test]
@@ -2200,42 +2151,37 @@ mod tests {
         assert_eq!(valid_pool_resize(4096, -1), None);
     }
 
-    #[test]
-    fn pool_resize_accepts_the_same_size_and_rejects_shrinking_as_invalid_fd() {
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        let pool_id = 20;
-        ctx.pools.insert(
-            pool_id,
-            ShmPool {
-                file: Arc::new(shm_pool_file(&[0; 4096])),
-                size: 4096,
-                shm: 10,
-            },
-        );
-        ctx.last_sender_id = pool_id;
-        let mut handler = ShmHandler;
-        let mut resize = |ctx: &mut Context, size| {
-            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_resize(
-                &mut handler,
-                ctx,
-                size,
-            )
-        };
-
-        // libwayland accepts a resize to the current size.
-        assert_eq!(resize(&mut ctx, 4096), Action::Drop);
-        assert!(!ctx.is_fatal());
-        assert!(ctx.host_to_client_queue.is_empty());
-        assert_eq!(ctx.pools[&pool_id].size, 4096);
-
-        assert_eq!(resize(&mut ctx, 2048), Action::Drop);
-        assert!(ctx.is_fatal());
-        assert_eq!(
-            protocol_error_code(&ctx),
-            wl_shm::ERROR_INVALID_FD,
-            "shrinking a pool is wl_shm.invalid_fd, as in libwayland"
-        );
-        assert_eq!(ctx.pools[&pool_id].size, 4096);
+    /// A 4096-byte pool may keep its size, as libwayland accepts, or grow
+    /// within its file; shrinking it or growing it past its file's end is
+    /// `wl_shm.invalid_fd`, as in libwayland, and keeps its size.
+    #[tokio::test]
+    async fn a_pool_resize_must_keep_or_grow_its_size_within_its_file() {
+        for (file_size, size, valid) in [
+            (4096, 4096, true),
+            (8192, 8192, true),
+            (4096, 2048, false),
+            (4096, 8192, false),
+        ] {
+            let (mut s, shm) = session_with_shm().await;
+            let file = shm_pool_file(&[0; 4096]);
+            let pool = s.shm_pool(shm, file.try_clone().unwrap()).await;
+            file.set_len(file_size).unwrap();
+            let resize = wl_shm_pool::req::resize(pool, size);
+            if valid {
+                s.guest([resize]).await;
+                assert_eq!(s.guest_received(), [], "resize to {size}");
+                assert_eq!(s.ctx().pools[&pool].size, size as usize);
+            } else {
+                s.guest_fatal([resize]).await;
+                assert_eq!(
+                    s.guest_received_and_error(),
+                    (vec![], (pool, wl_shm::ERROR_INVALID_FD)),
+                    "resize to {size}"
+                );
+                assert_eq!(s.ctx().pools[&pool].size, 4096);
+            }
+            assert_eq!(s.host_received(), []);
+        }
     }
 
     #[test]
@@ -2723,58 +2669,54 @@ mod tests {
 
     /// Without VirtWL the host is a local compositor (`--local-compositor`),
     /// which maps a memfd as the buffer's wl_shm pool.
-    #[test]
-    fn without_virtwl_a_buffer_is_backed_by_a_memfd_of_its_size() {
-        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
-        const HOST_SHM: u32 = 2;
-        let (pool_id, buffer_id) = (20, 30);
+    #[tokio::test]
+    async fn without_virtwl_a_buffer_is_backed_by_a_memfd_of_its_size() {
+        let (mut s, shm) = session_with_shm().await;
+        let pool = s.shm_pool(shm, shm_pool_file(&[0; 4096])).await;
+        let buffer = s.new_id();
         let (width, height, stride) = (8, 4, 32);
+        s.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            buffer,
+            0,
+            width,
+            height,
+            stride,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
 
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.host_shm_id = Some(HOST_SHM);
-        ctx.shadow_table
-            .insert_host_only_for_test(HOST_SHM, "wl_shm", 1);
-        ctx.pools.insert(
-            pool_id,
-            ShmPool {
-                file: Arc::new(shm_pool_file(&[0; 4096])),
-                size: 4096,
-                shm: 10,
-            },
-        );
-        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
-        ctx.last_sender_id = pool_id;
-
+        // The host gets a pool of the buffer's size for it alone.
+        let received = s.host_received();
+        let (host_shm, AnyRequest::WlShm(wl_shm::Request::CreatePool { id, fd, size })) =
+            &received[0]
+        else {
+            panic!("the host got {received:?}");
+        };
+        let (host_buffer, _) = received[1].1.new_object().expect("a host buffer");
+        assert_eq!(Some(*host_shm), s.ctx().host_shm_id);
+        assert_eq!(*size, stride * height);
+        let pool_size = nix::sys::stat::fstat(fd).expect("fstat the pool").st_size;
+        assert_eq!(pool_size, i64::from(stride * height));
         assert_eq!(
-            <ShmHandler as crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler>::on_create_buffer(
-                &mut ShmHandler,
-                &mut ctx,
-                buffer_id,
-                0,
-                width,
-                height,
-                stride,
-                0,
-            ),
-            Action::Drop
-        );
-
-        assert!(!ctx.is_fatal());
-        assert!(ctx.shadow_table.get_host_id(buffer_id).is_some());
-        let host_pool = msg_sender(&ctx.client_to_host_queue[1].0);
-        assert_eq!(
-            queued_headers(&ctx.client_to_host_queue),
+            received[1..],
             [
-                (HOST_SHM, wl_shm::REQ_CREATE_POOL),
-                (host_pool, wl_shm_pool::REQ_CREATE_BUFFER),
-                (host_pool, wl_shm_pool::REQ_DESTROY),
+                (
+                    *id,
+                    wl_shm_pool::Request::CreateBuffer {
+                        id: host_buffer,
+                        offset: 0,
+                        width,
+                        height,
+                        stride,
+                        format: wl_shm::FORMAT_ARGB8888
+                    }
+                    .into()
+                ),
+                (*id, wl_shm_pool::Request::Destroy {}.into()),
             ]
         );
-        let pool_fd = ctx.client_to_host_queue[0].1[0].as_fd();
-        let pool_size = nix::sys::stat::fstat(pool_fd)
-            .expect("fstat the pool")
-            .st_size;
-        assert_eq!(pool_size, i64::from(stride * height));
+        assert_eq!(s.guest_received(), []);
     }
 
     /// Host storage that cannot be set up (here: the host has no wl_shm to
