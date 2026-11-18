@@ -50,9 +50,11 @@ limitations under the License.
 //! `crate::handler::aura_objects` creates and releases every Aura object.
 
 mod arc;
+mod remote_shell;
 
 #[cfg(test)]
 pub(crate) use self::arc::register_window_bounds_barrier_for_test;
+pub(crate) use self::remote_shell::RemoteShellHandler;
 
 use crate::handler::aura_objects::{self, ensure_host_zaura_surface};
 use crate::protocols::aura_shell::zaura_output::EVT_INSETS_SINCE;
