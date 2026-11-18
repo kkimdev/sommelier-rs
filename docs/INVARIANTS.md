@@ -1199,9 +1199,11 @@ end it.
   Test: `a_held_socket_lock_protects_the_live_socket`.
 - **A failed start is logged, not a panic.** When the proxy cannot start
   (no `XDG_RUNTIME_DIR`, no device or compositor, a socket it cannot
-  claim or bind), it logs why and exits with status 1.
+  claim or bind), it logs why and exits with status 1. No test covers
+  the device or compositor case.
   Tests: `a_missing_runtime_directory_is_a_logged_startup_error`,
-  `an_unbindable_socket_is_a_logged_startup_error`.
+  `an_unbindable_socket_is_a_logged_startup_error`, and, for a socket
+  another process holds, `a_held_socket_lock_protects_the_live_socket`.
 
 ## ChromeOS shelf application IDs
 
