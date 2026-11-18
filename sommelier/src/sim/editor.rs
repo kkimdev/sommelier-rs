@@ -328,6 +328,15 @@ impl Reference {
         }
     }
 
+    /// Whether the input method's engine would pass `key` to the field
+    /// rather than consume it; a Latin layout has no engine. The ChromeOS
+    /// Korean engine takes a Space that ends a composition, with it (E15).
+    pub fn engine_passes(&self, key: Key) -> bool {
+        let out = self.composer.clone().key(key);
+        let ends_with_space = key == Key::Char(' ') && !out.commit.is_empty();
+        !self.typing.latin && !out.consumed && !ends_with_space
+    }
+
     /// The fields' models.
     pub fn fields(&self) -> &[TextModel] {
         &self.fields

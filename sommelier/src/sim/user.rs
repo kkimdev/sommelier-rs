@@ -28,7 +28,12 @@ limitations under the License.
 //! tap and focus move. Otherwise Exo can hand the engine a key after a
 //! press but before the press's reset, whose result the proxy drops by
 //! design (the fence), or a key can reach the client raw while a focus
-//! move's activation is in flight (E7).
+//! move's activation is in flight (E7). A settled case also settles after
+//! each key the engine passes. IMA confirms before such a key (E13), and
+//! if it has composed since its last commit, even a composition taken
+//! back to nothing, it then resets the engine behind the next key, if
+//! that is already in flight: the host loses the key's text (E5), which
+//! no proxy can restore.
 
 use super::editor::{Reference, Target, TextModel, Typing, UserAction};
 use super::hangul::Key;
@@ -85,6 +90,7 @@ pub(super) fn actions(
             _ => UserAction::Settle,
         };
         let moves = !matches!(action, UserAction::Key(_) | UserAction::Settle);
+        let passed = matches!(action, UserAction::Key(key) if reference.engine_passes(key));
         if settled && moves {
             settle(&mut actions);
         }
@@ -93,7 +99,7 @@ pub(super) fn actions(
             UserAction::Settle => settle(&mut actions),
             action => actions.push(action),
         }
-        if settled && moves {
+        if settled && (moves || passed) {
             settle(&mut actions);
         }
     }
@@ -186,6 +192,22 @@ mod tests {
                 at: Target::Start
             }
         ]));
+    }
+
+    #[test]
+    fn a_settled_case_settles_after_each_key_the_engine_passes() {
+        for (texts, actions) in cases(Typing::default(), true) {
+            let fields = texts.iter().map(|text| TextModel::new(text)).collect();
+            let mut reference = Reference::new(fields);
+            for (i, &action) in actions.iter().enumerate() {
+                if let UserAction::Key(key) = action {
+                    if reference.engine_passes(key) {
+                        assert_eq!(actions.get(i + 1), Some(&UserAction::Settle), "{actions:?}");
+                    }
+                }
+                reference.apply(action);
+            }
+        }
     }
 
     #[test]
