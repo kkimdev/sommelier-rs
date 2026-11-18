@@ -2177,10 +2177,7 @@ mod tests {
         ctx.shadow_table
             .insert_paired_for_test(REGISTRY, HOST_REGISTRY, "wl_registry");
         ctx.bind_aura_shell_for_test(SHELL);
-        ctx.registry_global_names
-            .entry(HOST_REGISTRY)
-            .or_default()
-            .insert(SHELL);
+        ctx.registries.entry(HOST_REGISTRY).or_default().list(SHELL);
         ctx.global_generations.insert(SHELL, 1);
         ctx.registry_global_generations
             .entry(HOST_REGISTRY)

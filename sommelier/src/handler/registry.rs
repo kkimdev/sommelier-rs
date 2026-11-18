@@ -206,10 +206,10 @@ pub(crate) fn global_still_seen(ctx: &Context, name: u32, generation: Option<u64
 /// The lowest host registry that still lists global `name` at
 /// `generation`, if any (see [`global_still_seen`]).
 fn registry_listing(ctx: &Context, name: u32, generation: Option<u64>) -> Option<u32> {
-    ctx.registry_global_names
+    ctx.registries
         .iter()
-        .filter(|(registry, names)| {
-            names.contains(&name)
+        .filter(|(registry, record)| {
+            record.lists(name)
                 && ctx
                     .registry_global_generations
                     .get(registry)
@@ -270,9 +270,9 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
         .and_then(|names| names.get(&name))
         .copied();
     let already_seen = ctx
-        .registry_global_names
+        .registries
         .get(&registry_id)
-        .is_some_and(|names| names.contains(&name));
+        .is_some_and(|record| record.lists(name));
 
     if already_seen && previous_generation == current_generation {
         return false;
@@ -299,10 +299,7 @@ fn note_registry_global(ctx: &mut Context, name: u32) -> bool {
         }
         (Some(current), _, _) => current,
     };
-    ctx.registry_global_names
-        .entry(registry_id)
-        .or_default()
-        .insert(name);
+    ctx.registries.entry(registry_id).or_default().list(name);
     if let Some(names) = ctx.registry_global_removed.get_mut(&registry_id) {
         names.remove(&name);
     }
@@ -379,9 +376,9 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
 
     for pending in matching {
         let is_current = ctx
-            .registry_global_names
+            .registries
             .get(&pending.registry_host_id)
-            .is_some_and(|names| names.contains(&pending.name))
+            .is_some_and(|record| record.lists(pending.name))
             && ctx
                 .registry_global_generations
                 .get(&pending.registry_host_id)
@@ -889,8 +886,8 @@ fn admit_guest_bind(
     if ctx.removed_host_globals.contains(&name) {
         return None;
     }
-    if let Some(names) = ctx.registry_global_names.get(&registry_host_id) {
-        if !names.contains(&name) {
+    if let Some(record) = ctx.registries.get(&registry_host_id) {
+        if !record.lists(name) {
             return None;
         }
         let registry_generation = ctx
@@ -1223,9 +1220,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             .copied()
             .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
         let registry_seen = ctx
-            .registry_global_names
+            .registries
             .get_mut(&registry_id)
-            .is_some_and(|names| names.remove(&name));
+            .is_some_and(|record| record.unlist(name));
         if !registry_seen {
             return Action::Drop;
         }
@@ -1449,15 +1446,12 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
         .registry_global_generations
         .remove(&registry_host_id)
         .unwrap_or_default();
-    let listed = ctx
-        .registry_global_names
-        .remove(&registry_host_id)
-        .unwrap_or_default();
+    let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
     ctx.registry_global_removed.remove(&registry_host_id);
     ctx.registry_global_visibility.remove(&registry_host_id);
     ctx.pending_dmabuf_globals
         .retain(|pending| pending.registry_host_id != registry_host_id);
-    for name in listed {
+    for name in record.listed() {
         let Some(&generation) = generations.get(&name) else {
             continue;
         };
@@ -1682,10 +1676,7 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
         let mut ctx = gpu_context(&[A]);
-        ctx.registry_global_names
-            .entry(A.host)
-            .or_default()
-            .insert(7);
+        ctx.registries.entry(A.host).or_default().list(7);
         ctx.registry_global_generations
             .entry(A.host)
             .or_default()
@@ -1704,7 +1695,7 @@ mod tests {
             });
 
         assert_eq!(A.destroy(&mut ctx), Action::Forward);
-        assert!(!ctx.registry_global_names.contains_key(&A.host));
+        assert!(!ctx.registries.contains_key(&A.host));
         assert!(!ctx.registry_global_generations.contains_key(&A.host));
         assert!(!ctx.registry_global_visibility.contains_key(&A.host));
         assert!(ctx.pending_dmabuf_globals.is_empty());

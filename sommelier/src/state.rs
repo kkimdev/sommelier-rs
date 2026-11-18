@@ -22,6 +22,7 @@ mod internal_callbacks;
 mod lifecycle;
 mod objects;
 mod outputs;
+mod registries;
 mod render;
 mod window_placement;
 mod xdg_roles;
@@ -57,6 +58,7 @@ pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
 };
+pub(crate) use self::registries::RegistryRecord;
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
@@ -476,12 +478,9 @@ pub struct Context {
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
     pub hidden_host_globals: BTreeMap<u32, String>,
-    /// Global names already emitted by each host registry object. A single
-    /// Wayland client may create more than one wl_registry; the compositor
-    /// sends the complete global list to each one, so this must not be a
-    /// connection-wide set keyed only by global name. Ordered, because a
-    /// registry's end retires the globals it alone listed in that order.
-    pub registry_global_names: BTreeMap<u32, BTreeSet<u32>>,
+    /// What each host registry has advertised, by host registry ID (see
+    /// [`RegistryRecord`]).
+    pub(crate) registries: BTreeMap<u32, RegistryRecord>,
     /// Names removed from each registry. A subsequent global event for a
     /// removed name represents a new advertisement generation; a bind of a
     /// removed name crossed its removal on the wire. Each name keeps the
@@ -1069,7 +1068,7 @@ impl Context {
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             hidden_host_globals: BTreeMap::new(),
-            registry_global_names: BTreeMap::new(),
+            registries: BTreeMap::new(),
             registry_global_removed: BTreeMap::new(),
             registry_global_generations: BTreeMap::new(),
             registry_global_visibility: BTreeMap::new(),

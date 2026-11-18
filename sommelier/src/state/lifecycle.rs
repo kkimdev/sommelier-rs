@@ -384,7 +384,7 @@ impl Context {
 
         // Registries.
         let registries = self
-            .registry_global_names
+            .registries
             .keys()
             .chain(self.registry_global_removed.keys())
             .chain(self.registry_global_generations.keys())
