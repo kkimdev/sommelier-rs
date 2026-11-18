@@ -350,8 +350,8 @@ pub struct Context {
     pub pending_native_creates: BTreeMap<HostId, PendingNativeCreate>,
     pub surfaces: BTreeMap<u32, SurfaceState>,
     /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
-    /// reaches them in that order (INVARIANTS "Output order does not
-    /// depend on hashing").
+    /// reaches them in that order (INVARIANTS "Nothing the proxy sends
+    /// depends on hash order").
     pub text_inputs: BTreeMap<u32, TextInputState>,
     pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
