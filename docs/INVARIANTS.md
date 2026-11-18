@@ -461,11 +461,12 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   connection-wide metadata, and the internal binding it backs, stay until
   every registry that listed it has seen its `global_remove`, so each can
   still be sent its own; then the metadata goes, and a new bind of the
-  name is refused through any registry. A registry destroyed through `wl_fixes` before it sees the
-  removal no longer counts, and if it was the last, its destruction
-  retires the global. The removal is on record connection-wide from the
-  first `global_remove` until the global is retired or advertised anew,
-  so this holds even when every registry that saw it was destroyed first.
+  name is refused through any registry. A registry destroyed through
+  `wl_fixes` before it sees the removal no longer counts, and if it was
+  the last, its destruction retires the global. The removal is on record
+  connection-wide from the first `global_remove` until the global is
+  retired or advertised anew, so this holds even when every registry that
+  saw it was destroyed first.
   A registry destroyed while the global is still advertised retires
   nothing. Only a registry that lists the current advertisement keeps it
   alive; one that still lists an older advertisement of a re-advertised
