@@ -454,36 +454,67 @@ fn guest_txn_encodes_in_canonical_order() {
     assert_eq!(guest::resolve_preedit_cursor("", None, Some(3)), (0, 0));
 }
 
+/// The production sources of the core.
+const SOURCES: [(&str, &str); 6] = [
+    ("mod.rs", include_str!("mod.rs")),
+    ("guest.rs", include_str!("guest.rs")),
+    ("host.rs", include_str!("host.rs")),
+    ("serial.rs", include_str!("serial.rs")),
+    ("state.rs", include_str!("state.rs")),
+    ("step.rs", include_str!("step.rs")),
+];
+
+/// The file of each occurrence of `pattern` in [`SOURCES`].
+fn occurrences(pattern: &str) -> Vec<&'static str> {
+    SOURCES
+        .iter()
+        .flat_map(|(file, source)| source.matches(pattern).map(move |_| *file))
+        .collect()
+}
+
+/// B4: the count has one writer, called from the Commit arm alone.
 #[test]
 fn count_bumps_only_in_the_commit_arm() {
-    let sources = [
-        ("mod.rs", include_str!("mod.rs")),
-        ("guest.rs", include_str!("guest.rs")),
-        ("host.rs", include_str!("host.rs")),
-        ("serial.rs", include_str!("serial.rs")),
-        ("state.rs", include_str!("state.rs")),
-        ("step.rs", include_str!("step.rs")),
-    ];
-    let calls = |pattern: &str| {
-        sources
-            .iter()
-            .flat_map(|(file, source)| source.matches(pattern).map(move |_| *file))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(calls(".bump()"), ["state.rs"]);
-    assert_eq!(calls(".count_commit()"), ["step.rs"]);
-    // B5: one builder of the v3 transaction events.
+    assert_eq!(occurrences(".bump()"), ["state.rs"]);
+    assert_eq!(occurrences(".count_commit()"), ["step.rs"]);
+}
+
+/// B5 and the core's isolation: one builder of the v3 transaction
+/// events, and no import from the rest of the proxy but the wire, the
+/// generated protocols and the three state types the old code shares.
+#[test]
+fn ime_is_isolated() {
     for event in [
         "evt::preedit_string(",
         "evt::delete_surrounding_text(",
         "evt::commit_string(",
         "evt::done(",
     ] {
-        let files = calls(event);
+        let files = occurrences(event);
         assert!(
             !files.is_empty() && files.iter().all(|&file| file == "guest.rs"),
             "{event}"
         );
+    }
+    assert_eq!(occurrences("crate::handler"), [] as [&str; 0]);
+    let state_types = |names: &str| {
+        names
+            .trim_matches(['{', '}'])
+            .split(',')
+            .all(|name| ["HostContentType", "V3Committed", "V3Pending"].contains(&name))
+    };
+    for (file, source) in SOURCES {
+        let mut source = source;
+        while let Some(start) = source.find("\nuse crate::") {
+            let rest = &source[start + "\nuse crate::".len()..];
+            let end = rest.find(';').expect("a use ends");
+            let path: String = rest[..end].split_whitespace().collect();
+            let allowed = path.starts_with("protocols::")
+                || path.starts_with("wire::")
+                || path.strip_prefix("state::").is_some_and(state_types);
+            assert!(allowed, "{file} uses crate::{path}");
+            source = rest;
+        }
     }
 }
 

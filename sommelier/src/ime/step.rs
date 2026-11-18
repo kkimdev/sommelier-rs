@@ -297,11 +297,17 @@ impl ImeCore {
             }
             HostIme::CursorPosition { index, anchor } => {
                 // Exo sends it only before a commit_string.
+                // H6: the old handlers recorded it for the next commit and
+                // only logged it there.
                 log::debug!("Cannot represent v1 cursor_position({index}, {anchor}) in v3");
                 return;
             }
             // B3: a composition event takes the assembly first, whatever
-            // becomes of it.
+            // becomes of it. The old handlers differ only where no client
+            // can tell, since Exo sends styling and a cursor only right
+            // before their preedit: a dropped commit took only its
+            // cursor_position, and a dropped delete or confirmation took
+            // nothing.
             HostIme::Preedit { .. }
             | HostIme::Commit { .. }
             | HostIme::Delete { .. }
