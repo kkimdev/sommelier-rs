@@ -513,6 +513,11 @@ mod tests {
         assert!(updated.contains(OFlag::O_NONBLOCK));
     }
 
+    /// Drives a real VirtWL context: a receive on the empty context
+    /// returns at once, an asynchronous one waits, and a `wl_display.sync`
+    /// wakes it with the host's `wl_callback.done`. It needs a read-write
+    /// VirtWL device (`/dev/wl0`, or `SOMMELIER_TEST_VIRTWL`) with a host
+    /// compositor behind it; see "Live VirtWL test" in CONTRIBUTING.md.
     #[tokio::test]
     #[ignore = "requires a live Crostini VirtWL device"]
     async fn live_try_recv_eagain_then_async_recv_wakes() {
