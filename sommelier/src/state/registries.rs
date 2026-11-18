@@ -94,6 +94,11 @@ impl RegistryRecord {
 
     /// The registry lists global `name` at `generation`, an advertisement
     /// whose visibility the proxy has yet to decide.
+    ///
+    /// Listing a name the registry already lists resets its visibility to
+    /// undecided. The old map kept the earlier decision; this differs only
+    /// in theory, because a conforming compositor always sends
+    /// `global_remove` before it advertises a name again.
     pub(crate) fn list(&mut self, name: u32, generation: u64) {
         self.globals.insert(
             name,
@@ -123,6 +128,10 @@ impl RegistryRecord {
     /// crossed the removal may create an inert object at up to
     /// `inert_bind_version`.
     pub(crate) fn remove(&mut self, name: u32, inert_bind_version: Option<u32>) {
+        debug_assert!(
+            self.lists(name),
+            "global {name} removed without being listed"
+        );
         if let Some(global) = self.globals.get_mut(&name) {
             global.status = Status::Removed { inert_bind_version };
         }
@@ -141,12 +150,15 @@ impl RegistryRecord {
     /// The registry's current advertisement of global `name`, which it
     /// lists, was `visible` to the guest, or not.
     pub(crate) fn set_visibility(&mut self, name: u32, visible: bool) {
+        let global = self.globals.get_mut(&name);
         if let Some(RegistryGlobal {
             status: Status::Listed { visible: decided },
             ..
-        }) = self.globals.get_mut(&name)
+        }) = global
         {
             *decided = Some(visible);
+        } else {
+            debug_assert!(false, "visibility set on global {name} that is not listed");
         }
     }
 
@@ -161,5 +173,42 @@ impl RegistryRecord {
     /// since removed.
     pub(crate) fn generations(&self) -> impl Iterator<Item = u64> + '_ {
         self.globals.values().map(|global| global.generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_name_goes_from_listed_to_removed_and_listed_again() {
+        let mut record = RegistryRecord::default();
+        record.list(3, 1);
+        record.set_visibility(3, true);
+        assert!(record.lists(3));
+        assert!(!record.is_removed(3));
+        assert_eq!(record.listed_generation(3), Some(1));
+        assert_eq!(record.visibility(3), Some(true));
+
+        record.remove(3, Some(4));
+        assert!(!record.lists(3));
+        assert!(record.is_removed(3));
+        assert_eq!(record.listed_generation(3), None);
+        assert_eq!(record.generation(3), Some(1));
+        assert_eq!(record.visibility(3), None);
+        assert_eq!(
+            record.removal(3),
+            Some(Removal {
+                inert_bind_version: Some(4)
+            })
+        );
+
+        record.list(3, 2);
+        assert!(record.lists(3));
+        assert!(!record.is_removed(3));
+        assert_eq!(record.listed_generation(3), Some(2));
+        assert_eq!(record.generation(3), Some(2));
+        assert_eq!(record.visibility(3), None);
+        assert_eq!(record.removal(3), None);
     }
 }
