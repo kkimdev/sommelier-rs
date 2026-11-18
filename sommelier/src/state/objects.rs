@@ -412,24 +412,24 @@ impl ShadowTable {
 
     /// Return whether a guest request may allocate `guest_id`.
     ///
-    /// Client-created IDs must be non-zero, must not reuse an existing object,
-    /// and must stay below Wayland's server-generated ID range. Keeping this
-    /// check in the shadow table lets generated protocol dispatchers validate
-    /// every `new_id` request before a handler can mutate state.
+    /// Client-created IDs must be in [`Self::CLIENT_IDS`], as
+    /// libwayland-server requires, and must not reuse an existing object.
+    /// Keeping this check in the shadow table lets generated protocol
+    /// dispatchers validate every `new_id` request before a handler can
+    /// mutate state.
     pub fn is_guest_id_available(&self, guest_id: u32) -> bool {
-        guest_id > 1
-            && guest_id < Self::GUEST_SERVER_ID_START
-            && !self.guests.contains_key(&GuestId(guest_id))
+        Self::CLIENT_IDS.contains(&guest_id) && !self.guests.contains_key(&GuestId(guest_id))
     }
 
     /// Return whether a host event may create an object with ID `host_id`:
-    /// an ID from the server range that no object holds.
+    /// an ID from [`Self::SERVER_IDS`], which libwayland-client accepts, that
+    /// no object holds.
     ///
     /// libwayland-server allocates every object it creates from the server
     /// range. An ID from the client range is one this proxy allocates, so a
     /// host that sent one could later collide with the proxy's own objects.
     pub fn accepts_host_new_id(&self, host_id: u32) -> bool {
-        host_id >= Self::GUEST_SERVER_ID_START && !self.hosts.contains_key(&HostId(host_id))
+        Self::SERVER_IDS.contains(&host_id) && !self.hosts.contains_key(&HostId(host_id))
     }
 
     // Queries.
@@ -962,6 +962,10 @@ mod tests {
         assert!(!table.is_guest_id_available(0));
         assert!(!table.is_guest_id_available(1));
         assert!(table.is_guest_id_available(2));
+        // libwayland-server refuses a client ID past WL_MAP_MAX_OBJECTS.
+        assert!(table.is_guest_id_available(WL_MAP_MAX_OBJECTS));
+        assert!(!table.is_guest_id_available(WL_MAP_MAX_OBJECTS + 1));
+        assert!(!table.is_guest_id_available(SERVER - 1));
         assert!(!table.is_guest_id_available(SERVER));
 
         table.create_paired(2, "wl_surface", 1, 1);
@@ -979,6 +983,10 @@ mod tests {
             !table.accepts_host_new_id(30),
             "the client range is the proxy's"
         );
+        // libwayland-client refuses a server index past WL_MAP_MAX_OBJECTS.
+        assert!(table.accepts_host_new_id(SERVER + WL_MAP_MAX_OBJECTS));
+        assert!(!table.accepts_host_new_id(SERVER + WL_MAP_MAX_OBJECTS + 1));
+        assert!(!table.accepts_host_new_id(u32::MAX));
 
         let guest = table.adopt_host_created(SERVER, "wl_data_offer", 3);
         assert!(!table.accepts_host_new_id(SERVER));

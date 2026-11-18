@@ -331,11 +331,7 @@ impl Context {
         for &pool in self.pools.keys().chain(&self.stale_shm_pools) {
             guest("SHM pool", pool, "wl_shm_pool");
         }
-        for &shm in self
-            .shm_guest_formats
-            .keys()
-            .chain(&self.stale_shm_guest_objects)
-        {
+        for &shm in self.guest_shms.keys().chain(&self.stale_shm_guest_objects) {
             guest("wl_shm state", shm, "wl_shm");
         }
         for (buffer, _) in self.render_buffer_lifecycles() {
@@ -383,6 +379,17 @@ impl Context {
             );
         for &registry in registries {
             host("registry globals", registry, "wl_registry");
+        }
+        // A singleton candidate is a name a registry still lists.
+        for &name in self.singleton_candidates.keys() {
+            assert!(
+                registry::global_still_seen(
+                    self,
+                    name,
+                    self.global_generations.get(&name).copied()
+                ),
+                "singleton candidate {name} outlived every registry that lists it"
+            );
         }
         // A removal on record is of the global's current generation, and
         // waits for a registry that still lists it; a global the proxy

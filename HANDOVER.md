@@ -86,4 +86,4 @@
 ## Next steps
 
 1. Continue Crostini manual testing through the `wayland-2` service.
-2. Keep protocol and IME regressions covered by the serial test suite.
+2. Keep protocol and IME regressions covered by the test suite.

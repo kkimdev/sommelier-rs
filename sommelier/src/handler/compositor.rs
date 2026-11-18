@@ -538,18 +538,21 @@ impl WlSurfaceHandler for CompositorHandler {
                 "wl_surface.attach offset is non-zero for version 5+",
             );
         }
+        // An inert buffer, from a pool whose host wl_shm was removed, has
+        // no host object, so it reaches the host as no buffer.
+        let attached = buffer != 0 && !ctx.shadow_table.is_local(buffer);
         let pending = &mut ctx.surface_mut(surface_id).pending;
-        pending.attachment = if buffer == 0 {
-            SurfaceAttachment::Detach
-        } else {
+        pending.attachment = if attached {
             SurfaceAttachment::Attach(buffer)
+        } else {
+            SurfaceAttachment::Detach
         };
         pending.attach_offset = None;
         // Since wl_surface version 5, attach's x/y arguments are ignored
         // (and non-zero values were rejected above). Keep them out of the
         // legacy pending-offset slot so a legal attach(buffer, 0, 0) cannot
         // reset a previously committed wl_surface.offset.
-        if buffer != 0 && !has_offset_request {
+        if attached && !has_offset_request {
             pending.attach_offset = Some((x, y));
         }
         // A pending native buffer can be destroyed before the commit that
@@ -1556,8 +1559,8 @@ mod tests {
     #[test]
     fn destination_only_viewport_copies_only_the_damaged_pixels() {
         // A fractional-scale client: the 4x4 buffer fills an 8x8 surface,
-        // so a surface unit is half a buffer pixel. It has no damage_buffer
-        // (the host offers wl_compositor v3) and damages surface units.
+        // so a surface unit is half a buffer pixel. It damages surface
+        // units, as a client that does not use damage_buffer does.
         let (mut ctx, ..) = setup_ctx();
         commit_test_frame(&mut ctx, TEST_SURFACE, 42);
         let mut handler = CompositorHandler;
@@ -1838,6 +1841,31 @@ mod tests {
         // clear the current buffer.
         assert_eq!(handler.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        assert_eq!(
+            ctx.surfaces
+                .get(&surface_id)
+                .and_then(SurfaceState::current_buffer_id),
+            None
+        );
+    }
+
+    /// A buffer of a pool whose host `wl_shm` was removed has no host
+    /// object and no content.
+    #[test]
+    fn attaching_an_inert_buffer_detaches_the_surface() {
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let surface_id = 100;
+        ctx.last_sender_id = surface_id;
+        let mut handler = CompositorHandler;
+        register_test_native(&mut ctx, 42, (1, 1));
+        assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+        ctx.shadow_table.create_local(43, "wl_buffer", 1);
+
+        assert_eq!(handler.on_attach(&mut ctx, 43, 0, 0), Action::Forward);
+        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
+
+        assert!(!ctx.is_fatal());
         assert_eq!(
             ctx.surfaces
                 .get(&surface_id)

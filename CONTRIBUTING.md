@@ -96,11 +96,12 @@ for each move with a roundtrip, and enables, edits and disables the
 field; now and then it releases its seat while the field is enabled,
 reuses the seat's ID for a surface once it is deleted, and disables the
 field, which the proxy can then no longer deactivate. Each case must end
-without a panic or hang, close every descriptor, and either answer the
-stream's closing `wl_display.sync` or send one `wl_display.error`, its
-last event. The fake compositor behind the proxy also checks that every
-request it receives comes from a live host object, creates
-only fresh IDs and names live objects of the right interface; it deletes
+without a panic or hang, close every descriptor, and send at most one
+`wl_display.error`, as its last event. A case whose framing is intact
+must also either answer the stream's closing `wl_display.sync` or send
+that error. The fake compositor behind the proxy also checks that every
+request it receives comes from a live host object, creates only fresh IDs
+and names live objects of the right interface; it deletes
 destroyed objects at once, so the proxy's host ID reuse is exercised,
 creates objects of its own (a data offer for each data device, a buffer
 for each asynchronous dma-buf create), as weston does, destroys a
@@ -155,7 +156,8 @@ SOMMELIER_FUZZ_CASES=200000 SOMMELIER_FUZZ_SEED=1000000 \
 
 A failure names its seed; rerun that seed alone with
 `SOMMELIER_FUZZ_SEED=<seed> SOMMELIER_FUZZ_CASES=1`, and add `RUST_LOG=debug`
-and `-- --nocapture` to see the proxy's log. The seed fixes the case's
+to see the proxy's log. The test prints it with the failure; a replay
+that passes prints only its summary. The seed fixes the case's
 input, not its timing (how the pieces arrive, which side the proxy serves
 first), so replay a failing seed a few times before concluding it passes.
 

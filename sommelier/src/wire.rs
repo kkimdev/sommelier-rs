@@ -306,18 +306,16 @@ impl<'a> WireMessage<'a> {
         };
         let bytes = &self.payload[self.offset..bytes_end];
 
-        // Wayland strings include null terminator in the length.
-        // We expect at least one byte for the null terminator if len > 0.
-        if bytes.last() != Some(&0) {
+        // A Wayland string's length includes its terminating NUL, and
+        // libwayland rejects a string with a NUL before it ("string has
+        // embedded nul" in `wl_connection_demarshal`).
+        let Some((&0, text)) = bytes.split_last() else {
+            return Err(ProtocolError::InvalidString);
+        };
+        if text.contains(&0) {
             return Err(ProtocolError::InvalidString);
         }
-
-        // To match C behavior, we truncate at the first null terminator if there are interior nulls
-        let null_pos = bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(len.saturating_sub(1));
-        let s = std::str::from_utf8(&bytes[..null_pos])
+        let s = std::str::from_utf8(text)
             .map_err(|_| ProtocolError::InvalidString)?
             .to_owned();
 
@@ -370,6 +368,16 @@ impl<'a> WireMessage<'a> {
 
     pub fn is_payload_consumed(&self) -> bool {
         self.offset == self.payload.len()
+    }
+
+    /// `decoded`, the result of decoding this message, unless the decode
+    /// succeeded without reading the whole payload: then `TrailingData`. A
+    /// failed decode keeps its own error, which says why it stopped.
+    pub fn check_consumed<T>(&self, decoded: Result<T, ProtocolError>) -> Result<T, ProtocolError> {
+        match decoded {
+            Ok(_) if !self.is_payload_consumed() => Err(ProtocolError::TrailingData),
+            decoded => decoded,
+        }
     }
 }
 
@@ -946,6 +954,34 @@ mod tests {
             wire.offset, 4,
             "invalid input must not consume the string payload"
         );
+    }
+
+    #[test]
+    fn only_a_successful_decode_can_leave_trailing_data() {
+        let payload = [0; 8];
+        let mut wire = WireMessage::new(1, 0, &payload);
+        assert_eq!(wire.read_u32(), Ok(0));
+
+        assert_eq!(
+            wire.check_consumed(Ok(())),
+            Err(ProtocolError::TrailingData)
+        );
+        assert_eq!(
+            wire.check_consumed::<()>(Err(ProtocolError::InvalidString)),
+            Err(ProtocolError::InvalidString),
+            "a decode that stopped early reports why"
+        );
+        assert_eq!(wire.read_u32(), Ok(0));
+        assert_eq!(wire.check_consumed(Ok(())), Ok(()));
+    }
+
+    #[test]
+    fn wire_message_rejects_string_with_embedded_nul() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&4u32.to_ne_bytes());
+        payload.extend_from_slice(b"a\0b\0");
+        let mut wire = WireMessage::new(1, 0, &payload);
+        assert_eq!(wire.read_string(), Err(ProtocolError::InvalidString));
     }
 
     #[test]

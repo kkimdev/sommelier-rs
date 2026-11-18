@@ -25,6 +25,40 @@ use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
 /// A message's bytes and its descriptors' numbers.
 pub type RawMessage = (Vec<u8>, Vec<RawFd>);
 
+/// Set in the child process [`in_own_process`] runs a test in.
+const OWN_PROCESS_ENV: &str = "SOMMELIER_TEST_OWN_PROCESS";
+
+/// Run `body`, the body of test `test_path` (its path in the test binary,
+/// such as `proxy::fuzz::guest_streams_cannot_crash_hang_or_leak`), in a
+/// child copy of the test binary that runs only that test, for a test that
+/// needs the process to itself: its descriptors or its resource limits.
+///
+/// # Returns
+///
+/// In the test's own process, the child's standard output once the test
+/// passed there; in the child, which runs `body`, nothing.
+// A test may wait for its child; no client runs on the test's thread.
+#[allow(clippy::disallowed_methods)]
+pub fn in_own_process(test_path: &str, body: impl FnOnce()) -> String {
+    if std::env::var_os(OWN_PROCESS_ENV).is_some() {
+        body();
+        return String::new();
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([test_path, "--exact", "--test-threads=1", "--nocapture"])
+        .env(OWN_PROCESS_ENV, "1")
+        .output()
+        .expect("run the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // A path that names no test runs nothing and still succeeds.
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test_path} failed in its own process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
 /// `message` as a [`RawMessage`], which compares where owned descriptors
 /// do not. The descriptors close, so the returned numbers name nothing.
 pub fn raw_message((message, fds): Outgoing) -> RawMessage {

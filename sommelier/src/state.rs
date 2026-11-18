@@ -318,6 +318,28 @@ pub(crate) struct HostAuraShell {
     pub(crate) version: u32,
 }
 
+/// A synthetic guest `wl_shm` object.
+#[derive(Debug, Default)]
+pub struct GuestShm {
+    /// The host `wl_shm` global the guest bound it from. Its requests are
+    /// ignored once that name retires (`Context::stale_shm_guest_objects`),
+    /// whichever global the proxy itself has bound.
+    pub global_name: u32,
+    /// The formats already sent to it, so a host capability event that
+    /// arrives after the bind is not sent twice.
+    pub formats: HashSet<u32>,
+}
+
+/// The modifier and group state a host `wl_keyboard.modifiers` event
+/// carries, as XKB masks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyboardModifiers {
+    pub(crate) depressed: u32,
+    pub(crate) latched: u32,
+    pub(crate) locked: u32,
+    pub(crate) group: u32,
+}
+
 pub struct Context {
     pub shadow_table: ShadowTable,
     pub pools: HashMap<u32, ShmPool>,
@@ -381,19 +403,17 @@ pub struct Context {
     /// Optional formats learned from the internal host linux-dmabuf binding.
     /// These are removed when that binding's global is withdrawn.
     pub host_dmabuf_shm_formats: HashSet<u32>,
-    /// Formats already sent to each synthetic guest wl_shm object. Keeping
-    /// this per object prevents duplicate format events when host capability
-    /// events arrive after a guest bind.
-    pub shm_guest_formats: HashMap<u32, HashSet<u32>>,
-    /// Synthetic guest wl_shm objects whose host capability binding has been
-    /// removed. Wayland keeps an already-bound global object valid for
-    /// teardown, but requests sent to it after global removal are ignored.
-    /// Keep these IDs reserved and reject create_pool without allowing a
-    /// replacement host wl_shm binding to service the old object.
+    /// Every synthetic guest wl_shm object.
+    pub guest_shms: HashMap<u32, GuestShm>,
+    /// Synthetic guest wl_shm objects whose own global, the name each was
+    /// bound from, has retired. Wayland keeps an already-bound global
+    /// object valid for teardown, but requests sent to it after its
+    /// global's removal are ignored, even while the proxy has bound a
+    /// replacement; objects bound from a live name are unaffected.
     pub stale_shm_guest_objects: HashSet<u32>,
-    /// Synthetic wl_shm_pool children created before the host capability
-    /// binding disappeared. They remain destroyable, but must not resize or
-    /// create buffers through a replacement host binding.
+    /// Synthetic wl_shm_pool children of a stale guest wl_shm, created before
+    /// its global retired or after it. They remain destroyable, but must not
+    /// resize or create buffers through a replacement host binding.
     pub stale_shm_pools: HashSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
@@ -423,9 +443,11 @@ pub struct Context {
     /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
     /// interior mutation, so a connection stays on its one thread.
     pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
-    /// Current modifier bitmask for each host keyboard (using accelerator.rs
-    /// conventions).
-    pub(crate) keyboard_modifiers: HashMap<HostId, u32>,
+    /// The modifiers each host keyboard last sent, kept until the keyboard
+    /// ends. Exo sends them only when they change, before `enter` rather
+    /// than after it, and not again with a new keymap, so focus changes and
+    /// keymaps must not reset them.
+    pub(crate) keyboard_modifiers: HashMap<HostId, KeyboardModifiers>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
@@ -438,6 +460,10 @@ pub struct Context {
     pub supported_formats: HashSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
+    /// Every host global the proxy may bind as a singleton, by name, with
+    /// the host's interface and version, while a registry lists it; see
+    /// `handler::registry::Singleton`.
+    pub(crate) singleton_candidates: HashMap<u32, HostGlobal>,
     /// Host globals consumed internally by the proxy and therefore never
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
@@ -1014,7 +1040,7 @@ impl Context {
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),
-            shm_guest_formats: HashMap::new(),
+            guest_shms: HashMap::new(),
             stale_shm_guest_objects: HashSet::new(),
             stale_shm_pools: HashSet::new(),
             host_text_input_manager_v1_id: None,
@@ -1031,6 +1057,7 @@ impl Context {
             placement,
             supported_formats: HashSet::new(),
             host_globals: HashMap::new(),
+            singleton_candidates: HashMap::new(),
             hidden_host_globals: HashMap::new(),
             registry_global_names: HashMap::new(),
             registry_global_removed: HashMap::new(),
