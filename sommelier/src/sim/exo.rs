@@ -1306,6 +1306,17 @@ mod tests {
         &exo.text_inputs[&TI].text.predicted
     }
 
+    /// A prediction of `text`, with the cursor at `cursor` and the
+    /// composition, if any, at `composition`.
+    fn predicts(text: &str, cursor: usize, composition: Option<Range<usize>>) -> Predicted {
+        let text = text.to_owned();
+        Predicted {
+            text,
+            cursor,
+            composition,
+        }
+    }
+
     #[test]
     fn e1_activate_moves_the_input_method_only_to_another_surface() {
         let mut exo = exo();
@@ -1410,33 +1421,19 @@ mod tests {
         send(&mut exo, TI, surrounding("ab", 1));
         press(&mut exo, 'r', &[commits("가")], true);
         press(&mut exo, 's', &[shows("ㄴ")], true);
-        let composing = Predicted {
-            text: "a가ㄴb".to_owned(),
-            cursor: 7,
-            composition: Some(4..7),
-        };
-        assert_eq!(*predicted(&exo), composing);
+        assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, Some(4..7)));
         // A report of a state an edit led to is the client catching up.
         send(&mut exo, TI, surrounding("a가b", 4));
-        assert_eq!(*predicted(&exo), composing);
+        assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, Some(4..7)));
         // A cancelled composition stays, as text.
         send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
-        let cancelled = Predicted {
-            composition: None,
-            ..composing
-        };
-        assert_eq!(*predicted(&exo), cancelled);
+        assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, None));
         assert_eq!(exo.take_engine(), [EngineIn::Reset]);
         // Any other report replaces the prediction, composition and all, so
         // a detach then has nothing to confirm.
         press(&mut exo, 'e', &[shows("ㄷ")], true);
         send(&mut exo, TI, surrounding("xyz", 3));
-        let reported = Predicted {
-            text: "xyz".to_owned(),
-            cursor: 3,
-            composition: None,
-        };
-        assert_eq!(*predicted(&exo), reported);
+        assert_eq!(*predicted(&exo), predicts("xyz", 3, None));
         events(&mut exo);
         send(&mut exo, TI, deactivate());
         assert_eq!(events(&mut exo), [leave()]);
