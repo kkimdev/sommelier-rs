@@ -22,7 +22,7 @@ limitations under the License.
 //! each one waits for, so `wl_callback.done` dispatches through one match
 //! in `crate::handler::callback`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::HostId;
 
@@ -42,7 +42,7 @@ pub(crate) enum InternalCallback {
         host_text_input: u32,
     },
     /// The host text input of guest `text_input` has delivered every event
-    /// it sent before it handled the `reset` a pointer press sent it
+    /// it sent before it handled the `reset` a press sent it
     /// (`TextInputState::reset_fence`).
     TextInputResetFence { text_input: u32 },
     /// Exo has processed the `set_window_bounds` that placement sent to this
@@ -57,7 +57,7 @@ pub(crate) enum InternalCallback {
 /// never mistaken for a guest callback.
 #[derive(Debug, Default)]
 pub(crate) struct InternalCallbacks {
-    by_callback: HashMap<HostId, InternalCallback>,
+    by_callback: BTreeMap<HostId, InternalCallback>,
 }
 
 impl InternalCallbacks {

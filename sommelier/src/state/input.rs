@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::{serial_is_after, HostId};
 
@@ -322,12 +322,12 @@ pub struct TextInputState {
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
-    /// The `wl_display.sync` queued after the `reset` a pointer press sent
-    /// the host ([`Self::prepare_press_commit`]), until it returns. Exo
-    /// sends nothing in answer to the `reset`, but the events it sent
-    /// before it handled the `reset` still arrive, and they belong to the
-    /// composition the press committed (INVARIANTS "A pointer press ends
-    /// the composition on its surface").
+    /// The `wl_display.sync` queued after the `reset` a press sent the
+    /// host ([`Self::prepare_press_commit`]), until it returns. Exo sends
+    /// nothing in answer to the `reset`, but the events it sent before it
+    /// handled the `reset` still arrive, and they belong to the
+    /// composition the press committed (INVARIANTS "A press ends the
+    /// composition on its surface").
     pub(crate) reset_fence: Option<HostId>,
     /// Whether the proxy warned that the guest seat cannot carry an
     /// activation, which every later reconcile would repeat. It is never
@@ -649,12 +649,13 @@ impl TextInputState {
         self.unreported_host_edit = true;
     }
 
-    /// A pointer pressed on guest surface `surface`. A press on the
-    /// surface this text input is focused on, while the guest shows a
-    /// preedit of the active host generation, ends that composition before
-    /// the press reaches the guest, as mutter and KWin end theirs: the guest
-    /// commits the preedit it shows, and the host is told to `reset`
-    /// (INVARIANTS "A pointer press ends the composition on its surface").
+    /// A pointer button or a touch pressed on guest surface `surface`. A
+    /// press on the surface this text input is focused on, while the guest
+    /// shows a preedit of the active host generation, ends that
+    /// composition before the press reaches the guest, as mutter and KWin
+    /// end theirs: the guest commits the preedit it shows, and the host is
+    /// told to `reset` (INVARIANTS "A press ends the composition on its
+    /// surface").
     ///
     /// Returns the plan of that commit, or `None` if the press leaves the
     /// composition alone.
@@ -770,7 +771,7 @@ struct PeekWatermark {
 /// IME recovery already emitted a balanced pair and later host events must be
 /// suppressed. Encoding these states as one enum prevents the parallel-set
 /// inconsistencies that previously caused duplicate and stuck keys.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum GuestKeyOwner {
     Physical,
     TextInputKeysym,
@@ -923,7 +924,7 @@ impl KeyGeneration {
 #[derive(Default)]
 pub struct KeyGenerationRegistry {
     next_generation: u64,
-    entries: HashMap<HostId, HashMap<u32, KeyGeneration>>,
+    entries: BTreeMap<HostId, BTreeMap<u32, KeyGeneration>>,
     /// Releases that retired generations of each keyboard's key still owe
     /// the guest, at most one per channel that pressed them (`Physical` or
     /// `TextInputKeysym`); the current generation's lives in `entries`. A
@@ -933,8 +934,8 @@ pub struct KeyGenerationRegistry {
     /// a keysym entry only waits, and the bound stops such entries piling
     /// up. See INVARIANTS "A key waits for at most one late release per
     /// channel".
-    retired_guest_releases: HashMap<(HostId, u32, GuestKeyOwner), RetiredGuestRelease>,
-    latest_peek_sequences: HashMap<(u32, Option<u32>), PeekWatermark>,
+    retired_guest_releases: BTreeMap<(HostId, u32, GuestKeyOwner), RetiredGuestRelease>,
+    latest_peek_sequences: BTreeMap<(u32, Option<u32>), PeekWatermark>,
 }
 
 impl KeyGenerationRegistry {
@@ -1860,7 +1861,7 @@ pub struct KeyboardFocus {
 /// `wl_pointer.button` names no surface, and a press on the surface of a
 /// composition ends it ([`TextInputState::prepare_press_commit`]).
 #[derive(Debug, Default)]
-pub struct PointerFocus(HashMap<HostId, u32>);
+pub struct PointerFocus(BTreeMap<HostId, u32>);
 
 impl PointerFocus {
     /// `pointer` entered guest surface `surface`.
@@ -1924,7 +1925,7 @@ pub struct KeyboardFocusUpdate {
 /// retaining a fallback focus that a delayed leave could revive.
 #[derive(Default)]
 pub struct KeyboardFocusRegistry {
-    keyboards: HashMap<HostId, KeyboardFocus>,
+    keyboards: BTreeMap<HostId, KeyboardFocus>,
     /// Focus generations superseded by a different keyboard resource.
     ///
     /// Their seat focus is no longer authoritative, but the guest resource
@@ -1932,15 +1933,26 @@ pub struct KeyboardFocusRegistry {
     /// enter on the same keyboard supersedes its older generation without a
     /// tombstone because forwarding that delayed leave would clear the newer
     /// resource focus.
-    retired_guest_enters: HashMap<(HostId, u32), KeyboardFocus>,
+    retired_guest_enters: BTreeMap<(HostId, u32), KeyboardFocus>,
 }
 
 impl KeyboardFocusRegistry {
+    /// The surface the keyboards of `guest_seat` focus. [`Self::enter`]
+    /// retires every other keyboard of the seat on another surface, so
+    /// they all focus the same one.
     pub fn surface_for_seat(&self, guest_seat: u32) -> Option<u32> {
-        self.keyboards
-            .values()
-            .find(|focus| focus.guest_seat == guest_seat)
-            .map(|focus| focus.guest_surface)
+        let surfaces = || {
+            self.keyboards
+                .values()
+                .filter(move |focus| focus.guest_seat == guest_seat)
+                .map(|focus| focus.guest_surface)
+        };
+        let surface = surfaces().next();
+        debug_assert!(
+            surfaces().all(|other| Some(other) == surface),
+            "the keyboards of seat {guest_seat} focus different surfaces"
+        );
+        surface
     }
 
     pub fn focus_for_keyboard(&self, host_keyboard: HostId) -> Option<KeyboardFocus> {
@@ -2977,7 +2989,7 @@ mod tests {
             // resource. A newer enter on the same resource supersedes its
             // previous surface; active and retired registry generations must
             // account for this model exactly.
-            let mut guest_focus = HashMap::new();
+            let mut guest_focus = BTreeMap::new();
             for _ in 0..sequence_len {
                 let operation = operations[encoded % operations.len()];
                 encoded /= operations.len();
@@ -3622,8 +3634,8 @@ mod tests {
         #[derive(Default)]
         struct Model {
             next_generation: u64,
-            keys: HashMap<u32, ModelGeneration>,
-            retired_guest_releases: HashMap<(u32, GuestKeyOwner), RetiredGuestRelease>,
+            keys: BTreeMap<u32, ModelGeneration>,
+            retired_guest_releases: BTreeMap<(u32, GuestKeyOwner), RetiredGuestRelease>,
         }
 
         impl Model {
@@ -4036,7 +4048,7 @@ mod tests {
                 assert_eq!(registry.next_generation, model.next_generation);
                 let actual = registry.entries.get(&keyboard);
                 assert_eq!(
-                    actual.map(HashMap::len).unwrap_or_default(),
+                    actual.map(BTreeMap::len).unwrap_or_default(),
                     model.keys.len()
                 );
                 for (&key, expected) in &model.keys {
@@ -4067,7 +4079,7 @@ mod tests {
                         .iter()
                         .filter(|((pending_keyboard, _, _), _)| *pending_keyboard == keyboard)
                         .map(|(&(_, key, owner), &release)| ((key, owner), release))
-                        .collect::<HashMap<_, _>>(),
+                        .collect::<BTreeMap<_, _>>(),
                     model.retired_guest_releases
                 );
                 assert!(

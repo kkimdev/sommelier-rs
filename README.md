@@ -142,7 +142,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now sommelier-rs@wayland-2.service
 ```
 
-The service passes `--virtio-wl /dev/wl0` and the instance name to the proxy.
+The service passes `--virtio-wl /dev/wl0 --gpu-accel` and the instance name to
+the proxy.
 Use `systemctl --user status sommelier-rs@wayland-2.service` to inspect it.
 
 ## Build, test, and run from source

@@ -199,9 +199,9 @@ encode wire bytes ad hoc.
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
-| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
+| Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
 | Outputs | `registry.rs`, `output.rs` | `outputs.rs` (`OutputRegistry`) |
 | ChromeOS shell metadata | `aura_objects.rs`, `gtk_shell.rs` | `aura_surfaces.rs`, `xdg_roles.rs` |
@@ -214,7 +214,7 @@ Two mechanisms let a handler act outside its own message:
   guest's own message.
 - `callback::queue_internal_sync` issues a host-only `wl_display.sync` and
   `state::InternalCallbacks` records what it waits for, such as the
-  text-input drain, the fence after a pointer press's `reset`, or the
+  text-input drain, the fence after a press's `reset`, or the
   placement barrier.
 
 ### Window placement
@@ -322,12 +322,18 @@ or host error wins over an internal failure. After dispatch,
   anything), it leaves the message and everything after it buffered and
   ends the batch. Only a guest request with no descriptor arguments may
   wait: only the guest stream can be parked, and the descriptors would
-  be gone when the request is dispatched again. `Client` parks the guest
-  stream (`ParkedRequest`): it neither reads nor dispatches guest
-  messages, and fair dispatch does not offer them, while host events and
-  other clients go on. Once the exported sync_file is readable, or, for
-  the virtio-gpu fallback, which has no descriptor to wait on, a poll
-  interval after it parked, it dispatches the same message again, which
+  be gone when the request is dispatched again. A message that waits
+  otherwise, or with a forward, output or deferred work, is a proxy bug:
+  the session ends as an internal failure, before the deferred work runs
+  (test: `a_wait_with_output_ends_the_session`). `proxy::fuzz` counts
+  such an end like any other session end, but never reaches a fence
+  wait: its planes are memfds and its contexts have no allocator, so no
+  fence is ever pending. `Client` parks the guest stream
+  (`ParkedRequest`): it neither reads nor dispatches guest messages, and
+  fair dispatch does not offer them, while host events and other clients
+  go on. Once the exported sync_file is readable, or, for the virtio-gpu
+  fallback, which has no descriptor to wait on, a poll interval after it
+  parked, it dispatches the same message again, which
   checks its fence afresh. The interval starts at `FENCE_POLL_INTERVAL`
   (2 ms) and doubles each time the message waits again, up to
   `MAX_FENCE_POLL_INTERVAL` (16 ms), since each ask costs several
@@ -395,7 +401,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `pread` from the pool's file, so a client that shrinks the file after
   `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
   Each guest `wl_buffer` gets host storage, chosen once by
-  `select_shm_backing` (`shm.rs`): VirtWL shared memory laid out exactly
+  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out exactly
   like the guest buffer and imported by the host as a `wl_shm` pool, or,
   with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
   a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
@@ -419,6 +425,19 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
+
+`handler/shm.rs` holds a submodule per concern, and re-exports what other
+handlers call:
+
+| Submodule (`handler/shm/`) | Concern |
+| --- | --- |
+| `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
+| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities |
+| `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
+| `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
+| `copy.rs` | The copy of damaged pixels from the pool into the host storage |
+| `damage.rs` | Damage rectangles: clipping to a buffer and merging |
+| `buffer_lifetime.rs` | Every guest `wl_buffer`'s destroy and release, and its deferred retirement |
 
 Guest dma-buf (`linux_dmabuf.rs`) is forwarded rather than copied. For
 classic virtio-gpu PRIME buffers, `allocator.rs` replaces the guest's
@@ -469,9 +488,10 @@ transactions, each closed by a `done`; a delete, which Exo counts from the
 start of the surrounding text, is measured against the text the guest last
 committed. A guest commit that leaves the field enabled is answered
 with a `done`, which Chromium waits for before it sends more. A pointer
-press on the surface of a composition ends it before the guest gets the
-press, as mutter and KWin do: `pointer.rs` follows each pointer's surface,
-the guest commits the preedit it shows, and Exo is told to `reset`.
+press or a touch-down on the surface of a composition ends it before the
+guest gets the press, as mutter and KWin do: `pointer.rs` follows each
+pointer's surface, `touch.rs` reads a down's own, the guest commits the
+preedit it shows, and Exo is told to `reset`.
 Behind the `reset` goes a fence, a host `wl_display.sync`. Until it
 returns, the field's host composition events are dropped, because Exo
 sent them for the composition the press committed. The rules are under
