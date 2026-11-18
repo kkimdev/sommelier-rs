@@ -258,7 +258,7 @@ mod tests {
             let mut ctx = Context::new_for_test(false, false, vec![]);
             register_test_buffer(&mut ctx, kind, guest_buffer, host_buffer);
             if shown {
-                ctx.surface_mut(surface)
+                ctx.surface_for_test(surface)
                     .set_current_buffer_for_test(Some(guest_buffer), Some((1, 1)));
             }
             assert!(ctx.mark_buffer_submitted(guest_buffer));
@@ -342,7 +342,7 @@ mod tests {
             // guest object uses the recorded release instead of waiting for
             // a second one that cannot arrive.
             if shown {
-                ctx.surface_mut(surface)
+                ctx.surface_for_test(surface)
                     .set_current_buffer_for_test(Some(guest_buffer), None);
             }
             ctx.last_sender_id = guest_buffer;
@@ -480,9 +480,9 @@ mod tests {
             assert!(ctx.mark_buffer_submitted(guest_id));
             assert!(ctx.mark_buffer_released(guest_id));
         }
-        ctx.surface_mut(40).pending.attachment =
+        ctx.surface_for_test(40).pending.attachment =
             crate::state::SurfaceAttachment::Attach(local_buffer);
-        ctx.surface_mut(41).pending.attachment =
+        ctx.surface_for_test(41).pending.attachment =
             crate::state::SurfaceAttachment::Attach(native_buffer);
 
         retire_eligible_buffers(&mut ctx);

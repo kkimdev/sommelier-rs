@@ -48,6 +48,7 @@ pub(crate) const SHELL: u32 = 300;
 pub(crate) fn add_surface(ctx: &mut Context) {
     ctx.shadow_table
         .insert_paired_for_test(SURFACE.guest, SURFACE.host, "wl_surface");
+    ctx.create_surface(SURFACE.guest);
 }
 
 /// Give `ctx` wl_surface [`SURFACE`] with the toplevel role:

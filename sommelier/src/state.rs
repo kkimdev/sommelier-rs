@@ -732,10 +732,34 @@ impl Context {
         self.render_buffers.len()
     }
 
-    /// The state of the guest `wl_surface` `surface`, created by the first
-    /// request that sets any.
-    pub(crate) fn surface_mut(&mut self, surface: u32) -> &mut SurfaceState {
+    /// Create the state of guest `wl_surface` `surface`, as its
+    /// `wl_compositor.create_surface` arrives. The state ends with the
+    /// surface (see `forget_surface`).
+    pub(crate) fn create_surface(&mut self, surface: u32) {
+        let previous = self.surfaces.insert(surface, SurfaceState::default());
+        debug_assert!(previous.is_none(), "wl_surface {surface} created twice");
+    }
+
+    /// The state of the live guest `wl_surface` `surface`, or `None` if the
+    /// proxy has lost it, which [`Self::missing_surface_state`] ends the
+    /// session for.
+    pub(crate) fn surface_mut(&mut self, surface: u32) -> Option<&mut SurfaceState> {
+        self.surfaces.get_mut(&surface)
+    }
+
+    /// The state of `surface`, created if a test sets it up without a
+    /// `create_surface`.
+    #[cfg(test)]
+    pub(crate) fn surface_for_test(&mut self, surface: u32) -> &mut SurfaceState {
         self.surfaces.entry(surface).or_default()
+    }
+
+    /// End the session because live `wl_surface` `surface` has no state, an
+    /// internal divergence: every surface gets its state when it is
+    /// created. A handler returns the [`Action::Drop`] this returns.
+    #[must_use = "a handler returns the Action::Drop"]
+    pub(crate) fn missing_surface_state(&mut self, surface: u32) -> Action {
+        self.fail(format_args!("wl_surface {surface} has no state"))
     }
 
     /// Stale what `commit` of `surface`, which shows its buffer through
