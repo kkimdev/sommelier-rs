@@ -16,7 +16,7 @@ limitations under the License.
 
 //! The guest → host direction: the host state a text input's committed
 //! state calls for ([`HostTarget`]), the requests that bring the
-//! [`HostLink`](super::state::HostLink) to it ([`reconcile`]), and their
+//! [`LinkState`] to it ([`reconcile`]), and their
 //! encoding.
 
 use super::state::{LinkState, TextInput};

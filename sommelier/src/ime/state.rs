@@ -35,7 +35,7 @@ pub(super) struct TextInput {
     /// The requests since the guest's latest commit.
     pending: V3Pending,
     field: Field,
-    link: HostLink,
+    link: LinkState,
     /// The reset fence of a press (F4) until its `done` (W2). It lives
     /// beside the link and survives every change of it.
     fence: Option<BarrierToken>,
@@ -67,11 +67,9 @@ enum ExoText {
 }
 
 /// What the host text input has applied, by Exo's rules (INVARIANTS "The
-/// host gets each content type once it can apply it, and only then"). Its
-/// state is readable, but only this file changes it.
-#[derive(Debug)]
-pub(super) struct HostLink(LinkState);
-
+/// host gets each content type once it can apply it, and only then").
+/// Only the transitions of [`TextInput`] change it, and only
+/// [`TextInput::leave_attached`] leaves `Attached`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LinkState {
     /// No input method is attached, and none is about to be.
@@ -86,69 +84,11 @@ pub(super) enum LinkState {
     Draining { barrier: BarrierToken },
 }
 
-/// Proof that the link just left `Attached`, which [`Composition::end`]
-/// takes: a composition exists only while attached.
-#[must_use = "pass it to Composition::end"]
-struct LeftAttached(());
-
-impl HostLink {
-    fn activate_sent(&mut self) {
-        debug_assert_eq!(self.0, LinkState::Detached);
-        self.0 = LinkState::Attached { content_type: None };
-    }
-
-    fn content_type_sent(&mut self, applied: HostContentType) {
-        debug_assert!(matches!(self.0, LinkState::Attached { .. }));
-        self.0 = LinkState::Attached {
-            content_type: Some(applied),
-        };
-    }
-
-    /// The guest started a new field (G9c): the old field's content type
-    /// is the new one's no longer.
-    fn new_field(&mut self) {
-        if let LinkState::Attached { content_type } = &mut self.0 {
-            *content_type = None;
-        }
-    }
-
-    fn deactivate_sent(&mut self, barrier: BarrierToken) -> LeftAttached {
-        debug_assert!(matches!(self.0, LinkState::Attached { .. }));
-        self.0 = LinkState::Draining { barrier };
-        LeftAttached(())
-    }
-
-    /// End an attached link without a barrier: no live seat can carry a
-    /// `deactivate` (R1), Exo detached itself (H2), or the host deleted
-    /// the v1 object (F6).
-    fn end_without_barrier(&mut self) -> Option<LeftAttached> {
-        matches!(self.0, LinkState::Attached { .. }).then(|| {
-            self.0 = LinkState::Detached;
-            LeftAttached(())
-        })
-    }
-
-    fn barrier_done(&mut self, token: BarrierToken) {
-        if self.0 == (LinkState::Draining { barrier: token }) {
-            self.0 = LinkState::Detached;
-        }
-    }
-}
-
 /// What the guest shows, and the v1 pieces of the next host event.
 #[derive(Debug, Default)]
 struct Composition {
     shown: Option<Preedit>,
     assembly: Assembly,
-}
-
-impl Composition {
-    /// Clear the composition when the link leaves `Attached`, returning
-    /// the preedit the guest showed.
-    fn end(&mut self, _: LeftAttached) -> Option<Preedit> {
-        self.assembly = Assembly::default();
-        self.shown.take()
-    }
 }
 
 /// The v1 `preedit_cursor` and `preedit_styling` selection that the next
@@ -175,7 +115,7 @@ impl TextInput {
             commits: CommitCount::default(),
             pending: V3Pending::default(),
             field: Field::focused_on(surface),
-            link: HostLink(LinkState::Detached),
+            link: LinkState::Detached,
             fence: None,
             composition: Composition::default(),
             warned: Warned::default(),
@@ -195,11 +135,11 @@ impl TextInput {
     }
 
     pub(super) fn link(&self) -> LinkState {
-        self.link.0
+        self.link
     }
 
     pub(super) fn is_attached(&self) -> bool {
-        matches!(self.link.0, LinkState::Attached { .. })
+        matches!(self.link, LinkState::Attached { .. })
     }
 
     /// The focused field's surface and committed state.
@@ -238,8 +178,10 @@ impl TextInput {
 
     /// G9c steps 2 to 4: apply a commit's pending state, but an enable
     /// that `enable_conflict` rejects. Returns whether the commit started a
-    /// new field, which ends the composition with no guest output, since
-    /// the guest reset itself, and makes the host's content type unknown.
+    /// new field. A new field is never attached after the step: a disable
+    /// makes the reconcile leave `Attached`, which ends the composition
+    /// with no guest output, since the guest reset itself; an enable or a
+    /// rejected one starts from a link that was not attached (I1a).
     pub(super) fn apply_commit(&mut self, pending: V3Pending, enable_conflict: bool) -> bool {
         let Field::Focused(f) = &mut self.field else {
             debug_assert!(false, "a commit applies only to a focused field");
@@ -256,10 +198,6 @@ impl TextInput {
             new_field = enable_conflict || enabled != f.committed.enabled;
             if !enable_conflict {
                 f.committed.enabled = enabled;
-            }
-            if new_field {
-                self.composition = Composition::default();
-                self.link.new_field();
             }
         }
         if let Some(surrounding_text) = surrounding_text {
@@ -296,11 +234,11 @@ impl TextInput {
 
     /// F1, F2 and G10: the field ends, and a new one starts on `surface`,
     /// if any, disabled and with nothing pending. Returns the old field's
-    /// surface.
+    /// surface. The new field is disabled, so the step's reconcile leaves
+    /// `Attached`, which ends the composition.
     pub(super) fn refocus(&mut self, surface: Option<SurfaceId>) -> Option<SurfaceId> {
         let old = self.focused_surface();
         self.pending = V3Pending::default();
-        self.composition = Composition::default();
         self.field = Field::focused_on(surface);
         old
     }
@@ -320,12 +258,12 @@ impl TextInput {
     /// attached, no fence is pending, and the field is focused. The only
     /// constructor of [`Current`].
     pub(super) fn current(&mut self, ti: TiId) -> Option<Current<'_>> {
+        if !self.is_attached() || self.fence.is_some() {
+            return None;
+        }
         let Field::Focused(f) = &mut self.field else {
             return None;
         };
-        if !matches!(self.link.0, LinkState::Attached { .. }) || self.fence.is_some() {
-            return None;
-        }
         Some(Current {
             ti,
             seat: self.seat,
@@ -338,46 +276,60 @@ impl TextInput {
     }
 
     pub(super) fn activate_sent(&mut self) {
-        self.link.activate_sent();
+        debug_assert_eq!(self.link, LinkState::Detached);
+        self.link = LinkState::Attached { content_type: None };
     }
 
     pub(super) fn content_type_sent(&mut self, applied: HostContentType) {
-        self.link.content_type_sent(applied);
+        debug_assert!(self.is_attached());
+        self.link = LinkState::Attached {
+            content_type: Some(applied),
+        };
+    }
+
+    /// The one way out of `Attached`, into `next`. It ends the composition
+    /// with the link, since one exists only while attached (I2), and
+    /// returns it; if the link was not attached, it changes nothing and
+    /// returns `None`.
+    fn leave_attached(&mut self, next: LinkState) -> Option<Composition> {
+        debug_assert!(!matches!(next, LinkState::Attached { .. }));
+        if !self.is_attached() {
+            return None;
+        }
+        self.link = next;
+        Some(std::mem::take(&mut self.composition))
     }
 
     pub(super) fn deactivate_sent(&mut self, barrier: BarrierToken) {
-        let left = self.link.deactivate_sent(barrier);
-        self.composition.end(left);
+        let left = self.leave_attached(LinkState::Draining { barrier });
+        debug_assert!(left.is_some(), "only an attached link is deactivated");
     }
 
     /// R1: no live seat can carry the `deactivate` an attached link needs.
     pub(super) fn abandoned(&mut self) {
-        let left = self.link.end_without_barrier();
+        let left = self.leave_attached(LinkState::Detached);
         debug_assert!(left.is_some(), "only an attached link is abandoned");
-        if let Some(left) = left {
-            self.composition.end(left);
-        }
     }
 
     /// H2: Exo detached its input method itself. Returns `None` if the
     /// link was not attached (H2'), and otherwise whether the guest showed
     /// a preedit, which it must now be told to clear.
     pub(super) fn exo_detached(&mut self) -> Option<bool> {
-        let left = self.link.end_without_barrier()?;
-        Some(self.composition.end(left).is_some())
+        let left = self.leave_attached(LinkState::Detached)?;
+        Some(left.shown.is_some())
     }
 
     /// F6: the host deleted the v1 object, so nothing more goes to it.
     pub(super) fn host_deleted(&mut self) {
-        if let Some(left) = self.link.end_without_barrier() {
-            self.composition.end(left);
-        }
+        self.leave_attached(LinkState::Detached);
     }
 
     /// W1 and W2: the barrier `token` returned. It ends the drain or the
     /// fence it is, in any link state.
     pub(super) fn barrier_done(&mut self, token: BarrierToken) {
-        self.link.barrier_done(token);
+        if self.link == (LinkState::Draining { barrier: token }) {
+            self.link = LinkState::Detached;
+        }
         if self.fence == Some(token) {
             self.fence = None;
         }
@@ -398,7 +350,7 @@ impl TextInput {
     pub(super) fn assert_invariants(&self, ti: TiId, env: &impl Env) {
         let attached = self.is_attached();
         assert!(!attached || self.is_enabled(), "I1a: {ti:?} {self:?}");
-        let steps = host::reconcile(&host::target(self, env), self.link.0);
+        let steps = host::reconcile(&host::target(self, env), self.link);
         assert_eq!(steps, HostSteps::default(), "I1b: {ti:?} {self:?}");
         let Composition { shown, assembly } = &self.composition;
         if shown.is_some() || *assembly != Assembly::default() {
