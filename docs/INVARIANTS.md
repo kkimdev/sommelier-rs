@@ -1013,8 +1013,14 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   land wrong (see HANDOVER). Preedit regions are deliberately not gated
   by `unreported_host_edit`: dropping one would leave Exo composing text
   the guest does not show, so a region right after an unreported edit may
-  take its text from the guest's last report.
+  take its text from the guest's last report. One such edit is accounted
+  for: while the guest shows the preedit an earlier region took from its
+  last report and has not reported since, a new region deletes only the
+  bytes around it that the guest still has, and a region that does not
+  cover those bytes is dropped, since it would lose them or show them
+  twice (`ShownPreedit::region`).
   Tests: `exo_deletes_become_v3_deletes_around_the_cursor`,
+  `a_region_over_a_region_deletes_only_what_the_guest_has`,
   `a_delete_waits_for_the_guest_to_report_the_input_methods_edits`,
   `a_reset_commit_waits_for_the_guest_to_report_it`,
   `delete_lengths_read_both_conventions`,

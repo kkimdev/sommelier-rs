@@ -93,6 +93,16 @@
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
   only a delete within that round trip can land wrong. Mirroring Exo's
   `SurroundingTextTracker` would close this; no host has shown it.
+- A preedit region over a preedit an earlier region made deletes only the
+  bytes the guest still has, but two cases stay approximate. A region
+  that does not cover the shown one, an empty one included, is dropped:
+  the guest keeps showing the old preedit while Exo composes the new
+  range, as the right answer, giving the old text back before the new
+  delete, needs a commit before a delete, which one v3 transaction
+  cannot order. And once the host replaces a region's preedit with a
+  `preedit_string`, a later region is measured against the guest's last
+  report again, which still holds the bytes the first region took
+  (`a_region_over_a_region_deletes_only_what_the_guest_has`).
 - The pointer press or touch-down that ends a composition
   ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
   checked on a host. In VS Code or Chrome started with

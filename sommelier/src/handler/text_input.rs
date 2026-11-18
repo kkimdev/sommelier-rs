@@ -1184,21 +1184,40 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         // goes last; an empty region deletes nothing and clears only a
         // shown preedit (docs/INVARIANTS.md, "A v3 transaction's events go
         // in one order").
-        // The region's preedit is the text it deletes.
+        // The region's preedit is the text it takes.
         let empty = preedit_text.is_empty();
         debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
+        // The guest no longer has the bytes the shown preedit took, if a
+        // region made it and the guest has not reported its text since:
+        // they are not deleted again. A region that does not cover them
+        // would leave them lost or shown twice, so it is dropped.
+        let deleted = match plan.shown_region {
+            None => (before_length, after_length),
+            Some((shown_before, shown_after)) => match (
+                before_length.checked_sub(shown_before),
+                after_length.checked_sub(shown_after),
+            ) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    log::debug!(
+                        "Ignoring a preedit region of text input {guest_id} that does not \
+                         cover the region it shows"
+                    );
+                    return drop_host_preedit(ctx, guest_id);
+                }
+            },
+        };
+        let deletes = deleted != (0, 0);
         let mut transaction = Vec::new();
         if plan.had_preedit
-            && !empty
+            && deletes
             && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
         {
             return drop_host_preedit(ctx, guest_id);
         }
-        if !empty {
+        if deletes {
             transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-                guest_id,
-                before_length,
-                after_length,
+                guest_id, deleted.0, deleted.1,
             ));
         }
         if (plan.had_preedit || !empty)
@@ -1219,7 +1238,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .get_mut(&guest_id)
             .expect("active text input disappeared while installing preedit region");
         let guest_seat = plan.guest_seat;
-        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end));
+        let region = (before_length, after_length);
+        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end), region);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
 
@@ -5407,6 +5427,44 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// A region over the preedit an earlier region made deletes only the
+    /// text the guest still has. Until the guest reports its text, the
+    /// surrounding text it committed still holds the bytes the earlier
+    /// region took for the preedit, which the guest no longer has, so they
+    /// are not deleted again. A region that does not cover them is dropped.
+    /// Once the guest reports, its text is measured as it is.
+    #[tokio::test]
+    async fn a_region_over_a_region_deletes_only_what_the_guest_has() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The guest's text is "abc|ef": of "cd", only "c" is left.
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // "ef" does not cover the shown "cd".
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 2)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        // The guest reports its text "ab|ef", which no longer holds "cd".
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abef", 2, 2).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("abef", 2, 2), f.commit_state(3)];
+        assert_eq!(f.s.host_received(), expected);
+        let expected = [preedit_at("cd", 2, 2), done(3)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("b", 1, 1), done(3)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A preedit region makes committed surrounding text around the cursor
     /// the preedit; text the guest has not committed, or a region apart
     /// from the cursor, cannot be.
@@ -5454,13 +5512,15 @@ mod tests {
         // a Backspace (`text_input_delete_surrounding_text`,
         // `src/video/wayland/SDL_waylandevents.c` 2683-2710, main
         // 1fc62260fc81), which its `testime` ignores while a preedit shows
-        // (`test/testime.c` 1084-1086).
+        // (`test/testime.c` 1084-1086). The guest's text is "가|다" now,
+        // so of the region "가나" it deletes only "가"
+        // ([`a_region_over_a_region_deletes_only_what_the_guest_has`]).
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
         ])
         .await;
-        let expected = [no_preedit(), delete(6, 0), preedit_at("가나", 0, 3), done()];
+        let expected = [no_preedit(), delete(3, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // The `done` of the guest's next commit repeats the region's

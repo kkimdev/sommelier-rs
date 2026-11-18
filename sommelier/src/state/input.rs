@@ -263,6 +263,10 @@ pub struct ShownPreedit {
     pub text: String,
     /// The `cursor_begin` and `cursor_end` sent with `text`.
     pub cursor: (i32, i32),
+    /// For a preedit a region made, the bytes before and after the cursor
+    /// of the guest's committed surrounding text that it took, and the
+    /// guest therefore no longer has.
+    pub region: Option<(u32, u32)>,
 }
 
 impl ShownPreedit {
@@ -281,6 +285,7 @@ impl ShownPreedit {
         Self {
             text: text.to_string(),
             cursor: (end, end),
+            region: None,
         }
     }
 }
@@ -385,6 +390,9 @@ pub(crate) struct PreeditRegionPlan {
     pub surrounding_cursor: i32,
     pub done_serial: u32,
     pub had_preedit: bool,
+    /// The bytes around `surrounding_cursor` that the shown preedit took,
+    /// if a region made it and the guest has not reported its text since.
+    pub shown_region: Option<(u32, u32)>,
     pub selection: Option<(u32, u32)>,
     pub cursor: Option<i32>,
 }
@@ -589,7 +597,11 @@ impl TextInputState {
         // A cleared preedit with a reset commit reaches the guest as that
         // commit, an edit the guest has yet to report.
         self.unreported_host_edit |= cleared && has_reset_commit;
-        self.current_preedit = ShownPreedit { text, cursor };
+        self.current_preedit = ShownPreedit {
+            text,
+            cursor,
+            region: None,
+        };
         arm_backspace_repeat
     }
 
@@ -629,16 +641,25 @@ impl TextInputState {
             surrounding_cursor: *surrounding_cursor,
             done_serial: self.guest_commit_serial,
             had_preedit: self.current_preedit.has_text(),
+            // Only a surrounding text the guest commits clears the flag,
+            // and every other edit replaces the preedit.
+            shown_region: self
+                .current_preedit
+                .region
+                .filter(|_| self.unreported_host_edit),
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
     }
 
+    /// Close a preedit region, which made `preedit_text` of the bytes
+    /// `region` before and after the committed cursor.
     pub(crate) fn finish_preedit_region(
         &mut self,
         plan: PreeditRegionPlan,
         preedit_text: String,
         cursor: (i32, i32),
+        region: (u32, u32),
     ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
@@ -650,6 +671,7 @@ impl TextInputState {
         // guest has no edit to report.
         self.unreported_host_edit |= !preedit_text.is_empty();
         self.current_preedit = ShownPreedit {
+            region: (!preedit_text.is_empty()).then_some(region),
             text: preedit_text,
             cursor,
         };
@@ -2574,6 +2596,7 @@ mod tests {
         expected.current_preedit = ShownPreedit {
             text: "각".to_string(),
             cursor: (0, 3),
+            region: None,
         };
         expected.pending_preedit_selection = None;
         expected.pending_preedit_cursor = None;
