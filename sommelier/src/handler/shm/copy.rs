@@ -350,27 +350,33 @@ mod tests {
     /// writes outside the destination, nor leaves it partly updated.
     #[test]
     fn copy_rejects_a_buffer_that_overruns_its_destination() {
-        // Two rows of two ARGB8888 pixels, 8 bytes apart, need 16 bytes.
-        let source = shm_pool_file(&[0x11; 16]);
+        // Three rows of four ARGB8888 pixels, 16 bytes apart, need 48 bytes.
+        let source = shm_pool_file(&[0x11; 48]);
         let layout = ShmCopyLayout {
-            width: 2,
-            height: 2,
-            src_stride: 8,
-            dst_stride: 8,
+            width: 4,
+            height: 3,
+            src_stride: 16,
+            dst_stride: 16,
             ..ARGB8888_1X1
         };
-        let last_row = DamageRegion::from(vec![BufferRect::new(0, 1, 2, 1)]);
-        for damage in [&DamageRegion::Full, &last_row] {
-            let destination = host_mapping(&[0; 15]);
+        let last_row = DamageRegion::from(vec![BufferRect::new(0, 2, 4, 1)]);
+        // Two spans that stay apart: the first pixel of row 0, which fits,
+        // and the last pixel of row 2, which does not.
+        let fitting_span_then_overrun = DamageRegion::from(vec![
+            BufferRect::new(0, 0, 1, 1),
+            BufferRect::new(3, 2, 1, 1),
+        ]);
+        for damage in [&DamageRegion::Full, &last_row, &fitting_span_then_overrun] {
+            let destination = host_mapping(&[0; 47]);
             assert!(matches!(
                 copy_shm_damage(&source, &destination, layout, damage),
                 Err(ShmCopyError::Destination)
             ));
-            assert_eq!(destination.to_vec(), [0; 15], "nothing is copied");
+            assert_eq!(destination.to_vec(), [0; 47], "nothing is copied");
         }
-        let destination = host_mapping(&[0; 16]);
+        let destination = host_mapping(&[0; 48]);
         copy_shm_damage(&source, &destination, layout, &DamageRegion::Full).unwrap();
-        assert_eq!(destination.to_vec(), [0x11; 16]);
+        assert_eq!(destination.to_vec(), [0x11; 48]);
     }
 
     #[test]
