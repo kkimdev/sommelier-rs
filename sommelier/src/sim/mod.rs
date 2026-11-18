@@ -44,7 +44,6 @@ mod display;
 mod editor;
 mod engine;
 pub(crate) mod exo;
-mod golden;
 mod hangul;
 mod keymap;
 pub(crate) mod oracle;
