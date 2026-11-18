@@ -530,8 +530,8 @@ impl AsRawFd for WaylandConnection {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        decode_unix_control_fds, recv_unix_message, unix_send_flags, OutgoingMessages,
-        WaylandConnection, MAX_FDS_PER_SEND,
+        decode_unix_control_fds, recv_unix_message, OutgoingMessages, WaylandConnection,
+        MAX_FDS_PER_SEND,
     };
     use crate::test_support::{any_fd_has_identity, fd_identity, shm_pool_file};
     use crate::wire::MessageBuilder;
@@ -544,11 +544,37 @@ mod tests {
     use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
+    /// A send to a peer that has gone returns `BrokenPipe` and raises no
+    /// `SIGPIPE`, even where `SIGPIPE` would end the process. The Rust
+    /// runtime ignores it, so the test restores its default action, which
+    /// is the process's, in a child process of its own.
     #[test]
     fn unix_send_suppresses_sigpipe() {
-        assert!(
-            unix_send_flags().contains(nix::sys::socket::MsgFlags::MSG_NOSIGNAL),
-            "disconnecting Wayland peers must return EPIPE instead of killing Sommelier"
+        crate::test_support::in_own_process(
+            "connection::tests::unix_send_suppresses_sigpipe",
+            || {
+                assert_ne!(
+                    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+                    libc::SIG_ERR
+                );
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build a runtime");
+                let error = runtime.block_on(async {
+                    let (peer, socket) = UnixStream::pair().expect("unix socket pair");
+                    drop(peer);
+                    let mut connection =
+                        WaylandConnection::new(socket.into()).expect("register test socket");
+                    let mut messages = OutgoingMessages::default();
+                    messages.push((vec![0; 8], Vec::new()));
+                    connection
+                        .send_messages(&messages)
+                        .await
+                        .expect_err("the peer has gone")
+                });
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            },
         );
     }
 
