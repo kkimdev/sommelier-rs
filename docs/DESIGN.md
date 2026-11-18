@@ -395,10 +395,11 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `pread` from the pool's file, so a client that shrinks the file after
   `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
   Each guest `wl_buffer` gets host storage, chosen once by
-  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out exactly
-  like the guest buffer and imported by the host as a `wl_shm` pool, or,
-  with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
-  a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
+  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out
+  exactly like the guest buffer and imported by the host as a `wl_shm`
+  pool, or, with `--gpu-accel` and a kernel that supports VirtWL dma-buf
+  allocation, a host-backed PRIME dma-buf imported through the host's
+  linux-dmabuf.
   With `--local-compositor` and no VirtWL, the shared memory is a memfd,
   with or without `--gpu-accel` (see
   [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm)).
@@ -428,7 +429,7 @@ handlers call:
 | Submodule (`handler/shm/`) | Concern |
 | --- | --- |
 | `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
-| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities |
+| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
 | `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
 | `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
 | `copy.rs` | The copy of damaged pixels from the pool into the host storage |
