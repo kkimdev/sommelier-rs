@@ -22,6 +22,7 @@ mod internal_callbacks;
 mod lifecycle;
 mod objects;
 mod outputs;
+mod registries;
 mod render;
 mod window_placement;
 mod xdg_roles;
@@ -57,6 +58,7 @@ pub use self::outputs::OutputState;
 pub(crate) use self::outputs::{
     is_valid_transform, GlobalBinding, OutputRegistry, INERT_BIND_INTERFACE,
 };
+pub(crate) use self::registries::RegistryRecord;
 #[cfg(test)]
 pub(crate) use self::render::SurfacePending;
 pub(crate) use self::render::{
@@ -476,24 +478,9 @@ pub struct Context {
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
     pub hidden_host_globals: BTreeMap<u32, String>,
-    /// Global names already emitted by each host registry object. A single
-    /// Wayland client may create more than one wl_registry; the compositor
-    /// sends the complete global list to each one, so this must not be a
-    /// connection-wide set keyed only by global name. Ordered, because a
-    /// registry's end retires the globals it alone listed in that order.
-    pub registry_global_names: BTreeMap<u32, BTreeSet<u32>>,
-    /// Names removed from each registry. A subsequent global event for a
-    /// removed name represents a new advertisement generation; a bind of a
-    /// removed name crossed its removal on the wire. Each name keeps the
-    /// version the guest saw if it can be bound inert (see
-    /// `INERT_BIND_INTERFACE`), and `None` otherwise.
-    pub registry_global_removed: BTreeMap<u32, BTreeMap<u32, Option<u32>>>,
-    pub registry_global_generations: BTreeMap<u32, BTreeMap<u32, u64>>,
-    /// Whether each registry's current advertisement for a name was visible
-    /// to the guest. This is kept per registry/generation so a delayed
-    /// global_remove for an old hidden/visible generation cannot be classified
-    /// using replacement metadata.
-    pub registry_global_visibility: BTreeMap<u32, BTreeMap<u32, bool>>,
+    /// What each host registry has advertised, by host registry ID (see
+    /// [`RegistryRecord`]).
+    pub(crate) registries: BTreeMap<u32, RegistryRecord>,
     pub global_generations: BTreeMap<u32, u64>,
     pub next_global_generation: u64,
     /// The generation of each global whose current advertisement the host
@@ -502,11 +489,6 @@ pub struct Context {
     /// the removal, which a guest may destroy before the last registry that
     /// lists the global sees it.
     pub removed_global_generations: BTreeMap<u32, u64>,
-    /// Globals that have been removed from the host registry. Keep their
-    /// metadata until every registry has observed the removal so a second
-    /// registry can still receive its own global_remove event, while blocking
-    /// new binds in the meantime.
-    pub removed_host_globals: BTreeSet<u32>,
     pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
@@ -1069,14 +1051,10 @@ impl Context {
             host_globals: BTreeMap::new(),
             singleton_candidates: BTreeMap::new(),
             hidden_host_globals: BTreeMap::new(),
-            registry_global_names: BTreeMap::new(),
-            registry_global_removed: BTreeMap::new(),
-            registry_global_generations: BTreeMap::new(),
-            registry_global_visibility: BTreeMap::new(),
+            registries: BTreeMap::new(),
             global_generations: BTreeMap::new(),
             next_global_generation: 1,
             removed_global_generations: BTreeMap::new(),
-            removed_host_globals: BTreeSet::new(),
             pending_params: BTreeMap::new(),
             used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
