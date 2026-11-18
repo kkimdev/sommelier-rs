@@ -87,7 +87,10 @@ always consumed; a configuration problem never stops the proxy) is owned by
   returning. The ChromiumOS kernel normally returns none on error; this
   guards against other implementations and malformed devices.
   Tests: `returned_ioctl_fd_is_closed_on_error_paths`,
-  `recv_ioctl_error_closes_descriptors_written_before_failure`.
+  `dmabuf_probe_closes_its_descriptor_whatever_the_result`,
+  `recv_ioctl_error_closes_descriptors_written_before_failure`,
+  `recv_rejects_an_oversized_length_and_closes_its_descriptors`,
+  `raw_fds_are_closed_once_each`.
 
 ## Wire messages
 

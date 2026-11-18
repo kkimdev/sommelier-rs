@@ -477,16 +477,19 @@ fn recv_message(fd: RawFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::{
-        add_nonblocking_flag, close_raw_fds, close_returned_fd, dmabuf_probe_supported,
-        owned_fds_from_txn, VirtWaylandChannel, DEFAULT_BUFFER_SIZE, MAX_SEND_SIZE,
+        add_nonblocking_flag, dmabuf_probe_supported, owned_fds_from_txn, probe_supports_dmabuf,
+        recv_result, take_dmabuf, take_returned_fd, unique_raw_fds, VirtWaylandChannel,
+        VirtWaylandDmabufLayout, DEFAULT_BUFFER_SIZE, MAX_SEND_SIZE,
     };
     use crate::protocols::wayland::wl_display;
     use crate::test_support::{any_fd_has_identity, fd_identity, TestFdIdentity};
-    use crate::virtwl::virtwl_ioctl_txn;
+    use crate::virtwl::{virtwl_ioctl_new_dmabuf, virtwl_ioctl_txn, VIRTWL_SEND_MAX_ALLOCS};
     use crate::wire::WL_DISPLAY_ID;
+    use nix::errno::Errno;
     use nix::fcntl::OFlag;
     use nix::sys::memfd::{memfd_create, MFdFlags};
-    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+    use std::io;
+    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -576,50 +579,168 @@ mod tests {
         assert!(!dmabuf_probe_supported(Some(libc::ENOTTY)));
     }
 
-    #[test]
-    fn dmabuf_layout_preserves_all_returned_planes() {
-        let layout = super::VirtWaylandDmabufLayout {
-            strides: [4096, 2048, 0],
-            offsets: [0, 4096 * 1080, 0],
-        };
-        assert_eq!(layout.strides, [4096, 2048, 0]);
-        assert_eq!(layout.offsets, [0, 4096 * 1080, 0]);
-    }
-
-    /// A descriptor as a device returns it: a raw number the proxy now
-    /// owns, with the identity of its unique memfd.
+    /// A descriptor as a device returns it, with the identity of its unique
+    /// memfd.
     ///
     /// Tests assert on the identity, because the number can be reused by a
     /// parallel test as soon as the code under test closes it.
-    fn returned_fd() -> (RawFd, TestFdIdentity) {
+    fn owned_returned_fd() -> (OwnedFd, TestFdIdentity) {
         let memfd = memfd_create(c"sommelier-virtwl-returned-fd", MFdFlags::MFD_CLOEXEC)
             .expect("memfd_create");
         let identity = fd_identity(memfd.as_raw_fd());
-        (memfd.into_raw_fd(), identity)
+        (memfd, identity)
+    }
+
+    /// A descriptor as a device returns it: a raw number the proxy now
+    /// owns, with the identity of its memfd.
+    fn returned_fd() -> (RawFd, TestFdIdentity) {
+        let (fd, identity) = owned_returned_fd();
+        (fd.into_raw_fd(), identity)
+    }
+
+    /// The layout `VIRTWL_IOCTL_NEW_DMABUF` writes, with six distinct plane
+    /// values.
+    fn dmabuf_metadata(stride0: u32) -> virtwl_ioctl_new_dmabuf {
+        virtwl_ioctl_new_dmabuf {
+            width: 64,
+            height: 32,
+            format: 0,
+            stride0,
+            stride1: 128,
+            stride2: 96,
+            offset0: 16,
+            offset1: 8192,
+            offset2: 12288,
+        }
+    }
+
+    #[test]
+    fn dmabuf_layout_preserves_all_returned_planes() {
+        let (fd, identity) = owned_returned_fd();
+        let (fd, layout) = take_dmabuf(fd, dmabuf_metadata(256)).expect("a valid dma-buf");
+        assert_eq!(
+            layout,
+            VirtWaylandDmabufLayout {
+                strides: [256, 128, 96],
+                offsets: [16, 8192, 12288],
+            }
+        );
+        assert_eq!(fd_identity(fd.as_raw_fd()), identity);
     }
 
     #[test]
     fn returned_ioctl_fd_is_closed_on_error_paths() {
-        let (returned_fd, identity) = returned_fd();
-        close_returned_fd(returned_fd);
+        // A device that wrote a descriptor and then failed the ioctl.
+        let (fd, identity) = returned_fd();
+        let error = take_returned_fd(Err(Errno::EINVAL), fd, "VIRTWL_IOCTL_NEW_ALLOC")
+            .expect_err("the ioctl failed");
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert!(!any_fd_has_identity(identity));
+
+        // A dma-buf whose layout is malformed.
+        let (fd, identity) = owned_returned_fd();
+        let error = take_dmabuf(fd, dmabuf_metadata(0)).expect_err("a zero plane-0 stride");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!any_fd_has_identity(identity));
     }
 
     #[test]
-    fn recv_ioctl_error_closes_descriptors_written_before_failure() {
-        let (returned_fd, identity) = returned_fd();
+    fn returned_ioctl_fd_is_taken_over_on_success() {
+        let (fd, identity) = returned_fd();
+        let fd = take_returned_fd(Ok(0), fd, "VIRTWL_IOCTL_NEW_PIPE").expect("the ioctl succeeded");
+        assert_eq!(fd_identity(fd.as_raw_fd()), identity);
 
-        // Model a device that wrote a descriptor and then returned an ioctl
-        // error. The receive error branch must reclaim it before propagating
-        // the error.
+        let error = take_returned_fd(Ok(0), -1, "VIRTWL_IOCTL_NEW_PIPE")
+            .expect_err("a success without a descriptor");
+        assert_eq!(
+            error.to_string(),
+            "Invalid fd returned from VIRTWL_IOCTL_NEW_PIPE"
+        );
+    }
+
+    #[test]
+    fn dmabuf_probe_closes_its_descriptor_whatever_the_result() {
+        // Only ENOTTY says the kernel lacks the ioctl; EINVAL is the
+        // expected answer to the probe's zero-sized metadata.
+        for (result, supported) in [
+            (Ok(0), true),
+            (Err(Errno::EINVAL), true),
+            (Err(Errno::ENOTTY), false),
+        ] {
+            let (fd, identity) = returned_fd();
+            assert_eq!(probe_supports_dmabuf(result, fd), supported, "{result:?}");
+            assert!(!any_fd_has_identity(identity), "{result:?}");
+        }
+        assert!(!probe_supports_dmabuf(Ok(0), -1));
+    }
+
+    /// A receive transaction that carries `fds` and claims `len` bytes.
+    fn recv_txn(fds: &[RawFd], len: usize) -> virtwl_ioctl_txn {
         let mut txn = virtwl_ioctl_txn {
-            fds: [-1; crate::virtwl::VIRTWL_SEND_MAX_ALLOCS],
-            len: 0,
+            fds: [-1; VIRTWL_SEND_MAX_ALLOCS],
+            len: len.try_into().expect("a u32 length"),
         };
-        txn.fds[0] = returned_fd;
-        close_raw_fds(&txn.fds);
+        txn.fds[..fds.len()].copy_from_slice(fds);
+        txn
+    }
 
-        assert!(!any_fd_has_identity(identity));
+    /// A full receive payload whose every byte depends on its position.
+    fn recv_payload() -> Vec<u8> {
+        (0..MAX_SEND_SIZE).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn raw_fds_are_closed_once_each() {
+        assert_eq!(unique_raw_fds(&[7, -1, 3, 7, -2, 3, 0]), [7, 3, 0]);
+    }
+
+    #[test]
+    fn recv_ioctl_error_closes_descriptors_written_before_failure() {
+        // A device that wrote two descriptors, one of them twice, and then
+        // failed the ioctl.
+        let (first, first_identity) = returned_fd();
+        let (second, second_identity) = returned_fd();
+        let txn = recv_txn(&[first, second, first], 0);
+
+        let error =
+            recv_result(Err(Errno::EIO), &txn, &recv_payload()).expect_err("the ioctl failed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(!any_fd_has_identity(first_identity));
+        assert!(!any_fd_has_identity(second_identity));
+    }
+
+    #[test]
+    fn recv_rejects_an_oversized_length_and_closes_its_descriptors() {
+        // A well-formed descriptor array, so only the length is wrong, and
+        // one that repeats a descriptor.
+        for repeats in [1, 2] {
+            let (fd, identity) = returned_fd();
+            let txn = recv_txn(&vec![fd; repeats], MAX_SEND_SIZE + 1);
+
+            let error = recv_result(Ok(0), &txn, &recv_payload()).expect_err("an oversized length");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{repeats}");
+            assert!(!any_fd_has_identity(identity), "{repeats}");
+        }
+
+        // A message that fills the whole payload still fits.
+        let (data, fds) = recv_result(Ok(0), &recv_txn(&[], MAX_SEND_SIZE), &recv_payload())
+            .expect("a full payload");
+        assert_eq!(data, recv_payload());
+        assert!(fds.is_empty());
+    }
+
+    #[test]
+    fn recv_returns_the_message_and_its_descriptors() {
+        let (fd, identity) = returned_fd();
+        let txn = recv_txn(&[fd], 5);
+
+        let (data, fds) = recv_result(Ok(0), &txn, &recv_payload()).expect("a message");
+
+        assert_eq!(data, [0, 1, 2, 3, 4]);
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fd_identity(fds[0].as_raw_fd()), identity);
     }
 
     #[test]
@@ -627,6 +748,14 @@ mod tests {
         let (returned_fd, identity) = returned_fd();
         // `owned_fds_from_txn` closes a malformed array at once.
         let invalid = [-1, returned_fd];
+        assert!(owned_fds_from_txn(&invalid).is_err());
+        assert!(!any_fd_has_identity(identity));
+    }
+
+    #[test]
+    fn virtwl_fd_array_rejects_a_repeated_descriptor() {
+        let (returned_fd, identity) = returned_fd();
+        let invalid = [returned_fd, returned_fd];
         assert!(owned_fds_from_txn(&invalid).is_err());
         assert!(!any_fd_has_identity(identity));
     }
