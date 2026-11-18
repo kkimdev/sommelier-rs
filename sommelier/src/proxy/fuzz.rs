@@ -30,7 +30,9 @@ limitations under the License.
 //! destroys a destroyed surface's pending frame callbacks without `done`, and
 //! gives the keyboard focus to each surface the proxy commits, as a click on
 //! its window would, holds its answer to a text input's drain barrier, as a
-//! slow host would, and keeps the text-input state Exo would ([`exo`]). In some
+//! slow host would, presses a pointer button or touches down on the focused
+//! surface while a preedit is live, and keeps the text-input state Exo would
+//! ([`exo`]). In some
 //! cases it also destroys live objects of one interface on its own
 //! ([`HOST_DESTROYED`]).
 //!
@@ -88,7 +90,7 @@ use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::wayland::{
     wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
-    wl_registry, wl_seat, wl_surface,
+    wl_pointer, wl_registry, wl_seat, wl_surface, wl_touch,
 };
 use crate::state::Context;
 use crate::test_support::{frames, Rng};
@@ -121,6 +123,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 const MAX_REQUESTS: usize = 64;
 /// The guest's `wl_registry`, bound before each case's requests.
 const REGISTRY: u32 = 2;
+/// `BTN_LEFT` of `linux/input-event-codes.h`.
+const BTN_LEFT: u32 = 0x110;
 /// The first ID of the range servers allocate from (`WL_SERVER_ID_START`).
 const SERVER_ID_START: u32 = 0xff00_0000;
 
@@ -162,11 +166,16 @@ fn guest_streams_cannot_crash_hang_or_leak() {
         let restarts = INPUT_METHOD_RESTARTS.load(Ordering::Relaxed);
         let seatless = SEATLESS_ACTIVATIONS.load(Ordering::Relaxed);
         let dead_seat_deactivates = DEACTIVATES_OF_DESTROYED_SEATS.load(Ordering::Relaxed);
+        let presses = PRESSES_DURING_PREEDITS.load(Ordering::Relaxed);
         let remote_surfaces = REMOTE_SURFACES.load(Ordering::Relaxed);
         if cases >= COVERAGE_CASES {
             assert!(
                 remote_surfaces > 0,
                 "no case created a remote surface, so the remote-shell backend's facades went untested"
+            );
+            assert!(
+                presses > 0,
+                "no press followed a preedit, so ending a composition went untested"
             );
             assert!(
                 reused > 0,
@@ -208,6 +217,7 @@ fn guest_streams_cannot_crash_hang_or_leak() {
              {leaves} text-input leaves sent, {restarts} input methods restarted, \
              {seatless} activations outlived their seat, \
              {dead_seat_deactivates} deactivates named a destroyed seat, \
+             {presses} presses sent with a preedit, \
              {remote_surfaces} facade windows got a remote surface"
         );
     });
@@ -1571,6 +1581,8 @@ fn compositor(
     // Answers held back, and whether the last request was a deactivation.
     let mut held = Vec::new();
     let mut after_deactivate = false;
+    // Whether a pointer or touch event went out.
+    let mut pressed = false;
     // The seat each active host text input was activated with.
     let mut activations: BTreeMap<u32, u32> = BTreeMap::new();
     let mut server_ids = ServerIds {
@@ -1751,8 +1763,16 @@ fn compositor(
                         &mut deleted,
                     ));
                 }
-                if rng.one_in(8) && exo.destroy_input_method() {
+                // No restart once a press went out: the proxy's reset fence
+                // is its own sync, which the compositor answers after the
+                // guest may have closed, and the proxy then exits before it
+                // reads the `leave` that answer carries.
+                if !pressed && rng.one_in(8) && exo.destroy_input_method() {
                     INPUT_METHOD_RESTARTS.fetch_add(1, Ordering::Relaxed);
+                } else if rng.one_in(2) {
+                    let events = composition_and_presses(&exo, &objects, &mut serial, &mut rng);
+                    pressed |= !events.is_empty();
+                    reply.extend(events);
                 }
                 let callback = WireMessage::new(sender, opcode, payload)
                     .read_u32()
@@ -1915,6 +1935,77 @@ fn text_input_events(events: Vec<(u32, Option<u32>)>) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+
+/// `wl_pointer` and `wl_touch` events whose compositor presses on the
+/// focused surface, as a click or tap on its window does, and the preedits
+/// they follow: each text input attached on that surface composes, then each
+/// pointer enters the surface and presses and releases, and each touch goes
+/// down and up. The press reaches the proxy while the preedit is live, and
+/// ends it ([`crate::handler::text_input::end_composition_on_press`]); the
+/// run's checks (`Context::assert_no_orphans`, the guest's event checks and
+/// the exchange with Exo) judge what follows.
+fn composition_and_presses(
+    exo: &Exo,
+    objects: &BTreeMap<u32, String>,
+    serial: &mut u32,
+    rng: &mut Rng,
+) -> Vec<Vec<u8>> {
+    let Some(surface) = exo.focus() else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut composing = false;
+    for text_input in exo.composing_text_inputs() {
+        if rng.one_in(2) {
+            composing = true;
+            *serial += 1;
+            events.push(
+                zwp_text_input_v1::evt::preedit_string(text_input, *serial, "나", "나")
+                    .expect("a short preedit fits a message")
+                    .0,
+            );
+        }
+    }
+    let with = |interface: &str| -> Vec<u32> {
+        objects
+            .iter()
+            .filter(|&(_, candidate)| candidate == interface)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+    let mut presses = 0;
+    for pointer in with("wl_pointer") {
+        *serial += 1;
+        events.push(wl_pointer::evt::enter(pointer, *serial, surface, 0, 0).0);
+        if rng.one_in(2) {
+            presses += 1;
+            for state in [
+                wl_pointer::BUTTON_STATE_PRESSED,
+                wl_pointer::BUTTON_STATE_RELEASED,
+            ] {
+                *serial += 1;
+                events.push(wl_pointer::evt::button(pointer, *serial, 0, BTN_LEFT, state).0);
+            }
+        }
+    }
+    for touch in with("wl_touch") {
+        if rng.one_in(2) {
+            presses += 1;
+            *serial += 1;
+            events.push(wl_touch::evt::down(touch, *serial, 0, surface, 0, 0, 0).0);
+            *serial += 1;
+            events.push(wl_touch::evt::up(touch, *serial, 0, 0).0);
+        }
+    }
+    if composing {
+        PRESSES_DURING_PREEDITS.fetch_add(presses, Ordering::Relaxed);
+    }
+    events
+}
+
+/// Pointer presses and touch-downs the compositor sent in a batch with a
+/// preedit, across all cases.
+static PRESSES_DURING_PREEDITS: AtomicU64 = AtomicU64::new(0);
 
 /// `wl_keyboard.enter` of `keyboard` on `surface`, with no keys pressed.
 fn keyboard_enter(keyboard: u32, serial: u32, surface: u32) -> Vec<u8> {

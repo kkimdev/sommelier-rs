@@ -51,6 +51,8 @@ impl Guest<'_> {
         let (bind_seat, seat, seat_version) = self.bind_global(seat);
         let (bind_manager, manager, manager_version) = self.bind_global(manager);
         let keyboard = self.create("wl_keyboard", seat_version);
+        let pointer = self.create("wl_pointer", seat_version);
+        let touch = self.create("wl_touch", seat_version);
         let text_input = self.create("zwp_text_input_v3", manager_version);
         let surfaces: Vec<u32> = (0..2 + self.rng.below(2))
             .map(|_| self.create("wl_surface", compositor_version))
@@ -60,6 +62,10 @@ impl Guest<'_> {
             bind_seat,
             bind_manager,
             request(seat, wl_seat::REQ_GET_KEYBOARD, &[keyboard]),
+            // For the compositor's presses ([`super::compositor`]), which
+            // end a composition.
+            request(seat, wl_seat::REQ_GET_POINTER, &[pointer]),
+            request(seat, wl_seat::REQ_GET_TOUCH, &[touch]),
             request(
                 manager,
                 zwp_text_input_manager_v3::REQ_GET_TEXT_INPUT,
