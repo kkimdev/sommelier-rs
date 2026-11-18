@@ -281,8 +281,8 @@ that it ended), so a fatal branch rolls nothing back: only output could
 escape, and the loop drops it.
 
 Effects cover only wire output and the fence wait. What a handler does
-outside the wire takes effect at once: it starts clipboard pumps, copies
-pixels into a buffer's host storage and allocates GBM buffers. A session
+outside the wire takes effect at once: it starts clipboard pumps,
+allocates a buffer's host storage and copies pixels into it. A session
 that ends aborts its pumps (`Client::run`), and its `Context` frees the
 rest.
 
@@ -335,9 +335,9 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   like the guest buffer and imported by the host as a `wl_shm` pool, or,
   with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
   a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
-  With `--local-compositor` and no VirtWL, the shared memory is a memfd
-  (or, with `--gpu-accel`, a DRM render node and the host's linux-dmabuf,
-  a GBM dma-buf).
+  With `--local-compositor` and no VirtWL, the shared memory is a memfd,
+  with or without `--gpu-accel` (see
+  [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm)).
   `ShmBacking` records the choice, so the copy path re-checks nothing.
 - On commit, the damaged region is copied from the guest pool into the host
   storage before the host `wl_surface.commit` is queued, so the host never

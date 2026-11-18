@@ -394,7 +394,8 @@ pub struct Context {
     /// Formats observed from the host's SHM or dmabuf capability events that
     /// the SHM bridge can actually copy. ARGB/XRGB are always available per
     /// the wl_shm contract; optional formats are added only after the host
-    /// advertises them.
+    /// advertises them. Only a VirtWL session offers all of them to the
+    /// guest; without VirtWL only `host_wl_shm_formats` count.
     pub host_shm_formats: HashSet<u32>,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
@@ -561,7 +562,6 @@ pub struct Context {
 }
 
 pub(crate) struct LocalBufferCopyResources<'a> {
-    pub allocator: Option<&'a Allocator>,
     pub channel: Option<&'a Arc<VirtWaylandChannel>>,
     pub buffer: &'a mut BufferState,
 }
@@ -706,14 +706,9 @@ impl Context {
         &mut self,
         host_id: HostId,
     ) -> Option<LocalBufferCopyResources<'_>> {
-        let allocator = self.allocator.as_ref();
         let channel = self.virtwayland_channel.as_ref();
         let buffer = self.render_buffers.local_copy_mut(host_id)?;
-        Some(LocalBufferCopyResources {
-            allocator,
-            channel,
-            buffer,
-        })
+        Some(LocalBufferCopyResources { channel, buffer })
     }
 
     pub(crate) fn render_buffer_lifecycles(

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::allocator::Allocator;
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_shm, wl_shm_pool};
@@ -77,22 +76,27 @@ fn shm_format_from_drm(format: u32) -> Option<u32> {
 }
 
 fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
-    // NV12 is advertised only when the selected output path can describe both
-    // planes. VirtWL uses one contiguous allocation; the GBM direct path
-    // validates plane metadata and rejects separate dma-buf objects before
-    // exposing a buffer to the host compositor.
-    (MANDATORY_SHM_FORMATS.contains(&format) || ctx.host_shm_formats.contains(&format))
-        && (format != wl_shm::FORMAT_NV12
-            || ctx.virtwayland_channel.is_some()
-            || (ctx.gpu_accel && ctx.host_dmabuf_id.is_some() && ctx.allocator.is_some()))
+    // Without VirtWL every guest SHM buffer reaches the host's wl_shm (see
+    // `select_shm_backing`), so only the formats it lists count. VirtWL also
+    // sends some buffers through the host's linux-dmabuf.
+    let host_formats = if ctx.virtwayland_channel.is_some() {
+        &ctx.host_shm_formats
+    } else {
+        &ctx.host_wl_shm_formats
+    };
+    MANDATORY_SHM_FORMATS.contains(&format) || host_formats.contains(&format)
 }
 
-/// Record a format advertised by the internal host wl_shm object and enqueue
-/// it for synthetic guest wl_shm objects that were already bound.
-pub(crate) fn record_host_shm_format(ctx: &mut Context, format: u32) {
-    if !supported_shm_format(format) || !ctx.host_shm_formats.insert(format) {
+/// Record a format the host reported through its wl_shm or linux-dmabuf and
+/// enqueue it for the synthetic guest wl_shm objects already bound, if it is
+/// available to them.
+fn record_host_shm_format(ctx: &mut Context, format: u32) {
+    if !supported_shm_format(format) {
         return;
     }
+    // A format one source already reported may become available to the
+    // guest only now; each guest binding sends a format once.
+    ctx.host_shm_formats.insert(format);
 
     let guest_ids: Vec<u32> = ctx.guest_shms.keys().copied().collect();
     for guest_id in guest_ids {
@@ -213,25 +217,6 @@ fn regular_file_has_size(file: &File, size: usize) -> bool {
         metadata.file_type().is_file()
             && u64::try_from(size).is_ok_and(|size| metadata.len() >= size)
     })
-}
-
-/// Whether two descriptors refer to the same dma-buf object, by inode.
-///
-/// Each dma-buf has its own inode only from Linux 5.3; on older kernels all
-/// dma-bufs share one anonymous inode, and this reports any two of them as
-/// the same object. A `true` is therefore not proof on every kernel.
-fn same_dma_buf_object(first_fd: RawFd, second_fd: RawFd) -> bool {
-    if first_fd < 0 || second_fd < 0 {
-        return false;
-    }
-    let mut first = unsafe { std::mem::zeroed::<libc::stat>() };
-    let mut second = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(first_fd, &mut first) } != 0
-        || unsafe { libc::fstat(second_fd, &mut second) } != 0
-    {
-        return false;
-    }
-    first.st_dev == second.st_dev && first.st_ino == second.st_ino
 }
 
 fn valid_buffer_layout(
@@ -374,7 +359,7 @@ mod dmabuf_layout {
         let stride1 = strides[1] as usize;
         let offset1 = offsets[1] as usize;
         let minimum1 = width;
-        // VirtWL and the GBM path use one contiguous dma-buf for NV12. Plane 1
+        // VirtWL uses one contiguous dma-buf for NV12. Plane 1
         // must begin after the complete Y plane; merely checking against
         // `offset0` would allow overlapping planes and make the copy layout
         // ambiguous.
@@ -407,20 +392,12 @@ enum ShmBacking {
     },
 }
 
-/// A host dma-buf allocation for a guest SHM buffer.
+/// A VirtWL dma-buf allocation for a guest SHM buffer.
 ///
-/// Both planes of an NV12 buffer are expected in the one dma-buf `fd`, which
-/// the copy path maps for both: VirtWL allocates a single object, and
-/// [`allocate_gbm_buffer`] rejects plane objects that
-/// [`same_dma_buf_object`] can tell apart.
+/// VirtWL allocates a single object, so both planes of an NV12 buffer are in
+/// the one dma-buf `fd`, which the copy path maps for both.
 struct DmabufAllocation {
-    bo: Option<gbm::BufferObject<()>>,
     fd: OwnedFd,
-    /// GBM's own descriptor for NV12 plane 1, which plane 1's `add` sends.
-    /// [`same_dma_buf_object`] cannot prove it is `fd`'s object on every
-    /// kernel, so the host gets exactly what GBM returned. `None` for VirtWL,
-    /// whose single descriptor plane 1 duplicates.
-    plane1_fd: Option<OwnedFd>,
     layout: DmabufLayout,
     modifier: u64,
     dmabuf_sync: bool,
@@ -538,110 +515,10 @@ fn allocate_virtwl_dmabuf(
         ));
     }
     Ok(DmabufAllocation {
-        bo: None,
         fd,
-        plane1_fd: None,
         layout,
         modifier: 0,
         dmabuf_sync: true,
-    })
-}
-
-fn allocate_gbm_buffer(
-    allocator: &Allocator,
-    width: i32,
-    height: i32,
-    format: u32,
-) -> io::Result<DmabufAllocation> {
-    let bo = allocator
-        .allocate(
-            u32::try_from(width)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid buffer width"))?,
-            u32::try_from(height).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid buffer height")
-            })?,
-            ShmHandler::wl_shm_format_to_drm_format(format),
-        )
-        .map_err(io::Error::other)?;
-    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
-    let stride0 = bo.stride_for_plane(0).map_err(io::Error::other)?;
-    if stride0 == 0 || stride0 > i32::MAX as u32 || !valid_shm_stride(format, width, stride0 as i32)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "GBM returned an invalid SHM stride",
-        ));
-    }
-    let fd = bo.fd().map_err(io::Error::other)?;
-    let plane_count = bo.plane_count().map_err(io::Error::other)?;
-    let offset0 = bo.offset(0).map_err(io::Error::other)?;
-    let (plane1_fd, stride1, offset1) = if drm_format == wl_shm::FORMAT_NV12 {
-        if plane_count != 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("GBM returned {plane_count} planes for NV12, expected 2"),
-            ));
-        }
-        let stride1 = bo.stride_for_plane(1).map_err(io::Error::other)?;
-        let offset1 = bo.offset(1).map_err(io::Error::other)?;
-        if stride1 < u32::try_from(width).unwrap_or(u32::MAX)
-            || !stride1.is_multiple_of(2)
-            || offset1 < offset0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "GBM returned invalid NV12 plane-1 metadata",
-            ));
-        }
-        // The copy path maps `fd` for both planes, so they must be the same
-        // dma-buf object.
-        let plane1_fd = bo.fd_for_plane(1).map_err(io::Error::other)?;
-        if !same_dma_buf_object(fd.as_raw_fd(), plane1_fd.as_raw_fd()) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "GBM NV12 planes use separate dma-buf objects",
-            ));
-        }
-        (Some(plane1_fd), stride1, offset1)
-    } else {
-        if plane_count != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("GBM returned {plane_count} planes for single-plane format"),
-            ));
-        }
-        (None, 0, 0)
-    };
-    // The modifier is part of the host import contract. Treat an allocator
-    // query failure as an allocation failure instead of silently labelling an
-    // unknown/tiled BO as LINEAR (modifier 0).
-    let modifier = bo.modifier().map(u64::from).map_err(io::Error::other)?;
-    if drm_format == wl_shm::FORMAT_NV12 && modifier != 0 {
-        // The NV12 copy path maps the PRIME descriptor directly because GBM's
-        // single-plane map API does not promise that the UV plane is present.
-        // A tiled/compressed modifier would make those linear byte offsets
-        // incorrect even if mmap itself succeeds. Fall back to ordinary SHM
-        // allocation instead of presenting corrupted frames.
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("GBM returned non-linear NV12 modifier {modifier:#x}"),
-        ));
-    }
-    let layout = validate_dmabuf_layout(
-        drm_format,
-        width,
-        height,
-        [stride0, stride1, 0],
-        [offset0, offset1, 0],
-    )
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid GBM buffer layout"))?;
-    Ok(DmabufAllocation {
-        bo: Some(bo),
-        fd,
-        plane1_fd,
-        layout,
-        modifier,
-        dmabuf_sync: false,
     })
 }
 
@@ -685,7 +562,7 @@ impl ShmCopyLayout {
             offset: usize::try_from(buffer.offset).ok()?,
             width: usize::try_from(buffer.width).ok()?,
             src_stride: buffer.stride as usize,
-            dst_stride: buffer.bo_stride as usize,
+            dst_stride: buffer.dest_stride as usize,
             dst_plane1_offset: buffer.dmabuf_plane1_offset,
             dst_plane1_stride: buffer.dmabuf_plane1_stride,
             height: usize::try_from(buffer.height).ok()?,
@@ -1368,7 +1245,6 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Result<S
         size: buffer_size,
         ..
     } = *request;
-    debug!("Allocator present={}", ctx.allocator.is_some());
     debug!(
         "VirtWayland channel present={}",
         ctx.virtwayland_channel.is_some()
@@ -1428,37 +1304,10 @@ fn select_shm_backing(ctx: &mut Context, request: &ShmBufferRequest) -> Result<S
             width, height, format, buffer_size
         );
         ShmBacking::Shared(fd)
-    } else if let (Some(allocator), Some(host_dmabuf_id)) = (&ctx.allocator, host_dmabuf_id) {
-        // GBM output is valid only for the direct linux-dmabuf path: a PRIME
-        // fd sent as a wl_shm pool would make the host compositor mmap an
-        // object with the wrong protocol contract.
-        match allocate_gbm_buffer(allocator, width, height, format) {
-            Ok(allocation) => {
-                debug!(
-                    "Using GBM linux-dmabuf allocation: {}x{} format={:#010x} stride={} modifier={:#x}",
-                    width,
-                    height,
-                    format,
-                    allocation.layout.plane0().stride,
-                    allocation.modifier
-                );
-                ShmBacking::Dmabuf {
-                    host_dmabuf_id,
-                    allocation,
-                }
-            }
-            Err(error) => {
-                error!("Failed to allocate GBM dma-buf: {}", error);
-                return Err(reject_buffer_creation(
-                    ctx,
-                    pool_id,
-                    "unable to allocate wl_shm buffer backing",
-                ));
-            }
-        }
     } else {
         // Without VirtWL the host is a local compositor (`--local-compositor`),
-        // which maps ordinary shared memory as a wl_shm pool.
+        // which maps ordinary shared memory as a wl_shm pool, with or
+        // without `--gpu-accel`.
         match local_shared_memory(buffer_size.unsigned_abs()) {
             Ok(fd) => {
                 debug!(
@@ -1603,9 +1452,8 @@ fn create_shared_buffer(
         height,
         stride: stride as u32,
         format,
-        bo: None,
         dmabuf_fd: Some(shared_fd),
-        bo_stride: stride as u32,
+        dest_stride: stride as u32,
         dmabuf_plane1_offset: plane1_offset,
         dmabuf_plane1_stride: plane1_stride,
         dmabuf_sync: false,
@@ -1641,9 +1489,7 @@ fn create_dmabuf_buffer(
         ..
     } = request;
     let DmabufAllocation {
-        bo,
         fd: dmabuf_fd_owned,
-        plane1_fd,
         layout,
         modifier,
         dmabuf_sync,
@@ -1663,7 +1509,7 @@ fn create_dmabuf_buffer(
         }
     };
     let plane1_add = if let Some(plane1) = layout.plane1() {
-        match plane1_fd.as_ref().unwrap_or(&dmabuf_fd_owned).try_clone() {
+        match dmabuf_fd_owned.try_clone() {
             Ok(fd) => Some((plane1, fd)),
             Err(error) => {
                 error!("Failed to duplicate NV12 dma-buf fd: {}", error);
@@ -1678,29 +1524,13 @@ fn create_dmabuf_buffer(
         None
     };
 
-    let (dest_ptr, dest_size) = if bo.is_none() {
-        let Some((ptr, size)) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
-            error!(
-                "dma-buf cannot be safely mmaped (offset={}, size={})",
-                layout.plane0().offset,
-                layout.span()
-            );
-            return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
-        };
-        (ptr, size)
-    } else if format == wl_shm::FORMAT_NV12 {
-        // GBM's map API does not guarantee that a multi-plane BO's UV
-        // plane is included in the mapped slice. A direct dma-buf
-        // mapping is therefore mandatory for NV12: falling back to
-        // `gbm.map_mut` would expose only the Y plane and make every
-        // commit defer forever without ever updating UV.
-        let Some(mapped) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
-            error!("GBM NV12 dma-buf cannot be safely mmaped");
-            return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
-        };
-        mapped
-    } else {
-        (std::ptr::null_mut(), 0)
+    let Some((dest_ptr, dest_size)) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
+        error!(
+            "dma-buf cannot be safely mmaped (offset={}, size={})",
+            layout.plane0().offset,
+            layout.span()
+        );
+        return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm dma-buf backing");
     };
 
     // A new object takes its parent's version.
@@ -1764,9 +1594,8 @@ fn create_dmabuf_buffer(
         height,
         stride: stride as u32,
         format,
-        bo,
         dmabuf_fd: Some(dmabuf_fd_owned),
-        bo_stride: layout.plane0().stride,
+        dest_stride: layout.plane0().stride,
         dmabuf_plane1_offset: layout.plane1_relative_offset(),
         dmabuf_plane1_stride: layout.plane1_stride(),
         dmabuf_sync,
@@ -2026,18 +1855,18 @@ mod tests {
     use super::{
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, coalesce_damage_rects,
         copy_shm_damage, guest_shm_format_available, record_host_shm_drm_format,
-        record_host_shm_format, record_host_shm_wl_format, register_guest_shm,
-        regular_file_has_size, retire_eligible_buffers, same_dma_buf_object, valid_buffer_layout,
-        valid_pool_resize, valid_pool_size, valid_shm_stride, validate_dmabuf_layout, ShmCopyError,
-        ShmCopyLayout,
+        record_host_shm_wl_format, register_guest_shm, regular_file_has_size,
+        retire_eligible_buffers, valid_buffer_layout, valid_pool_resize, valid_pool_size,
+        valid_shm_stride, validate_dmabuf_layout, ShmCopyError, ShmCopyLayout,
     };
     use crate::handler::registry::RegistryHandler;
+    use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
     use crate::protocols::wayland::wl_shm_pool::WlShmPoolHandler;
     use crate::protocols::wayland::{wl_buffer, wl_display, wl_registry, wl_shm, wl_shm_pool};
-    use crate::protocols::AnyRequest;
+    use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::Session;
     use crate::state::{BufferRect, DamageRegion};
     use crate::state::{Context, HostId, RenderBufferLifecycle, ShmPool};
@@ -2247,8 +2076,8 @@ mod tests {
 
     #[test]
     fn validates_shm_format_stride() {
-        // A stride, which GBM may choose too, must cover the guest format's
-        // row, or the copy would truncate every row.
+        // A stride must cover the guest format's row, or the copy would
+        // truncate every row.
         assert!(valid_shm_stride(0, 10, 40));
         assert!(!valid_shm_stride(0, 10, 39));
         assert!(valid_shm_stride(0x3631_4752, 10, 20));
@@ -2518,24 +2347,13 @@ mod tests {
     }
 
     #[test]
-    fn nv12_is_not_advertised_without_a_real_output_allocator() {
-        let mut ctx = Context::new_for_test(true, false, vec![]);
-        ctx.host_dmabuf_id = Some(7);
-        ctx.host_shm_formats.insert(wl_shm::FORMAT_NV12);
-        assert!(
-            !guest_shm_format_available(&ctx, wl_shm::FORMAT_NV12),
-            "advertising NV12 without VirtWL or GBM would make create_buffer fail"
-        );
-    }
-
-    #[test]
     fn host_optional_shm_format_is_sent_once_to_existing_guest_bindings() {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         register_guest_shm(&mut ctx, 20, 10);
         ctx.host_to_client_queue.clear();
 
-        record_host_shm_format(&mut ctx, 0x3631_4752);
-        record_host_shm_format(&mut ctx, 0x3631_4752);
+        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
+        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
 
         assert_eq!(
             decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
@@ -2554,7 +2372,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         let guest_shm = 20;
         let optional_format = 0x3631_4752;
-        ctx.host_shm_formats.insert(optional_format);
+        record_host_shm_wl_format(&mut ctx, optional_format);
         ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
         ctx.host_to_client_queue.clear();
@@ -2588,7 +2406,7 @@ mod tests {
         ctx.shadow_table.create_local(guest_shm, "wl_shm", 2);
         register_guest_shm(&mut ctx, guest_shm, 10);
         ctx.host_to_client_queue.clear();
-        record_host_shm_format(&mut ctx, optional_format);
+        record_host_shm_wl_format(&mut ctx, optional_format);
         assert!(
             ctx.host_to_client_queue.is_empty(),
             "a capability already sent by the replacement object must not be duplicated"
@@ -2657,17 +2475,6 @@ mod tests {
         // `pread` cannot read a pool from a pipe or a device.
         let (pipe_read, _pipe_write) = nix::unistd::pipe().expect("pipe");
         assert!(!regular_file_has_size(&File::from(pipe_read), 0));
-    }
-
-    #[test]
-    fn identifies_dup_fds_for_one_dma_buf_object() {
-        let fd = shm_pool_file(&[]);
-        let duplicate = fd.try_clone().expect("duplicate fd");
-        assert!(same_dma_buf_object(fd.as_raw_fd(), duplicate.as_raw_fd()));
-
-        let (pipe_read, pipe_write) = nix::unistd::pipe().expect("pipe");
-        assert!(!same_dma_buf_object(fd.as_raw_fd(), pipe_read.as_raw_fd()));
-        drop(pipe_write);
     }
 
     /// Without VirtWL the host is a local compositor (`--local-compositor`),
@@ -2743,6 +2550,88 @@ mod tests {
             ]
         );
         assert_eq!(s.guest_received(), []);
+    }
+
+    /// The host object the proxy binds for itself when the host advertises
+    /// `interface`, learned from the bind among what the host received.
+    fn internal_bind(received: &[(u32, AnyRequest)], interface: &str) -> u32 {
+        received
+            .iter()
+            .find_map(|(_, request)| match request {
+                AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. })
+                    if id.0 == interface =>
+                {
+                    Some(id.2)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the proxy did not bind {interface}: {received:?}"))
+    }
+
+    /// Without VirtWL every guest SHM buffer reaches the host's wl_shm, so
+    /// the guest's wl_shm offers an optional format only once the host's
+    /// wl_shm lists it, even if the host's linux-dmabuf takes it.
+    #[tokio::test]
+    async fn without_virtwl_guest_shm_offers_only_the_host_wl_shm_formats() {
+        let mut s = Session::with_context(Context::new_for_test(true, false, vec![]));
+        let registry = s.registry().await;
+        let shm_name = s.advertise("wl_shm", wl_shm::VERSION).await;
+        let host_shm = internal_bind(&s.host_received(), "wl_shm");
+        let advertised = s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            &advertised[..]
+        else {
+            panic!("the guest was not advertised wl_shm: {advertised:?}");
+        };
+        let shm = s.new_id();
+        s.guest([wl_registry::req::bind(registry.id, shm_name, "wl_shm", *version, shm).unwrap()])
+            .await;
+        assert_eq!(s.host_received(), [], "the proxy implements wl_shm");
+        assert_eq!(
+            s.guest_received(),
+            [
+                (shm, wl_shm::Event::Format { format: 0 }.into()),
+                (shm, wl_shm::Event::Format { format: 1 }.into()),
+            ]
+        );
+        // With `--gpu-accel` the proxy binds the host linux-dmabuf too; the
+        // guest gets that global as well, which is not this test's concern.
+        s.advertise("zwp_linux_dmabuf_v1", 3).await;
+        let host_dmabuf = internal_bind(&s.host_received(), "zwp_linux_dmabuf_v1");
+        s.guest_received();
+
+        s.host([
+            zwp_linux_dmabuf_v1::evt::format(host_dmabuf, wl_shm::FORMAT_RGB565),
+            zwp_linux_dmabuf_v1::evt::format(host_dmabuf, wl_shm::FORMAT_NV12),
+        ])
+        .await;
+        assert_eq!(s.guest_received(), [], "dma-buf formats are not wl_shm's");
+
+        s.host([
+            wl_shm::evt::format(host_shm, wl_shm::FORMAT_RGB565),
+            wl_shm::evt::format(host_shm, wl_shm::FORMAT_NV12),
+        ])
+        .await;
+        assert_eq!(
+            s.guest_received(),
+            [
+                (
+                    shm,
+                    wl_shm::Event::Format {
+                        format: wl_shm::FORMAT_RGB565
+                    }
+                    .into()
+                ),
+                (
+                    shm,
+                    wl_shm::Event::Format {
+                        format: wl_shm::FORMAT_NV12
+                    }
+                    .into()
+                ),
+            ]
+        );
+        assert_eq!(s.host_received(), []);
     }
 
     /// Host storage that cannot be set up (here: the host has no wl_shm to
@@ -3039,7 +2928,7 @@ mod tests {
         register_guest_shm(&mut ctx, new_guest_shm, 10);
         ctx.host_to_client_queue.clear();
 
-        record_host_shm_format(&mut ctx, 0x3631_4752);
+        record_host_shm_wl_format(&mut ctx, 0x3631_4752);
 
         assert_eq!(
             decoded(&ctx.host_to_client_queue, wl_shm::Event::from_wire),
