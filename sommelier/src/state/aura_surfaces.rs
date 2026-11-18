@@ -22,12 +22,12 @@ limitations under the License.
 //! [`AuraSurfaces`] only records the association;
 //! `crate::handler::aura_objects` creates and releases the host objects.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// One connection's host `wl_surface` → host `zaura_surface` associations.
 #[derive(Debug, Default)]
 pub(crate) struct AuraSurfaces {
-    by_wl_surface: HashMap<u32, u32>,
+    by_wl_surface: BTreeMap<u32, u32>,
 }
 
 impl AuraSurfaces {

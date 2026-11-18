@@ -25,7 +25,7 @@ mod render;
 mod window_placement;
 mod xdg_roles;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ use crate::placement_config::PlacementConfig;
 /// for a [`HostId`]. Handlers and the table's query methods pass raw `u32`
 /// IDs, so at those call sites the direction is a naming convention
 /// (`guest_*`, `host_*`), not a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestId(pub(crate) u32);
 
 /// A Wayland object ID on the **host** connection.
@@ -87,7 +87,7 @@ pub struct GuestId(pub(crate) u32);
 /// buffers) uses it, so a guest ID cannot be passed there. Event handlers
 /// receive the raw sender as `ctx.last_sender_id`; [`HostId::from_event_sender`]
 /// wraps it, and [`ShadowTable::get_guest_id`] translates a host ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub(crate) u32);
 
 /// Compare Wayland serials across wrapping `u32` space.
@@ -282,7 +282,7 @@ pub struct GtkShellState {
     /// shell binding. ChromeOS validates the token before granting focus.
     pub startup_id: Option<String>,
     /// Synthetic gtk_surface1 objects created from this shell binding.
-    pub surfaces: HashSet<u32>,
+    pub surfaces: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,7 +329,7 @@ pub struct GuestShm {
     pub global_name: u32,
     /// The formats already sent to it, so a host capability event that
     /// arrives after the bind is not sent twice.
-    pub formats: HashSet<u32>,
+    pub formats: BTreeSet<u32>,
 }
 
 /// The modifier and group state a host `wl_keyboard.modifiers` event
@@ -344,13 +344,16 @@ pub(crate) struct KeyboardModifiers {
 
 pub struct Context {
     pub shadow_table: ShadowTable,
-    pub pools: HashMap<u32, ShmPool>,
+    pub pools: BTreeMap<u32, ShmPool>,
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
-    pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
-    pub surfaces: HashMap<u32, SurfaceState>,
-    pub text_inputs: HashMap<u32, TextInputState>,
-    pub keyboard_to_seat: HashMap<u32, u32>,
+    pub pending_native_creates: BTreeMap<HostId, PendingNativeCreate>,
+    pub surfaces: BTreeMap<u32, SurfaceState>,
+    /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
+    /// reaches them in that order (INVARIANTS "Nothing the proxy sends
+    /// depends on hash order").
+    pub text_inputs: BTreeMap<u32, TextInputState>,
+    pub keyboard_to_seat: BTreeMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
     pub pointer_focus: PointerFocus,
     pub last_sender_id: u32,
@@ -397,26 +400,27 @@ pub struct Context {
     /// the wl_shm contract; optional formats are added only after the host
     /// advertises them. Only a VirtWL session offers all of them to the
     /// guest; without VirtWL only `host_wl_shm_formats` count.
-    pub host_shm_formats: HashSet<u32>,
+    pub host_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
-    pub host_wl_shm_formats: HashSet<u32>,
+    pub host_wl_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host linux-dmabuf binding.
     /// These are removed when that binding's global is withdrawn.
-    pub host_dmabuf_shm_formats: HashSet<u32>,
-    /// Every synthetic guest wl_shm object.
-    pub guest_shms: HashMap<u32, GuestShm>,
+    pub host_dmabuf_shm_formats: BTreeSet<u32>,
+    /// Every synthetic guest wl_shm object, ordered by ID: a host format
+    /// reaches them in that order.
+    pub guest_shms: BTreeMap<u32, GuestShm>,
     /// Synthetic guest wl_shm objects whose own global, the name each was
     /// bound from, has retired. Wayland keeps an already-bound global
     /// object valid for teardown, but requests sent to it after its
     /// global's removal are ignored, even while the proxy has bound a
     /// replacement; objects bound from a live name are unaffected.
-    pub stale_shm_guest_objects: HashSet<u32>,
+    pub stale_shm_guest_objects: BTreeSet<u32>,
     /// Synthetic wl_shm_pool children of a stale guest wl_shm, created before
     /// its global retired or after it. They remain destroyable, but must not
     /// resize or create buffers through a replacement host binding.
-    pub stale_shm_pools: HashSet<u32>,
+    pub stale_shm_pools: BTreeSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
     /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
@@ -427,101 +431,103 @@ pub struct Context {
     /// by mistake is a **compile error**, preventing the direction bug where a
     /// client→host request handler reads `ctx.last_sender_id` (a guest ID) and
     /// uses it to look up a host-keyed map.
-    pub keyboard_to_extended_keyboard: HashMap<HostId, HostId>,
+    pub keyboard_to_extended_keyboard: BTreeMap<HostId, HostId>,
     /// Reverse lookup for keyboard-extension v2 events. `peek_key` is sent by
     /// the extended-keyboard object, while the physical-key state belongs to
     /// the corresponding host `wl_keyboard`.
-    pub extended_keyboard_to_keyboard: HashMap<HostId, HostId>,
+    pub extended_keyboard_to_keyboard: BTreeMap<HostId, HostId>,
     /// Physical, peek, repeat-recovery, and guest-delivery state for every
     /// keyboard/key generation.
     pub key_generations: KeyGenerationRegistry,
     /// Evdev keycodes that the active XKB keymap marks as repeatable.
-    pub keyboard_repeatable_keys: HashMap<HostId, HashSet<u32>>,
+    pub keyboard_repeatable_keys: BTreeMap<HostId, BTreeSet<u32>>,
     /// Parsed keymap for each host keyboard. Keymap updates and failures are
     /// scoped to their sender so one seat cannot invalidate another seat.
-    pub(crate) keyboard_keymaps: HashMap<HostId, xkb::Keymap>,
+    pub(crate) keyboard_keymaps: BTreeMap<HostId, xkb::Keymap>,
     /// XKB state for each host keyboard. A client can bind keyboards from
     /// multiple seats, whose modifier and layout-group state must not leak.
     /// It makes `Context` `!Send` and `!Sync`: `xkb::State` uses non-atomic
     /// interior mutation, so a connection stays on its one thread.
-    pub(crate) keyboard_xkb_states: HashMap<HostId, xkb::State>,
+    pub(crate) keyboard_xkb_states: BTreeMap<HostId, xkb::State>,
     /// The modifiers each host keyboard last sent, kept until the keyboard
     /// ends. Exo sends them only when they change, before `enter` rather
     /// than after it, and not again with a new keymap, so focus changes and
     /// keymaps must not reset them.
-    pub(crate) keyboard_modifiers: HashMap<HostId, KeyboardModifiers>,
+    pub(crate) keyboard_modifiers: BTreeMap<HostId, KeyboardModifiers>,
     /// Effective keysym → evdev keycode mappings from each host keyboard's
     /// negotiated XKB keymap. Text-input-v1 `keysym` events do not carry a
     /// physical keycode, so the IME bridge uses this per-keyboard map when it
     /// synthesizes a wl_keyboard event.
-    pub keyboard_keysym_to_keycode: HashMap<HostId, HashMap<u32, u32>>,
+    pub keyboard_keysym_to_keycode: BTreeMap<HostId, BTreeMap<u32, u32>>,
     /// The process-wide placement configuration: host accelerators, the
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
     placement: Arc<PlacementConfig>,
-    pub supported_formats: HashSet<u32>,
+    pub supported_formats: BTreeSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
-    pub host_globals: HashMap<u32, HostGlobal>,
+    pub host_globals: BTreeMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
     /// the host's interface and version, while a registry lists it; see
     /// `handler::registry::Singleton`.
-    pub(crate) singleton_candidates: HashMap<u32, HostGlobal>,
+    pub(crate) singleton_candidates: BTreeMap<u32, HostGlobal>,
     /// Host globals consumed internally by the proxy and therefore never
     /// advertised to the guest. Keeping their names lets global_remove clean
     /// the corresponding host-only object without leaking a removal event.
-    pub hidden_host_globals: HashMap<u32, String>,
+    pub hidden_host_globals: BTreeMap<u32, String>,
     /// Global names already emitted by each host registry object. A single
     /// Wayland client may create more than one wl_registry; the compositor
     /// sends the complete global list to each one, so this must not be a
-    /// connection-wide set keyed only by global name.
-    pub registry_global_names: HashMap<u32, HashSet<u32>>,
+    /// connection-wide set keyed only by global name. Ordered, because a
+    /// registry's end retires the globals it alone listed in that order.
+    pub registry_global_names: BTreeMap<u32, BTreeSet<u32>>,
     /// Names removed from each registry. A subsequent global event for a
     /// removed name represents a new advertisement generation; a bind of a
     /// removed name crossed its removal on the wire. Each name keeps the
     /// version the guest saw if it can be bound inert (see
     /// `INERT_BIND_INTERFACE`), and `None` otherwise.
-    pub registry_global_removed: HashMap<u32, HashMap<u32, Option<u32>>>,
-    pub registry_global_generations: HashMap<u32, HashMap<u32, u64>>,
+    pub registry_global_removed: BTreeMap<u32, BTreeMap<u32, Option<u32>>>,
+    pub registry_global_generations: BTreeMap<u32, BTreeMap<u32, u64>>,
     /// Whether each registry's current advertisement for a name was visible
     /// to the guest. This is kept per registry/generation so a delayed
     /// global_remove for an old hidden/visible generation cannot be classified
     /// using replacement metadata.
-    pub registry_global_visibility: HashMap<u32, HashMap<u32, bool>>,
-    pub global_generations: HashMap<u32, u64>,
+    pub registry_global_visibility: BTreeMap<u32, BTreeMap<u32, bool>>,
+    pub global_generations: BTreeMap<u32, u64>,
     pub next_global_generation: u64,
     /// The generation of each global whose current advertisement the host
     /// removed, from the first registry's `global_remove` until the global
     /// is retired or advertised anew. It outlives the registries that saw
     /// the removal, which a guest may destroy before the last registry that
     /// lists the global sees it.
-    pub removed_global_generations: HashMap<u32, u64>,
+    pub removed_global_generations: BTreeMap<u32, u64>,
     /// Globals that have been removed from the host registry. Keep their
     /// metadata until every registry has observed the removal so a second
     /// registry can still receive its own global_remove event, while blocking
     /// new binds in the meantime.
-    pub removed_host_globals: HashSet<u32>,
-    pub pending_params: HashMap<u32, Vec<PendingParam>>,
+    pub removed_host_globals: BTreeSet<u32>,
+    pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
     /// The protocol object remains alive after consumption so subsequent
     /// add/create requests can report `already_used` instead of being
     /// confused with an object that was never tracked.
-    pub used_dmabuf_params: HashSet<u32>,
+    pub used_dmabuf_params: BTreeSet<u32>,
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
     /// generation keeps an object created from an old, still-bound factory
-    /// isolated from a replacement global's capabilities.
-    pub synthetic_feedback_objects: HashMap<u32, u64>,
+    /// isolated from a replacement global's capabilities. Ordered, because
+    /// completed capabilities reach the objects in that order.
+    pub synthetic_feedback_objects: BTreeMap<u32, u64>,
     /// Avoid queuing one complete feedback sequence for every legacy
     /// format/modifier event. A host can advertise hundreds of pairs in a
     /// single roundtrip; sending one memfd per event can overflow the
     /// receiver's SCM_RIGHTS batch and desynchronize the Wayland FD stream.
     /// The proxy clears this set after each dispatch batch.
-    pub synthetic_feedback_refresh_pending: HashSet<u32>,
+    pub synthetic_feedback_refresh_pending: BTreeSet<u32>,
     /// Capability snapshots for every host dmabuf global generation referenced
     /// by a live guest object. A completed snapshot is immutable except for a
     /// defensive refresh if a non-conforming host sends a late unique pair.
-    pub dmabuf_capabilities: HashMap<u64, DmabufCapabilityState>,
+    pub dmabuf_capabilities: BTreeMap<u64, DmabufCapabilityState>,
     /// Generation collected by the current internal host dmabuf binding.
     pub host_dmabuf_generation: Option<u64>,
     /// Host-only wl_callback barriers the proxy issued for itself, and what
@@ -532,7 +538,7 @@ pub struct Context {
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
     /// Guest dmabuf factory ID to the host-global generation from which it was
     /// bound. Global removal does not invalidate an already-bound factory.
-    pub dmabuf_guest_generations: HashMap<u32, u64>,
+    pub dmabuf_guest_generations: BTreeMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
     /// The internal host zaura_shell binding (not exposed to the guest), if
@@ -548,16 +554,16 @@ pub struct Context {
     /// it owns).
     pub(crate) outputs: OutputRegistry,
     /// Synthetic GTK shell bindings and their activation token state.
-    pub gtk_shells: HashMap<u32, GtkShellState>,
+    pub gtk_shells: BTreeMap<u32, GtkShellState>,
     /// Synthetic GTK surfaces associated with guest wl_surface objects.
-    pub gtk_surfaces: HashMap<u32, GtkSurfaceState>,
+    pub gtk_surfaces: BTreeMap<u32, GtkSurfaceState>,
     /// The host Aura surface of each host wl_surface (see [`AuraSurfaces`]).
     pub(crate) aura_surfaces: AuraSurfaces,
     /// The guest's xdg_surface and xdg_toplevel links to their wl_surface.
     pub(crate) xdg_roles: XdgRoles,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
-    pub viewport_to_wl_surface: HashMap<u32, u32>,
+    pub viewport_to_wl_surface: BTreeMap<u32, u32>,
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
 }
@@ -1006,12 +1012,12 @@ impl Context {
         let window_placement = WindowPlacementState::new(placement.backend());
         Self {
             shadow_table: ShadowTable::new(),
-            pools: HashMap::new(),
+            pools: BTreeMap::new(),
             render_buffers: RenderBufferRegistry::default(),
-            pending_native_creates: HashMap::new(),
-            surfaces: HashMap::new(),
-            text_inputs: HashMap::new(),
-            keyboard_to_seat: HashMap::new(),
+            pending_native_creates: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
+            text_inputs: BTreeMap::new(),
+            keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
             pointer_focus: PointerFocus::default(),
             last_sender_id: 0,
@@ -1033,56 +1039,56 @@ impl Context {
             host_text_input_manager_v1_global_name: None,
             host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_shm_formats: HashSet::new(),
-            host_wl_shm_formats: HashSet::new(),
-            host_dmabuf_shm_formats: HashSet::new(),
-            guest_shms: HashMap::new(),
-            stale_shm_guest_objects: HashSet::new(),
-            stale_shm_pools: HashSet::new(),
+            host_shm_formats: BTreeSet::new(),
+            host_wl_shm_formats: BTreeSet::new(),
+            host_dmabuf_shm_formats: BTreeSet::new(),
+            guest_shms: BTreeMap::new(),
+            stale_shm_guest_objects: BTreeSet::new(),
+            stale_shm_pools: BTreeSet::new(),
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
-            keyboard_to_extended_keyboard: HashMap::new(),
-            extended_keyboard_to_keyboard: HashMap::new(),
+            keyboard_to_extended_keyboard: BTreeMap::new(),
+            extended_keyboard_to_keyboard: BTreeMap::new(),
             key_generations: KeyGenerationRegistry::default(),
-            keyboard_repeatable_keys: HashMap::new(),
-            keyboard_keymaps: HashMap::new(),
-            keyboard_xkb_states: HashMap::new(),
-            keyboard_modifiers: HashMap::new(),
-            keyboard_keysym_to_keycode: HashMap::new(),
+            keyboard_repeatable_keys: BTreeMap::new(),
+            keyboard_keymaps: BTreeMap::new(),
+            keyboard_xkb_states: BTreeMap::new(),
+            keyboard_modifiers: BTreeMap::new(),
+            keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
-            supported_formats: HashSet::new(),
-            host_globals: HashMap::new(),
-            singleton_candidates: HashMap::new(),
-            hidden_host_globals: HashMap::new(),
-            registry_global_names: HashMap::new(),
-            registry_global_removed: HashMap::new(),
-            registry_global_generations: HashMap::new(),
-            registry_global_visibility: HashMap::new(),
-            global_generations: HashMap::new(),
+            supported_formats: BTreeSet::new(),
+            host_globals: BTreeMap::new(),
+            singleton_candidates: BTreeMap::new(),
+            hidden_host_globals: BTreeMap::new(),
+            registry_global_names: BTreeMap::new(),
+            registry_global_removed: BTreeMap::new(),
+            registry_global_generations: BTreeMap::new(),
+            registry_global_visibility: BTreeMap::new(),
+            global_generations: BTreeMap::new(),
             next_global_generation: 1,
-            removed_global_generations: HashMap::new(),
-            removed_host_globals: HashSet::new(),
-            pending_params: HashMap::new(),
-            used_dmabuf_params: HashSet::new(),
-            synthetic_feedback_objects: HashMap::new(),
-            synthetic_feedback_refresh_pending: HashSet::new(),
-            dmabuf_capabilities: HashMap::new(),
+            removed_global_generations: BTreeMap::new(),
+            removed_host_globals: BTreeSet::new(),
+            pending_params: BTreeMap::new(),
+            used_dmabuf_params: BTreeSet::new(),
+            synthetic_feedback_objects: BTreeMap::new(),
+            synthetic_feedback_refresh_pending: BTreeSet::new(),
+            dmabuf_capabilities: BTreeMap::new(),
             host_dmabuf_generation: None,
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
-            dmabuf_guest_generations: HashMap::new(),
+            dmabuf_guest_generations: BTreeMap::new(),
             gpu_accel,
             xdg_decoration,
             host_zaura_shell: None,
             vm_identifier,
             window_placement,
             outputs: OutputRegistry::default(),
-            gtk_shells: HashMap::new(),
-            gtk_surfaces: HashMap::new(),
+            gtk_shells: BTreeMap::new(),
+            gtk_surfaces: BTreeMap::new(),
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
-            viewport_to_wl_surface: HashMap::new(),
+            viewport_to_wl_surface: BTreeMap::new(),
             clipboard_pumps: ClipboardPumps::default(),
         }
     }

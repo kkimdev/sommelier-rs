@@ -22,7 +22,7 @@ use super::ShmHandler;
 use crate::protocols;
 use crate::state::{Context, HostId};
 use crate::wire::Action;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Queue the host `wl_buffer.destroy`; the caller retires the ID mapping.
 pub(crate) fn queue_host_buffer_destroy(ctx: &mut Context, host_id: u32) {
@@ -63,14 +63,14 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: Ho
 /// two sets together prevents SHM and native collectors from drifting into
 /// subtly different definitions of "referenced".
 struct SurfaceBufferReferences {
-    current: HashSet<u32>,
-    pending: HashSet<u32>,
+    current: BTreeSet<u32>,
+    pending: BTreeSet<u32>,
 }
 
 impl SurfaceBufferReferences {
     fn collect(ctx: &Context) -> Self {
-        let mut current = HashSet::new();
-        let mut pending = HashSet::new();
+        let mut current = BTreeSet::new();
+        let mut pending = BTreeSet::new();
         for surface in ctx.surfaces.values() {
             current.extend(surface.current_buffer_id());
             pending.extend(surface.pending.attachment.buffer_id());

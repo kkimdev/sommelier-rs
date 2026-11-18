@@ -32,7 +32,7 @@ limitations under the License.
 //! only answers ownership questions and returns the IDs whose host teardown
 //! the caller must perform.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
 use crate::arc_task_ids::ArcIdAllocator;
 
@@ -95,20 +95,20 @@ pub(crate) struct ArcPlacementState {
     arc_id_allocator: &'static ArcIdAllocator,
     /// Guest wl_surface ID → ARC policy identity, stable for the surface's
     /// lifetime.
-    arc_application_ids: HashMap<u32, String>,
+    arc_application_ids: BTreeMap<u32, String>,
     /// Guest surfaces whose ARC policy identity has already been sent to the
     /// paired host Aura surface. Keeping this separate from the allocated
     /// identity avoids repeating the metadata request on every placement.
-    arc_application_ids_applied: HashSet<u32>,
+    arc_application_ids_applied: BTreeSet<u32>,
     /// Guest xdg_toplevel ID → host zaura_toplevel ID.
-    aura_toplevel_by_xdg_toplevel: HashMap<u32, u32>,
+    aura_toplevel_by_xdg_toplevel: BTreeMap<u32, u32>,
     /// Reverse of `aura_toplevel_by_xdg_toplevel`, used to route host Aura
     /// toplevel events back to the guest role.
-    xdg_toplevel_by_aura_toplevel: HashMap<u32, u32>,
+    xdg_toplevel_by_aura_toplevel: BTreeMap<u32, u32>,
     /// The newest barrier of each live Aura toplevel; only it gates
     /// configure delivery. Every barrier, including superseded ones, stays
     /// pending in `crate::state::InternalCallbacks` until its `done`.
-    active_barriers: HashMap<u32, ActiveBarrier>,
+    active_barriers: BTreeMap<u32, ActiveBarrier>,
 }
 
 impl ArcPlacementState {
@@ -121,11 +121,11 @@ impl ArcPlacementState {
     pub(crate) fn new(arc_id_allocator: &'static ArcIdAllocator) -> Self {
         Self {
             arc_id_allocator,
-            arc_application_ids: HashMap::new(),
-            arc_application_ids_applied: HashSet::new(),
-            aura_toplevel_by_xdg_toplevel: HashMap::new(),
-            xdg_toplevel_by_aura_toplevel: HashMap::new(),
-            active_barriers: HashMap::new(),
+            arc_application_ids: BTreeMap::new(),
+            arc_application_ids_applied: BTreeSet::new(),
+            aura_toplevel_by_xdg_toplevel: BTreeMap::new(),
+            xdg_toplevel_by_aura_toplevel: BTreeMap::new(),
+            active_barriers: BTreeMap::new(),
         }
     }
 
@@ -289,7 +289,7 @@ impl ArcPlacementState {
                     .iter()
                     .map(|(&aura, &xdg)| (xdg, aura)),
             );
-        let mut aura_toplevels = HashSet::new();
+        let mut aura_toplevels = BTreeSet::new();
         for (toplevel, aura_toplevel) in toplevels {
             guest("Aura toplevel", toplevel, "xdg_toplevel");
             host_only("Aura toplevel", aura_toplevel, "zaura_toplevel");

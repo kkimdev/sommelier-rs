@@ -222,6 +222,19 @@ always consumed; a configuration problem never stops the proxy) is owned by
   `earlier_reverse_output_reaches_the_guest_before_the_error`,
   `a_forward_that_ends_the_session_discards_its_deferred_work`,
   `an_invalid_message_length_is_reported_before_closing`.
+- **Nothing the proxy sends depends on hash order.** No message the
+  proxy sends, and no state that later decides one (an ID or number it
+  allocates, or which of several objects it picks), depends on the order
+  of a hash collection. When a message makes the proxy send something for
+  each of several objects, it visits them in ascending order of a key the
+  session's messages decide, such as an ID. The crate therefore uses no
+  hash collection: every map and set is a `BTreeMap` or `BTreeSet`, and
+  `sommelier/clippy.toml` makes `std::collections::HashMap` and `HashSet`
+  `clippy::disallowed_types` errors. So the same messages always make the
+  same bytes, and a session can be replayed exactly.
+  Tests: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`,
+  `a_host_format_reaches_every_guest_shm_in_id_order`,
+  `keys_held_at_an_enter_are_numbered_in_the_hosts_order`.
 
 ## Protocol errors
 

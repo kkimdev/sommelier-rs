@@ -187,7 +187,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 /// retired, and their pools inert (see `Context::stale_shm_guest_objects`),
 /// whether or not the proxy's own binding was `name`.
 pub(crate) fn retire_guest_shms(ctx: &mut Context, name: u32) {
-    let stale: std::collections::HashSet<u32> = ctx
+    let stale: std::collections::BTreeSet<u32> = ctx
         .guest_shms
         .iter()
         .filter(|(_, shm)| shm.global_name == name)

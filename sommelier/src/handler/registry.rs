@@ -1455,7 +1455,7 @@ pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
             retire_unseen_global(ctx, name);
         }
     }
-    let generations: std::collections::HashSet<_> = generations.into_values().collect();
+    let generations: std::collections::BTreeSet<_> = generations.into_values().collect();
     for generation in generations {
         crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
     }
