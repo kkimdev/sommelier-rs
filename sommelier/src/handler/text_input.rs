@@ -4396,6 +4396,85 @@ mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// Each keyboard of a seat gets one `enter` and one `leave` for each
+    /// focus it is given, whatever order the host's events take, and the
+    /// seat's focus, which its text input follows, is the focus of the
+    /// keyboard that entered last.
+    #[tokio::test]
+    async fn each_keyboard_focus_is_entered_and_left_once() {
+        // Keyboard `a` has entered the surface with serial 1.
+        let mut f = Field::disabled().await;
+        let (a, surface) = (f.keyboard, f.surface);
+        let id = f.s.new_id();
+        let host = f.s.create(wl_seat::req::get_keyboard(f.seat.id, id)).await;
+        let b = Object { id, host };
+        let replacement = f.s.surface().await;
+        let enter = |keyboard: Object, serial, surface: Object| {
+            wl_keyboard::evt::enter(keyboard.host, serial, surface.host, &[]).unwrap()
+        };
+        let leave = |keyboard: Object, serial, surface: Object| {
+            wl_keyboard::evt::leave(keyboard.host, serial, surface.host)
+        };
+        let entered = |keyboard: Object, serial, surface: Object| {
+            let enter = wl_keyboard::Event::Enter {
+                serial,
+                surface: surface.id,
+                keys: Vec::new(),
+            };
+            let modifiers = wl_keyboard::Event::Modifiers {
+                serial,
+                mods_depressed: 0,
+                mods_latched: 0,
+                mods_locked: 0,
+                group: 0,
+            };
+            [(keyboard.id, enter.into()), (keyboard.id, modifiers.into())]
+        };
+        let left = |keyboard: Object, serial, surface: Object| {
+            let leave = wl_keyboard::Event::Leave {
+                serial,
+                surface: surface.id,
+            };
+            (keyboard.id, leave.into())
+        };
+
+        // A second keyboard needs its own enter; a duplicate is dropped.
+        f.s.host([enter(b, 2, surface), enter(b, 3, surface)]).await;
+        assert_eq!(f.s.guest_received(), entered(b, 2, surface));
+        // The seat keeps its focus through `b`.
+        f.s.host([leave(a, 4, surface), leave(a, 5, surface)]).await;
+        assert_eq!(f.s.guest_received(), [left(a, 4, surface)]);
+        f.s.host([leave(b, 6, surface)]).await;
+        let mut expected = vec![left(b, 6, surface)];
+        expected.extend(f.events([V3::Leave {
+            surface: surface.id,
+        }]));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // `b` takes the seat's focus elsewhere before `a` leaves: that
+        // leave still balances `a`'s enter, once, and moves no focus.
+        f.s.host([enter(a, 7, surface)]).await;
+        let mut expected = Vec::from(entered(a, 7, surface));
+        expected.extend(f.events([V3::Enter {
+            surface: surface.id,
+        }]));
+        assert_eq!(f.s.guest_received(), expected);
+        f.s.host([enter(b, 8, replacement)]).await;
+        let mut expected = Vec::from(entered(b, 8, replacement));
+        expected.extend(f.events([
+            V3::Leave {
+                surface: surface.id,
+            },
+            V3::Enter {
+                surface: replacement.id,
+            },
+        ]));
+        assert_eq!(f.s.guest_received(), expected);
+        f.s.host([leave(a, 9, surface), leave(a, 10, surface)])
+            .await;
+        assert_eq!(f.s.guest_received(), [left(a, 9, surface)]);
+    }
+
     /// The fixture's guest text input, its host text input and extension.
     const TI: u32 = 20;
     const HOST: u32 = 10;
