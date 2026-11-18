@@ -20,7 +20,11 @@ limitations under the License.
 //! key's evdev keycode, and a client maps it back. Shift is not a key of its
 //! own here: a key that needs it, such as an uppercase letter, comes with
 //! the Shift modifier set around it.
+//!
+//! A press, from a pointer or a touch, names its point in the field by
+//! where it lands on the field's surface ([`position`] and [`target`]).
 
+use super::editor::Target;
 use super::hangul::Key;
 
 /// The first evdev keycode of each letter row, and the row's letters.
@@ -85,6 +89,29 @@ pub(super) fn key(keycode: u32, shift: bool) -> Option<Key> {
     Some(key)
 }
 
+/// Where a press at `at` lands on a field's surface: the surface-local
+/// `x`, as `wl_fixed`, with `y` 0. A field is one line, and each target
+/// has a column of its own: the start, the end, then each marker.
+pub(super) fn position(at: Target) -> i32 {
+    let column = match at {
+        Target::Start => 0,
+        Target::End => 1,
+        Target::BeforeMarker(digit) => 2 + i32::from(digit),
+    };
+    column * 256
+}
+
+/// The target of a press that landed at `x` ([`position`]); `None` for a
+/// point no target has.
+pub(super) fn target(x: i32) -> Option<Target> {
+    let at = match x.checked_div(256).filter(|_| x % 256 == 0)? {
+        0 => Target::Start,
+        1 => Target::End,
+        column => Target::BeforeMarker(u8::try_from(column - 2).ok().filter(|&d| d < 10)?),
+    };
+    Some(at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +127,16 @@ mod tests {
         assert_eq!(keycode(Key::Char('q')), (16, false));
         assert_eq!(keycode(Key::Char('M')), (50, true));
         assert_eq!(super::key(1, false), None, "KEY_ESC");
+    }
+
+    #[test]
+    fn every_target_a_press_names_maps_back() {
+        let markers = (0..10).map(Target::BeforeMarker);
+        for at in [Target::Start, Target::End].into_iter().chain(markers) {
+            assert_eq!(target(position(at)), Some(at), "{at:?}");
+        }
+        assert_eq!(target(position(Target::End) + 1), None, "between columns");
+        assert_eq!(target(12 * 256), None, "past the last marker");
+        assert_eq!(target(-256), None);
     }
 }
