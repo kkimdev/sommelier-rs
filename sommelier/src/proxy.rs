@@ -1161,30 +1161,83 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sighup_without_a_shortcuts_file_does_not_end_the_proxy() {
+    /// A reload without a shortcuts file is a logged no-op: the proxy keeps
+    /// serving, and keeps taking reloads. Tests send reloads through a
+    /// channel; `SIGHUP` is the process's, so only `main`'s test and
+    /// `a_real_sighup_reloads_the_shortcuts_file` raise it.
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_reload_keeps_the_proxy_and_its_reloads() {
         let dir = crate::test_support::TempDir::new("sighup");
         let listener = UnixListener::bind(dir.path().join("socket")).expect("bind listener");
         let config = test_client_config();
         assert!(config.placement.reload().is_none(), "no file to reload");
+        let (reload, reloads) = tokio::sync::mpsc::channel(1);
         let local = tokio::task::LocalSet::new();
-        let serving = local.spawn_local(serve(listener, config, install_reload_signal()));
+        let serving = local.spawn_local(serve(listener, config, Some(reloads)));
         local
             .run_until(async {
-                // Let serve start its reload task and wait for clients.
-                tokio::task::yield_now().await;
-                // Without a handler this would terminate the test process.
-                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // The channel holds one reload, so each send after the
+                // first waits until the reload task has taken the one
+                // before. The clock is paused, so it moves only once every
+                // task waits: the timeout fails a reload nothing takes.
+                for reload_number in 1..=3 {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), reload.send(()))
+                        .await
+                        .unwrap_or_else(|_| panic!("reload {reload_number} is never taken"))
+                        .expect("the reload task takes reloads");
+                }
             })
             .await;
-        assert!(
-            !serving.is_finished(),
-            "the proxy keeps serving after the logged no-op reload"
-        );
+        assert!(!serving.is_finished(), "the proxy keeps serving");
     }
 
-    /// A reload must not wait for the accept loop's retry pause.
+    /// A real `SIGHUP` reaches a reload task, as `serve` runs one;
+    /// `reload_does_not_wait_for_the_accept_retry_pause` covers `serve`
+    /// running it. The signal is the process's, so any other test
+    /// listening for it only reloads a configuration of its own once more.
+    #[tokio::test]
+    async fn a_real_sighup_reloads_the_shortcuts_file() {
+        use crate::window_layout::WindowLayoutAction;
+
+        let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
+        let dir = crate::test_support::TempDir::new("sighup");
+        let bind_alt_q = |action: &str| {
+            dir.write(
+                "shortcuts.toml",
+                format!("version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"{action}\"\n")
+                    .as_bytes(),
+            )
+        };
+        let shortcuts = bind_alt_q("left");
+        let placement = Arc::new(PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
+            Some(&shortcuts),
+            crate::arc_task_ids::ArcIdAllocator::block_for_test(),
+        ));
+        let reloads = reload_on_signal(
+            install_reload_signal().expect("install the SIGHUP handler"),
+            Arc::clone(&placement),
+        );
+        bind_alt_q("right");
+        // Without the handler this would terminate the test process.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        let applied = async {
+            while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                () = reloads => panic!("the SIGHUP stream ended"),
+                () = applied => {}
+            }
+        })
+        .await
+        .expect("the SIGHUP reload applies");
+    }
+
+    /// A reload must not wait for the accept loop's retry pause, and every
+    /// reload applies the file as it is then.
     #[tokio::test(start_paused = true)]
     async fn reload_does_not_wait_for_the_accept_retry_pause() {
         use crate::window_layout::WindowLayoutAction;
@@ -1192,10 +1245,14 @@ mod tests {
 
         let alt_q = crate::accelerator::parse_accelerator("<Alt>q").unwrap();
         let dir = crate::test_support::TempDir::new("reload-during-retry");
-        let shortcuts = dir.write(
-            "shortcuts.toml",
-            b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"left\"\n",
-        );
+        let bind_alt_q = |action: &str| {
+            dir.write(
+                "shortcuts.toml",
+                format!("version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"{action}\"\n")
+                    .as_bytes(),
+            )
+        };
+        let shortcuts = bind_alt_q("left");
         let placement = Arc::new(PlacementConfig::resolve_for_test(
             &[("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1")],
             Some(&shortcuts),
@@ -1219,33 +1276,39 @@ mod tests {
             UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
                 .expect("register the socket");
 
+        let (reload, reloads) = tokio::sync::mpsc::channel(1);
         let local = tokio::task::LocalSet::new();
-        local.spawn_local(serve(listener, config, install_reload_signal()));
+        local.spawn_local(serve(listener, config, Some(reloads)));
         local
             .run_until(async {
                 tokio::task::yield_now().await;
-                let started = tokio::time::Instant::now();
-                dir.write(
-                    "shortcuts.toml",
-                    b"version = 1\n[[bindings]]\nchord = \"<Alt>q\"\naction = \"right\"\n",
-                );
-                assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
-                // The clock is paused, so it moves only while every task
-                // waits; the timeout fails a reload that never applies
-                // instead of hanging.
-                let applied = async {
-                    while placement.action_for(&alt_q) != Some(WindowLayoutAction::Right) {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                };
-                tokio::time::timeout(ACCEPT_RETRY_DELAY * 10, applied)
-                    .await
-                    .expect("the reload applies");
-                assert!(
-                    started.elapsed() < ACCEPT_RETRY_DELAY,
-                    "the reload waited {:?} for the accept loop",
-                    started.elapsed()
-                );
+                for (name, action) in [
+                    ("right", WindowLayoutAction::Right),
+                    ("left", WindowLayoutAction::Left),
+                ] {
+                    let started = tokio::time::Instant::now();
+                    bind_alt_q(name);
+                    reload
+                        .send(())
+                        .await
+                        .expect("the reload task takes reloads");
+                    // The clock is paused, so it moves only while every task
+                    // waits; the timeout fails a reload that never applies
+                    // instead of hanging.
+                    let applied = async {
+                        while placement.action_for(&alt_q) != Some(action) {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    };
+                    tokio::time::timeout(ACCEPT_RETRY_DELAY * 10, applied)
+                        .await
+                        .unwrap_or_else(|_| panic!("the reload to {action:?} applies"));
+                    assert!(
+                        started.elapsed() < ACCEPT_RETRY_DELAY,
+                        "the reload waited {:?} for the accept loop",
+                        started.elapsed()
+                    );
+                }
             })
             .await;
     }
