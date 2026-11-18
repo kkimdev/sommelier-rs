@@ -621,7 +621,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   file, and the proxy copies a keymap to compile it, so a size near 4 GiB
   would otherwise abort every client.
   Tests: `on_keymap_ignores_a_keymap_over_the_size_limit`,
-  `an_oversized_keymap_clears_the_loaded_one_and_is_forwarded`.
+  `an_unusable_keymap_clears_the_loaded_one_and_is_forwarded`.
 - **IME state is scoped to its keyboard or seat.** Pressed-key sets, repeat
   flags and focus markers used to bridge ChromeOS IME events belong to the
   originating keyboard or seat, never to the process. Synthetic

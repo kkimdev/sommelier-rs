@@ -1206,9 +1206,16 @@ mod tests {
     // Evdev keycodes and modifier masks of the default keymap, which
     // `keymap_loads_from_non_rewound_memfd` pins.
     const KEY_Q: u32 = 16;
+    const KEY_W: u32 = 17;
+    const KEY_E: u32 = 18;
     const KEY_T: u32 = 20;
     const KEY_A: u32 = 30;
+    const KEY_S: u32 = 31;
+    const KEY_D: u32 = 32;
     const KEY_LEFTSHIFT: u32 = 42;
+    const KEY_Z: u32 = 44;
+    const KEY_X: u32 = 45;
+    const KEY_C: u32 = 46;
     const KEY_B: u32 = 48;
     const KEY_SPACE: u32 = 57;
     const BACKSPACE: u32 = EVDEV_KEY_BACKSPACE;
@@ -1846,6 +1853,103 @@ mod tests {
     /// The text-input `done` that closes the guest's first commit.
     fn done(ime: Ime) -> (u32, AnyEvent) {
         (ime.id, zwp_text_input_v3::Event::Done { serial: 1 }.into())
+    }
+
+    // -----------------------------------------------------------------------
+    // Chords
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chord_classification_follows_the_configuration() {
+        use WindowLayoutAction::*;
+        let arc = |spec: &str| Arc::new(PlacementConfig::arc_bounds_for_test(spec));
+        let resolve = |variables: &[(&str, &str)]| {
+            Arc::new(PlacementConfig::resolve_for_test(
+                variables,
+                None,
+                ArcIdAllocator::block_for_test(),
+            ))
+        };
+        let nine = arc(
+            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,\
+             <Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
+        );
+        let alt_q = arc("<Alt>q=top-left");
+        let control_q = arc("<Control>q=top-left");
+        // The ARC bounds policy is off, so the binding is ignored.
+        let ungated = resolve(&[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")]);
+        let both = resolve(&[
+            ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
+            ("SOMMELIER_ACCELERATORS", "<Control>a"),
+            (
+                "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
+                "<Control>q=top-left",
+            ),
+        ]);
+        let cases = [
+            (&nine, ALT, KEY_Q, KeyClass::Placement(TopLeft)),
+            (&nine, ALT, KEY_W, KeyClass::Placement(Top)),
+            (&nine, ALT, KEY_E, KeyClass::Placement(TopRight)),
+            (&nine, ALT, KEY_A, KeyClass::Placement(Left)),
+            (&nine, ALT, KEY_S, KeyClass::Placement(Fullscreen)),
+            (&nine, ALT, KEY_D, KeyClass::Placement(Right)),
+            (&nine, ALT, KEY_Z, KeyClass::Placement(BottomLeft)),
+            (&nine, ALT, KEY_X, KeyClass::Placement(Bottom)),
+            (&nine, ALT, KEY_C, KeyClass::Placement(BottomRight)),
+            // A binding needs exactly its modifiers.
+            (&alt_q, 0, KEY_Q, KeyClass::Guest),
+            (&alt_q, ALT | SHIFT, KEY_Q, KeyClass::Guest),
+            (&control_q, CONTROL, KEY_Q, KeyClass::Placement(TopLeft)),
+            (&ungated, ALT, KEY_Q, KeyClass::Guest),
+            (&both, CONTROL, KEY_A, KeyClass::HostAccelerator),
+            (&both, CONTROL, KEY_Q, KeyClass::Placement(TopLeft)),
+            (&both, CONTROL, KEY_Z, KeyClass::Guest),
+        ];
+        for (placement, modifiers, key, class) in cases {
+            let mut p = Proxy::with(Context::with_placement_for_test(Arc::clone(placement)));
+            p.keymap(KEYBOARD);
+            p.modifiers(KEYBOARD, modifiers);
+            assert_eq!(
+                p.classify(KEYBOARD, key),
+                class,
+                "key {key} with modifiers {modifiers:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_forms_no_chord_without_a_keymap_or_beyond_the_keycode_range() {
+        let mut p = Proxy::new();
+        let keyboard = HostId(KEYBOARD.host);
+        assert_eq!(
+            KeyboardHandler::current_chord(&p.ctx, keyboard, KEY_A),
+            None
+        );
+        p.keymap(KEYBOARD);
+        // XKB's keycode is the evdev keycode plus 8.
+        assert_eq!(
+            KeyboardHandler::current_chord(&p.ctx, keyboard, u32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn compositor_shortcut_is_handled_and_release_is_suppressed() {
+        let keyboard = HostId(5);
+        let key = 24;
+        let mut ctx = Context::new_for_test(false, false, vec![]);
+
+        let press = ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
+        assert_eq!(press.delivery, GuestKeyDelivery::Drop);
+        assert_eq!(press.ack_handled, Some(true));
+        assert_eq!(ctx.guest_key_owner(keyboard, key), Some(CompositorShortcut));
+
+        let release =
+            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease);
+        assert_eq!(release.delivery, GuestKeyDelivery::Drop);
+        assert_eq!(release.ack_handled, Some(true));
+        assert!(release.ends_repeat);
+        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2518,6 +2622,219 @@ mod tests {
         assert!(!p.ctx.window_placement.has_active_barrier(aura_toplevel));
         assert_eq!(p.ctx.client_to_host_queue.len(), host_queue_len);
         assert_eq!(p.ctx.text_inputs[&t.guest], state_after_activation);
+    }
+
+    // -----------------------------------------------------------------------
+    // Keymaps
+    // -----------------------------------------------------------------------
+
+    /// The proxy maps a keymap, rather than reading it, so it loads from a
+    /// memfd whose offset the host left at its end. It compiles to the
+    /// keycodes and modifier masks the tests name.
+    #[test]
+    fn keymap_loads_from_non_rewound_memfd() {
+        let mut p = Proxy::new();
+        p.keymap(KEYBOARD);
+
+        let keyboard = HostId(KEYBOARD.host);
+        assert!(p.ctx.keyboard_xkb_states.contains_key(&keyboard));
+        let keycodes = &p.ctx.keyboard_keysym_to_keycode[&keyboard];
+        for (sym, key) in [
+            (keysyms::KEY_q, KEY_Q),
+            (keysyms::KEY_w, KEY_W),
+            (keysyms::KEY_e, KEY_E),
+            (keysyms::KEY_t, KEY_T),
+            (keysyms::KEY_a, KEY_A),
+            // A shifted keysym maps to its physical key.
+            (keysyms::KEY_A, KEY_A),
+            (keysyms::KEY_s, KEY_S),
+            (keysyms::KEY_d, KEY_D),
+            (keysyms::KEY_Shift_L, KEY_LEFTSHIFT),
+            (keysyms::KEY_z, KEY_Z),
+            (keysyms::KEY_x, KEY_X),
+            (keysyms::KEY_c, KEY_C),
+            (keysyms::KEY_b, KEY_B),
+            (keysyms::KEY_space, KEY_SPACE),
+            (keysyms::KEY_BackSpace, BACKSPACE),
+        ] {
+            assert_eq!(keycodes.get(&sym), Some(&key), "keysym {sym:#x}");
+        }
+        let repeatable = &p.ctx.keyboard_repeatable_keys[&keyboard];
+        assert!(repeatable.contains(&KEY_SPACE) && repeatable.contains(&BACKSPACE));
+        assert!(!repeatable.contains(&KEY_LEFTSHIFT));
+        let keymap = &p.ctx.keyboard_keymaps[&keyboard];
+        let mask = |name| 1 << keymap.mod_get_index(name);
+        assert_eq!(
+            [SHIFT, CAPS_LOCK, CONTROL, ALT],
+            [
+                mask(xkb::MOD_NAME_SHIFT),
+                mask(xkb::MOD_NAME_CAPS),
+                mask(xkb::MOD_NAME_CTRL),
+                mask(xkb::MOD_NAME_ALT)
+            ]
+        );
+    }
+
+    #[test]
+    fn keymap_mmap_is_private_not_shared() {
+        use nix::sys::memfd::{memfd_create, MFdFlags};
+        use std::ffi::CString;
+
+        let fd = memfd_create(
+            CString::new("test-keymap-private").unwrap().as_c_str(),
+            MFdFlags::empty(),
+        )
+        .expect("memfd_create failed");
+        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate failed");
+        let view = MmapView::from_fd(fd.as_fd(), 4096).expect("mmap failed");
+        let address = view.ptr.as_ptr() as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("read smaps");
+        let mapping_header = smaps
+            .lines()
+            .position(|line| {
+                let mut fields = line.split_whitespace();
+                let Some(range) = fields.next() else {
+                    return false;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return false;
+                };
+                usize::from_str_radix(start, 16).ok().is_some_and(|start| {
+                    usize::from_str_radix(end, 16)
+                        .ok()
+                        .is_some_and(|end| address >= start && address < end)
+                })
+            })
+            .expect("mapping must appear in smaps");
+        let vm_flags = smaps
+            .lines()
+            .skip(mapping_header + 1)
+            .take_while(|line| {
+                let Some(range) = line.split_whitespace().next() else {
+                    return true;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return true;
+                };
+                !(usize::from_str_radix(start, 16).is_ok()
+                    && usize::from_str_radix(end, 16).is_ok())
+            })
+            .find_map(|line| line.strip_prefix("VmFlags:"))
+            .expect("mapping must have VmFlags");
+        assert!(
+            !vm_flags.split_whitespace().any(|flag| flag == "sh"),
+            "keymap must use MAP_PRIVATE, got shared mapping flags: {vm_flags}"
+        );
+    }
+
+    /// A keymap the proxy cannot use replaces the loaded one: it is
+    /// forwarded, and the keyboard's XKB and key state go, so that no chord
+    /// is classified until a usable keymap arrives. The keyboard's
+    /// modifiers, which Exo does not send again, and another keyboard's
+    /// keymap stay.
+    #[test]
+    fn an_unusable_keymap_clears_the_loaded_one_and_is_forwarded() {
+        let xkb_v1 = KEYMAP_FORMAT_XKB_V1;
+        let not_xkb = b"this is not a valid xkb keymap\0";
+        // A keymap only its format makes unusable.
+        let usable = crate::proxy::harness::default_keymap();
+        let cases: [(&str, u32, &[u8], u32); 8] = [
+            ("no keymap", KEYMAP_FORMAT_NO_KEYMAP, b"", 100),
+            ("an unsupported format", 99, &usable, usable.len() as u32),
+            // mmap(len=0) is undefined.
+            ("an empty keymap", xkb_v1, b"", 0),
+            // The size is refused before the descriptor is mapped.
+            (
+                "a keymap over the size limit",
+                xkb_v1,
+                b"",
+                MAX_KEYMAP_SIZE + 1,
+            ),
+            // Mapping past the end of the file would raise SIGBUS.
+            ("a size beyond the file", xkb_v1, b"\0", 2),
+            ("no trailing NUL", xkb_v1, b"xkb_keymap", 10),
+            ("invalid UTF-8", xkb_v1, &[0xFF, 0xFE, 0xFD, 0], 4),
+            (
+                "an invalid XKB keymap",
+                xkb_v1,
+                not_xkb,
+                not_xkb.len() as u32,
+            ),
+        ];
+        for (case, format, bytes, size) in cases {
+            let mut p = Proxy::new();
+            p.keymap(KEYBOARD);
+            p.keymap(OTHER_KEYBOARD);
+            p.modifiers(KEYBOARD, CONTROL);
+            let keyboard = HostId(KEYBOARD.host);
+            let keys = &mut p.ctx.key_generations;
+            keys.suppress_host_accelerator(keyboard, KEY_A);
+            keys.observe_peek_press(keyboard, BACKSPACE, 1, 123, true);
+            keys.cancel_backspace_repeat(keyboard, BACKSPACE);
+            assert!(p.ctx.claim_guest_key(keyboard, BACKSPACE, ImeRecovery));
+
+            assert_eq!(
+                p.keymap_of(KEYBOARD, format, bytes, size),
+                Action::Forward,
+                "{case}"
+            );
+
+            let ctx = &p.ctx;
+            assert!(!ctx.keyboard_keymaps.contains_key(&keyboard), "{case}");
+            assert!(!ctx.keyboard_xkb_states.contains_key(&keyboard), "{case}");
+            assert!(
+                !ctx.keyboard_keysym_to_keycode.contains_key(&keyboard),
+                "{case}"
+            );
+            assert!(
+                !ctx.keyboard_repeatable_keys.contains_key(&keyboard),
+                "{case}"
+            );
+            assert!(!p.held(KEYBOARD, BACKSPACE), "{case}");
+            assert!(!p.cancelled(KEYBOARD), "{case}");
+            assert!(
+                ctx.key_generations.peek(keyboard, BACKSPACE).is_none(),
+                "{case}"
+            );
+            assert_eq!(p.owner(KEYBOARD, BACKSPACE), None, "{case}");
+            assert!(
+                !ctx.key_generations
+                    .host_accelerator_suppressed(keyboard, KEY_A),
+                "{case}"
+            );
+            assert_eq!(
+                ctx.keyboard_modifiers[&keyboard].depressed, CONTROL,
+                "{case}"
+            );
+            let other = HostId(OTHER_KEYBOARD.host);
+            assert!(
+                ctx.keyboard_keymaps.contains_key(&other)
+                    && ctx.keyboard_xkb_states.contains_key(&other),
+                "{case}: another keyboard's keymap stays"
+            );
+        }
+    }
+
+    #[test]
+    fn on_keymap_ignores_a_keymap_over_the_size_limit() {
+        for (size, accepted) in [(MAX_KEYMAP_SIZE, true), (MAX_KEYMAP_SIZE + 1, false)] {
+            let mut p = Proxy::new();
+            // A valid keymap, padded with blanks to `size` with its NUL.
+            let mut bytes = crate::proxy::harness::default_keymap();
+            bytes.pop();
+            bytes.resize(size as usize - 1, b' ');
+            bytes.push(0);
+
+            assert_eq!(
+                p.keymap_of(KEYBOARD, KEYMAP_FORMAT_XKB_V1, &bytes, size),
+                Action::Forward
+            );
+            assert_eq!(
+                p.ctx.keyboard_keymaps.contains_key(&HostId(KEYBOARD.host)),
+                accepted,
+                "a keymap of {size} bytes"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4145,753 +4462,5 @@ mod tests {
         kb.confirm(ime).await;
         let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
         assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
-    }
-
-    /// Helper: create an anonymous memfd, write the default keymap into it
-    /// (with a trailing NUL byte as required by the Wayland spec), and call
-    /// on_keymap so the handler builds its XKB state. Returns the keymap
-    /// object so tests can look up keycodes.
-    fn load_test_keymap(handler: &mut KeyboardHandler, ctx: &mut Context) -> xkb::Keymap {
-        let keymap = default_keymap();
-        let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-
-        // Use an anonymous memfd so we don't need the `tempfile` crate.
-        // nix is already a dependency of the main crate.
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-        let name = CString::new("sommelier-test-keymap").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        nix::unistd::write(&fd, keymap_str.as_bytes()).expect("write keymap failed");
-        // Write the NUL terminator required by the Wayland spec
-        // (wl_keyboard.keymap.size always includes it). on_keymap's debug_assert
-        // checks for this byte, so omitting it would fire in debug builds.
-        nix::unistd::write(&fd, &[0u8]).expect("write NUL failed");
-
-        // size = string bytes + 1 NUL terminator, matching what a real host sends.
-        let size = keymap_str.len() as u32 + 1;
-        handler.on_keymap(ctx, 1, fd.as_fd(), size);
-        assert!(
-            ctx.keyboard_keymaps
-                .contains_key(&HostId::from_event_sender(ctx)),
-            "keymap should be loaded for the sending keyboard"
-        );
-        keymap
-    }
-
-    /// The default XKB keymap the tests' host sends.
-    fn default_keymap() -> xkb::Keymap {
-        xkb::Keymap::new_from_names(
-            &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .unwrap()
-    }
-
-    /// Send keyboard `ctx.last_sender_id` a `wl_keyboard.modifiers` event
-    /// that holds the named XKB modifiers of `keymap`.
-    fn hold_modifiers(
-        handler: &mut KeyboardHandler,
-        ctx: &mut Context,
-        keymap: &xkb::Keymap,
-        names: &[&str],
-    ) {
-        let depressed = names
-            .iter()
-            .fold(0, |mask, name| mask | 1 << keymap.mod_get_index(name));
-        assert_eq!(
-            handler.on_modifiers(ctx, 1, depressed, 0, 0, 0),
-            Action::Forward
-        );
-    }
-
-    /// Find the evdev keycode for a given keysym in the keymap.
-    ///
-    /// Returns `None` if the keysym is not present. Call sites should use
-    /// `.expect("<description>")` so that test-failure output names the keysym
-    /// that was missing rather than showing a bare panic from inside this helper.
-    ///
-    /// # Note on shift-level lookup
-    /// This helper uses `key_get_syms_by_level(..., level=0)` which returns the
-    /// **unshifted** (base level) symbol for each key. This is intentional for
-    /// the purposes of *finding* a keycode given a base keysym: tests using this
-    /// helper should not involve shifted accelerators (e.g. `<Shift>A`), since
-    /// such tests would need a different lookup strategy. The production code uses
-    /// `key_get_one_sym` which correctly accounts for the active shift level at
-    /// runtime.
-    fn find_keycode(keymap: &xkb::Keymap, target: u32) -> Option<u32> {
-        let min = keymap.min_keycode().raw();
-        let max = keymap.max_keycode().raw();
-        for k in min..=max {
-            let syms = keymap.key_get_syms_by_level(k.into(), 0, 0);
-            if syms.iter().any(|s| s.raw() == target) {
-                // XKB keycodes = evdev keycode + 8 (XKB_KEYCODE_OFFSET in xkbcommon.h).
-                // Wayland wl_keyboard.key uses evdev keycodes, so subtract 8.
-                return Some(k - 8);
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn window_layout_actions_cover_nine_alt_keys() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
-            "<Alt>q=top-left,<Alt>w=top,<Alt>e=top-right,<Alt>a=left,<Alt>s=fullscreen,\
-             <Alt>d=right,<Alt>z=bottom-left,<Alt>x=bottom,<Alt>c=bottom-right",
-        ));
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
-
-        let expected = [
-            (xkb::keysyms::KEY_q, WindowLayoutAction::TopLeft),
-            (xkb::keysyms::KEY_w, WindowLayoutAction::Top),
-            (xkb::keysyms::KEY_e, WindowLayoutAction::TopRight),
-            (xkb::keysyms::KEY_a, WindowLayoutAction::Left),
-            (xkb::keysyms::KEY_s, WindowLayoutAction::Fullscreen),
-            (xkb::keysyms::KEY_d, WindowLayoutAction::Right),
-            (xkb::keysyms::KEY_z, WindowLayoutAction::BottomLeft),
-            (xkb::keysyms::KEY_x, WindowLayoutAction::Bottom),
-            (xkb::keysyms::KEY_c, WindowLayoutAction::BottomRight),
-        ];
-        for (sym, action) in expected {
-            let key = find_keycode(&keymap, sym).expect("layout keysym not found");
-            assert_eq!(
-                KeyboardHandler::classify_key(&ctx, HostId(5), key),
-                KeyClass::Placement(action)
-            );
-        }
-    }
-
-    #[test]
-    fn window_layout_requires_exact_alt_modifier() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
-            "<Alt>q=top-left",
-        ));
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-
-        hold_modifiers(&mut handler, &mut ctx, &keymap, &[]);
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), key),
-            KeyClass::Guest
-        );
-        hold_modifiers(
-            &mut handler,
-            &mut ctx,
-            &keymap,
-            &[xkb::MOD_NAME_ALT, xkb::MOD_NAME_SHIFT],
-        );
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), key),
-            KeyClass::Guest
-        );
-    }
-
-    #[test]
-    fn window_layout_honors_non_alt_configured_modifier() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::arc_bounds_for_test(
-            "<Control>q=top-left",
-        ));
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-
-        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_CTRL]);
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), key),
-            KeyClass::Placement(WindowLayoutAction::TopLeft)
-        );
-    }
-
-    #[test]
-    fn placement_binding_is_guest_input_without_arc_bounds_policy() {
-        let mut handler = KeyboardHandler::new();
-        // The gate is off, so the configured binding is ignored at startup.
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
-            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
-            None,
-            ArcIdAllocator::block_for_test(),
-        ));
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        let key = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_ALT]);
-
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), key),
-            KeyClass::Guest
-        );
-    }
-
-    #[test]
-    fn host_accelerator_and_placement_classify_from_one_chord() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::with_placement_for_test(PlacementConfig::resolve_for_test(
-            &[
-                ("SOMMELIER_WINDOW_BOUNDS_AS_ARC", "1"),
-                ("SOMMELIER_ACCELERATORS", "<Control>a"),
-                (
-                    "SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS",
-                    "<Control>q=top-left",
-                ),
-            ],
-            None,
-            ArcIdAllocator::block_for_test(),
-        ));
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        let a = find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a not found");
-        let q = find_keycode(&keymap, xkb::keysyms::KEY_q).expect("KEY_q not found");
-        let z = find_keycode(&keymap, xkb::keysyms::KEY_z).expect("KEY_z not found");
-        hold_modifiers(&mut handler, &mut ctx, &keymap, &[xkb::MOD_NAME_CTRL]);
-
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), a),
-            KeyClass::HostAccelerator
-        );
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), q),
-            KeyClass::Placement(WindowLayoutAction::TopLeft)
-        );
-        assert_eq!(
-            KeyboardHandler::classify_key(&ctx, HostId(5), z),
-            KeyClass::Guest
-        );
-    }
-
-    #[test]
-    fn compositor_shortcut_is_handled_and_release_is_suppressed() {
-        let keyboard = HostId(5);
-        let key = 24;
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-
-        let press = ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutPress);
-        assert_eq!(press.delivery, GuestKeyDelivery::Drop);
-        assert_eq!(press.ack_handled, Some(true));
-        assert_eq!(
-            ctx.guest_key_owner(keyboard, key),
-            Some(GuestKeyOwner::CompositorShortcut)
-        );
-
-        let release =
-            ctx.transition_guest_key(keyboard, key, GuestKeyEvent::CompositorShortcutRelease);
-        assert_eq!(release.delivery, GuestKeyDelivery::Drop);
-        assert_eq!(release.ack_handled, Some(true));
-        assert!(release.ends_repeat);
-        assert_eq!(ctx.guest_key_owner(keyboard, key), None);
-    }
-
-    /// Regression test: on_keymap must use mmap rather than read/seek because:
-    /// 1. The host sends keymap data via shared memory (memfd); mmap reads from
-    ///    offset 0 regardless of the fd cursor position.
-    /// 2. read() would advance the fd offset, preventing the fd from being
-    ///    forwarded with its original data intact.
-    /// 3. On non-seekable fds the cursor cannot be reset to 0 at all.
-    ///
-    /// This test creates a memfd, writes the keymap, and does NOT seek back
-    /// to the start — simulating a host that wrote and then sent the fd.
-    /// The on_keymap implementation must still load the keymap via mmap.
-    #[test]
-    fn keymap_loads_from_non_rewound_memfd() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-
-        let dummy_ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap = xkb::Keymap::new_from_names(
-            &dummy_ctx,
-            "",
-            "",
-            "",
-            "",
-            None,
-            xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .unwrap();
-        let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-        let keymap_bytes = keymap_str.as_bytes();
-
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let name = CString::new("test-keymap-norw").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        nix::unistd::write(&fd, keymap_bytes).expect("write failed");
-        // Write the NUL terminator that on_keymap expects (wl_keyboard.keymap.size
-        // always includes it). Without this, the mmap covers one byte beyond what
-        // was written; we'd rely on OS zero-fill of fresh anonymous pages, which is
-        // guaranteed on Linux but is not required by POSIX.
-        nix::unistd::write(&fd, &[0u8]).expect("write NUL failed");
-        // Deliberately do NOT seek back to 0.
-        // read()/pread() from here would get 0 bytes or fail.
-        // mmap with offset 0 must still work.
-
-        handler.on_keymap(&mut ctx, 1, fd.as_fd(), keymap_bytes.len() as u32 + 1);
-        assert!(
-            ctx.keyboard_keymaps.contains_key(&HostId(0)),
-            "keymap must load via mmap even when fd cursor is at EOF"
-        );
-        assert!(
-            ctx.keyboard_xkb_states.contains_key(&HostId(0)),
-            "XKB state must be initialized after keymap load"
-        );
-        assert!(
-            ctx.keyboard_keysym_to_keycode
-                .get(&HostId(0))
-                .is_some_and(|mapping| mapping.contains_key(&xkb::keysyms::KEY_A)),
-            "the negotiated keymap must provide a keysym fallback map"
-        );
-        assert!(
-            ctx.keyboard_keysym_to_keycode[&HostId(0)][&xkb::keysyms::KEY_a]
-                == find_keycode(&keymap, xkb::keysyms::KEY_a).expect("KEY_a must be mapped"),
-            "the map must expose the same evdev keycode as the negotiated XKB keymap"
-        );
-    }
-
-    #[test]
-    fn keymap_mmap_is_private_not_shared() {
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-
-        let fd = memfd_create(
-            CString::new("test-keymap-private").unwrap().as_c_str(),
-            MFdFlags::empty(),
-        )
-        .expect("memfd_create failed");
-        nix::unistd::ftruncate(&fd, 4096).expect("ftruncate failed");
-        let view = MmapView::from_fd(fd.as_fd(), 4096).expect("mmap failed");
-        let address = view.ptr.as_ptr() as usize;
-        let smaps = std::fs::read_to_string("/proc/self/smaps").expect("read smaps");
-        let mapping_header = smaps
-            .lines()
-            .position(|line| {
-                let mut fields = line.split_whitespace();
-                let Some(range) = fields.next() else {
-                    return false;
-                };
-                let Some((start, end)) = range.split_once('-') else {
-                    return false;
-                };
-                usize::from_str_radix(start, 16).ok().is_some_and(|start| {
-                    usize::from_str_radix(end, 16)
-                        .ok()
-                        .is_some_and(|end| address >= start && address < end)
-                })
-            })
-            .expect("mapping must appear in smaps");
-        let vm_flags = smaps
-            .lines()
-            .skip(mapping_header + 1)
-            .take_while(|line| {
-                let Some(range) = line.split_whitespace().next() else {
-                    return true;
-                };
-                let Some((start, end)) = range.split_once('-') else {
-                    return true;
-                };
-                !(usize::from_str_radix(start, 16).is_ok()
-                    && usize::from_str_radix(end, 16).is_ok())
-            })
-            .find_map(|line| line.strip_prefix("VmFlags:"))
-            .expect("mapping must have VmFlags");
-        assert!(
-            !vm_flags.split_whitespace().any(|flag| flag == "sh"),
-            "keymap must use MAP_PRIVATE, got shared mapping flags: {vm_flags}"
-        );
-    }
-
-    #[test]
-    fn no_chord_without_xkb_state() {
-        // No keymap is loaded; the lookup must degrade gracefully, not panic.
-        let ctx = Context::new_for_test(false, false, vec![]);
-        assert_eq!(
-            KeyboardHandler::current_chord(&ctx, HostId(0), 30),
-            None,
-            "a key forms no chord before the XKB state is initialised"
-        );
-    }
-
-    #[test]
-    fn overflowing_evdev_keycode_forms_no_chord() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, vec![]);
-        ctx.last_sender_id = 5;
-        load_test_keymap(&mut handler, &mut ctx);
-        assert_eq!(
-            KeyboardHandler::current_chord(&ctx, HostId(5), u32::MAX),
-            None,
-            "keycode + XKB offset must be checked before arithmetic"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // New tests added by code review fixes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn on_keymap_ignores_zero_size() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        // A zero-size keymap must be rejected gracefully (mmap(len=0) is UB).
-        // The empty file isn't mapped because the size check fires first.
-        let action = handler.on_keymap(
-            &mut ctx,
-            1, /* XKB_V1 */
-            crate::test_support::shm_pool_file(&[]).as_fd(),
-            0, /* size=0 */
-        );
-        assert_eq!(
-            action,
-            Action::Forward,
-            "zero-size keymap must forward, not panic"
-        );
-        assert!(
-            !ctx.keyboard_keymaps.contains_key(&HostId(0)),
-            "keymap must not be set after zero-size event"
-        );
-    }
-
-    /// An oversized keymap replaces a loaded one like any keymap the proxy
-    /// cannot use: the proxy drops its XKB state and still forwards it.
-    #[test]
-    fn an_oversized_keymap_clears_the_loaded_one_and_is_forwarded() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.last_sender_id = 5;
-        load_test_keymap(&mut handler, &mut ctx);
-
-        // The size is refused before the descriptor is mapped.
-        let file = crate::test_support::shm_pool_file(&[]);
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                KEYMAP_FORMAT_XKB_V1,
-                file.as_fd(),
-                MAX_KEYMAP_SIZE + 1
-            ),
-            Action::Forward
-        );
-
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_keysym_to_keycode.contains_key(&HostId(5)));
-    }
-
-    #[test]
-    fn on_keymap_ignores_a_keymap_over_the_size_limit() {
-        for (size, accepted) in [(MAX_KEYMAP_SIZE, true), (MAX_KEYMAP_SIZE + 1, false)] {
-            let mut handler = KeyboardHandler::new();
-            let mut ctx = Context::new_for_test(false, false, Vec::new());
-            // A valid keymap, padded with blanks to `size` with its NUL.
-            let mut bytes = default_keymap()
-                .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
-                .into_bytes();
-            bytes.resize(size as usize - 1, b' ');
-            bytes.push(0);
-            let file = crate::test_support::shm_pool_file(&bytes);
-
-            assert_eq!(
-                handler.on_keymap(&mut ctx, KEYMAP_FORMAT_XKB_V1, file.as_fd(), size),
-                Action::Forward
-            );
-            assert_eq!(
-                ctx.keyboard_keymaps.contains_key(&HostId(0)),
-                accepted,
-                "a keymap of {size} bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn no_keymap_format_leaves_no_keyboard_state() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        // Format 0 = KEYMAP_FORMAT_NO_KEYMAP; forward without loading.
-        let action = handler.on_keymap(
-            &mut ctx,
-            0, /* format=no_keymap */
-            crate::test_support::shm_pool_file(&[]).as_fd(),
-            100,
-        );
-        assert_eq!(action, Action::Forward);
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(0)));
-    }
-
-    #[test]
-    fn unsupported_keymap_format_clears_previous_keyboard_state() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        load_test_keymap(&mut handler, &mut ctx);
-
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                99,
-                crate::test_support::shm_pool_file(&[]).as_fd(),
-                0
-            ),
-            Action::Forward
-        );
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(0)));
-        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(0)));
-    }
-
-    #[test]
-    fn keymap_without_trailing_nul_is_rejected_without_panicking() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        load_test_keymap(&mut handler, &mut ctx);
-
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-        let name = CString::new("test-keymap-missing-nul").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        let malformed = b"xkb_keymap";
-        nix::unistd::write(&fd, malformed).expect("write failed");
-
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                KEYMAP_FORMAT_XKB_V1,
-                fd.as_fd(),
-                malformed.len() as u32,
-            ),
-            Action::Forward
-        );
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(0)));
-        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(0)));
-    }
-
-    #[test]
-    fn keymap_size_larger_than_fd_is_rejected_without_sigbus() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        load_test_keymap(&mut handler, &mut ctx);
-
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-        let name = CString::new("test-keymap-short-fd").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        let bytes = b"\0";
-        nix::unistd::write(&fd, bytes).expect("write failed");
-
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                KEYMAP_FORMAT_XKB_V1,
-                fd.as_fd(),
-                (bytes.len() + 1) as u32,
-            ),
-            Action::Forward
-        );
-        assert!(
-            !ctx.keyboard_keymaps.contains_key(&HostId(0)),
-            "a short keymap fd must not leave stale keymap state"
-        );
-        assert!(
-            !ctx.keyboard_xkb_states.contains_key(&HostId(0)),
-            "a short keymap fd must not leave stale XKB state"
-        );
-    }
-
-    #[test]
-    fn no_keymap_event_clears_previous_keyboard_state() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.last_sender_id = 5;
-        let keymap = load_test_keymap(&mut handler, &mut ctx);
-        let ctrl_mask = 1 << keymap.mod_get_index("Control");
-        handler.on_modifiers(&mut ctx, 1, ctrl_mask, 0, 0, 0);
-        ctx.key_generations.suppress_host_accelerator(HostId(5), 30);
-
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                0,
-                crate::test_support::shm_pool_file(&[]).as_fd(),
-                0
-            ),
-            Action::Forward
-        );
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(5)));
-        assert_eq!(
-            ctx.keyboard_modifiers[&HostId(5)].depressed,
-            ctrl_mask,
-            "the host's modifiers outlive its keymap"
-        );
-        assert!(!ctx
-            .key_generations
-            .host_accelerator_suppressed(HostId(5), 30));
-    }
-
-    #[test]
-    fn no_keymap_event_does_not_clear_another_keyboard() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.last_sender_id = 5;
-        load_test_keymap(&mut handler, &mut ctx);
-        ctx.last_sender_id = 6;
-        load_test_keymap(&mut handler, &mut ctx);
-
-        ctx.last_sender_id = 5;
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                0,
-                crate::test_support::shm_pool_file(&[]).as_fd(),
-                0
-            ),
-            Action::Forward
-        );
-        assert!(!ctx.keyboard_keymaps.contains_key(&HostId(5)));
-        assert!(!ctx.keyboard_xkb_states.contains_key(&HostId(5)));
-        assert!(
-            ctx.keyboard_keymaps.contains_key(&HostId(6)),
-            "one keyboard's NO_KEYMAP event must preserve another keyboard's keymap"
-        );
-        assert!(
-            ctx.keyboard_xkb_states.contains_key(&HostId(6)),
-            "one keyboard's NO_KEYMAP event must preserve another keyboard's XKB state"
-        );
-    }
-
-    /// Regression: on_keymap must log an error and not crash when the
-    /// keymap data is not valid UTF-8, or when xkbcommon rejects the
-    /// string. In both cases the handler must degrade gracefully:
-    /// keymap stays absent, state stays absent, Action::Forward is returned.
-    #[test]
-    fn on_keymap_logs_error_on_invalid_utf8() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-        let name = CString::new("test-bad-keymap").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        // Write a lone continuation byte — invalid UTF-8 — followed by a NUL
-        // terminator, because wl_keyboard.keymap.size always includes the NUL.
-        let bad_bytes: &[u8] = &[0xFF, 0xFE, 0xFD, 0x00];
-        nix::unistd::write(&fd, bad_bytes).expect("write failed");
-
-        let action = handler.on_keymap(
-            &mut ctx,
-            1, /* XKB_V1 */
-            fd.as_fd(),
-            bad_bytes.len() as u32,
-        );
-        assert_eq!(action, Action::Forward, "invalid UTF-8 must still forward");
-        assert!(
-            !ctx.keyboard_keymaps.contains_key(&HostId(0)),
-            "keymap must remain absent on parse error"
-        );
-        assert!(
-            !ctx.keyboard_xkb_states.contains_key(&HostId(0)),
-            "state must remain absent on parse error"
-        );
-    }
-
-    #[test]
-    fn on_keymap_logs_error_on_invalid_xkb_string() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-
-        use nix::sys::memfd::{memfd_create, MFdFlags};
-        use std::ffi::CString;
-        let name = CString::new("test-bad-xkb").unwrap();
-        let fd = memfd_create(name.as_c_str(), MFdFlags::empty()).expect("memfd_create failed");
-        // Valid UTF-8 but not a valid XKB keymap. Include trailing NUL because
-        // wl_keyboard.keymap.size always includes the NUL terminator.
-        let garbage = b"this is not a valid xkb keymap\0";
-        nix::unistd::write(&fd, garbage).expect("write failed");
-
-        let action = handler.on_keymap(
-            &mut ctx,
-            1, /* XKB_V1 */
-            fd.as_fd(),
-            garbage.len() as u32,
-        );
-        assert_eq!(
-            action,
-            Action::Forward,
-            "invalid XKB string must still forward"
-        );
-        assert!(
-            !ctx.keyboard_keymaps.contains_key(&HostId(0)),
-            "keymap must remain absent on XKB compile error"
-        );
-        assert!(
-            !ctx.keyboard_xkb_states.contains_key(&HostId(0)),
-            "state must remain absent on XKB compile error"
-        );
-    }
-
-    #[test]
-    fn invalid_keymap_clears_context_keyboard_state() {
-        let mut handler = KeyboardHandler::new();
-        let mut ctx = Context::new_for_test(false, false, Vec::new());
-        ctx.last_sender_id = 5;
-        load_test_keymap(&mut handler, &mut ctx);
-        ctx.key_generations
-            .observe_peek_press(HostId(5), EVDEV_KEY_BACKSPACE, 1, 123, true);
-        ctx.key_generations
-            .cancel_backspace_repeat(HostId(5), EVDEV_KEY_BACKSPACE);
-        assert!(ctx.claim_guest_key(HostId(5), EVDEV_KEY_BACKSPACE, GuestKeyOwner::ImeRecovery));
-
-        assert_eq!(
-            handler.on_keymap(
-                &mut ctx,
-                99,
-                crate::test_support::shm_pool_file(&[]).as_fd(),
-                0
-            ),
-            Action::Forward
-        );
-        assert!(!ctx
-            .key_generations
-            .physically_held(HostId(5), EVDEV_KEY_BACKSPACE));
-        assert!(!ctx
-            .key_generations
-            .backspace_repeat_cancelled(HostId(5), EVDEV_KEY_BACKSPACE));
-        assert!(ctx
-            .key_generations
-            .peek(HostId(5), EVDEV_KEY_BACKSPACE)
-            .is_none());
-        assert!(!ctx.keyboard_repeatable_keys.contains_key(&HostId(5)));
-        assert!(ctx
-            .guest_key_owner(HostId(5), EVDEV_KEY_BACKSPACE)
-            .is_none());
-    }
-
-    /// Structural test: `MessageBuilder::build_message` must produce well-formed wire frames.
-    ///
-    /// This catches any future refactoring that breaks the `[sender][size<<16|opcode][payload]`
-    /// encoding, which would silently corrupt all internal protocol messages.
-    #[test]
-    #[allow(clippy::disallowed_methods)]
-    fn build_wayland_msg_encodes_frame_correctly() {
-        let payload = [0x01u8, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]; // two u32 words
-        let mut builder = crate::wire::MessageBuilder::new();
-        builder.write_u32(0x00000001);
-        builder.write_u32(0x00000002);
-        let msg = builder.build_message(42, 7);
-
-        let sender = crate::test_support::msg_sender(&msg);
-        assert_eq!(sender, 42, "sender_id wrong");
-
-        let expected_total_len = 8u32 + payload.len() as u32; // header + payload
-        let word2 = u32::from_ne_bytes(msg[4..8].try_into().unwrap());
-        assert_eq!(word2 >> 16, expected_total_len, "size field wrong");
-        assert_eq!(word2 & 0xFFFF, 7, "opcode field wrong");
-
-        assert_eq!(&msg[8..], &payload, "payload bytes wrong");
     }
 }
