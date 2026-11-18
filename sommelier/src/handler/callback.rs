@@ -69,6 +69,13 @@ impl WlCallbackHandler for CallbackHandler {
                     text_input,
                     host_text_input,
                 ),
+                InternalCallback::TextInputResetFence { text_input } => {
+                    crate::handler::text_input::complete_reset_fence(
+                        ctx,
+                        HostId(host_id),
+                        text_input,
+                    )
+                }
                 InternalCallback::WindowBoundsBarrier { zaura_toplevel } => {
                     crate::handler::window_placement::complete_barrier(
                         ctx,

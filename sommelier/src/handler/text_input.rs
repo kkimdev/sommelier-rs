@@ -25,9 +25,9 @@ use crate::protocols::wayland::{wl_keyboard, wl_seat};
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
-    reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
-    HostContentType, HostId, HostPreeditContext, HostTarget, InternalCallback, Link,
-    SeatFocusChange, TextInputState,
+    reconcile, ActivationStep, ConfirmPreeditPlan, Context, CursorRect, GuestKeyDelivery,
+    GuestKeyEvent, HostApplied, HostContentType, HostId, HostPreeditContext, HostTarget,
+    InternalCallback, Link, SeatFocusChange, TextInputState,
 };
 use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
@@ -632,11 +632,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return Action::Drop;
         };
         let Some(plan) = state.prepare_host_preedit() else {
-            log::debug!(
-                "Ignoring stale preedit_string for inactive text input {}",
-                guest_id
-            );
-            return Action::Drop;
+            log::debug!("Ignoring stale preedit_string for text input {guest_id}");
+            return drop_host_preedit(ctx, guest_id);
         };
         // The preedit_cursor and preedit_styling before it are byte offsets
         // into it, which replacing an invalid sequence would move.
@@ -723,11 +720,8 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return Action::Drop;
         };
         let Some(plan) = state.prepare_host_commit() else {
-            log::debug!(
-                "Ignoring stale commit_string for inactive text input {}",
-                guest_id
-            );
-            return Action::Drop;
+            log::debug!("Ignoring stale commit_string for text input {guest_id}");
+            return drop_host_commit(ctx, guest_id);
         };
         if serial != plan.done_serial {
             log::debug!(
@@ -1013,10 +1007,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         };
         // A delete ends the composition, as a commit does.
         let Some(plan) = state.prepare_host_commit() else {
-            log::debug!(
-                "Ignoring stale delete_surrounding_text for inactive text input {}",
-                guest_id
-            );
+            log::debug!("Ignoring stale delete_surrounding_text for text input {guest_id}");
             return Action::Drop;
         };
         log::trace!(
@@ -1142,14 +1133,12 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             return Action::Drop;
         };
         let Some(plan) = state.prepare_preedit_region() else {
-            log::warn!(
-                "on_set_preedit_region: inactive input or no surrounding text for host_ext_id={}",
-                host_ext_id
-            );
-            if state.host_is_active() {
-                return drop_host_preedit(ctx, guest_id);
+            if state.host_composition_is_current() {
+                log::warn!("Ignoring a preedit region of text input {guest_id}, which stated no surrounding text");
+            } else {
+                log::debug!("Ignoring a stale preedit region of text input {guest_id}");
             }
-            return Action::Drop;
+            return drop_host_preedit(ctx, guest_id);
         };
 
         let text = &plan.surrounding_text;
@@ -1272,6 +1261,7 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             return Action::Drop;
         };
         let Some(plan) = state.prepare_confirm_preedit() else {
+            log::debug!("Ignoring a stale confirm_preedit of text input {guest_id}");
             return Action::Drop;
         };
         if plan.preedit_text.is_empty() {
@@ -1320,26 +1310,38 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             plan.preedit_text,
             plan.done_serial
         );
-        let mut transaction = Vec::new();
-        if !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0) {
+        if !commit_shown_preedit(ctx, guest_id, plan) {
             return drop_host_preedit(ctx, guest_id);
         }
-
-        if !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text) {
-            return drop_host_preedit(ctx, guest_id);
-        }
-        transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
-
-        let state = ctx
-            .text_inputs
-            .get_mut(&guest_id)
-            .expect("active text input disappeared while confirming preedit");
-        let guest_seat = plan.guest_seat;
-        state.finish_confirm_preedit(plan);
-        end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
-        ctx.host_to_client_queue.extend(transaction);
         Action::Drop
     }
+}
+
+/// Commit the preedit text input `guest_id` shows, as one v3 transaction
+/// that clears the preedit, commits its text and ends with a `done`, and
+/// close the composition ([`TextInputState::finish_confirm_preedit`]).
+///
+/// # Returns
+///
+/// Whether the transaction was queued; if not, nothing changed.
+fn commit_shown_preedit(ctx: &mut Context, guest_id: u32, plan: ConfirmPreeditPlan) -> bool {
+    let mut transaction = Vec::new();
+    if !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
+        || !push_commit_string_to(&mut transaction, guest_id, &plan.preedit_text)
+    {
+        return false;
+    }
+    transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
+
+    let state = ctx
+        .text_inputs
+        .get_mut(&guest_id)
+        .expect("active text input disappeared while committing its preedit");
+    let guest_seat = plan.guest_seat;
+    state.finish_confirm_preedit(plan);
+    end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
+    ctx.host_to_client_queue.extend(transaction);
+    true
 }
 
 pub struct TextInputManagerV3Handler;
@@ -1875,14 +1877,64 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     }
 }
 
+/// A pointer pressed on guest surface `surface`, a press the guest has yet
+/// to get: end the composition of the text input that
+/// [`TextInputState::prepare_press_commit`] says the press ends. Only one
+/// can be: one text input on a connection is enabled at a time. The guest
+/// commits the preedit it shows, and the host `reset`s, which drops Exo's
+/// composition without an event back.
+///
+/// # Returns
+///
+/// Whether a composition ended, so that the press must follow the guest
+/// events queued.
+pub(crate) fn end_composition_on_press(ctx: &mut Context, surface: u32) -> bool {
+    let Some((guest_id, host_v1_id, plan)) =
+        ctx.text_inputs.iter().find_map(|(&guest_id, state)| {
+            let plan = state.prepare_press_commit(surface)?;
+            Some((guest_id, state.host_v1_id, plan))
+        })
+    else {
+        return false;
+    };
+    // The preedit reached the guest, so its commit fits a message.
+    if !commit_shown_preedit(ctx, guest_id, plan) {
+        return false;
+    }
+    log::debug!("A pointer press ended the composition of text input {guest_id}");
+    ctx.client_to_host_queue
+        .push(zwp_text_input_v1::req::reset(host_v1_id));
+    let callback = queue_internal_sync(
+        ctx,
+        InternalCallback::TextInputResetFence {
+            text_input: guest_id,
+        },
+    );
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.fence_reset(callback);
+    }
+    true
+}
+
+/// Complete the fence ([`InternalCallback::TextInputResetFence`]) of the
+/// `reset` a pointer press sent for guest text input `guest_id`. The
+/// callback names the fence alone: a pending callback's ID is in no other
+/// use, so a text input that reuses the guest ID cannot hold it.
+pub(crate) fn complete_reset_fence(ctx: &mut Context, callback_id: HostId, guest_id: u32) {
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.complete_reset_fence(callback_id);
+    }
+}
+
 /// Answer the guest's latest commit on text input `guest_id` with a
 /// `done`, if the commit left the field enabled, as mutter and KWin do. The
 /// protocol numbers each `done` by the commits so far, and a client may
 /// hold its surrounding text and cursor rectangle until a `done` names its
 /// latest commit, as Chromium does. A `done` applies the preedit sent since
 /// the previous one, or none, so this one repeats the preedit the guest
-/// shows. Unlike mutter and KWin, the proxy cannot end the host's
-/// composition when the guest resets its own (see HANDOVER).
+/// shows. Unlike mutter and KWin, the proxy does not end the host's
+/// composition when the guest resets its own; only a pointer press does
+/// ([`end_composition_on_press`]).
 fn answer_guest_commit(ctx: &mut Context, guest_id: u32) {
     let Some(state) = ctx
         .text_inputs
@@ -2145,7 +2197,7 @@ mod tests {
     use crate::protocols::wayland::wl_callback::WlCallbackHandler;
     use crate::protocols::wayland::wl_display;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
+    use crate::protocols::wayland::{wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
     use crate::test_support::{decoded, respell};
@@ -2723,6 +2775,23 @@ mod tests {
             assert_eq!(self.enter_surface().await, []);
         }
 
+        /// The host's `button` event of `pointer`, of the left button in
+        /// `state`.
+        fn button(pointer: Object, state: u32) -> Outgoing {
+            wl_pointer::evt::button(pointer.host, 4, 500, BTN_LEFT, state)
+        }
+
+        /// The `button` event `pointer` gets for [`Self::button`].
+        fn guest_button(pointer: Object, state: u32) -> (u32, AnyEvent) {
+            let button = wl_pointer::Event::Button {
+                serial: 4,
+                time: 500,
+                button: BTN_LEFT,
+                state,
+            };
+            (pointer.id, button.into())
+        }
+
         /// The host completes the drain barrier `callback`.
         async fn drain(&mut self, callback: u32) {
             self.s.host([wl_callback::evt::done(callback, 0)]).await;
@@ -2861,6 +2930,8 @@ mod tests {
 
     /// The evdev code of the space bar.
     const SPACE: u32 = 57;
+    /// The evdev code of the left mouse button.
+    const BTN_LEFT: u32 = 0x110;
 
     /// The `wl_display.sync` that creates drain barrier `callback`.
     fn sync(callback: u32) -> (u32, AnyRequest) {
@@ -3969,6 +4040,364 @@ mod tests {
         f.s.host([f.preedit("가낙", "가낙")]).await;
         let expected = [preedit("가낙"), V3::Done { serial: 2 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A pointer press on the surface of a composition ends it before the
+    /// press reaches the guest, as mutter
+    /// (`meta_wayland_text_input_handle_event`) and KWin
+    /// (`InputMethodEventFilter::pointerButton`) do: the guest commits the
+    /// preedit it shows, and Exo, told to `reset`, drops the composition,
+    /// so the next key starts a new syllable instead of joining the old one.
+    #[tokio::test]
+    async fn a_press_on_the_composing_surface_commits_the_preedit() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        // The reset goes behind a fence: Exo's events sent before it
+        // handled the reset belong to the dropped composition.
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        f.drain(fence).await;
+
+        // The composition ended: the release changes nothing, and the
+        // input method's next commit replaces no preedit.
+        let released = wl_pointer::BUTTON_STATE_RELEASED;
+        f.s.host([Field::button(pointer, released)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, released)]
+        );
+        f.s.host([f.commit("나")]).await;
+        let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// The events Exo sent before it handled the press's `reset` still
+    /// arrive, and its commits belong to the composition the press
+    /// committed: the input method's own commit of the syllable, as when
+    /// Space ends it just before the click, or of the syllable it became
+    /// after the preedit the press committed. The guest gets neither, so
+    /// no syllable reaches it twice. Commits after the reset's fence reach
+    /// the guest.
+    #[tokio::test]
+    async fn a_commit_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("각", "각")]).await;
+        let expected = [preedit("각"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("각"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // In flight: the input method's commit of the syllable, with its
+        // cursor, and of the syllable it became.
+        let cursor = v1::cursor_position(f.host, 3, 3);
+        f.s.host([cursor, f.commit("각"), f.commit("갂")]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        f.drain(fence).await;
+        f.s.host([f.commit("나")]).await;
+        let expected = [commit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A preedit Exo sent before it handled the press's `reset` belongs to
+    /// the composition the reset dropped: the guest never shows it, so a
+    /// second press commits nothing, and the guest does not end up with
+    /// `가간`. Preedits after the reset's fence reach the guest.
+    #[tokio::test]
+    async fn a_preedit_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+
+        // In flight: the syllable the next jamo made, with its cursor.
+        f.s.host([v1::preedit_cursor(f.host, 3), f.preedit("간", "간")])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        f.s.host([Field::button(pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, pressed)]
+        );
+
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        // The dropped preedit's cursor went with it.
+        f.drain(fence).await;
+        f.s.host([f.preedit("나다", "나다")]).await;
+        let expected = [preedit("나다"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Through the field "나", the guest shows the preedit "가", and a press
+    /// commits it behind a reset fence. Returns the pointer and the fence.
+    async fn press_after_na_ga(f: &mut Field) -> (Object, u32) {
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 2 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        (pointer, fence)
+    }
+
+    /// A delete Exo sent before it handled the press's `reset` was made
+    /// against the composition the press committed: the guest never gets
+    /// it, even one counted from the cursor, which the proxy would
+    /// otherwise forward at once.
+    #[tokio::test]
+    async fn a_delete_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::with_surrounding_text("나", 3, 3).await;
+        let (_, fence) = press_after_na_ga(&mut f).await;
+        f.s.host([f.delete_range(-3, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+        f.drain(fence).await;
+        f.s.host([f.delete_range(-3, 3)]).await;
+        let expected = [delete(3, 0), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A preedit region Exo sent before it handled the press's `reset`
+    /// would turn text before the cursor back into a composition the
+    /// reset dropped: the guest never gets it.
+    #[tokio::test]
+    async fn a_preedit_region_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::with_surrounding_text("나", 3, 3).await;
+        let (_, fence) = press_after_na_ga(&mut f).await;
+        f.s.host([ext::set_preedit_region(f.host_ext, -3, 3)]).await;
+        assert_eq!(f.s.guest_received(), []);
+        f.drain(fence).await;
+    }
+
+    /// A confirmation Exo sent before it handled the press's `reset`
+    /// confirms the composition the press committed. With nothing composed
+    /// it would stand for the held Space, which the guest would then get
+    /// as a key the input method never gave it.
+    #[tokio::test]
+    async fn a_confirm_in_flight_at_a_press_is_dropped() {
+        let mut f = Field::typing().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_234,
+        };
+        f.s.host([f.peek(space), f.preedit("각", "각")]).await;
+        assert_eq!(f.s.guest_received(), f.events([preedit("각"), DONE]));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("각"), DONE]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), []);
+        f.drain(fence).await;
+    }
+
+    /// The field shows the preedit "가", and a press commits it behind a
+    /// reset fence. Returns the fence.
+    async fn press_during_ga(f: &mut Field) -> u32 {
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        f.s.host([f.preedit("가", "가")]).await;
+        assert_eq!(f.s.guest_received(), f.events([preedit("가"), DONE]));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), DONE]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        fence
+    }
+
+    /// A focus change while a reset fence is pending deactivates behind a
+    /// drain barrier, which the host answers after the fence. The fence
+    /// then ends, and the next generation's composition reaches the guest.
+    #[tokio::test]
+    async fn a_reset_fence_ends_before_the_next_generation() {
+        let mut f = Field::enabled().await;
+        let fence = press_during_ga(&mut f).await;
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let drain = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(drain)]);
+        f.drain(fence).await;
+        f.drain(drain).await;
+
+        f.keyboard_enter().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(2));
+        f.answered(2);
+        f.s.host([f.preedit("나", "나")]).await;
+        let expected = [preedit("나"), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A text input destroyed while its reset fence is pending takes the
+    /// fence with it: the fence's return later changes nothing, not even
+    /// for a new text input that reuses the guest ID.
+    #[tokio::test]
+    async fn a_reset_fence_ends_with_its_text_input() {
+        let mut f = Field::enabled().await;
+        let fence = press_during_ga(&mut f).await;
+        f.s.guest([v3::destroy(f.ti)]).await;
+        let host = f.s.host_received();
+        let drain = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(drain), f.ext(Ext::Destroy {})]);
+        let delete_id = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, delete_id.into())]);
+
+        let ti = f.ti;
+        f.create_text_input(ti).await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+        f.answered(1);
+        f.drain(fence).await;
+        f.drain(drain).await;
+        assert_eq!(f.s.guest_received(), []);
+        f.s.host([f.preedit("나", "나")]).await;
+        let expected = [preedit("나"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// Only a press on the surface of a composition ends it: a press with
+    /// no composition, a press on another surface and a release change
+    /// nothing, and the composition goes on.
+    #[tokio::test]
+    async fn a_press_elsewhere_or_without_a_composition_changes_nothing() {
+        let mut f = Field::enabled().await;
+        let pointer = f.s.pointer_on(f.seat.id, f.surface).await;
+        let (pressed, released) = (
+            wl_pointer::BUTTON_STATE_PRESSED,
+            wl_pointer::BUTTON_STATE_RELEASED,
+        );
+
+        // No composition.
+        f.s.host([Field::button(pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, pressed)]
+        );
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // A release.
+        f.s.host([Field::button(pointer, released)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(pointer, released)]
+        );
+
+        // A press on another surface, or after the pointer left.
+        let other = f.s.surface().await;
+        let other_pointer = f.s.pointer_on(f.seat.id, other).await;
+        f.s.host([Field::button(other_pointer, pressed)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_button(other_pointer, pressed)]
+        );
+        let leave = wl_pointer::evt::leave(pointer.host, 5, f.surface.host);
+        f.s.host([leave, Field::button(pointer, pressed)]).await;
+        let leave = wl_pointer::Event::Leave {
+            serial: 5,
+            surface: f.surface.id,
+        };
+        assert_eq!(
+            f.s.guest_received(),
+            [
+                (pointer.id, leave.into()),
+                Field::guest_button(pointer, pressed)
+            ]
+        );
+
+        // The host was told nothing, and the composition goes on.
+        assert_eq!(f.s.host_received(), []);
+        f.s.host([f.commit("각")]).await;
+        let expected = [no_preedit(), commit("각"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A `leave` names the surface it leaves. One that names a surface
+    /// other than the pointer's, as from a host that delivers a `leave`
+    /// late, leaves the pointer where it is, so a press there still ends
+    /// the composition.
+    #[tokio::test]
+    async fn a_leave_of_another_surface_keeps_the_pointer_on_its_surface() {
+        let mut f = Field::enabled().await;
+        let other = f.s.surface().await;
+        let pointer = f.s.pointer_on(f.seat.id, other).await;
+        let leave = wl_pointer::evt::leave(pointer.host, 2, other.host);
+        let enter = wl_pointer::evt::enter(pointer.host, 3, f.surface.host, 0, 0);
+        let late_leave = wl_pointer::evt::leave(pointer.host, 4, other.host);
+        f.s.host([leave, enter, late_leave]).await;
+        let leave = |serial| wl_pointer::Event::Leave {
+            serial,
+            surface: other.id,
+        };
+        let enter = wl_pointer::Event::Enter {
+            serial: 3,
+            surface: f.surface.id,
+            surface_x: 0,
+            surface_y: 0,
+        };
+        assert_eq!(
+            f.s.guest_received(),
+            [
+                (pointer.id, leave(2).into()),
+                (pointer.id, enter.into()),
+                (pointer.id, leave(4).into()),
+            ]
+        );
+
+        f.s.host([f.preedit("가", "가")]).await;
+        let expected = [preedit("가"), V3::Done { serial: 1 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        f.s.host([Field::button(pointer, pressed)]).await;
+        let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
+        expected.push(Field::guest_button(pointer, pressed));
+        assert_eq!(f.s.guest_received(), expected);
+        let host = f.s.host_received();
+        let fence = barrier(&host);
+        assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
+        f.drain(fence).await;
     }
 
     /// An input method that replaces text deletes, then commits, each a

@@ -39,7 +39,8 @@ limitations under the License.
 
 use super::{Context, DeletedHostId, HostId, Link};
 use crate::handler::{
-    compositor, keyboard, linux_dmabuf, output, registry, shm, text_input, window_placement,
+    compositor, keyboard, linux_dmabuf, output, pointer, registry, shm, text_input,
+    window_placement,
 };
 use crate::protocols::linux_dmabuf_v1::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
@@ -47,7 +48,7 @@ use crate::protocols::linux_dmabuf_v1::{
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
 use crate::protocols::viewporter::wp_viewport;
 use crate::protocols::wayland::{
-    wl_keyboard, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use crate::protocols::xdg_shell::{xdg_popup, xdg_surface, xdg_toplevel};
 
@@ -162,6 +163,7 @@ fn forget_object(
         (wl_registry::NAME, Some(host)) => registry::forget_registry(ctx, host),
         (wl_output::NAME, Some(host)) => output::forget_output(ctx, host),
         (wl_keyboard::NAME, Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
+        (wl_pointer::NAME, Some(host)) => pointer::forget_pointer(ctx, HostId(host)),
         (wl_surface::NAME, Some(host)) => compositor::forget_surface(ctx, guest, host),
         (wp_viewport::NAME, _) => compositor::forget_viewport(ctx, guest),
         (xdg_surface::NAME, _) => compositor::forget_xdg_surface(ctx, guest),
@@ -318,8 +320,21 @@ impl Context {
                 keyboard.0
             );
         }
+        for (pointer, surface) in self.pointer_focus.focuses_for_test() {
+            host("pointer focus", pointer.0, "wl_pointer");
+            guest("pointer focus", surface, "wl_surface");
+        }
         for (&text_input, state) in &self.text_inputs {
             guest("text input state", text_input, "zwp_text_input_v3");
+            // A fence that outlived its callback would drop the field's
+            // composition events for good.
+            if let Some(fence) = state.reset_fence {
+                assert_eq!(
+                    self.internal_callbacks.get(fence),
+                    Some(super::InternalCallback::TextInputResetFence { text_input }),
+                    "text input {text_input} keeps a reset fence whose callback is not pending"
+                );
+            }
             if let Some(surface) = state.active_surface {
                 guest("text input focus", surface, "wl_surface");
             }

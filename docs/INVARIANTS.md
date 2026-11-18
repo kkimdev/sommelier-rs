@@ -948,10 +948,13 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   host is still composing, so only a commit that changes whether the
   field is enabled, or an enable the proxy ignores, starts a new field,
   which ends the composition and the Backspace repeat leased to it and
-  tells the host its content type again. GTK3 enables an enabled field
-  again on every click in it, and mutter and KWin keep the preedit across
-  that too; the host keeps the content type, since before the v8
-  extension a resend would reset its composition. A commit that disables
+  tells the host its content type again. An enable of an enabled field
+  keeps the composition, as mutter and KWin keep the preedit across it,
+  and the host keeps the content type, since before the v8 extension a
+  resend would reset its composition. GTK3 sends one on every click in
+  the field, after the press; a press on the field's surface has already
+  ended the composition (next rule), so the composition it keeps is one
+  a click elsewhere, such as on a subsurface, left running. A commit that disables
   the field, and a commit while unfocused, get no `done`, as from mutter;
   nor does an enable ignored because another text input on the
   connection is enabled, which leaves the field disabled. Nor do the
@@ -962,8 +965,9 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   repeat is forgotten, since its bare `done` clears it. Host IME events reach the
   guest as whole transactions, so this `done` never splits one, and it
   leaves `unreported_host_edit` alone: only the surrounding text a commit
-  states clears that. Unlike mutter and KWin, the proxy cannot end the
-  host's composition when the guest resets its own (see HANDOVER).
+  states clears that. Unlike mutter and KWin, the proxy does not end the
+  host's composition when the guest resets its own; only a pointer press
+  does (next rule).
   Tests: `every_commit_of_an_enabled_field_gets_a_done`,
   `a_commit_during_composition_keeps_the_preedit`,
   `reenabling_an_enabled_field_keeps_its_composition`,
@@ -973,6 +977,116 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `on_set_preedit_region_translates_correctly`,
   `second_text_input_enable_on_the_connection_is_ignored`,
   `oversized_surrounding_commit_does_not_partially_advance_state`.
+- **A pointer press ends the composition on its surface.** When a host
+  `wl_pointer.button` press comes from a pointer whose `enter` named the
+  surface an active text input is focused on, while the guest shows a
+  preedit, the proxy ends that composition before the guest gets the
+  press (`text_input::end_composition_on_press`, decided by
+  `TextInputState::prepare_press_commit`). The guest gets one transaction
+  that clears the preedit, commits its text and ends with `done` carrying
+  the current commit count, then the press; the host gets
+  `zwp_text_input_v1.reset`. Otherwise Exo keeps composing: the next jamo
+  joins the old syllable, or the old preedit reappears at the click point.
+  A press with no composition, on another surface (a subsurface
+  included), and a release change nothing. This is what the reference
+  compositors do:
+  - mutter handles a button press or touch-begin before delivering it
+    (`src/wayland/meta-wayland-seat.c` 507-511). If the picked surface is
+    the text input's, it calls `clutter_input_focus_reset` and
+    `meta_wayland_text_input_focus_flush_done`
+    (`src/wayland/meta-wayland-text-input.c` 1208-1238). That reset
+    commits the preedit when the input method composes in commit mode, as
+    ibus-hangul does, then clears it and resets the input method
+    (`clutter/clutter/clutter-input-focus.c` 108-128). The client gets
+    `preedit_string(NULL)`, `commit_string` and `done(serial)`. Revision
+    mutter fe9693a72c78.
+  - KWin, on a button press on the active window
+    (`InputMethodEventFilter::pointerButton`, `src/input.cpp` 2060-2073),
+    commits the preedit's commit text with a preedit clear and `done`, then
+    sends the input method `reset` (`InputMethod::commitPendingText`,
+    `src/inputmethod.cpp` 225-235). Revision KWin f213b9afd80b.
+
+  The proxy commits the preedit the guest shows, because Exo sends the
+  same text as the preedit's commit text
+  (`components/exo/wayland/zwp_text_input_manager.cc` 176-179). Exo's
+  `reset` discards the composition and sends nothing back. Its handler
+  (599-601) calls `TextInput::Reset` (`components/exo/text_input.cc`
+  152-156), which cancels its tracked composition and calls
+  `InputMethodAsh::CancelComposition`
+  (`ui/base/ime/ash/input_method_ash.cc` 410-415). That resets the engine
+  without confirming or clearing anything on the client. Revision Chromium
+  faf801e427d0. So the `reset` itself commits nothing, and the guest's
+  commit is the only commit of that text that the reset causes.
+
+  The commit is an input-method edit the guest has yet to report
+  (`unreported_host_edit`), and it ends the Backspace repeat leased to
+  the field, as a confirmation does. The press is re-sent after the
+  transaction rather than forwarded, since a forward precedes its
+  message's other events. The proxy tracks each host pointer's surface in
+  `PointerFocus` from its `enter` until a `leave` of that surface, the
+  pointer's end or the surface's end. A `leave` of another surface,
+  which a host can deliver late, changes nothing, as for a keyboard. The
+  dispatcher drops an `enter` or `leave` naming a surface the guest
+  destroyed (`ShadowTable::event_object`). Touch is not handled.
+
+  Events Exo sent before it handled the `reset` still arrive, and they
+  belong to the composition the press committed. So the `reset` goes
+  behind a fence, a `wl_display.sync`
+  (`InternalCallback::TextInputResetFence`, kept in
+  `TextInputState::reset_fence`). Exo handles requests in order. So the
+  sync's `done` comes after every event Exo sent before it handled the
+  `reset`, and before any event of a request sent later, a later
+  `activate` included, so the fence needs no generation of its own.
+  Until the fence returns, every host composition event of the field is
+  dropped: a preedit, a preedit region, a commit, a delete or a
+  confirmation. One predicate, `TextInputState::host_composition_is_current`,
+  gates each one's plan. Why each is dropped:
+  - A preedit or a preedit region would show text Exo no longer composes,
+    which a second press would commit again. A region would also delete
+    text the guest already has.
+  - A commit of the pressed text is the input method's own commit of
+    that composition, as when Space ended the syllable just before the
+    click.
+  - A commit of other text was made for that composition too: it changed
+    after the preedit the press committed, as from `가` to `각`, and was
+    then committed. Forwarding it would add the syllable a second time.
+  - A delete was measured against that composition.
+  - A confirmation confirms it. With nothing left to confirm, it would
+    stand for a held key the input method took, and the guest would get
+    that key.
+
+  The proxy cannot tell those events from new text typed within the
+  round trip, such as a `.`, so that text is lost, as is any key the
+  input method took within it. Losing a keystroke typed during the click
+  was preferred to inserting text twice.
+
+  The fence cannot be a drain barrier: `deactivate` makes Exo confirm
+  the composition itself, and until the next `activate` attaches the
+  input method, keys would reach the guest without it. A fence ends only
+  when its callback returns (`assert_no_orphans` checks that each one
+  names a pending callback). A focus change or the text input's end does
+  not end it early: requests sent later reach Exo after it.
+
+  The fence covers the events already on the wire when Exo handled the
+  `reset`, not results the input method had yet to produce. The review
+  of this rule found that Chrome's `CancelComposition` does not cancel a
+  key the engine is still processing (`ProcessKeyEventDone`). So an
+  engine commit for a key pressed right before the click can still
+  arrive after the fence, and the guest then gets the syllable twice.
+  The fence narrows the window; it does not close it, and no heuristic
+  filter tries to.
+
+  Tests: `a_press_on_the_composing_surface_commits_the_preedit`,
+  `a_press_elsewhere_or_without_a_composition_changes_nothing`,
+  `a_leave_of_another_surface_keeps_the_pointer_on_its_surface`,
+  `a_commit_in_flight_at_a_press_is_dropped`,
+  `a_preedit_in_flight_at_a_press_is_dropped`,
+  `a_preedit_region_in_flight_at_a_press_is_dropped`,
+  `a_delete_in_flight_at_a_press_is_dropped`,
+  `a_confirm_in_flight_at_a_press_is_dropped`,
+  `a_reset_fence_ends_before_the_next_generation`,
+  `a_reset_fence_ends_with_its_text_input`,
+  `pointer_focus_ends_with_its_surface_or_pointer`.
 
 ## Process
 

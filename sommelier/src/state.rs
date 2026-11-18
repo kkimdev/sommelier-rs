@@ -46,8 +46,8 @@ pub(crate) use self::input::{
     reconcile, ActivationStep, ConfirmPreeditPlan, CursorRect, GuestKeyDecision, GuestKeyDelivery,
     GuestKeyEvent, GuestKeyOwner, HostApplied, HostCommitPlan, HostContentType, HostPreeditContext,
     HostPreeditPlan, HostTarget, KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry,
-    KeyboardFocusUpdate, PeekKeyProvenance, PreeditRegionPlan, SeatFocusChange, ShownPreedit,
-    TextInputState, V3Pending,
+    KeyboardFocusUpdate, PeekKeyProvenance, PointerFocus, PreeditRegionPlan, SeatFocusChange,
+    ShownPreedit, TextInputState, V3Pending,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
@@ -352,6 +352,7 @@ pub struct Context {
     pub text_inputs: HashMap<u32, TextInputState>,
     pub keyboard_to_seat: HashMap<u32, u32>,
     pub keyboard_focus: KeyboardFocusRegistry,
+    pub pointer_focus: PointerFocus,
     pub last_sender_id: u32,
     /// Requests the message being dispatched sends the host besides its
     /// forward (an ack_key or a bind, say); part of its [`Effects`].
@@ -1012,6 +1013,7 @@ impl Context {
             text_inputs: HashMap::new(),
             keyboard_to_seat: HashMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
+            pointer_focus: PointerFocus::default(),
             last_sender_id: 0,
             client_to_host_queue: Vec::new(),
             host_to_client_queue: Vec::new(),

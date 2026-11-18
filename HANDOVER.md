@@ -93,28 +93,34 @@
   (`a_client_that_waits_for_done_reports_the_text_an_edit_leaves`), so
   only a delete within that round trip can land wrong. Mirroring Exo's
   `SurroundingTextTracker` would close this; no host has shown it.
-- A Chromium or Electron v3 guest can show a stale syllable again after
-  a click. Clicking during a composition makes Chromium commit the
-  syllable and `Reset()` its own composition, but Exo is never told:
-  text-input-v1 has no `reset` the proxy could send, so Exo keeps
-  composing, and the next answered `done` shows the old preedit again at
-  the click point. After a reset with a composition open, Chromium
-  ignores input-method text that no key brought for 100 ms
-  (`kIgnoreCommitsDuration`, `ui/base/ime/linux/input_method_auralinux.cc`),
-  which usually hides this; a busy Electron window can take longer. To
-  check: in VS Code, click, and click again, while a Korean syllable is
-  composing. The fix is to end Exo's composition on a pointer press on
-  the focused surface, as mutter and KWin end theirs; it is a tracked
-  follow-up.
+- The pointer press that ends a composition
+  ([Keyboard and IME](docs/INVARIANTS.md#keyboard-and-ime)) has not been
+  checked on a host. In VS Code or Chrome started with
+  `--enable-wayland-ime --wayland-text-input-version=3`, and in a GTK3 app
+  such as gedit, type a Korean syllable and click elsewhere in the field
+  while it is composing. The syllable must stay where it was, committed
+  once. The next jamo must start a new syllable at the click point,
+  without joining the old one, and the old syllable must not show up
+  again there.
+  - Press Space and click at the same instant, many times. The syllable
+    should appear once.
+  - The reset's fence covers only events already on the wire. A commit
+    the input method makes after Exo handled the `reset`, for a key it
+    was still processing, still doubles the syllable. Note how often
+    that happens.
+  - A key the input method takes within the click's round trip is lost
+    by design (see the rule).
+  - A click on a subsurface, which the keyboard focus never names, does
+    not end the composition. mutter also matches the exact surface; KWin
+    matches the window.
+  - Touch does not end a composition yet; mutter's and KWin's do.
 - The `done` that answers each guest text-input-v3 commit has not been
   checked on a host. In Chrome or VS Code started with
   `--enable-wayland-ime --wayland-text-input-version=3`, type Korean and
   check that the candidate window follows the caret after a click or an
   arrow key, before the next keystroke, and that a composition survives
   the caret-rectangle updates it causes, with no syllable dropped or
-  doubled. In a GTK3 app such as Firefox, click in the field while a
-  syllable is composing: the syllable stays shown, and the next jamo
-  joins it.
+  doubled.
 - Deletes are dropped while the guest has a selection, because GTK and Qt
   count v3 delete lengths from the cursor and Chromium's v3 client from
   the selection's ends; no lengths serve both. An input method that

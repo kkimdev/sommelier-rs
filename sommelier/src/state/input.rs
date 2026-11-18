@@ -322,6 +322,13 @@ pub struct TextInputState {
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
+    /// The `wl_display.sync` queued after the `reset` a pointer press sent
+    /// the host ([`Self::prepare_press_commit`]), until it returns. Exo
+    /// sends nothing in answer to the `reset`, but the events it sent
+    /// before it handled the `reset` still arrive, and they belong to the
+    /// composition the press committed (INVARIANTS "A pointer press ends
+    /// the composition on its surface").
+    pub(crate) reset_fence: Option<HostId>,
     /// Whether the proxy warned that the guest seat cannot carry an
     /// activation, which every later reconcile would repeat. It is never
     /// reset, so the proxy warns once per text input, not once per seat it
@@ -408,6 +415,7 @@ impl TextInputState {
             pending_cursor_position: None,
             unreported_host_edit: false,
             host: HostApplied::default(),
+            reset_fence: None,
             warned_seat_missing: false,
             warned_delete_range: false,
         }
@@ -535,14 +543,26 @@ impl TextInputState {
         self.pending_cursor_position = Some((index, anchor));
     }
 
+    /// Whether host composition events (a preedit, a preedit region, a
+    /// commit, a delete or a confirmation) are current: the host
+    /// generation is active, and they were not sent before the host
+    /// handled a press's `reset` ([`Self::reset_fence`]). Every
+    /// `prepare_*` plan of one checks it, so a stale one is dropped.
+    pub(crate) fn host_composition_is_current(&self) -> bool {
+        self.host_is_active() && self.reset_fence.is_none()
+    }
+
+    /// The plan of a host preedit, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_host_preedit(&self) -> Option<HostPreeditPlan> {
-        self.host_is_active().then_some(HostPreeditPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            had_preedit: self.current_preedit.has_text(),
-            selection: self.pending_preedit_selection,
-            cursor: self.pending_preedit_cursor,
-        })
+        self.host_composition_is_current()
+            .then_some(HostPreeditPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                had_preedit: self.current_preedit.has_text(),
+                selection: self.pending_preedit_selection,
+                cursor: self.pending_preedit_cursor,
+            })
     }
 
     pub(crate) fn finish_host_preedit(
@@ -571,13 +591,16 @@ impl TextInputState {
         arm_backspace_repeat
     }
 
+    /// The plan of a host commit, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_host_commit(&self) -> Option<HostCommitPlan> {
-        self.host_is_active().then_some(HostCommitPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            had_preedit: self.current_preedit.has_text(),
-            cursor_position: self.pending_cursor_position,
-        })
+        self.host_composition_is_current()
+            .then_some(HostCommitPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                had_preedit: self.current_preedit.has_text(),
+                cursor_position: self.pending_cursor_position,
+            })
     }
 
     /// Close a host commit or delete, which `edited` the text unless it
@@ -590,8 +613,11 @@ impl TextInputState {
         self.unreported_host_edit |= edited;
     }
 
+    /// The plan of a host preedit region, or `None` if it is stale
+    /// ([`Self::host_composition_is_current`]) or the guest stated no
+    /// surrounding text.
     pub(crate) fn prepare_preedit_region(&self) -> Option<PreeditRegionPlan> {
-        if !self.host_is_active() {
+        if !self.host_composition_is_current() {
             return None;
         }
         let (surrounding_text, surrounding_cursor, _) = self.committed.surrounding_text.as_ref()?;
@@ -623,12 +649,50 @@ impl TextInputState {
         self.unreported_host_edit = true;
     }
 
+    /// A pointer pressed on guest surface `surface`. A press on the
+    /// surface this text input is focused on, while the guest shows a
+    /// preedit of the active host generation, ends that composition before
+    /// the press reaches the guest, as mutter and KWin end theirs: the guest
+    /// commits the preedit it shows, and the host is told to `reset`
+    /// (INVARIANTS "A pointer press ends the composition on its surface").
+    ///
+    /// Returns the plan of that commit, or `None` if the press leaves the
+    /// composition alone.
+    pub(crate) fn prepare_press_commit(&self, surface: u32) -> Option<ConfirmPreeditPlan> {
+        if self.active_surface != Some(surface) || !self.current_preedit.has_text() {
+            return None;
+        }
+        self.prepare_confirm_preedit()
+    }
+
+    /// The host was sent the press's `reset`, behind the sync `callback`.
+    ///
+    /// No fence is pending then: a press commits only a shown preedit, and
+    /// no host preedit reaches the guest while one is.
+    pub(crate) fn fence_reset(&mut self, callback: HostId) {
+        debug_assert_eq!(self.reset_fence, None, "a press overwrote a pending fence");
+        self.reset_fence = Some(callback);
+    }
+
+    /// The sync `callback` returned: if it is the fence of the press's
+    /// `reset`, the host has handled the `reset`, and its events are
+    /// current again.
+    pub(crate) fn complete_reset_fence(&mut self, callback: HostId) {
+        if self.reset_fence == Some(callback) {
+            self.reset_fence = None;
+        }
+    }
+
+    /// The plan of a host confirmation, or of a press's commit, or `None`
+    /// if host composition events are stale
+    /// ([`Self::host_composition_is_current`]).
     pub(crate) fn prepare_confirm_preedit(&self) -> Option<ConfirmPreeditPlan> {
-        self.host_is_active().then(|| ConfirmPreeditPlan {
-            guest_seat: self.guest_seat,
-            done_serial: self.guest_commit_serial,
-            preedit_text: self.current_preedit.text.clone(),
-        })
+        self.host_composition_is_current()
+            .then(|| ConfirmPreeditPlan {
+                guest_seat: self.guest_seat,
+                done_serial: self.guest_commit_serial,
+                preedit_text: self.current_preedit.text.clone(),
+            })
     }
 
     /// The guest was not shown the preedit the proxy repeated, which it
@@ -1790,6 +1854,48 @@ pub struct KeyboardFocus {
     pub guest_seat: u32,
     pub guest_surface: u32,
     pub host_surface: u32,
+}
+
+/// The guest surface each host `wl_pointer` has entered. A
+/// `wl_pointer.button` names no surface, and a press on the surface of a
+/// composition ends it ([`TextInputState::prepare_press_commit`]).
+#[derive(Debug, Default)]
+pub struct PointerFocus(HashMap<HostId, u32>);
+
+impl PointerFocus {
+    /// `pointer` entered guest surface `surface`.
+    pub fn enter(&mut self, pointer: HostId, surface: u32) {
+        self.0.insert(pointer, surface);
+    }
+
+    /// `pointer` left guest surface `surface`. A `leave` of a surface it
+    /// is not on, which a host can deliver late, changes nothing, as for
+    /// a keyboard ([`KeyboardFocusRegistry::leave`]).
+    pub fn leave(&mut self, pointer: HostId, surface: u32) {
+        if self.surface(pointer) == Some(surface) {
+            self.0.remove(&pointer);
+        }
+    }
+
+    /// `pointer` ended.
+    pub fn forget_pointer(&mut self, pointer: HostId) {
+        self.0.remove(&pointer);
+    }
+
+    /// The surface `pointer` is on, if any.
+    pub fn surface(&self, pointer: HostId) -> Option<u32> {
+        self.0.get(&pointer).copied()
+    }
+
+    /// Guest surface `surface` ended: no pointer is on it.
+    pub fn forget_surface(&mut self, surface: u32) {
+        self.0.retain(|_, &mut entered| entered != surface);
+    }
+
+    #[cfg(test)]
+    pub(super) fn focuses_for_test(&self) -> impl Iterator<Item = (HostId, u32)> + '_ {
+        self.0.iter().map(|(&pointer, &surface)| (pointer, surface))
+    }
 }
 
 /// One authoritative seat focus transition.
