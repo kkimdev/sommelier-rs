@@ -622,6 +622,11 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
+        // A surface has state only once a request sets some
+        // (`Context::surface_mut`), so a first commit with nothing pending,
+        // as a client sends to map an xdg surface, has none. It commits
+        // the defaults, which a fresh surface has; keeping that state would
+        // record nothing.
         let mut default_surface = SurfaceState::default();
         let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
             || default_surface.prepare_commit(),
