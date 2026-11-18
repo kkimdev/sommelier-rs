@@ -20,6 +20,7 @@ limitations under the License.
 
 mod copy;
 mod damage;
+mod dmabuf;
 mod dmabuf_layout;
 mod formats;
 
@@ -30,7 +31,8 @@ pub(crate) use self::formats::{
     register_guest_shm,
 };
 
-use self::dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
+use self::dmabuf::{allocate_virtwl_dmabuf, map_dmabuf, DmabufAllocation};
+use self::dmabuf_layout::DmabufLayout;
 use self::formats::{
     format_bytes_per_pixel, guest_shm_format_available, record_host_shm_wl_format,
     supported_shm_format,
@@ -45,7 +47,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::Arc;
 
@@ -135,136 +137,6 @@ enum ShmBacking {
         host_dmabuf_id: u32,
         allocation: DmabufAllocation,
     },
-}
-
-/// A VirtWL dma-buf allocation for a guest SHM buffer.
-///
-/// VirtWL allocates a single object, so both planes of an NV12 buffer are in
-/// the one dma-buf `fd`, which the copy path maps for both.
-struct DmabufAllocation {
-    fd: OwnedFd,
-    layout: DmabufLayout,
-    modifier: u64,
-    dmabuf_sync: bool,
-}
-
-fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
-    let offset0 = layout.plane0().offset as usize;
-    let span = layout.span();
-    if fd < 0 || span <= offset0 {
-        return None;
-    }
-    // `mmap` takes a signed length and an `off_t` offset. Avoid lossy casts
-    // even on a wider host where a malicious Wayland metadata value can fit
-    // in usize but not in either syscall argument.
-    if span > isize::MAX as usize
-        || span - offset0 > isize::MAX as usize
-        || libc::off_t::try_from(offset0).is_err()
-    {
-        return None;
-    }
-    // mmap(2) requires a page-aligned file offset. VirtWL/minigbm normally
-    // returns offset 0 for linear allocations; reject an incompatible layout
-    // rather than mapping the wrong bytes.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page_size = usize::try_from(page_size).ok()?;
-    if page_size == 0 || !offset0.is_multiple_of(page_size) {
-        return None;
-    }
-    // A successful mmap does not prove that a regular file is large enough:
-    // touching a page beyond EOF raises SIGBUS. DMA-BUF providers generally
-    // expose anon-inode descriptors without a useful st_size, so only enforce
-    // the check for regular files (including memfd objects).
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
-        return None;
-    }
-    let file_type = (stat.st_mode as libc::mode_t) & libc::S_IFMT;
-    if stat.st_size < 0 {
-        return None;
-    }
-    // DMA-BUF anon-inode implementations differ in their mode bits, but
-    // several expose a positive st_size that is authoritative. Check every
-    // descriptor with a usable size; only a zero-sized non-regular provider
-    // has to rely on mmap as the final validation.
-    if file_type == libc::S_IFREG || stat.st_size > 0 {
-        let file_size = u64::try_from(stat.st_size).ok()?;
-        let required_size = u64::try_from(span).ok()?;
-        if file_size < required_size {
-            return None;
-        }
-    }
-    let map_size = span - offset0;
-    let ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            map_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            libc::off_t::try_from(offset0).ok()?,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        None
-    } else {
-        Some((ptr as *mut u8, map_size))
-    }
-}
-
-fn allocate_virtwl_dmabuf(
-    ctx: &Context,
-    width: i32,
-    height: i32,
-    format: u32,
-) -> io::Result<DmabufAllocation> {
-    let Some(channel) = ctx
-        .virtwayland_channel
-        .as_ref()
-        .filter(|channel| channel.supports_dmabuf())
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "VirtWL dma-buf allocation is unavailable",
-        ));
-    };
-    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
-    let (fd, metadata) = channel.allocate_dmabuf(
-        u32::try_from(width)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf width"))?,
-        u32::try_from(height)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf height"))?,
-        drm_format,
-    )?;
-    let layout = validate_dmabuf_layout(
-        drm_format,
-        width,
-        height,
-        metadata.strides,
-        metadata.offsets,
-    )
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid VirtWL dma-buf layout"))?;
-    // Probe the exact mapping that the copy path will use while the allocation
-    // is still owned by this function.  A VirtWL driver may expose the ioctl
-    // but return metadata that cannot be mmaped (for example a non-page-aligned
-    // plane-0 offset); treat that as an allocation failure so the caller can
-    // fall back to ordinary VirtWL shared memory.
-    if let Some((mapped_ptr, mapped_size)) = map_dmabuf(fd.as_raw_fd(), layout) {
-        unsafe {
-            libc::munmap(mapped_ptr as *mut libc::c_void, mapped_size);
-        }
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "VirtWL dma-buf cannot be mapped",
-        ));
-    }
-    Ok(DmabufAllocation {
-        fd,
-        layout,
-        modifier: 0,
-        dmabuf_sync: true,
-    })
 }
 
 /// Reject a `wl_buffer` creation the proxy has no resources for.
@@ -1177,12 +1049,12 @@ impl protocols::wayland::wl_buffer::WlBufferHandler for ShmHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::map_dmabuf;
+    use super::dmabuf_layout::validate_dmabuf_layout;
     use super::ShmHandler;
     use super::{
         copy_shm_damage, record_host_shm_wl_format, register_guest_shm, regular_file_has_size,
         retire_eligible_buffers, valid_buffer_layout, valid_pool_resize, valid_pool_size,
-        valid_shm_stride, validate_dmabuf_layout, ShmCopyLayout,
+        valid_shm_stride, ShmCopyLayout,
     };
     use super::{create_dmabuf_buffer, create_shared_buffer, DmabufAllocation, ShmBufferRequest};
     use crate::handler::registry::RegistryHandler;
@@ -1207,7 +1079,7 @@ mod tests {
     };
     use crate::wire::{Action, WireMessage, WL_DISPLAY_ID};
     use std::fs::File;
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsFd;
     use std::os::unix::fs::FileExt;
     use std::sync::Arc;
 
@@ -1390,30 +1262,6 @@ mod tests {
         assert!(valid_shm_stride(wl_shm::FORMAT_NV12, 10, 10));
         assert!(!valid_shm_stride(wl_shm::FORMAT_NV12, 11, 11));
         assert!(!valid_shm_stride(0xdead_beef, 10, 40));
-    }
-
-    #[test]
-    fn rejects_unaligned_dmabuf_mappings() {
-        // A layout's span cannot exceed isize::MAX on a 64-bit host (u32
-        // offsets and strides, i32 rows), so only the alignment rule is
-        // reachable here.
-        let layout = validate_dmabuf_layout(0x3432_5258, 1, 1, [4, 0, 0], [1, 0, 0])
-            .expect("a valid but unaligned single-plane layout");
-        assert!(map_dmabuf(0, layout).is_none());
-    }
-
-    #[test]
-    fn rejects_regular_dmabuf_backing_shorter_than_metadata() {
-        let fd = shm_pool_file(&[0; 4096]);
-        assert!(
-            map_dmabuf(
-                fd.as_raw_fd(),
-                validate_dmabuf_layout(0x3432_5258, 16, 128, [64, 0, 0], [0, 0, 0])
-                    .expect("an 8192-byte single-plane layout")
-            )
-            .is_none(),
-            "mmap preflight must reject a regular backing that would SIGBUS"
-        );
     }
 
     /// A buffer whose host copy is shared memory, which the host imports
