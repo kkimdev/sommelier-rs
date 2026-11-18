@@ -1783,12 +1783,14 @@ mod tests {
         (k.id, event.into())
     }
 
-    /// The press and release that IME recovery replays for `key` at
-    /// `time`, with synthetic serials `serial` and `serial + 1`.
-    fn recovered(k: Keyboard, serial: u32, time: u32, key: u32) -> [(u32, AnyEvent); 2] {
+    /// What the guest gets when IME recovery replays `key` on `k` at
+    /// `time`: a press and release with synthetic serials `serial` and
+    /// `serial + 1`, and the `done` of `ime`'s transaction.
+    fn recovered(ime: Ime, k: Keyboard, serial: u32, time: u32, key: u32) -> [(u32, AnyEvent); 3] {
         [
             key_event(k, serial, time, key, PRESSED),
             key_event(k, serial + 1, time, key, RELEASED),
+            done(ime),
         ]
     }
 
@@ -3777,9 +3779,10 @@ mod tests {
             2,
             "only focused text inputs should receive leave events"
         );
+        let hosts = text_inputs.map(|(guest, _)| guest + 500);
         let deactivated = p.ctx.client_to_host_queue.iter().filter(|(message, _)| {
             msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
-                && [540, 541, 542].contains(&msg_sender(message))
+                && hosts.contains(&msg_sender(message))
         });
         assert_eq!(
             deactivated.count(),
@@ -4129,10 +4132,7 @@ mod tests {
             }
             kb.confirm(ime).await;
             let expected = match recovery {
-                Some(Replay { key, time }) => {
-                    let [press, release] = recovered(kb.k, 1, time, key);
-                    vec![press, release, done(ime)]
-                }
+                Some(Replay { key, time }) => recovered(ime, kb.k, 1, time, key).into(),
                 None => Vec::new(),
             };
             assert_eq!(kb.s.guest_received(), expected, "{case}");
@@ -4165,8 +4165,10 @@ mod tests {
 
         for serial in [1, 3, 5] {
             kb.confirm(ime).await;
-            let [press, release] = recovered(kb.k, serial, 1234, KEY_SPACE);
-            assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+            assert_eq!(
+                kb.s.guest_received(),
+                recovered(ime, kb.k, serial, 1234, KEY_SPACE)
+            );
         }
 
         kb.peek(701, 1300, KEY_SPACE, RELEASED).await;
@@ -4186,8 +4188,10 @@ mod tests {
         let ime = kb.text_input().await;
         kb.peek(1, 500, KEY_SPACE, PRESSED).await;
         kb.confirm(ime).await;
-        let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
-        assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 1, 500, KEY_SPACE)
+        );
 
         assert_eq!(kb.key(1, KEY_SPACE, PRESSED).await, Route::Host);
         assert_eq!(kb.key(3, KEY_SPACE, REPEATED).await, Route::Host);
@@ -4207,8 +4211,10 @@ mod tests {
         let ime = kb.text_input().await;
         kb.peek(1, 500, KEY_SPACE, PRESSED).await;
         kb.confirm(ime).await;
-        let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
-        assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 1, 500, KEY_SPACE)
+        );
 
         kb.keysym(ime, 501, 2, keysyms::KEY_space, PRESSED).await;
         kb.keysym(ime, 502, 3, keysyms::KEY_space, RELEASED).await;
@@ -4223,84 +4229,44 @@ mod tests {
     async fn recovery_tombstone_suppresses_keysym_after_physical_release() {
         #[derive(Clone, Copy, Debug)]
         enum Delayed {
-            KeyboardPress,
-            KeyboardRelease,
+            KeyPress,
+            KeyRelease,
             PeekRelease,
-            KeysymPress,
-            KeysymRelease,
+            SymPress,
+            SymRelease,
         }
         use Delayed::*;
 
         let orderings = [
-            [
-                KeysymPress,
-                KeysymRelease,
-                KeyboardPress,
-                KeyboardRelease,
-                PeekRelease,
-            ],
-            [
-                KeyboardPress,
-                KeysymPress,
-                KeysymRelease,
-                KeyboardRelease,
-                PeekRelease,
-            ],
-            [
-                KeyboardPress,
-                KeyboardRelease,
-                KeysymPress,
-                KeysymRelease,
-                PeekRelease,
-            ],
-            [
-                KeysymPress,
-                KeyboardPress,
-                PeekRelease,
-                KeysymRelease,
-                KeyboardRelease,
-            ],
-            [
-                KeyboardPress,
-                PeekRelease,
-                KeysymPress,
-                KeysymRelease,
-                KeyboardRelease,
-            ],
-            [
-                KeysymPress,
-                KeyboardPress,
-                KeyboardRelease,
-                PeekRelease,
-                KeysymRelease,
-            ],
-            [
-                PeekRelease,
-                KeyboardPress,
-                KeyboardRelease,
-                KeysymPress,
-                KeysymRelease,
-            ],
+            [SymPress, SymRelease, KeyPress, KeyRelease, PeekRelease],
+            [KeyPress, SymPress, SymRelease, KeyRelease, PeekRelease],
+            [KeyPress, KeyRelease, SymPress, SymRelease, PeekRelease],
+            [SymPress, KeyPress, PeekRelease, SymRelease, KeyRelease],
+            [KeyPress, PeekRelease, SymPress, SymRelease, KeyRelease],
+            [SymPress, KeyPress, KeyRelease, PeekRelease, SymRelease],
+            [PeekRelease, KeyPress, KeyRelease, SymPress, SymRelease],
         ];
         for ordering in orderings {
             let mut kb = Kb::new().await;
             let ime = kb.text_input().await;
             kb.peek(1, 500, KEY_SPACE, PRESSED).await;
             kb.confirm(ime).await;
-            let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
-            assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+            assert_eq!(
+                kb.s.guest_received(),
+                recovered(ime, kb.k, 1, 500, KEY_SPACE)
+            );
 
             for event in ordering {
                 match event {
-                    KeyboardPress => {
+                    KeyPress => {
                         assert_eq!(kb.key(1, KEY_SPACE, PRESSED).await, Route::Host)
                     }
-                    KeyboardRelease => {
+                    KeyRelease => {
                         assert_eq!(kb.key(2, KEY_SPACE, RELEASED).await, Route::Host)
                     }
                     PeekRelease => kb.peek(2, 503, KEY_SPACE, RELEASED).await,
-                    KeysymPress => kb.keysym(ime, 500, 1, keysyms::KEY_space, PRESSED).await,
-                    KeysymRelease => kb.keysym(ime, 503, 2, keysyms::KEY_space, RELEASED).await,
+                    SymPress => kb.keysym(ime, 500, 1, keysyms::KEY_space, PRESSED).await,
+                    SymRelease => kb.keysym(ime, 503, 2, keysyms::KEY_space, RELEASED).await,
                 }
                 assert_eq!(kb.s.guest_received(), [], "{ordering:?}: {event:?}");
             }
@@ -4325,7 +4291,10 @@ mod tests {
         let ime = kb.text_input().await;
         kb.peek(1, 500, KEY_SPACE, PRESSED).await;
         kb.confirm(ime).await;
-        kb.s.guest_received();
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 1, 500, KEY_SPACE)
+        );
         kb.peek(2, 510, KEY_SPACE, RELEASED).await;
         kb.peek(10, 600, KEY_SPACE, PRESSED).await;
 
@@ -4386,8 +4355,10 @@ mod tests {
             "the keysyms suppress the delayed physical press"
         );
         kb.confirm(ime).await;
-        let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
-        assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 1, 500, KEY_SPACE)
+        );
         kb.peek(4, 503, KEY_SPACE, RELEASED).await;
         kb.confirm(ime).await;
         assert_eq!(kb.s.guest_received(), []);
@@ -4412,8 +4383,10 @@ mod tests {
         );
 
         kb.confirm(ime).await;
-        let [press, release] = recovered(other, 1, 500, KEY_SPACE);
-        assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, other, 1, 500, KEY_SPACE)
+        );
         kb.keysym(ime, 503, 4, keysyms::KEY_space, PRESSED).await;
         kb.keysym(ime, 504, 5, keysyms::KEY_space, RELEASED).await;
         assert_eq!(
@@ -4460,7 +4433,9 @@ mod tests {
         assert_eq!(kb.s.guest_received(), []);
         assert_eq!(kb.s.host_received(), released(other));
         kb.confirm(ime).await;
-        let [press, release] = recovered(kb.k, 1, 500, KEY_SPACE);
-        assert_eq!(kb.s.guest_received(), [press, release, done(ime)]);
+        assert_eq!(
+            kb.s.guest_received(),
+            recovered(ime, kb.k, 1, 500, KEY_SPACE)
+        );
     }
 }
