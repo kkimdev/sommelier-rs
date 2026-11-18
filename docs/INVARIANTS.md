@@ -988,8 +988,8 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     802-825), so no lengths delete Exo's range in both;
   - for a non-negative index, while an edit of the input method that the
     proxy forwarded (a non-empty commit, the reset commit of a cleared
-    preedit, a confirmation, a preedit region or a delete) is not yet in
-    a surrounding text the guest committed
+    preedit, a confirmation, a non-empty preedit region or a delete) is
+    not yet in a surrounding text the guest committed
     (`TextInputState::unreported_host_edit`), since Exo measures against
     its prediction of the text, which includes the edit;
   - if the range does not contain the cursor, does not fit that text on

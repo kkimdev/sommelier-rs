@@ -5062,6 +5062,18 @@ mod tests {
                 vec![DONE_2, delete(1, 0), DONE_2],
             ),
             (
+                // The guest gets only a `done`, so it has no edit to report.
+                "an empty preedit region edits nothing",
+                Some(("abc", 3, 3)),
+                |f| {
+                    vec![
+                        ext::set_preedit_region(f.host_ext, 0, 0),
+                        f.delete_range(2, 1),
+                    ]
+                },
+                vec![DONE_2, delete(1, 0), DONE_2],
+            ),
+            (
                 // Exo deletes "cX" of its "abcX|def"; in the guest's
                 // "abc|def", the same bytes are "c" and "d".
                 "a delete after a commit the guest has not reported is dropped",

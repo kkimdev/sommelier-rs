@@ -315,11 +315,11 @@ pub struct TextInputState {
     /// it.
     pub pending_cursor_position: Option<(i32, i32)>,
     /// Whether the proxy has forwarded an edit of the host input method (a
-    /// non-empty commit, confirmation, preedit region or delete) since the
-    /// guest last committed its surrounding text. Exo measures its deletes
-    /// against its prediction of the text, which includes such an edit, so
-    /// until the guest reports the result, the committed text is not what
-    /// Exo measured.
+    /// non-empty commit, confirmation, non-empty preedit region or delete)
+    /// since the guest last committed its surrounding text. Exo measures
+    /// its deletes against its prediction of the text, which includes such
+    /// an edit, so until the guest reports the result, the committed text
+    /// is not what Exo measured.
     pub(crate) unreported_host_edit: bool,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
@@ -646,11 +646,13 @@ impl TextInputState {
         debug_assert_eq!(plan.cursor, self.pending_preedit_cursor);
         self.pending_preedit_selection = None;
         self.pending_preedit_cursor = None;
+        // An empty region deletes nothing and leaves no preedit, so the
+        // guest has no edit to report.
+        self.unreported_host_edit |= !preedit_text.is_empty();
         self.current_preedit = ShownPreedit {
             text: preedit_text,
             cursor,
         };
-        self.unreported_host_edit = true;
     }
 
     /// A pointer button or a touch pressed on guest surface `surface`. A
