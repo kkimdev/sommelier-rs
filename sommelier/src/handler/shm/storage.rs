@@ -22,14 +22,13 @@ use super::dmabuf_layout::DmabufLayout;
 use super::formats::wl_shm_format_to_drm_format;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
 use crate::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool};
-use crate::state::{BufferState, Context, StalePixels};
+use crate::state::{BufferState, Context, HostMapping, StalePixels};
 use crate::wire::Action;
 use log::{debug, error};
 use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
-use std::ptr;
 use std::sync::Arc;
 
 /// The host storage chosen for one guest SHM buffer.
@@ -120,14 +119,13 @@ impl From<DmabufLayout> for HostCopyPlanes {
 }
 
 impl ShmBufferRequest {
-    /// The state of this buffer, whose host copy is `dest_fd`, mapped at
-    /// `dest_ptr` for `dest_size` bytes, which the state unmaps when it is
-    /// dropped, with its planes at `planes`. The host copy lacks every
+    /// The state of this buffer, whose host copy is `dest_fd`, mapped as
+    /// `host_copy`, with its planes at `planes`. The host copy lacks every
     /// pixel so far.
     fn buffer_state(
         &self,
         dest_fd: OwnedFd,
-        (dest_ptr, dest_size): (*mut u8, usize),
+        host_copy: HostMapping,
         planes: HostCopyPlanes,
         dmabuf_sync: bool,
     ) -> BufferState {
@@ -143,8 +141,7 @@ impl ShmBufferRequest {
             dmabuf_plane1_offset: planes.plane1_offset,
             dmabuf_plane1_stride: planes.plane1_stride,
             dmabuf_sync,
-            dest_ptr,
-            dest_size,
+            host_copy: Some(host_copy),
             stale: StalePixels::all(),
         }
     }
@@ -278,9 +275,8 @@ pub(super) fn create_shared_buffer(
         size: buffer_size,
         ..
     } = request;
-    // Check the capability before mapping the destination so a
-    // disappearing wl_shm global cannot leak a raw mmap that has
-    // no BufferState owner.
+    // Check the capability before mapping the destination, so that a
+    // missing wl_shm global fails before any work.
     let Some(host_wl_shm_id) = ctx.host_shm_id else {
         error!("wl_shm not available on host");
         return reject_buffer_creation(ctx, pool_id, "host wl_shm is unavailable");
@@ -304,24 +300,14 @@ pub(super) fn create_shared_buffer(
 
     // Map the buffer for SHM synchronization. Both VirtWL allocations
     // and memfds are ordinary shared-memory fds and can be mapped directly.
-    let dest_size = buffer_size.unsigned_abs() as usize;
-    let dest_ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            dest_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            shared_fd.as_raw_fd(),
-            0,
-        ) as *mut u8
-    };
-    if dest_ptr as *mut libc::c_void == libc::MAP_FAILED {
-        error!(
-            "Failed to mmap shared SHM buffer: {:?}",
-            std::io::Error::last_os_error()
-        );
-        return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm buffer backing");
-    }
+    let host_copy =
+        match HostMapping::map_shared(shared_fd.as_fd(), buffer_size.unsigned_abs() as usize, 0) {
+            Ok(host_copy) => host_copy,
+            Err(error) => {
+                error!("Failed to mmap shared SHM buffer: {:?}", error);
+                return reject_buffer_creation(ctx, pool_id, "unable to map wl_shm buffer backing");
+            }
+        };
 
     // The temporary host wl_shm_pool remains live until the queued
     // destroy request is processed by the compositor, although it has no
@@ -361,7 +347,7 @@ pub(super) fn create_shared_buffer(
     ctx.retire_destroyed_host_object(host_pool_id);
 
     let planes = HostCopyPlanes::like_guest(&request);
-    let state = request.buffer_state(shared_fd, (dest_ptr, dest_size), planes, false);
+    let state = request.buffer_state(shared_fd, host_copy, planes, false);
     register_shm_buffer(ctx, &request, host_buffer_id, state)
 }
 
@@ -416,7 +402,7 @@ pub(super) fn create_dmabuf_buffer(
         None
     };
 
-    let Some((dest_ptr, dest_size)) = map_dmabuf(dmabuf_fd_owned.as_raw_fd(), layout) else {
+    let Some(host_copy) = map_dmabuf(dmabuf_fd_owned.as_fd(), layout) else {
         error!(
             "dma-buf cannot be safely mmaped (offset={}, size={})",
             layout.plane0().offset,
@@ -481,7 +467,7 @@ pub(super) fn create_dmabuf_buffer(
 
     let state = request.buffer_state(
         dmabuf_fd_owned,
-        (dest_ptr, dest_size),
+        host_copy,
         HostCopyPlanes::from(layout),
         dmabuf_sync,
     );
@@ -529,12 +515,8 @@ mod tests {
     /// does.
     fn copy_every_pixel(buffer: &BufferState) {
         let layout = ShmCopyLayout::for_buffer(buffer).expect("a copy layout");
-        assert!(!buffer.dest_ptr.is_null());
-        // SAFETY: the buffer's host copy maps `dest_size` bytes that the
-        // state owns, and the test holds no other reference to them.
-        let destination =
-            unsafe { std::slice::from_raw_parts_mut(buffer.dest_ptr, buffer.dest_size) };
-        copy_shm_damage(&buffer.pool_file, destination, layout, &DamageRegion::Full).unwrap();
+        let host_copy = buffer.host_copy.as_ref().expect("a host copy");
+        copy_shm_damage(&buffer.pool_file, host_copy, layout, &DamageRegion::Full).unwrap();
     }
 
     /// A buffer whose host copy is shared memory, which the host imports

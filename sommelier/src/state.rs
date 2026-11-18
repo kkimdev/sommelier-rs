@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod aura_surfaces;
+mod host_mapping;
 mod id_allocator;
 mod input;
 mod internal_callbacks;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 
 pub(crate) use self::aura_surfaces::AuraSurfaces;
+pub(crate) use self::host_mapping::HostMapping;
 use self::render::RenderBufferRegistry;
 #[cfg(test)]
 use self::render::MAX_PENDING_DAMAGE_RECTS;

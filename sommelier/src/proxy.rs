@@ -3607,8 +3607,7 @@ mod tests {
             dmabuf_plane1_offset: 0,
             dmabuf_plane1_stride: 0,
             dmabuf_sync: false,
-            dest_ptr: std::ptr::null_mut(),
-            dest_size: 0,
+            host_copy: None,
             stale: StalePixels::all(),
         }
     }

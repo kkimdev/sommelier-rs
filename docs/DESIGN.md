@@ -199,7 +199,7 @@ encode wire bytes ad hoc.
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
@@ -410,7 +410,10 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   pixels (a short read) is the client's error and ends the session with
   `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
   the commit and forces a full copy next time. This is a copy, not
-  zero-copy.
+  zero-copy. The proxy's mapping of the host storage is a `HostMapping`,
+  which only the kernel writes, as `pread` fills a range of it: the
+  host may read that memory at any time, so the proxy never holds a Rust
+  reference to it.
 - Damage carries its coordinate space in its type: `BufferRect` for
   `damage_buffer` and the copy, `SurfaceRect` for `wl_surface.damage` and
   the host, which takes nothing else. `SurfaceMapping` (`render.rs`) is
