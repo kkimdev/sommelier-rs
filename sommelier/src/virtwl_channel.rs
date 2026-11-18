@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 // The VirtWL device boundary: its ioctls return raw descriptors, which the
-// functions below that allow `clippy::disallowed_methods` take over or
-// close, even on error paths. The allow is per function so the blocking
-// guard still covers the rest of the channel.
+// proxy owns even when the ioctl fails. Each ioctl wrapper hands what its
+// ioctl wrote to `take_returned_fd`, `probe_supports_dmabuf`,
+// `take_dmabuf` or `recv_result`, which take every descriptor over or
+// close it, on error paths too. Only the helpers that handle raw
+// descriptors allow `clippy::disallowed_methods`, each on its own, so the
+// blocking guard still covers the rest of the channel.
 
 use crate::virtwl::{
-    virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_recv, virtwl_ioctl_send,
-    virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,
+    virtwl_ioctl_dmabuf_sync, virtwl_ioctl_new, virtwl_ioctl_new_dmabuf, virtwl_ioctl_recv,
+    virtwl_ioctl_send, virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,
     VIRTWL_SEND_MAX_ALLOCS,
 };
 use std::collections::HashSet;
@@ -63,13 +66,20 @@ fn add_nonblocking_flag(flags: nix::fcntl::OFlag) -> nix::fcntl::OFlag {
     flags | nix::fcntl::OFlag::O_NONBLOCK
 }
 
+/// The descriptors in `fds` that `close_raw_fds` closes: each non-negative
+/// one, once, so a repeated number cannot close a descriptor that reused it.
+fn unique_raw_fds(fds: &[i32]) -> Vec<RawFd> {
+    let mut seen = HashSet::new();
+    fds.iter()
+        .copied()
+        .filter(|&fd| fd >= 0 && seen.insert(fd))
+        .collect()
+}
+
 #[allow(clippy::disallowed_methods)]
 fn close_raw_fds(fds: &[i32]) {
-    let mut seen = HashSet::new();
-    for &fd in fds {
-        if fd >= 0 && seen.insert(fd) {
-            let _ = nix::unistd::close(fd);
-        }
+    for fd in unique_raw_fds(fds) {
+        let _ = nix::unistd::close(fd);
     }
 }
 
@@ -114,6 +124,114 @@ fn owned_fds_from_txn(raw_fds: &[i32]) -> io::Result<Vec<OwnedFd>> {
         .collect())
 }
 
+/// Takes over the descriptor a `VIRTWL_IOCTL_NEW` ioctl named `ioctl`
+/// returned in `fd`, given the ioctl's `result`.
+///
+/// The kernel may fill `fd` before reporting a later validation error, so
+/// the descriptor is the proxy's even when the ioctl failed: an error
+/// closes it.
+#[allow(clippy::disallowed_methods)]
+fn take_returned_fd(
+    result: nix::Result<libc::c_int>,
+    fd: RawFd,
+    ioctl: &str,
+) -> io::Result<OwnedFd> {
+    if let Err(error) = result {
+        close_returned_fd(fd);
+        return Err(io::Error::from(error));
+    }
+    if fd < 0 {
+        return Err(io::Error::other(format!(
+            "Invalid fd returned from {ioctl}"
+        )));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether the zero-sized `VIRTWL_IOCTL_NEW_DMABUF` probe that returned
+/// `result` and `fd` shows the kernel allocates dma-bufs. Closes `fd`,
+/// which the proxy owns whatever the result.
+fn probe_supports_dmabuf(result: nix::Result<libc::c_int>, fd: RawFd) -> bool {
+    match result {
+        Ok(_) if fd >= 0 => {
+            close_returned_fd(fd);
+            true
+        }
+        Ok(_) => {
+            log::debug!("virtwl dmabuf capability probe returned success without a valid fd");
+            false
+        }
+        Err(error) => {
+            // Some virtwl implementations allocate the descriptor before
+            // rejecting the zero-sized probe metadata. Never leak that
+            // descriptor on the capability-probe error path.
+            close_returned_fd(fd);
+            let errno = error as i32;
+            log::debug!(
+                "virtwl dmabuf capability probe returned errno {} ({})",
+                errno,
+                std::io::Error::from_raw_os_error(errno)
+            );
+            dmabuf_probe_supported(Some(errno))
+        }
+    }
+}
+
+/// The dma-buf `fd` that `VIRTWL_IOCTL_NEW_DMABUF` returned, with the
+/// layout the host allocator wrote into `raw`. A zero plane-0 stride is
+/// malformed, and drops `fd`.
+fn take_dmabuf(
+    fd: OwnedFd,
+    raw: virtwl_ioctl_new_dmabuf,
+) -> io::Result<(OwnedFd, VirtWaylandDmabufLayout)> {
+    if raw.stride0 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VirtWL dma-buf returned a zero plane-0 stride",
+        ));
+    }
+
+    Ok((
+        fd,
+        VirtWaylandDmabufLayout {
+            strides: [raw.stride0, raw.stride1, raw.stride2],
+            offsets: [raw.offset0, raw.offset1, raw.offset2],
+        },
+    ))
+}
+
+/// The message a `VIRTWL_IOCTL_RECV` that returned `result` wrote into
+/// `txn` and `payload`, the buffer after it.
+///
+/// Every descriptor in `txn` is the proxy's, so each error closes them.
+fn recv_result(
+    result: nix::Result<libc::c_int>,
+    txn: &virtwl_ioctl_txn,
+    payload: &[u8],
+) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    if let Err(error) = result {
+        // The ChromiumOS virtwl driver normally returns without
+        // publishing descriptors when recv fails. Treat the transaction
+        // buffer as an untrusted device boundary nevertheless: an
+        // alternate implementation may have allocated VFDs before
+        // reporting a later error.
+        close_raw_fds(&txn.fds);
+        return Err(io::Error::from(error));
+    }
+
+    let Some(data) = payload.get(..txn.len as usize) else {
+        close_raw_fds(&txn.fds);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Received data too large",
+        ));
+    };
+
+    let data = data.to_vec();
+    let fds = owned_fds_from_txn(&txn.fds)?;
+    Ok((data, fds))
+}
+
 pub struct VirtWaylandChannel {
     // The device file descriptor (/dev/wl0)
     dev_file: File,
@@ -124,7 +242,6 @@ pub struct VirtWaylandChannel {
 }
 
 impl VirtWaylandChannel {
-    #[allow(clippy::disallowed_methods)]
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let dev_file = OpenOptions::new()
             .read(true)
@@ -138,21 +255,7 @@ impl VirtWaylandChannel {
             // virtwl_ioctl_new is generated by ioctl_readwrite! and takes *mut T
             virtwl_ioctl_new(dev_file.as_raw_fd(), &mut new_ctx)
         };
-        if let Err(error) = ioctl_result {
-            // The kernel may fill fd before reporting a later validation
-            // error. Treat that descriptor as owned even on failure.
-            close_returned_fd(new_ctx.fd);
-            return Err(io::Error::from(error));
-        }
-
-        let ctx_fd_raw = new_ctx.fd;
-        if ctx_fd_raw < 0 {
-            return Err(io::Error::other(
-                "Invalid fd returned from VIRTWL_IOCTL_NEW_CTX",
-            ));
-        }
-
-        let ctx_fd = unsafe { OwnedFd::from_raw_fd(ctx_fd_raw) };
+        let ctx_fd = take_returned_fd(ioctl_result, new_ctx.fd, "VIRTWL_IOCTL_NEW_CTX")?;
 
         // Probe the optional dmabuf allocation ioctl once per channel. This
         // mirrors ChromiumOS Sommelier's VirtWaylandChannel::init(): virtwl
@@ -162,29 +265,7 @@ impl VirtWaylandChannel {
         let mut dmabuf_probe = crate::virtwl::virtwl_ioctl_new::new_dmabuf(0, 0, 0);
         let dmabuf_probe_result =
             unsafe { virtwl_ioctl_new(dev_file.as_raw_fd(), &mut dmabuf_probe) };
-        let supports_dmabuf = match dmabuf_probe_result {
-            Ok(_) if dmabuf_probe.fd >= 0 => {
-                close_returned_fd(dmabuf_probe.fd);
-                true
-            }
-            Ok(_) => {
-                log::debug!("virtwl dmabuf capability probe returned success without a valid fd");
-                false
-            }
-            Err(error) => {
-                // Some virtwl implementations allocate the descriptor before
-                // rejecting the zero-sized probe metadata. Never leak that
-                // descriptor on the capability-probe error path.
-                close_returned_fd(dmabuf_probe.fd);
-                let errno = error as i32;
-                log::debug!(
-                    "virtwl dmabuf capability probe returned errno {} ({})",
-                    errno,
-                    std::io::Error::from_raw_os_error(errno)
-                );
-                dmabuf_probe_supported(Some(errno))
-            }
-        };
+        let supports_dmabuf = probe_supports_dmabuf(dmabuf_probe_result, dmabuf_probe.fd);
 
         // Set non-blocking on context FD for AsyncFd
         // F_SETFL replaces the complete file-status flag set. Preserve flags
@@ -208,23 +289,11 @@ impl VirtWaylandChannel {
         self.supports_dmabuf
     }
 
-    #[allow(clippy::disallowed_methods)]
     pub fn allocate(&self, size: u32) -> io::Result<(OwnedFd, u32)> {
         let mut new_alloc = crate::virtwl::virtwl_ioctl_new::new_alloc(size);
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_alloc) };
-        if let Err(error) = ioctl_result {
-            close_returned_fd(new_alloc.fd);
-            return Err(io::Error::from(error));
-        }
-
-        let fd = new_alloc.fd;
-        if fd < 0 {
-            return Err(io::Error::other(
-                "Invalid fd returned from VIRTWL_IOCTL_NEW_ALLOC",
-            ));
-        }
-
-        Ok((unsafe { OwnedFd::from_raw_fd(fd) }, size))
+        let fd = take_returned_fd(ioctl_result, new_alloc.fd, "VIRTWL_IOCTL_NEW_ALLOC")?;
+        Ok((fd, size))
     }
 
     /// Allocate a host-backed PRIME dma-buf and return the layout selected by
@@ -233,7 +302,6 @@ impl VirtWaylandChannel {
     /// The returned descriptor is mapped into the guest by the VirtWL kernel
     /// driver.  It can be sent to the host compositor as a linux-dmabuf plane
     /// descriptor and can be CPU-accessed after a `sync` begin operation.
-    #[allow(clippy::disallowed_methods)]
     pub fn allocate_dmabuf(
         &self,
         width: u32,
@@ -250,34 +318,8 @@ impl VirtWaylandChannel {
         let mut new_dmabuf = crate::virtwl::virtwl_ioctl_new::new_dmabuf(width, height, format);
         let ioctl_result =
             unsafe { crate::virtwl::virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_dmabuf) };
-        if let Err(error) = ioctl_result {
-            close_returned_fd(new_dmabuf.fd);
-            return Err(io::Error::from(error));
-        }
-
-        let fd = new_dmabuf.fd;
-        if fd < 0 {
-            return Err(io::Error::other(
-                "Invalid fd returned from VIRTWL_IOCTL_NEW_DMABUF",
-            ));
-        }
-
-        let layout = new_dmabuf.get_dmabuf();
-        if layout.stride0 == 0 {
-            close_returned_fd(fd);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VirtWL dma-buf returned a zero plane-0 stride",
-            ));
-        }
-
-        Ok((
-            unsafe { OwnedFd::from_raw_fd(fd) },
-            VirtWaylandDmabufLayout {
-                strides: [layout.stride0, layout.stride1, layout.stride2],
-                offsets: [layout.offset0, layout.offset1, layout.offset2],
-            },
-        ))
+        let fd = take_returned_fd(ioctl_result, new_dmabuf.fd, "VIRTWL_IOCTL_NEW_DMABUF")?;
+        take_dmabuf(fd, new_dmabuf.get_dmabuf())
     }
 
     /// Synchronize CPU access to a VirtWL dma-buf.
@@ -300,7 +342,6 @@ impl VirtWaylandChannel {
             .map_err(io::Error::from)
     }
 
-    #[allow(clippy::disallowed_methods)]
     pub fn create_pipe(&self, read: bool) -> io::Result<OwnedFd> {
         let mut new_pipe = if read {
             crate::virtwl::virtwl_ioctl_new::new_pipe_read()
@@ -309,19 +350,7 @@ impl VirtWaylandChannel {
         };
 
         let ioctl_result = unsafe { virtwl_ioctl_new(self.dev_file.as_raw_fd(), &mut new_pipe) };
-        if let Err(error) = ioctl_result {
-            close_returned_fd(new_pipe.fd);
-            return Err(io::Error::from(error));
-        }
-
-        let fd = new_pipe.fd;
-        if fd < 0 {
-            return Err(io::Error::other(
-                "Invalid fd returned from VIRTWL_IOCTL_NEW_PIPE",
-            ));
-        }
-
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        take_returned_fd(ioctl_result, new_pipe.fd, "VIRTWL_IOCTL_NEW_PIPE")
     }
 
     /// Send `data` with copies of `fds`, which stay open.
@@ -427,40 +456,20 @@ fn recv_message(fd: RawFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     // Use Vec<u32> to guarantee 4-byte alignment for virtwl_ioctl_txn
     let mut buf: Vec<u32> = vec![0u32; buf_size_bytes.div_ceil(4)];
     let buf_ptr = buf.as_mut_ptr() as *mut u8;
-    let txn = unsafe { &mut *(buf_ptr as *mut virtwl_ioctl_txn) };
-    txn.len = MAX_SEND_SIZE as u32;
-    txn.fds.fill(-1); // Prevent reading uninitialized or previous FDs
+    {
+        let txn = unsafe { &mut *buf_ptr.cast::<virtwl_ioctl_txn>() };
+        txn.len = MAX_SEND_SIZE as u32;
+        txn.fds.fill(-1); // Prevent reading uninitialized or previous FDs
+    }
 
     // virtwl_ioctl_recv is generated by ioctl_write_ptr! and takes *const
     // virtwl_ioctl_txn. Even though it takes *const, the kernel WRITES to
-    // it (because of the _IOW direction quirk).
-    let result = unsafe {
-        virtwl_ioctl_recv(fd, txn as *mut virtwl_ioctl_txn as *const virtwl_ioctl_txn)
-            .map_err(io::Error::from)
-    };
-    if let Err(error) = result {
-        // The ChromiumOS virtwl driver normally returns without
-        // publishing descriptors when recv fails. Treat the transaction
-        // buffer as an untrusted device boundary nevertheless: an
-        // alternate implementation may have allocated VFDs before
-        // reporting a later error.
-        close_raw_fds(&txn.fds);
-        return Err(error);
-    }
-
-    let data_len = txn.len as usize;
-    if data_len > MAX_SEND_SIZE {
-        close_raw_fds(&txn.fds);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Received data too large",
-        ));
-    }
-
-    let data_slice = unsafe { std::slice::from_raw_parts(buf_ptr.add(header_size), data_len) };
-    let data = data_slice.to_vec();
-    let fds = owned_fds_from_txn(&txn.fds)?;
-    Ok((data, fds))
+    // it (because of the _IOW direction quirk), payload included, so pass
+    // a pointer to the whole buffer, not to the header.
+    let result = unsafe { virtwl_ioctl_recv(fd, buf_ptr.cast::<virtwl_ioctl_txn>().cast_const()) };
+    let txn = unsafe { &*buf_ptr.cast::<virtwl_ioctl_txn>() };
+    let payload = unsafe { std::slice::from_raw_parts(buf_ptr.add(header_size), MAX_SEND_SIZE) };
+    recv_result(result, txn, payload)
 }
 
 #[cfg(test)]
