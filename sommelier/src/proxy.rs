@@ -679,17 +679,24 @@ impl Client {
             // when it is due. Nothing overtakes it.
             if let Some(wait) = effects.wait {
                 // Only a guest request waits, and only one that takes no
-                // descriptors: they would be gone when it is dispatched
-                // again. A host event that waited would spin the loop.
-                debug_assert_eq!(direction, Direction::ClientToHost);
-                debug_assert_eq!(conn.read_fds.len(), queued_fds);
-                debug_assert!(
-                    forward.is_none()
-                        && deferred_work == 0
-                        && effects.to_host.is_empty()
-                        && effects.to_guest.is_empty(),
-                    "a message that waits has no output"
-                );
+                // descriptors and has no output: its descriptors would be
+                // gone when it is dispatched again, and its output would be
+                // lost. A host event that waited would spin the loop. Any
+                // other wait is a proxy bug, which ends the session.
+                if direction != Direction::ClientToHost
+                    || conn.read_fds.len() != queued_fds
+                    || forward.is_some()
+                    || deferred_work != 0
+                    || !effects.to_host.is_empty()
+                    || !effects.to_guest.is_empty()
+                {
+                    log::error!(
+                        "A {direction:?} message from object {sender_id} waits for a fence \
+                         but took descriptors or has output; ending the session"
+                    );
+                    end = Some(SessionEnd::Internal);
+                    break;
+                }
                 let now = Instant::now();
                 let timeout = wait.timeout;
                 let parked = match resumed {
@@ -2597,6 +2604,42 @@ mod tests {
             [(SURFACE_HOST, wl_surface::REQ_ATTACH)]
         );
         assert!(sent_messages(&mut guest_peer).contains(&(CALLBACK, wl_callback::EVT_DONE)));
+    }
+
+    /// A message that waits for a fence after it queued output is a proxy
+    /// bug: the session ends instead of losing the output.
+    #[tokio::test]
+    async fn a_wait_with_output_ends_the_session() {
+        use protocols::wayland::{wl_callback, wl_display, wl_surface};
+        let (mut s, surface) = session_with_a_surface().await;
+        let (buffer, callback) = (s.new_id(), s.new_id());
+        // A native buffer whose one plane the guest GPU is still writing.
+        let (plane, _signal) = crate::test_support::pipe();
+        let ctx = s.ctx();
+        ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+        ctx.shadow_table.insert_paired_with_version_for_test(
+            buffer,
+            HOST_FENCED_BUFFER,
+            "wl_buffer",
+            1,
+        );
+        assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
+        s.guest([wl_surface::req::attach(surface.id, Some(buffer), 0, 0)])
+            .await;
+        assert_eq!(s.host_received().len(), 1, "the attach");
+
+        // Injects a fault no peer can cause: an event queued for the guest
+        // when the commit waits, as from a handler that queued it first.
+        s.ctx()
+            .host_to_client_queue
+            .push(wl_callback::evt::done(callback, 0));
+        s.guest_fatal([wl_surface::req::commit(surface.id)]).await;
+        assert!(!s.parked());
+        assert_eq!(s.host_received(), []);
+        assert_eq!(
+            s.guest_received_and_error(),
+            (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION))
+        );
     }
 
     #[tokio::test]

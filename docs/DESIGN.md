@@ -322,10 +322,12 @@ or host error wins over an internal failure. After dispatch,
   anything), it leaves the message and everything after it buffered and
   ends the batch. Only a guest request with no descriptor arguments may
   wait: only the guest stream can be parked, and the descriptors would
-  be gone when the request is dispatched again. `Client` parks the guest
-  stream (`ParkedRequest`): it neither reads nor dispatches guest
-  messages, and fair dispatch does not offer them, while host events and
-  other clients go on. Once the exported sync_file is readable, or, for
+  be gone when the request is dispatched again. A message that waits
+  otherwise, or with output, is a proxy bug and ends the session as an
+  internal failure (test: `a_wait_with_output_ends_the_session`).
+  `Client` parks the guest stream (`ParkedRequest`): it neither reads nor
+  dispatches guest messages, and fair dispatch does not offer them, while
+  host events and other clients go on. Once the exported sync_file is readable, or, for
   the virtio-gpu fallback, which has no descriptor to wait on, a poll
   interval after it parked, it dispatches the same message again, which
   checks its fence afresh. The interval starts at `FENCE_POLL_INTERVAL`
