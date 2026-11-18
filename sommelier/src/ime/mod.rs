@@ -35,7 +35,7 @@ mod step;
 mod tests;
 
 // Shared with the old handlers until the staged switch deletes them.
-pub(crate) use guest::{delete_lengths, lengths_around_cursor};
+pub(crate) use guest::{delete_lengths, lengths_around_cursor, resolve_preedit_cursor};
 #[cfg(test)]
 pub(crate) use host::map_v3_content_type;
 pub(crate) use host::{content_type_requests, takes_surrounding_text_support};

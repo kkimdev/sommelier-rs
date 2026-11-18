@@ -16,7 +16,8 @@ limitations under the License.
 
 use crate::handler::callback::queue_internal_sync;
 use crate::ime::{
-    content_type_requests, delete_lengths, lengths_around_cursor, takes_surrounding_text_support,
+    content_type_requests, delete_lengths, lengths_around_cursor, resolve_preedit_cursor,
+    takes_surrounding_text_support,
 };
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
@@ -74,50 +75,6 @@ fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> 
         .get(&guest_id)
         .filter(|state| state.host_is_active())
         .map(|_| guest_id)
-}
-
-/// The `cursor_begin` and `cursor_end` of preedit `text`, from the
-/// host's pending preedit `selection` or `cursor`, or at its end. An empty
-/// preedit always gets `(0, 0)`, never the hidden cursor `(-1, -1)`
-/// (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
-fn resolve_preedit_cursor(
-    text: &str,
-    selection: Option<(u32, u32)>,
-    cursor: Option<i32>,
-) -> (i32, i32) {
-    if text.is_empty() {
-        return (0, 0);
-    }
-    if let Some((index, length)) = selection {
-        let end = index.saturating_add(length);
-        if end <= text.len() as u32
-            && text.is_char_boundary(index as usize)
-            && text.is_char_boundary(end as usize)
-        {
-            return (index as i32, end as i32);
-        }
-        log::warn!(
-            "Ignoring invalid preedit selection: index={}, length={}, text_len={}",
-            index,
-            length,
-            text.len()
-        );
-    } else if let Some(cursor) = cursor {
-        if cursor < 0 {
-            return (-1, -1);
-        }
-        if (cursor as usize) <= text.len() && text.is_char_boundary(cursor as usize) {
-            return (cursor, cursor);
-        }
-        log::warn!(
-            "Ignoring invalid preedit cursor: cursor={}, text_len={}",
-            cursor,
-            text.len()
-        );
-    }
-
-    let end = text.len() as i32;
-    (end, end)
 }
 
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {

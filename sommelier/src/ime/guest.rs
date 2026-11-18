@@ -109,13 +109,11 @@ impl GuestTxn {
     }
 }
 
-// TODO(after #80): delete the old copy in handler/text_input.rs, which
-// #80 changes to match this one.
 /// The cursor of the preedit `text` from the host's `preedit_styling`
 /// selection or `preedit_cursor`, which are byte offsets into it. An
 /// invalid one is ignored, with a warning, and the cursor goes at the end.
 /// An empty preedit's cursor is `(0, 0)`.
-pub(super) fn resolve_preedit_cursor(
+pub(crate) fn resolve_preedit_cursor(
     text: &str,
     selection: Option<(u32, u32)>,
     cursor: Option<i32>,
