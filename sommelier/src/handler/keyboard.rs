@@ -363,11 +363,6 @@ impl KeyboardHandler {
         ctx.keyboard_keysym_to_keycode.remove(&host_keyboard_id);
     }
 
-    fn clear_host_keyboard_keymap_and_state(ctx: &mut Context, host_keyboard_id: HostId) {
-        Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-        Self::clear_host_keyboard_state(ctx, host_keyboard_id);
-    }
-
     fn keysym_to_evdev_keycodes(keymap: &xkb::Keymap) -> std::collections::HashMap<u32, u32> {
         let mut keycodes = std::collections::HashMap::new();
         for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
@@ -501,50 +496,29 @@ impl KeyboardHandler {
                 handled,
             ));
     }
-}
 
-impl Default for KeyboardHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
-    /// Parse the keymap to set up XKB state for keysym resolution.
-    /// The host sends keymap data via a shared-memory fd (e.g. memfd).
-    /// We mmap it to read without consuming data, so the fd can still
-    /// be forwarded to the guest client.
-    fn on_keymap(
-        &mut self,
-        ctx: &mut Context,
-        format: u32,
-        fd: BorrowedFd<'_>,
-        size: u32,
-    ) -> Action {
-        let host_keyboard_id = HostId::from_event_sender(ctx);
+    /// Compile the keymap of `format` and `size` that a `wl_keyboard.keymap`
+    /// carries in `fd`, or log why the proxy cannot use it and return
+    /// `None`. The keymap is mapped rather than read, so the descriptor's
+    /// offset is untouched when it is forwarded to the guest.
+    fn compile_keymap(&self, format: u32, fd: BorrowedFd<'_>, size: u32) -> Option<xkb::Keymap> {
         if format == KEYMAP_FORMAT_NO_KEYMAP {
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
+            return None;
         }
-        // Only handle XKB_V1 format keymaps.
         if format != KEYMAP_FORMAT_XKB_V1 {
             log::warn!("on_keymap: unsupported keymap format {}, ignoring", format);
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
+            return None;
         }
-
         // A zero-size keymap is malformed; mmap(len=0) is UB per POSIX.
         if size == 0 {
             log::warn!("on_keymap: received zero-size keymap from host, ignoring");
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
+            return None;
         }
         if size > MAX_KEYMAP_SIZE {
             log::warn!(
                 "on_keymap: keymap of {size} bytes exceeds the {MAX_KEYMAP_SIZE}-byte limit, ignoring"
             );
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
+            return None;
         }
 
         // size is a u32 from the Wayland wire; the cast to usize is lossless on
@@ -555,63 +529,74 @@ impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
                 fd.as_raw_fd(),
                 size
             );
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
+            return None;
         };
-        let slice = mapping.as_bytes();
-
         // Per the Wayland spec, wl_keyboard.keymap.size includes a trailing NUL.
-        // A malformed host event must not panic the proxy or leave stale XKB
-        // state active for this keyboard.
-        if slice.last() != Some(&0) {
+        let Some((&0, text)) = mapping.as_bytes().split_last() else {
             log::error!(
                 "on_keymap: keymap data is missing the trailing NUL required by the Wayland spec"
             );
-            Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-            return Action::Forward;
-        }
-        let len = slice.len() - 1;
-
-        match std::str::from_utf8(&slice[..len]) {
+            return None;
+        };
+        let text = match std::str::from_utf8(text) {
+            Ok(text) => text,
             Err(e) => {
                 log::error!("on_keymap: keymap bytes are not valid UTF-8: {}", e);
-                Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
+                return None;
             }
-            Ok(s) => match xkb::Keymap::new_from_string(
-                &self.context,
-                // `new_from_string` takes ownership; copy required because `s`
-                // borrows from the mmap region which is dropped at the end of
-                // this function.
-                s.to_owned(),
-                xkb::KEYMAP_FORMAT_TEXT_V1,
-                xkb::KEYMAP_COMPILE_NO_FLAGS,
-            ) {
-                None => {
-                    log::error!("on_keymap: xkbcommon failed to compile the keymap string");
-                    Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-                }
-                Some(keymap) => {
-                    Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
-                    let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
-                    let repeatable_keys = Self::repeatable_evdev_keycodes(&keymap);
-                    let mut state = xkb::State::new(&keymap);
-                    // Exo sends only the keymap on a layout change, so the
-                    // modifiers held and locked before it still apply.
-                    if let Some(&modifiers) = ctx.keyboard_modifiers.get(&host_keyboard_id) {
-                        Self::apply_modifiers(&mut state, modifiers);
-                    }
-                    ctx.keyboard_xkb_states.insert(host_keyboard_id, state);
-                    ctx.keyboard_keymaps.insert(host_keyboard_id, keymap);
-                    ctx.keyboard_keysym_to_keycode
-                        .insert(host_keyboard_id, keysym_map);
-                    ctx.keyboard_repeatable_keys
-                        .insert(host_keyboard_id, repeatable_keys);
-                    log::info!("XKB keymap loaded successfully");
-                }
-            },
+        };
+        let keymap = xkb::Keymap::new_from_string(
+            &self.context,
+            // `new_from_string` takes ownership; copy required because `text`
+            // borrows from the mmap region, which is unmapped when `mapping`
+            // drops at the end of this function.
+            text.to_owned(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        );
+        if keymap.is_none() {
+            log::error!("on_keymap: xkbcommon failed to compile the keymap string");
         }
-        // `mapping` drops here, unmapping the region.
+        keymap
+    }
+}
 
+impl Default for KeyboardHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl wl_keyboard::WlKeyboardHandler for KeyboardHandler {
+    /// Replace the keyboard's keymap with the one the host sent, or with
+    /// none if the proxy cannot use it (see `clear_host_keyboard_keymap`),
+    /// and forward the event either way.
+    fn on_keymap(
+        &mut self,
+        ctx: &mut Context,
+        format: u32,
+        fd: BorrowedFd<'_>,
+        size: u32,
+    ) -> Action {
+        let host_keyboard_id = HostId::from_event_sender(ctx);
+        Self::clear_host_keyboard_keymap(ctx, host_keyboard_id);
+        if let Some(keymap) = self.compile_keymap(format, fd, size) {
+            let keysym_map = Self::keysym_to_evdev_keycodes(&keymap);
+            let repeatable_keys = Self::repeatable_evdev_keycodes(&keymap);
+            let mut state = xkb::State::new(&keymap);
+            // Exo sends only the keymap on a layout change, so the
+            // modifiers held and locked before it still apply.
+            if let Some(&modifiers) = ctx.keyboard_modifiers.get(&host_keyboard_id) {
+                Self::apply_modifiers(&mut state, modifiers);
+            }
+            ctx.keyboard_xkb_states.insert(host_keyboard_id, state);
+            ctx.keyboard_keymaps.insert(host_keyboard_id, keymap);
+            ctx.keyboard_keysym_to_keycode
+                .insert(host_keyboard_id, keysym_map);
+            ctx.keyboard_repeatable_keys
+                .insert(host_keyboard_id, repeatable_keys);
+            log::info!("XKB keymap loaded successfully");
+        }
         Action::Forward
     }
 
@@ -1010,7 +995,8 @@ pub(crate) fn forget_keyboard(ctx: &mut Context, guest_keyboard_id: u32, host_ke
     //   wl_keyboard.modifiers, the accelerator check would use stale modifier
     //   bits and could produce wrong NOT_HANDLED/HANDLED decisions. Only the
     //   keyboard's end clears them; see `Context::keyboard_modifiers`.
-    KeyboardHandler::clear_host_keyboard_keymap_and_state(ctx, host_keyboard_id);
+    KeyboardHandler::clear_host_keyboard_keymap(ctx, host_keyboard_id);
+    KeyboardHandler::clear_host_keyboard_state(ctx, host_keyboard_id);
     ctx.keyboard_modifiers.remove(&host_keyboard_id);
     if let Some(host_extended_id) = ctx.keyboard_to_extended_keyboard.remove(&host_keyboard_id) {
         ctx.extended_keyboard_to_keyboard.remove(&host_extended_id);
