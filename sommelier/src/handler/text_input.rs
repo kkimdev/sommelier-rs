@@ -659,22 +659,24 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
+        // An empty preedit clears the shown one before its reset commit;
+        // a new preedit carries no commit, so it is last
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        let mut transaction = Vec::new();
+        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+            return drop_host_preedit(ctx, guest_id);
+        }
         // The v1 `commit` argument is the replacement text to use if this
         // preedit is reset, not text to insert alongside every live preedit
         // update. Exo commonly sends identical non-empty `text` and `commit`
         // values while composing Korean; forwarding both would insert every
         // intermediate syllable. Apply the fallback only when the host
         // actually clears the preedit (notably on reset/unfocus).
-        let mut transaction = Vec::new();
         if plan.had_preedit
             && text.is_empty()
             && !commit.is_empty()
             && !push_commit_string_to(&mut transaction, guest_id, commit)
         {
-            return drop_host_preedit(ctx, guest_id);
-        }
-
-        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
             return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -1115,7 +1117,7 @@ impl zcr_text_input_extension_v1::ZcrTextInputExtensionV1Handler for TextInputEx
 pub struct ExtendedTextInputV1Handler;
 impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextInputV1Handler {
     // Translates zcr_extended_text_input_v1::set_preedit_region (cursor-relative index/length)
-    // into zwp_text_input_v1::delete_surrounding_text + preedit_string + done.
+    // into zwp_text_input_v3::delete_surrounding_text + preedit_string + done.
     fn on_set_preedit_region(&mut self, ctx: &mut Context, index: i32, length: u32) -> Action {
         let host_ext_id = ctx.last_sender_id;
         log::trace!(
@@ -1166,6 +1168,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
+        // The new preedit goes after the delete
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
         transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
             guest_id,
@@ -3452,7 +3456,7 @@ mod tests {
         f.s.host([f.preedit("간", "간")]).await;
         assert_eq!(f.s.guest_received(), f.events([preedit("간"), done()]));
         f.s.host([f.preedit("", "간")]).await;
-        let expected = [commit("간"), no_preedit(), done()];
+        let expected = [no_preedit(), commit("간"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
@@ -4773,7 +4777,7 @@ mod tests {
             (
                 "a preedit reset commits its fallback",
                 |f| vec![f.preedit("미완성", ""), f.preedit("", "확정")],
-                vec![preedit("미완성"), DONE, commit("확정"), no_preedit(), DONE],
+                vec![preedit("미완성"), DONE, no_preedit(), commit("확정"), DONE],
             ),
             (
                 "a reset without a preedit commits nothing",
@@ -5265,7 +5269,7 @@ mod tests {
         let mut f = Field::with_surrounding_text("abc", 3, 3).await;
         f.s.host([f.preedit("가", "가"), f.preedit("", "가")]).await;
         let done = || V3::Done { serial: 2 };
-        let expected = [preedit("가"), done(), commit("가"), no_preedit(), done()];
+        let expected = [preedit("가"), done(), no_preedit(), commit("가"), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         f.s.host([f.delete_range(2, 1)]).await;

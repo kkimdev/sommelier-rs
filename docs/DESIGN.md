@@ -199,7 +199,7 @@ encode wire bytes ad hoc.
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
@@ -395,7 +395,7 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `pread` from the pool's file, so a client that shrinks the file after
   `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
   Each guest `wl_buffer` gets host storage, chosen once by
-  `select_shm_backing` (`shm.rs`): VirtWL shared memory laid out exactly
+  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out exactly
   like the guest buffer and imported by the host as a `wl_shm` pool, or,
   with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
   a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
@@ -419,6 +419,19 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
+
+`handler/shm.rs` holds a submodule per concern, and re-exports what other
+handlers call:
+
+| Submodule (`handler/shm/`) | Concern |
+| --- | --- |
+| `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
+| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities |
+| `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
+| `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
+| `copy.rs` | The copy of damaged pixels from the pool into the host storage |
+| `damage.rs` | Damage rectangles: clipping to a buffer and merging |
+| `buffer_lifetime.rs` | Every guest `wl_buffer`'s destroy and release, and its deferred retirement |
 
 Guest dma-buf (`linux_dmabuf.rs`) is forwarded rather than copied. For
 classic virtio-gpu PRIME buffers, `allocator.rs` replaces the guest's
