@@ -136,6 +136,75 @@ mod tests {
         );
     }
 
+    /// The strings other arguments index by byte offset decode to
+    /// `IndexedString`, and every other string to a lossy `String`.
+    #[test]
+    fn test_generate_byte_indexed_strings() {
+        let v1 = generate_compact("text-input-unstable-v1.xml");
+        assert!(
+            v1.contains(
+                "SetSurroundingText{text:crate::wire::IndexedString,cursor:u32,anchor:u32}"
+            )
+        );
+        assert!(
+            v1.contains("PreeditString{serial:u32,text:crate::wire::IndexedString,commit:String}"),
+            "only the preedit is indexed"
+        );
+        assert!(v1.contains("CommitString{serial:u32,text:String}"));
+        assert!(v1.contains("msg.read_indexed_string()?"));
+        assert!(
+            v1.contains("builder.write_indexed_string(&text)"),
+            "a forward sends the string as it came"
+        );
+        assert!(
+            v1.contains("_text:&crate::wire::IndexedString"),
+            "a handler gets the IndexedString"
+        );
+        assert!(
+            v1.contains("pubfnpreedit_string(sender_id:u32,serial:u32,text:&str,commit:&str)"),
+            "an encoder takes a str, as the proxy builds only UTF-8"
+        );
+
+        let v3 = generate_compact("text-input-unstable-v3.xml");
+        assert!(
+            v3.contains(
+                "SetSurroundingText{text:crate::wire::IndexedString,cursor:i32,anchor:i32}"
+            )
+        );
+        assert!(v3.contains(
+            "PreeditString{text:Option<crate::wire::IndexedString>,cursor_begin:i32,cursor_end:i32}"
+        ));
+        assert!(v3.contains("msg.read_nullable_indexed_string()?"));
+        assert!(v3.contains("builder.write_nullable_indexed_string(text.as_ref())"));
+        assert!(v3.contains("CommitString{text:Option<String>}"));
+
+        let xdg_shell = generate_compact("xdg-shell.xml");
+        assert!(xdg_shell.contains("SetTitle{title:String}"));
+        assert!(!xdg_shell.contains("IndexedString"));
+    }
+
+    /// Every BYTE_INDEXED_STRINGS entry names one string argument of the
+    /// vendored protocols, and one that names none, or no string, is
+    /// reported, so a stale entry fails the build.
+    #[test]
+    fn test_byte_indexed_strings_each_name_one_argument() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let protocols: Vec<_> = std::fs::read_dir(manifest_dir.join("../third_party/protocols"))
+            .expect("the vendored protocols")
+            .map(|entry| entry.expect("a protocol file").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "xml"))
+            .map(|path| parse(&path).expect("a vendored protocol"))
+            .collect();
+        generator::check_byte_indexed_strings(&protocols);
+        let table = [
+            ("zwp_text_input_v3", "set_surrounding_text", "text"),
+            ("zwp_text_input_v3", "set_surrounding_text", "txt"),
+            ("zwp_text_input_v3", "set_surrounding_text", "cursor"),
+            ("zwp_text_input_v4", "set_surrounding_text", "text"),
+        ];
+        assert_eq!(generator::unmatched_entries(&protocols, &table), table[1..]);
+    }
+
     #[test]
     fn test_generate_since_version_guards() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

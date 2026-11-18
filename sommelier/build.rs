@@ -17,7 +17,7 @@ limitations under the License.
 use std::env;
 use std::fs;
 use std::path::Path;
-use wayland_codegen::generator::{generate, generate_routing};
+use wayland_codegen::generator::{check_byte_indexed_strings, generate, generate_routing};
 use wayland_codegen::parse;
 
 fn main() {
@@ -79,6 +79,8 @@ fn main() {
             .unwrap_or_else(|_| panic!("Failed to write {}", dest_path.display()));
         parsed_protocols.push(protocol);
     }
+
+    check_byte_indexed_strings(&parsed_protocols);
 
     let routing_path = Path::new(&out_dir).join("protocol_routing.rs");
     fs::write(&routing_path, generate_routing(&parsed_protocols))

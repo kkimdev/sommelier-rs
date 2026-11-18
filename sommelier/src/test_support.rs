@@ -65,6 +65,23 @@ pub fn raw_message((message, fds): Outgoing) -> RawMessage {
     (message, fds.iter().map(AsRawFd::as_raw_fd).collect())
 }
 
+/// `message`, an encoded message that carries the string `text`, with
+/// `text` spelled as `bytes`: a string no encoder writes, such as one that
+/// is not UTF-8 or has a NUL inside. `bytes` is as long as `text`, so the
+/// framing holds. Only the first occurrence of `text` in the payload
+/// changes, so `text` must not be empty or appear earlier in it.
+pub fn respell((mut message, fds): Outgoing, text: &str, bytes: &[u8]) -> Outgoing {
+    assert!(!text.is_empty(), "an empty text names no bytes to respell");
+    assert_eq!(text.len(), bytes.len(), "a respelling keeps the length");
+    let payload = &mut message[MessageHeader::LEN..];
+    let at = payload
+        .windows(text.len())
+        .position(|window| window == text.as_bytes())
+        .expect("the message carries the text");
+    payload[at..at + bytes.len()].copy_from_slice(bytes);
+    (message, fds)
+}
+
 /// A dispatch result whose message compares; see [`raw_message`].
 pub fn raw_dispatch(
     result: Result<Option<Outgoing>, ProtocolError>,

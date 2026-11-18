@@ -19,7 +19,101 @@ use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use std::collections::{BTreeMap, HashSet};
 
+/// The string arguments that other arguments index by byte offset, as
+/// `(interface, message, argument)`. Every other string decodes to a
+/// `String` with each sequence that is not UTF-8 replaced by U+FFFD, but a
+/// replacement would move these offsets, so these decode to
+/// `wire::IndexedString`, which tells the handler that the string was not
+/// UTF-8.
+pub(crate) const BYTE_INDEXED_STRINGS: &[(&str, &str, &str)] = &[
+    // Its cursor and anchor.
+    ("zwp_text_input_v1", "set_surrounding_text", "text"),
+    ("zwp_text_input_v3", "set_surrounding_text", "text"),
+    // The preedit_cursor and preedit_styling events before it.
+    ("zwp_text_input_v1", "preedit_string", "text"),
+    // Its cursor_begin and cursor_end.
+    ("zwp_text_input_v3", "preedit_string", "text"),
+];
+
+/// Panic unless every entry of [`BYTE_INDEXED_STRINGS`] names exactly one
+/// string argument of `protocols`, all the protocols the proxy generates,
+/// so that a stale entry fails the build instead of leaving its string
+/// lossy.
+pub fn check_byte_indexed_strings(protocols: &[Protocol]) {
+    let unmatched = unmatched_entries(protocols, BYTE_INDEXED_STRINGS);
+    assert!(
+        unmatched.is_empty(),
+        "BYTE_INDEXED_STRINGS entries that name no single string argument: {unmatched:?}"
+    );
+}
+
+/// The entries of `table` that name no single string argument of
+/// `protocols`.
+pub(crate) fn unmatched_entries<'t>(
+    protocols: &[Protocol],
+    table: &[(&'t str, &'t str, &'t str)],
+) -> Vec<(&'t str, &'t str, &'t str)> {
+    let arguments = |(interface, message, argument): (&str, &str, &str)| {
+        protocols
+            .iter()
+            .flat_map(|protocol| &protocol.items)
+            .filter_map(|item| match item {
+                ProtocolItem::Interface(found) if found.name == interface => Some(found),
+                _ => None,
+            })
+            .flat_map(|found| &found.items)
+            .filter_map(|item| match item {
+                InterfaceItem::Request(found) | InterfaceItem::Event(found)
+                    if found.name == message =>
+                {
+                    Some(found)
+                }
+                _ => None,
+            })
+            .flat_map(|found| args(&found.items))
+            .filter(|arg| arg.name == argument && arg.typ == "string")
+            .count()
+    };
+    table
+        .iter()
+        .copied()
+        .filter(|&entry| arguments(entry) != 1)
+        .collect()
+}
+
+/// `protocol` with the arguments in [`BYTE_INDEXED_STRINGS`] marked.
+fn mark_byte_indexed_strings(protocol: &Protocol) -> Protocol {
+    let mut protocol = protocol.clone();
+    for item in &mut protocol.items {
+        let ProtocolItem::Interface(interface) = item else {
+            continue;
+        };
+        for item in &mut interface.items {
+            let (InterfaceItem::Request(message) | InterfaceItem::Event(message)) = item else {
+                continue;
+            };
+            for item in &mut message.items {
+                let MessageItem::Arg(arg) = item else {
+                    continue;
+                };
+                let key = (
+                    interface.name.as_str(),
+                    message.name.as_str(),
+                    arg.name.as_str(),
+                );
+                arg.byte_indexed = BYTE_INDEXED_STRINGS.contains(&key);
+                assert!(
+                    !arg.byte_indexed || arg.typ == "string",
+                    "{key:?} is not a string"
+                );
+            }
+        }
+    }
+    protocol
+}
+
 pub fn generate(protocol: &Protocol) -> String {
+    let protocol = &mark_byte_indexed_strings(protocol);
     let mut parts = Vec::new();
     let mut interface_names = Vec::new();
     let mut handler_trait_names = Vec::new();
@@ -367,6 +461,10 @@ fn map_type(arg: &Arg) -> TokenStream {
         // round-trip can lose low bits while proxying an otherwise opaque
         // protocol value.
         "fixed" => quote! { i32 },
+        "string" if arg.byte_indexed && arg.allow_null.unwrap_or(false) => {
+            quote! { Option<crate::wire::IndexedString> }
+        }
+        "string" if arg.byte_indexed => quote! { crate::wire::IndexedString },
         "string" if arg.allow_null.unwrap_or(false) => quote! { Option<String> },
         "string" => quote! { String },
         "object" => quote! { u32 },
@@ -389,6 +487,10 @@ fn map_read_fn(arg: &Arg) -> TokenStream {
         "int" => quote! { msg.read_i32()? },
         "uint" => quote! { msg.read_u32()? },
         "fixed" => quote! { msg.read_fixed()? },
+        "string" if arg.byte_indexed && arg.allow_null.unwrap_or(false) => {
+            quote! { msg.read_nullable_indexed_string()? }
+        }
+        "string" if arg.byte_indexed => quote! { msg.read_indexed_string()? },
         "string" if arg.allow_null.unwrap_or(false) => quote! { msg.read_nullable_string()? },
         "string" => quote! { msg.read_string()? },
         "object" => quote! { msg.read_u32()? },
@@ -421,6 +523,10 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
             }
         }
         "fixed" => quote! { builder.write_fixed(#name) },
+        "string" if arg.byte_indexed && arg.allow_null.unwrap_or(false) => {
+            quote! { builder.write_nullable_indexed_string(#name.as_ref()) }
+        }
+        "string" if arg.byte_indexed => quote! { builder.write_indexed_string(&#name) },
         "string" if arg.allow_null.unwrap_or(false) => {
             quote! { builder.write_nullable_string(#name.as_deref()) }
         }
@@ -1083,7 +1189,8 @@ fn generate_since_constant(opcode_name: &Ident, since: Option<u32>) -> TokenStre
 /// carries a string or an array can exceed the wire's 16-bit length and
 /// returns a `Result`; any other cannot and returns the message directly.
 /// The message owns its descriptors, as `OwnedFd`s, so one that cannot be
-/// built or is never sent closes them.
+/// built or is never sent closes them. A string is a `&str`, even one
+/// other arguments index: what the proxy builds itself is UTF-8.
 fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> TokenStream {
     let name = sanitize_ident(&message.name);
     let mut params = Vec::new();

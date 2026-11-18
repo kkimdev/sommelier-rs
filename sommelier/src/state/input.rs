@@ -457,6 +457,14 @@ impl TextInputState {
         self.pending_preedit_cursor = Some(index);
     }
 
+    /// Drop the preedit_cursor and preedit_styling recorded for a host
+    /// preedit that does not reach the guest, so that they do not apply to
+    /// the next one.
+    pub(crate) fn discard_pending_preedit_styling(&mut self) {
+        self.pending_preedit_cursor = None;
+        self.pending_preedit_selection = None;
+    }
+
     pub fn record_cursor_position(&mut self, index: i32, anchor: i32) {
         self.pending_cursor_position = Some((index, anchor));
     }

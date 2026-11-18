@@ -28,7 +28,7 @@ use crate::state::{
     reconcile, ActivationStep, Context, CursorRect, GuestKeyDelivery, GuestKeyEvent, HostApplied,
     HostContentType, HostId, HostTarget, InternalCallback, Link, SeatFocusChange, TextInputState,
 };
-use crate::wire::{queue_or_drop, Action, Outgoing};
+use crate::wire::{queue_or_drop, Action, IndexedString, Outgoing};
 
 /// Queue `zwp_text_input_v3.preedit_string`, or drop host text that does not
 /// fit a message (see [`queue_or_drop`]).
@@ -561,6 +561,16 @@ pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u3
     )
 }
 
+/// Drop a host `preedit_string` for active text input `guest_id` that
+/// does not reach the guest, with the preedit_cursor and preedit_styling
+/// that were part of it.
+fn drop_host_preedit(ctx: &mut Context, guest_id: u32) -> Action {
+    if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+        state.discard_pending_preedit_styling();
+    }
+    Action::Drop
+}
+
 pub struct TextInputManagerV1Handler;
 impl zwp_text_input_manager_v1::ZwpTextInputManagerV1Handler for TextInputManagerV1Handler {}
 
@@ -570,7 +580,7 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
         &mut self,
         ctx: &mut Context,
         serial: u32,
-        text: &String,
+        text: &IndexedString,
         commit: &String,
     ) -> Action {
         let host_id = ctx.last_sender_id;
@@ -586,6 +596,12 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
                 guest_id
             );
             return Action::Drop;
+        };
+        // The preedit_cursor and preedit_styling before it are byte offsets
+        // into it, which replacing an invalid sequence would move.
+        let IndexedString::Utf8(text) = text else {
+            log::debug!("Ignoring a host preedit that is not UTF-8");
+            return drop_host_preedit(ctx, guest_id);
         };
         let repeat_keyboard = held_backspace_keyboard_for_seat(ctx, plan.guest_seat);
         let (cursor_begin, cursor_end) = resolve_preedit_cursor(text, plan.selection, plan.cursor);
@@ -1823,7 +1839,7 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
     fn on_set_surrounding_text(
         &mut self,
         ctx: &mut Context,
-        text: &String,
+        text: &IndexedString,
         cursor: i32,
         anchor: i32,
     ) -> Action {
@@ -1831,6 +1847,18 @@ impl zwp_text_input_v3::ZwpTextInputV3Handler for TextInputV3Handler {
         if !v3_is_focused(ctx, guest_id) {
             return Action::Drop;
         }
+        // The cursor and anchor are byte offsets into the text, which
+        // replacing an invalid sequence would move. Empty the field's text
+        // instead, so that the host's input method does not go on editing
+        // text the guest no longer has, and keep its support for
+        // surrounding text, which would change the host's content type.
+        let IndexedString::Utf8(text) = text else {
+            log::debug!("Emptying surrounding text that is not UTF-8");
+            if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
+                state.pending.surrounding_text = Some(Some((String::new(), 0, 0)));
+            }
+            return Action::Drop;
+        };
         log::trace!(
             ">>> v3 on_set_surrounding_text: guest_id={}, text={:?}, cursor={}, anchor={}",
             guest_id,
@@ -2001,7 +2029,7 @@ mod tests {
     use crate::protocols::wayland::{wl_callback, wl_compositor, wl_registry, wl_seat};
     use crate::protocols::{AnyEvent, AnyRequest};
     use crate::proxy::harness::{Object, Session};
-    use crate::test_support::decoded;
+    use crate::test_support::{decoded, respell};
     use crate::wire::WL_DISPLAY_ID;
     use std::os::fd::OwnedFd;
     use zcr_extended_text_input_v1::{evt as ext, Request as Ext};
@@ -3167,6 +3195,49 @@ mod tests {
         }
     }
 
+    /// The cursor and anchor are byte offsets into the surrounding text,
+    /// which replacing an invalid sequence would move, so surrounding text
+    /// that is not UTF-8 cannot reach the host. It empties the field's
+    /// surrounding text instead, rather than leave the host's input method
+    /// editing text the guest no longer has, and the field keeps its
+    /// support for surrounding text, so the host's content type stays. The
+    /// session goes on, and the next valid text reaches the host.
+    #[tokio::test]
+    async fn surrounding_text_that_is_not_utf8_clears_the_hosts() {
+        let mut f = Field::enabled().await;
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "가", 3, 3).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let mut expected = vec![f.surrounding_text("가", 3, 3)];
+        expected.extend(f.content_type((0, 0), true));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+
+        let latin1 = v3::set_surrounding_text(f.ti, "Cafe", 3, 3).unwrap();
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "나", 3, 3).unwrap(),
+            respell(latin1, "Cafe", b"Caf\xe9"),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("", 0, 0), f.commit_state(3)]
+        );
+
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "Café", 5, 5).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        assert_eq!(
+            f.s.host_received(),
+            [f.surrounding_text("Café", 5, 5), f.commit_state(4)]
+        );
+    }
+
     /// The v3 content type maps to the host's, which is told with it that
     /// a v3 client supports inline composition, and whether the field has
     /// surrounding text.
@@ -3682,6 +3753,35 @@ mod tests {
                     preedit("다"),
                     DONE,
                 ],
+            ),
+            (
+                // Its preedit_cursor and preedit_styling are byte offsets
+                // into it, which replacing an invalid sequence would move.
+                "a preedit that is not UTF-8 is ignored",
+                |f| {
+                    let latin1 = respell(f.preedit("Cafe", ""), "Cafe", b"Caf\xe9");
+                    vec![f.preedit("가", ""), latin1, f.preedit("가나", "")]
+                },
+                vec![preedit("가"), DONE, preedit("가나"), DONE],
+            ),
+            (
+                "an ignored preedit takes its cursor and styling with it",
+                |f| {
+                    let latin1 = respell(f.preedit("Cafe", ""), "Cafe", b"Caf\xe9");
+                    vec![
+                        v1::preedit_styling(f.host, 0, 3, 6),
+                        v1::preedit_cursor(f.host, 3),
+                        latin1,
+                        f.preedit("가나", ""),
+                    ]
+                },
+                vec![preedit("가나"), DONE],
+            ),
+            (
+                // Nothing the proxy uses indexes committed text.
+                "a commit that is not UTF-8 commits replacement characters",
+                |f| vec![respell(f.commit("Cafe"), "Cafe", b"Caf\xe9")],
+                vec![commit("Caf\u{fffd}"), DONE],
             ),
             (
                 "a delete waits for its commit",
@@ -4574,7 +4674,7 @@ mod tests {
 
         fn preedit(&mut self, text: &str, commit: &str) {
             self.ctx.last_sender_id = HOST;
-            let (text, commit) = (text.to_string(), commit.to_string());
+            let (text, commit) = (IndexedString::from(text), commit.to_string());
             TextInputV1Handler.on_preedit_string(&mut self.ctx, 0, &text, &commit);
         }
 
@@ -4714,6 +4814,7 @@ mod tests {
         let oversized = "x".repeat(4_084);
         let end = oversized.len() as i32;
         ime.ctx.last_sender_id = TI;
+        let oversized = IndexedString::from(oversized.as_str());
         TextInputV3Handler.on_set_surrounding_text(&mut ime.ctx, &oversized, end, end);
         TextInputV3Handler.on_set_content_type(&mut ime.ctx, 0, 13);
         let mut expected = ime.state().clone();

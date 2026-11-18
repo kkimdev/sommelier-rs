@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt;
@@ -141,6 +142,46 @@ impl MessageHeader {
         header[..4].copy_from_slice(&self.sender_id.to_ne_bytes());
         header[4..].copy_from_slice(&word.to_ne_bytes());
         Ok(header)
+    }
+}
+
+/// A string argument that other arguments index by byte offset, such as
+/// the text of `zwp_text_input_v3.set_surrounding_text`, whose cursor and
+/// anchor are offsets into it. Every other string decodes to a `String`
+/// with each sequence that is not UTF-8 replaced by U+FFFD
+/// ([`WireMessage::read_string`]), but a replacement here would move the
+/// offsets after it, so the handler learns that the string was not UTF-8
+/// and drops it. The generator's `BYTE_INDEXED_STRINGS` lists these
+/// arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexedString {
+    Utf8(String),
+    /// The string as received, without its terminating NUL.
+    NotUtf8(Vec<u8>),
+}
+
+impl IndexedString {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self::Utf8(text.to_owned()),
+            Err(_) => Self::NotUtf8(bytes.to_vec()),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Utf8(text) => text.as_bytes(),
+            Self::NotUtf8(bytes) => bytes,
+        }
+    }
+}
+
+/// For tests: production code gets an `IndexedString` only by decoding
+/// one, which checks that it is UTF-8.
+#[cfg(test)]
+impl From<&str> for IndexedString {
+    fn from(text: &str) -> Self {
+        Self::Utf8(text.to_owned())
     }
 }
 
@@ -322,21 +363,49 @@ impl<'a> WireMessage<'a> {
         Ok(Some(text))
     }
 
-    fn utf8(bytes: &[u8]) -> Result<String, ProtocolError> {
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|_| ProtocolError::InvalidString)
+    /// `bytes` with each sequence that is not UTF-8 replaced by U+FFFD.
+    /// Wayland requires UTF-8, but libwayland does not check it, so a
+    /// client that sends Latin-1 keeps its session.
+    fn lossy(&self, bytes: &[u8]) -> String {
+        match String::from_utf8_lossy(bytes) {
+            Cow::Borrowed(text) => text.to_owned(),
+            Cow::Owned(text) => {
+                log::debug!(
+                    "Replaced invalid UTF-8 in a string argument of opcode {} of object {}",
+                    self.opcode,
+                    self.sender_id
+                );
+                text
+            }
+        }
     }
 
+    /// A string argument, whose sequences that are not UTF-8 are replaced
+    /// by U+FFFD.
     pub fn read_string(&mut self) -> Result<String, ProtocolError> {
         let bytes = self
             .read_string_bytes(false)?
             .ok_or(ProtocolError::InvalidString)?;
-        Self::utf8(bytes)
+        Ok(self.lossy(bytes))
     }
 
+    /// [`Self::read_string`] of a nullable argument.
     pub fn read_nullable_string(&mut self) -> Result<Option<String>, ProtocolError> {
-        self.read_string_bytes(true)?.map(Self::utf8).transpose()
+        let bytes = self.read_string_bytes(true)?;
+        Ok(bytes.map(|bytes| self.lossy(bytes)))
+    }
+
+    /// A string argument that other arguments index by byte offset.
+    pub fn read_indexed_string(&mut self) -> Result<IndexedString, ProtocolError> {
+        let bytes = self
+            .read_string_bytes(false)?
+            .ok_or(ProtocolError::InvalidString)?;
+        Ok(IndexedString::from_bytes(bytes))
+    }
+
+    /// [`Self::read_indexed_string`] of a nullable argument.
+    pub fn read_nullable_indexed_string(&mut self) -> Result<Option<IndexedString>, ProtocolError> {
+        Ok(self.read_string_bytes(true)?.map(IndexedString::from_bytes))
     }
 
     pub fn read_array(&mut self) -> Result<Vec<u8>, ProtocolError> {
@@ -448,6 +517,18 @@ impl MessageBuilder {
         }
     }
 
+    /// Forward an [`IndexedString`] as it was received.
+    pub fn write_indexed_string(&mut self, val: &IndexedString) {
+        self.write_string_bytes(val.as_bytes());
+    }
+
+    pub fn write_nullable_indexed_string(&mut self, val: Option<&IndexedString>) {
+        match val {
+            Some(value) => self.write_indexed_string(value),
+            None => self.write_u32(0),
+        }
+    }
+
     pub fn write_array(&mut self, val: &[u8]) {
         let len = val.len() as u32;
         self.write_u32(len);
@@ -537,7 +618,9 @@ impl MessageBuilder {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::{Framing, MessageBuilder, MessageHeader, Outgoing, ProtocolError, WireMessage};
+    use super::{
+        Framing, IndexedString, MessageBuilder, MessageHeader, Outgoing, ProtocolError, WireMessage,
+    };
     use crate::protocols::aura_shell::zaura_surface;
     use crate::protocols::linux_dmabuf_v1::{
         zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
@@ -943,13 +1026,56 @@ mod tests {
         assert_eq!(wire.offset, message.len() - 8);
     }
 
+    /// A string that is not UTF-8 decodes with each invalid sequence
+    /// replaced by U+FFFD, as libwayland passes it through.
     #[test]
-    fn wire_message_rejects_invalid_utf8_strings() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&4u32.to_ne_bytes());
-        payload.extend_from_slice(&[0xff, 0x00, 0x00, 0x00]);
+    fn wire_message_replaces_invalid_utf8_in_strings() {
+        let mut builder = MessageBuilder::new();
+        builder.write_string("a_b_c");
+        builder.write_nullable_string(Some("_"));
+        let mut payload = builder.into_payload();
+        // "a\xffb\xe9c", then "\xe9".
+        payload[5] = 0xff;
+        payload[7] = 0xe9;
+        payload[16] = 0xe9;
         let mut wire = WireMessage::new(1, 0, &payload);
-        assert_eq!(wire.read_string(), Err(ProtocolError::InvalidString));
+        assert_eq!(wire.read_string(), Ok("a\u{fffd}b\u{fffd}c".to_string()));
+        assert_eq!(
+            wire.read_nullable_string(),
+            Ok(Some("\u{fffd}".to_string()))
+        );
+        assert!(wire.is_payload_consumed());
+    }
+
+    /// A string other arguments index by byte offset keeps its bytes when
+    /// it is not UTF-8, so a handler can tell, and a forward can send it
+    /// unchanged.
+    #[test]
+    fn indexed_strings_keep_bytes_that_are_not_utf8() {
+        let mut builder = MessageBuilder::new();
+        builder.write_string("가");
+        builder.write_string("a_");
+        builder.write_nullable_string(None);
+        builder.write_nullable_string(Some("b_"));
+        let mut payload = builder.into_payload();
+        payload[13] = 0xe9;
+        payload[25] = 0xe9;
+        let mut wire = WireMessage::new(1, 0, &payload);
+        let utf8 = wire.read_indexed_string().unwrap();
+        let latin1 = wire.read_indexed_string().unwrap();
+        assert_eq!(utf8, IndexedString::from("가"));
+        assert_eq!(latin1, IndexedString::NotUtf8(b"a\xe9".to_vec()));
+        assert_eq!(wire.read_nullable_indexed_string(), Ok(None));
+        let nullable = wire.read_nullable_indexed_string().unwrap();
+        assert_eq!(nullable, Some(IndexedString::NotUtf8(b"b\xe9".to_vec())));
+        assert!(wire.is_payload_consumed());
+
+        let mut builder = MessageBuilder::new();
+        builder.write_indexed_string(&utf8);
+        builder.write_indexed_string(&latin1);
+        builder.write_nullable_indexed_string(None);
+        builder.write_nullable_indexed_string(nullable.as_ref());
+        assert_eq!(builder.into_payload(), payload);
     }
 
     #[test]
