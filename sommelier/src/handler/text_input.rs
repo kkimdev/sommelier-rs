@@ -5510,6 +5510,60 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// A region equal to the shown one deletes nothing more: only the
+    /// preedit is sent again.
+    #[tokio::test]
+    async fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// While the guest shows the preedit a region made and has not
+    /// reported, an empty region and a region that does not cover the shown
+    /// one on both sides are dropped.
+    #[tokio::test]
+    async fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
+        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let done = |serial| V3::Done { serial };
+        // "c" before the cursor and "d" after it.
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
+        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        for (index, length) in [(0, 0), (-2, 2), (0, 2), (-1, 1)] {
+            f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
+                .await;
+            assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
+        }
+    }
+
+    /// A region over a region whose bytes lie on both sides of the cursor
+    /// deletes the bytes beyond the shown ones on both sides.
+    #[tokio::test]
+    async fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
+        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
+        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 4)]).await;
+        let expected = [
+            no_preedit(),
+            delete(1, 1),
+            preedit_at("bcde", 2, 2),
+            done(2),
+        ];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A preedit region makes committed surrounding text around the cursor
     /// the preedit; text the guest has not committed, or a region apart
     /// from the cursor, cannot be.
