@@ -329,9 +329,15 @@ pub fn register_test_buffer(
     });
 }
 
+/// A host copy that holds `bytes`: a mapping of a memfd.
+pub fn host_mapping(bytes: &[u8]) -> crate::state::HostMapping {
+    crate::state::HostMapping::map_shared(shm_pool_file(bytes).as_fd(), bytes.len(), 0)
+        .expect("a mapping of a memfd")
+}
+
 /// The state of a `width`x`height` local-copy buffer with rows of `stride`
-/// bytes, from a pool of zeros, whose host copy is a private mapping a test
-/// can read.
+/// bytes, from a pool of zeros, whose host copy is a mapping a test can
+/// read.
 pub fn mapped_test_buffer(
     width: i32,
     height: i32,
@@ -339,17 +345,6 @@ pub fn mapped_test_buffer(
     stale: crate::state::StalePixels,
 ) -> crate::state::BufferState {
     let size = usize::try_from(height).unwrap() * stride as usize;
-    let destination = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert_ne!(destination, libc::MAP_FAILED);
     crate::state::BufferState {
         pool_file: std::sync::Arc::new(shm_pool_file(&vec![0; size])),
         offset: 0,
@@ -362,8 +357,7 @@ pub fn mapped_test_buffer(
         dmabuf_plane1_offset: 0,
         dmabuf_plane1_stride: 0,
         dmabuf_sync: false,
-        dest_ptr: destination.cast(),
-        dest_size: size,
+        host_copy: Some(host_mapping(&vec![0; size])),
         stale,
     }
 }

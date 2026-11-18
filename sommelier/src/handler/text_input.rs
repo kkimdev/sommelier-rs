@@ -76,11 +76,18 @@ fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> 
         .map(|_| guest_id)
 }
 
+/// The `cursor_begin` and `cursor_end` of preedit `text`, from the
+/// host's pending preedit `selection` or `cursor`, or at its end. An empty
+/// preedit always gets `(0, 0)`, never the hidden cursor `(-1, -1)`
+/// (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
 fn resolve_preedit_cursor(
     text: &str,
     selection: Option<(u32, u32)>,
     cursor: Option<i32>,
 ) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
     if let Some((index, length)) = selection {
         let end = index.saturating_add(length);
         if end <= text.len() as u32
@@ -523,11 +530,13 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             guest_id
         );
 
-        // An empty preedit clears the shown one before its reset commit;
-        // a new preedit carries no commit, so it is last
+        // An empty preedit goes only to clear the shown one, before its
+        // reset commit; a new preedit carries no commit, so it is last
         // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
         let mut transaction = Vec::new();
-        if !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end) {
+        if (plan.had_preedit || !text.is_empty())
+            && !push_preedit_string_to(&mut transaction, guest_id, text, cursor_begin, cursor_end)
+        {
             return drop_host_preedit(ctx, guest_id);
         }
         // The v1 `commit` argument is the replacement text to use if this
@@ -609,7 +618,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             return drop_host_commit(ctx, guest_id);
         }
 
-        if !push_commit_string_to(&mut transaction, guest_id, text) {
+        // An empty commit inserts nothing, so it goes as no event
+        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        if !text.is_empty() && !push_commit_string_to(&mut transaction, guest_id, text) {
             return drop_host_commit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -620,8 +631,9 @@ impl zwp_text_input_v1::ZwpTextInputV1Handler for TextInputV1Handler {
             .expect("active text input disappeared while encoding commit");
         let pending_cursor_position = plan.cursor_position;
         let guest_seat = plan.guest_seat;
-        // An empty commit with no preedit to replace changes no text.
-        let edited = plan.had_preedit || !text.is_empty();
+        // An empty commit changes no text: the guest gets at most the clear
+        // of its preedit, as from an empty preedit.
+        let edited = !text.is_empty();
         state.finish_host_commit(plan, edited);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
 
@@ -1032,21 +1044,36 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         let (cursor_begin, cursor_end) =
             resolve_preedit_cursor(&preedit_text, plan.selection, pending_cursor);
 
-        // The new preedit goes after the delete
-        // (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
+        // A shown preedit is cleared before the delete, and the new preedit
+        // goes last; an empty region deletes nothing and clears only a
+        // shown preedit (docs/INVARIANTS.md, "A v3 transaction's events go
+        // in one order").
+        // The region's preedit is the text it deletes.
+        let empty = preedit_text.is_empty();
+        debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
         let mut transaction = Vec::new();
-        transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-            guest_id,
-            before_length,
-            after_length,
-        ));
-        if !push_preedit_string_to(
-            &mut transaction,
-            guest_id,
-            &preedit_text,
-            cursor_begin,
-            cursor_end,
-        ) {
+        if plan.had_preedit
+            && !empty
+            && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
+        {
+            return drop_host_preedit(ctx, guest_id);
+        }
+        if !empty {
+            transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
+                guest_id,
+                before_length,
+                after_length,
+            ));
+        }
+        if (plan.had_preedit || !empty)
+            && !push_preedit_string_to(
+                &mut transaction,
+                guest_id,
+                &preedit_text,
+                cursor_begin,
+                cursor_end,
+            )
+        {
             return drop_host_preedit(ctx, guest_id);
         }
         transaction.push(zwp_text_input_v3::evt::done(guest_id, plan.done_serial));
@@ -4570,7 +4597,18 @@ mod tests {
             (
                 "a reset without a preedit commits nothing",
                 |f| vec![f.preedit("", "stale fallback")],
-                vec![no_preedit(), DONE],
+                vec![DONE],
+            ),
+            (
+                // GTK emits `commit` for an empty commit_string too
+                // (`text_input_commit_apply`, `gtk/gtkimcontextwayland.c`
+                // 281-282, GTK 92348cd4), and GTK4's `GtkText` and
+                // `GtkTextView` delete the selection before they insert it
+                // (`gtk_text_enter_text`, `gtk/gtktext.c` 4592-4593;
+                // `gtk_text_view_commit_text`, `gtk/gtktextview.c` 8779).
+                "an empty commit sends no commit_string",
+                |f| vec![f.commit(""), f.preedit("미완성", ""), f.commit("")],
+                vec![DONE, preedit("미완성"), DONE, no_preedit(), DONE],
             ),
             (
                 "a commit clears the preedit",
@@ -4861,10 +4899,57 @@ mod tests {
                 vec![delete(1, 0), DONE_2],
             ),
             (
+                // It sends no commit_string either (`host_ime_events_become_v3_transactions`).
                 "an empty commit without a preedit edits nothing",
                 Some(("abc", 3, 3)),
                 |f| vec![f.commit(""), f.delete_range(2, 1)],
-                vec![commit(""), DONE_2, delete(1, 0), DONE_2],
+                vec![DONE_2, delete(1, 0), DONE_2],
+            ),
+            (
+                // The guest gets only the preedit's clear, as from an empty
+                // preedit, so it has no edit to report.
+                "an empty commit over a preedit edits nothing",
+                Some(("abc", 3, 3)),
+                |f| vec![f.preedit("x", ""), f.commit(""), f.delete_range(2, 1)],
+                vec![
+                    preedit("x"),
+                    DONE_2,
+                    no_preedit(),
+                    DONE_2,
+                    delete(1, 0),
+                    DONE_2,
+                ],
+            ),
+            (
+                "an empty preedit region over a preedit edits nothing",
+                Some(("abc", 3, 3)),
+                |f| {
+                    vec![
+                        f.preedit("x", ""),
+                        ext::set_preedit_region(f.host_ext, 0, 0),
+                        f.delete_range(2, 1),
+                    ]
+                },
+                vec![
+                    preedit("x"),
+                    DONE_2,
+                    no_preedit(),
+                    DONE_2,
+                    delete(1, 0),
+                    DONE_2,
+                ],
+            ),
+            (
+                // The guest gets only a `done`, so it has no edit to report.
+                "an empty preedit region edits nothing",
+                Some(("abc", 3, 3)),
+                |f| {
+                    vec![
+                        ext::set_preedit_region(f.host_ext, 0, 0),
+                        f.delete_range(2, 1),
+                    ]
+                },
+                vec![DONE_2, delete(1, 0), DONE_2],
             ),
             (
                 // Exo deletes "cX" of its "abcX|def"; in the guest's
@@ -5064,6 +5149,97 @@ mod tests {
         assert_eq!(f.s.guest_received(), []);
     }
 
+    /// An empty preedit reaches the guest only to clear the one it shows.
+    /// Over none, the transaction is its `done` alone, since clients tell
+    /// an empty preedit from none:
+    /// - GTK emits `preedit-start` for an empty preedit over none
+    ///   (`text_input_preedit_apply`, `gtk/gtkimcontextwayland.c` 241-244,
+    ///   GTK 92348cd4), on which GTK4's `GtkText` deletes the selection
+    ///   (`gtk_text_preedit_start_cb`, `gtk/gtktext.c` 4491), as does
+    ///   `GtkTextView`.
+    /// - Chromium applies one that differs from the preedit it last
+    ///   applied, as one with a hidden cursor does
+    ///   (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 466,
+    ///   revision ffb4f13519), and an empty composition over none deletes
+    ///   the selection (`UpdateCompositionIfTextSelected`,
+    ///   `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
+    ///
+    /// Either way the user's selected text would go.
+    #[tokio::test]
+    async fn an_empty_preedit_reaches_only_a_guest_that_shows_one() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([
+            f.preedit("", ""),
+            f.preedit("", "stale fallback"),
+            v1::preedit_cursor(f.host, -1),
+            f.preedit("", ""),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), f.events([done(), done(), done()]));
+
+        f.s.host([f.preedit("가", ""), f.preedit("", "")]).await;
+        let expected = [preedit("가"), done(), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// An empty preedit, which clears the one the guest shows, always has
+    /// the cursor `(0, 0)`, even after the host hid the cursor. Chromium
+    /// keeps the last preedit it applied, cursor included, and applies a
+    /// `done`'s preedit only if it differs, an absent one counting as
+    /// `("", 0, 0)` (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc`
+    /// 466, `zwp_text_input_v3.h` 139-140, revision ffb4f13519). After
+    /// `("", -1, -1)`, the next `done` without a preedit would apply an
+    /// empty composition again, which deletes the selection
+    /// (`UpdateCompositionIfTextSelected`,
+    /// `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
+    #[tokio::test]
+    async fn an_empty_preedit_has_no_hidden_cursor() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = f.events([preedit("가"), done(), no_preedit(), done()]);
+        f.s.host([
+            f.preedit("가", ""),
+            v1::preedit_cursor(f.host, -1),
+            f.preedit("", ""),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), expected);
+
+        f.s.host([
+            f.preedit("가", ""),
+            v1::preedit_cursor(f.host, -1),
+            ext::set_preedit_region(f.host_ext, 0, 0),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), expected);
+    }
+
+    /// An empty preedit region deletes nothing, so it sends no
+    /// `delete_surrounding_text`, only the empty preedit that clears a
+    /// shown one ([`an_empty_preedit_reaches_only_a_guest_that_shows_one`]). Chromium
+    /// applies an empty delete too (`ZwpTextInputV3Impl::OnDone`,
+    /// `ui/ozone/platform/wayland/host/zwp_text_input_v3.cc` 440, revision
+    /// ffb4f13519), and while nothing is composed it deletes the selection
+    /// (`InputMethodAuraLinux::OnDeleteSurroundingText`,
+    /// `ui/base/ime/linux/input_method_auralinux.cc` 518): the user's
+    /// selected text would go.
+    #[tokio::test]
+    async fn an_empty_preedit_region_sends_no_delete() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 0)]).await;
+        assert_eq!(f.s.guest_received(), f.events([done()]));
+
+        f.s.host([
+            f.preedit("가", ""),
+            ext::set_preedit_region(f.host_ext, 0, 0),
+        ])
+        .await;
+        let expected = [preedit("가"), done(), no_preedit(), done()];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A preedit region makes committed surrounding text around the cursor
     /// the preedit; text the guest has not committed, or a region apart
     /// from the cursor, cannot be.
@@ -5106,12 +5282,18 @@ mod tests {
         .await;
         let expected = [delete(3, 0), preedit_at("나", 0, 0), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
+        // A region over the shown preedit clears it before its delete:
+        // SDL3 applies each event as it arrives and turns the delete into
+        // a Backspace (`text_input_delete_surrounding_text`,
+        // `src/video/wayland/SDL_waylandevents.c` 2683-2710, main
+        // 1fc62260fc81), which its `testime` ignores while a preedit shows
+        // (`test/testime.c` 1084-1086).
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
         ])
         .await;
-        let expected = [delete(6, 0), preedit_at("가나", 0, 3), done()];
+        let expected = [no_preedit(), delete(6, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // The `done` of the guest's next commit repeats the region's

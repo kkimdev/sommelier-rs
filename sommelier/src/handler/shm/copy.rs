@@ -20,10 +20,9 @@ limitations under the License.
 use super::damage::{clipped_damage, coalesce_damage_rects};
 use super::formats::format_bytes_per_pixel;
 use crate::protocols::wayland::wl_shm;
-use crate::state::{BufferRect, BufferSpace, BufferState, DamageRegion};
+use crate::state::{BufferRect, BufferSpace, BufferState, DamageRegion, HostMapping};
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 
 #[derive(Clone, Copy)]
 struct PlaneCopy {
@@ -35,14 +34,14 @@ struct PlaneCopy {
     row_bytes: usize,
 }
 
-/// Bounds and layout metadata for copying one guest SHM buffer.
+/// Layout metadata for copying one guest SHM buffer.
 ///
-/// Keeping the source file and destination pointer separate from this value
+/// Keeping the source file and the destination separate from this value
 /// makes the copy entry point difficult to call with mismatched dimensions
-/// while avoiding a long list of loosely-related scalar arguments.
+/// while avoiding a long list of loosely-related scalar arguments. The
+/// destination's length bounds the copy.
 #[derive(Clone, Copy)]
 pub(crate) struct ShmCopyLayout {
-    pub(crate) dest_size: usize,
     pub(crate) format: u32,
     pub(crate) offset: usize,
     pub(crate) width: usize,
@@ -60,7 +59,6 @@ impl ShmCopyLayout {
     /// The layout that copies `buffer` into its own host mapping.
     pub(crate) fn for_buffer(buffer: &BufferState) -> Option<Self> {
         Some(Self {
-            dest_size: buffer.dest_size,
             format: buffer.format,
             offset: usize::try_from(buffer.offset).ok()?,
             width: usize::try_from(buffer.width).ok()?,
@@ -113,21 +111,22 @@ fn valid_plane_copy(dest_size: usize, plane: PlaneCopy) -> bool {
     src_end.is_some() && dst_end.is_some_and(|dst_end| dst_end <= dest_size)
 }
 
-/// Copy only the damaged rectangles of a SHM image into the host-side
-/// linear buffer.
+/// Copy only the damaged rectangles of a SHM image from `source` into
+/// `destination`, the host-side linear buffer.
 ///
 /// ChromiumOS treats NV12 as two planes sharing one FD: the UV plane starts
 /// immediately after the full-resolution Y plane and has half as many rows.
-/// Validate every plane and every rectangle before touching either destination
-/// plane so malformed client metadata cannot leave a partially updated buffer.
+/// Validate every plane and every rectangle against `destination` before
+/// touching either destination plane so malformed client metadata cannot
+/// leave a partially updated buffer.
 pub(crate) fn copy_shm_damage(
     source: &File,
-    dst_ptr: *mut u8,
+    destination: &HostMapping,
     layout: ShmCopyLayout,
     damage: &DamageRegion<BufferSpace>,
 ) -> Result<(), ShmCopyError> {
+    let dest_size = destination.len();
     let ShmCopyLayout {
-        dest_size,
         format,
         offset,
         width,
@@ -137,12 +136,7 @@ pub(crate) fn copy_shm_damage(
         dst_plane1_stride,
         height,
     } = layout;
-    if dst_ptr.is_null()
-        || dst_ptr as *mut libc::c_void == libc::MAP_FAILED
-        || width == 0
-        || height == 0
-        || format_bytes_per_pixel(format).is_none()
-    {
+    if width == 0 || height == 0 || format_bytes_per_pixel(format).is_none() {
         return Err(ShmCopyError::Destination);
     }
 
@@ -267,18 +261,23 @@ pub(crate) fn copy_shm_damage(
         for chunk in 0..chunks {
             let src_offset = plane.src_offset + chunk * plane.src_stride;
             let dst_offset = plane.dst_offset + chunk * plane.dst_stride;
-            // Safety: valid_plane_copy checked that every row of the span,
-            // and so this chunk, lies inside the destination mapping, and
-            // nothing else references that memory during the copy.
-            let destination =
-                unsafe { std::slice::from_raw_parts_mut(dst_ptr.add(dst_offset), chunk_bytes) };
+            debug_assert!(
+                dst_offset + chunk_bytes <= dest_size,
+                "valid_plane_copy admitted a chunk past the destination"
+            );
             // The read fails, instead of raising SIGBUS like a mapping
             // would, if the client truncated the pool file. EFAULT is the
-            // destination mapping's fault, not the client's. (A FUSE-backed
-            // pool could also return EFAULT; it is then treated as a host
-            // storage failure, which only drops the commit.)
-            source
-                .read_exact_at(destination, src_offset as u64)
+            // destination mapping's fault, not the client's; it is also how
+            // the mapping refuses a range outside it, which valid_plane_copy
+            // already excluded. (A FUSE-backed pool could also return
+            // EFAULT; it is then treated as a host storage failure, which
+            // only drops the commit.)
+            destination
+                .pread_into(
+                    dst_offset..dst_offset + chunk_bytes,
+                    source,
+                    src_offset as u64,
+                )
                 .map_err(|error| match error.raw_os_error() {
                     Some(libc::EFAULT) => ShmCopyError::Destination,
                     _ => ShmCopyError::Source(error),
@@ -290,14 +289,14 @@ pub(crate) fn copy_shm_damage(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_shm_damage, ShmCopyError, ShmCopyLayout};
+    use super::{coalesce_damage_rects, copy_shm_damage, ShmCopyError, ShmCopyLayout};
     use crate::protocols::wayland::wl_shm;
-    use crate::state::{BufferRect, DamageRegion};
-    use crate::test_support::shm_pool_file;
+    use crate::state::{BufferRect, DamageRegion, HostMapping};
+    use crate::test_support::{host_mapping, shm_pool_file};
+    use std::os::fd::AsFd;
 
-    /// A 4x4 NV12 frame, copied into a packed destination of 24 bytes.
+    /// A 4x4 NV12 frame, which fills a packed destination of 24 bytes.
     const NV12_4X4: ShmCopyLayout = ShmCopyLayout {
-        dest_size: 24,
         format: wl_shm::FORMAT_NV12,
         offset: 0,
         width: 4,
@@ -308,9 +307,8 @@ mod tests {
         height: 4,
     };
 
-    /// One ARGB8888 pixel, copied into a destination of 4 bytes.
+    /// One ARGB8888 pixel, which fills a destination of 4 bytes.
     const ARGB8888_1X1: ShmCopyLayout = ShmCopyLayout {
-        dest_size: 4,
         format: 0,
         width: 1,
         height: 1,
@@ -322,50 +320,66 @@ mod tests {
         let mut source = [0u8; 24];
         source[..16].fill(0x11);
         source[16..].fill(0x22);
-        let mut destination = [0u8; 24];
+        let destination = host_mapping(&[0; 24]);
 
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            ShmCopyLayout {
-                dest_size: destination.len(),
-                ..NV12_4X4
-            },
+            &destination,
+            NV12_4X4,
             &DamageRegion::Full,
         )
         .is_ok());
-        assert_eq!(&destination[..16], &[0x11; 16]);
-        assert_eq!(&destination[16..], &[0x22; 8]);
+        let copied = destination.to_vec();
+        assert_eq!(&copied[..16], &[0x11; 16]);
+        assert_eq!(&copied[16..], &[0x22; 8]);
 
         // The Y plane fits a 23-byte destination, but the UV plane does not.
-        destination.fill(0);
+        let destination = host_mapping(&[0; 23]);
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
-            destination.as_mut_ptr(),
-            ShmCopyLayout {
-                dest_size: 23,
-                ..NV12_4X4
-            },
+            &destination,
+            NV12_4X4,
             &DamageRegion::Full,
         )
         .is_err());
-        assert!(
-            destination.iter().all(|byte| *byte == 0),
+        assert_eq!(
+            destination.to_vec(),
+            [0; 23],
             "an invalid UV span must not leave the Y plane partially copied"
         );
     }
 
+    /// A buffer whose last row ends past its destination is refused
+    /// before anything is copied, whatever the damage: the copy never
+    /// writes outside the destination, nor leaves it partly updated.
     #[test]
-    fn copy_rejects_null_or_failed_destinations_before_pointer_arithmetic() {
-        let source = shm_pool_file(&[0u8; 4]);
-        let layout = ARGB8888_1X1;
-        let damage = DamageRegion::from(vec![BufferRect::new(0, 0, 1, 1)]);
-        for destination in [std::ptr::null_mut(), libc::MAP_FAILED.cast()] {
+    fn copy_rejects_a_buffer_that_overruns_its_destination() {
+        // Three rows of four ARGB8888 pixels, 16 bytes apart, need 48 bytes.
+        let source = shm_pool_file(&[0x11; 48]);
+        let layout = ShmCopyLayout {
+            width: 4,
+            height: 3,
+            src_stride: 16,
+            dst_stride: 16,
+            ..ARGB8888_1X1
+        };
+        let last_row = DamageRegion::from(vec![BufferRect::new(0, 2, 4, 1)]);
+        // Two spans that stay apart, in this order: the first pixel of
+        // row 0, which fits, and the last pixel of row 2, which does not.
+        let spans = vec![BufferRect::new(0, 0, 1, 1), BufferRect::new(3, 2, 1, 1)];
+        assert_eq!(coalesce_damage_rects(&spans), spans, "kept apart, in order");
+        let fitting_span_then_overrun = DamageRegion::from(spans);
+        for damage in [&DamageRegion::Full, &last_row, &fitting_span_then_overrun] {
+            let destination = host_mapping(&[0; 47]);
             assert!(matches!(
-                copy_shm_damage(&source, destination, layout, &damage),
+                copy_shm_damage(&source, &destination, layout, damage),
                 Err(ShmCopyError::Destination)
             ));
+            assert_eq!(destination.to_vec(), [0; 47], "nothing is copied");
         }
+        let destination = host_mapping(&[0; 48]);
+        copy_shm_damage(&source, &destination, layout, &DamageRegion::Full).unwrap();
+        assert_eq!(destination.to_vec(), [0x11; 48]);
     }
 
     #[test]
@@ -374,14 +388,12 @@ mod tests {
         // a mapping past the new end raised SIGBUS and killed the proxy.
         let source = shm_pool_file(&[0x11; 8]);
         source.set_len(4).unwrap();
-        let mut destination = [0u8; 8];
         let layout = ShmCopyLayout {
-            dest_size: destination.len(),
             height: 2,
             ..ARGB8888_1X1
         };
         assert!(matches!(
-            copy_shm_damage(&source, destination.as_mut_ptr(), layout, &DamageRegion::Full),
+            copy_shm_damage(&source, &host_mapping(&[0; 8]), layout, &DamageRegion::Full),
             Err(ShmCopyError::Source(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
         ));
     }
@@ -391,21 +403,11 @@ mod tests {
         // The kernel reports a fault in the destination as EFAULT, which must
         // not become the client's invalid_fd.
         let source = shm_pool_file(&[0x11; 4]);
-        let destination = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(destination, libc::MAP_FAILED);
-        let layout = ARGB8888_1X1;
-        let result = copy_shm_damage(&source, destination.cast(), layout, &DamageRegion::Full);
-        unsafe { libc::munmap(destination, 4096) };
-        assert!(matches!(result, Err(ShmCopyError::Destination)));
+        let destination = HostMapping::map_read_only(shm_pool_file(&[0; 4]).as_fd(), 4).unwrap();
+        assert!(matches!(
+            copy_shm_damage(&source, &destination, ARGB8888_1X1, &DamageRegion::Full),
+            Err(ShmCopyError::Destination)
+        ));
     }
 
     #[test]
@@ -413,13 +415,12 @@ mod tests {
         let mut source = [0u8; 24];
         source[..16].fill(0x11);
         source[16..].fill(0x22);
-        let mut destination = [0u8; 32];
+        let destination = host_mapping(&[0; 32]);
 
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
-            destination.as_mut_ptr(),
+            &destination,
             ShmCopyLayout {
-                dest_size: destination.len(),
                 dst_plane1_offset: 20,
                 dst_plane1_stride: 4,
                 ..NV12_4X4
@@ -427,10 +428,11 @@ mod tests {
             &DamageRegion::Full,
         )
         .is_ok());
-        assert_eq!(&destination[..16], &[0x11; 16]);
-        assert_eq!(&destination[16..20], &[0; 4]);
-        assert_eq!(&destination[20..28], &[0x22; 8]);
-        assert_eq!(&destination[28..], &[0; 4]);
+        let copied = destination.to_vec();
+        assert_eq!(&copied[..16], &[0x11; 16]);
+        assert_eq!(&copied[16..20], &[0; 4]);
+        assert_eq!(&copied[20..28], &[0x22; 8]);
+        assert_eq!(&copied[28..], &[0; 4]);
     }
 
     #[test]
@@ -439,13 +441,12 @@ mod tests {
         source[..16].fill(0x11);
         source[16..20].fill(0x21);
         source[20..24].fill(0x22);
-        let mut destination = [0xcc; 36];
+        let destination = host_mapping(&[0xcc; 36]);
 
         assert!(copy_shm_damage(
             &shm_pool_file(&source),
-            destination.as_mut_ptr(),
+            &destination,
             ShmCopyLayout {
-                dest_size: destination.len(),
                 dst_plane1_offset: 20,
                 dst_plane1_stride: 8,
                 ..NV12_4X4
@@ -453,6 +454,7 @@ mod tests {
             &DamageRegion::from(vec![BufferRect::new(0, 2, 4, 2)]),
         )
         .is_ok());
+        let destination = destination.to_vec();
 
         // Only the damaged bottom half is changed.  The UV row must use its
         // own eight-byte destination stride, not the four-byte Y stride.

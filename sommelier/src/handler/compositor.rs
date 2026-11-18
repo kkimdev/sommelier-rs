@@ -28,8 +28,8 @@ use crate::protocols::wayland::wl_surface::{self, WlSurfaceHandler, REQ_OFFSET_S
 use crate::protocols::xdg_shell::xdg_toplevel;
 use crate::state::{
     is_valid_transform, BufferRect, BufferSpace, BufferState, Context, DamageRegion, FenceWait,
-    PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping, SurfaceRect,
-    SurfaceState, ViewportState,
+    HostMapping, PostDispatch, ShadowTable, SurfaceAttachment, SurfaceCommit, SurfaceMapping,
+    SurfaceRect, SurfaceState, ViewportState,
 };
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{queue_or_drop, Action, Outgoing};
@@ -317,14 +317,14 @@ fn copy_surface_buffer(
             trace!(
                 "Copied damaged SHM buffer: dst_stride={}, src_stride={}, \
                  width={}, height={}, format={:#010x}, buffer.offset={}, \
-                 dest_size={}",
+                 host_copy_size={}",
                 buffer.dest_stride,
                 buffer.stride,
                 buffer.width,
                 buffer.height,
                 buffer.format,
                 buffer.offset,
-                buffer.dest_size
+                buffer.host_copy.as_ref().map_or(0, HostMapping::len)
             );
         }
         Err(error) => {
@@ -355,8 +355,8 @@ fn copy_to_host_storage(
     } else {
         None
     };
-    let result = if !buffer.dest_ptr.is_null() {
-        copy_shm_damage(&buffer.pool_file, buffer.dest_ptr, layout, damage)
+    let result = if let Some(host_copy) = &buffer.host_copy {
+        copy_shm_damage(&buffer.pool_file, host_copy, layout, damage)
     } else {
         // Both backings map their storage when the buffer is created, so
         // only a test fixture without a mapping reaches this.
@@ -424,10 +424,10 @@ pub(crate) fn forget_surface(ctx: &mut Context, wl_surface_guest_id: u32, wl_sur
         .remove(&wl_surface_guest_id)
         .and_then(|surface| surface.current_buffer_id());
     ctx.forget_surface_buffer_copies(wl_surface_guest_id);
-    crate::handler::shm::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
+    crate::handler::buffer::clear_buffer_uses_after_surface_destroy(ctx, destroyed_surface_buffer);
     // Pending-only objects do not receive a host release event. Retire
     // every buffer made eligible by removing this surface in one pass.
-    crate::handler::shm::retire_eligible_buffers(ctx);
+    crate::handler::buffer::retire_eligible_buffers(ctx);
     ctx.viewport_to_wl_surface
         .retain(|_, surface_id| *surface_id != wl_surface_guest_id);
     ctx.key_generations
@@ -527,7 +527,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // means the compositor will never emit wl_buffer.release for the
         // superseded object, so retire its host proxy after the new attach
         // request in the ordered queue.
-        crate::handler::shm::retire_eligible_buffers(ctx);
+        crate::handler::buffer::retire_eligible_buffers(ctx);
         Action::Forward
     }
 
@@ -706,7 +706,7 @@ impl WlSurfaceHandler for CompositorHandler {
                 if let Some(surface) = ctx.surfaces.get_mut(&surface_id) {
                     commit.rollback(surface);
                 }
-                crate::handler::shm::retire_eligible_buffers(ctx);
+                crate::handler::buffer::retire_eligible_buffers(ctx);
                 return Action::Drop;
             }
         }
@@ -759,7 +759,7 @@ impl WlSurfaceHandler for CompositorHandler {
         // finalized. Append them together, in order, only once every check
         // has passed, so the host never sees a partial transaction.
         ctx.client_to_host_queue.append(&mut host_messages);
-        crate::handler::shm::retire_eligible_buffers(ctx);
+        crate::handler::buffer::retire_eligible_buffers(ctx);
         Action::Drop
     }
 }
@@ -1206,7 +1206,7 @@ mod tests {
     /// The host copy of local-copy buffer `guest_id`.
     fn test_destination(ctx: &Context, guest_id: u32) -> Vec<u8> {
         let buffer = ctx.local_buffer(guest_id).unwrap();
-        unsafe { std::slice::from_raw_parts(buffer.dest_ptr, buffer.dest_size) }.to_vec()
+        buffer.host_copy.as_ref().unwrap().to_vec()
     }
 
     fn register_test_local(ctx: &mut Context, guest_id: u32, backing: BufferState) {
@@ -1416,9 +1416,12 @@ mod tests {
     /// exactly what the next commit copies.
     fn draw_test_frame(ctx: &Context, buffer: u32, pixel: u8) {
         let local = ctx.local_buffer(buffer).unwrap();
-        let bytes = vec![pixel; local.dest_size];
-        local.pool_file.write_all_at(&bytes, 0).unwrap();
-        unsafe { std::ptr::write_bytes(local.dest_ptr, 0, local.dest_size) };
+        let host_copy = local.host_copy.as_ref().unwrap();
+        let size = host_copy.len();
+        local.pool_file.write_all_at(&vec![pixel; size], 0).unwrap();
+        host_copy
+            .pread_into(0..size, &shm_pool_file(&vec![0; size]), 0)
+            .unwrap();
     }
 
     /// The (x, y) pixels of `buffer`'s host copy that hold `pixel`.
@@ -2526,7 +2529,6 @@ mod tests {
         ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
         register_test_buffer(&mut ctx, BufferKind::Shm, buffer_id, host_buffer_id);
         let pool = test_pool_file(&ctx, buffer_id);
-        let destination = ctx.local_buffer(buffer_id).unwrap().dest_ptr;
         // This buffer has completed a previous compositor-use interval. A new
         // attach must reopen that interval even when the guest destroys the
         // object before commit.
@@ -2559,7 +2561,7 @@ mod tests {
         assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
         // The guest object is gone, but the local backing is not.
         assert_eq!(
-            unsafe { std::slice::from_raw_parts(destination, BUFFER_BYTES) },
+            test_destination(&ctx, buffer_id)[..BUFFER_BYTES],
             [0x22; BUFFER_BYTES],
             "destroying the guest buffer before commit must not lose its frame"
         );
@@ -2765,12 +2767,7 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let mut buffer = mapped_test_buffer(8, 6, 32, StalePixels::all());
-        let destination_ptr = buffer.dest_ptr;
-        buffer.dest_ptr = std::ptr::null_mut();
-        buffer.dest_size = 0;
-        unsafe {
-            libc::munmap(destination_ptr as *mut libc::c_void, 32 * 6);
-        }
+        buffer.host_copy = None;
         register_test_local(&mut ctx, buffer_id, buffer);
 
         ctx.last_sender_id = surface_id;

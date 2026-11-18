@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use super::outputs::transformed_extent;
 use super::HostId;
+use super::HostMapping;
 
 /// A guest `wl_shm_pool`.
 ///
@@ -63,24 +64,10 @@ pub struct BufferState {
     /// Whether the output descriptor requires VirtWL dma-buf begin/end
     /// synchronization around CPU writes.
     pub dmabuf_sync: bool,
-    pub dest_ptr: *mut u8,
-    pub dest_size: usize,
+    /// The proxy's mapping of the host copy. Only a test fixture has none.
+    pub host_copy: Option<HostMapping>,
     /// The pixels the host copy lacks, which the next copy covers.
     pub stale: StalePixels,
-}
-
-unsafe impl Send for BufferState {}
-unsafe impl Sync for BufferState {}
-
-impl Drop for BufferState {
-    fn drop(&mut self) {
-        if !self.dest_ptr.is_null() && self.dest_ptr as *mut libc::c_void != libc::MAP_FAILED {
-            unsafe {
-                libc::munmap(self.dest_ptr as *mut libc::c_void, self.dest_size);
-                self.dest_ptr = std::ptr::null_mut();
-            }
-        }
-    }
 }
 
 /// The pixels a local buffer's host copy lacks, relative to the surface it
