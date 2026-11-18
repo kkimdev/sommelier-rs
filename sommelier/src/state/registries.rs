@@ -41,6 +41,11 @@ pub(crate) struct RegistryRecord {
     /// keeps the version the guest saw if it can be bound inert (see
     /// `INERT_BIND_INTERFACE`), and `None` otherwise.
     removed: BTreeMap<u32, Option<u32>>,
+    /// Whether the registry's current advertisement of each name it lists
+    /// was visible to the guest. It is kept per registry and generation so
+    /// that a delayed `global_remove` of an old hidden or visible generation
+    /// is not classified by its replacement's metadata.
+    visibility: BTreeMap<u32, bool>,
 }
 
 impl RegistryRecord {
@@ -86,13 +91,27 @@ impl RegistryRecord {
         self.removed.insert(name, inert_bind_version);
     }
 
-    /// The registry no longer lists global `name`.
+    /// The registry no longer lists global `name`, so its visibility is
+    /// forgotten too.
     ///
     /// # Returns
     ///
     /// Whether it listed it.
     pub(crate) fn unlist(&mut self, name: u32) -> bool {
+        self.visibility.remove(&name);
         self.listed.remove(&name)
+    }
+
+    /// Whether the registry's current advertisement of global `name` was
+    /// visible to the guest, if the proxy has decided.
+    pub(crate) fn visibility(&self, name: u32) -> Option<bool> {
+        self.visibility.get(&name).copied()
+    }
+
+    /// The registry's current advertisement of global `name` was `visible`
+    /// to the guest, or not.
+    pub(crate) fn set_visibility(&mut self, name: u32, visible: bool) {
+        self.visibility.insert(name, visible);
     }
 
     /// The names the registry lists, in order, with their generations.

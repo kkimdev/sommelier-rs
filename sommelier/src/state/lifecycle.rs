@@ -383,15 +383,11 @@ impl Context {
         }
 
         // Registries.
-        let registries = self
-            .registries
-            .keys()
-            .chain(self.registry_global_visibility.keys())
-            .chain(
-                self.pending_dmabuf_globals
-                    .iter()
-                    .map(|pending| &pending.registry_host_id),
-            );
+        let registries = self.registries.keys().chain(
+            self.pending_dmabuf_globals
+                .iter()
+                .map(|pending| &pending.registry_host_id),
+        );
         for &registry in registries {
             host("registry globals", registry, "wl_registry");
         }

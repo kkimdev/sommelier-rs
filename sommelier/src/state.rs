@@ -481,11 +481,6 @@ pub struct Context {
     /// What each host registry has advertised, by host registry ID (see
     /// [`RegistryRecord`]).
     pub(crate) registries: BTreeMap<u32, RegistryRecord>,
-    /// Whether each registry's current advertisement for a name was visible
-    /// to the guest. This is kept per registry/generation so a delayed
-    /// global_remove for an old hidden/visible generation cannot be classified
-    /// using replacement metadata.
-    pub registry_global_visibility: BTreeMap<u32, BTreeMap<u32, bool>>,
     pub global_generations: BTreeMap<u32, u64>,
     pub next_global_generation: u64,
     /// The generation of each global whose current advertisement the host
@@ -1062,7 +1057,6 @@ impl Context {
             singleton_candidates: BTreeMap::new(),
             hidden_host_globals: BTreeMap::new(),
             registries: BTreeMap::new(),
-            registry_global_visibility: BTreeMap::new(),
             global_generations: BTreeMap::new(),
             next_global_generation: 1,
             removed_global_generations: BTreeMap::new(),

@@ -339,10 +339,7 @@ fn defer_synthetic_dmabuf_global(
     if !ctx.pending_dmabuf_globals.contains(&pending) {
         ctx.pending_dmabuf_globals.push(pending);
     }
-    ctx.registry_global_visibility
-        .entry(registry_host_id)
-        .or_default()
-        .insert(name, false);
+    set_registry_global_visibility(ctx, registry_host_id, name, false);
 }
 
 pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64) {
@@ -392,10 +389,7 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
             zwp_linux_dmabuf_v1::NAME,
             pending.version,
         );
-        ctx.registry_global_visibility
-            .entry(pending.registry_host_id)
-            .or_default()
-            .insert(pending.name, visible);
+        set_registry_global_visibility(ctx, pending.registry_host_id, pending.name, visible);
         if !visible {
             ctx.host_globals.remove(&pending.name);
         }
@@ -786,10 +780,21 @@ fn advertise_text_input_manager_v3(ctx: &mut Context, name: u32) {
 }
 
 fn record_registry_global_visibility(ctx: &mut Context, name: u32, visible: bool) {
-    ctx.registry_global_visibility
-        .entry(ctx.last_sender_id)
-        .or_default()
-        .insert(name, visible);
+    set_registry_global_visibility(ctx, ctx.last_sender_id, name, visible);
+}
+
+/// Host registry `registry_host_id`'s current advertisement of global
+/// `name` was `visible` to the guest, or not. Only a registry that lists
+/// the name has an advertisement to classify.
+fn set_registry_global_visibility(
+    ctx: &mut Context,
+    registry_host_id: u32,
+    name: u32,
+    visible: bool,
+) {
+    if let Some(record) = ctx.registries.get_mut(&registry_host_id) {
+        record.set_visibility(name, visible);
+    }
 }
 
 fn can_synthesize_dmabuf_feedback(ctx: &Context, version: u32) -> bool {
@@ -1192,10 +1197,9 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
             .get(&registry_id)
             .and_then(|record| record.generation(name));
         let was_visible = ctx
-            .registry_global_visibility
+            .registries
             .get(&registry_id)
-            .and_then(|visibility| visibility.get(&name))
-            .copied()
+            .and_then(|record| record.visibility(name))
             .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
         let registry_seen = ctx
             .registries
@@ -1227,9 +1231,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                 );
             }
             crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
-        }
-        if let Some(visibility) = ctx.registry_global_visibility.get_mut(&registry_id) {
-            visibility.remove(&name);
         }
         // Host registries are independent Wayland objects and their events can
         // be interleaved. A global name may be removed from one registry and
@@ -1421,7 +1422,6 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 /// last one, it will never see the removal, so the global is retired now.
 pub(crate) fn forget_registry(ctx: &mut Context, registry_host_id: u32) {
     let record = ctx.registries.remove(&registry_host_id).unwrap_or_default();
-    ctx.registry_global_visibility.remove(&registry_host_id);
     ctx.pending_dmabuf_globals
         .retain(|pending| pending.registry_host_id != registry_host_id);
     for (name, generation) in record.listed() {
@@ -1646,11 +1646,9 @@ mod tests {
     #[test]
     fn wl_fixes_destroy_registry_removes_deferred_dmabuf_advertisements() {
         let mut ctx = gpu_context(&[A]);
-        ctx.registries.entry(A.host).or_default().list(7, 9);
-        ctx.registry_global_visibility
-            .entry(A.host)
-            .or_default()
-            .insert(7, false);
+        let record = ctx.registries.entry(A.host).or_default();
+        record.list(7, 9);
+        record.set_visibility(7, false);
         ctx.dmabuf_capabilities.entry(9).or_default();
         ctx.pending_dmabuf_globals
             .push(crate::state::PendingDmabufGlobal {
@@ -1662,7 +1660,6 @@ mod tests {
 
         assert_eq!(A.destroy(&mut ctx), Action::Forward);
         assert!(!ctx.registries.contains_key(&A.host));
-        assert!(!ctx.registry_global_visibility.contains_key(&A.host));
         assert!(ctx.pending_dmabuf_globals.is_empty());
         assert!(!ctx.dmabuf_capabilities.contains_key(&9));
         assert!(ctx.shadow_table.is_pending_destroy_guest(A.guest));
@@ -1875,8 +1872,8 @@ mod tests {
                 Vec::from_iter(offered.map(|version| (A.guest, global_event(10, dmabuf, version))))
             );
             assert_eq!(
-                ctx.registry_global_visibility[&A.host].get(&10),
-                Some(&offered.is_some())
+                ctx.registries[&A.host].visibility(10),
+                Some(offered.is_some())
             );
         }
     }
