@@ -1263,7 +1263,7 @@ mod tests {
             ("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=left"),
         ];
         // Variables only tests read.
-        const TEST_ONLY: &[&str] = &["SOMMELIER_FUZZ_", "SOMMELIER_TEST_"];
+        const TEST_ONLY: &[&str] = &["SOMMELIER_DST_", "SOMMELIER_FUZZ_", "SOMMELIER_TEST_"];
         let named = source_files(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src"

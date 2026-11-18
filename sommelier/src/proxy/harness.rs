@@ -115,6 +115,17 @@ impl Session {
         );
     }
 
+    /// The guest sends `requests`; returns whether the session goes on, for
+    /// a driver that reports a session's end rather than asserting it.
+    pub(crate) async fn try_guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) -> bool {
+        self.send(Direction::ClientToHost, requests).await
+    }
+
+    /// The host sends `events`; returns whether the session goes on.
+    pub(crate) async fn try_host(&mut self, events: impl IntoIterator<Item = Outgoing>) -> bool {
+        self.send(Direction::HostToClient, events).await
+    }
+
     /// Make every later send to the guest fail, as when its connection
     /// breaks. Closing the guest's end would not do: a process another test
     /// spawns may hold a copy of it.

@@ -119,7 +119,7 @@ struct Window {
 
 /// Chromium's v3 client.
 #[derive(Debug)]
-pub(super) struct Chromium {
+pub(in crate::sim) struct Chromium {
     protocol: Protocol,
     fields: Vec<Field>,
     windows: Vec<Window>,

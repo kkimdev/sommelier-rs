@@ -25,11 +25,46 @@ limitations under the License.
 //! A case's messages travel FIFO [`Channel`]s, each delivered when its
 //! drawn latency has passed, and [`earliest`] picks what happens next, so
 //! the only reorderings are across channels, never within one.
+//!
+//! [`World`] joins a client model, the real proxy (a [`Session`]), the Exo
+//! model, its engine and the host's [`Display`] by those channels, and
+//! steps them on one clock (the design's section 4.2):
+//!
+//! | Channel | Carries | Latency (µs) |
+//! |---|---|---|
+//! | C→P | the guest's requests | 0 to 2,000 |
+//! | P→C | the proxy's events to the guest | 0 to 2,000 |
+//! | P→E | the proxy's requests to the host | 0 to 3,000 |
+//! | E→P | the host's events to the proxy | 0 to 3,000 |
+//! | E→Eng | what Exo hands the engine | 0 to 1,000 |
+//!
+//! The engine answers after its own service time, and the user acts at
+//! the times the actions draw. The proxy gets one message at a time, the
+//! finest interleaving its dispatch can produce, and what it sends goes
+//! out at once. Exo, the engine and the client each handle one message
+//! atomically.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
+use super::client::chromium::Chromium;
+use super::client::gtk::Gtk;
+use super::client::{Client, Field, PressKind};
 use super::clock::Micros;
-use crate::test_support::Rng;
+use super::display::Display;
+use super::editor::{TextModel, UserAction};
+use super::engine::{Engine, EngineIn, Lag};
+use super::exo::{Answer, Exo};
+use super::keymap;
+use super::oracle::{Seen, Shadow, SpecText};
+use super::ClientKind;
+use crate::protocols::text_input_unstable_v3::{zwp_text_input_manager_v3, zwp_text_input_v3};
+use crate::protocols::wayland::{
+    wl_compositor, wl_display, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_touch,
+};
+use crate::protocols::{AnyEvent, AnyRequest};
+use crate::proxy::harness::Session;
+use crate::test_support::{decode, Rng};
+use crate::wire::{Outgoing, WL_DISPLAY_ID};
 
 /// The source of a case's choices.
 pub(super) trait Choose {
@@ -147,6 +182,494 @@ pub(super) fn earliest(sources: &[Option<Micros>], choices: &mut impl Choose) ->
         n => choices.pick(u32::try_from(n).expect("a few sources")) as usize,
     };
     Some(tied[pick])
+}
+
+/// The channels' longest latencies (section 4.2).
+const GUEST_LATENCY: Micros = Micros(2_000);
+const HOST_LATENCY: Micros = Micros(3_000);
+const ENGINE_LATENCY: Micros = Micros(1_000);
+/// How long the user waits once everything has settled.
+const SETTLE: Micros = Micros::from_millis(50);
+
+/// Where a line of a case's trace happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Place {
+    /// A guest request reached the proxy.
+    CToP,
+    /// The proxy sent the guest an event.
+    PToC,
+    /// The proxy sent the host a request.
+    PToE,
+    /// A host event reached the proxy.
+    EToP,
+    /// The engine answered part of a key.
+    Engine,
+    /// The user acted.
+    User,
+}
+
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let place = match self {
+            Self::CToP => "C→P",
+            Self::PToC => "P→C",
+            Self::PToE => "P→E",
+            Self::EToP => "E→P",
+            Self::Engine => "Eng",
+            Self::User => "U",
+        };
+        f.write_str(place)
+    }
+}
+
+/// A line of a case's trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Line {
+    pub at: Micros,
+    pub place: Place,
+    pub text: String,
+}
+
+impl std::fmt::Display for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = self.at.0 as f64 / 1_000.0;
+        write!(f, "{ms:10.3} {} {}", self.place, self.text)
+    }
+}
+
+/// What a case's world is made of, beside its choices.
+pub(super) struct Setup<'a> {
+    pub client: ClientKind,
+    /// The input method is a Latin layout, which has no engine.
+    pub latin: bool,
+    /// The text-input extension's version, if the host has one.
+    pub extension: Option<u32>,
+    pub lag: Lag,
+    /// The fields' initial texts.
+    pub texts: &'a [String],
+}
+
+/// What a case counts beside the oracle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Tally {
+    /// Engine answers that went out after a reset made after the key was
+    /// handed over (E5's outcome (c), P3).
+    pub late: u64,
+    /// Engine answers whose text a reset dropped (E5's outcome (b)).
+    pub dropped: u64,
+}
+
+/// One case's client, proxy, Exo, engine and display, joined by channels.
+pub(super) struct World<'t> {
+    now: Micros,
+    pub choices: Choices,
+    session: Session,
+    /// The client model, once the setup created its text input.
+    client: Option<Box<dyn Client>>,
+    pub exo: Exo,
+    engine: Engine,
+    display: Display,
+    c_to_p: Channel<Outgoing>,
+    p_to_c: Channel<(u32, AnyEvent)>,
+    p_to_e: Channel<(u32, AnyRequest)>,
+    /// Each host event, and whether it carries an engine answer that came
+    /// late ([`Answer::Late`]).
+    e_to_p: Channel<(Outgoing, bool)>,
+    to_engine: Channel<EngineIn>,
+    /// The guest's view of what the client models do not take: the
+    /// globals, Shift and where its pointer is.
+    globals: BTreeMap<String, (u32, u32)>,
+    shift: bool,
+    pointer: Option<(u32, i32)>,
+    /// The guest's text input.
+    text_input: u32,
+    /// The fields' guest surfaces.
+    surfaces: Vec<u32>,
+    /// The oracle's two readers, from the end of the setup.
+    pub spec: Option<SpecText>,
+    pub shadow: Option<Shadow>,
+    /// Which fields a focus move, click or tap left while their client
+    /// showed a preedit ([`super::oracle::classify`]).
+    pub left_composing: Vec<bool>,
+    pub tally: Tally,
+    /// The proxy ended the session.
+    pub ended: bool,
+    trace: &'t mut Vec<Line>,
+}
+
+impl<'t> World<'t> {
+    /// A world set up as `setup` says, its every draw from `choices`, its
+    /// trace in `trace`: the guest has bound the globals, created the
+    /// fields' surfaces, a keyboard, a pointer, a touch and a text input,
+    /// and the keyboard focus is on field 0. If the proxy ends the session
+    /// on the way, the world stops there, [`World::ended`].
+    pub async fn new(setup: &Setup<'_>, choices: Choices, trace: &'t mut Vec<Line>) -> World<'t> {
+        let mut exo = Exo::default();
+        exo.latin = setup.latin;
+        let mut world = World {
+            now: Micros(0),
+            choices,
+            session: Session::new(),
+            client: None,
+            exo,
+            engine: Engine::new(setup.lag),
+            display: Display::new(setup.extension),
+            c_to_p: Channel::new(GUEST_LATENCY),
+            p_to_c: Channel::new(GUEST_LATENCY),
+            p_to_e: Channel::new(HOST_LATENCY),
+            e_to_p: Channel::new(HOST_LATENCY),
+            to_engine: Channel::new(ENGINE_LATENCY),
+            globals: BTreeMap::new(),
+            shift: false,
+            pointer: None,
+            text_input: 0,
+            surfaces: Vec::new(),
+            spec: None,
+            shadow: None,
+            left_composing: vec![false; setup.texts.len()],
+            tally: Tally::default(),
+            ended: false,
+            trace,
+        };
+        let registry = world.session.new_id();
+        world.guest([wl_display::req::get_registry(WL_DISPLAY_ID, registry)]);
+        world.run(&[]).await;
+        if world.ended {
+            return world;
+        }
+        let [compositor, seat, manager] = [
+            wl_compositor::NAME,
+            wl_seat::NAME,
+            zwp_text_input_manager_v3::NAME,
+        ]
+        .map(|interface| {
+            let (name, version) = world.globals[interface];
+            let id = world.session.new_id();
+            let bind = wl_registry::req::bind(registry, name, interface, version, id);
+            world.guest([bind.expect("a bind fits a message")]);
+            id
+        });
+        world.surfaces = setup.texts.iter().map(|_| world.session.new_id()).collect();
+        for surface in world.surfaces.clone() {
+            world.guest([wl_compositor::req::create_surface(compositor, surface)]);
+        }
+        let [keyboard, pointer, touch, text_input] = [(); 4].map(|_| world.session.new_id());
+        world.guest([
+            wl_seat::req::get_keyboard(seat, keyboard),
+            wl_seat::req::get_pointer(seat, pointer),
+            wl_seat::req::get_touch(seat, touch),
+            zwp_text_input_manager_v3::req::get_text_input(manager, text_input, seat),
+        ]);
+        world.text_input = text_input;
+        world.run(&[]).await;
+        if world.ended {
+            return world;
+        }
+        let fields = world
+            .surfaces
+            .iter()
+            .zip(setup.texts)
+            .map(|(&surface, text)| Field {
+                surface,
+                model: TextModel::new(text),
+            })
+            .collect();
+        world.client = Some(match setup.client {
+            ClientKind::Chromium => Box::new(Chromium::new(text_input, fields)),
+            ClientKind::Gtk3 => Box::new(Gtk::new(false, text_input, fields)),
+            ClientKind::Gtk4 => Box::new(Gtk::new(true, text_input, fields)),
+        });
+        world.spec = Some(SpecText::new(world.display.surfaces(), setup.texts));
+        world.shadow = Some(Shadow::new(&world.surfaces, setup.texts));
+        world.act(UserAction::Focus(0));
+        world.run(&[]).await;
+        world
+    }
+
+    /// The engine's composition.
+    pub fn engine_composition(&self) -> String {
+        self.engine.composition()
+    }
+
+    /// The client model.
+    pub fn client(&self) -> &dyn Client {
+        self.client.as_deref().expect("a client model")
+    }
+
+    /// Plays `actions`, each at its time, and then delivers until every
+    /// channel is empty and the engine idle. Each action but a `Settle`
+    /// comes a drawn gap after the one before: 30 to 300 ms, as in normal
+    /// typing, or, half the time, 0 to 20 ms, a burst. A `Settle` waits
+    /// for everything to settle, and the next action comes 50 ms later.
+    /// Stops early if the proxy ends the session.
+    pub async fn run(&mut self, actions: &[UserAction]) {
+        let mut actions = actions.iter().copied().peekable();
+        let mut next = self.now;
+        while !self.ended {
+            let idle = [
+                self.c_to_p.ready_at(),
+                self.p_to_c.ready_at(),
+                self.p_to_e.ready_at(),
+                self.e_to_p.ready_at(),
+                self.to_engine.ready_at(),
+                self.engine.ready_at(),
+            ];
+            let user = match actions.peek() {
+                Some(UserAction::Settle) if idle.iter().any(Option::is_some) => None,
+                Some(_) => Some(next.max(self.now)),
+                None => None,
+            };
+            let mut sources = idle.to_vec();
+            sources.push(user);
+            let Some(source) = earliest(&sources, &mut self.choices) else {
+                return;
+            };
+            self.now = self.now.max(sources[source].expect("a ready source"));
+            match source {
+                0 => {
+                    let request = self.c_to_p.take();
+                    self.deliver_guest_request(request).await;
+                }
+                1 => {
+                    let (sender, event) = self.p_to_c.take();
+                    self.deliver_to_guest(sender, event);
+                }
+                2 => {
+                    let (sender, request) = self.p_to_e.take();
+                    let events = self.display.request(sender, &request, &mut self.exo);
+                    self.host_sends(events, false);
+                }
+                3 => {
+                    let (event, late) = self.e_to_p.take();
+                    self.deliver_host_event(event, late).await;
+                }
+                4 => {
+                    let input = self.to_engine.take();
+                    self.engine.send(self.now, input, &mut self.choices);
+                }
+                5 => self.engine_answers(),
+                _ => {
+                    let action = actions.next().expect("an action");
+                    self.act(action);
+                    next = self.now
+                        + match action {
+                            UserAction::Settle => SETTLE,
+                            _ if self.choices.pick(2) == 0 => {
+                                Micros::from_millis(self.choices.between(30, 300))
+                            }
+                            _ => Micros::from_millis(self.choices.between(0, 20)),
+                        };
+                }
+            }
+        }
+    }
+
+    /// The user acts: Exo takes a key's press and release; a click or a
+    /// tap focuses its field's surface, as a click on a window does, and
+    /// then presses there; a focus move moves the seat's focus.
+    fn act(&mut self, action: UserAction) {
+        self.log(Place::User, format!("{action:?}"));
+        let time = (self.now.0 / 1_000) as u32;
+        let field = match action {
+            UserAction::Click { field, .. } | UserAction::Tap { field, .. } => field,
+            UserAction::Focus(field) => field,
+            UserAction::Key(key) => {
+                for state in [
+                    wl_keyboard::KEY_STATE_PRESSED,
+                    wl_keyboard::KEY_STATE_RELEASED,
+                ] {
+                    self.exo.key(self.now, key, state);
+                }
+                return self.host_sends(Vec::new(), false);
+            }
+            UserAction::Settle => return,
+        };
+        let surface = self.display.surfaces()[field];
+        if self.exo.focus() != Some(surface) {
+            let left = self
+                .exo
+                .focus()
+                .map(|s| self.display.surfaces().iter().position(|&f| f == s));
+            if let (Some(Some(left)), Some(client)) = (left, &self.client) {
+                self.left_composing[left] |= !client.fields()[left].model.preedit.is_empty();
+            }
+            self.exo.move_focus(Some(surface), &mut self.choices);
+        }
+        let presses = match action {
+            UserAction::Click { at, .. } => self.display.click(surface, at, time),
+            UserAction::Tap { at, .. } => self.display.tap(surface, at, time),
+            _ => Vec::new(),
+        };
+        self.host_sends(presses, false);
+    }
+
+    /// Exo's events since its last input, then `events`, go to the proxy,
+    /// and what Exo handed the engine goes to the engine. Exo's events carry
+    /// a late answer if `late`.
+    fn host_sends(&mut self, events: Vec<Outgoing>, late: bool) {
+        for event in self.exo.take_events() {
+            self.e_to_p.send(self.now, (event, late), &mut self.choices);
+        }
+        for event in events {
+            self.e_to_p
+                .send(self.now, (event, false), &mut self.choices);
+        }
+        for input in self.exo.take_engine() {
+            self.to_engine.send(self.now, input, &mut self.choices);
+        }
+    }
+
+    /// The engine answers part of the key in service, and Exo applies it.
+    fn engine_answers(&mut self) {
+        let answer = self.engine.take(&mut self.choices);
+        self.log(Place::Engine, format!("{answer:?}"));
+        let verdict = self.exo.answer(&answer);
+        match verdict {
+            Answer::Normal => {}
+            Answer::Late => self.tally.late += 1,
+            Answer::Dropped => self.tally.dropped += 1,
+        }
+        self.host_sends(Vec::new(), verdict == Answer::Late);
+    }
+
+    /// The guest sends `requests` at once, on C→P.
+    fn guest(&mut self, requests: impl IntoIterator<Item = Outgoing>) {
+        for request in requests {
+            self.c_to_p.send(self.now, request, &mut self.choices);
+        }
+    }
+
+    /// A guest request reaches the proxy.
+    async fn deliver_guest_request(&mut self, request: Outgoing) {
+        let text_input = self.text_input;
+        let decoded = decode(&request.0, &mut VecDeque::new(), |msg| {
+            match msg.sender_id == text_input {
+                true => zwp_text_input_v3::Request::from_wire(msg),
+                false => Err(crate::wire::ProtocolError::InvalidSender(msg.sender_id)),
+            }
+        });
+        match &decoded {
+            Ok((_, request)) => {
+                self.log(Place::CToP, format!("{request:?}"));
+                self.see(Seen::Guest(request));
+            }
+            Err(_) => self.log(Place::CToP, "a setup request".to_owned()),
+        }
+        let goes_on = self.session.try_guest([request]).await;
+        self.send_proxy_output(goes_on);
+    }
+
+    /// A host event reaches the proxy.
+    async fn deliver_host_event(&mut self, event: Outgoing, late: bool) {
+        let (sender, decoded) = self.display.decode(&event);
+        let note = if late { " (late)" } else { "" };
+        self.log(Place::EToP, format!("{sender} {decoded:?}{note}"));
+        self.see(Seen::Host {
+            sender,
+            event: &decoded,
+            late,
+        });
+        let goes_on = self.session.try_host([event]).await;
+        self.send_proxy_output(goes_on);
+    }
+
+    /// What the proxy sent goes out on P→E and P→C.
+    fn send_proxy_output(&mut self, goes_on: bool) {
+        for (sender, request) in self.session.host_received() {
+            self.log(Place::PToE, format!("{sender} {request:?}"));
+            self.see(Seen::ToHost(&request));
+            self.p_to_e
+                .send(self.now, (sender, request), &mut self.choices);
+        }
+        for (sender, event) in self.session.guest_received() {
+            self.log(Place::PToC, format!("{sender} {event:?}"));
+            self.see(Seen::ToGuest(&event));
+            self.p_to_c
+                .send(self.now, (sender, event), &mut self.choices);
+        }
+        self.ended |= !goes_on;
+    }
+
+    /// An event reaches the guest: the client model takes what it models,
+    /// and the guest keeps the globals, Shift and the pointer's place.
+    fn deliver_to_guest(&mut self, sender: u32, event: AnyEvent) {
+        let now = self.now;
+        if let AnyEvent::WlRegistry(wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        }) = event
+        {
+            self.globals.insert(interface, (name, version));
+            return;
+        }
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        let press = |x| keymap::target(x).expect("a press at a target");
+        let requests = match event {
+            AnyEvent::ZwpTextInputV3(event) => client.event(now, sender, event),
+            AnyEvent::WlKeyboard(wl_keyboard::Event::Enter { surface, .. }) => {
+                client.keyboard_focus(now, Some(surface))
+            }
+            AnyEvent::WlKeyboard(wl_keyboard::Event::Leave { .. }) => {
+                client.keyboard_focus(now, None)
+            }
+            AnyEvent::WlKeyboard(wl_keyboard::Event::Modifiers { mods_depressed, .. }) => {
+                self.shift = mods_depressed & keymap::SHIFT != 0;
+                Vec::new()
+            }
+            AnyEvent::WlKeyboard(wl_keyboard::Event::Key { key, state, .. })
+                if state == wl_keyboard::KEY_STATE_PRESSED =>
+            {
+                match keymap::key(key, self.shift) {
+                    Some(key) => client.key(now, key),
+                    None => Vec::new(),
+                }
+            }
+            AnyEvent::WlPointer(wl_pointer::Event::Enter {
+                surface, surface_x, ..
+            }) => {
+                self.pointer = Some((surface, surface_x));
+                Vec::new()
+            }
+            AnyEvent::WlPointer(wl_pointer::Event::Motion { surface_x, .. }) => {
+                if let Some((_, x)) = &mut self.pointer {
+                    *x = surface_x;
+                }
+                Vec::new()
+            }
+            AnyEvent::WlPointer(wl_pointer::Event::Button { state, .. }) => {
+                let (surface, x) = self.pointer.expect("a button on a surface");
+                match state == wl_pointer::BUTTON_STATE_PRESSED {
+                    true => client.press(now, surface, press(x), PressKind::Button),
+                    false => client.release(now, false),
+                }
+            }
+            AnyEvent::WlTouch(wl_touch::Event::Down { surface, x, .. }) => {
+                client.press(now, surface, press(x), PressKind::Touch)
+            }
+            AnyEvent::WlTouch(wl_touch::Event::Up { .. }) => client.release(now, false),
+            _ => Vec::new(),
+        };
+        self.guest(requests);
+    }
+
+    /// The oracle's readers follow `seen`.
+    fn see(&mut self, seen: Seen<'_>) {
+        if let (Some(spec), Some(shadow)) = (&mut self.spec, &mut self.shadow) {
+            spec.see(seen);
+            shadow.see(seen);
+        }
+    }
+
+    fn log(&mut self, place: Place, text: String) {
+        self.trace.push(Line {
+            at: self.now,
+            place,
+            text,
+        });
+    }
 }
 
 #[cfg(test)]
