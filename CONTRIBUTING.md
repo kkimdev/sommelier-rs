@@ -128,7 +128,7 @@ gets one before the closing sync is answered), and each object the server
 creates gets a fresh ID from the server range.
 
 The compositor also models what Exo makes of the text-input requests
-(`proxy::fuzz::exo`, which cites the Chromium source of each rule): it
+(`sim::exo`, which cites the Chromium source of each rule): it
 drops a content type while no input method is attached, spends a pending
 surrounding-text support on the next content type, keeps surrounding
 text and the cursor rectangle regardless, and sends `enter` and `leave`
