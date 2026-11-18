@@ -323,13 +323,17 @@ or host error wins over an internal failure. After dispatch,
   ends the batch. Only a guest request with no descriptor arguments may
   wait: only the guest stream can be parked, and the descriptors would
   be gone when the request is dispatched again. A message that waits
-  otherwise, or with output, is a proxy bug and ends the session as an
-  internal failure (test: `a_wait_with_output_ends_the_session`).
-  `Client` parks the guest stream (`ParkedRequest`): it neither reads nor
-  dispatches guest messages, and fair dispatch does not offer them, while
-  host events and other clients go on. Once the exported sync_file is readable, or, for
-  the virtio-gpu fallback, which has no descriptor to wait on, a poll
-  interval after it parked, it dispatches the same message again, which
+  otherwise, or with a forward, output or deferred work, is a proxy bug:
+  the session ends as an internal failure, before the deferred work runs
+  (test: `a_wait_with_output_ends_the_session`). `proxy::fuzz` counts
+  such an end like any other session end, but never reaches a fence
+  wait: its planes are memfds and its contexts have no allocator, so no
+  fence is ever pending. `Client` parks the guest stream
+  (`ParkedRequest`): it neither reads nor dispatches guest messages, and
+  fair dispatch does not offer them, while host events and other clients
+  go on. Once the exported sync_file is readable, or, for the virtio-gpu
+  fallback, which has no descriptor to wait on, a poll interval after it
+  parked, it dispatches the same message again, which
   checks its fence afresh. The interval starts at `FENCE_POLL_INTERVAL`
   (2 ms) and doubles each time the message waits again, up to
   `MAX_FENCE_POLL_INTERVAL` (16 ms), since each ask costs several

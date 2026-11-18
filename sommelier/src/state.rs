@@ -624,6 +624,12 @@ impl Context {
         Action::Drop
     }
 
+    /// Whether the message being dispatched waits for a fence (see
+    /// [`Self::wait_for_fence`]).
+    pub(crate) fn waits_for_fence(&self) -> bool {
+        self.fence_wait.is_some()
+    }
+
     /// Take what the message just dispatched produced (see [`Effects`]).
     pub(crate) fn take_effects(&mut self) -> Effects {
         Effects {
