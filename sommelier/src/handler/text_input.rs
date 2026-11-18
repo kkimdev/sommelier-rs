@@ -2801,18 +2801,19 @@ mod tests {
             (pointer.id, button.into())
         }
 
-        /// A host `wl_touch.down` of `touch` on `surface`.
-        fn down(touch: Object, surface: Object) -> Outgoing {
-            wl_touch::evt::down(touch.host, 6, 600, surface.host, 0, 256, 512)
+        /// A host `wl_touch.down` of `touch` on `surface`, of touch point
+        /// `id`.
+        fn down(touch: Object, surface: Object, id: i32) -> Outgoing {
+            wl_touch::evt::down(touch.host, 6, 600, surface.host, id, 256, 512)
         }
 
         /// The `down` event `touch` gets for [`Self::down`].
-        fn guest_down(touch: Object, surface: Object) -> (u32, AnyEvent) {
+        fn guest_down(touch: Object, surface: Object, id: i32) -> (u32, AnyEvent) {
             let down = wl_touch::Event::Down {
                 serial: 6,
                 time: 600,
                 surface: surface.id,
-                id: 0,
+                id,
                 x: 256,
                 y: 512,
             };
@@ -4393,12 +4394,12 @@ mod tests {
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        f.s.host([Field::down(touch, f.surface)]).await;
+        f.s.host([Field::down(touch, f.surface, 1)]).await;
         let host = f.s.host_received();
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
-        expected.push(Field::guest_down(touch, f.surface));
+        expected.push(Field::guest_down(touch, f.surface, 1));
         assert_eq!(f.s.guest_received(), expected);
         f.drain(fence).await;
 
@@ -4418,16 +4419,19 @@ mod tests {
         let touch = f.s.touch(f.seat.id).await;
 
         // No composition.
-        f.s.host([Field::down(touch, f.surface)]).await;
-        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, f.surface)]);
+        f.s.host([Field::down(touch, f.surface, 1)]).await;
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_down(touch, f.surface, 1)]
+        );
         f.s.host([f.preedit("가", "가")]).await;
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // Another surface.
         let other = f.s.surface().await;
-        f.s.host([Field::down(touch, other)]).await;
-        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other)]);
+        f.s.host([Field::down(touch, other, 1)]).await;
+        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other, 1)]);
 
         // The host was told nothing, and the composition goes on.
         assert_eq!(f.s.host_received(), []);
@@ -4447,18 +4451,21 @@ mod tests {
         f.s.host([f.preedit("가", "가")]).await;
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
-        f.s.host([Field::down(touch, f.surface)]).await;
+        f.s.host([Field::down(touch, f.surface, 1)]).await;
         let host = f.s.host_received();
         let fence = barrier(&host);
         assert_eq!(host, [f.v1(V1::Reset {}), sync(fence)]);
         let mut expected = f.events([no_preedit(), commit("가"), V3::Done { serial: 1 }]);
-        expected.push(Field::guest_down(touch, f.surface));
+        expected.push(Field::guest_down(touch, f.surface, 1));
         assert_eq!(f.s.guest_received(), expected);
 
         // In flight: the syllable the next jamo made.
-        f.s.host([f.preedit("간", "간"), Field::down(touch, f.surface)])
+        f.s.host([f.preedit("간", "간"), Field::down(touch, f.surface, 1)])
             .await;
-        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, f.surface)]);
+        assert_eq!(
+            f.s.guest_received(),
+            [Field::guest_down(touch, f.surface, 1)]
+        );
         assert_eq!(f.s.host_received(), []);
         f.drain(fence).await;
     }
