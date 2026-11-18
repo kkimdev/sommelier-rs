@@ -31,6 +31,8 @@ mod host;
 mod serial;
 mod state;
 mod step;
+#[cfg(test)]
+mod tests;
 
 use state::TextInput;
 
