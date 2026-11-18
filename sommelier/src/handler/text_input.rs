@@ -1877,8 +1877,8 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
     }
 }
 
-/// A pointer pressed on guest surface `surface`, a press the guest has yet
-/// to get: end the composition of the text input that
+/// A press on guest surface `surface`, a press the guest has yet to get:
+/// end the composition of the text input that
 /// [`TextInputState::prepare_press_commit`] says the press ends. Only one
 /// can be: one text input on a connection is enabled at a time. The guest
 /// commits the preedit it shows, and the host `reset`s, which drops Exo's
@@ -1886,20 +1886,26 @@ pub(crate) fn forget_text_input(ctx: &mut Context, guest_id: u32, host_deleted: 
 ///
 /// # Returns
 ///
-/// Whether a composition ended, so that the press must follow the guest
-/// events queued.
-pub(crate) fn end_composition_on_press(ctx: &mut Context, surface: u32) -> bool {
+/// How to dispatch the press. If a composition ended, the press, built by
+/// `press`, is queued after the guest events that end it, since a forward
+/// would precede them, and the original is dropped; otherwise it is
+/// forwarded.
+pub(crate) fn end_composition_on_press(
+    ctx: &mut Context,
+    surface: u32,
+    press: impl FnOnce() -> Outgoing,
+) -> Action {
     let Some((guest_id, host_v1_id, plan)) =
         ctx.text_inputs.iter().find_map(|(&guest_id, state)| {
             let plan = state.prepare_press_commit(surface)?;
             Some((guest_id, state.host_v1_id, plan))
         })
     else {
-        return false;
+        return Action::Forward;
     };
     // The preedit reached the guest, so its commit fits a message.
     if !commit_shown_preedit(ctx, guest_id, plan) {
-        return false;
+        return Action::Forward;
     }
     log::debug!("A pointer press ended the composition of text input {guest_id}");
     ctx.client_to_host_queue
@@ -1913,7 +1919,8 @@ pub(crate) fn end_composition_on_press(ctx: &mut Context, surface: u32) -> bool 
     if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
         state.fence_reset(callback);
     }
-    true
+    ctx.host_to_client_queue.push(press());
+    Action::Drop
 }
 
 /// Complete the fence ([`InternalCallback::TextInputResetFence`]) of the
