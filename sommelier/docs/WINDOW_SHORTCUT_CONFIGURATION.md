@@ -1,15 +1,18 @@
 # Window placement shortcut configuration
 
 Compositor-owned window placement shortcuts move the focused XDG toplevel
-with one `zaura_toplevel.set_window_bounds` request when a configured chord is
-pressed. This document is the single owner of their contract; the README
+to a configured region of its output's work area when a configured chord is
+pressed. A placement backend moves it: the ARC backend with one
+`zaura_toplevel.set_window_bounds` request (see
+[Backends](#backends)). This document is the single owner of their contract; the README
 and the code link here instead of restating it.
 
 ## Settings
 
 | Setting | Meaning |
 | --- | --- |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | The gate for the opt-in ARC bounds policy that placement needs. On for `1`, `true`, `yes` or `on` (case-insensitive, surrounding whitespace ignored); off for anything else, including a value that is not UTF-8. |
+| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The placement backend: `arc` or `off` (case-insensitive, surrounding whitespace ignored). Unset or blank, `SOMMELIER_WINDOW_BOUNDS_AS_ARC` decides. `off` wins over that gate. Any other value, or a value that is not UTF-8, is a configuration problem (see [Resolution at startup](#resolution-at-startup)). |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | The legacy gate, kept for compatibility: while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset, it chooses the ARC backend when on. On for `1`, `true`, `yes` or `on` (case-insensitive, surrounding whitespace ignored); off for anything else, including a value that is not UTF-8. |
 | `SOMMELIER_ACCELERATORS` | Chords the host compositor keeps. A binding may not use one of them. |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Binding source: a `CHORD=ACTION` list with named actions only. It never reloads. |
 | `--window-shortcuts-config PATH` | Binding source: a versioned TOML file with named actions or arbitrary rectangles. `SIGHUP` reloads it. |
@@ -18,9 +21,10 @@ The two binding sources are mutually exclusive; giving both is a
 configuration problem (see [Resolution at startup](#resolution-at-startup)).
 `PlacementConfig::from_environment` reads every setting once, at startup, so
 a change to the environment needs a restart. A variable that is empty or only
-whitespace counts as unset. For `SOMMELIER_ACCELERATORS` and
-`SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, a value that is not UTF-8 counts as
-set and invalid; for the gate it means off, as the table says.
+whitespace counts as unset. For `SOMMELIER_WINDOW_PLACEMENT_BACKEND`,
+`SOMMELIER_ACCELERATORS` and `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS`, a value
+that is not UTF-8 counts as set and invalid; for the gate it means off, as
+the table says.
 
 ## Resolution at startup
 
@@ -30,14 +34,15 @@ Sommelier is the Wayland proxy for every app in the container, so exiting
 would close them all and could restart-loop under a service manager. Each
 problem is logged once per process instead. The rules apply in this order:
 
-1. **The policy needs the gate and an ARC block.** With the gate off nothing
-   is reserved. With the gate on, the proxy reserves its block of ARC task
-   IDs (see
+1. **Placement needs a backend.** The backend setting, or the legacy gate,
+   chooses one; an unusable backend setting logs one error and leaves
+   placement off. Without a backend nothing is reserved. The ARC backend
+   reserves the proxy's block of ARC task IDs (see
    [Sommelier's task-ID allocator](ARC_TASK_AND_SESSION_IDS.md#sommeliers-task-id-allocator));
-   if that fails, the policy is off for the whole process. While the policy
+   if that fails, placement is off for the whole process. While placement
    is off, any requested binding source (one or both) is ignored with one
    warning and is not read or validated, and no chord is consumed.
-2. **An unusable binding source disables shortcuts.** While the policy is
+2. **An unusable binding source disables shortcuts.** While a backend is
    active, a requested source is unusable in these cases:
    - both sources are given;
    - the environment list is not UTF-8 or fails validation;
@@ -47,8 +52,8 @@ problem is logged once per process instead. The rules apply in this order:
      against it.
 
    Each case logs one error that says why. The proxy then runs with placement
-   shortcuts disabled: no binding is active and no chord is consumed. The ARC
-   policy itself stays active. With an invalid `SOMMELIER_ACCELERATORS`, key
+   shortcuts disabled: no binding is active and no chord is consumed. The
+   backend itself stays active. With an invalid `SOMMELIER_ACCELERATORS`, key
    filtering is disabled too.
 3. **A file can recover by reload.** If the file was the only source, its
    path resolved, and `SOMMELIER_ACCELERATORS` is valid, `SIGHUP` re-reads
@@ -56,15 +61,15 @@ problem is logged once per process instead. The rules apply in this order:
    [Reloading](#reloading)). Every other unusable case needs a restart; the
    table below says which.
 4. **Host accelerators alone only lose filtering.** Without a usable binding
-   source (no source, or the policy is off), a malformed
+   source (no source, or placement is off), a malformed
    `SOMMELIER_ACCELERATORS` logs one warning and disables key filtering, so
    every key goes to the guest.
 
-| Policy (gate and ARC block) | Binding source | Result |
+| Backend | Binding source | Result |
 | --- | --- | --- |
-| off | none | No placement. |
+| off (none chosen, an unusable setting, or no ARC block) | none | No placement. |
 | off | one or both | One warning; no source is read. No placement. |
-| active | none | The ARC metadata path only; no chord is consumed. |
+| active | none | The backend's metadata path only (for ARC, the ARC identity); no chord is consumed. |
 | active | one, valid | The bindings are active. |
 | active | both | One error; shortcuts disabled; no reload. |
 | active | environment list invalid or not UTF-8 | One error; shortcuts disabled; no reload. |
@@ -72,9 +77,25 @@ problem is logged once per process instead. The rules apply in this order:
 | active | file path cannot be resolved | One error; shortcuts disabled; no reload. |
 | active | one, with `SOMMELIER_ACCELERATORS` invalid | One error; shortcuts and key filtering disabled; no reload. |
 
+## Backends
+
+Every backend shares the configuration, the chord handling, the output and
+work area, and the rounding rule below; it differs only in how the window
+is moved.
+
+- **`arc`** sends `zaura_toplevel.set_window_bounds` in screen
+  coordinates. Exo accepts it only from a surface it classifies as an ARC
+  window, so every surface's Aura application ID becomes a per-surface
+  `org.chromium.arc.<task_id>` identity while the backend is active (see
+  [ARC task and session IDs](ARC_TASK_AND_SESSION_IDS.md)). That
+  classification also changes how Chrome treats the window beyond its
+  bounds. Before the bounds, the window leaves fullscreen, maximized and
+  snapped state; a host barrier holds the configures Exo sends until it has
+  applied them.
+
 ## Chord handling
 
-While the policy is active, a chord that matches a binding is always
+While a backend is active, a chord that matches a binding is always
 consumed: it never reaches the guest, even when the placement is skipped
 (for example, with no focused toplevel, before the output's metadata is
 complete, or for a rectangle the output cannot represent). A chord listed in
@@ -290,12 +311,12 @@ kill -HUP "$SOMMELIER_PID"
   already captured as a shortcut stays captured until it is released, even
   if its binding was removed, so the guest never sees an unpaired release.
   Key repeat never repeats a placement.
-- A reload never changes the gate, the ARC policy, ARC identities, Aura
+- A reload never changes the backend, ARC identities, Aura
   objects, or pending bounds barriers, and it never re-reads an environment
   variable.
 - The `SIGHUP` handler is installed in every configuration, right after
   argument parsing and before the file is first read, so `SIGHUP` never
-  terminates the proxy. If no file is in use (no option, the policy is off,
+  terminates the proxy. If no file is in use (no option, placement is off,
   or startup could not use the file at all), `SIGHUP` is logged and ignored.
   If the handler cannot be installed, that is logged and the proxy runs
   without reloads.
@@ -336,7 +357,7 @@ These parts were intentionally not reintroduced:
 
 - `--experimental-window-placement`, `--window-host-policy`,
   `--window-geometry-method`, and the position-only self-parent backend. The
-  ARC policy environment gate is the only switch, and bounds are the only
+  backend setting is the only switch, and bounds are the only
   geometry method.
 - `action = "window.place"`. A binding now names its target directly with
   `rect` or a named `action`.

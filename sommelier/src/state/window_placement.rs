@@ -33,7 +33,7 @@ pub(crate) use self::arc::{
     ArcPlacementState, PendingWindowBoundsConfigure, PendingWindowBoundsSurfaceConfigure,
 };
 
-use crate::arc_task_ids::ArcIdAllocator;
+use crate::placement_config::PlacementBackend;
 
 /// One connection's window placement state.
 #[derive(Debug)]
@@ -51,12 +51,13 @@ impl WindowPlacementState {
     ///
     /// # Arguments
     ///
-    /// * `arc_id_allocator` - `PlacementConfig::arc_id_allocator`: the
-    ///   process's ARC task-ID block while the ARC backend is active, `None`
-    ///   while placement is off.
-    pub(crate) fn new(arc_id_allocator: Option<&'static ArcIdAllocator>) -> Self {
-        match arc_id_allocator {
-            Some(allocator) => Self::Arc(Box::new(ArcPlacementState::new(allocator))),
+    /// * `backend` - `PlacementConfig::backend`: the process's backend, or
+    ///   `None` while placement is off.
+    pub(crate) fn new(backend: Option<PlacementBackend>) -> Self {
+        match backend {
+            Some(PlacementBackend::Arc(allocator)) => {
+                Self::Arc(Box::new(ArcPlacementState::new(allocator)))
+            }
             None => Self::Off,
         }
     }

@@ -1001,7 +1001,7 @@ impl Context {
         allocator: Option<Allocator>,
         placement: Arc<PlacementConfig>,
     ) -> Self {
-        let window_placement = WindowPlacementState::new(placement.arc_id_allocator());
+        let window_placement = WindowPlacementState::new(placement.backend());
         Self {
             shadow_table: ShadowTable::new(),
             pools: HashMap::new(),

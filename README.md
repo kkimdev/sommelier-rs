@@ -219,7 +219,8 @@ test uses `/dev/wl0`.
 | `WAYLAND_DISPLAY` | Display socket used by guest clients. |
 | `SOMMELIER_VM_IDENTIFIER` | ChromeOS VM namespace used for shelf IDs; defaults to `termina`. |
 | `SOMMELIER_ACCELERATORS` | Comma-separated chords, such as `Super_L` or `<Alt>tab`, that the host compositor keeps. See [keyboard shortcut inhibition](sommelier/docs/KEYBOARD_SHORTCUT_INHIBITION.md#the-sommelier_accelerators-environment-variable). |
-| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Opt into the experimental ARC policy required for compositor-owned window placement. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
+| `SOMMELIER_WINDOW_PLACEMENT_BACKEND` | The experimental window placement backend, `arc` or `off`; off by default. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
+| `SOMMELIER_WINDOW_BOUNDS_AS_ARC` | Legacy switch for the `arc` placement backend, used while `SOMMELIER_WINDOW_PLACEMENT_BACKEND` is unset. See [the settings](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md#settings). |
 | `SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS` | Optional `CHORD=ACTION,...` placement bindings. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 | `SOMMELIER_DRM_DEVICE` | Optional DRM render node override. |
 | `SOMMELIER_TEST_GUI_FONT` | Font path used by the IME sample GUI. |
@@ -229,12 +230,12 @@ test uses `/dev/wl0`.
 | `--window-shortcuts-config PATH` | Optional TOML file of placement bindings (named actions or work-area rects), reloaded on `SIGHUP`. See [placement configuration](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md). |
 
 Compositor-owned window placement is opt-in, and no placement shortcut is
-active by default. With the ARC policy gate and placement bindings
+active by default. With a placement backend and placement bindings
 configured, Sommelier consumes the bound chords and moves the focused XDG
 toplevel to a region of its output's work area. For example:
 
 ```text
-SOMMELIER_WINDOW_BOUNDS_AS_ARC=1
+SOMMELIER_WINDOW_PLACEMENT_BACKEND=arc
 SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS="<Alt>q=top-left,<Alt>w=top,<Alt>s=fullscreen"
 ```
 

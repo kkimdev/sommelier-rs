@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Fabricated ARC task IDs for the `SOMMELIER_WINDOW_BOUNDS_AS_ARC` policy.
+//! Fabricated ARC task IDs for the ARC placement backend.
 //!
 //! The pool, the per-process block reservation, its exclusivity scope and its
 //! failure behavior are specified once, in the "Sommelier's task-ID
@@ -147,7 +147,7 @@ static PROCESS_BLOCK: OnceLock<Option<ReservedBlock>> = OnceLock::new();
 /// Return this process's allocator, reserving its block on the first call.
 ///
 /// `PlacementConfig::from_environment` calls this once, at startup, when
-/// `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set. A failed reservation is logged
+/// the ARC placement backend is chosen. A failed reservation is logged
 /// once and cached for the process: its causes (no private runtime
 /// directory, no lock directory, no randomness, every block taken) do not
 /// clear while the process runs.

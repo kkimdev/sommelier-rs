@@ -1,7 +1,8 @@
 # ARC task and restore-session IDs
 
 This note records the ChromeOS application-ID namespaces relevant to the
-opt-in window placement experiment (`SOMMELIER_WINDOW_BOUNDS_AS_ARC`). It
+opt-in window placement experiment's ARC backend
+(`SOMMELIER_WINDOW_PLACEMENT_BACKEND=arc`). It
 describes host behavior observed in Chromium/ChromeOS source; an ARC-looking
 app ID is not a supported way to turn a Crostini window into an Android task.
 
@@ -39,7 +40,7 @@ restore handshake, so neither spelling creates a genuine ARC task/session.
 
 ## IDs used by Sommelier
 
-When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is enabled, each guest `wl_surface`
+While the ARC placement backend is active, each guest `wl_surface`
 receives its own task-form identity:
 
 ```text
@@ -115,9 +116,9 @@ only.
   produced.
 - **Blocks.** The pool is split into 148 blocks of 1,000,000 IDs; the last
   block is partial.
-- **Reservation at startup.** When `SOMMELIER_WINDOW_BOUNDS_AS_ARC` is set to
-  a true value (see [the settings](WINDOW_SHORTCUT_CONFIGURATION.md#settings)),
-  the proxy reserves one block for the whole process while it resolves its
+- **Reservation at startup.** When the settings choose the ARC backend
+  (see [the settings](WINDOW_SHORTCUT_CONFIGURATION.md#settings)), the
+  proxy reserves one block for the whole process while it resolves its
   placement configuration at startup, before it accepts a client. The search
   starts at a random block and walks every block once.
 - **Lock.** A block is reserved by an exclusive, non-blocking `flock` on
