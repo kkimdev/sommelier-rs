@@ -50,7 +50,7 @@ pub(crate) use self::input::{
     GuestKeyEvent, GuestKeyOwner, HostApplied, HostCommitPlan, HostContentType, HostPreeditContext,
     HostPreeditPlan, HostTarget, KeyGenerationRegistry, KeyboardFocus, KeyboardFocusRegistry,
     KeyboardFocusUpdate, PeekKeyProvenance, PointerFocus, PreeditRegionPlan, SeatFocusChange,
-    ShownPreedit, TextInputState, V3Pending,
+    ShownPreedit, TextInputState, V3Committed, V3Pending,
 };
 pub(crate) use self::internal_callbacks::{InternalCallback, InternalCallbacks};
 pub use self::objects::{DeletedHostId, Link, ShadowTable};
