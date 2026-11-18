@@ -270,7 +270,9 @@ Per-object state lives with the module that owns it (`surfaces`,
 `OutputRegistry`, the keyboard maps, and so on), keyed by the object's
 guest or host ID. `state/lifecycle.rs` ends it with the object, whichever
 way the object ends: each `Context` wrapper of a table transition that
-ends an object runs one hook.
+ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created
+with the surface, by `wl_compositor.create_surface`; a live surface without
+its state is an internal divergence that ends the session.
 
 - `forget_object` runs once per object, at its first end: a guest
   destructor, a terminal event, a local destructor, a bind that never

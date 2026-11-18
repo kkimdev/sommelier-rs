@@ -513,7 +513,10 @@ impl WlSurfaceHandler for CompositorHandler {
         // An inert buffer, from a pool whose host wl_shm was removed, has
         // no host object, so it reaches the host as no buffer.
         let attached = buffer != 0 && !ctx.shadow_table.is_local(buffer);
-        let pending = &mut ctx.surface_mut(surface_id).pending;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let pending = &mut surface.pending;
         pending.attachment = if attached {
             SurfaceAttachment::Attach(buffer)
         } else {
@@ -537,7 +540,11 @@ impl WlSurfaceHandler for CompositorHandler {
     }
 
     fn on_damage(&mut self, ctx: &mut Context, x: i32, y: i32, width: i32, height: i32) -> Action {
-        ctx.surface_mut(ctx.last_sender_id)
+        let surface_id = ctx.last_sender_id;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface
             .pending
             .surface_damage
             .push(SurfaceRect::new(x, y, width, height));
@@ -555,7 +562,11 @@ impl WlSurfaceHandler for CompositorHandler {
         width: i32,
         height: i32,
     ) -> Action {
-        ctx.surface_mut(ctx.last_sender_id)
+        let surface_id = ctx.last_sender_id;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface
             .pending
             .buffer_damage
             .push(BufferRect::new(x, y, width, height));
@@ -573,7 +584,11 @@ impl WlSurfaceHandler for CompositorHandler {
                 "invalid wl_surface buffer scale",
             );
         }
-        ctx.surface_mut(ctx.last_sender_id).pending.buffer_scale = Some(scale);
+        let surface_id = ctx.last_sender_id;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface.pending.buffer_scale = Some(scale);
         Action::Forward
     }
 
@@ -589,12 +604,20 @@ impl WlSurfaceHandler for CompositorHandler {
                 "invalid wl_surface buffer transform",
             );
         }
-        ctx.surface_mut(ctx.last_sender_id).pending.buffer_transform = Some(transform);
+        let surface_id = ctx.last_sender_id;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface.pending.buffer_transform = Some(transform);
         Action::Forward
     }
 
     fn on_offset(&mut self, ctx: &mut Context, x: i32, y: i32) -> Action {
-        ctx.surface_mut(ctx.last_sender_id).pending.offset = Some((x, y));
+        let surface_id = ctx.last_sender_id;
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface.pending.offset = Some((x, y));
         Action::Forward
     }
 
@@ -628,16 +651,10 @@ impl WlSurfaceHandler for CompositorHandler {
             }
         }
 
-        // A surface has state only once a request sets some
-        // (`Context::surface_mut`), so a first commit with nothing pending,
-        // as a client sends to map an xdg surface, has none. It commits
-        // the defaults, which a fresh surface has; keeping that state would
-        // record nothing.
-        let mut default_surface = SurfaceState::default();
-        let commit = ctx.surfaces.get_mut(&surface_id).map_or_else(
-            || default_surface.prepare_commit(),
-            SurfaceState::prepare_commit,
-        );
+        let Some(surface) = ctx.surfaces.get_mut(&surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        let commit = surface.prepare_commit();
         let attached_buffer_id = commit.attached_buffer_id();
         let copied_buffer_id = buffer_to_copy(ctx, &commit);
 
@@ -788,7 +805,10 @@ impl wp_viewporter::WpViewporterHandler for CompositorHandler {
             );
         }
         ctx.viewport_to_wl_surface.insert(id, surface);
-        ctx.surface_mut(surface).pending.viewport = Some(Some(ViewportState::new()));
+        let Some(state) = ctx.surface_mut(surface) else {
+            return ctx.missing_surface_state(surface);
+        };
+        state.pending.viewport = Some(Some(ViewportState::new()));
         Action::Forward
     }
 }
@@ -818,8 +838,10 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
                 "invalid wp_viewport source",
             );
         }
-        ctx.surface_mut(surface_id).pending_viewport_mut().source =
-            (!unset).then_some((x, y, width, height));
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface.pending_viewport_mut().source = (!unset).then_some((x, y, width, height));
         Action::Forward
     }
 
@@ -844,9 +866,10 @@ impl wp_viewport::WpViewportHandler for CompositorHandler {
                 "invalid wp_viewport destination",
             );
         }
-        ctx.surface_mut(surface_id)
-            .pending_viewport_mut()
-            .destination = (!unset).then_some((width, height));
+        let Some(surface) = ctx.surface_mut(surface_id) else {
+            return ctx.missing_surface_state(surface_id);
+        };
+        surface.pending_viewport_mut().destination = (!unset).then_some((width, height));
         Action::Forward
     }
 }
@@ -1281,7 +1304,7 @@ mod tests {
         buffer_id: Option<u32>,
         dimensions: Option<(i32, i32)>,
     ) {
-        ctx.surface_mut(surface_id)
+        ctx.surface_for_test(surface_id)
             .set_current_buffer_for_test(buffer_id, dimensions);
     }
 
@@ -1377,6 +1400,35 @@ mod tests {
             queued_headers(&effects.to_host).last(),
             Some(&(SURFACE.host, REQ_COMMIT))
         );
+    }
+
+    /// A live surface without its state is an internal divergence that ends
+    /// the session, not a state the proxy recreates.
+    #[test]
+    fn a_live_surface_without_state_ends_the_session() {
+        type Request = fn(&mut CompositorHandler, &mut Context) -> Action;
+        let requests: [(&str, Request); 6] = [
+            ("attach", |h, ctx| h.on_attach(ctx, 0, 0, 0)),
+            ("damage", |h, ctx| h.on_damage(ctx, 0, 0, 1, 1)),
+            ("damage_buffer", |h, ctx| {
+                h.on_damage_buffer(ctx, 0, 0, 1, 1)
+            }),
+            ("set_buffer_scale", |h, ctx| h.on_set_buffer_scale(ctx, 1)),
+            ("offset", |h, ctx| h.on_offset(ctx, 0, 0)),
+            ("commit", |h, ctx| h.on_commit(ctx)),
+        ];
+        for (name, request) in requests {
+            let mut ctx = toplevel_ctx();
+            ctx.surfaces.remove(&TEST_SURFACE);
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(request(&mut CompositorHandler, &mut ctx), Action::Drop);
+            assert_eq!(
+                ctx.session_end(),
+                Some(&crate::state::SessionEnd::Internal),
+                "{name}"
+            );
+            assert!(ctx.surfaces.is_empty(), "{name} recreated the state");
+        }
     }
 
     /// The wl_surface that [`toplevel_ctx`] maps to a host surface.
@@ -1849,7 +1901,7 @@ mod tests {
         register_test_native(&mut ctx, buffer_id, (100, 50));
         // A rotated buffer damages its whole surface, whose extent shows
         // the dimensions the damage is mapped with.
-        ctx.surface_mut(surface_id).current_buffer_transform = 1;
+        ctx.surface_for_test(surface_id).current_buffer_transform = 1;
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -3582,7 +3634,7 @@ mod tests {
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         assert!(ctx.mark_buffer_submitted(guest_buffer));
         set_test_surface_content(&mut ctx, first_surface, Some(guest_buffer), None);
-        ctx.surface_mut(second_surface).pending.attachment =
+        ctx.surface_for_test(second_surface).pending.attachment =
             SurfaceAttachment::Attach(guest_buffer);
 
         let mut handler = CompositorHandler;
