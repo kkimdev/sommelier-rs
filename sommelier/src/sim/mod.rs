@@ -28,5 +28,6 @@ mod engine;
 pub(crate) mod exo;
 mod hangul;
 mod keymap;
+pub(crate) mod oracle;
 mod sched;
 mod user;

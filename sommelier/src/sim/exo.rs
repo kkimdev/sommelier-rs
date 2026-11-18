@@ -691,6 +691,16 @@ impl Exo {
         std::mem::take(&mut self.events)
     }
 
+    /// The composition Exo tracks for the text input attached on the
+    /// focused surface, if one is; empty if it composes nothing.
+    pub(super) fn composition(&self) -> Option<String> {
+        let mut attached = self.text_inputs.values().filter(|text_input| {
+            text_input.field.attached && self.focus.is_some() && text_input.surface == self.focus
+        });
+        let text_input = attached.next()?;
+        Some(text_input.text.predicted.composition().to_owned())
+    }
+
     /// The fields of the text inputs active on the focused surface.
     pub(crate) fn focused_fields(&self) -> Vec<Field> {
         self.text_inputs

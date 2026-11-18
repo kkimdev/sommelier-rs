@@ -86,7 +86,7 @@ use crate::protocols::wayland::{
     wl_registry, wl_seat, wl_surface,
 };
 use crate::protocols::AnyRequest;
-use crate::sim::exo::{self, Exo};
+use crate::sim::exo::Exo;
 use crate::state::Context;
 use crate::test_support::{frames, msg_opcode, Rng};
 use crate::wire::{Framing, MessageBuilder, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};

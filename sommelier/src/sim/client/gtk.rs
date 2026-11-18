@@ -82,7 +82,7 @@ struct Context {
 
 /// The v3 client of GTK3 or GTK4.
 #[derive(Debug)]
-pub(super) struct Gtk {
+pub(in crate::sim) struct Gtk {
     /// GTK4 rather than GTK3.
     v4: bool,
     protocol: Protocol,
