@@ -73,11 +73,18 @@ fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> 
         .map(|_| guest_id)
 }
 
+/// The `cursor_begin` and `cursor_end` of preedit `text`, from the
+/// host's pending preedit `selection` or `cursor`, or at its end. An empty
+/// preedit always gets `(0, 0)`, never the hidden cursor `(-1, -1)`
+/// (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
 fn resolve_preedit_cursor(
     text: &str,
     selection: Option<(u32, u32)>,
     cursor: Option<i32>,
 ) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
     if let Some((index, length)) = selection {
         let end = index.saturating_add(length);
         if end <= text.len() as u32
@@ -5284,6 +5291,38 @@ mod tests {
         f.s.host([f.preedit("가", ""), f.preedit("", "")]).await;
         let expected = [preedit("가"), done(), no_preedit(), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// An empty preedit, which clears the one the guest shows, always has
+    /// the cursor `(0, 0)`, even after the host hid the cursor. Chromium
+    /// keeps the last preedit it applied, cursor included, and applies a
+    /// `done`'s preedit only if it differs, an absent one counting as
+    /// `("", 0, 0)` (`ui/ozone/platform/wayland/host/zwp_text_input_v3.cc`
+    /// 466, `zwp_text_input_v3.h` 139-140, revision ffb4f13519). After
+    /// `("", -1, -1)`, the next `done` without a preedit would apply an
+    /// empty composition again, which deletes the selection
+    /// (`UpdateCompositionIfTextSelected`,
+    /// `ui/base/ime/linux/input_method_auralinux.cc` 325-328).
+    #[tokio::test]
+    async fn an_empty_preedit_has_no_hidden_cursor() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 2).await;
+        let done = || V3::Done { serial: 2 };
+        let expected = f.events([preedit("가"), done(), no_preedit(), done()]);
+        f.s.host([
+            f.preedit("가", ""),
+            v1::preedit_cursor(f.host, -1),
+            f.preedit("", ""),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), expected);
+
+        f.s.host([
+            f.preedit("가", ""),
+            v1::preedit_cursor(f.host, -1),
+            ext::set_preedit_region(f.host_ext, 0, 0),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), expected);
     }
 
     /// An empty preedit region deletes nothing, so it sends no

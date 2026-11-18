@@ -926,11 +926,16 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
     (`gtk/gtkimcontextwayland.c` 241-244), on which GTK4's `GtkText`
     deletes the selection (`gtk_text_preedit_start_cb`, `gtk/gtktext.c`
     4491), as does `GtkTextView` (`gtk_text_view_preedit_start_handler`,
-    `gtk/gtktextview.c` 8834).
-    Chromium applies one that differs from the preedit it last applied
-    (`zwp_text_input_v3.cc` 466), and an empty composition over none
-    deletes the selection (`ui/base/ime/linux/input_method_auralinux.cc`
-    325-328).
+    `gtk/gtktextview.c` 8834). Chromium applies a `done`'s preedit only
+    if it differs from the last one it applied, an absent one counting
+    as `("", 0, 0)` (`zwp_text_input_v3.cc` 466, `zwp_text_input_v3.h`
+    139-140), so an empty preedit with the cursor `(0, 0)` over none
+    changes nothing there. With the hidden cursor `(-1, -1)` it differs,
+    and an empty composition over none deletes the selection
+    (`ui/base/ime/linux/input_method_auralinux.cc` 325-328). So every
+    empty `preedit_string`, the one that clears a shown preedit
+    included, carries the cursor `(0, 0)`: after `("", -1, -1)`, the
+    next `done` without a preedit would differ.
   - no `delete_surrounding_text(0, 0)`, such as an empty preedit region
     would make. Chromium applies it (`zwp_text_input_v3.cc` 440 tests
     that a delete arrived, not its lengths), and while nothing is
@@ -949,6 +954,7 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `on_set_preedit_region_translates_correctly`,
   `exo_deletes_become_v3_deletes_around_the_cursor`,
   `an_empty_preedit_reaches_only_a_guest_that_shows_one`,
+  `an_empty_preedit_has_no_hidden_cursor`,
   `an_empty_preedit_region_sends_no_delete`.
 - **Exo's deletes are absolute and stand alone.** Exo sends
   `zwp_text_input_v1.delete_surrounding_text(index, length)` with `index`

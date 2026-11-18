@@ -266,8 +266,9 @@ pub struct ShownPreedit {
 }
 
 impl ShownPreedit {
-    /// Whether the guest shows a composition. Empty text is always sent
-    /// with the cursor `(0, 0)`, so the text alone decides.
+    /// Whether the guest shows a composition, which the text alone
+    /// decides: empty text is always sent, and kept, with the cursor
+    /// `(0, 0)` (the handler's `resolve_preedit_cursor`).
     pub fn has_text(&self) -> bool {
         !self.text.is_empty()
     }
