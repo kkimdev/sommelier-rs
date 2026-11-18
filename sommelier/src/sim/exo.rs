@@ -68,7 +68,6 @@ limitations under the License.
 //! or height to 0.
 
 use super::clock::Micros;
-use super::editor::{TextModel, Txn};
 use super::engine::{EngineIn, EngineOut, TextAction};
 use super::hangul::Key;
 use super::keymap;
@@ -84,6 +83,7 @@ use crate::protocols::wayland::{wl_keyboard, wl_seat};
 use crate::protocols::AnyRequest;
 use crate::wire::{IndexedString, Outgoing};
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::Range;
 
 /// What one Exo `TextInput` holds for its field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,10 +181,87 @@ struct TextInput {
     field: Field,
     /// The delegate's `pending_surrounding_text_supported_`.
     pending_support: bool,
-    /// What `SurroundingTextTracker` predicts the text is (E4): the last
-    /// surrounding text with the input method's edits since; its preedit is
-    /// the composition Exo tracks (`composition_`).
-    text: TextModel,
+    /// What Exo predicts the field holds (E4). [`Field::surrounding_text`]
+    /// is the last report as sent, for the fuzzer to compare.
+    text: Tracker,
+}
+
+/// What `SurroundingTextTracker` (`ui/base/ime/surrounding_text_tracker.cc`)
+/// predicts a field holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Predicted {
+    /// The text, with the composition in it.
+    text: String,
+    cursor: usize,
+    /// Where the composition is in `text`, if there is one.
+    composition: Option<Range<usize>>,
+}
+
+impl Predicted {
+    fn composition(&self) -> &str {
+        self.composition
+            .clone()
+            .map_or("", |range| &self.text[range])
+    }
+
+    /// Puts `text` in place of the composition, or at the cursor, with the
+    /// cursor after it; returns where it is.
+    fn replace(&mut self, text: &str) -> Range<usize> {
+        let range = self.composition.take().unwrap_or(self.cursor..self.cursor);
+        self.text.replace_range(range.clone(), text);
+        self.cursor = range.start + text.len();
+        range.start..self.cursor
+    }
+}
+
+/// `SurroundingTextTracker`: the prediction, and the states that the input
+/// method's edits since the last report led to, oldest first.
+#[derive(Default)]
+struct Tracker {
+    predicted: Predicted,
+    expected: Vec<Predicted>,
+}
+
+impl Tracker {
+    /// `Update`, for a report of the field: one that names a state an edit
+    /// led to is the client catching up, which keeps the prediction, since
+    /// the edits after that state lead to it; any other replaces the
+    /// prediction, and with it the composition.
+    fn update(&mut self, text: String, cursor: usize, anchor: usize) {
+        let named = |state: &Predicted| {
+            state.text == text && state.cursor == cursor && state.cursor == anchor
+        };
+        match self.expected.iter().position(named) {
+            Some(state) => drop(self.expected.drain(..state)),
+            None => {
+                self.predicted = Predicted {
+                    text,
+                    cursor,
+                    composition: None,
+                };
+                self.expected = vec![self.predicted.clone()];
+            }
+        }
+    }
+
+    /// `OnSetCompositionText`.
+    fn set_composition(&mut self, text: &str) {
+        let range = self.predicted.replace(text);
+        self.predicted.composition = (!range.is_empty()).then_some(range);
+        self.expected.push(self.predicted.clone());
+    }
+
+    /// `OnInsertText`.
+    fn insert(&mut self, text: &str) {
+        self.predicted.replace(text);
+        self.expected.push(self.predicted.clone());
+    }
+
+    /// `OnConfirmCompositionText` and `CancelComposition`: the composition
+    /// stays, as text.
+    fn end_composition(&mut self) {
+        self.predicted.composition = None;
+    }
 }
 
 impl TextInput {
@@ -206,7 +283,7 @@ impl TextInput {
                 cursor_rectangle: (0, 0, 0, 0),
             },
             pending_support: true,
-            text: TextModel::default(),
+            text: Tracker::default(),
         }
     }
 
@@ -636,8 +713,8 @@ impl Exo {
                     IndexedString::NotUtf8(bytes) => String::from_utf8_lossy(bytes).into_owned(),
                 };
                 let text_input = self.text_input(sender);
-                text_input.text.text.clone_from(&text);
-                text_input.text.cursor = *cursor as usize;
+                let (at, from) = (*cursor as usize, *anchor as usize);
+                text_input.text.update(text.clone(), at, from);
                 text_input.field.surrounding_text = (text, *cursor, *anchor);
             }
             Request::SetCursorRectangle {
@@ -710,7 +787,7 @@ impl Exo {
     /// the input method serves this text input, it resets
     /// (`CancelComposition`). Nothing goes to the client (E5).
     fn reset(&mut self, id: u32) {
-        self.text_input(id).text.preedit.clear();
+        self.text_input(id).text.end_composition();
         if self.ima.client == Some(id) {
             self.reset_context();
         }
@@ -783,7 +860,8 @@ impl Exo {
             self.set_composition(id, &text);
         }
         let extension = self.confirming_extension(id);
-        if extension.is_some() || !self.text_input(id).text.preedit.is_empty() {
+        let composing = !self.text_input(id).text.predicted.composition().is_empty();
+        if extension.is_some() || composing {
             self.confirm_composition_text(id, extension);
         }
         let commit = self.ima.commit.take();
@@ -797,12 +875,9 @@ impl Exo {
     /// then a `commit_string` of the composition.
     fn confirm_composition_text(&mut self, id: u32, extension: Option<u32>) {
         let text = &mut self.text_input(id).text;
-        let composition = std::mem::take(&mut text.preedit);
-        text.apply_txn(&Txn {
-            commit: composition.clone(),
-            ..Txn::default()
-        });
-        let cursor = i32::try_from(text.cursor).expect("a short text");
+        let composition = text.predicted.composition().to_owned();
+        let cursor = i32::try_from(text.predicted.cursor).expect("a short text");
+        text.end_composition();
         if let Some(extension) = extension {
             let unchanged = extended::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
             self.events
@@ -839,10 +914,7 @@ impl Exo {
         let serial = self.next_serial();
         let event = zwp_text_input_v1::evt::commit_string(id, serial, text);
         self.events.push(event.expect("a commit fits a message"));
-        self.text_input(id).text.apply_txn(&Txn {
-            commit: text.to_owned(),
-            ..Txn::default()
-        });
+        self.text_input(id).text.insert(text);
     }
 
     /// `TextInput::SetCompositionText`: `preedit_cursor` at the end of the
@@ -854,7 +926,7 @@ impl Exo {
         let serial = self.next_serial();
         let event = zwp_text_input_v1::evt::preedit_string(id, serial, text, text);
         self.events.push(event.expect("a preedit fits a message"));
-        self.text_input(id).text.preedit = text.to_owned();
+        self.text_input(id).text.set_composition(text);
     }
 
     /// One transition of `key` on the keyboard, if it is on a surface: a
@@ -1227,8 +1299,8 @@ mod tests {
         &exo.text_inputs[&TI].field
     }
 
-    fn predicted(exo: &Exo) -> &TextModel {
-        &exo.text_inputs[&TI].text
+    fn predicted(exo: &Exo) -> &Predicted {
+        &exo.text_inputs[&TI].text.predicted
     }
 
     #[test]
@@ -1330,19 +1402,43 @@ mod tests {
     }
 
     #[test]
-    fn e4_exo_predicts_the_text_from_the_last_report_and_the_edits_since() {
+    fn e4_exo_predicts_the_text_from_reports_and_the_input_methods_edits() {
         let mut exo = active(Host::default());
         send(&mut exo, TI, surrounding("ab", 1));
         press(&mut exo, 'r', &[commits("가")], true);
-        let edited = TextModel {
-            text: "a가b".to_owned(),
-            cursor: 4,
-            preedit: String::new(),
+        press(&mut exo, 's', &[shows("ㄴ")], true);
+        let composing = Predicted {
+            text: "a가ㄴb".to_owned(),
+            cursor: 7,
+            composition: Some(4..7),
         };
-        assert_eq!(*predicted(&exo), edited);
-        // Without an input method too, the next report replaces it.
-        send(&mut exo, TI, deactivate());
+        assert_eq!(*predicted(&exo), composing);
+        // A report of a state an edit led to is the client catching up.
+        send(&mut exo, TI, surrounding("a가b", 4));
+        assert_eq!(*predicted(&exo), composing);
+        // A cancelled composition stays, as text.
+        send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
+        let cancelled = Predicted {
+            composition: None,
+            ..composing
+        };
+        assert_eq!(*predicted(&exo), cancelled);
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        // Any other report replaces the prediction, composition and all, so
+        // a detach then has nothing to confirm.
+        press(&mut exo, 'e', &[shows("ㄷ")], true);
         send(&mut exo, TI, surrounding("xyz", 3));
+        let reported = Predicted {
+            text: "xyz".to_owned(),
+            cursor: 3,
+            composition: None,
+        };
+        assert_eq!(*predicted(&exo), reported);
+        events(&mut exo);
+        send(&mut exo, TI, deactivate());
+        assert_eq!(events(&mut exo), [leave()]);
+        // Without an input method, Exo keeps the reports too.
+        send(&mut exo, TI, surrounding("uv", 0));
         let rectangle = zwp_text_input_v1::Request::SetCursorRectangle {
             x: 1,
             y: 2,
@@ -1350,8 +1446,8 @@ mod tests {
             height: 4,
         };
         send(&mut exo, TI, rectangle);
-        assert_eq!(*predicted(&exo), TextModel::new("xyz"));
-        assert_eq!(field(&exo).surrounding_text, ("xyz".to_owned(), 3, 3));
+        assert_eq!(predicted(&exo).text, "uv");
+        assert_eq!(field(&exo).surrounding_text, ("uv".to_owned(), 0, 0));
         assert_eq!(field(&exo).cursor_rectangle, (1, 2, 3, 4));
     }
 
@@ -1372,7 +1468,7 @@ mod tests {
         exo.take_engine();
         send(&mut exo, TI, reset());
         assert_eq!(events(&mut exo), []);
-        assert_eq!(predicted(&exo).preedit, "");
+        assert_eq!(predicted(&exo).composition, None);
         // IMA was composing, so the engine resets too.
         assert_eq!(exo.take_engine(), [EngineIn::Reset]);
         assert!(answer(&mut exo, 1, vec![shows("가")]), "late");
