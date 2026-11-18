@@ -27,6 +27,8 @@ mod connection;
 mod handler;
 mod placement_config;
 mod proxy;
+#[cfg(test)]
+mod sim;
 mod state;
 #[cfg(test)]
 mod test_support;
