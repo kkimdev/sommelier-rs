@@ -26,5 +26,7 @@ pub mod output;
 pub mod registry;
 pub mod seat;
 pub mod shm;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text_input;
 pub mod window_placement;

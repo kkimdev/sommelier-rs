@@ -586,57 +586,17 @@ mod fixture {
     use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
     use std::collections::VecDeque;
 
-    /// A guest object and the host object it is paired with.
-    #[derive(Clone, Copy)]
-    pub(super) struct Paired {
-        pub(super) guest: u32,
-        pub(super) host: u32,
-    }
+    pub(super) use crate::handler::test_support::{
+        add_toplevel, toplevel_ctx_with, Paired, SHELL, SURFACE, TOPLEVEL, XDG_SURFACE,
+    };
 
-    pub(super) const SURFACE: Paired = Paired {
-        guest: 100,
-        host: 200,
-    };
-    pub(super) const XDG_SURFACE: Paired = Paired {
-        guest: 110,
-        host: 210,
-    };
-    pub(super) const TOPLEVEL: Paired = Paired {
-        guest: 120,
-        host: 220,
-    };
-    /// The host `zaura_shell`, at the vendored version.
-    pub(super) const SHELL: u32 = 300;
     /// Host keyboard 5 (guest 10, on seat 11).
     pub(super) const KEYBOARD: Paired = Paired { guest: 10, host: 5 };
     /// A 3840x2160 output at 1x.
     pub(super) const OUTPUT: u32 = 25;
 
-    /// Give `ctx` wl_surface [`SURFACE`] with the toplevel role:
-    /// [`XDG_SURFACE`] and its [`TOPLEVEL`].
-    pub(super) fn add_toplevel(ctx: &mut Context) {
-        for (object, interface) in [
-            (SURFACE, "wl_surface"),
-            (XDG_SURFACE, "xdg_surface"),
-            (TOPLEVEL, "xdg_toplevel"),
-        ] {
-            ctx.shadow_table
-                .insert_paired_for_test(object.guest, object.host, interface);
-        }
-        ctx.xdg_roles
-            .add_toplevel_role_for_test(XDG_SURFACE.guest, SURFACE.guest, TOPLEVEL.guest);
-    }
-
-    /// A context under `placement` with [`add_toplevel`] and [`SHELL`].
-    pub(super) fn toplevel_ctx_with(placement: PlacementConfig) -> Context {
-        let mut ctx = Context::with_placement_for_test(placement);
-        add_toplevel(&mut ctx);
-        ctx.bind_aura_shell_for_test(SHELL);
-        ctx
-    }
-
     /// [`toplevel_ctx_with`] the ARC backend, without bindings.
-    pub(super) fn toplevel_ctx() -> Context {
+    pub(super) fn arc_toplevel_ctx() -> Context {
         toplevel_ctx_with(PlacementConfig::arc_bounds_for_test(""))
     }
 
@@ -726,10 +686,9 @@ mod fixture {
     /// What `ctx` queued for the host.
     pub(super) fn host_requests(ctx: &Context) -> Vec<(u32, AnyRequest)> {
         let table = &ctx.shadow_table;
-        // The fixtures pair neither the display nor the shell.
+        // The fixtures do not pair the display.
         let interface_of = |id| match id {
             WL_DISPLAY_ID => Some("wl_display"),
-            SHELL => Some("zaura_shell"),
             id => table.get_host_interface(id),
         };
         decode_queue(

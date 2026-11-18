@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn bounds_barrier_holds_configures_until_done_and_flushes_toplevel_first() {
         for surface_serial in [None, Some(77)] {
-            let mut ctx = toplevel_ctx();
+            let mut ctx = arc_toplevel_ctx();
             let (aura_toplevel, callback) = (650, 651);
             remember_aura_toplevel(&mut ctx, aura_toplevel);
             ctx.shadow_table
@@ -899,7 +899,7 @@ mod tests {
     /// stays reserved for the connection.
     #[test]
     fn aura_toplevel_without_release_is_retired_silently() {
-        let mut ctx = toplevel_ctx();
+        let mut ctx = arc_toplevel_ctx();
         ctx.host_zaura_shell
             .as_mut()
             .expect("bound zaura_shell")
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn xdg_toplevel_destroy_reserves_aura_id_until_host_delete_id() {
-        let mut ctx = toplevel_ctx();
+        let mut ctx = arc_toplevel_ctx();
         let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
         ctx.last_sender_id = TOPLEVEL.guest;
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn window_bounds_barrier_is_queued_after_placement_request() {
-        let mut ctx = toplevel_ctx();
+        let mut ctx = arc_toplevel_ctx();
         let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
 
@@ -1059,7 +1059,7 @@ mod tests {
             (6, &host_states, &[1, 5, 8, 9]),
             (7, &host_states, &[1, 5, 8, 9, 10, 13]),
         ] {
-            let mut ctx = toplevel_ctx();
+            let mut ctx = arc_toplevel_ctx();
             ctx.shadow_table
                 .set_guest_version_for_test(TOPLEVEL.guest, guest_version);
             remember_aura_toplevel(&mut ctx, 77);
@@ -1082,7 +1082,7 @@ mod tests {
 
     #[test]
     fn held_aura_configure_is_filtered_when_barrier_completes() {
-        let mut ctx = toplevel_ctx();
+        let mut ctx = arc_toplevel_ctx();
         ctx.shadow_table
             .set_guest_version_for_test(TOPLEVEL.guest, 1);
         let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn aura_origin_change_is_dropped_with_or_without_a_bounds_barrier() {
-        let mut ctx = toplevel_ctx();
+        let mut ctx = arc_toplevel_ctx();
         let aura_id = ensure_zaura_toplevel(&mut ctx, TOPLEVEL.guest).expect("aura toplevel");
         ctx.client_to_host_queue.clear();
         let origin_change = |ctx: &mut Context| {
