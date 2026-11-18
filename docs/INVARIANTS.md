@@ -230,7 +230,8 @@ always consumed; a configuration problem never stops the proxy) is owned by
   where the order changes nothing sent (a search for the one match, a
   minimum, removals). So the same messages always make the same bytes,
   and a session can be replayed exactly.
-  Test: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`.
+  Tests: `the_text_inputs_of_a_seat_follow_its_focus_in_id_order`,
+  `a_host_format_reaches_every_guest_shm_in_id_order`.
 
 ## Protocol errors
 

@@ -408,8 +408,9 @@ pub struct Context {
     /// Optional formats learned from the internal host linux-dmabuf binding.
     /// These are removed when that binding's global is withdrawn.
     pub host_dmabuf_shm_formats: HashSet<u32>,
-    /// Every synthetic guest wl_shm object.
-    pub guest_shms: HashMap<u32, GuestShm>,
+    /// Every synthetic guest wl_shm object, ordered by ID: a host format
+    /// reaches them in that order.
+    pub guest_shms: BTreeMap<u32, GuestShm>,
     /// Synthetic guest wl_shm objects whose own global, the name each was
     /// bound from, has retired. Wayland keeps an already-bound global
     /// object valid for teardown, but requests sent to it after its
@@ -1039,7 +1040,7 @@ impl Context {
             host_shm_formats: HashSet::new(),
             host_wl_shm_formats: HashSet::new(),
             host_dmabuf_shm_formats: HashSet::new(),
-            guest_shms: HashMap::new(),
+            guest_shms: BTreeMap::new(),
             stale_shm_guest_objects: HashSet::new(),
             stale_shm_pools: HashSet::new(),
             host_text_input_manager_v1_id: None,
