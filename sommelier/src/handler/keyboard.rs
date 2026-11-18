@@ -42,6 +42,7 @@ use crate::state::{
 use crate::window_layout::WindowLayoutAction;
 use crate::wire::Action;
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use xkbcommon::xkb;
 
 /// Linux evdev keycode reported by wl_keyboard and peek_key for Backspace.
@@ -52,6 +53,23 @@ pub(crate) const EVDEV_KEY_BACKSPACE: u32 = 14;
 /// checked against its file, and the proxy copies the keymap to compile it,
 /// so a host size near 4 GiB would otherwise abort the process.
 const MAX_KEYMAP_SIZE: u32 = 1 << 20;
+
+/// Whether the proxy warned that the host has no
+/// `zcr_keyboard_extension_v1` to acknowledge keys through. Such a host
+/// sends every key so, to every client, so one warning per process says
+/// it all.
+static NO_KEYBOARD_EXTENSION_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// The level to log a key at that the host's missing
+/// `zcr_keyboard_extension_v1` leaves unacknowledged: a warning the first
+/// time in the process, which this call records, and debug after.
+fn take_no_keyboard_extension_log_level() -> log::Level {
+    if NO_KEYBOARD_EXTENSION_WARNED.swap(true, Ordering::Relaxed) {
+        log::Level::Debug
+    } else {
+        log::Level::Warn
+    }
+}
 
 /// Who owns a key, decided from its chord (see `KeyboardHandler::classify_key`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -443,19 +461,32 @@ impl KeyboardHandler {
     /// The manager global may disappear after a child has been created. The
     /// child has its own protocol lifetime, so route acknowledgements from the
     /// child mapping directly and do not require the manager binding to remain.
-    /// If no child has been bound for this keyboard, the key event arrived
-    /// before `on_enter` (or the host has no extension), so no acknowledgement
-    /// is sent.
+    /// If no child has been bound for this keyboard, no acknowledgement is
+    /// sent: either the key event arrived before `on_enter`, which the next
+    /// enter mends, or the host has no extension, which only the first such
+    /// key in the process warns about.
     fn send_ack_key(ctx: &mut Context, host_keyboard_id: HostId, serial: u32, handled: bool) {
         let Some(&host_extended_id) = ctx.keyboard_to_extended_keyboard.get(&host_keyboard_id)
         else {
-            log::warn!(
-                "ack_key: no extended keyboard bound for host_keyboard_id={}; \
-                 key event arrived before on_enter? serial={}, handled={}",
-                host_keyboard_id.0,
-                serial,
-                handled
-            );
+            if ctx.host_keyboard_extension_id.is_some() {
+                log::debug!(
+                    "ack_key: no extended keyboard bound yet for host_keyboard_id={}; \
+                     key event arrived before on_enter? serial={}, handled={}",
+                    host_keyboard_id.0,
+                    serial,
+                    handled
+                );
+            } else {
+                log::log!(
+                    take_no_keyboard_extension_log_level(),
+                    "ack_key: the host has no zcr_keyboard_extension_v1, so keys go \
+                     unacknowledged (host_keyboard_id={}, serial={}, handled={}); \
+                     later ones are logged at debug",
+                    host_keyboard_id.0,
+                    serial,
+                    handled
+                );
+            }
             return;
         };
         let handled = if handled {
@@ -2820,6 +2851,34 @@ mod tests {
                 "{case}: another keyboard's keymap stays"
             );
         }
+    }
+
+    /// A key that arrives before its keyboard's first enter has bound an
+    /// extended keyboard goes unacknowledged at debug, since the next enter
+    /// binds one. A host without `zcr_keyboard_extension_v1` acknowledges no
+    /// key ever, so the first such key in the process warns and the rest go
+    /// at debug. The flag is the process's, so the test runs alone in a
+    /// child process.
+    #[test]
+    fn a_host_without_the_keyboard_extension_warns_once_per_process() {
+        crate::test_support::in_own_process(
+            "handler::keyboard::tests::a_host_without_the_keyboard_extension_warns_once_per_process",
+            || {
+                let mut p = Proxy::new();
+                // The host has the extension, but no enter has bound the
+                // keyboard's extended keyboard yet.
+                p.ctx.host_keyboard_extension_id = Some(HostId(500));
+                p.key(KEYBOARD, 1, 1, KEY_A, PRESSED);
+                assert!(p.ctx.client_to_host_queue.is_empty());
+                assert!(!NO_KEYBOARD_EXTENSION_WARNED.load(Ordering::Relaxed));
+
+                p.ctx.host_keyboard_extension_id = None;
+                p.key(KEYBOARD, 2, 2, KEY_A, RELEASED);
+                assert!(p.ctx.client_to_host_queue.is_empty());
+                assert!(NO_KEYBOARD_EXTENSION_WARNED.load(Ordering::Relaxed));
+                assert_eq!(take_no_keyboard_extension_log_level(), log::Level::Debug);
+            },
+        );
     }
 
     #[test]
