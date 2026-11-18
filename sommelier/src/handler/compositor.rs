@@ -2432,6 +2432,21 @@ mod tests {
         );
     }
 
+    /// A surface has no state until a request sets some, so its first
+    /// commit may have none; it commits the defaults, as a fresh surface
+    /// has them, and is forwarded.
+    #[tokio::test]
+    async fn a_first_commit_without_surface_state_is_forwarded() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        s.guest([wl_surface::req::commit(surface.id)]).await;
+        assert_eq!(
+            s.host_received(),
+            [(surface.host, wl_surface::Request::Commit {}.into())]
+        );
+        assert_eq!(s.guest_received(), []);
+    }
+
     /// Surface damage of more rectangles than the proxy keeps damages the
     /// whole surface, so a damage-only commit copies the whole buffer, not
     /// just the buffer damage, which here is none.
