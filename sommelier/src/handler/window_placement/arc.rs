@@ -1104,4 +1104,148 @@ mod tests {
         assert_eq!(origin_change(&mut ctx), Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
     }
+
+    /// The ARC backend's contract on the wire, through a whole session:
+    /// each toplevel gets an Aura toplevel in screen coordinates; a chord
+    /// gives its surface an ARC identity, leaves fullscreen, maximized and
+    /// snapped state, sends the bounds and a barrier, and the configures
+    /// the host sends before the barrier's `done` reach the guest after it.
+    #[tokio::test]
+    async fn an_arc_placement_moves_the_window_behind_a_barrier() {
+        use crate::protocols::wayland::wl_callback;
+        use crate::protocols::xdg_shell::xdg_wm_base;
+
+        let mut d = Desk::new(PlacementConfig::arc_bounds_for_test("<Alt>q=top-left")).await;
+        let xdg_surface = d.s.new_id();
+        let host_xdg_surface =
+            d.s.create(xdg_wm_base::req::get_xdg_surface(
+                d.wm_base.id,
+                xdg_surface,
+                d.surface.id,
+            ))
+            .await;
+        let toplevel = d.s.new_id();
+        d.s.guest([xdg_surface::req::get_toplevel(xdg_surface, toplevel)])
+            .await;
+        let host = d.s.host_received();
+        let [(_, AnyRequest::XdgSurface(xdg_surface::Request::GetToplevel { id: host_toplevel })), (
+            _,
+            AnyRequest::ZauraShell(zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                id: aura_toplevel,
+                ..
+            }),
+        ), _] = host[..]
+        else {
+            panic!("the toplevel got no Aura toplevel: {host:?}");
+        };
+        assert_eq!(
+            host,
+            [
+                (
+                    host_xdg_surface,
+                    xdg_surface::Request::GetToplevel { id: host_toplevel }.into()
+                ),
+                (
+                    d.shell,
+                    zaura_shell::Request::GetAuraToplevelForXdgToplevel {
+                        id: aura_toplevel,
+                        toplevel: host_toplevel
+                    }
+                    .into()
+                ),
+                (
+                    aura_toplevel,
+                    zaura_toplevel::Request::SetSupportsScreenCoordinates {}.into()
+                ),
+            ]
+        );
+
+        d.focus().await;
+        d.chord(3).await;
+        assert_eq!(d.s.guest_received(), [], "the chord is consumed");
+        let host = d.s.host_received();
+        let [(
+            _,
+            AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface {
+                id: aura_surface, ..
+            }),
+        ), (
+            _,
+            AnyRequest::ZauraSurface(zaura_surface::Request::SetApplicationId {
+                application_id: ref identity,
+            }),
+        ), .., (_, AnyRequest::WlDisplay(wl_display::Request::Sync { callback }))] = host[..]
+        else {
+            panic!("no placement: {host:?}");
+        };
+        assert!(identity
+            .as_deref()
+            .is_some_and(|identity| identity.starts_with(ARC_APPLICATION_ID_PREFIX)));
+        let (width, height) = (DESK_WORK_AREA.0 / 2, DESK_WORK_AREA.1 / 2);
+        assert_eq!(
+            host,
+            [
+                (
+                    d.shell,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: aura_surface,
+                        surface: d.surface.host
+                    }
+                    .into()
+                ),
+                (
+                    aura_surface,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: identity.clone()
+                    }
+                    .into()
+                ),
+                (
+                    host_toplevel,
+                    xdg_toplevel::Request::UnsetFullscreen {}.into()
+                ),
+                (
+                    host_toplevel,
+                    xdg_toplevel::Request::UnsetMaximized {}.into()
+                ),
+                (aura_surface, zaura_surface::Request::UnsetSnap {}.into()),
+                (
+                    aura_toplevel,
+                    window_bounds(0, 0, width, height, d.output.host)
+                ),
+                (WL_DISPLAY_ID, wl_display::Request::Sync { callback }.into()),
+            ]
+        );
+
+        d.s.host([
+            xdg_toplevel::evt::configure(host_toplevel, width, height, &[]).unwrap(),
+            xdg_surface::evt::configure(host_xdg_surface, 9),
+        ])
+        .await;
+        assert_eq!(d.s.guest_received(), [], "held behind the barrier");
+        d.s.host([
+            wl_callback::evt::done(callback, 0),
+            wl_display::evt::delete_id(WL_DISPLAY_ID, callback),
+        ])
+        .await;
+        assert_eq!(
+            d.s.guest_received(),
+            [
+                (
+                    toplevel,
+                    xdg_toplevel::Event::Configure {
+                        width,
+                        height,
+                        states: Vec::new()
+                    }
+                    .into()
+                ),
+                (
+                    xdg_surface,
+                    xdg_surface::Event::Configure { serial: 9 }.into()
+                ),
+            ]
+        );
+        assert_eq!(d.s.host_received(), []);
+    }
 }

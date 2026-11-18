@@ -440,16 +440,16 @@ pub(crate) fn translate_aura_configure(
 #[cfg(test)]
 mod fixture {
     use super::*;
-
     use crate::handler::compositor::CompositorHandler;
-
     use crate::placement_config::PlacementConfig;
-
     use crate::protocols::aura_shell::zaura_toplevel;
     use crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler;
-
+    use crate::protocols::aura_shell::{zaura_output, zaura_shell};
+    use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
     use crate::protocols::xdg_shell::xdg_toplevel;
+    use crate::protocols::xdg_shell::xdg_wm_base;
     use crate::protocols::{AnyEvent, AnyRequest};
+    use crate::proxy::harness::{Object, Session};
     use crate::state::OutputState;
     use crate::test_support::{decode, msg_sender};
     use crate::wire::{Action, Outgoing, WL_DISPLAY_ID};
@@ -675,6 +675,135 @@ mod fixture {
         ctx.shadow_table
             .insert_host_only_for_test(aura_toplevel, "zaura_toplevel", 38);
     }
+
+    /// A whole proxy session for placement tests, with the objects every
+    /// backend needs: the proxy's own `zaura_shell`, a 1920x1080 output at
+    /// 1x whose shelf takes 48 pixels, an `xdg_wm_base`, a keyboard and a
+    /// surface.
+    pub(super) struct Desk {
+        pub(super) s: Session,
+        /// The host `zaura_shell` the proxy bound.
+        pub(super) shell: u32,
+        pub(super) output: Object,
+        pub(super) wm_base: Object,
+        pub(super) keyboard: Object,
+        pub(super) surface: Object,
+    }
+
+    /// The work area of [`Desk`]'s output: the shelf takes its bottom.
+    pub(super) const DESK_WORK_AREA: (i32, i32) = (1920, 1080 - 48);
+
+    impl Desk {
+        /// A session under `placement`, which must have a backend: the
+        /// output gets its Aura output, whose metadata the host sends.
+        /// What either peer gets for this is checked and not kept.
+        pub(super) async fn new(placement: PlacementConfig) -> Self {
+            let mut s = Session::with_context(Context::with_placement_for_test(placement));
+            let registry = s.registry().await;
+            s.advertise("zaura_shell", zaura_shell::VERSION).await;
+            let host = s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id, .. }))] = &host[..]
+            else {
+                panic!("the proxy did not bind zaura_shell: {host:?}");
+            };
+            let shell = id.2;
+            assert_eq!(s.guest_received().len(), 1, "gtk_shell1 is advertised");
+
+            let output_name = s.advertise("wl_output", wl_output::VERSION).await;
+            let advertised = s.guest_received();
+            let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+                &advertised[..]
+            else {
+                panic!("the output was not advertised: {advertised:?}");
+            };
+            let id = s.new_id();
+            s.guest([
+                wl_registry::req::bind(registry.id, output_name, "wl_output", *version, id)
+                    .unwrap(),
+            ])
+            .await;
+            let host = s.host_received();
+            let [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { id: bound, .. })), (
+                aura_shell,
+                AnyRequest::ZauraShell(zaura_shell::Request::GetAuraOutput {
+                    id: aura_output,
+                    output: aura_of,
+                }),
+            )] = &host[..]
+            else {
+                panic!("the output got no Aura output: {host:?}");
+            };
+            assert_eq!((*aura_shell, *aura_of), (shell, bound.2));
+            let output = Object { id, host: bound.2 };
+            let aura_output = *aura_output;
+            s.host([
+                wl_output::evt::geometry(output.host, 0, 0, 0, 0, 0, "", "", 0).unwrap(),
+                wl_output::evt::mode(output.host, wl_output::MODE_CURRENT, 1920, 1080, 60),
+                zaura_output::evt::scale(aura_output, zaura_output::SCALE_PROPERTY_CURRENT, 1000),
+                zaura_output::evt::device_scale_factor(aura_output, 1000),
+                zaura_output::evt::insets(aura_output, 0, 0, 1080 - DESK_WORK_AREA.1, 0),
+                wl_output::evt::done(output.host),
+            ])
+            .await;
+            assert!(
+                s.guest_received()
+                    .iter()
+                    .all(|(sender, _)| *sender == output.id),
+                "the guest gets only its output's events"
+            );
+            assert_eq!(s.host_received(), []);
+
+            let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
+            let (_, keyboard) = s.keyboard().await;
+            let surface = s.surface().await;
+            Self {
+                s,
+                shell,
+                output,
+                wm_base,
+                keyboard,
+                surface,
+            }
+        }
+
+        /// The host gives the keyboard's focus to the surface and holds
+        /// Alt.
+        pub(super) async fn focus(&mut self) {
+            let alt = 1 << 3;
+            self.s
+                .host([
+                    wl_keyboard::evt::enter(self.keyboard.host, 1, self.surface.host, &[]).unwrap(),
+                    wl_keyboard::evt::modifiers(self.keyboard.host, 2, alt, 0, 0, 0),
+                ])
+                .await;
+            assert_eq!(self.s.guest_received().len(), 3, "enter and modifiers");
+            assert_eq!(self.s.host_received(), []);
+        }
+
+        /// The host sends a press and release of Q, which with Alt is the
+        /// `<Alt>q` chord, as key events `serial` and `serial + 1`.
+        pub(super) async fn chord(&mut self, serial: u32) {
+            let q = 16;
+            self.s
+                .host([
+                    wl_keyboard::evt::key(
+                        self.keyboard.host,
+                        serial,
+                        serial,
+                        q,
+                        wl_keyboard::KEY_STATE_PRESSED,
+                    ),
+                    wl_keyboard::evt::key(
+                        self.keyboard.host,
+                        serial + 1,
+                        serial + 1,
+                        q,
+                        wl_keyboard::KEY_STATE_RELEASED,
+                    ),
+                ])
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -682,14 +811,10 @@ mod tests {
     use super::fixture::*;
     use super::*;
     use crate::arc_task_ids::ArcIdAllocator;
-
     use crate::placement_config::PlacementConfig;
     use crate::protocols::aura_shell::zaura_shell;
-
     use crate::protocols::aura_shell::zaura_toplevel;
-
     use crate::protocols::wayland::wl_surface::{self};
-
     use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel};
     use crate::protocols::{AnyEvent, AnyRequest};
 
