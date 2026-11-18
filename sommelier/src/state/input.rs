@@ -321,6 +321,16 @@ pub struct TextInputState {
     /// an edit, so until the guest reports the result, the committed text
     /// is not what Exo measured.
     pub(crate) unreported_host_edit: bool,
+    /// The bytes before and after the committed surrounding text's cursor
+    /// that preedit regions took since the guest last reported, which the
+    /// guest no longer has though that text still holds them. `Some` only
+    /// while [`Self::unreported_host_edit`] is set, and [`Self::commit`]
+    /// owns both. A host `preedit_string` leaves it alone; an edit that
+    /// ends the composition (a commit, a delete, a confirmation) gives
+    /// the bytes back as text, and so clears it. A stale guest report that
+    /// crosses a transaction clears it early, the same race INVARIANTS
+    /// already admits for the flag.
+    pub(crate) unreported_taken: Option<(u32, u32)>,
     /// What the host text input has applied.
     pub(crate) host: HostApplied,
     /// The `wl_display.sync` queued after the `reset` a press sent the
@@ -385,6 +395,9 @@ pub(crate) struct PreeditRegionPlan {
     pub surrounding_cursor: i32,
     pub done_serial: u32,
     pub had_preedit: bool,
+    /// [`TextInputState::unreported_taken`], the bytes around
+    /// `surrounding_cursor` that earlier regions took.
+    pub unreported_taken: Option<(u32, u32)>,
     pub selection: Option<(u32, u32)>,
     pub cursor: Option<i32>,
 }
@@ -416,6 +429,7 @@ impl TextInputState {
             pending_preedit_selection: None,
             pending_cursor_position: None,
             unreported_host_edit: false,
+            unreported_taken: None,
             host: HostApplied::default(),
             reset_fence: None,
             warned_seat_missing: false,
@@ -446,6 +460,7 @@ impl TextInputState {
         self.pending = V3Pending::default();
         self.committed = V3Committed::default();
         self.unreported_host_edit = false;
+        self.unreported_taken = None;
         self.clear_host_composition();
         std::mem::replace(&mut self.active_surface, active_surface)
     }
@@ -509,6 +524,7 @@ impl TextInputState {
         if let Some(surrounding_text) = surrounding_text {
             self.committed.surrounding_text = surrounding_text;
             self.unreported_host_edit = false;
+            self.unreported_taken = None;
         }
         if let Some(content_type) = content_type {
             self.committed.content_type = content_type;
@@ -629,16 +645,24 @@ impl TextInputState {
             surrounding_cursor: *surrounding_cursor,
             done_serial: self.guest_commit_serial,
             had_preedit: self.current_preedit.has_text(),
+            // Only `commit` (a surrounding text the guest commits) clears
+            // it, so a host preedit_string, which replaces the preedit,
+            // does not give the guest those bytes back.
+            unreported_taken: self.unreported_taken,
             selection: self.pending_preedit_selection,
             cursor: self.pending_preedit_cursor,
         })
     }
 
+    /// Close a preedit region, which made `preedit_text` of the bytes
+    /// `region` before and after the committed cursor. It covers the bytes
+    /// earlier regions took, so it takes the total.
     pub(crate) fn finish_preedit_region(
         &mut self,
         plan: PreeditRegionPlan,
         preedit_text: String,
         cursor: (i32, i32),
+        region: (u32, u32),
     ) {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.had_preedit, self.current_preedit.has_text());
@@ -648,7 +672,10 @@ impl TextInputState {
         self.pending_preedit_cursor = None;
         // An empty region deletes nothing and leaves no preedit, so the
         // guest has no edit to report.
-        self.unreported_host_edit |= !preedit_text.is_empty();
+        if !preedit_text.is_empty() {
+            self.unreported_host_edit = true;
+            self.unreported_taken = Some(region);
+        }
         self.current_preedit = ShownPreedit {
             text: preedit_text,
             cursor,
@@ -706,6 +733,7 @@ impl TextInputState {
     /// therefore no longer shows.
     pub(crate) fn forget_shown_preedit(&mut self) {
         self.current_preedit = ShownPreedit::default();
+        self.unreported_taken = None;
     }
 
     /// Close a host composition transaction after its complete guest message
@@ -714,6 +742,7 @@ impl TextInputState {
         debug_assert_eq!(plan.done_serial, self.guest_commit_serial);
         debug_assert_eq!(plan.preedit_text, self.current_preedit.text);
         self.current_preedit = ShownPreedit::default();
+        self.unreported_taken = None;
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
         self.unreported_host_edit = true;
@@ -738,6 +767,7 @@ impl TextInputState {
 
     fn clear_host_composition(&mut self) {
         self.current_preedit = ShownPreedit::default();
+        self.unreported_taken = None;
         self.pending_preedit_cursor = None;
         self.pending_preedit_selection = None;
         self.pending_cursor_position = None;
