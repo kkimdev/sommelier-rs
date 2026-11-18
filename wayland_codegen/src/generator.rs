@@ -507,21 +507,12 @@ fn map_read_fn(arg: &Arg) -> TokenStream {
     }
 }
 
+/// The write of a forwarded argument that needs no translation: every
+/// type but `object` and `new_id`, whose IDs dispatch translates itself.
 fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
     match arg.typ.as_str() {
         "int" => quote! { builder.write_i32(#name) },
-        "uint" | "object" => quote! { builder.write_u32(#name) },
-        "new_id" => {
-            if arg.interface.is_none() {
-                quote! {
-                    builder.write_string(&#name.0);
-                    builder.write_u32(#name.1);
-                    builder.write_u32(#name.2);
-                }
-            } else {
-                quote! { builder.write_u32(#name) }
-            }
-        }
+        "uint" => quote! { builder.write_u32(#name) },
         "fixed" => quote! { builder.write_fixed(#name) },
         "string" if arg.byte_indexed && arg.allow_null.unwrap_or(false) => {
             quote! { builder.write_nullable_indexed_string(#name.as_ref()) }
@@ -540,6 +531,7 @@ fn map_write_fn(arg: &Arg, name: &Ident) -> TokenStream {
 fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String)>) -> TokenStream {
     let mod_name = format_ident!("{}", interface.name);
     let mut constant_names = ConstantNames::new(&interface.name);
+    constant_names.claim("NAME");
     constant_names.claim("VERSION");
     let handler_trait_name = format_ident!("{}Handler", snake_to_camel(&interface.name));
 
@@ -608,6 +600,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 });
 
                 // Dispatch arm
+                let mut local_object_checks = Vec::new();
                 let mut mapping_and_writing = Vec::new();
                 let mut handler_call_args = Vec::new();
                 let mut field_names_list = Vec::new();
@@ -631,17 +624,18 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 
                         match arg.typ.as_str() {
                             // The pre-handler validation translated the
-                            // object (see `generate_request_validations`).
+                            // object (see `generate_request_validations`): a
+                            // nullable one to a host ID, a non-nullable one to
+                            // a `Link`, which must name a host object.
                             "object" => {
-                                let host = translated_object_ident(arg);
-                                if arg.allow_null.unwrap_or(false) {
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(#host);
-                                    });
+                                let translated = translated_object_ident(arg);
+                                let host = if arg.allow_null.unwrap_or(false) {
+                                    translated
                                 } else {
+                                    let host = format_ident!("host_{}", arg.name);
                                     let req_name_str = &req.name;
-                                    mapping_and_writing.push(quote! {
-                                        let Link::Host(host_id) = #host else {
+                                    local_object_checks.push(quote! {
+                                        let Link::Host(#host) = #translated else {
                                             log::debug!(
                                                 "Dropping request {} naming a local object as non-nullable argument {}",
                                                 #req_name_str,
@@ -649,9 +643,12 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                             );
                                             return Ok(None);
                                         };
-                                        builder.write_u32(host_id);
                                     });
-                                }
+                                    host
+                                };
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#host);
+                                });
                             }
                             "new_id" => {
                                 if let Some(ref interface_name) = arg.interface {
@@ -708,8 +705,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         #(#request_validations)*
                         let handler_action = handler.#method_name(ctx, #(#handler_call_args),*);
                         if handler_action == Action::Forward {
-                            // Check the sender before mapping any new_id: a
-                            // dropped request must not consume or map an ID.
+                            // Check the sender and every object argument
+                            // before mapping any new_id: a dropped request
+                            // must not consume or map an ID, since
+                            // libwayland-server refuses a gap in client IDs.
                             let Link::Host(host_sender_id) = sender else {
                                 log::debug!(
                                     "Dropping request from local object {}",
@@ -718,6 +717,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 #local_destructor_cleanup
                                 return Ok(None);
                             };
+                            #(#local_object_checks)*
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
@@ -745,7 +745,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
 
                 let decodes = generate_reads(&evt.items);
                 let field_names = generate_field_names(&evt.items);
-                let event_validations = generate_event_validations(&evt.items);
+                let event_validations = generate_event_validations(
+                    &format!("{}.{}", interface.name, evt.name),
+                    &evt.items,
+                );
                 let event_version_validation = generate_version_validation(evt.since, true);
                 event_decoders.push(quote! {
                     #evt_idx => {
@@ -768,6 +771,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                 });
 
                 // Dispatch arm for event (Host -> Guest)
+                let mut unmapped_object_checks = Vec::new();
                 let mut mapping_and_writing = Vec::new();
                 let mut handler_call_args = Vec::new();
                 let mut field_names_list = Vec::new();
@@ -805,8 +809,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 );
                                 let evt_name_str = &evt.name;
                                 let arg_name_str = &arg.name;
-                                mapping_and_writing.push(quote! {
-                                    let Some(guest_id) = ctx.shadow_table.get_guest_id(#name) else {
+                                let guest = translated_object_ident(arg);
+                                unmapped_object_checks.push(quote! {
+                                    let Some(#guest) = ctx.shadow_table.get_guest_id(#name) else {
                                         log::debug!(
                                             "Dropping event {} naming an object with no guest counterpart as argument {}",
                                             #evt_name_str,
@@ -814,26 +819,28 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                         );
                                         return Ok(None);
                                     };
-                                    builder.write_u32(guest_id);
+                                });
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(#guest);
                                 });
                             }
                             "new_id" => {
-                                if let Some(ref interface_name) = arg.interface {
-                                    // A child object takes its parent's
-                                    // version, bound to no local that could
-                                    // shadow a later argument.
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(ctx.shadow_table.adopt_host_created(
-                                            #name,
-                                            #interface_name,
-                                            ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
-                                        ));
-                                    });
-                                } else {
-                                    mapping_and_writing.push(quote! {
-                                        builder.write_u32(#name);
-                                    });
-                                }
+                                let Some(interface_name) = &arg.interface else {
+                                    panic!(
+                                        "event argument {} creates an object of no interface, which no vendored protocol has",
+                                        arg.name
+                                    );
+                                };
+                                // A child object takes its parent's version,
+                                // bound to no local that could shadow a later
+                                // argument.
+                                mapping_and_writing.push(quote! {
+                                    builder.write_u32(ctx.shadow_table.adopt_host_created(
+                                        #name,
+                                        #interface_name,
+                                        ctx.shadow_table.host_object_version_or_unknown(msg.sender_id),
+                                    ));
+                                });
                             }
                             _ => {
                                 let write_call = map_write_fn(arg, &name);
@@ -864,9 +871,10 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                         // same object rather than looking it up again.
                         let mapped_guest_sender_id = ctx.shadow_table.get_guest_id(msg.sender_id);
                         if handler.#method_name(ctx, #(#handler_call_args),*) == Action::Forward {
-                            // Check the sender before mapping any new_id: a
-                            // dropped event must not consume a guest server
-                            // ID, since libwayland-client refuses gaps.
+                            // Check the sender and every object argument
+                            // before mapping any new_id: a dropped event must
+                            // not consume a guest server ID, since
+                            // libwayland-client refuses gaps.
                             let Some(guest_sender_id) = mapped_guest_sender_id else {
                                 log::debug!(
                                     "Dropping event from unmapped sender {}",
@@ -874,6 +882,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
                                 );
                                 return Ok(None);
                             };
+                            #(#unmapped_object_checks)*
                             #[allow(unused_mut)]
                             let mut builder = MessageBuilder::new();
                             #(#mapping_and_writing)*
@@ -895,6 +904,9 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
         }
     }
 
+    // Handlers name the interface by its module's `NAME`, as the wire and
+    // the shadow table do, rather than spelling it again.
+    let interface_name = &interface.name;
     // The XML owns the newest version of each interface, as it owns each
     // message's since-version; nothing newer can be decoded.
     let interface_version = interface.version;
@@ -904,6 +916,7 @@ fn generate_interface(interface: &Interface, int_enums: &HashSet<(String, String
         pub mod #mod_name {
             use super::*;
 
+            pub const NAME: &str = #interface_name;
             pub const VERSION: u32 = #interface_version;
             #(#request_opcodes)*
             #(#event_opcodes)*
@@ -1293,8 +1306,9 @@ fn generate_encoder(interface: &str, message: &Message, opcode: &Ident) -> Token
 
 /// The flat constant names of one interface module.
 ///
-/// Opcodes, their `_SINCE` versions, `VERSION` and enum entries share one
-/// namespace, so an enum named after a message could produce a name twice.
+/// Opcodes, their `_SINCE` versions, `NAME`, `VERSION` and enum entries
+/// share one namespace, so an enum named after a message could produce a
+/// name twice.
 /// Generation stops instead of emitting a module that does not compile, or
 /// one where the name means something else than its XML.
 struct ConstantNames<'a> {
@@ -1530,8 +1544,9 @@ fn generate_request_validations(items: &[MessageItem]) -> Vec<TokenStream> {
 /// must name a live object with a guest counterpart, or the event is
 /// dropped; it is validated and translated to the guest ID in one lookup,
 /// bound to [`translated_object_ident`]. An object of no interface is
-/// resolved only when the event is forwarded.
-fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
+/// resolved only when the event is forwarded. `event` names the event
+/// (`interface.event`) in what the lookup logs.
+fn generate_event_validations(event: &str, items: &[MessageItem]) -> Vec<TokenStream> {
     let mut validations = Vec::new();
     for arg in args(items) {
         let name = sanitize_ident(&arg.name);
@@ -1551,7 +1566,7 @@ fn generate_event_validations(items: &[MessageItem]) -> Vec<TokenStream> {
                     continue;
                 };
                 let guest = translated_object_ident(arg);
-                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface) };
+                let lookup = quote! { ctx.shadow_table.event_object(#name, #interface, #event) };
                 validations.push(if arg.allow_null.unwrap_or(false) {
                     quote! {
                         let #guest = if #name == 0 {

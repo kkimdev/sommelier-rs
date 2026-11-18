@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::protocols;
 use crate::protocols::linux_dmabuf_v1::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
-use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+use crate::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool};
 use crate::state::{
     BufferRect, BufferSpace, BufferState, Context, DamageRegion, HostId, Rect, ShmPool, StalePixels,
 };
@@ -1131,7 +1131,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
                 ctx.last_sender_id
             );
             // The guest owns the new ID, so the pool exists, inert.
-            ctx.shadow_table.create_local(id, "wl_shm_pool", 1);
+            ctx.shadow_table.create_local(id, wl_shm_pool::NAME, 1);
             ctx.stale_shm_pools.insert(id);
             return Action::Drop;
         }
@@ -1177,7 +1177,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
         };
 
         ctx.pools.insert(pool_id, pool);
-        ctx.shadow_table.create_local(pool_id, "wl_shm_pool", 1);
+        ctx.shadow_table.create_local(pool_id, wl_shm_pool::NAME, 1);
 
         Action::Drop
     }
@@ -1412,11 +1412,11 @@ fn create_shared_buffer(
         .host_object_version_or_unknown(host_wl_shm_id);
     let host_pool_id = ctx
         .shadow_table
-        .create_host_only("wl_shm_pool", pool_version);
+        .create_host_only(wl_shm_pool::NAME, pool_version);
 
     let host_buffer_id = ctx
         .shadow_table
-        .create_paired(request.id, "wl_buffer", 1, 1);
+        .create_paired(request.id, wl_buffer::NAME, 1, 1);
     ctx.client_to_host_queue.extend([
         wl_shm::req::create_pool(host_wl_shm_id, host_pool_id, fd_to_send, buffer_size),
         // The buffer starts the pool, and keeps its SHM (not DRM) format.
@@ -1539,7 +1539,7 @@ fn create_dmabuf_buffer(
         .host_object_version_or_unknown(host_dmabuf_id);
     let params_id = ctx
         .shadow_table
-        .create_host_only("zwp_linux_buffer_params_v1", params_version);
+        .create_host_only(zwp_linux_buffer_params_v1::NAME, params_version);
     ctx.client_to_host_queue
         .push(zwp_linux_dmabuf_v1::req::create_params(
             host_dmabuf_id,
@@ -1572,7 +1572,7 @@ fn create_dmabuf_buffer(
 
     let host_buffer_id = ctx
         .shadow_table
-        .create_paired(request.id, "wl_buffer", 1, 1);
+        .create_paired(request.id, wl_buffer::NAME, 1, 1);
     ctx.client_to_host_queue
         .push(zwp_linux_buffer_params_v1::req::create_immed(
             params_id,
@@ -1648,7 +1648,7 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
             );
             // The guest owns the new ID, so the buffer exists, inert:
             // attaching it detaches (`CompositorHandler::on_attach`).
-            ctx.shadow_table.create_local(id, "wl_buffer", 1);
+            ctx.shadow_table.create_local(id, wl_buffer::NAME, 1);
             return Action::Drop;
         }
         let Some(pool) = ctx.pools.get(&pool_id) else {

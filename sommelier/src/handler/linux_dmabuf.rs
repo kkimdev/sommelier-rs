@@ -18,7 +18,7 @@ use crate::handler::shm::record_host_shm_drm_format;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
-use crate::protocols::wayland::{wl_display, wl_shm};
+use crate::protocols::wayland::{wl_buffer, wl_display, wl_shm};
 use crate::state::{Context, HostId, PendingNativeCreate, PendingParam};
 use crate::wire::{Action, MessageHeader, Outgoing, WL_DISPLAY_ID};
 use log::{debug, error};
@@ -292,7 +292,7 @@ impl LinuxDmabufHandler {
         };
         ctx.shadow_table.create_local(
             guest_id,
-            "zwp_linux_dmabuf_feedback_v1",
+            zwp_linux_dmabuf_feedback_v1::NAME,
             GUEST_DMABUF_VERSION,
         );
         ctx.synthetic_feedback_objects.insert(guest_id, generation);
@@ -914,9 +914,12 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
         // The request is dropped and rebuilt here, so create the buffer the
         // generated dispatcher would have created for it.
         let buffer_version = ctx.shadow_table.guest_object_version_or_unknown(params_id);
-        let host_buffer_id =
-            ctx.shadow_table
-                .create_paired(buffer_id, "wl_buffer", buffer_version, buffer_version);
+        let host_buffer_id = ctx.shadow_table.create_paired(
+            buffer_id,
+            wl_buffer::NAME,
+            buffer_version,
+            buffer_version,
+        );
         ctx.client_to_host_queue
             .push(zwp_linux_buffer_params_v1::req::create_immed(
                 host_params_id.0,

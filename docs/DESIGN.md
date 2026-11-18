@@ -129,6 +129,8 @@ build time (`sommelier/build.rs`). For each protocol it generates:
   proxy implements itself, and `zaura_shell` has a v6 floor.
   `forwarded_global_version` never offers a forwarded global above its
   generated `VERSION`.
+- A `NAME` constant, the interface's name. Handlers name an interface
+  by it, never by a copied literal.
 
 `generate_routing` derives the interface-to-protocol routing table, and
 `interface_version`, each interface's `VERSION` by name, from the same
@@ -167,8 +169,13 @@ The table's API keeps those entries consistent by construction:
 - **Generated dispatch** resolves each sender and object argument once,
   before the handler runs, which validates and translates it together:
   `request_sender` and `request_object` return a `Link` (a host ID, or
-  local), and `event_object` returns the guest ID. A host-created object
-  must have a fresh server ID (`accepts_host_new_id`).
+  local), and `event_object` returns the guest ID. An event that names a
+  stale object is dropped; one that names an object of another interface
+  is dropped too, and the first on a connection warns, since the host
+  broke the protocol (test: `an_event_object_of_another_interface_is_warned_of`).
+  The warning is once per connection because each `Context` owns its own
+  `ShadowTable`, which keeps the flag; later ones log at debug level.
+  A host-created object must have a fresh server ID (`accepts_host_new_id`).
 
 Guest and host ID spaces are independent: the proxy allocates host IDs
 itself, and host-created objects get guest IDs in the server range

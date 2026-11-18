@@ -17,13 +17,14 @@ limitations under the License.
 //! The objects of one connection on each side of the proxy, and how the
 //! two sides pair up.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
 use super::{GuestId, HostId};
 use crate::protocols::wayland::wl_display;
 use crate::wire::WL_DISPLAY_ID;
-use log::warn;
+use log::{debug, warn};
 
 /// What a host `wl_display.delete_id` ended
 /// ([`ShadowTable::release_deleted_host_id`]).
@@ -167,6 +168,9 @@ pub struct ShadowTable {
     /// translated to a fresh ID in this range before they reach the guest.
     /// An ID returns here when its guest object ends.
     guest_server_ids: IdAllocator,
+    /// Whether [`Self::event_object`] has warned that the host named an
+    /// object of another interface; later ones log at debug level.
+    warned_wrong_interface: Cell<bool>,
 }
 
 impl ShadowTable {
@@ -191,6 +195,7 @@ impl ShadowTable {
             hosts: HashMap::new(),
             host_ids: IdAllocator::new(Self::CLIENT_IDS),
             guest_server_ids: IdAllocator::new(Self::SERVER_IDS),
+            warned_wrong_interface: Cell::new(false),
         }
     }
 
@@ -244,7 +249,7 @@ impl ShadowTable {
     /// Create `wl_display`, the object a connection starts with, under the
     /// ID it has on both sides.
     pub fn create_display(&mut self) {
-        let interface = || Interface::new("wl_display", wl_display::VERSION);
+        let interface = || Interface::new(wl_display::NAME, wl_display::VERSION);
         self.insert_pair(
             GuestId(WL_DISPLAY_ID),
             interface(),
@@ -383,14 +388,19 @@ impl ShadowTable {
         })
     }
 
-    /// Resolve an object argument of a host event, which must be a host
-    /// object of `interface` paired with a live guest object.
+    /// Resolve an object argument of host event `event` (such as
+    /// `wl_surface.enter`), which must be a host object of `interface`
+    /// paired with a live guest object.
+    ///
+    /// An object the guest has destroyed is a race the event lost. An
+    /// object of another interface is the host breaking the protocol: the
+    /// first on a connection warns, later ones log at debug level.
     ///
     /// # Returns
     ///
     /// The guest object's ID, or `None` when the event may not reach the
     /// guest naming `host_id` there.
-    pub fn event_object(&self, host_id: u32, interface: &str) -> Option<u32> {
+    pub fn event_object(&self, host_id: u32, interface: &str, event: &str) -> Option<u32> {
         let HostObject::Paired {
             guest,
             interface: own,
@@ -398,7 +408,21 @@ impl ShadowTable {
         else {
             return None;
         };
-        (own.name == interface && !self.is_pending_destroy_guest(guest.0)).then_some(guest.0)
+        if own.name != interface {
+            if self.warned_wrong_interface.replace(true) {
+                debug!(
+                    "Dropping host event {event}: it names {} {host_id} as a {interface}",
+                    own.name
+                );
+            } else {
+                warn!(
+                    "Dropping host event {event}: it names {} {host_id} as a {interface}, which breaks the protocol",
+                    own.name
+                );
+            }
+            return None;
+        }
+        (!self.is_pending_destroy_guest(guest.0)).then_some(guest.0)
     }
 
     /// Return whether guest object `guest_id` is one the proxy implements
@@ -859,6 +883,8 @@ mod tests {
     use super::*;
 
     const SERVER: u32 = ShadowTable::GUEST_SERVER_ID_START;
+    /// The event a test resolves an object argument for, as logged.
+    const EVENT: &str = "wl_pointer.enter";
 
     #[test]
     fn host_ids_stay_within_libwayland_servers_client_range() {
@@ -1040,16 +1066,32 @@ mod tests {
         let host = table.create_paired(21, "wl_surface", 4, 4);
         let binding = table.create_host_only("wl_shm", 1);
 
-        assert_eq!(table.event_object(host, "wl_surface"), Some(21));
-        assert_eq!(table.event_object(host, "wl_output"), None);
+        assert_eq!(table.event_object(host, "wl_surface", EVENT), Some(21));
+        assert_eq!(table.event_object(host, "wl_output", EVENT), None);
         assert_eq!(
-            table.event_object(binding, "wl_shm"),
+            table.event_object(binding, "wl_shm", EVENT),
             None,
             "no guest object"
         );
 
         table.guest_destroyed(21);
-        assert_eq!(table.event_object(host, "wl_surface"), None);
+        assert_eq!(table.event_object(host, "wl_surface", EVENT), None);
+    }
+
+    /// A host event that names an object of another interface breaks the
+    /// protocol, unlike one that names a stale object, which is a race: the
+    /// connection warns of the first.
+    #[test]
+    fn an_event_object_of_another_interface_is_warned_of() {
+        let mut table = ShadowTable::new();
+        let stale = table.create_paired(21, "wl_surface", 4, 4);
+        table.guest_destroyed(21);
+        let host = table.create_paired(22, "wl_surface", 4, 4);
+
+        assert_eq!(table.event_object(stale, "wl_surface", EVENT), None);
+        assert!(!table.warned_wrong_interface.get());
+        assert_eq!(table.event_object(host, "wl_output", EVENT), None);
+        assert!(table.warned_wrong_interface.get());
     }
 
     #[test]
@@ -1266,8 +1308,11 @@ mod tests {
 
         assert_eq!(table.get_interface(20), Some("zwp_text_input_v3"));
         assert_eq!(table.get_host_interface(host), Some("zwp_text_input_v1"));
-        assert_eq!(table.event_object(host, "zwp_text_input_v1"), Some(20));
-        assert_eq!(table.event_object(host, "zwp_text_input_v3"), None);
+        assert_eq!(
+            table.event_object(host, "zwp_text_input_v1", EVENT),
+            Some(20)
+        );
+        assert_eq!(table.event_object(host, "zwp_text_input_v3", EVENT), None);
 
         // Once the guest object goes, the host object keeps its own
         // interface, routes its events and stays reserved.

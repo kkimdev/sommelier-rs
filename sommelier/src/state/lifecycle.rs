@@ -41,6 +41,15 @@ use super::{Context, DeletedHostId, HostId, Link};
 use crate::handler::{
     compositor, keyboard, linux_dmabuf, output, registry, shm, text_input, window_placement,
 };
+use crate::protocols::linux_dmabuf_v1::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+};
+use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
+use crate::protocols::viewporter::wp_viewport;
+use crate::protocols::wayland::{
+    wl_keyboard, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+};
+use crate::protocols::xdg_shell::{xdg_popup, xdg_surface, xdg_toplevel};
 
 impl Context {
     /// The guest destroyed guest object `guest_id`; see
@@ -150,20 +159,20 @@ fn forget_object(
     host_deleted: bool,
 ) {
     match (interface, host) {
-        ("wl_registry", Some(host)) => registry::forget_registry(ctx, host),
-        ("wl_output", Some(host)) => output::forget_output(ctx, host),
-        ("wl_keyboard", Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
-        ("wl_surface", Some(host)) => compositor::forget_surface(ctx, guest, host),
-        ("wp_viewport", _) => compositor::forget_viewport(ctx, guest),
-        ("xdg_surface", _) => compositor::forget_xdg_surface(ctx, guest),
-        ("xdg_toplevel", _) => compositor::forget_xdg_toplevel(ctx, guest),
-        ("xdg_popup", _) => window_placement::forget_xdg_popup(ctx, guest),
-        ("wl_shm", _) => shm::forget_shm(ctx, guest),
-        ("wl_shm_pool", _) => shm::forget_pool(ctx, guest),
-        ("zwp_linux_dmabuf_v1", _) => linux_dmabuf::forget_factory(ctx, guest),
-        ("zwp_linux_dmabuf_feedback_v1", _) => linux_dmabuf::forget_feedback(ctx, guest),
-        ("zwp_linux_buffer_params_v1", _) => linux_dmabuf::forget_params(ctx, guest, host),
-        ("zwp_text_input_v3", _) => text_input::forget_text_input(ctx, guest, host_deleted),
+        (wl_registry::NAME, Some(host)) => registry::forget_registry(ctx, host),
+        (wl_output::NAME, Some(host)) => output::forget_output(ctx, host),
+        (wl_keyboard::NAME, Some(host)) => keyboard::forget_keyboard(ctx, guest, HostId(host)),
+        (wl_surface::NAME, Some(host)) => compositor::forget_surface(ctx, guest, host),
+        (wp_viewport::NAME, _) => compositor::forget_viewport(ctx, guest),
+        (xdg_surface::NAME, _) => compositor::forget_xdg_surface(ctx, guest),
+        (xdg_toplevel::NAME, _) => compositor::forget_xdg_toplevel(ctx, guest),
+        (xdg_popup::NAME, _) => window_placement::forget_xdg_popup(ctx, guest),
+        (wl_shm::NAME, _) => shm::forget_shm(ctx, guest),
+        (wl_shm_pool::NAME, _) => shm::forget_pool(ctx, guest),
+        (zwp_linux_dmabuf_v1::NAME, _) => linux_dmabuf::forget_factory(ctx, guest),
+        (zwp_linux_dmabuf_feedback_v1::NAME, _) => linux_dmabuf::forget_feedback(ctx, guest),
+        (zwp_linux_buffer_params_v1::NAME, _) => linux_dmabuf::forget_params(ctx, guest, host),
+        (zwp_text_input_v3::NAME, _) => text_input::forget_text_input(ctx, guest, host_deleted),
         _ => {}
     }
 }
@@ -332,7 +341,11 @@ impl Context {
         }
         for (&params, create) in &self.pending_native_creates {
             assert_eq!(
-                table.event_object(params.0, "zwp_linux_buffer_params_v1"),
+                table.event_object(
+                    params.0,
+                    "zwp_linux_buffer_params_v1",
+                    "zwp_linux_buffer_params_v1.created"
+                ),
                 Some(create.guest_params_id),
                 "asynchronous dma-buf create outlived host params {}",
                 params.0

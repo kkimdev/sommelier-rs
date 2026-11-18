@@ -771,6 +771,59 @@ mod tests {
         );
     }
 
+    /// Generated dispatch checks every object argument before it maps a
+    /// `new_id`, so a request dropped for naming a local object where the
+    /// host needs one of its own maps nothing and uses up no host ID:
+    /// libwayland-server refuses the next new ID after a gap. This pins the
+    /// generated dispatcher, with a handler that forwards: `OutputHandler`
+    /// makes the xdg_output of an inert output inert instead
+    /// (`xdg_output_of_an_inert_output_is_inert`).
+    #[test]
+    fn request_dropped_for_a_local_argument_maps_no_new_id() {
+        use crate::protocols::xdg_output_unstable_v1::zxdg_output_manager_v1::{
+            self, ZxdgOutputManagerV1Handler,
+        };
+        struct Forwarding;
+        impl ZxdgOutputManagerV1Handler for Forwarding {}
+        const MANAGER: u32 = 10;
+        const INERT_OUTPUT: u32 = 11;
+        const XDG_OUTPUT: u32 = 12;
+        let context = || {
+            let mut ctx = Context::new_for_test(false, false, Vec::new());
+            ctx.shadow_table
+                .insert_paired_for_test(MANAGER, 20, "zxdg_output_manager_v1");
+            ctx.shadow_table.create_local(INERT_OUTPUT, "wl_output", 4);
+            ctx
+        };
+        // The host ID the next object takes when nothing used one up.
+        let next_host_id = context()
+            .shadow_table
+            .create_paired(13, "zxdg_output_v1", 3, 3);
+
+        let mut ctx = context();
+        let payload: Vec<u8> = [XDG_OUTPUT, INERT_OUTPUT]
+            .iter()
+            .flat_map(|id| id.to_ne_bytes())
+            .collect();
+        let mut get = WireMessage::new(
+            MANAGER,
+            zxdg_output_manager_v1::REQ_GET_XDG_OUTPUT,
+            &payload,
+        );
+        let result = zxdg_output_manager_v1::dispatch_request(&mut get, &mut Forwarding, &mut ctx);
+
+        assert_eq!(raw_dispatch(result), Ok(None));
+        assert!(
+            ctx.shadow_table.is_guest_id_available(XDG_OUTPUT),
+            "a dropped request must not map its new_id"
+        );
+        assert_eq!(
+            ctx.shadow_table.create_paired(13, "zxdg_output_v1", 3, 3),
+            next_host_id,
+            "a dropped request must not use up a host ID"
+        );
+    }
+
     /// Every clipboard or drag-and-drop selection brings a new host data
     /// offer. The guest IDs must be recycled, or a long session would run
     /// out of server IDs.

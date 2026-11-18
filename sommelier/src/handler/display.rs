@@ -94,7 +94,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_get_registry(&mut self, ctx: &mut Context, registry: u32) -> Action {
         let host_registry_id = ctx.shadow_table.create_paired(
             registry,
-            "wl_registry",
+            wl_registry::NAME,
             wl_registry::VERSION,
             wl_registry::VERSION,
         );
@@ -110,7 +110,7 @@ impl wl_display::WlDisplayHandler for DisplayHandler {
     fn on_sync(&mut self, ctx: &mut Context, callback: u32) -> Action {
         let host_callback_id = ctx.shadow_table.create_paired(
             callback,
-            "wl_callback",
+            wl_callback::NAME,
             wl_callback::VERSION,
             wl_callback::VERSION,
         );

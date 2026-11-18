@@ -18,6 +18,9 @@ use crate::allocator::PendingFence;
 use crate::connection::{OutgoingMessages, WaylandConnection};
 use crate::placement_config::PlacementConfig;
 use crate::protocols;
+use crate::protocols::aura_shell::{zaura_output, zaura_toplevel};
+use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
+use crate::protocols::wayland::wl_buffer;
 use crate::state::{Context, PostDispatch, SessionEnd};
 use crate::virtwl_channel::VirtWaylandChannel;
 use crate::wire::{Framing, MessageHeader, Outgoing, ProtocolError, WireMessage};
@@ -77,7 +80,7 @@ enum Direction {
 
 fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bool {
     let interface = ctx.shadow_table.get_host_interface(sender_id);
-    let allows_deferred_buffer_release = interface.is_some_and(|name| name == "wl_buffer")
+    let allows_deferred_buffer_release = interface.is_some_and(|name| name == wl_buffer::NAME)
         && opcode == protocols::wayland::wl_buffer::EVT_RELEASE
         && ctx.host_buffer_is_guest_destroyed(sender_id);
     // An asynchronous linux-dmabuf create can legally be followed by
@@ -88,7 +91,7 @@ fn pending_host_event_is_stale(ctx: &Context, sender_id: u32, opcode: u16) -> bo
     // because generated new_id mapping only runs when the event is
     // forwarded.
     let allows_orphan_dmabuf_result = interface
-        .is_some_and(|name| name == "zwp_linux_buffer_params_v1")
+        .is_some_and(|name| name == zwp_linux_buffer_params_v1::NAME)
         && (opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_CREATED
             || opcode == protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::EVT_FAILED);
     ctx.shadow_table.is_pending_destroy_host(sender_id)
@@ -429,14 +432,14 @@ impl Client {
         };
 
         if family == protocols::ProtocolFamily::AuraShell {
-            if interface == "zaura_toplevel" {
+            if interface == zaura_toplevel::NAME {
                 return protocols::aura_shell::zaura_toplevel::dispatch_event(
                     msg,
                     &mut handler.compositor,
                     ctx,
                 );
             }
-            if interface == "zaura_output" {
+            if interface == zaura_output::NAME {
                 return protocols::aura_shell::zaura_output::dispatch_event(
                     msg,
                     &mut handler.output,

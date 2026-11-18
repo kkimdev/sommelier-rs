@@ -289,10 +289,17 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   host `new_id` from the client range, which the proxy allocates from,
   ends the connection like a reused one. A guest ID from the server range
   returns when its guest object ends. Generated dispatchers create a
-  `new_id`'s object only when its message's sender is paired, so a message
-  dropped for a local sender consumes no ID; one dropped later, for a
-  local object in a non-nullable argument, still does (a nullable one is
-  sent as null). Freed IDs are reused first, so the ID
+  `new_id`'s object only once its message's sender and every object
+  argument have resolved, so a message dropped for a local sender, for a
+  local object in a non-nullable request argument (a nullable one is sent
+  as null) or for an event object with no guest counterpart maps nothing
+  and consumes no ID. An event object of an interface resolves before the
+  handler runs; the one of no interface, `wl_display.error`'s, resolves as
+  the event is forwarded, also before any mapping. A handler that returns
+  `Forward` must not map the request's own `new_id`; mapping belongs to
+  the generated arm. Handlers that map it themselves (`on_bind`,
+  `on_get_registry`, `on_sync`, `on_get_text_input`) return `Drop`. Freed
+  IDs are reused first, so the ID
   spaces stay as dense as the live objects, and each stays within
   libwayland's map limit: index `WL_MAP_MAX_OBJECTS` (`0xF00000`)
   inclusive, the ID itself on the client side and its offset from
@@ -313,6 +320,10 @@ Tests: `viewport_source_must_fit_the_transformed_scaled_buffer`,
   `guest_id_availability_rejects_reserved_and_reused_ids`,
   `host_new_ids_must_be_fresh_server_ids`,
   `event_from_an_unmapped_sender_maps_no_new_id`,
+  `request_dropped_for_a_local_argument_maps_no_new_id`,
+  `test_request_object_arguments_are_checked_before_new_id_mapping`,
+  `test_event_object_arguments_are_checked_before_new_id_mapping`,
+  `test_no_forward_drops_after_mapping_a_new_id`,
   `host_ids_stay_within_libwayland_servers_client_range`.
 - **An object's state ends with it, once.** Every end of an object goes
   through a `Context` wrapper of its table transition (the transitions

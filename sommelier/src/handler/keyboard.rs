@@ -428,7 +428,7 @@ impl KeyboardHandler {
                     .host_object_version_or_unknown(extension_host_id.0);
                 let host_extended_id = HostId(
                     ctx.shadow_table
-                        .create_host_only("zcr_extended_keyboard_v1", extended_version),
+                        .create_host_only(zcr_extended_keyboard_v1::NAME, extended_version),
                 );
                 ctx.keyboard_to_extended_keyboard
                     .insert(host_keyboard_id, host_extended_id);

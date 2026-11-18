@@ -239,8 +239,17 @@ mod tests {
             .expect("zaura_shell module");
         assert!(
             compact[zaura_shell_start..]
-                .starts_with("pubmodzaura_shell{usesuper::*;pubconstVERSION:u32=38u32;"),
+                .starts_with("pubmodzaura_shell{usesuper::*;pubconstNAME:&str=\"zaura_shell\";pubconstVERSION:u32=38u32;"),
             "an interface's XML version must become its VERSION constant"
+        );
+    }
+
+    #[test]
+    fn test_generate_interface_name_from_protocol_xml() {
+        let gtk = generate_compact("gtk-shell.xml");
+        assert!(
+            gtk.contains("pubmodgtk_shell1{usesuper::*;pubconstNAME:&str=\"gtk_shell1\";"),
+            "an interface module names its interface"
         );
     }
 
@@ -458,6 +467,143 @@ mod tests {
             ),
             "an object argument must be resolved once, before the handler runs"
         );
+    }
+
+    /// A request that names a local object where the host needs one of its
+    /// own is dropped before its `new_id` is mapped, so it uses up no host
+    /// ID: libwayland-server refuses the next new ID after a gap.
+    #[test]
+    fn test_request_object_arguments_are_checked_before_new_id_mapping() {
+        let compact = generate_compact("xdg-output-unstable-v1.xml");
+        let arm = compact
+            .find("Request::GetXdgOutput{id,output}=>{")
+            .map(|start| &compact[start..])
+            .expect("get_xdg_output dispatch arm");
+        let local_check = arm
+            .find("namingalocalobjectasnon-nullableargument")
+            .expect("local object check");
+        let mapping = arm.find("create_paired(").expect("new_id mapping");
+        assert!(
+            local_check < mapping,
+            "every object argument must be checked before the new_id is mapped"
+        );
+    }
+
+    /// No forwarded message of any vendored protocol can drop once it has
+    /// mapped its `new_id`: every check that drops it comes first, whatever
+    /// the shape of its arguments.
+    #[test]
+    fn test_no_forward_drops_after_mapping_a_new_id() {
+        use crate::protocol::{InterfaceItem, MessageItem, ProtocolItem};
+        let protocols = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../third_party/protocols");
+        for entry in std::fs::read_dir(protocols).expect("read the vendored protocols") {
+            let path = entry.expect("a protocol file").path();
+            if path.extension().is_none_or(|extension| extension != "xml") {
+                continue;
+            }
+            let protocol = parse(&path).expect("parse a vendored protocol");
+            // Every request and event with a `new_id` argument has one
+            // dispatch arm, whose forward block maps it.
+            let creating_messages = protocol
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    ProtocolItem::Interface(interface) => Some(&interface.items),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|item| {
+                    let (InterfaceItem::Request(message) | InterfaceItem::Event(message)) = item
+                    else {
+                        return false;
+                    };
+                    message
+                        .items
+                        .iter()
+                        .any(|item| matches!(item, MessageItem::Arg(arg) if arg.typ == "new_id"))
+                })
+                .count();
+            let compact = without_whitespace(&generator::generate(&protocol));
+            // Each forward block runs from its handler's verdict to the
+            // message it returns.
+            let ends: Vec<_> = compact.split("returnOk(Some(outgoing));").collect();
+            let mut mapping_forwards = 0;
+            for end in &ends[..ends.len() - 1] {
+                let start = end.rfind("==Action::Forward{").expect("a forward block");
+                let block = &end[start..];
+                let Some(mapping) = ["create_paired(", "adopt_host_created("]
+                    .iter()
+                    .filter_map(|mapping| block.find(mapping))
+                    .min()
+                else {
+                    continue;
+                };
+                mapping_forwards += 1;
+                assert!(
+                    !block[mapping..].contains("returnOk(None)"),
+                    "{}: a forward drops after mapping a new_id: {block}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                mapping_forwards,
+                creating_messages,
+                "{}: every message that creates an object has a forward block that maps it",
+                path.display()
+            );
+        }
+    }
+
+    /// An event drops for an object argument of no interface that has no
+    /// guest counterpart before its `new_id` is mapped, so it uses up no
+    /// guest server ID. No vendored event has both; this one does.
+    #[test]
+    fn test_event_object_arguments_are_checked_before_new_id_mapping() {
+        let xml = r#"
+        <protocol name="order">
+          <interface name="thing" version="1">
+            <event name="made">
+              <arg name="id" type="new_id" interface="thing"/>
+              <arg name="cause" type="object"/>
+            </event>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        let compact = without_whitespace(&generator::generate(&protocol));
+        let arm = compact
+            .find("Event::Made{id,cause}=>{")
+            .map(|start| &compact[start..])
+            .expect("made dispatch arm");
+        let unmapped_check = arm
+            .find("naminganobjectwithnoguestcounterpart")
+            .expect("unmapped object check");
+        let mapping = arm.find("adopt_host_created(").expect("new_id mapping");
+        assert!(
+            unmapped_check < mapping,
+            "every object argument must be checked before the new_id is mapped"
+        );
+    }
+
+    /// An event's `new_id` of no interface has no type to adopt the host's
+    /// object as; generation names the argument instead of emitting code
+    /// that fails to compile with an obscure type error.
+    #[test]
+    #[should_panic(expected = "event argument id creates an object of no interface")]
+    fn test_generate_rejects_an_event_new_id_of_no_interface() {
+        let xml = r#"
+        <protocol name="untyped">
+          <interface name="thing" version="1">
+            <event name="made">
+              <arg name="id" type="new_id"/>
+            </event>
+          </interface>
+        </protocol>
+        "#;
+        let protocol: crate::protocol::Protocol =
+            quick_xml::de::from_str(xml).expect("Failed to parse XML");
+        generator::generate(&protocol);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_manager_v3;
 use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
-use crate::protocols::wayland::wl_keyboard;
+use crate::protocols::wayland::{wl_keyboard, wl_seat};
 #[cfg(test)]
 use crate::state::GuestKeyOwner;
 use crate::state::{
@@ -1363,9 +1363,9 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
             .host_object_version_or_unknown(host_manager_id);
         let host_v1_id = ctx.shadow_table.create_bridged(
             id,
-            "zwp_text_input_v3",
+            zwp_text_input_v3::NAME,
             guest_manager_version,
-            "zwp_text_input_v1",
+            zwp_text_input_v1::NAME,
             host_manager_version,
         );
         ctx.client_to_host_queue
@@ -1382,7 +1382,7 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
                     .host_object_version_or_unknown(host_ext_manager_id);
                 let host_ext_id = ctx
                     .shadow_table
-                    .create_host_only("zcr_extended_text_input_v1", host_ext_version);
+                    .create_host_only(zcr_extended_text_input_v1::NAME, host_ext_version);
                 ctx.client_to_host_queue.push(
                     zcr_text_input_extension_v1::req::get_extended_text_input(
                         host_ext_manager_id,
@@ -1528,7 +1528,7 @@ fn host_target(ctx: &Context, state: &TextInputState) -> HostTarget {
 fn live_host_seat(ctx: &Context, state: &TextInputState) -> Option<u32> {
     let seat = ctx
         .shadow_table
-        .request_object(state.guest_seat, "wl_seat")?;
+        .request_object(state.guest_seat, wl_seat::NAME)?;
     match seat {
         Link::Host(host_seat) => Some(host_seat),
         // The proxy implements no wl_seat itself.
