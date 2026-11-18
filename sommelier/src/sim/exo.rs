@@ -477,7 +477,13 @@ impl Exo {
         let time = millis(now);
         if self.ima.client.is_none() || self.latin {
             let consumed = if pressed {
-                self.pressed.insert(keymap::keycode(key).0, false);
+                // `Keyboard::OnKeyEvent` passes a press only of a key it
+                // does not hold.
+                let code = keymap::keycode(key).0;
+                if self.pressed.contains_key(&code) {
+                    return;
+                }
+                self.pressed.insert(code, false);
                 false
             } else {
                 let Some(consumed) = self.release(key) else {
@@ -1868,6 +1874,23 @@ mod tests {
             key(8, 'Q', UP),
         ];
         assert_eq!(events(&mut exo), shifted);
+    }
+
+    #[test]
+    fn e7_a_press_of_a_held_key_goes_nowhere() {
+        // `Keyboard::OnKeyEvent` passes a press only of a key it does not
+        // hold, so a second press before the release sends nothing.
+        let mut exo = exo();
+        exo.key(NOW, k('r'), DOWN);
+        exo.key(NOW, k('r'), DOWN);
+        exo.key(NOW, k('r'), UP);
+        let raw = [
+            peek(1, 'r', DOWN),
+            key(1, 'r', DOWN),
+            peek(2, 'r', UP),
+            key(2, 'r', UP),
+        ];
+        assert_eq!(events(&mut exo), raw);
     }
 
     #[test]
