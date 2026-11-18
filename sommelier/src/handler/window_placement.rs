@@ -1553,4 +1553,221 @@ mod tests {
         assert_eq!(origin_change(&mut ctx), Action::Drop);
         assert!(ctx.host_to_client_queue.is_empty());
     }
+
+    /// With placement off, the default, the proxy sends either peer what it
+    /// sent before placement had backends: it binds no remote shell and no
+    /// Aura output or toplevel, the Aura surface gets the guest's ID in the
+    /// Guest OS namespace, configures pass through, and a chord that a
+    /// binding source names reaches the guest, since no source is read.
+    #[tokio::test]
+    async fn placement_off_traffic_is_unchanged() {
+        use crate::protocols::wayland::{wl_keyboard, wl_output, wl_registry};
+        use crate::protocols::xdg_shell::xdg_wm_base;
+        use crate::proxy::harness::Session;
+
+        let placement = PlacementConfig::resolve_for_test(
+            &[("SOMMELIER_WINDOW_PLACEMENT_SHORTCUTS", "<Alt>q=top-left")],
+            None,
+            ArcIdAllocator::block_for_test(),
+        );
+        let mut s = Session::with_context(Context::with_placement_for_test(placement));
+        let registry = s.registry().await;
+
+        // A remote shell is neither bound nor advertised.
+        s.advertise("zcr_remote_shell_v2", 6).await;
+        assert_eq!(s.host_received(), []);
+        assert_eq!(s.guest_received(), []);
+        // An output gets no Aura output: the host gets only the bind, and
+        // a zaura_shell bound later retries none.
+        let output_name = s.advertise("wl_output", wl_output::VERSION).await;
+        let advertised = s.guest_received();
+        let [(_, AnyEvent::WlRegistry(wl_registry::Event::Global { version, .. }))] =
+            &advertised[..]
+        else {
+            panic!("the output was not advertised: {advertised:?}");
+        };
+        let output = s.new_id();
+        s.guest([
+            wl_registry::req::bind(registry.id, output_name, "wl_output", *version, output)
+                .unwrap(),
+        ])
+        .await;
+        let host = s.host_received();
+        assert!(
+            matches!(
+                &host[..],
+                [(_, AnyRequest::WlRegistry(wl_registry::Request::Bind { name, .. }))]
+                    if *name == output_name
+            ),
+            "{host:?}"
+        );
+        // The proxy binds zaura_shell for itself, and only it, even with a
+        // live output.
+        let shell_name = s.advertise("zaura_shell", zaura_shell::VERSION).await;
+        let host = s.host_received();
+        let [(sender, AnyRequest::WlRegistry(wl_registry::Request::Bind { name, id }))] = &host[..]
+        else {
+            panic!("the proxy did not bind zaura_shell alone: {host:?}");
+        };
+        assert_eq!((*sender, *name), (registry.host, shell_name));
+        assert_eq!((id.0.as_str(), id.1), ("zaura_shell", zaura_shell::VERSION));
+        let shell = id.2;
+        // It stands behind the guest's gtk_shell1.
+        assert_eq!(
+            s.guest_received(),
+            [(
+                registry.id,
+                wl_registry::Event::Global {
+                    name: shell_name,
+                    interface: "gtk_shell1".to_string(),
+                    version: 1
+                }
+                .into()
+            )]
+        );
+        let (_, keyboard) = s.keyboard().await;
+        let wm_base = s.bind_paired("xdg_wm_base", xdg_wm_base::VERSION).await;
+        assert_eq!(s.host_received(), []);
+
+        let surface = s.surface().await;
+        let xdg_surface = s.new_id();
+        let host_xdg_surface = s
+            .create(xdg_wm_base::req::get_xdg_surface(
+                wm_base.id,
+                xdg_surface,
+                surface.id,
+            ))
+            .await;
+        let toplevel = s.new_id();
+        let host_toplevel = s
+            .create(xdg_surface::req::get_toplevel(xdg_surface, toplevel))
+            .await;
+        assert_eq!(s.host_received(), [], "no Aura toplevel");
+        assert_eq!(s.guest_received(), []);
+
+        s.guest([xdg_toplevel::req::set_app_id(toplevel, "org.example.App").unwrap()])
+            .await;
+        let native = "org.chromium.guest_os.termina.wayland.org.example.App".to_string();
+        let host = s.host_received();
+        let aura_surface = match &host[..] {
+            [_, (_, AnyRequest::ZauraShell(zaura_shell::Request::GetAuraSurface { id, .. })), _] => {
+                *id
+            }
+            _ => panic!("no Aura surface: {host:?}"),
+        };
+        assert_eq!(
+            host,
+            [
+                (
+                    host_toplevel,
+                    xdg_toplevel::Request::SetAppId {
+                        app_id: native.clone()
+                    }
+                    .into()
+                ),
+                (
+                    shell,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: aura_surface,
+                        surface: surface.host
+                    }
+                    .into()
+                ),
+                (
+                    aura_surface,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: Some(native)
+                    }
+                    .into()
+                ),
+            ]
+        );
+
+        s.host([
+            xdg_toplevel::evt::configure(host_toplevel, 800, 600, &[]).unwrap(),
+            xdg_surface::evt::configure(host_xdg_surface, 7),
+        ])
+        .await;
+        assert_eq!(
+            s.guest_received(),
+            [
+                (
+                    toplevel,
+                    xdg_toplevel::Event::Configure {
+                        width: 800,
+                        height: 600,
+                        states: Vec::new()
+                    }
+                    .into()
+                ),
+                (
+                    xdg_surface,
+                    xdg_surface::Event::Configure { serial: 7 }.into()
+                ),
+            ]
+        );
+
+        // The chord reaches the guest.
+        let alt = 1 << 3;
+        let q = 16;
+        s.host([
+            wl_keyboard::evt::enter(keyboard.host, 1, surface.host, &[]).unwrap(),
+            wl_keyboard::evt::modifiers(keyboard.host, 2, alt, 0, 0, 0),
+            wl_keyboard::evt::key(keyboard.host, 3, 3, q, wl_keyboard::KEY_STATE_PRESSED),
+            wl_keyboard::evt::key(keyboard.host, 4, 4, q, wl_keyboard::KEY_STATE_RELEASED),
+        ])
+        .await;
+        let key = |serial, state| {
+            let key = wl_keyboard::Event::Key {
+                serial,
+                time: serial,
+                key: q,
+                state,
+            };
+            (keyboard.id, key.into())
+        };
+        let modifiers = |serial, mods_depressed| {
+            let modifiers = wl_keyboard::Event::Modifiers {
+                serial,
+                mods_depressed,
+                mods_latched: 0,
+                mods_locked: 0,
+                group: 0,
+            };
+            (keyboard.id, modifiers.into())
+        };
+        let enter = wl_keyboard::Event::Enter {
+            serial: 1,
+            surface: surface.id,
+            keys: Vec::new(),
+        };
+        assert_eq!(
+            s.guest_received(),
+            [
+                (keyboard.id, enter.into()),
+                modifiers(1, 0),
+                modifiers(2, alt),
+                key(3, wl_keyboard::KEY_STATE_PRESSED),
+                key(4, wl_keyboard::KEY_STATE_RELEASED),
+            ]
+        );
+        assert_eq!(s.host_received(), []);
+
+        s.guest([
+            xdg_toplevel::req::destroy(toplevel),
+            xdg_surface::req::destroy(xdg_surface),
+            wl_surface::req::destroy(surface.id),
+        ])
+        .await;
+        assert_eq!(
+            s.host_received(),
+            [
+                (host_toplevel, xdg_toplevel::Request::Destroy {}.into()),
+                (host_xdg_surface, xdg_surface::Request::Destroy {}.into()),
+                (aura_surface, zaura_surface::Request::Release {}.into()),
+                (surface.host, wl_surface::Request::Destroy {}.into()),
+            ]
+        );
+        assert_eq!(s.guest_received(), []);
+    }
 }
