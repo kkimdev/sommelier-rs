@@ -18,12 +18,10 @@ limitations under the License.
 //! one, and mapping it for the copy.
 
 use super::dmabuf_layout::{validate_dmabuf_layout, DmabufLayout};
-use super::ShmHandler;
-use crate::state::Context;
+use super::formats::wl_shm_format_to_drm_format;
+use crate::state::{Context, HostMapping};
 use std::io;
-use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::ptr;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 /// A VirtWL dma-buf allocation for a guest SHM buffer.
 ///
@@ -36,10 +34,10 @@ pub(super) struct DmabufAllocation {
     pub(super) dmabuf_sync: bool,
 }
 
-pub(super) fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, usize)> {
+pub(super) fn map_dmabuf(fd: BorrowedFd<'_>, layout: DmabufLayout) -> Option<HostMapping> {
     let offset0 = layout.plane0().offset as usize;
     let span = layout.span();
-    if fd < 0 || span <= offset0 {
+    if span <= offset0 {
         return None;
     }
     // `mmap` takes a signed length and an `off_t` offset. Avoid lossy casts
@@ -64,7 +62,7 @@ pub(super) fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, us
     // expose anon-inode descriptors without a useful st_size, so only enforce
     // the check for regular files (including memfd objects).
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
         return None;
     }
     let file_type = (stat.st_mode as libc::mode_t) & libc::S_IFMT;
@@ -82,22 +80,7 @@ pub(super) fn map_dmabuf(fd: RawFd, layout: DmabufLayout) -> Option<(*mut u8, us
             return None;
         }
     }
-    let map_size = span - offset0;
-    let ptr = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            map_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            libc::off_t::try_from(offset0).ok()?,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        None
-    } else {
-        Some((ptr as *mut u8, map_size))
-    }
+    HostMapping::map_shared(fd, span - offset0, u64::try_from(offset0).ok()?).ok()
 }
 
 pub(super) fn allocate_virtwl_dmabuf(
@@ -116,7 +99,7 @@ pub(super) fn allocate_virtwl_dmabuf(
             "VirtWL dma-buf allocation is unavailable",
         ));
     };
-    let drm_format = ShmHandler::wl_shm_format_to_drm_format(format);
+    let drm_format = wl_shm_format_to_drm_format(format);
     let (fd, metadata) = channel.allocate_dmabuf(
         u32::try_from(width)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dma-buf width"))?,
@@ -137,11 +120,7 @@ pub(super) fn allocate_virtwl_dmabuf(
     // but return metadata that cannot be mmaped (for example a non-page-aligned
     // plane-0 offset); treat that as an allocation failure so the caller can
     // fall back to ordinary VirtWL shared memory.
-    if let Some((mapped_ptr, mapped_size)) = map_dmabuf(fd.as_raw_fd(), layout) {
-        unsafe {
-            libc::munmap(mapped_ptr as *mut libc::c_void, mapped_size);
-        }
-    } else {
+    if map_dmabuf(fd.as_fd(), layout).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "VirtWL dma-buf cannot be mapped",
@@ -159,7 +138,7 @@ pub(super) fn allocate_virtwl_dmabuf(
 mod tests {
     use super::{map_dmabuf, validate_dmabuf_layout};
     use crate::test_support::shm_pool_file;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
 
     #[test]
     fn rejects_unaligned_dmabuf_mappings() {
@@ -168,7 +147,7 @@ mod tests {
         // reachable here.
         let layout = validate_dmabuf_layout(0x3432_5258, 1, 1, [4, 0, 0], [1, 0, 0])
             .expect("a valid but unaligned single-plane layout");
-        assert!(map_dmabuf(0, layout).is_none());
+        assert!(map_dmabuf(shm_pool_file(&[0; 4096]).as_fd(), layout).is_none());
     }
 
     #[test]
@@ -176,7 +155,7 @@ mod tests {
         let fd = shm_pool_file(&[0; 4096]);
         assert!(
             map_dmabuf(
-                fd.as_raw_fd(),
+                fd.as_fd(),
                 validate_dmabuf_layout(0x3432_5258, 16, 128, [64, 0, 0], [0, 0, 0])
                     .expect("an 8192-byte single-plane layout")
             )

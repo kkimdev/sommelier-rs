@@ -18,7 +18,6 @@ limitations under the License.
 //! mandatory ones at once, each optional one once the host reports it),
 //! their DRM codes, and their bytes per pixel.
 
-use super::ShmHandler;
 use crate::protocols::wayland::wl_shm;
 use crate::state::Context;
 
@@ -167,13 +166,13 @@ pub(super) fn format_bytes_per_pixel(format: u32) -> Option<usize> {
     }
 }
 
-impl ShmHandler {
-    pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
-        match format {
-            wl_shm::FORMAT_ARGB8888 => 0x34325241, // DRM_FORMAT_ARGB8888
-            wl_shm::FORMAT_XRGB8888 => 0x34325258, // DRM_FORMAT_XRGB8888
-            _ => format,
-        }
+/// The DRM code of wl_shm `format`. Only the two mandatory formats differ;
+/// every other format has the same FourCC in both.
+pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
+    match format {
+        wl_shm::FORMAT_ARGB8888 => 0x34325241, // DRM_FORMAT_ARGB8888
+        wl_shm::FORMAT_XRGB8888 => 0x34325258, // DRM_FORMAT_XRGB8888
+        _ => format,
     }
 }
 

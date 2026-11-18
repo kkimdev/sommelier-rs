@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod aura_objects;
+pub mod buffer;
 pub mod callback;
 pub mod compositor;
 pub mod data_device;

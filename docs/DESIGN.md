@@ -199,7 +199,7 @@ encode wire bytes ad hoc.
 | Area | Handlers (`sommelier/src/handler/`) | State owners (`sommelier/src/state/`, `state.rs`) |
 | --- | --- | --- |
 | Display, registry, callbacks | `display.rs`, `registry.rs`, `callback.rs` | `ShadowTable`, `Context`, `InternalCallbacks` |
-| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`) |
+| Surfaces, viewports, xdg-shell, SHM | `compositor.rs` (including `set_app_id` and the XDG toplevels' Aura objects), `buffer.rs` (every guest `wl_buffer`'s lifetime), `shm.rs` and a submodule per concern ([Buffers](#buffers)) | `render.rs` (`SurfaceState`, `SurfaceMapping`, `RenderBufferRegistry`), `host_mapping.rs` (`HostMapping`) |
 | Dma-buf | `linux_dmabuf.rs` | `Context` dma-buf state, `allocator.rs` |
 | Keyboard and IME | `keyboard.rs`, `pointer.rs`, `touch.rs`, `text_input.rs`, `seat.rs` | `input.rs` (focus, key generations, text input) |
 | Clipboard | `data_device.rs` (including `pump`) | `ClipboardPumps` in `state.rs` |
@@ -401,10 +401,11 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   `pread` from the pool's file, so a client that shrinks the file after
   `create_pool` makes a read fail instead of raising SIGBUS in the proxy.
   Each guest `wl_buffer` gets host storage, chosen once by
-  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out exactly
-  like the guest buffer and imported by the host as a `wl_shm` pool, or,
-  with `--gpu-accel` and a kernel that supports VirtWL dma-buf allocation,
-  a host-backed PRIME dma-buf imported through the host's linux-dmabuf.
+  `select_shm_backing` (`shm/storage.rs`): VirtWL shared memory laid out
+  exactly like the guest buffer and imported by the host as a `wl_shm`
+  pool, or, with `--gpu-accel` and a kernel that supports VirtWL dma-buf
+  allocation, a host-backed PRIME dma-buf imported through the host's
+  linux-dmabuf.
   With `--local-compositor` and no VirtWL, the shared memory is a memfd,
   with or without `--gpu-accel` (see
   [Surfaces, damage and SHM](INVARIANTS.md#surfaces-damage-and-shm)).
@@ -415,7 +416,10 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   pixels (a short read) is the client's error and ends the session with
   `wl_shm.invalid_fd`; a host storage failure (mapping, dma-buf sync) drops
   the commit and forces a full copy next time. This is a copy, not
-  zero-copy.
+  zero-copy. The proxy's mapping of the host storage is a `HostMapping`,
+  which only the kernel writes, as `pread` fills a range of it: the
+  host may read that memory at any time, so the proxy never holds a Rust
+  reference to it.
 - Damage carries its coordinate space in its type: `BufferRect` for
   `damage_buffer` and the copy, `SurfaceRect` for `wl_surface.damage` and
   the host, which takes nothing else. `SurfaceMapping` (`render.rs`) is
@@ -425,6 +429,8 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
+  `handler/buffer.rs` handles every guest `wl_buffer`, SHM or dma-buf:
+  its destroy and release, and its deferred retirement.
 
 `handler/shm.rs` holds a submodule per concern, and re-exports what other
 handlers call:
@@ -432,12 +438,11 @@ handlers call:
 | Submodule (`handler/shm/`) | Concern |
 | --- | --- |
 | `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
-| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities |
+| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
 | `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
 | `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
 | `copy.rs` | The copy of damaged pixels from the pool into the host storage |
 | `damage.rs` | Damage rectangles: clipping to a buffer and merging |
-| `buffer_lifetime.rs` | Every guest `wl_buffer`'s destroy and release, and its deferred retirement |
 
 Guest dma-buf (`linux_dmabuf.rs`) is forwarded rather than copied. For
 classic virtio-gpu PRIME buffers, `allocator.rs` replaces the guest's

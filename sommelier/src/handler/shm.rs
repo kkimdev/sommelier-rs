@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Guest `wl_shm`, which the proxy implements itself, and the lifetime of
-//! every guest `wl_buffer`; see "Buffers" in `docs/DESIGN.md`. Each concern
-//! is a submodule.
+//! Guest `wl_shm`, which the proxy implements itself; see "Buffers" in
+//! `docs/DESIGN.md`. Each concern is a submodule.
 
-mod buffer_lifetime;
 mod copy;
 mod damage;
 mod dmabuf;
@@ -27,9 +25,6 @@ mod formats;
 mod pool;
 mod storage;
 
-pub(crate) use self::buffer_lifetime::{
-    clear_buffer_uses_after_surface_destroy, queue_host_buffer_destroy, retire_eligible_buffers,
-};
 pub(crate) use self::copy::{copy_shm_damage, ShmCopyError, ShmCopyLayout};
 pub(crate) use self::damage::{coalesce_damage_rects, damage_reaches_buffer};
 pub(crate) use self::formats::{
@@ -39,18 +34,3 @@ pub(crate) use self::formats::{
 pub(crate) use self::pool::{forget_pool, forget_shm, retire_guest_shms};
 
 pub struct ShmHandler;
-
-/// Test helpers that the submodules' tests share.
-#[cfg(test)]
-mod tests {
-    use crate::protocols::wayland::wl_shm;
-    use crate::proxy::harness::Session;
-
-    /// A session whose guest has bound `wl_shm`, which the proxy
-    /// implements.
-    pub(super) async fn session_with_shm() -> (Session, u32) {
-        let mut s = Session::new();
-        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
-        (s, shm)
-    }
-}
