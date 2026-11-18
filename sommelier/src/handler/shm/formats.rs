@@ -21,9 +21,12 @@ limitations under the License.
 use crate::protocols::wayland::wl_shm;
 use crate::state::Context;
 
-/// Formats advertised by ChromiumOS Sommelier's wl_shm shim. Every format
-/// after ARGB/XRGB has the same FourCC value in wl_shm and DRM, so the
-/// linux-dmabuf shim uses them as DRM formats too.
+/// The one list of pixel formats the proxy converts and advertises: the
+/// guest's `wl_shm` offers them, and the guest's linux-dmabuf shim passes
+/// only their DRM codes (`is_supported_drm_format`). It is the same set in
+/// two numberings: wl_shm and DRM share a value for every format except
+/// ARGB8888 and XRGB8888, which `wl_shm_format_to_drm_format` maps. The
+/// set follows ChromiumOS Sommelier's `sl_drm_format_is_supported()`.
 const SUPPORTED_SHM_FORMATS: [u32; 6] = [
     wl_shm::FORMAT_ARGB8888,
     wl_shm::FORMAT_XRGB8888,
@@ -39,16 +42,16 @@ pub(super) fn supported_shm_format(format: u32) -> bool {
     SUPPORTED_SHM_FORMATS.contains(&format)
 }
 
+/// The wl_shm format whose DRM code is `format`, if it is a supported one.
 fn shm_format_from_drm(format: u32) -> Option<u32> {
-    match format {
-        // DRM_FORMAT_ARGB8888/XRGB8888 use FourCC values while wl_shm uses
-        // the enum values 0/1 for the same layouts.
-        0x3432_5241 => Some(wl_shm::FORMAT_ARGB8888),
-        0x3432_5258 => Some(wl_shm::FORMAT_XRGB8888),
-        wl_shm::FORMAT_NV12 => Some(wl_shm::FORMAT_NV12),
-        format if supported_shm_format(format) => Some(format),
-        _ => None,
-    }
+    SUPPORTED_SHM_FORMATS
+        .into_iter()
+        .find(|shm| wl_shm_format_to_drm_format(*shm) == format)
+}
+
+/// Whether DRM code `format` is one of the supported formats.
+pub(crate) fn is_supported_drm_format(format: u32) -> bool {
+    shm_format_from_drm(format).is_some()
 }
 
 pub(super) fn guest_shm_format_available(ctx: &Context, format: u32) -> bool {
@@ -180,7 +183,9 @@ pub(super) fn wl_shm_format_to_drm_format(format: u32) -> u32 {
 mod tests {
     use super::{
         clear_host_shm_dmabuf_formats, clear_host_shm_wl_formats, guest_shm_format_available,
-        record_host_shm_drm_format, record_host_shm_wl_format, register_guest_shm,
+        is_supported_drm_format, record_host_shm_drm_format, record_host_shm_wl_format,
+        register_guest_shm, shm_format_from_drm, wl_shm_format_to_drm_format,
+        SUPPORTED_SHM_FORMATS,
     };
     use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
     use crate::protocols::wayland::{wl_registry, wl_shm};
@@ -189,6 +194,33 @@ mod tests {
     use crate::state::Context;
     use crate::test_support::decoded;
     use crate::wire::Action;
+
+    /// The linux-dmabuf shim and the wl_shm shim advertise one set of
+    /// formats, numbered two ways: `SUPPORTED_SHM_FORMATS` by wl_shm value,
+    /// the shim's list by DRM FourCC.
+    #[test]
+    fn the_shm_and_drm_format_lists_are_one_set() {
+        let drm = |format: u32| {
+            SUPPORTED_SHM_FORMATS
+                .map(wl_shm_format_to_drm_format)
+                .contains(&format)
+        };
+        for shm in SUPPORTED_SHM_FORMATS {
+            let drm = wl_shm_format_to_drm_format(shm);
+            assert_eq!(shm_format_from_drm(drm), Some(shm), "{shm:#x}");
+            assert!(is_supported_drm_format(drm), "{drm:#x}");
+        }
+        // The wl_shm enum values 0 and 1 are not DRM codes.
+        for not_drm in [
+            wl_shm::FORMAT_ARGB8888,
+            wl_shm::FORMAT_XRGB8888,
+            0xdead_beef,
+        ] {
+            assert!(!drm(not_drm));
+            assert_eq!(shm_format_from_drm(not_drm), None, "{not_drm:#x}");
+            assert!(!is_supported_drm_format(not_drm), "{not_drm:#x}");
+        }
+    }
 
     #[test]
     fn synthetic_shm_advertises_mandatory_formats_until_host_capabilities_arrive() {

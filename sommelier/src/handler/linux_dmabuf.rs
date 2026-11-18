@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::handler::shm::record_host_shm_drm_format;
+use crate::handler::shm::{is_supported_drm_format, record_host_shm_drm_format};
 use crate::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_feedback_v1;
 use crate::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1;
@@ -43,22 +43,6 @@ const MAX_FEEDBACK_FORMATS: usize = u16::MAX as usize + 1;
 const MAX_TRANCHE_INDICES_PER_EVENT: usize = (MessageHeader::MAX_LEN - MessageHeader::LEN - 4) / 2;
 
 pub struct LinuxDmabufHandler;
-
-fn is_supported_drm_format(format: u32) -> bool {
-    // Keep this list in sync with ChromiumOS
-    // `sl_drm_format_is_supported()`. These are the formats for which the
-    // proxy can safely import/copy a single-plane buffer (plus NV12 for the
-    // host feedback protocol).
-    matches!(
-        format,
-        wl_shm::FORMAT_NV12 // DRM_FORMAT_NV12
-            | 0x3631_4752 // DRM_FORMAT_RGB565
-            | 0x3432_5258 // DRM_FORMAT_XRGB8888
-            | 0x3432_5241 // DRM_FORMAT_ARGB8888
-            | 0x3432_4258 // DRM_FORMAT_XBGR8888
-            | 0x3432_4241 // DRM_FORMAT_ABGR8888
-    )
-}
 
 fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
     let allocator = ctx.allocator.as_ref().ok_or_else(|| {

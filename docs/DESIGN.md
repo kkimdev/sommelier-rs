@@ -438,7 +438,7 @@ handlers call:
 | Submodule (`handler/shm/`) | Concern |
 | --- | --- |
 | `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
-| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
+| `formats.rs` | The one list of supported formats (`SUPPORTED_SHM_FORMATS`, also the source of the linux-dmabuf shim's DRM list); the ones the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
 | `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
 | `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
 | `copy.rs` | The copy of damaged pixels from the pool into the host storage |
