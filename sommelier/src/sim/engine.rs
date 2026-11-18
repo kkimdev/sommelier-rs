@@ -17,19 +17,36 @@ limitations under the License.
 //! The input method engine behind Exo, which answers each key after a
 //! while.
 //!
-//! Chrome hands each key to the engine and acts on the answer when it
-//! arrives (`ProcessKeyEventDone`). The engine works through what Exo
-//! hands it in order, one key at a time: it answers a key from its
-//! composition as it stands when it reaches the key, and the answer
-//! arrives after a service time drawn from the case's [`Lag`]. A reset
-//! takes effect when the engine reaches it, so it cancels no key handed
-//! over before it: that key's answer, made from the old composition,
-//! arrives after Exo has handled the reset. Chrome's `CancelComposition`
-//! behaves the same (INVARIANTS, "A pointer press ends the composition on
-//! its surface"), and the simulation must show the proxy coping with it.
+//! `InputMethodAsh` (`ui/base/ime/ash/input_method_ash.cc`, IMA below)
+//! hands each key event, press or release, to the engine and gets its
+//! answer in two parts: first the text the key made (`CommitText`,
+//! `UpdateCompositionText`), which IMA buffers while the key is in flight,
+//! then the callback (`ProcessKeyEventDone`), which says whether the engine
+//! handled the key and sends the buffered text on with it. The engine works
+//! through what it is handed in order, one key at a time: it answers a key
+//! from its composition as it stands when it reaches the key, sends the
+//! text after a service time drawn from the case's [`Lag`], and the
+//! callback a drawn gap later.
 //!
-//! In Korean mode the engine composes with [`Composer`]; in Latin mode it
-//! passes every key to the application.
+//! IMA's reset (`ResetContext`) can fall anywhere in that, with one of
+//! three outcomes for a key in flight:
+//! - before the key's text: the text arrives after the reset, made from the
+//!   composition before it, and goes out with the callback, late (the
+//!   window INVARIANTS "A pointer press ends the composition on its
+//!   surface" says the press fence cannot close);
+//! - between the text and the callback: the reset clears the buffer, and
+//!   the key goes out handled, with no text;
+//! - after the callback: the reset cancels what the key left.
+//!
+//! IMA resets the engine itself ([`EngineIn::Reset`]) only if it was
+//! composing (`ResetContext`), and the engine reaches that reset after
+//! every key handed over before it.
+//!
+//! In Korean mode the engine composes with [`Composer`], except that Space
+//! ending a composition is part of the commit and handled, as the ChromeOS
+//! Korean engine does in the host trace that the proxy's test
+//! `held_space_repeats_after_ime_commit_until_physical_release` records. In
+//! Latin mode it handles no key, and it handles no release in either.
 
 use super::clock::Micros;
 use super::hangul::{Composer, Key, Output};
@@ -39,22 +56,19 @@ use std::collections::VecDeque;
 /// What Exo hands the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EngineIn {
-    /// A key press, with the ID its answer carries.
-    Key { key: Key, id: u64 },
-    /// Drop the composition. Exo sends it for a `reset` and for a detach,
-    /// whose confirmation Exo makes itself from the composition it tracks.
+    /// A key's press or release, with the ID its answer carries.
+    Key { key: Key, pressed: bool, id: u64 },
+    /// Drop the composition (`Engine::Reset`).
     Reset,
 }
 
-/// The engine's answer to a key.
+/// A part of the engine's answer to a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct EngineOut {
-    pub id: u64,
-    /// The edits the key made, in order.
-    pub actions: Vec<TextAction>,
-    /// Whether the engine used the key; a key it did not use reaches the
-    /// application after the edits.
-    pub consumed: bool,
+pub(super) enum EngineOut {
+    /// The text key `id` made, in order; never empty.
+    Text { id: u64, actions: Vec<TextAction> },
+    /// The callback: whether the engine handled key `id`.
+    Done { id: u64, handled: bool },
 }
 
 /// An edit of the engine's.
@@ -71,7 +85,7 @@ pub(super) enum TextAction {
 pub(super) enum Mode {
     /// The Korean two-set input method.
     Korean,
-    /// An input method that passes every key, as for English.
+    /// An input method that handles no key, as for English.
     Latin,
 }
 
@@ -103,6 +117,22 @@ impl Lag {
     }
 }
 
+/// The gap between a key's text and its callback, which travel the same
+/// mojo pipe: up to 1 ms.
+fn gap(choices: &mut impl Choose) -> Micros {
+    Micros(choices.between(0, 1_000))
+}
+
+/// The key in service.
+struct InService {
+    /// When its next part is ready.
+    at: Micros,
+    id: u64,
+    /// Its text, until sent.
+    text: Vec<TextAction>,
+    handled: bool,
+}
+
 /// The engine, with what Exo handed it that it has not answered yet.
 pub(super) struct Engine {
     mode: Mode,
@@ -110,8 +140,7 @@ pub(super) struct Engine {
     composer: Composer,
     /// What the engine has not reached yet, in order.
     queue: VecDeque<EngineIn>,
-    /// The key in service: when its answer is ready, and the answer.
-    busy: Option<(Micros, EngineOut)>,
+    busy: Option<InService>,
 }
 
 impl Engine {
@@ -131,18 +160,28 @@ impl Engine {
         self.serve(now, choices);
     }
 
-    /// When the answer to the key in service is ready; `None` while the
-    /// engine has nothing to do.
+    /// When the next part of the answer to the key in service is ready;
+    /// `None` while the engine has nothing to do.
     pub fn ready_at(&self) -> Option<Micros> {
-        self.busy.as_ref().map(|&(at, _)| at)
+        self.busy.as_ref().map(|key| key.at)
     }
 
-    /// The answer to the key in service, at [`Engine::ready_at`]. The
-    /// engine then starts on what follows.
+    /// The next part of the answer to the key in service, at
+    /// [`Engine::ready_at`]: its text if it made any, then its callback,
+    /// after which the engine starts on what follows.
     pub fn take(&mut self, choices: &mut impl Choose) -> EngineOut {
-        let (at, out) = self.busy.take().expect("a key in service");
-        self.serve(at, choices);
-        out
+        let mut key = self.busy.take().expect("a key in service");
+        if !key.text.is_empty() {
+            let (id, actions) = (key.id, std::mem::take(&mut key.text));
+            key.at = key.at + gap(choices);
+            self.busy = Some(key);
+            return EngineOut::Text { id, actions };
+        }
+        self.serve(key.at, choices);
+        EngineOut::Done {
+            id: key.id,
+            handled: key.handled,
+        }
     }
 
     /// Works through the queue from `now` until a key is in service.
@@ -151,30 +190,37 @@ impl Engine {
             match self.queue.pop_front() {
                 None => return,
                 Some(EngineIn::Reset) => self.composer.reset(),
-                Some(EngineIn::Key { key, id }) => {
-                    let out = self.answer(key, id);
-                    self.busy = Some((now + self.lag.service(choices), out));
+                Some(EngineIn::Key { key, pressed, id }) => {
+                    let (text, handled) = self.answer(key, pressed);
+                    let at = now + self.lag.service(choices);
+                    self.busy = Some(InService {
+                        at,
+                        id,
+                        text,
+                        handled,
+                    });
                 }
             }
         }
     }
 
-    /// The answer to `key`: a commit if it finished text, then the
-    /// composition if it differs from the one shown, which a commit ends.
-    fn answer(&mut self, key: Key, id: u64) -> EngineOut {
-        if self.mode == Mode::Latin {
-            return EngineOut {
-                id,
-                actions: Vec::new(),
-                consumed: false,
-            };
+    /// The answer to a key: a commit if it finished text, then the
+    /// composition if it differs from the one shown, which a commit ends;
+    /// and whether the engine handled the key.
+    fn answer(&mut self, key: Key, pressed: bool) -> (Vec<TextAction>, bool) {
+        if !pressed || self.mode == Mode::Latin {
+            return (Vec::new(), false);
         }
         let shown = self.composer.preedit();
         let Output {
-            commit,
+            mut commit,
             preedit,
-            consumed,
+            mut consumed,
         } = self.composer.key(key);
+        if key == Key::Char(' ') && !commit.is_empty() {
+            commit.push(' ');
+            consumed = true;
+        }
         let mut actions = Vec::new();
         let shown = if commit.is_empty() {
             shown
@@ -185,11 +231,7 @@ impl Engine {
         if preedit != shown {
             actions.push(TextAction::Preedit(preedit));
         }
-        EngineOut {
-            id,
-            actions,
-            consumed,
-        }
+        (actions, consumed)
     }
 }
 
@@ -199,17 +241,36 @@ mod tests {
     use crate::sim::hangul::keys;
 
     /// The answers of an engine in `mode`, with no lag, to `script` (see
-    /// [`keys`]), each with its key's position as its ID.
+    /// [`keys`]): each press's text and whether the engine handled it.
     fn answers(mode: Mode, script: &str) -> Vec<(Vec<TextAction>, bool)> {
         let mut engine = Engine::new(mode, Lag::Fast);
         let mut answers = Vec::new();
         for (id, key) in (0..).zip(keys(script)) {
-            engine.send(Micros(0), EngineIn::Key { key, id }, &mut |_| 0);
-            let out = engine.take(&mut |_| 0);
-            assert_eq!(out.id, id);
-            answers.push((out.actions, out.consumed));
+            engine.send(Micros(0), press(key, id), &mut |_| 0);
+            let mut text = Vec::new();
+            loop {
+                match engine.take(&mut |_| 0) {
+                    EngineOut::Text { id: of, actions } => {
+                        assert_eq!(of, id);
+                        text = actions;
+                    }
+                    EngineOut::Done { id: of, handled } => {
+                        assert_eq!(of, id);
+                        answers.push((text, handled));
+                        break;
+                    }
+                }
+            }
         }
         answers
+    }
+
+    fn press(key: Key, id: u64) -> EngineIn {
+        EngineIn::Key {
+            key,
+            pressed: true,
+            id,
+        }
     }
 
     fn preedit(text: &str) -> TextAction {
@@ -223,7 +284,7 @@ mod tests {
     #[test]
     fn korean_mode_composes_and_sends_only_what_changed() {
         assert_eq!(
-            answers(Mode::Korean, "rkrk⌫⌫ "),
+            answers(Mode::Korean, "rkrk⌫⌫⌫"),
             [
                 (vec![preedit("ㄱ")], true),
                 (vec![preedit("가")], true),
@@ -236,22 +297,42 @@ mod tests {
                 (vec![], false),
             ]
         );
-        assert_eq!(
-            answers(Mode::Korean, "rk "),
-            [
-                (vec![preedit("ㄱ")], true),
-                (vec![preedit("가")], true),
-                (vec![commit("가")], false),
-            ]
-        );
     }
 
     #[test]
-    fn latin_mode_passes_every_key() {
+    fn space_ending_a_composition_is_committed_with_it() {
+        assert_eq!(
+            answers(Mode::Korean, "rk  ⏎"),
+            [
+                (vec![preedit("ㄱ")], true),
+                (vec![preedit("가")], true),
+                (vec![commit("가 ")], true),
+                // With nothing composed, Space and Enter go to the client.
+                (vec![], false),
+                (vec![], false),
+            ]
+        );
+        assert_eq!(answers(Mode::Korean, "r⏎")[1], (vec![commit("ㄱ")], false));
+    }
+
+    #[test]
+    fn latin_mode_and_every_release_are_unhandled() {
         assert_eq!(
             answers(Mode::Latin, "rk"),
             [(vec![], false), (vec![], false)]
         );
+        let mut engine = Engine::new(Mode::Korean, Lag::Fast);
+        let release = EngineIn::Key {
+            key: Key::Char('r'),
+            pressed: false,
+            id: 0,
+        };
+        engine.send(Micros(0), release, &mut |_| 0);
+        let done = EngineOut::Done {
+            id: 0,
+            handled: false,
+        };
+        assert_eq!(engine.take(&mut |_| 0), done);
     }
 
     #[test]
@@ -274,18 +355,30 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_answers_one_key_at_a_time_in_order() {
+    fn the_text_comes_after_the_service_time_and_the_callback_a_gap_later() {
         let mut engine = Engine::new(Mode::Korean, Lag::Normal);
-        let mut choices = |_| 0;
+        // Every service time and gap at its largest.
+        let mut choices = |n: u32| n - 1;
         for (id, key) in (0..).zip(keys("rk")) {
-            engine.send(Micros(0), EngineIn::Key { key, id }, &mut choices);
+            engine.send(Micros(0), press(key, id), &mut choices);
         }
-        assert_eq!(engine.ready_at(), Some(Micros(2_000)));
-        assert_eq!(engine.take(&mut choices).id, 0);
-        // The second key waited for the first.
-        assert_eq!(engine.ready_at(), Some(Micros(4_000)));
-        assert_eq!(engine.take(&mut choices).id, 1);
-        assert_eq!(engine.ready_at(), None);
+        let mut parts = Vec::new();
+        while let Some(at) = engine.ready_at() {
+            parts.push((at, engine.take(&mut choices)));
+        }
+        let text = |id, text: &str| EngineOut::Text {
+            id,
+            actions: vec![preedit(text)],
+        };
+        let done = |id| EngineOut::Done { id, handled: true };
+        // The second key waits for the first's callback.
+        let expected = [
+            (Micros(15_000), text(0, "ㄱ")),
+            (Micros(16_000), done(0)),
+            (Micros(31_000), text(1, "가")),
+            (Micros(32_000), done(1)),
+        ];
+        assert_eq!(parts, expected);
     }
 
     #[test]
@@ -293,21 +386,18 @@ mod tests {
         let mut engine = Engine::new(Mode::Korean, Lag::Fast);
         let mut choices = |_| 0;
         for (id, key) in (0..).zip(keys("rk")) {
-            engine.send(Micros(0), EngineIn::Key { key, id }, &mut choices);
+            engine.send(Micros(0), press(key, id), &mut choices);
         }
         engine.send(Micros(1), EngineIn::Reset, &mut choices);
-        engine.send(
-            Micros(2),
-            EngineIn::Key {
-                key: Key::Char('k'),
-                id: 2,
-            },
-            &mut choices,
-        );
-        let mut take = || engine.take(&mut choices).actions;
-        assert_eq!(take(), [preedit("ㄱ")]);
-        // Made from the composition before the reset, and late.
-        assert_eq!(take(), [preedit("가")]);
-        assert_eq!(take(), [preedit("ㅏ")]);
+        engine.send(Micros(2), press(Key::Char('k'), 2), &mut choices);
+        let mut texts = Vec::new();
+        while engine.ready_at().is_some() {
+            if let EngineOut::Text { actions, .. } = engine.take(&mut choices) {
+                texts.push(actions);
+            }
+        }
+        // The second is made from the composition before the reset.
+        let expected = [[preedit("ㄱ")], [preedit("가")], [preedit("ㅏ")]];
+        assert_eq!(texts, expected);
     }
 }
