@@ -320,7 +320,7 @@ mod tests {
         let mut ctx = Context::new_for_test(false, false, vec![]);
         ctx.bind_aura_shell_for_test(100);
         let host = ctx.shadow_table.create_paired(SURFACE, "wl_surface", 1, 1);
-        ctx.surface_mut(SURFACE);
+        ctx.create_surface(SURFACE);
         let aura_surface =
             crate::handler::aura_objects::ensure_host_zaura_surface(&mut ctx, SURFACE)
                 .expect("an Aura surface");

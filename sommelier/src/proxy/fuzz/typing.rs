@@ -314,7 +314,7 @@ impl V3Field {
         use zcr_extended_text_input_v1 as extended;
         let (hint, purpose) = self.content_type;
         let (v1_hint, v1_purpose, input_type, input_mode, flags, learning_mode) =
-            crate::handler::text_input::map_v3_content_type(hint, purpose);
+            crate::ime::map_v3_content_type(hint, purpose);
         let content_type = if extension_version >= extended::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE {
             exo::ContentType {
                 input_type,

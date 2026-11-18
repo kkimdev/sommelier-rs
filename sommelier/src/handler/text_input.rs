@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 use crate::handler::callback::queue_internal_sync;
+use crate::ime::{
+    content_type_requests, delete_lengths, lengths_around_cursor, resolve_preedit_cursor,
+    takes_surrounding_text_support,
+};
 use crate::protocols::text_input_extension_unstable_v1::zcr_extended_text_input_v1;
 use crate::protocols::text_input_extension_unstable_v1::zcr_text_input_extension_v1;
 use crate::protocols::text_input_unstable_v1::zwp_text_input_manager_v1;
@@ -73,86 +77,6 @@ fn active_guest_for_host_text_input(ctx: &Context, host_id: u32) -> Option<u32> 
         .map(|_| guest_id)
 }
 
-/// The `cursor_begin` and `cursor_end` of preedit `text`, from the
-/// host's pending preedit `selection` or `cursor`, or at its end. An empty
-/// preedit always gets `(0, 0)`, never the hidden cursor `(-1, -1)`
-/// (docs/INVARIANTS.md, "A v3 transaction's events go in one order").
-fn resolve_preedit_cursor(
-    text: &str,
-    selection: Option<(u32, u32)>,
-    cursor: Option<i32>,
-) -> (i32, i32) {
-    if text.is_empty() {
-        return (0, 0);
-    }
-    if let Some((index, length)) = selection {
-        let end = index.saturating_add(length);
-        if end <= text.len() as u32
-            && text.is_char_boundary(index as usize)
-            && text.is_char_boundary(end as usize)
-        {
-            return (index as i32, end as i32);
-        }
-        log::warn!(
-            "Ignoring invalid preedit selection: index={}, length={}, text_len={}",
-            index,
-            length,
-            text.len()
-        );
-    } else if let Some(cursor) = cursor {
-        if cursor < 0 {
-            return (-1, -1);
-        }
-        if (cursor as usize) <= text.len() && text.is_char_boundary(cursor as usize) {
-            return (cursor, cursor);
-        }
-        log::warn!(
-            "Ignoring invalid preedit cursor: cursor={}, text_len={}",
-            cursor,
-            text.len()
-        );
-    }
-
-    let end = text.len() as i32;
-    (end, end)
-}
-
-/// Split the `length` bytes of `text` from byte `start` into the
-/// text-input-v3 lengths before and after `cursor`, the only form in which
-/// v3 can delete them.
-///
-/// # Returns
-///
-/// `None` if the range does not contain the cursor or does not lie on
-/// character boundaries of `text`.
-fn lengths_around_cursor(text: &str, cursor: i32, start: i64, length: u32) -> Option<(u32, u32)> {
-    let start = usize::try_from(start).ok()?;
-    let end = start.checked_add(usize::try_from(length).ok()?)?;
-    let cursor = usize::try_from(cursor).ok()?;
-    if !(start <= cursor && cursor <= end) || text.get(start..end).is_none() {
-        return None;
-    }
-    // Both lengths are at most `length`.
-    Some(((cursor - start) as u32, (end - cursor) as u32))
-}
-
-/// The text-input-v3 lengths of a v1 `delete_surrounding_text(index,
-/// length)` in `text` around `cursor`. A negative `index` can only mean the
-/// v1 XML's reading, relative to the cursor; Exo sends it non-negative,
-/// counted from the start of the text (docs/INVARIANTS.md, "Exo's deletes
-/// are absolute and stand alone").
-///
-/// # Returns
-///
-/// `None` as [`lengths_around_cursor`] does.
-fn delete_lengths(text: &str, cursor: i32, index: i32, length: u32) -> Option<(u32, u32)> {
-    let start = match index {
-        ..0 => i64::from(cursor) + i64::from(index),
-        _ => i64::from(index),
-    };
-    lengths_around_cursor(text, cursor, start, length)
-}
-
 fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
     static KEYCODES: std::sync::OnceLock<std::collections::BTreeMap<u32, u32>> =
         std::sync::OnceLock::new();
@@ -202,12 +126,6 @@ fn keysym_to_evdev_keycode(sym: u32) -> Option<u32> {
         })
         .get(&sym)
         .copied()
-}
-
-fn extension_version_allows(version: u32, required: u32) -> bool {
-    // The unknown version of a test fixture is the largest, so it allows
-    // every request.
-    version >= required
 }
 
 /// Return whether the repeat fallback belongs to this physical host
@@ -501,103 +419,6 @@ fn synthesize_ime_consumed_key_pair(ctx: &mut Context, held: HeldRepeatKey) -> b
         ));
     }
     true
-}
-
-/// Map a v3 content type to the host's v1 `(hint, purpose)` and the
-/// extension's `(input_type, input_mode, input_flags, learning_mode)`.
-pub(crate) fn map_v3_content_type(hint: u32, purpose: u32) -> (u32, u32, u32, u32, u32, u32) {
-    use zcr_extended_text_input_v1 as ext;
-    use zwp_text_input_v1 as v1;
-    use zwp_text_input_v3 as v3;
-
-    // zwp_text_input_v1 has no PIN purpose and its values after PASSWORD are
-    // shifted by one compared with v3.
-    let mut v1_hint = hint;
-    let v1_purpose = match purpose {
-        v3::CONTENT_PURPOSE_NORMAL..=v3::CONTENT_PURPOSE_PASSWORD => purpose,
-        v3::CONTENT_PURPOSE_PIN => {
-            v1_hint |= v1::CONTENT_HINT_SENSITIVE_DATA;
-            v1::CONTENT_PURPOSE_DIGITS
-        }
-        v3::CONTENT_PURPOSE_DATE => v1::CONTENT_PURPOSE_DATE,
-        v3::CONTENT_PURPOSE_TIME => v1::CONTENT_PURPOSE_TIME,
-        v3::CONTENT_PURPOSE_DATETIME => v1::CONTENT_PURPOSE_DATETIME,
-        v3::CONTENT_PURPOSE_TERMINAL => v1::CONTENT_PURPOSE_TERMINAL,
-        _ => v1::CONTENT_PURPOSE_NORMAL, // Unknown values degrade to NORMAL.
-    };
-
-    // Chrome's extension uses TextInputType/TextInputMode enums rather than
-    // Wayland's content-purpose enum.
-    let multiline = hint & v3::CONTENT_HINT_MULTILINE != 0;
-    let input_type = match (purpose, multiline) {
-        (
-            v3::CONTENT_PURPOSE_NORMAL | v3::CONTENT_PURPOSE_ALPHA | v3::CONTENT_PURPOSE_NAME,
-            true,
-        ) => ext::INPUT_TYPE_TEXT_AREA,
-        (v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_NUMBER | v3::CONTENT_PURPOSE_PIN, _) => {
-            ext::INPUT_TYPE_NUMBER
-        }
-        (v3::CONTENT_PURPOSE_PHONE, _) => ext::INPUT_TYPE_TELEPHONE,
-        (v3::CONTENT_PURPOSE_URL, _) => ext::INPUT_TYPE_URL,
-        (v3::CONTENT_PURPOSE_EMAIL, _) => ext::INPUT_TYPE_EMAIL,
-        (v3::CONTENT_PURPOSE_PASSWORD, _) => ext::INPUT_TYPE_PASSWORD,
-        (v3::CONTENT_PURPOSE_DATE, _) => ext::INPUT_TYPE_DATE,
-        (v3::CONTENT_PURPOSE_TIME, _) => ext::INPUT_TYPE_TIME,
-        (v3::CONTENT_PURPOSE_DATETIME, _) => ext::INPUT_TYPE_DATE_TIME,
-        _ => ext::INPUT_TYPE_TEXT,
-    };
-    let input_mode = match purpose {
-        v3::CONTENT_PURPOSE_DIGITS | v3::CONTENT_PURPOSE_PIN => ext::INPUT_MODE_NUMERIC,
-        v3::CONTENT_PURPOSE_NUMBER => ext::INPUT_MODE_DECIMAL,
-        v3::CONTENT_PURPOSE_PHONE => ext::INPUT_MODE_TEL,
-        v3::CONTENT_PURPOSE_URL => ext::INPUT_MODE_URL,
-        v3::CONTENT_PURPOSE_EMAIL => ext::INPUT_MODE_EMAIL,
-        _ => ext::INPUT_MODE_DEFAULT,
-    };
-
-    let mut input_flags = ext::INPUT_FLAGS_NONE;
-    if hint & v3::CONTENT_HINT_COMPLETION != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCOMPLETE_ON;
-    }
-    if hint & v3::CONTENT_HINT_SPELLCHECK != 0 {
-        // text-input-v3 calls bit 1 `spellcheck`. Chrome's extension keeps
-        // spellchecking distinct from its separate autocorrect flag.
-        input_flags |= ext::INPUT_FLAGS_SPELLCHECK_ON;
-    }
-    if hint & v3::CONTENT_HINT_AUTO_CAPITALIZATION != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_SENTENCES;
-    }
-    if hint & v3::CONTENT_HINT_LOWERCASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_NONE;
-    }
-    if hint & v3::CONTENT_HINT_UPPERCASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_CHARACTERS;
-    }
-    if hint & v3::CONTENT_HINT_TITLECASE != 0 {
-        input_flags |= ext::INPUT_FLAGS_AUTOCAPITALIZE_WORDS;
-    }
-    let secret = hint & (v3::CONTENT_HINT_HIDDEN_TEXT | v3::CONTENT_HINT_SENSITIVE_DATA) != 0
-        || matches!(
-            purpose,
-            v3::CONTENT_PURPOSE_PASSWORD | v3::CONTENT_PURPOSE_PIN
-        );
-    if secret {
-        input_flags |= ext::INPUT_FLAGS_HAS_BEEN_PASSWORD;
-    }
-
-    let learning_mode = if secret {
-        ext::LEARNING_MODE_DISABLED
-    } else {
-        ext::LEARNING_MODE_ENABLED
-    };
-    (
-        v1_hint,
-        v1_purpose,
-        input_type,
-        input_mode,
-        input_flags,
-        learning_mode,
-    )
 }
 
 /// Drop a host event that would set the preedit of active text input
@@ -1184,21 +1005,40 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
         // goes last; an empty region deletes nothing and clears only a
         // shown preedit (docs/INVARIANTS.md, "A v3 transaction's events go
         // in one order").
-        // The region's preedit is the text it deletes.
+        // The region's preedit is the text it takes.
         let empty = preedit_text.is_empty();
         debug_assert_eq!(empty, (before_length, after_length) == (0, 0));
+        // The guest no longer has the bytes earlier regions took, if it has
+        // not reported its text since: they are not deleted again. A region
+        // that does not cover them would leave them lost or shown twice, so
+        // it is dropped.
+        let deleted = match plan.unreported_taken {
+            None => (before_length, after_length),
+            Some((shown_before, shown_after)) => match (
+                before_length.checked_sub(shown_before),
+                after_length.checked_sub(shown_after),
+            ) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    log::debug!(
+                        "Ignoring a preedit region of text input {guest_id} that does not \
+                         cover the region it shows"
+                    );
+                    return drop_host_preedit(ctx, guest_id);
+                }
+            },
+        };
+        let deletes = deleted != (0, 0);
         let mut transaction = Vec::new();
         if plan.had_preedit
-            && !empty
+            && deletes
             && !push_preedit_string_to(&mut transaction, guest_id, "", 0, 0)
         {
             return drop_host_preedit(ctx, guest_id);
         }
-        if !empty {
+        if deletes {
             transaction.push(zwp_text_input_v3::evt::delete_surrounding_text(
-                guest_id,
-                before_length,
-                after_length,
+                guest_id, deleted.0, deleted.1,
             ));
         }
         if (plan.had_preedit || !empty)
@@ -1219,7 +1059,8 @@ impl zcr_extended_text_input_v1::ZcrExtendedTextInputV1Handler for ExtendedTextI
             .get_mut(&guest_id)
             .expect("active text input disappeared while installing preedit region");
         let guest_seat = plan.guest_seat;
-        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end));
+        let region = (before_length, after_length);
+        state.finish_preedit_region(plan, preedit_text, (cursor_begin, cursor_end), region);
         end_backspace_repeat_for_text_input(ctx, guest_seat, guest_id);
         ctx.host_to_client_queue.extend(transaction);
 
@@ -1449,92 +1290,14 @@ impl zwp_text_input_manager_v3::ZwpTextInputManagerV3Handler for TextInputManage
     }
 }
 
-/// Whether the extension `host_ext_id` takes `set_surrounding_text_support`.
-fn host_takes_surrounding_text_support(ctx: &Context, host_ext_id: Option<u32>) -> bool {
-    host_ext_id.is_some_and(|host_ext_id| {
-        extension_version_allows(
-            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
-            zcr_extended_text_input_v1::REQ_SET_SURROUNDING_TEXT_SUPPORT_SINCE,
-        )
-    })
+/// The ID and version of the host extension `host_ext_id`, if any.
+fn host_ext(ctx: &Context, host_ext_id: Option<u32>) -> Option<(u32, u32)> {
+    host_ext_id.map(|id| (id, ctx.shadow_table.host_object_version_or_unknown(id)))
 }
 
-/// Push the host requests that set `content_type` on the text input
-/// `(host_v1_id, host_ext_id)`, with its surrounding-text support if it has
-/// one.
-fn push_content_type(
-    transaction: &mut Vec<Outgoing>,
-    ctx: &Context,
-    (host_v1_id, host_ext_id): (u32, Option<u32>),
-    content_type: HostContentType,
-) {
-    let (hint, purpose) = content_type.content_type;
-    let (v1_hint, v1_purpose, input_type, input_mode, input_flags, learning_mode) =
-        map_v3_content_type(hint, purpose);
-    let host_ext = host_ext_id.map(|host_ext_id| {
-        (
-            host_ext_id,
-            ctx.shadow_table.host_object_version_or_unknown(host_ext_id),
-        )
-    });
-    match host_ext {
-        // The extension XML says v8's set_input_type is "used in place of"
-        // v1 set_content_type. Exo applies the pending surrounding-text
-        // support to whichever of the two comes first and then resets it to
-        // supported, so sending both would always report the surrounding
-        // text as supported.
-        Some((host_ext_id, version))
-            if extension_version_allows(
-                version,
-                zcr_extended_text_input_v1::REQ_SET_INPUT_TYPE_SINCE,
-            ) =>
-        {
-            if let Some(supported) = content_type.surrounding_text_support {
-                transaction.push(
-                    zcr_extended_text_input_v1::req::set_surrounding_text_support(
-                        host_ext_id,
-                        if supported {
-                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_SUPPORTED
-                        } else {
-                            zcr_extended_text_input_v1::SURROUNDING_TEXT_SUPPORT_UNSUPPORTED
-                        },
-                    ),
-                );
-            }
-            // A text-input-v3 client supports inline preedit by definition.
-            transaction.push(zcr_extended_text_input_v1::req::set_input_type(
-                host_ext_id,
-                input_type,
-                input_mode,
-                input_flags,
-                learning_mode,
-                zcr_extended_text_input_v1::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
-            ));
-        }
-        // Before v8 the XML replaces nothing, so the four-argument request
-        // follows v1 set_content_type; v8's set_input_type would be a
-        // protocol error on v1-v7.
-        host_ext => {
-            debug_assert_eq!(content_type.surrounding_text_support, None);
-            transaction.push(zwp_text_input_v1::req::set_content_type(
-                host_v1_id, v1_hint, v1_purpose,
-            ));
-            if let Some((host_ext_id, _)) = host_ext.filter(|&(_, version)| {
-                extension_version_allows(
-                    version,
-                    zcr_extended_text_input_v1::REQ_DEPRECATED_SET_INPUT_TYPE_SINCE,
-                )
-            }) {
-                transaction.push(zcr_extended_text_input_v1::req::deprecated_set_input_type(
-                    host_ext_id,
-                    input_type,
-                    input_mode,
-                    input_flags,
-                    learning_mode,
-                ));
-            }
-        }
-    }
+/// The version of the host extension of text input `state`, if it has one.
+fn host_ext_version(ctx: &Context, state: &TextInputState) -> Option<u32> {
+    host_ext(ctx, state.host_ext_id).map(|(_, version)| version)
 }
 
 /// The host state the text input `state` should have.
@@ -1548,7 +1311,7 @@ fn host_target(ctx: &Context, state: &TextInputState) -> HostTarget {
         seat_live: live_host_seat(ctx, state).is_some(),
         content_type: HostContentType {
             content_type: state.committed.content_type,
-            surrounding_text_support: host_takes_surrounding_text_support(ctx, state.host_ext_id)
+            surrounding_text_support: takes_surrounding_text_support(host_ext_version(ctx, state))
                 .then_some(state.committed.surrounding_text.is_some()),
         },
     }
@@ -1692,7 +1455,8 @@ pub(crate) fn reconcile_host(ctx: &mut Context, guest_id: u32, commit: Option<Gu
     } = commit.unwrap_or_default();
     let mut transaction = Vec::from_iter(surrounding_text);
     if let Some(content_type) = steps.content_type {
-        push_content_type(&mut transaction, ctx, host_ids, content_type);
+        let ext = host_ext(ctx, host_ids.1);
+        transaction.extend(content_type_requests(host_ids.0, ext, content_type));
         if let Some(state) = ctx.text_inputs.get_mut(&guest_id) {
             state.host.apply_content_type(content_type);
         }
@@ -2225,6 +1989,7 @@ mod tests {
     use super::*;
     use crate::handler::callback::CallbackHandler;
     use crate::handler::keyboard::KeyboardHandler;
+    use crate::ime::map_v3_content_type;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_extended_keyboard_v1::ZcrExtendedKeyboardV1Handler;
     use crate::protocols::keyboard_extension_unstable_v1::zcr_keyboard_extension_v1;
@@ -5452,6 +5217,118 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
+    /// A region over the preedit an earlier region made deletes only the
+    /// text the guest still has. Until the guest reports its text, the
+    /// surrounding text it committed still holds the bytes the earlier
+    /// region took for the preedit, which the guest no longer has, so they
+    /// are not deleted again. A region that does not cover them is dropped.
+    /// Once the guest reports, its text is measured as it is.
+    #[tokio::test]
+    async fn a_region_over_a_region_deletes_only_what_the_guest_has() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // The guest's text is "abc|ef": of "cd", only "c" is left.
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        // "ef" does not cover the shown "cd".
+        f.s.host([ext::set_preedit_region(f.host_ext, 0, 2)]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        // The guest reports its text "ab|ef", which no longer holds "cd".
+        f.s.guest([
+            v3::set_surrounding_text(f.ti, "abef", 2, 2).unwrap(),
+            v3::commit(f.ti),
+        ])
+        .await;
+        let expected = [f.surrounding_text("abef", 2, 2), f.commit_state(3)];
+        assert_eq!(f.s.host_received(), expected);
+        let expected = [preedit_at("cd", 2, 2), done(3)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("b", 1, 1), done(3)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A host `preedit_string` after a region replaces the preedit but not
+    /// what the guest lost: the bytes the region took stay out of its text
+    /// until it reports, so a later region still deletes only the rest.
+    #[tokio::test]
+    async fn a_region_after_a_host_preedit_deletes_only_what_the_guest_has() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([f.preedit("x", "")]).await;
+        let _ = f.s.guest_received();
+
+        // The guest's text is "abc|ef": of "cd", only "c" is left.
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 2)]).await;
+        let expected = [no_preedit(), delete(1, 0), preedit_at("cd", 2, 2), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A region equal to the shown one deletes nothing more: only the
+    /// preedit is sent again.
+    #[tokio::test]
+    async fn a_region_equal_to_the_shown_one_sends_only_the_preedit() {
+        let mut f = Field::with_surrounding_text("abcdef", 4, 4).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [delete(1, 0), preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 1)]).await;
+        let expected = [preedit_at("d", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// While the guest shows the preedit a region made and has not
+    /// reported, an empty region and a region that does not cover the shown
+    /// one on both sides are dropped.
+    #[tokio::test]
+    async fn a_region_that_does_not_cover_the_shown_one_is_dropped() {
+        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let done = |serial| V3::Done { serial };
+        // "c" before the cursor and "d" after it.
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
+        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        for (index, length) in [(0, 0), (-2, 2), (0, 2), (-1, 1)] {
+            f.s.host([ext::set_preedit_region(f.host_ext, index, length)])
+                .await;
+            assert_eq!(f.s.guest_received(), [], "region {index}+{length}");
+        }
+    }
+
+    /// A region over a region whose bytes lie on both sides of the cursor
+    /// deletes the bytes beyond the shown ones on both sides.
+    #[tokio::test]
+    async fn a_region_over_a_region_deletes_the_rest_on_both_sides() {
+        let mut f = Field::with_surrounding_text("abcdef", 3, 3).await;
+        let done = |serial| V3::Done { serial };
+        f.s.host([ext::set_preedit_region(f.host_ext, -1, 2)]).await;
+        let expected = [delete(1, 1), preedit_at("cd", 1, 1), done(2)];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+
+        f.s.host([ext::set_preedit_region(f.host_ext, -2, 4)]).await;
+        let expected = [
+            no_preedit(),
+            delete(1, 1),
+            preedit_at("bcde", 2, 2),
+            done(2),
+        ];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
     /// A preedit region makes committed surrounding text around the cursor
     /// the preedit; text the guest has not committed, or a region apart
     /// from the cursor, cannot be.
@@ -5499,13 +5376,15 @@ mod tests {
         // a Backspace (`text_input_delete_surrounding_text`,
         // `src/video/wayland/SDL_waylandevents.c` 2683-2710, main
         // 1fc62260fc81), which its `testime` ignores while a preedit shows
-        // (`test/testime.c` 1084-1086).
+        // (`test/testime.c` 1084-1086). The guest's text is "가|다" now,
+        // so of the region "가나" it deletes only "가"
+        // ([`a_region_over_a_region_deletes_only_what_the_guest_has`]).
         f.s.host([
             v1::preedit_styling(f.host, 0, 3, 6),
             ext::set_preedit_region(f.host_ext, -6, 6),
         ])
         .await;
-        let expected = [no_preedit(), delete(6, 0), preedit_at("가나", 0, 3), done()];
+        let expected = [no_preedit(), delete(3, 0), preedit_at("가나", 0, 3), done()];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
         // The `done` of the guest's next commit repeats the region's

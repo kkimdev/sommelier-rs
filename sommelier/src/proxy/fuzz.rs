@@ -32,9 +32,8 @@ limitations under the License.
 //! its window would, holds its answer to a text input's drain barrier, as a
 //! slow host would, presses a pointer button or touches down on the focused
 //! surface while a preedit is live, and keeps the text-input state Exo would
-//! ([`exo`]). In some
-//! cases it also destroys live objects of one interface on its own
-//! ([`HOST_DESTROYED`]).
+//! ([`crate::sim::exo`]). In some cases it also destroys live objects of one
+//! interface on its own ([`HOST_DESTROYED`]).
 //!
 //! Every case must:
 //! - end within [`CASE_TIMEOUT`] without a panic;
@@ -80,7 +79,6 @@ limitations under the License.
 // which no encoder can do.
 #![allow(clippy::disallowed_methods)]
 
-mod exo;
 mod typing;
 
 use super::{Client, Direction};
@@ -92,10 +90,11 @@ use crate::protocols::wayland::{
     wl_callback, wl_data_device, wl_data_device_manager, wl_display, wl_fixes, wl_keyboard,
     wl_pointer, wl_registry, wl_seat, wl_surface, wl_touch,
 };
+use crate::protocols::AnyRequest;
+use crate::sim::exo::{self, Exo};
 use crate::state::Context;
-use crate::test_support::{frames, Rng};
-use crate::wire::{Framing, MessageBuilder, MessageHeader, WireMessage, WL_DISPLAY_ID};
-use exo::Exo;
+use crate::test_support::{frames, msg_opcode, Rng};
+use crate::wire::{Framing, MessageBuilder, MessageHeader, Outgoing, WireMessage, WL_DISPLAY_ID};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IoSlice, Read, Write};
@@ -1184,7 +1183,7 @@ fn run_case(protocols: &Arc<Protocols>, globals: &[Global], config: Config, seed
             assert_eq!(
                 host.focused_fields(),
                 expected,
-                "Exo's text fields on the focused surface differ from what the guest committed: {host:?}"
+                "Exo's text fields on the focused surface differ from what the guest committed"
             );
             FIELDS_CHECKED.fetch_add(expected.len() as u64, Ordering::Relaxed);
             DEFERRED_ACTIVATIONS.fetch_add(typed.deferred_activations, Ordering::Relaxed);
@@ -1659,9 +1658,16 @@ fn compositor(
                 );
             }
             // A request from or naming an object the compositor destroyed
-            // changes nothing.
-            if !zombie && !named.iter().any(|object| zombies.contains_key(object)) {
-                exo.request(&interface, sender, opcode, payload);
+            // changes nothing. Exo models the text inputs; the rest of the
+            // host is this compositor's.
+            if !zombie
+                && !named.iter().any(|object| zombies.contains_key(object))
+                && interface.contains("text_input")
+            {
+                let mut message = WireMessage::new(sender, opcode, payload);
+                let request = AnyRequest::from_wire(&interface, &mut message)
+                    .expect("an accepted text-input request");
+                exo.request(sender, &request);
             }
             match (interface.as_str(), opcode) {
                 ("zwp_text_input_v1", zwp_text_input_v1::REQ_ACTIVATE) if !zombie => {
@@ -1706,7 +1712,7 @@ fn compositor(
                         serial += 1;
                         reply.push(keyboard_enter(keyboard, serial, sender));
                     }
-                    exo.set_focus(Some(sender));
+                    exo.set_text_input_focus(Some(sender));
                     // Which of Exo's seat observers hears of the focus first,
                     // its keyboards or its text inputs, is not modelled.
                     let text_input_events = text_input_events(exo.take_events());
@@ -1921,19 +1927,15 @@ static INPUT_METHOD_RESTARTS: AtomicU64 = AtomicU64::new(0);
 /// `zwp_text_input_v1.leave` events the compositor sent, across all cases.
 static TEXT_INPUT_LEAVES: AtomicU64 = AtomicU64::new(0);
 
-/// The `zwp_text_input_v1.enter` (with its surface) and `leave` events of
-/// the host text inputs in `events`.
-fn text_input_events(events: Vec<(u32, Option<u32>)>) -> Vec<Vec<u8>> {
-    events
-        .into_iter()
-        .map(|(text_input, surface)| match surface {
-            Some(surface) => zwp_text_input_v1::evt::enter(text_input, surface).0,
-            None => {
-                TEXT_INPUT_LEAVES.fetch_add(1, Ordering::Relaxed);
-                zwp_text_input_v1::evt::leave(text_input).0
-            }
-        })
-        .collect()
+/// `events`, which Exo sent, after counting their `zwp_text_input_v1.leave`
+/// events: the requests Exo is given here make it send nothing else.
+fn text_input_events(events: Vec<Outgoing>) -> Vec<Vec<u8>> {
+    let leaves = events
+        .iter()
+        .filter(|(event, _)| msg_opcode(event) == zwp_text_input_v1::EVT_LEAVE)
+        .count();
+    TEXT_INPUT_LEAVES.fetch_add(leaves as u64, Ordering::Relaxed);
+    events.into_iter().map(|(event, _)| event).collect()
 }
 
 /// `wl_pointer` and `wl_touch` events whose compositor presses on the

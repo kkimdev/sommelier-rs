@@ -270,7 +270,9 @@ Per-object state lives with the module that owns it (`surfaces`,
 `OutputRegistry`, the keyboard maps, and so on), keyed by the object's
 guest or host ID. `state/lifecycle.rs` ends it with the object, whichever
 way the object ends: each `Context` wrapper of a table transition that
-ends an object runs one hook.
+ends an object runs one hook. A `wl_surface`'s `SurfaceState` is created
+with the surface, by `wl_compositor.create_surface`; a live surface without
+its state is an internal divergence that ends the session.
 
 - `forget_object` runs once per object, at its first end: a guest
   destructor, a terminal event, a local destructor, a bind that never
@@ -429,8 +431,8 @@ guest memfd cannot reach the host. The proxy therefore implements guest
   (`NeverSubmitted`, `AwaitingRelease`, `ReleaseOwed`, `Released`), so
   `wl_buffer.release` reaches the guest exactly when the host is done,
   including after the surface that showed it is destroyed.
-  `handler/buffer.rs` handles every guest `wl_buffer`, SHM or dma-buf:
-  its destroy and release, and its deferred retirement.
+  `BufferHandler` (`handler/buffer.rs`) handles every guest `wl_buffer`,
+  SHM or dma-buf: its destroy and release, and its deferred retirement.
 
 `handler/shm.rs` holds a submodule per concern, and re-exports what other
 handlers call:
@@ -438,7 +440,7 @@ handlers call:
 | Submodule (`handler/shm/`) | Concern |
 | --- | --- |
 | `pool.rs` | The guest's `wl_shm` and `wl_shm_pool`: pool creation and resize, buffer validation, retiring and forgetting the objects |
-| `formats.rs` | The formats the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
+| `formats.rs` | The one list of supported formats (`SUPPORTED_SHM_FORMATS`, also the source of the linux-dmabuf shim's DRM list); the ones the guest's `wl_shm` offers, from the host's capabilities; each format's DRM code and bytes per pixel |
 | `storage.rs` | A buffer's host storage: choosing and allocating it, and creating the host buffer that imports it |
 | `dmabuf.rs`, `dmabuf_layout.rs` | VirtWL dma-buf allocation and mapping; the validated dma-buf layout |
 | `copy.rs` | The copy of damaged pixels from the pool into the host storage |
