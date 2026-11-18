@@ -4428,10 +4428,10 @@ mod tests {
         let expected = [preedit("가"), V3::Done { serial: 1 }];
         assert_eq!(f.s.guest_received(), f.events(expected));
 
-        // Another surface.
+        // A second finger, on another surface.
         let other = f.s.surface().await;
-        f.s.host([Field::down(touch, other, 1)]).await;
-        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other, 1)]);
+        f.s.host([Field::down(touch, other, 2)]).await;
+        assert_eq!(f.s.guest_received(), [Field::guest_down(touch, other, 2)]);
 
         // The host was told nothing, and the composition goes on.
         assert_eq!(f.s.host_received(), []);
@@ -4440,10 +4440,10 @@ mod tests {
         assert_eq!(f.s.guest_received(), f.events(expected));
     }
 
-    /// A touch-down while the reset fence of an earlier one is pending,
-    /// as from a second finger, ends nothing: the preedit Exo sent before
-    /// it handled the `reset` never reached the guest, so the host gets
-    /// no second `reset` and the guest no second commit.
+    /// A second finger's touch-down while the reset fence of the first
+    /// finger's is pending ends nothing: the preedit Exo sent before it
+    /// handled the `reset` never reached the guest, so the host gets no
+    /// second `reset` and the guest no second commit.
     #[tokio::test]
     async fn a_touch_down_during_a_reset_fence_sends_no_second_reset() {
         let mut f = Field::enabled().await;
@@ -4459,12 +4459,13 @@ mod tests {
         expected.push(Field::guest_down(touch, f.surface, 1));
         assert_eq!(f.s.guest_received(), expected);
 
-        // In flight: the syllable the next jamo made.
-        f.s.host([f.preedit("간", "간"), Field::down(touch, f.surface, 1)])
+        // In flight: the syllable the next jamo made. Then a second
+        // finger touches down while the first stays down.
+        f.s.host([f.preedit("간", "간"), Field::down(touch, f.surface, 2)])
             .await;
         assert_eq!(
             f.s.guest_received(),
-            [Field::guest_down(touch, f.surface, 1)]
+            [Field::guest_down(touch, f.surface, 2)]
         );
         assert_eq!(f.s.host_received(), []);
         f.drain(fence).await;
