@@ -303,13 +303,18 @@ impl TextInput {
     /// or v1 `set_content_type`. Each handler takes the pending support and
     /// resets it to supported before `SetTypeModeFlags`, which returns
     /// early, dropping the type, while no input method is attached.
-    fn set_type_mode_flags(&mut self, content_type: ContentType) {
+    /// Returns whether it changed the type, mode, flags, learning, inline
+    /// composition or surrounding-text support (`changed`).
+    fn set_type_mode_flags(&mut self, content_type: ContentType) -> bool {
         let supported = std::mem::replace(&mut self.pending_support, true);
         if !self.field.attached {
-            return;
+            return false;
         }
+        let changed = self.field.content_type != content_type
+            || self.field.surrounding_text_supported != supported;
         self.field.content_type = content_type;
         self.field.surrounding_text_supported = supported;
+        changed
     }
 }
 
@@ -730,8 +735,20 @@ impl Exo {
             },
             _ => return,
         };
-        if let Some(text_input) = self.extended(sender) {
-            text_input.set_type_mode_flags(content_type);
+        if let Some(id) = self.extended_id(sender) {
+            self.set_type_mode_flags(id, content_type);
+        }
+    }
+
+    /// `SetTypeModeFlags` for text input `id`: if it changed anything and
+    /// the input method serves it, `OnTextInputTypeChanged` runs
+    /// `UpdateContextFocusState` and so `ResetContext`, which drops the
+    /// buffers, marks the keys in flight late, and resets the engine if IMA
+    /// took it to be composing; with the new type none, it returns early.
+    fn set_type_mode_flags(&mut self, id: u32, content_type: ContentType) {
+        let changed = self.text_input(id).set_type_mode_flags(content_type);
+        if changed && self.ima.client == Some(id) {
+            self.reset_context();
         }
     }
 
@@ -740,7 +757,7 @@ impl Exo {
         match request {
             Request::SetContentType { hint, purpose } => {
                 let content_type = v1_content_type(*hint, *purpose);
-                self.text_input(sender).set_type_mode_flags(content_type);
+                self.set_type_mode_flags(sender, content_type);
             }
             Request::Activate { surface, .. } => self.activate(sender, *surface),
             Request::Deactivate { .. } => self.deactivate(sender),
@@ -1098,8 +1115,14 @@ impl Exo {
 
     /// The text input of `extension`, if it still has one.
     fn extended(&mut self, extension: u32) -> Option<&mut TextInput> {
-        let id = self.extensions.get(&extension)?;
-        self.text_inputs.get_mut(id)
+        let id = self.extended_id(extension)?;
+        self.text_inputs.get_mut(&id)
+    }
+
+    /// The ID of the text input of `extension`, if it still has one.
+    fn extended_id(&self, extension: u32) -> Option<u32> {
+        let id = *self.extensions.get(&extension)?;
+        self.text_inputs.contains_key(&id).then_some(id)
     }
 }
 
@@ -1740,6 +1763,57 @@ mod tests {
         };
         assert_eq!(exo.answer(&done), Answer::Normal);
         assert_eq!(events(&mut exo), []);
+    }
+
+    #[test]
+    fn a_changed_content_type_resets_the_context_of_the_text_input_it_serves() {
+        let mut exo = active(V10);
+        press(&mut exo, 'r', &[shows("ㄱ")], true);
+        exo.key(NOW, k('k'), DOWN);
+        exo.take_engine();
+        // A new type drops the buffers, marks the key late and resets the
+        // engine, which IMA took to be composing.
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_NUMBER));
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        assert!(exo.in_engine[0].late);
+        // The same type changes nothing.
+        exo.in_engine[0].late = false;
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_NUMBER));
+        assert_eq!(exo.take_engine(), []);
+        assert!(!exo.in_engine[0].late);
+        // Nor does it without an input method, which drops the type.
+        let mut exo = exo_for(V10);
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_NUMBER));
+        assert!(exo.take_engine().is_empty());
+    }
+
+    #[test]
+    fn a_changed_surrounding_text_support_or_a_type_of_none_resets_as_the_type_does() {
+        let composing = || {
+            let mut exo = active(V10);
+            press(&mut exo, 'r', &[shows("ㄱ")], true);
+            exo.key(NOW, k('k'), DOWN);
+            exo.take_engine();
+            exo
+        };
+        // The support alone counts, once a request spends it.
+        let mut exo = composing();
+        send(&mut exo, EXT, support(false));
+        assert_eq!(exo.take_engine(), []);
+        let same = extended::Request::SetInputType {
+            input_type: extended::INPUT_TYPE_TEXT,
+            input_mode: extended::INPUT_MODE_TEXT,
+            input_flags: extended::INPUT_FLAGS_NONE,
+            learning_mode: extended::LEARNING_MODE_ENABLED,
+            inline_composition_support: extended::INLINE_COMPOSITION_SUPPORT_SUPPORTED,
+        };
+        send(&mut exo, EXT, same);
+        assert_eq!(exo.take_engine(), [EngineIn::Reset]);
+        // With the type none, `ResetContext` returns early.
+        let mut exo = composing();
+        send(&mut exo, EXT, input_type(extended::INPUT_TYPE_NONE));
+        assert_eq!(exo.take_engine(), []);
+        assert!(!exo.in_engine[0].late);
     }
 
     #[test]
