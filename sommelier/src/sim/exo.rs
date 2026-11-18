@@ -259,10 +259,20 @@ impl Tracker {
         self.expected.push(self.predicted.clone());
     }
 
-    /// `OnConfirmCompositionText` and `CancelComposition`: the composition
-    /// stays, as text.
-    fn end_composition(&mut self) {
+    /// `OnConfirmCompositionText`: the composition stays, as text, and the
+    /// state that leaves is one more an edit led to.
+    fn confirm(&mut self) {
         self.predicted.composition = None;
+        self.expected.push(self.predicted.clone());
+    }
+
+    /// `CancelComposition`: the composition stays, as text, and the states
+    /// the edits led to are forgotten, so that the next report that does
+    /// not name the prediction replaces it as `ResetInternal` does, and the
+    /// prediction is the only state to catch up to.
+    fn cancel(&mut self) {
+        self.predicted.composition = None;
+        self.expected = vec![self.predicted.clone()];
     }
 }
 
@@ -791,7 +801,7 @@ impl Exo {
     /// the input method serves this text input, it resets
     /// (`CancelComposition`). Nothing goes to the client (E5).
     fn reset(&mut self, id: u32) {
-        self.text_input(id).text.end_composition();
+        self.text_input(id).text.cancel();
         if self.ima.client == Some(id) {
             self.reset_context();
         }
@@ -881,7 +891,7 @@ impl Exo {
         let text = &mut self.text_input(id).text;
         let composition = text.predicted.composition().to_owned();
         let cursor = i32::try_from(text.predicted.cursor).expect("a short text");
-        text.end_composition();
+        text.confirm();
         if let Some(extension) = extension {
             let unchanged = extended::CONFIRM_PREEDIT_SELECTION_BEHAVIOR_UNCHANGED;
             self.events
@@ -1463,6 +1473,33 @@ mod tests {
         assert_eq!(predicted(&exo).text, "uv");
         assert_eq!(field(&exo).surrounding_text, ("uv".to_owned(), 0, 0));
         assert_eq!(field(&exo).cursor_rectangle, (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn a_reset_forgets_the_states_an_edit_led_to_and_a_confirmation_keeps_them() {
+        let typed = |unhandled: bool| {
+            let mut exo = active(V10);
+            send(&mut exo, TI, surrounding("ab", 1));
+            press(&mut exo, 'r', &[commits("가")], true);
+            press(&mut exo, 's', &[shows("ㄴ")], true);
+            if unhandled {
+                press(&mut exo, 'a', &[], false);
+            } else {
+                send(&mut exo, TI, zwp_text_input_v1::Request::Reset {});
+            }
+            exo
+        };
+        // A reset leaves the prediction as the one state to catch up to,
+        // so a report of an earlier state replaces it.
+        let mut exo = typed(false);
+        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 1);
+        send(&mut exo, TI, surrounding("a가b", 4));
+        assert_eq!(*predicted(&exo), predicts("a가b", 4, None));
+        // A confirmation adds a state, and the report is still catching up.
+        let mut exo = typed(true);
+        assert_eq!(exo.text_inputs[&TI].text.expected.len(), 4);
+        send(&mut exo, TI, surrounding("a가b", 4));
+        assert_eq!(*predicted(&exo), predicts("a가ㄴb", 7, None));
     }
 
     /// The text and the handled callback of key `id`.
