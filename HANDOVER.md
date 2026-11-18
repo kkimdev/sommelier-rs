@@ -22,6 +22,9 @@
   the rules every change must keep.
 - The opt-in window placement feature is described, with its code map, in
   [`sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md`](sommelier/docs/WINDOW_SHORTCUT_CONFIGURATION.md).
+- The IME core is being redesigned. [`docs/IME_REDESIGN.md`](docs/IME_REDESIGN.md)
+  holds the plan: a deterministic simulation test first, then a pure IME
+  core that replaces `TextInputState` in staged, golden-trace-gated PRs.
 
 ## Known issues and debt
 
