@@ -29,7 +29,7 @@ limitations under the License.
 
 use crate::protocols::wayland::wl_output;
 use crate::window_layout::Rect;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Whether `transform` is a `wl_output.transform` enum value.
 pub(crate) fn is_valid_transform(transform: i32) -> bool {
@@ -232,7 +232,7 @@ pub(crate) struct OutputRegistry {
     /// Host `wl_surface` → the live output it entered last. Exo shows each
     /// surface on one display, and moving it sends `leave` for the old
     /// display before `enter` for the new one.
-    surface_outputs: HashMap<u32, u32>,
+    surface_outputs: BTreeMap<u32, u32>,
 }
 
 impl OutputRegistry {

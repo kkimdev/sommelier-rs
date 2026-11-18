@@ -22,7 +22,7 @@ limitations under the License.
 //! each one waits for, so `wl_callback.done` dispatches through one match
 //! in `crate::handler::callback`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::HostId;
 
@@ -57,7 +57,7 @@ pub(crate) enum InternalCallback {
 /// never mistaken for a guest callback.
 #[derive(Debug, Default)]
 pub(crate) struct InternalCallbacks {
-    by_callback: HashMap<HostId, InternalCallback>,
+    by_callback: BTreeMap<HostId, InternalCallback>,
 }
 
 impl InternalCallbacks {

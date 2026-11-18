@@ -30,6 +30,8 @@ mod handler;
 mod ime;
 mod placement_config;
 mod proxy;
+#[cfg(test)]
+mod sim;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -148,8 +150,10 @@ async fn main() {
         virtio_wl = Some("/dev/wl0".to_string());
     }
 
-    // Need XDG_RUNTIME_DIR
-    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR not set");
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|error| {
+        log::error!("Cannot read XDG_RUNTIME_DIR, which holds the Wayland socket: {error}");
+        std::process::exit(1);
+    });
     let socket_path = format!("{}/{}", xdg_runtime, args.display);
 
     proxy::run(

@@ -18,7 +18,7 @@ limitations under the License.
 //! two sides pair up.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::id_allocator::{IdAllocator, WL_MAP_MAX_OBJECTS};
 use super::{GuestId, HostId};
@@ -155,9 +155,9 @@ impl HostObject {
 /// both entries.
 pub struct ShadowTable {
     /// Every object the guest has.
-    guests: HashMap<GuestId, GuestObject>,
+    guests: BTreeMap<GuestId, GuestObject>,
     /// Every host ID in use. A host `new_id` may not name one.
-    hosts: HashMap<HostId, HostObject>,
+    hosts: BTreeMap<HostId, HostObject>,
     /// The IDs this proxy allocates for its objects on the host connection.
     /// An ID returns here only through [`Self::release_deleted_host_id`] or
     /// [`Self::abandon`].
@@ -191,8 +191,8 @@ impl ShadowTable {
 
     pub fn new() -> Self {
         Self {
-            guests: HashMap::new(),
-            hosts: HashMap::new(),
+            guests: BTreeMap::new(),
+            hosts: BTreeMap::new(),
             host_ids: IdAllocator::new(Self::CLIENT_IDS),
             guest_server_ids: IdAllocator::new(Self::SERVER_IDS),
             warned_wrong_interface: Cell::new(false),

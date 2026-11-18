@@ -27,7 +27,7 @@ use crate::virtwl::{
     virtwl_ioctl_send, virtwl_ioctl_txn, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_WRITE,
     VIRTWL_SEND_MAX_ALLOCS,
 };
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -69,7 +69,7 @@ fn add_nonblocking_flag(flags: nix::fcntl::OFlag) -> nix::fcntl::OFlag {
 /// The descriptors in `fds` that `close_raw_fds` closes: each non-negative
 /// one, once, so a repeated number cannot close a descriptor that reused it.
 fn unique_raw_fds(fds: &[i32]) -> Vec<RawFd> {
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     fds.iter()
         .copied()
         .filter(|&fd| fd >= 0 && seen.insert(fd))
@@ -93,7 +93,7 @@ fn close_returned_fd(fd: i32) {
 #[allow(clippy::disallowed_methods)]
 fn owned_fds_from_txn(raw_fds: &[i32]) -> io::Result<Vec<OwnedFd>> {
     let mut packed = true;
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     let mut received = Vec::new();
 
     for &fd in raw_fds {

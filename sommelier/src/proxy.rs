@@ -656,10 +656,40 @@ impl Client {
                     None
                 }
             };
+            let after_forward = self.ctx.take_post_dispatch();
+            // Only a guest request waits for a fence, and only one that
+            // takes no descriptors and has no forward, output or deferred
+            // work: its descriptors would be gone when it is dispatched
+            // again, and the rest would be lost. A host event that waited
+            // would spin the loop. Any other wait is a proxy bug, which
+            // ends the session before its deferred work changes anything.
+            if self.ctx.waits_for_fence() && !self.ctx.is_fatal() {
+                let broken = [
+                    (direction != Direction::ClientToHost, "it is a host event"),
+                    (conn.read_fds.len() != queued_fds, "it took descriptors"),
+                    (forward.is_some(), "it has a forward"),
+                    (!after_forward.is_empty(), "it deferred work"),
+                    (
+                        !self.ctx.client_to_host_queue.is_empty(),
+                        "it queued requests for the host",
+                    ),
+                    (
+                        !self.ctx.host_to_client_queue.is_empty(),
+                        "it queued events for the guest",
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(broken, why)| broken.then_some(why));
+                if let Some(why) = broken {
+                    log::error!(
+                        "A {direction:?} message from object {sender_id} waits for a fence, \
+                         but {why}; ending the session"
+                    );
+                    self.ctx.end_session(SessionEnd::Internal);
+                }
+            }
             // Work deferred until the message is forwarded runs only if it
             // is, which a message that ends the session never is.
-            let after_forward = self.ctx.take_post_dispatch();
-            let deferred_work = after_forward.len();
             if forward.is_some() && !self.ctx.is_fatal() {
                 for effect in after_forward {
                     apply_post_dispatch(&mut self.ctx, effect);
@@ -678,18 +708,6 @@ impl Client {
             // buffered with everything after it, and is dispatched again
             // when it is due. Nothing overtakes it.
             if let Some(wait) = effects.wait {
-                // Only a guest request waits, and only one that takes no
-                // descriptors: they would be gone when it is dispatched
-                // again. A host event that waited would spin the loop.
-                debug_assert_eq!(direction, Direction::ClientToHost);
-                debug_assert_eq!(conn.read_fds.len(), queued_fds);
-                debug_assert!(
-                    forward.is_none()
-                        && deferred_work == 0
-                        && effects.to_host.is_empty()
-                        && effects.to_guest.is_empty(),
-                    "a message that waits has no output"
-                );
                 let now = Instant::now();
                 let timeout = wait.timeout;
                 let parked = match resumed {
@@ -2599,6 +2617,62 @@ mod tests {
         assert!(sent_messages(&mut guest_peer).contains(&(CALLBACK, wl_callback::EVT_DONE)));
     }
 
+    /// A message that waits for a fence after it queued output or deferred
+    /// work is a proxy bug: the session ends instead of losing the output,
+    /// before the deferred work runs.
+    #[tokio::test]
+    async fn a_wait_with_output_ends_the_session() {
+        use protocols::wayland::{wl_callback, wl_display, wl_surface};
+        type Inject = fn(&mut Context, super::harness::Object, u32);
+        let faults: [(&str, Inject); 3] = [
+            ("an event for the guest", |ctx, _, callback| {
+                ctx.host_to_client_queue
+                    .push(wl_callback::evt::done(callback, 0));
+            }),
+            ("a request for the host", |ctx, surface, _| {
+                ctx.client_to_host_queue
+                    .push(wl_surface::req::commit(surface.host));
+            }),
+            ("deferred work", |ctx, surface, callback| {
+                ctx.defer_until_forwarded(PostDispatch::XdgToplevelCreated {
+                    xdg_surface: surface.id,
+                    xdg_toplevel: callback,
+                });
+            }),
+        ];
+        for (fault, inject) in faults {
+            let (mut s, surface) = session_with_a_surface().await;
+            let (buffer, callback) = (s.new_id(), s.new_id());
+            // A native buffer whose one plane the guest GPU is still
+            // writing.
+            let (plane, _signal) = crate::test_support::pipe();
+            let ctx = s.ctx();
+            ctx.plane_fences_for_test = Some(PlaneFenceForTest::SyncFile);
+            ctx.shadow_table.insert_paired_with_version_for_test(
+                buffer,
+                HOST_FENCED_BUFFER,
+                "wl_buffer",
+                1,
+            );
+            assert!(ctx.register_native_buffer(HOST_FENCED_BUFFER, (1, 1), vec![plane]));
+            s.guest([wl_surface::req::attach(surface.id, Some(buffer), 0, 0)])
+                .await;
+            assert_eq!(s.host_received().len(), 1, "the attach");
+
+            // Injects a fault no peer can cause: what the commit has when
+            // it waits, as from a handler that queued it first.
+            inject(s.ctx(), surface, callback);
+            s.guest_fatal([wl_surface::req::commit(surface.id)]).await;
+            assert!(!s.parked(), "{fault}");
+            assert_eq!(s.host_received(), [], "{fault}");
+            assert_eq!(
+                s.guest_received_and_error(),
+                (vec![], (WL_DISPLAY_ID, wl_display::ERROR_IMPLEMENTATION)),
+                "{fault}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_parked_commit_is_forwarded_once_when_its_fence_signals() {
         use protocols::wayland::{wl_display, wl_surface};
@@ -3953,7 +4027,10 @@ pub async fn run(
             log::error!("Cannot claim the Wayland socket {display}: {error}");
             std::process::exit(1);
         });
-    let listener = UnixListener::bind(display).expect("Failed to bind socket");
+    let listener = UnixListener::bind(display).unwrap_or_else(|error| {
+        log::error!("Cannot bind the Wayland socket {display}: {error}");
+        std::process::exit(1);
+    });
     log::info!("Listening on {}", display);
 
     let config = ClientConfig {
