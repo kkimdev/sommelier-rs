@@ -366,10 +366,8 @@ pub(crate) fn publish_pending_dmabuf_globals(ctx: &mut Context, generation: u64)
         let is_current = ctx
             .registries
             .get(&pending.registry_host_id)
-            .is_some_and(|record| {
-                record.listed_generation(pending.name) == Some(generation)
-                    && !record.is_removed(pending.name)
-            })
+            .and_then(|record| record.listed_generation(pending.name))
+            == Some(generation)
             && ctx.global_generations.get(&pending.name) == Some(&generation);
         if !is_current {
             continue;
@@ -1192,46 +1190,37 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
 
     fn on_global_remove(&mut self, ctx: &mut Context, name: u32) -> Action {
         let registry_id = ctx.last_sender_id;
-        let removed_generation = ctx
-            .registries
-            .get(&registry_id)
-            .and_then(|record| record.generation(name));
-        let was_visible = ctx
-            .registries
-            .get(&registry_id)
-            .and_then(|record| record.visibility(name))
-            .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
-        let registry_seen = ctx
-            .registries
-            .get_mut(&registry_id)
-            .is_some_and(|record| record.unlist(name));
-        if !registry_seen {
+        let Some(record) = ctx.registries.get(&registry_id) else {
             return Action::Drop;
-        }
+        };
+        let Some(removed_generation) = record.listed_generation(name) else {
+            return Action::Drop;
+        };
+        let was_visible = record
+            .visibility(name)
+            .unwrap_or_else(|| ctx.host_globals.contains_key(&name));
         ctx.pending_dmabuf_globals.retain(|pending| {
             !(pending.registry_host_id == registry_id
                 && pending.name == name
-                && Some(pending.generation) == removed_generation)
+                && pending.generation == removed_generation)
         });
-        if let Some(generation) = removed_generation {
-            // A bound wl_output remains a valid Wayland object after its
-            // global advertisement disappears, but it must stop feeding
-            // compositor-owned placement, and its host-only zaura_output is
-            // released now (see `OutputRegistry::remove_global`). Match the
-            // exact advertisement generation so a delayed remove cannot
-            // retire a replacement.
-            for aura_output in ctx
-                .outputs
-                .remove_global(GlobalBinding { name, generation })
-            {
-                crate::handler::aura_objects::release(
-                    ctx,
-                    crate::handler::aura_objects::AuraChild::OUTPUT,
-                    aura_output,
-                );
-            }
-            crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, generation);
+        // A bound wl_output remains a valid Wayland object after its global
+        // advertisement disappears, but it must stop feeding
+        // compositor-owned placement, and its host-only zaura_output is
+        // released now (see `OutputRegistry::remove_global`). Match the
+        // exact advertisement generation so a delayed remove cannot retire a
+        // replacement.
+        for aura_output in ctx.outputs.remove_global(GlobalBinding {
+            name,
+            generation: removed_generation,
+        }) {
+            crate::handler::aura_objects::release(
+                ctx,
+                crate::handler::aura_objects::AuraChild::OUTPUT,
+                aura_output,
+            );
         }
+        crate::handler::linux_dmabuf::maybe_reclaim_capability_generation(ctx, removed_generation);
         // Host registries are independent Wayland objects and their events can
         // be interleaved. A global name may be removed from one registry and
         // re-advertised there before another registry delivers the old remove.
@@ -1239,7 +1228,7 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
         // has observed the removal; otherwise that stale remove invalidates a
         // newly advertised generation.
         let current_generation = ctx.global_generations.get(&name).copied();
-        let removes_current_generation = removed_generation == current_generation;
+        let removes_current_generation = Some(removed_generation) == current_generation;
         // Keep the version of a removed output the guest saw, so a bind that
         // crossed this removal is told apart from a bind of a name it never
         // saw. `host_globals` describes only the current generation.
@@ -1252,14 +1241,12 @@ impl wl_registry::WlRegistryHandler for RegistryHandler {
                     && global.interface == INERT_BIND_INTERFACE
             })
             .map(|global| global.version);
-        ctx.registries
-            .entry(registry_id)
-            .or_default()
-            .record_removal(name, inert_bind_version);
+        if let Some(record) = ctx.registries.get_mut(&registry_id) {
+            record.remove(name, inert_bind_version);
+        }
         if removes_current_generation {
-            if let Some(generation) = current_generation {
-                ctx.removed_global_generations.insert(name, generation);
-            }
+            ctx.removed_global_generations
+                .insert(name, removed_generation);
             if !global_still_seen(ctx, name, current_generation) {
                 retire_unseen_global(ctx, name);
             }
