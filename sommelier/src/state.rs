@@ -329,7 +329,7 @@ pub struct GuestShm {
     pub global_name: u32,
     /// The formats already sent to it, so a host capability event that
     /// arrives after the bind is not sent twice.
-    pub formats: HashSet<u32>,
+    pub formats: BTreeSet<u32>,
 }
 
 /// The modifier and group state a host `wl_keyboard.modifiers` event
@@ -344,11 +344,11 @@ pub(crate) struct KeyboardModifiers {
 
 pub struct Context {
     pub shadow_table: ShadowTable,
-    pub pools: HashMap<u32, ShmPool>,
+    pub pools: BTreeMap<u32, ShmPool>,
     render_buffers: RenderBufferRegistry,
     /// Asynchronous linux-dmabuf creates keyed by host params generation.
-    pub pending_native_creates: HashMap<HostId, PendingNativeCreate>,
-    pub surfaces: HashMap<u32, SurfaceState>,
+    pub pending_native_creates: BTreeMap<HostId, PendingNativeCreate>,
+    pub surfaces: BTreeMap<u32, SurfaceState>,
     /// Every guest `zwp_text_input_v3`, ordered by ID: a focus change
     /// reaches them in that order (INVARIANTS "Output order does not
     /// depend on hashing").
@@ -400,14 +400,14 @@ pub struct Context {
     /// the wl_shm contract; optional formats are added only after the host
     /// advertises them. Only a VirtWL session offers all of them to the
     /// guest; without VirtWL only `host_wl_shm_formats` count.
-    pub host_shm_formats: HashSet<u32>,
+    pub host_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host wl_shm binding.
     /// Keeping the source separate lets a dmabuf global disappear without
     /// invalidating a format that the host's real wl_shm object still offers.
-    pub host_wl_shm_formats: HashSet<u32>,
+    pub host_wl_shm_formats: BTreeSet<u32>,
     /// Optional formats learned from the internal host linux-dmabuf binding.
     /// These are removed when that binding's global is withdrawn.
-    pub host_dmabuf_shm_formats: HashSet<u32>,
+    pub host_dmabuf_shm_formats: BTreeSet<u32>,
     /// Every synthetic guest wl_shm object, ordered by ID: a host format
     /// reaches them in that order.
     pub guest_shms: BTreeMap<u32, GuestShm>,
@@ -416,11 +416,11 @@ pub struct Context {
     /// object valid for teardown, but requests sent to it after its
     /// global's removal are ignored, even while the proxy has bound a
     /// replacement; objects bound from a live name are unaffected.
-    pub stale_shm_guest_objects: HashSet<u32>,
+    pub stale_shm_guest_objects: BTreeSet<u32>,
     /// Synthetic wl_shm_pool children of a stale guest wl_shm, created before
     /// its global retired or after it. They remain destroyable, but must not
     /// resize or create buffers through a replacement host binding.
-    pub stale_shm_pools: HashSet<u32>,
+    pub stale_shm_pools: BTreeSet<u32>,
     pub host_text_input_manager_v1_id: Option<u32>,
     pub host_text_input_extension_v1_id: Option<u32>,
     /// Host-side zcr_keyboard_extension_v1 object ID (bound internally on startup).
@@ -463,7 +463,7 @@ pub struct Context {
     /// ARC bounds policy, and the placement bindings. Shared, never copied:
     /// a reloaded binding generation is visible to the next lookup.
     placement: Arc<PlacementConfig>,
-    pub supported_formats: HashSet<u32>,
+    pub supported_formats: BTreeSet<u32>,
     /// Host globals visible to the guest, keyed by their unique numeric name.
     pub host_globals: HashMap<u32, HostGlobal>,
     /// Every host global the proxy may bind as a singleton, by name, with
@@ -505,13 +505,13 @@ pub struct Context {
     /// registry can still receive its own global_remove event, while blocking
     /// new binds in the meantime.
     pub removed_host_globals: HashSet<u32>,
-    pub pending_params: HashMap<u32, Vec<PendingParam>>,
+    pub pending_params: BTreeMap<u32, Vec<PendingParam>>,
     /// Guest linux-dmabuf params objects consumed by create/create_immed.
     ///
     /// The protocol object remains alive after consumption so subsequent
     /// add/create requests can report `already_used` instead of being
     /// confused with an object that was never tracked.
-    pub used_dmabuf_params: HashSet<u32>,
+    pub used_dmabuf_params: BTreeSet<u32>,
     /// Guest feedback objects synthesized locally from the host's legacy
     /// linux-dmabuf format/modifier events, keyed by guest feedback ID. The
     /// generation keeps an object created from an old, still-bound factory
@@ -523,11 +523,11 @@ pub struct Context {
     /// single roundtrip; sending one memfd per event can overflow the
     /// receiver's SCM_RIGHTS batch and desynchronize the Wayland FD stream.
     /// The proxy clears this set after each dispatch batch.
-    pub synthetic_feedback_refresh_pending: HashSet<u32>,
+    pub synthetic_feedback_refresh_pending: BTreeSet<u32>,
     /// Capability snapshots for every host dmabuf global generation referenced
     /// by a live guest object. A completed snapshot is immutable except for a
     /// defensive refresh if a non-conforming host sends a late unique pair.
-    pub dmabuf_capabilities: HashMap<u64, DmabufCapabilityState>,
+    pub dmabuf_capabilities: BTreeMap<u64, DmabufCapabilityState>,
     /// Generation collected by the current internal host dmabuf binding.
     pub host_dmabuf_generation: Option<u64>,
     /// Host-only wl_callback barriers the proxy issued for itself, and what
@@ -538,7 +538,7 @@ pub struct Context {
     pub pending_dmabuf_globals: Vec<PendingDmabufGlobal>,
     /// Guest dmabuf factory ID to the host-global generation from which it was
     /// bound. Global removal does not invalidate an already-bound factory.
-    pub dmabuf_guest_generations: HashMap<u32, u64>,
+    pub dmabuf_guest_generations: BTreeMap<u32, u64>,
     pub gpu_accel: bool,
     pub xdg_decoration: bool,
     /// The internal host zaura_shell binding (not exposed to the guest), if
@@ -563,7 +563,7 @@ pub struct Context {
     pub(crate) xdg_roles: XdgRoles,
     /// Tracks wp_viewport objects back to their associated wl_surface so
     /// destroying a viewport restores the default damage coordinate mapping.
-    pub viewport_to_wl_surface: HashMap<u32, u32>,
+    pub viewport_to_wl_surface: BTreeMap<u32, u32>,
     /// The connection's clipboard transfers.
     pub(crate) clipboard_pumps: ClipboardPumps,
 }
@@ -1012,10 +1012,10 @@ impl Context {
         let window_placement = WindowPlacementState::new(placement.backend());
         Self {
             shadow_table: ShadowTable::new(),
-            pools: HashMap::new(),
+            pools: BTreeMap::new(),
             render_buffers: RenderBufferRegistry::default(),
-            pending_native_creates: HashMap::new(),
-            surfaces: HashMap::new(),
+            pending_native_creates: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
             text_inputs: BTreeMap::new(),
             keyboard_to_seat: BTreeMap::new(),
             keyboard_focus: KeyboardFocusRegistry::default(),
@@ -1039,12 +1039,12 @@ impl Context {
             host_text_input_manager_v1_global_name: None,
             host_text_input_extension_v1_global_name: None,
             host_keyboard_extension_global_name: None,
-            host_shm_formats: HashSet::new(),
-            host_wl_shm_formats: HashSet::new(),
-            host_dmabuf_shm_formats: HashSet::new(),
+            host_shm_formats: BTreeSet::new(),
+            host_wl_shm_formats: BTreeSet::new(),
+            host_dmabuf_shm_formats: BTreeSet::new(),
             guest_shms: BTreeMap::new(),
-            stale_shm_guest_objects: HashSet::new(),
-            stale_shm_pools: HashSet::new(),
+            stale_shm_guest_objects: BTreeSet::new(),
+            stale_shm_pools: BTreeSet::new(),
             host_text_input_manager_v1_id: None,
             host_text_input_extension_v1_id: None,
             host_keyboard_extension_id: None,
@@ -1057,7 +1057,7 @@ impl Context {
             keyboard_modifiers: BTreeMap::new(),
             keyboard_keysym_to_keycode: BTreeMap::new(),
             placement,
-            supported_formats: HashSet::new(),
+            supported_formats: BTreeSet::new(),
             host_globals: HashMap::new(),
             singleton_candidates: HashMap::new(),
             hidden_host_globals: HashMap::new(),
@@ -1069,15 +1069,15 @@ impl Context {
             next_global_generation: 1,
             removed_global_generations: HashMap::new(),
             removed_host_globals: HashSet::new(),
-            pending_params: HashMap::new(),
-            used_dmabuf_params: HashSet::new(),
+            pending_params: BTreeMap::new(),
+            used_dmabuf_params: BTreeSet::new(),
             synthetic_feedback_objects: BTreeMap::new(),
-            synthetic_feedback_refresh_pending: HashSet::new(),
-            dmabuf_capabilities: HashMap::new(),
+            synthetic_feedback_refresh_pending: BTreeSet::new(),
+            dmabuf_capabilities: BTreeMap::new(),
             host_dmabuf_generation: None,
             internal_callbacks: InternalCallbacks::default(),
             pending_dmabuf_globals: Vec::new(),
-            dmabuf_guest_generations: HashMap::new(),
+            dmabuf_guest_generations: BTreeMap::new(),
             gpu_accel,
             xdg_decoration,
             host_zaura_shell: None,
@@ -1088,7 +1088,7 @@ impl Context {
             gtk_surfaces: HashMap::new(),
             aura_surfaces: AuraSurfaces::default(),
             xdg_roles: XdgRoles::default(),
-            viewport_to_wl_surface: HashMap::new(),
+            viewport_to_wl_surface: BTreeMap::new(),
             clipboard_pumps: ClipboardPumps::default(),
         }
     }

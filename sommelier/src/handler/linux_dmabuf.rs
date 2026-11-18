@@ -86,7 +86,7 @@ fn local_device_id(ctx: &Context) -> io::Result<Vec<u8>> {
 
 fn feedback_pairs(ctx: &Context, generation: u64) -> Vec<(u32, u64)> {
     let mut pairs = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::BTreeSet::new();
 
     if let Some(capabilities) = ctx.dmabuf_capabilities.get(&generation) {
         for &(format, modifier) in &capabilities.format_modifiers {
@@ -466,7 +466,7 @@ impl LinuxDmabufHandler {
             return false;
         }
 
-        let mut seen_planes = std::collections::HashSet::new();
+        let mut seen_planes = std::collections::BTreeSet::new();
         params.iter().all(|param| {
             param.plane_idx < expected_planes
                 && seen_planes.insert(param.plane_idx)
@@ -494,7 +494,7 @@ impl LinuxDmabufHandler {
         if params.len() != expected_planes {
             return zwp_linux_buffer_params_v1::ERROR_INCOMPLETE;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         for param in params {
             if param.plane_idx >= expected_planes as u32 {
                 return zwp_linux_buffer_params_v1::ERROR_PLANE_IDX;
@@ -806,11 +806,11 @@ impl zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1Handler for LinuxDmabufHa
             sync_fds,
         };
         match ctx.pending_native_creates.entry(host_params_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(pending);
                 Action::Drop
             }
-            std::collections::hash_map::Entry::Occupied(_) => ctx.fail(format_args!(
+            std::collections::btree_map::Entry::Occupied(_) => ctx.fail(format_args!(
                 "Duplicate asynchronous dmabuf params host ID {}",
                 host_params_id.0
             )),

@@ -22,7 +22,7 @@ use crate::state::{
 };
 use crate::wire::Action;
 use log::{debug, error, warn};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -1016,14 +1016,14 @@ fn retire_destroyed_buffer_mapping(ctx: &mut Context, guest_id: u32, host_id: Ho
 /// two sets together prevents SHM and native collectors from drifting into
 /// subtly different definitions of "referenced".
 struct SurfaceBufferReferences {
-    current: HashSet<u32>,
-    pending: HashSet<u32>,
+    current: BTreeSet<u32>,
+    pending: BTreeSet<u32>,
 }
 
 impl SurfaceBufferReferences {
     fn collect(ctx: &Context) -> Self {
-        let mut current = HashSet::new();
-        let mut pending = HashSet::new();
+        let mut current = BTreeSet::new();
+        let mut pending = BTreeSet::new();
         for surface in ctx.surfaces.values() {
             current.extend(surface.current_buffer_id());
             pending.extend(surface.pending.attachment.buffer_id());
@@ -1187,7 +1187,7 @@ impl protocols::wayland::wl_shm::WlShmHandler for ShmHandler {
 /// retired, and their pools inert (see `Context::stale_shm_guest_objects`),
 /// whether or not the proxy's own binding was `name`.
 pub(crate) fn retire_guest_shms(ctx: &mut Context, name: u32) {
-    let stale: std::collections::HashSet<u32> = ctx
+    let stale: std::collections::BTreeSet<u32> = ctx
         .guest_shms
         .iter()
         .filter(|(_, shm)| shm.global_name == name)
