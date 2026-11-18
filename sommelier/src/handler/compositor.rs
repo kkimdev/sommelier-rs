@@ -1055,20 +1055,22 @@ impl crate::protocols::aura_shell::zaura_toplevel::ZauraToplevelHandler for Comp
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::protocols::aura_shell::zaura_shell::REQ_GET_AURA_SURFACE;
-    use crate::protocols::aura_shell::zaura_surface::REQ_RELEASE;
-    use crate::protocols::aura_shell::zaura_surface::REQ_SET_APPLICATION_ID;
+    use crate::protocols::aura_shell::{zaura_shell, zaura_surface};
+    use crate::protocols::text_input_unstable_v1::zwp_text_input_v1;
+    use crate::protocols::text_input_unstable_v3::zwp_text_input_v3;
     use crate::protocols::viewporter::wp_viewport::WpViewportHandler;
     use crate::protocols::viewporter::wp_viewporter::WpViewporterHandler;
+    use crate::protocols::wayland::wl_buffer;
     use crate::protocols::wayland::wl_buffer::WlBufferHandler;
     use crate::protocols::wayland::wl_keyboard::WlKeyboardHandler;
-    use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE, REQ_DESTROY};
+    use crate::protocols::wayland::wl_surface::{REQ_COMMIT, REQ_DAMAGE};
     use crate::protocols::xdg_shell::xdg_toplevel::XdgToplevelHandler;
-    use crate::protocols::xdg_shell::xdg_toplevel::REQ_SET_APP_ID;
-    use crate::state::ARC_APPLICATION_ID_PREFIX;
+    use crate::protocols::AnyRequest;
+    use crate::proxy::harness::Session;
     use crate::state::{BufferState, Context, RenderBufferLifecycle, RenderBufferUse, StalePixels};
     use crate::test_support::{
-        msg_opcode, msg_sender, protocol_error, protocol_error_code, queued_headers, shm_pool_file,
+        decode, decoded, mapped_test_buffer, msg_opcode, msg_sender, protocol_error_code,
+        queued_headers, register_test_buffer, shm_pool_file, BufferKind, BUFFER_KINDS,
     };
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::FileExt;
@@ -1103,6 +1105,11 @@ mod tests {
             "xdg_toplevel",
         );
         ctx.bind_aura_shell_for_test(zaura_shell_host);
+        ctx.shadow_table.insert_host_only_for_test(
+            zaura_shell_host,
+            "zaura_shell",
+            zaura_shell::VERSION,
+        );
         ctx.xdg_roles
             .add_toplevel_role_for_test(xdg_surface_id, wl_surface_guest, xdg_toplevel_id);
 
@@ -1128,12 +1135,16 @@ mod tests {
         let payload = inert_output.to_ne_bytes();
         let mut request =
             crate::wire::WireMessage::new(toplevel_guest, REQ_SET_FULLSCREEN, &payload);
-        let (message, _) = dispatch_request(&mut request, &mut CompositorHandler, &mut ctx)
+        let forwarded = dispatch_request(&mut request, &mut CompositorHandler, &mut ctx)
             .expect("valid request")
             .expect("forwarded");
-        assert_eq!(msg_sender(&message), toplevel_host);
-        assert_eq!(msg_opcode(&message), REQ_SET_FULLSCREEN);
-        assert_eq!(message[8..], 0u32.to_ne_bytes());
+        assert_eq!(
+            decoded(&[forwarded], xdg_toplevel::Request::from_wire),
+            [(
+                toplevel_host,
+                xdg_toplevel::Request::SetFullscreen { output: 0 }
+            )]
+        );
     }
 
     #[test]
@@ -1235,47 +1246,6 @@ mod tests {
         state
     }
 
-    fn mapped_test_buffer(
-        _guest_buffer_id: u32,
-        width: i32,
-        height: i32,
-        stride: u32,
-        stale: StalePixels,
-    ) -> BufferState {
-        let source_size = usize::try_from(height)
-            .unwrap()
-            .checked_mul(stride as usize)
-            .unwrap();
-        let destination_ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                source_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(destination_ptr, libc::MAP_FAILED);
-        BufferState {
-            pool_file: Arc::new(shm_pool_file(&vec![0; source_size])),
-            offset: 0,
-            width,
-            height,
-            stride,
-            format: 0,
-            bo: None,
-            dmabuf_fd: None,
-            bo_stride: stride,
-            dmabuf_plane1_offset: 0,
-            dmabuf_plane1_stride: 0,
-            dmabuf_sync: false,
-            dest_ptr: destination_ptr as *mut u8,
-            dest_size: source_size,
-            stale,
-        }
-    }
-
     /// The pool file of local-copy buffer `guest_id`, which a test writes
     /// as the client would draw.
     fn test_pool_file(ctx: &Context, guest_id: u32) -> Arc<std::fs::File> {
@@ -1315,6 +1285,27 @@ mod tests {
             host_id
         });
         assert!(ctx.register_native_buffer(host_id, size, sync_fds));
+    }
+
+    /// The requests queued for the host, decoded by their senders'
+    /// interfaces.
+    fn host_requests(ctx: &Context) -> Vec<(u32, AnyRequest)> {
+        ctx.client_to_host_queue
+            .iter()
+            .map(|(message, fds)| {
+                let mut fds = fds.iter().map(|fd| fd.try_clone().unwrap()).collect();
+                decode(message, &mut fds, |msg| {
+                    let interface = ctx
+                        .shadow_table
+                        .get_host_interface(msg.sender_id)
+                        .unwrap_or_else(|| {
+                            panic!("queued request sender {} is no host object", msg.sender_id)
+                        });
+                    AnyRequest::from_wire(interface, msg)
+                })
+                .expect("a queued request decodes")
+            })
+            .collect()
     }
 
     fn unsupported_dmabuf_sync_fd() -> OwnedFd {
@@ -1360,10 +1351,8 @@ mod tests {
         assert!(!ctx.is_fatal());
         assert!(ctx.native_buffer_uses_implicit_sync(buffer));
         assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| (msg_sender(message), msg_opcode(message))),
-            Some((wl_surface_host, REQ_COMMIT))
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT))
         );
 
         ctx.client_to_host_queue.clear();
@@ -1371,10 +1360,8 @@ mod tests {
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
         assert!(!ctx.is_fatal());
         assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| (msg_sender(message), msg_opcode(message))),
-            Some((wl_surface_host, REQ_COMMIT)),
+            queued_headers(&ctx.client_to_host_queue).last(),
+            Some(&(wl_surface_host, REQ_COMMIT)),
             "the cached compatibility mode must keep later commits live"
         );
     }
@@ -1453,7 +1440,7 @@ mod tests {
         register_test_local(
             ctx,
             buffer,
-            mapped_test_buffer(buffer, side, side, FRAME_STRIDE as u32, StalePixels::all()),
+            mapped_test_buffer(side, side, FRAME_STRIDE as u32, StalePixels::all()),
         );
         attach_and_commit(ctx, surface, buffer);
     }
@@ -1658,39 +1645,59 @@ mod tests {
         assert!(ctx.client_to_host_queue.is_empty());
     }
 
+    /// The guest sets `app_id` on the toplevel `xdg_toplevel_id`; returns the
+    /// requests that queues for the host.
+    fn set_test_app_id(
+        ctx: &mut Context,
+        xdg_toplevel_id: u32,
+        app_id: &str,
+    ) -> Vec<(u32, AnyRequest)> {
+        ctx.last_sender_id = xdg_toplevel_id;
+        assert_eq!(
+            CompositorHandler.on_set_app_id(ctx, &app_id.to_string()),
+            Action::Drop
+        );
+        host_requests(ctx)
+    }
+
     #[test]
     fn set_app_id_creates_zaura_surface_and_sets_app_id() {
-        let (mut ctx, xdg_toplevel_id, zaura_shell_host, _wl_surface_host) = setup_ctx();
-        ctx.last_sender_id = xdg_toplevel_id;
-
-        let mut handler = CompositorHandler;
-        let action = handler.on_set_app_id(&mut ctx, &"my_app".to_string());
-        assert_eq!(action, Action::Drop);
-
-        assert_eq!(ctx.client_to_host_queue.len(), 3);
-
-        let msg0 = &ctx.client_to_host_queue[0].0;
-        assert_eq!(msg_sender(msg0), xdg_toplevel_id + 100);
-        assert_eq!(msg_opcode(msg0), REQ_SET_APP_ID);
-
-        let msg1 = &ctx.client_to_host_queue[1].0;
-        assert_eq!(msg_sender(msg1), zaura_shell_host);
-        assert_eq!(msg_opcode(msg1), REQ_GET_AURA_SURFACE);
-
-        let msg2 = &ctx.client_to_host_queue[2].0;
-        assert_eq!(msg_opcode(msg2), REQ_SET_APPLICATION_ID);
-        let payload = &msg2[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let app_id_str = String::from_utf8(payload[4..4 + str_len - 1].to_vec()).unwrap();
-        assert!(app_id_str.starts_with("org.chromium.guest_os."));
-        assert!(app_id_str.ends_with(".wayland.my_app"));
+        let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) = setup_ctx();
+        let requests = set_test_app_id(&mut ctx, xdg_toplevel_id, "my_app");
+        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
+        let app_id = "org.chromium.guest_os.termina.wayland.my_app";
+        assert_eq!(
+            requests,
+            [
+                (
+                    xdg_toplevel_id + 100,
+                    xdg_toplevel::Request::SetAppId {
+                        app_id: app_id.into()
+                    }
+                    .into()
+                ),
+                (
+                    zaura_shell_host,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: zaura_surface_host,
+                        surface: wl_surface_host
+                    }
+                    .into()
+                ),
+                (
+                    zaura_surface_host,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: Some(app_id.into())
+                    }
+                    .into()
+                ),
+            ]
+        );
     }
 
     #[test]
     fn set_app_id_reuses_existing_zaura_surface() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        ctx.last_sender_id = xdg_toplevel_id;
-
         // An Aura surface created earlier, tracked the way
         // ensure_host_zaura_surface records it.
         let zaura_surface_host = 99u32;
@@ -1699,79 +1706,69 @@ mod tests {
         ctx.aura_surfaces
             .remember(wl_surface_host, zaura_surface_host);
 
-        let mut handler = CompositorHandler;
-        let action = handler.on_set_app_id(&mut ctx, &"reused".to_string());
-        assert_eq!(action, Action::Drop);
-
-        assert_eq!(ctx.client_to_host_queue.len(), 2);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_SET_APP_ID);
+        let app_id = "org.chromium.guest_os.termina.wayland.reused";
         assert_eq!(
-            msg_sender(&ctx.client_to_host_queue[0].0),
-            xdg_toplevel_id + 100
-        );
-        assert_eq!(
-            msg_opcode(&ctx.client_to_host_queue[1].0),
-            REQ_SET_APPLICATION_ID
-        );
-        assert_eq!(
-            msg_sender(&ctx.client_to_host_queue[1].0),
-            zaura_surface_host
+            set_test_app_id(&mut ctx, xdg_toplevel_id, "reused"),
+            [
+                (
+                    xdg_toplevel_id + 100,
+                    xdg_toplevel::Request::SetAppId {
+                        app_id: app_id.into()
+                    }
+                    .into()
+                ),
+                (
+                    zaura_surface_host,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: Some(app_id.into())
+                    }
+                    .into()
+                ),
+            ]
         );
     }
 
     #[test]
     fn set_app_id_uses_arc_namespace_when_bounds_policy_is_enabled() {
-        let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) =
+        let (mut ctx, xdg_toplevel_id, zaura_shell_host, wl_surface_host) =
             setup_ctx_with(crate::placement_config::PlacementConfig::arc_bounds_for_test(""));
-        ctx.last_sender_id = xdg_toplevel_id;
-
-        let mut handler = CompositorHandler;
+        let requests = set_test_app_id(&mut ctx, xdg_toplevel_id, "com.example.Terminal");
+        let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
+        // The Aura surface gets the first ID of the test policy's ARC task
+        // block; the role keeps the guest's.
+        let arc_app_id = "org.chromium.arc.2000000000";
         assert_eq!(
-            handler.on_set_app_id(&mut ctx, &"com.example.Terminal".to_string()),
-            Action::Drop
+            ctx.window_placement
+                .arc_application_id(TEST_SURFACE)
+                .as_deref(),
+            Some(arc_app_id)
         );
-        let xdg_message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| {
-                msg_sender(message) == xdg_toplevel_id + 100
-                    && msg_opcode(message) == REQ_SET_APP_ID
-            })
-            .expect("native XDG application ID request");
-        let payload = &xdg_message.0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
         assert_eq!(
-            std::str::from_utf8(&payload[4..4 + str_len - 1]).unwrap(),
-            native_wayland_app_id(&ctx.vm_identifier, "com.example.Terminal",)
-        );
-
-        let zaura_surface_host = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_GET_AURA_SURFACE)
-            .map(|(message, _)| u32::from_ne_bytes(message[8..12].try_into().unwrap()))
-            .expect("Aura surface request must allocate a host ID");
-        let aura_message = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| {
-                msg_sender(message) == zaura_surface_host
-                    && msg_opcode(message) == REQ_SET_APPLICATION_ID
-            })
-            .expect("ARC Aura application ID request");
-        let payload = &aura_message.0[8..];
-        let str_len = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let aura_app_id = std::str::from_utf8(&payload[4..4 + str_len - 1]).unwrap();
-        assert!(aura_app_id.starts_with(ARC_APPLICATION_ID_PREFIX));
-        assert!(!aura_app_id.starts_with("org.chromium.arc.session."));
-        assert!(aura_app_id
-            .strip_prefix(ARC_APPLICATION_ID_PREFIX)
-            .unwrap()
-            .parse::<u32>()
-            .is_ok());
-        assert_eq!(
-            Some(aura_app_id),
-            ctx.window_placement.arc_application_id(100).as_deref()
+            requests,
+            [
+                (
+                    xdg_toplevel_id + 100,
+                    xdg_toplevel::Request::SetAppId {
+                        app_id: "org.chromium.guest_os.termina.wayland.com.example.Terminal".into()
+                    }
+                    .into()
+                ),
+                (
+                    zaura_shell_host,
+                    zaura_shell::Request::GetAuraSurface {
+                        id: zaura_surface_host,
+                        surface: wl_surface_host
+                    }
+                    .into()
+                ),
+                (
+                    zaura_surface_host,
+                    zaura_surface::Request::SetApplicationId {
+                        application_id: Some(arc_app_id.into())
+                    }
+                    .into()
+                ),
+            ]
         );
     }
 
@@ -1779,13 +1776,16 @@ mod tests {
     fn set_app_id_noop_when_no_zaura_shell() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         ctx.host_zaura_shell = None;
-        ctx.last_sender_id = xdg_toplevel_id;
-
-        let mut handler = CompositorHandler;
-        let action = handler.on_set_app_id(&mut ctx, &"no_shell".to_string());
-        assert_eq!(action, Action::Drop);
-        assert_eq!(ctx.client_to_host_queue.len(), 1);
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_SET_APP_ID);
+        assert_eq!(
+            set_test_app_id(&mut ctx, xdg_toplevel_id, "no_shell"),
+            [(
+                xdg_toplevel_id + 100,
+                xdg_toplevel::Request::SetAppId {
+                    app_id: "org.chromium.guest_os.termina.wayland.no_shell".into()
+                }
+                .into()
+            )]
+        );
     }
 
     #[test]
@@ -1875,70 +1875,32 @@ mod tests {
     }
 
     #[test]
-    fn damage_only_commit_preserves_released_local_use() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        assert!(ctx.mark_buffer_submitted(buffer_id));
-        assert!(ctx.mark_buffer_released(buffer_id));
-        ctx.last_sender_id = surface_id;
+    fn damage_only_commit_preserves_a_released_use() {
+        // Only committing an explicit attach begins a compositor use.
+        for kind in BUFFER_KINDS {
+            let (mut ctx, ..) = setup_ctx();
+            let buffer = 42;
+            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
+            register_test_buffer(&mut ctx, kind, buffer, 43);
+            assert!(ctx.mark_buffer_submitted(buffer));
+            assert!(ctx.mark_buffer_released(buffer));
 
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.host_buffer_use(buffer_id),
-            Some(RenderBufferUse::Released),
-            "only committing an explicit attach may begin a compositor use interval"
-        );
-    }
-
-    #[test]
-    fn damage_only_commit_does_not_resubmit_released_current_buffer() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        assert!(ctx.mark_buffer_submitted(buffer_id));
-        assert!(ctx.mark_buffer_released(buffer_id));
-        ctx.last_sender_id = surface_id;
-
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(
-            !ctx.buffer_is_submitted(buffer_id),
-            "damage-only commit must not mark the wl_buffer as submitted again"
-        );
-    }
-
-    #[test]
-    fn damage_only_commit_preserves_released_native_use() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        register_test_native(&mut ctx, buffer_id, (1, 1));
-        assert!(ctx.mark_buffer_submitted(buffer_id));
-        assert!(ctx.mark_buffer_released(buffer_id));
-        ctx.last_sender_id = surface_id;
-
-        let mut handler = CompositorHandler;
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-        assert!(
-            ctx.buffer_is_released(buffer_id),
-            "damage-only commit must not clear the prior native-buffer release"
-        );
-        assert!(!ctx.buffer_is_submitted(buffer_id));
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_damage_buffer(&mut ctx, 0, 0, 1, 1),
+                Action::Drop
+            );
+            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert_eq!(
+                ctx.host_buffer_use(buffer),
+                Some(RenderBufferUse::Released),
+                "{kind:?}"
+            );
+            assert!(
+                !ctx.buffer_is_submitted(buffer),
+                "not resubmitted ({kind:?})"
+            );
+        }
     }
 
     #[test]
@@ -1947,6 +1909,9 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         register_test_native(&mut ctx, buffer_id, (100, 50));
+        // A rotated buffer damages its whole surface, whose extent shows
+        // the dimensions the damage is mapped with.
+        ctx.surface_mut(surface_id).current_buffer_transform = 1;
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.last_sender_id = surface_id;
         let mut handler = CompositorHandler;
@@ -1956,17 +1921,8 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("native damage must be forwarded before commit");
-        let width = i32::from_ne_bytes(damage.0[16..20].try_into().unwrap());
-        let height = i32::from_ne_bytes(damage.0[20..24].try_into().unwrap());
-        assert!(
-            width > 1 && height > 1,
-            "native damage must not be clipped to the fallback 1x1 dimensions"
-        );
+        // The whole rotated 100x50 buffer, not a 1x1 fallback.
+        assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
     }
 
     #[test]
@@ -1986,17 +1942,8 @@ mod tests {
         );
         assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
 
-        let damage = ctx
-            .client_to_host_queue
-            .iter()
-            .find(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
-            .expect("committed content metadata must survive wl_buffer destruction");
-        let width = i32::from_ne_bytes(damage.0[16..20].try_into().unwrap());
-        let height = i32::from_ne_bytes(damage.0[20..24].try_into().unwrap());
-        assert!(
-            width > 1 && height > 1,
-            "damage must use the 100x50 content snapshot instead of a 1x1 fallback"
-        );
+        // The whole rotated 100x50 content snapshot, not a 1x1 fallback.
+        assert_eq!(host_damage(&ctx), [(0, 0, 50, 100)]);
     }
 
     #[test]
@@ -2005,13 +1952,7 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, buffer_id, (1, 1));
+        register_test_buffer(&mut ctx, BufferKind::Native, buffer_id, host_buffer_id);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         ctx.mark_buffer_submitted(buffer_id);
 
@@ -2036,10 +1977,9 @@ mod tests {
         // event that cannot arrive.
         ctx.last_sender_id = buffer_id;
         assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .any(|(message, _)| msg_sender(message) == host_buffer_id),
+        assert_eq!(
+            host_requests(&ctx).last(),
+            Some(&(host_buffer_id, wl_buffer::Request::Destroy {}.into())),
             "host buffer destroy must use the completed release interval"
         );
     }
@@ -2053,13 +1993,7 @@ mod tests {
         let surface_id = 100;
         let buffer_id = 42;
         let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, buffer_id, (1, 1));
+        register_test_buffer(&mut ctx, BufferKind::Native, buffer_id, host_buffer_id);
         set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
         assert!(ctx.mark_buffer_submitted(buffer_id));
 
@@ -2092,335 +2026,139 @@ mod tests {
     }
 
     #[test]
-    fn attaching_idle_shm_buffer_without_commit_keeps_release_edge() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.mark_buffer_submitted(buffer_id);
+    fn attaching_an_idle_buffer_without_commit_keeps_its_release_edge() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, ..) = setup_ctx();
+            let (buffer, host_buffer) = (42, 43);
+            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
+            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
+            assert!(ctx.mark_buffer_submitted(buffer));
 
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Forward
-        );
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
+            let mut shm = crate::handler::shm::ShmHandler;
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                Action::Forward
+            );
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
+                Action::Forward
+            );
 
-        // No commit follows the attach yet. Keep the host object alive until
-        // the pending state is resolved; otherwise a later commit could race
-        // the queued destructor.
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(!ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+            // No commit follows the attach yet. Keep the host object alive
+            // until the pending state is resolved; otherwise a later commit
+            // could race the queued destructor.
+            ctx.last_sender_id = buffer;
+            assert_eq!(
+                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
+            assert_eq!(host_requests(&ctx), [], "{kind:?}");
 
-        // Replacing the pending attach proves that it will never commit, so
-        // the host destructor can now be ordered safely.
-        ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        assert!(buffer_host_destroy_is_queued(&ctx, buffer_id));
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+            // Replacing the pending attach proves that it will never commit,
+            // so the host destructor can now be ordered safely.
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, 0, 0, 0),
+                Action::Forward
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
+            assert_eq!(
+                host_requests(&ctx),
+                [(host_buffer, wl_buffer::Request::Destroy {}.into())],
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
-    fn attaching_idle_native_buffer_without_commit_keeps_release_edge() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, buffer_id, (1, 1));
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.mark_buffer_submitted(buffer_id);
+    fn a_delayed_release_before_a_pending_commit_keeps_the_host_buffer_alive() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, ..) = setup_ctx();
+            let (buffer, host_buffer) = (42, 43);
+            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
+            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
+            assert!(ctx.mark_buffer_submitted(buffer));
 
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Forward
-        );
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
+                Action::Forward
+            );
+            let mut shm = crate::handler::shm::ShmHandler;
+            ctx.last_sender_id = buffer;
+            assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
 
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(!ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+            // This release belongs to the old committed interval. It must not
+            // destroy the host object while the pending attach can still
+            // commit.
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
+            assert!(ctx.buffer_is_released(buffer), "{kind:?}");
+            assert_eq!(host_requests(&ctx), [], "{kind:?}");
 
-        ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        assert!(buffer_host_destroy_is_queued(&ctx, buffer_id));
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(CompositorHandler.on_commit(&mut ctx), Action::Drop);
+            assert!(buffer_is_guest_destroyed(&ctx, buffer), "{kind:?}");
+            assert!(ctx.buffer_is_submitted(buffer), "{kind:?}");
+
+            // A release for the newly committed interval is the one that
+            // permits the host destructor.
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
+            assert_eq!(
+                host_requests(&ctx).last(),
+                Some(&(host_buffer, wl_buffer::Request::Destroy {}.into())),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
-    fn delayed_shm_release_before_pending_commit_keeps_host_buffer_alive() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, 4, StalePixels::all()),
-        );
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.mark_buffer_submitted(buffer_id);
+    fn replacing_a_pending_destroyed_buffer_does_not_wait_for_release() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, ..) = setup_ctx();
+            let (old_buffer, old_host_buffer, new_buffer) = (42, 43, 44);
+            register_test_buffer(&mut ctx, kind, old_buffer, old_host_buffer);
 
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, old_buffer, 0, 0),
+                Action::Forward
+            );
+            let mut shm = crate::handler::shm::ShmHandler;
+            ctx.last_sender_id = old_buffer;
+            assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
+            assert!(
+                buffer_is_guest_destroyed(&ctx, old_buffer),
+                "a pending attach keeps the {kind:?} buffer alive until replaced"
+            );
 
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-
-        // This release belongs to the old committed interval. It must not
-        // destroy the host object while the pending attach can still commit.
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(!ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(ctx.buffer_is_submitted(buffer_id));
-
-        // A release for the newly committed interval is the one that permits
-        // the host destructor.
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, buffer_id));
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
-    }
-
-    #[test]
-    fn delayed_native_release_before_pending_commit_keeps_host_buffer_alive() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let buffer_id = 42;
-        let host_buffer_id = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, buffer_id, (1, 1));
-        set_test_surface_content(&mut ctx, surface_id, Some(buffer_id), None);
-        ctx.mark_buffer_submitted(buffer_id);
-
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = buffer_id;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(ctx.buffer_is_released(buffer_id));
-        assert!(!ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert!(ctx.buffer_is_submitted(buffer_id));
-        assert!(buffer_is_guest_destroyed(&ctx, buffer_id));
-        assert!(!ctx.buffer_is_released(buffer_id));
-
-        ctx.last_sender_id = host_buffer_id;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, buffer_id));
-        assert!(ctx
-            .client_to_host_queue
-            .iter()
-            .any(|(message, _)| msg_sender(message) == host_buffer_id));
-    }
-
-    #[test]
-    fn replacing_pending_destroyed_native_buffer_does_not_wait_for_release() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let old_buffer = 42;
-        let old_host_buffer = 43;
-        let new_buffer = 44;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            old_buffer,
-            old_host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, old_buffer, (1, 1));
-
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, old_buffer, 0, 0),
-            Action::Forward
-        );
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = old_buffer;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
-        assert!(
-            buffer_is_guest_destroyed(&ctx, old_buffer),
-            "a pending attach keeps the native buffer alive until replaced"
-        );
-
-        // The old pending attach is superseded before any commit reaches the
-        // compositor, so no wl_buffer.release event can arrive for it.
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, new_buffer, 0, 0),
-            Action::Forward
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, old_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_sender(message)),
-            Some(old_host_buffer)
-        );
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_opcode(message)),
-            Some(0),
-            "superseded pending buffer must be destroyed after the replacement attach"
-        );
-    }
-
-    #[test]
-    fn replacing_pending_destroyed_shm_buffer_does_not_wait_for_release() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let surface_id = 100;
-        let old_buffer = 42;
-        let old_host_buffer = 43;
-        let new_buffer = 44;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            old_buffer,
-            old_host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            old_buffer,
-            mapped_test_buffer(old_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, old_buffer, 0, 0),
-            Action::Forward
-        );
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = old_buffer;
-        assert_eq!(shm.on_destroy(&mut ctx), Action::Drop);
-        assert!(buffer_is_guest_destroyed(&ctx, old_buffer));
-
-        ctx.last_sender_id = surface_id;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, new_buffer, 0, 0),
-            Action::Forward
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, old_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_sender(message)),
-            Some(old_host_buffer)
-        );
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_opcode(message)),
-            Some(0),
-            "superseded pending SHM buffer must be destroyed after replacement attach"
-        );
+            // The old pending attach is superseded before any commit reaches
+            // the compositor, so no wl_buffer.release can arrive for it.
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, new_buffer, 0, 0),
+                Action::Forward
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, old_buffer), "{kind:?}");
+            assert_eq!(
+                host_requests(&ctx),
+                [(old_host_buffer, wl_buffer::Request::Destroy {}.into())],
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -2429,17 +2167,7 @@ mod tests {
         let surface_id = 100;
         let guest_buffer = 42;
         let host_buffer = 43;
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
+        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         // The buffer was committed by an earlier surface state and destroyed
         // by the guest, but its host use interval is still in flight. It is
@@ -2451,61 +2179,49 @@ mod tests {
         ctx.last_sender_id = surface_id;
         assert_eq!(compositor.on_attach(&mut ctx, 44, 0, 0), Action::Forward);
         assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
-        assert!(
-            !ctx.client_to_host_queue
-                .iter()
-                .any(|(message, _)| msg_sender(message) == host_buffer),
+        assert_eq!(
+            host_requests(&ctx),
+            [],
             "a submitted buffer must wait for wl_buffer.release after detach"
         );
     }
 
-    #[test]
-    fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
-        use crate::protocols::wayland::wl_shm::WlShmHandler;
-
-        const BUFFER_BYTES: usize = 4;
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
-        let shm_id = 10;
-        let pool_id = 20;
-        let buffer_id = 42;
-        let surface_id = 100;
-        let client_file = shm_pool_file(&[0x11; BUFFER_BYTES]);
-        ctx.last_sender_id = shm_id;
-        assert_eq!(
-            crate::handler::shm::ShmHandler.on_create_pool(
-                &mut ctx,
-                pool_id,
-                client_file.as_fd(),
-                BUFFER_BYTES as i32,
-            ),
-            Action::Drop
-        );
-        assert!(!ctx.is_fatal());
-        let mut buffer =
-            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all());
-        buffer.pool_file = Arc::clone(&ctx.pools[&pool_id].file);
-        register_test_local(&mut ctx, buffer_id, buffer);
+    #[tokio::test]
+    async fn commit_from_a_truncated_pool_is_a_protocol_error_not_a_crash() {
+        let mut s = Session::new();
+        let surface = s.surface().await;
+        let shm = s.bind("wl_shm", wl_shm::VERSION).await;
+        let client_file = shm_pool_file(&[0x11; 4]);
+        let pool = s.shm_pool(shm, client_file.try_clone().unwrap()).await;
+        let buffer = s.shm_buffer(pool, 1, 1).await;
 
         // The client shrinks its pool file behind the proxy's back. Reading
         // the pixels through a mapping of it raised SIGBUS and killed the
         // proxy with every guest GUI app.
         client_file.set_len(0).unwrap();
-        let mut handler = CompositorHandler;
-        ctx.last_sender_id = surface_id;
+        s.guest_fatal([
+            wl_surface::req::attach(surface.id, Some(buffer.id), 0, 0),
+            wl_surface::req::commit(surface.id),
+        ])
+        .await;
         assert_eq!(
-            handler.on_attach(&mut ctx, buffer_id, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(handler.on_commit(&mut ctx), Action::Drop);
-
-        assert_eq!(
-            protocol_error(&ctx),
-            (buffer_id, wl_shm::ERROR_INVALID_FD),
+            s.guest_received_and_error(),
+            (vec![], (buffer.id, wl_shm::ERROR_INVALID_FD)),
             "the error names the buffer whose pool failed, as libwayland does"
         );
-        assert!(
-            ctx.client_to_host_queue.is_empty(),
-            "the commit must not reach the host"
+        assert_eq!(
+            s.host_received(),
+            [(
+                surface.host,
+                wl_surface::Request::Attach {
+                    buffer: buffer.host,
+                    x: 0,
+                    y: 0
+                }
+                .into()
+            )],
+            "only the attach before the failed commit reaches the host \
+             (a_rejected_request_sends_nothing_of_its_own pins the rest)"
         );
     }
 
@@ -2675,7 +2391,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             46,
-            mapped_test_buffer(46, 2, 2, 8, StalePixels::all()),
+            mapped_test_buffer(2, 2, 8, StalePixels::all()),
         );
         attach_and_commit(&mut ctx, TEST_SURFACE, 46);
 
@@ -2796,17 +2512,7 @@ mod tests {
         let buffer_id = 42;
         let host_buffer_id = 43;
         ctx.shadow_table.set_guest_version_for_test(surface_id, 5);
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            buffer_id,
-            host_buffer_id,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            buffer_id,
-            mapped_test_buffer(buffer_id, 1, 1, BUFFER_BYTES as u32, StalePixels::all()),
-        );
+        register_test_buffer(&mut ctx, BufferKind::Shm, buffer_id, host_buffer_id);
         let pool = test_pool_file(&ctx, buffer_id);
         let destination = ctx.local_buffer(buffer_id).unwrap().dest_ptr;
         // This buffer has completed a previous compositor-use interval. A new
@@ -3023,7 +2729,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all()),
+            mapped_test_buffer(8, 6, 32, StalePixels::all()),
         );
 
         ctx.last_sender_id = surface_id;
@@ -3046,7 +2752,7 @@ mod tests {
         let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
         let surface_id = 100;
         let buffer_id = 42;
-        let mut buffer = mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::all());
+        let mut buffer = mapped_test_buffer(8, 6, 32, StalePixels::all());
         let destination_ptr = buffer.dest_ptr;
         buffer.dest_ptr = std::ptr::null_mut();
         buffer.dest_size = 0;
@@ -3179,13 +2885,17 @@ mod tests {
         assert_eq!(host_damage(&ctx), [(9, 19, 3, 3)]);
     }
 
-    /// The rectangles of the host `wl_surface.damage` requests queued so far.
+    /// The rectangles of the host `wl_surface.damage` requests queued so
+    /// far, all of which the test surface's host object sends.
     fn host_damage(ctx: &Context) -> Vec<(i32, i32, i32, i32)> {
+        const TEST_SURFACE_HOST: u32 = 200;
         ctx.client_to_host_queue
             .iter()
-            .filter(|(message, _)| msg_sender(message) == 200 && msg_opcode(message) == REQ_DAMAGE)
+            .filter(|(message, _)| msg_opcode(message) == REQ_DAMAGE)
             .map(|(message, _)| {
-                let mut wire = crate::wire::WireMessage::new(200, REQ_DAMAGE, &message[8..]);
+                let sender = msg_sender(message);
+                assert_eq!(sender, TEST_SURFACE_HOST, "damage from another object");
+                let mut wire = crate::wire::WireMessage::new(sender, REQ_DAMAGE, &message[8..]);
                 let mut next = || wire.read_i32().unwrap();
                 (next(), next(), next(), next())
             })
@@ -3286,7 +2996,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
 
         ctx.last_sender_id = surface_id;
@@ -3331,7 +3041,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending.offset = Some((3, 0));
@@ -3358,7 +3068,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             buffer_id,
-            mapped_test_buffer(buffer_id, 8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(8, 6, 32, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         let mut surface = SurfaceState::default();
         surface.pending.offset = Some((3, 0));
@@ -3454,7 +3164,7 @@ mod tests {
         register_test_local(
             &mut ctx,
             42,
-            mapped_test_buffer(42, 2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
+            mapped_test_buffer(2048, 2048, 8192, StalePixels::in_sync_on(TEST_SURFACE)),
         );
         assert_eq!(handler.on_attach(&mut ctx, 42, 0, 0), Action::Forward);
         assert_eq!(
@@ -3734,80 +3444,54 @@ mod tests {
     #[test]
     fn wl_surface_destroy_releases_zaura_surface() {
         let (mut ctx, xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-
-        ctx.last_sender_id = xdg_toplevel_id;
-        let mut handler = CompositorHandler;
-        handler.on_set_app_id(&mut ctx, &"app".to_string());
-
+        set_test_app_id(&mut ctx, xdg_toplevel_id, "app");
         let zaura_surface_host = ctx.aura_surfaces.get(wl_surface_host).unwrap();
 
-        let wl_surface_guest = 100u32;
         ctx.client_to_host_queue.clear();
-        ctx.last_sender_id = wl_surface_guest;
-        let action = WlSurfaceHandler::on_destroy(&mut handler, &mut ctx);
-        assert_eq!(action, Action::Drop);
+        ctx.last_sender_id = TEST_SURFACE;
         assert_eq!(
-            ctx.client_to_host_queue.len(),
-            2,
-            "queued opcodes: {:?}",
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(msg, _)| msg_opcode(msg))
-                .collect::<Vec<_>>()
+            WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+            Action::Drop
         );
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[0].0), REQ_RELEASE);
+        // The released Aura surface no longer decodes: its dispatch
+        // metadata goes at once.
         assert_eq!(
-            msg_sender(&ctx.client_to_host_queue[0].0),
-            zaura_surface_host
+            queued_headers(&ctx.client_to_host_queue),
+            [
+                (zaura_surface_host, zaura_surface::REQ_RELEASE),
+                (wl_surface_host, wl_surface::REQ_DESTROY),
+            ]
         );
-        assert_eq!(msg_opcode(&ctx.client_to_host_queue[1].0), REQ_DESTROY);
-        assert_eq!(msg_sender(&ctx.client_to_host_queue[1].0), wl_surface_host);
-
         assert_eq!(ctx.aura_surfaces.get(wl_surface_host), None);
     }
 
     #[test]
-    fn wl_surface_destroy_retires_deferred_native_buffer_after_surface_destroy() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        let wl_surface_guest = 100u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 60u32;
+    fn wl_surface_destroy_retires_a_submitted_buffer_after_the_surface() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, _, _, wl_surface_host) = setup_ctx();
+            let (buffer, host_buffer) = (50, 60);
+            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
+            mark_test_buffer_guest_destroyed(&mut ctx, buffer);
+            assert!(ctx.mark_buffer_submitted(buffer));
+            set_test_surface_content(&mut ctx, TEST_SURFACE, Some(buffer), None);
 
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, guest_buffer, (1, 1));
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-        set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                Action::Drop
+            );
 
-        ctx.last_sender_id = wl_surface_guest;
-        let mut handler = CompositorHandler;
-        assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
-            Action::Drop
-        );
-
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert!(!ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| msg_sender(message))
-                .collect::<Vec<_>>(),
-            vec![wl_surface_host, host_buffer],
-            "the host surface must be destroyed before the deferred buffer"
-        );
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_opcode(message)),
-            Some(0),
-            "the final queued request must be wl_buffer.destroy"
-        );
+            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
+            assert!(!ctx.buffer_is_submitted(buffer), "{kind:?}");
+            assert_eq!(
+                host_requests(&ctx),
+                [
+                    (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                    (host_buffer, wl_buffer::Request::Destroy {}.into()),
+                ],
+                "the host {kind:?} buffer must be destroyed after the surface"
+            );
+        }
     }
 
     #[test]
@@ -3825,13 +3509,7 @@ mod tests {
             "wl_surface",
             5,
         );
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, guest_buffer, (1, 1));
+        register_test_buffer(&mut ctx, BufferKind::Native, guest_buffer, host_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         for surface in [first_surface, second_surface] {
@@ -3846,10 +3524,9 @@ mod tests {
         );
         assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
         assert!(ctx.buffer_is_submitted(guest_buffer));
-        assert!(
-            !ctx.client_to_host_queue
-                .iter()
-                .any(|(message, _)| msg_sender(message) == host_buffer),
+        assert_eq!(
+            host_requests(&ctx),
+            [(first_surface_host, wl_surface::Request::Destroy {}.into())],
             "one surface cannot retire a buffer still owned by another"
         );
 
@@ -3861,11 +3538,12 @@ mod tests {
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
         assert!(ctx.host_buffer_use(guest_buffer).is_none());
         assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| msg_sender(message))
-                .collect::<Vec<_>>(),
-            vec![first_surface_host, second_surface_host, host_buffer],
+            host_requests(&ctx),
+            [
+                (first_surface_host, wl_surface::Request::Destroy {}.into()),
+                (second_surface_host, wl_surface::Request::Destroy {}.into()),
+                (host_buffer, wl_buffer::Request::Destroy {}.into()),
+            ],
             "the buffer destructor must follow both owning surface destructors"
         );
     }
@@ -3885,13 +3563,7 @@ mod tests {
             "wl_surface",
             5,
         );
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_native(&mut ctx, guest_buffer, (1, 1));
+        register_test_buffer(&mut ctx, BufferKind::Native, guest_buffer, host_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         assert!(ctx.mark_buffer_submitted(guest_buffer));
         set_test_surface_content(&mut ctx, first_surface, Some(guest_buffer), None);
@@ -3923,60 +3595,13 @@ mod tests {
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
         assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| msg_sender(message))
-                .collect::<Vec<_>>(),
-            vec![first_surface_host, second_surface_host, host_buffer],
+            host_requests(&ctx),
+            [
+                (first_surface_host, wl_surface::Request::Destroy {}.into()),
+                (second_surface_host, wl_surface::Request::Destroy {}.into()),
+                (host_buffer, wl_buffer::Request::Destroy {}.into()),
+            ],
             "the buffer destructor must follow both surface destructors without waiting for release"
-        );
-    }
-
-    #[test]
-    fn wl_surface_destroy_retires_submitted_shm_buffer_after_surface_destroy() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        let wl_surface_guest = 100u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 51u32;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
-        mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
-        ctx.mark_buffer_submitted(guest_buffer);
-        set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
-
-        ctx.last_sender_id = wl_surface_guest;
-        let mut handler = CompositorHandler;
-        assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut handler, &mut ctx),
-            Action::Drop
-        );
-
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert!(!ctx.buffer_is_submitted(guest_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| msg_sender(message))
-                .collect::<Vec<_>>(),
-            vec![wl_surface_host, host_buffer],
-            "the host surface must be destroyed before the retired SHM buffer"
-        );
-        assert_eq!(
-            ctx.client_to_host_queue
-                .last()
-                .map(|(message, _)| msg_opcode(message)),
-            Some(0),
-            "the final queued request must be wl_buffer.destroy"
         );
     }
 
@@ -3987,17 +3612,7 @@ mod tests {
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
+        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
         ctx.mark_buffer_submitted(guest_buffer);
         set_test_surface_content(&mut ctx, wl_surface_guest, Some(guest_buffer), None);
 
@@ -4023,32 +3638,23 @@ mod tests {
             Action::Drop
         );
         assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| u32::from_ne_bytes(message[0..4].try_into().unwrap()))
-                .eq([wl_surface_host, host_buffer]),
+        assert_eq!(
+            host_requests(&ctx),
+            [
+                (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                (host_buffer, wl_buffer::Request::Destroy {}.into()),
+            ],
             "surface destroy must precede the live buffer destroy"
         );
     }
 
     #[test]
     fn destroying_unrelated_surface_keeps_detached_submitted_buffer() {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _wl_surface_host) = setup_ctx();
+        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
         let guest_buffer = 50u32;
         let host_buffer = 51u32;
 
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        register_test_local(
-            &mut ctx,
-            guest_buffer,
-            mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
-        );
+        register_test_buffer(&mut ctx, BufferKind::Shm, guest_buffer, host_buffer);
         mark_test_buffer_guest_destroyed(&mut ctx, guest_buffer);
         // This is a committed buffer whose surface was detached before the
         // release edge arrived. It is not owned by surface 100, even though
@@ -4064,220 +3670,154 @@ mod tests {
 
         assert!(buffer_is_guest_destroyed(&ctx, guest_buffer));
         assert!(ctx.buffer_is_submitted(guest_buffer));
-        assert!(
-            !ctx.client_to_host_queue
-                .iter()
-                .any(|(message, _)| msg_sender(message) == host_buffer),
+        assert_eq!(
+            host_requests(&ctx),
+            [(wl_surface_host, wl_surface::Request::Destroy {}.into())],
             "an unrelated surface destroy must not preempt wl_buffer.release"
         );
     }
 
-    fn assert_detached_use_survives_destroy_of_new_current_surface(native: bool) {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, _first_surface_host) = setup_ctx();
-        let first_surface = 100u32;
-        let second_surface = 101u32;
-        let second_surface_host = 201u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 51u32;
+    #[test]
+    fn a_detached_use_survives_destroy_of_the_new_current_surface() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, ..) = setup_ctx();
+            let (first_surface, second_surface) = (TEST_SURFACE, 101);
+            let (buffer, host_buffer) = (50, 51);
+            ctx.shadow_table.insert_paired_with_version_for_test(
+                second_surface,
+                201,
+                "wl_surface",
+                5,
+            );
+            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
+            let awaiting_detached_release = Some(RenderBufferUse::AwaitingRelease {
+                has_detached_use: true,
+            });
 
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            second_surface,
-            second_surface_host,
-            "wl_surface",
-            5,
-        );
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        if native {
-            register_test_native(&mut ctx, guest_buffer, (1, 1));
-        } else {
-            register_test_local(
-                &mut ctx,
-                guest_buffer,
-                mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
+            attach_and_commit(&mut ctx, first_surface, buffer);
+            // Replacing B on S0 begins an unattributed outstanding use: S0 no
+            // longer names B, but only wl_buffer.release can prove the host
+            // has stopped sampling that detached attachment.
+            attach_and_commit(&mut ctx, first_surface, 0);
+            assert_eq!(
+                ctx.host_buffer_use(buffer),
+                awaiting_detached_release,
+                "{kind:?}"
+            );
+
+            // A later current use must preserve, not overwrite, the detached
+            // latch from S0.
+            attach_and_commit(&mut ctx, second_surface, buffer);
+            assert_eq!(
+                ctx.host_buffer_use(buffer),
+                awaiting_detached_release,
+                "{kind:?}"
+            );
+
+            let mut shm = crate::handler::shm::ShmHandler;
+            ctx.last_sender_id = buffer;
+            assert_eq!(
+                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            ctx.client_to_host_queue.clear();
+
+            ctx.last_sender_id = second_surface;
+            assert_eq!(
+                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                Action::Drop
+            );
+            assert_eq!(
+                buffer_lifecycle(&ctx, buffer),
+                Some(RenderBufferLifecycle::GuestDestroyed(
+                    RenderBufferUse::AwaitingRelease {
+                        has_detached_use: true
+                    }
+                )),
+                "destroying S1 proves only S1's current use, not S0's detached \
+                 use ({kind:?})"
+            );
+            assert!(
+                !buffer_host_destroy_is_queued(&ctx, buffer),
+                "the detached S0 use must keep the {kind:?} backing alive until \
+                 host release"
+            );
+
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert!(
+                buffer_host_destroy_is_queued(&ctx, buffer),
+                "the global host release closes every outstanding {kind:?} use"
             );
         }
+    }
 
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = first_surface;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, guest_buffer, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-
-        // Replacing B on S0 begins an unattributed outstanding use: S0 no
-        // longer names B, but only wl_buffer.release can prove the host has
-        // stopped sampling that detached attachment.
-        assert_eq!(compositor.on_attach(&mut ctx, 0, 0, 0), Action::Forward);
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.host_buffer_use(guest_buffer),
-            Some(RenderBufferUse::AwaitingRelease {
-                has_detached_use: true
-            })
-        );
-
-        // A later current use must preserve, not overwrite, the detached
-        // latch from S0.
-        ctx.last_sender_id = second_surface;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, guest_buffer, 0, 0),
-            Action::Forward
-        );
-        assert_eq!(compositor.on_commit(&mut ctx), Action::Drop);
-        assert_eq!(
-            ctx.host_buffer_use(guest_buffer),
-            Some(RenderBufferUse::AwaitingRelease {
-                has_detached_use: true
-            })
-        );
-
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(
-            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        ctx.client_to_host_queue.clear();
-
-        ctx.last_sender_id = second_surface;
-        assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            buffer_lifecycle(&ctx, guest_buffer),
-            Some(RenderBufferLifecycle::GuestDestroyed(
+    #[test]
+    fn destroying_a_pending_only_surface_keeps_awaiting_release() {
+        for kind in BUFFER_KINDS {
+            let (mut ctx, _, _, wl_surface_host) = setup_ctx();
+            let (buffer, host_buffer) = (50, 51);
+            register_test_buffer(&mut ctx, kind, buffer, host_buffer);
+            let awaiting_release = Some(RenderBufferLifecycle::GuestDestroyed(
                 RenderBufferUse::AwaitingRelease {
-                    has_detached_use: true
-                }
-            )),
-            "destroying S1 proves only S1's current use, not S0's detached use"
-        );
-        assert!(
-            !buffer_host_destroy_is_queued(&ctx, guest_buffer),
-            "the detached S0 use must keep backing alive until host release"
-        );
+                    has_detached_use: false,
+                },
+            ));
 
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(
-            buffer_host_destroy_is_queued(&ctx, guest_buffer),
-            "the global host release closes every outstanding use"
-        );
-    }
+            // The release belongs to an earlier committed use. Merely
+            // attaching the same buffer to another surface does not transfer
+            // ownership of that outstanding release edge until the new
+            // surface commits.
+            assert!(ctx.mark_buffer_submitted(buffer));
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                CompositorHandler.on_attach(&mut ctx, buffer, 0, 0),
+                Action::Forward
+            );
+            let mut shm = crate::handler::shm::ShmHandler;
+            ctx.last_sender_id = buffer;
+            assert_eq!(
+                WlBufferHandler::on_destroy(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert_eq!(buffer_lifecycle(&ctx, buffer), awaiting_release, "{kind:?}");
 
-    #[test]
-    fn detached_native_use_survives_destroy_of_new_current_surface() {
-        assert_detached_use_survives_destroy_of_new_current_surface(true);
-    }
+            ctx.last_sender_id = TEST_SURFACE;
+            assert_eq!(
+                WlSurfaceHandler::on_destroy(&mut CompositorHandler, &mut ctx),
+                Action::Drop
+            );
+            assert_eq!(
+                buffer_lifecycle(&ctx, buffer),
+                awaiting_release,
+                "destroying a pending-only surface must not consume another \
+                 use's release edge ({kind:?})"
+            );
+            assert_eq!(
+                host_requests(&ctx),
+                [(wl_surface_host, wl_surface::Request::Destroy {}.into())],
+                "the host {kind:?} buffer must remain alive until its real release"
+            );
 
-    #[test]
-    fn detached_local_use_survives_destroy_of_new_current_surface() {
-        assert_detached_use_survives_destroy_of_new_current_surface(false);
-    }
-
-    fn assert_destroying_pending_only_surface_keeps_awaiting_release(native: bool) {
-        let (mut ctx, _xdg_toplevel_id, _zaura_shell_host, wl_surface_host) = setup_ctx();
-        let wl_surface_guest = 100u32;
-        let guest_buffer = 50u32;
-        let host_buffer = 51u32;
-
-        ctx.shadow_table.insert_paired_with_version_for_test(
-            guest_buffer,
-            host_buffer,
-            "wl_buffer",
-            1,
-        );
-        if native {
-            register_test_native(&mut ctx, guest_buffer, (1, 1));
-        } else {
-            register_test_local(
-                &mut ctx,
-                guest_buffer,
-                mapped_test_buffer(guest_buffer, 1, 1, 4, StalePixels::in_sync_on(TEST_SURFACE)),
+            ctx.last_sender_id = host_buffer;
+            assert_eq!(
+                WlBufferHandler::on_release(&mut shm, &mut ctx),
+                Action::Drop
+            );
+            assert!(buffer_host_destroy_is_queued(&ctx, buffer), "{kind:?}");
+            assert_eq!(
+                host_requests(&ctx),
+                [
+                    (wl_surface_host, wl_surface::Request::Destroy {}.into()),
+                    (host_buffer, wl_buffer::Request::Destroy {}.into()),
+                ],
+                "the real release must retire the {kind:?} buffer after the \
+                 surface destructor"
             );
         }
-
-        // The release belongs to an earlier committed use. Merely attaching
-        // the same buffer to another surface does not transfer ownership of
-        // that outstanding release edge until the new surface commits.
-        assert!(ctx.mark_buffer_submitted(guest_buffer));
-        let mut compositor = CompositorHandler;
-        ctx.last_sender_id = wl_surface_guest;
-        assert_eq!(
-            compositor.on_attach(&mut ctx, guest_buffer, 0, 0),
-            Action::Forward
-        );
-        let mut shm = crate::handler::shm::ShmHandler;
-        ctx.last_sender_id = guest_buffer;
-        assert_eq!(
-            WlBufferHandler::on_destroy(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert_eq!(
-            buffer_lifecycle(&ctx, guest_buffer),
-            Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::AwaitingRelease {
-                    has_detached_use: false
-                }
-            ))
-        );
-
-        ctx.last_sender_id = wl_surface_guest;
-        assert_eq!(
-            WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
-            Action::Drop
-        );
-
-        assert_eq!(
-            buffer_lifecycle(&ctx, guest_buffer),
-            Some(RenderBufferLifecycle::GuestDestroyed(
-                RenderBufferUse::AwaitingRelease {
-                    has_detached_use: false
-                }
-            )),
-            "destroying a pending-only surface must not consume another use's release edge"
-        );
-        assert!(
-            !ctx.client_to_host_queue
-                .iter()
-                .any(|(message, _)| msg_sender(message) == host_buffer),
-            "the host buffer must remain alive until its real release"
-        );
-
-        ctx.last_sender_id = host_buffer;
-        assert_eq!(
-            WlBufferHandler::on_release(&mut shm, &mut ctx),
-            Action::Drop
-        );
-        assert!(buffer_host_destroy_is_queued(&ctx, guest_buffer));
-        assert_eq!(
-            ctx.client_to_host_queue
-                .iter()
-                .map(|(message, _)| msg_sender(message))
-                .collect::<Vec<_>>(),
-            vec![wl_surface_host, host_buffer],
-            "the real release must retire the buffer after the surface destructor"
-        );
-    }
-
-    #[test]
-    fn destroying_pending_only_surface_keeps_shm_awaiting_release() {
-        assert_destroying_pending_only_surface_keeps_awaiting_release(false);
-    }
-
-    #[test]
-    fn destroying_pending_only_surface_keeps_native_awaiting_release() {
-        assert_destroying_pending_only_surface_keeps_awaiting_release(true);
     }
 
     #[test]
@@ -4422,12 +3962,12 @@ mod tests {
             WlSurfaceHandler::on_destroy(&mut compositor, &mut ctx),
             Action::Drop
         );
-        assert_eq!(ctx.host_to_client_queue.len(), 1);
-        assert_eq!(msg_sender(&ctx.host_to_client_queue[0].0), text_input);
-        assert_eq!(msg_opcode(&ctx.host_to_client_queue[0].0), 1);
         assert_eq!(
-            u32::from_ne_bytes(ctx.host_to_client_queue[0].0[8..12].try_into().unwrap()),
-            surface
+            decoded(
+                &ctx.host_to_client_queue,
+                zwp_text_input_v3::Event::from_wire
+            ),
+            [(text_input, zwp_text_input_v3::Event::Leave { surface })]
         );
         assert!(ctx.text_inputs[&text_input].active_surface.is_none());
 
@@ -4530,7 +4070,8 @@ mod tests {
         assert_eq!(ctx.host_to_client_queue.len(), 2);
         for guest_text_input in [700, 710] {
             assert!(ctx.host_to_client_queue.iter().any(|(message, _)| {
-                msg_sender(message) == guest_text_input && msg_opcode(message) == 1
+                msg_sender(message) == guest_text_input
+                    && msg_opcode(message) == zwp_text_input_v3::EVT_LEAVE
             }));
         }
         assert!(ctx
@@ -4539,7 +4080,8 @@ mod tests {
             .all(|(message, _)| msg_sender(message) != 720));
         for host_v1 in [702, 712] {
             assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-                msg_sender(message) == host_v1 && msg_opcode(message) == 1
+                msg_sender(message) == host_v1
+                    && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
             }));
         }
         assert!(ctx
@@ -4681,7 +4223,8 @@ mod tests {
             .all(|(message, _)| { msg_sender(message) != healthy_on_replacement }));
         for host_text_input in [702, 722] {
             assert!(ctx.client_to_host_queue.iter().any(|(message, _)| {
-                msg_sender(message) == host_text_input && msg_opcode(message) == 1
+                msg_sender(message) == host_text_input
+                    && msg_opcode(message) == zwp_text_input_v1::REQ_DEACTIVATE
             }));
         }
         assert!(ctx
@@ -4728,7 +4271,7 @@ mod tests {
         assert!(
             ctx.client_to_host_queue
                 .iter()
-                .all(|(message, _)| msg_opcode(message) != REQ_RELEASE),
+                .all(|(message, _)| msg_opcode(message) != zaura_surface::REQ_RELEASE),
             "old aura-shell versions must not receive release"
         );
         assert_eq!(

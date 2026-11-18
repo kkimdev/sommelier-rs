@@ -1391,21 +1391,31 @@ mod tests {
         assert!(viewed(None, 2, 0, huge).source_fits_buffer());
     }
 
-    /// Whether buffer pixel `pixel`'s image along one axis meets the surface
-    /// interval `start..end`, computed exactly. A pixel spans
+    /// Buffer pixel `pixel`'s image along one axis, computed exactly: its
+    /// two edges and their common denominator. A pixel spans
     /// `(p / scale - origin) * destination / size` from `p = pixel` to
     /// `pixel + 1`, with `origin`, `size` and `destination` as fractions.
-    fn pixel_meets(
+    fn pixel_image(
         pixel: i128,
         scale: i128,
         (origin, origin_den): (i128, i128),
         (size, size_den): (i128, i128),
         (destination, destination_den): (i128, i128),
-        (start, end): (i128, i128),
-    ) -> bool {
+    ) -> (i128, i128, i128) {
         let at = |p: i128| (p * origin_den - scale * origin) * destination * size_den;
         let den = scale * origin_den * destination_den * size;
-        at(pixel) < end * den && at(pixel + 1) > start * den
+        (at(pixel), at(pixel + 1), den)
+    }
+
+    /// Whether pixel `image` overlaps the surface interval `start..end`.
+    fn pixel_meets((left, right, den): (i128, i128, i128), (start, end): (i128, i128)) -> bool {
+        left < end * den && right > start * den
+    }
+
+    /// Whether pixel `image` overlaps or borders the surface interval
+    /// `start..end`.
+    fn pixel_touches((left, right, den): (i128, i128, i128), (start, end): (i128, i128)) -> bool {
+        left <= end * den && right >= start * den
     }
 
     #[test]
@@ -1476,13 +1486,27 @@ mod tests {
                 };
                 let destination = destination.map_or(size, |d| (i128::from(d), 1));
                 let interval = (i128::from(start), i128::from(start) + i128::from(length));
+                let image =
+                    |pixel: i32| pixel_image(i128::from(pixel), s, origin, size, destination);
+                let meets = |pixel: i32| pixel_meets(image(pixel), interval);
+                let touches = |pixel: i32| pixel_touches(image(pixel), interval);
+                let case = format!(
+                    "{copied:?} for {damage:?}, scale {scale}, buffer {buffer:?}, \
+                     source {source:?}, destination {destination:?}"
+                );
                 for pixel in 0..extent {
-                    if pixel_meets(i128::from(pixel), s, origin, size, destination, interval) {
+                    let copied = (left..left + width).contains(&pixel);
+                    if meets(pixel) {
+                        assert!(copied, "pixel {pixel} missing from {case}");
+                    }
+                    // The copy grows by a pixel, so a copied pixel is next
+                    // to one the damage meets, or to one that only borders
+                    // it: where an edge falls exactly on a pixel boundary,
+                    // f64 may round it to just outside.
+                    if copied {
                         assert!(
-                            (left..left + width).contains(&pixel),
-                            "pixel {pixel} missing from {copied:?} for {damage:?}, \
-                             scale {scale}, buffer {buffer:?}, source {source:?}, \
-                             destination {destination:?}"
+                            (pixel - 1..=pixel + 1).any(touches),
+                            "pixel {pixel}, which no damaged pixel touches, copied in {case}"
                         );
                     }
                 }

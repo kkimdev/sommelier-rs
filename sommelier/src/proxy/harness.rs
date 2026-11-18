@@ -481,3 +481,48 @@ impl Message for AnyEvent {
         AnyEvent::new_object(self)
     }
 }
+
+/// SHM pools and buffers, which the proxy implements for the guest.
+impl Session {
+    /// A new `wl_shm_pool` of all of `file`, from the guest's `wl_shm`
+    /// `shm`. The pool is the proxy's own, so the host gets nothing.
+    pub(crate) async fn shm_pool(&mut self, shm: u32, file: std::fs::File) -> u32 {
+        use crate::protocols::wayland::wl_shm;
+        let size = file.metadata().expect("the pool file's size").len();
+        let pool = self.new_id();
+        let size = i32::try_from(size).expect("a pool of at most i32::MAX bytes");
+        self.guest([wl_shm::req::create_pool(shm, pool, file.into(), size)])
+            .await;
+        assert_eq!(self.host_received(), [], "the pool is the proxy's own");
+        pool
+    }
+
+    /// A new `width`x`height` ARGB8888 `wl_buffer` from the start of
+    /// `pool`, with rows of `4 * width` bytes. The host gets a buffer of
+    /// its own, from a pool the proxy creates for it; what the proxy sends
+    /// the host for it is not kept.
+    pub(crate) async fn shm_buffer(&mut self, pool: u32, width: i32, height: i32) -> Object {
+        use crate::protocols::wayland::{wl_shm, wl_shm_pool};
+        let id = self.new_id();
+        let earlier = self.host.received.len();
+        self.guest([wl_shm_pool::req::create_buffer(
+            pool,
+            id,
+            0,
+            width,
+            height,
+            4 * width,
+            wl_shm::FORMAT_ARGB8888,
+        )])
+        .await;
+        let forwarded = self.host.received.split_off(earlier);
+        let host = forwarded
+            .iter()
+            .find_map(|(_, request)| match request {
+                AnyRequest::WlShmPool(wl_shm_pool::Request::CreateBuffer { id, .. }) => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the host got no buffer: {forwarded:?}"));
+        Object { id, host }
+    }
+}
