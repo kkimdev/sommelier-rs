@@ -358,13 +358,13 @@ impl protocols::wayland::wl_shm_pool::WlShmPoolHandler for ShmHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::formats::register_guest_shm;
     use super::ShmHandler;
     use super::{
         record_host_shm_wl_format, regular_file_has_size, valid_buffer_layout, valid_pool_resize,
         valid_pool_size, valid_shm_stride,
     };
     use crate::handler::registry::RegistryHandler;
-    use crate::handler::shm::register_guest_shm;
     use crate::handler::test_support::session_with_shm;
     use crate::protocols::wayland::wl_registry::WlRegistryHandler;
     use crate::protocols::wayland::wl_shm::WlShmHandler;
