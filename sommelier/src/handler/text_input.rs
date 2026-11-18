@@ -2521,6 +2521,13 @@ mod tests {
             events
         }
 
+        /// The host's keyboard focus enters a new surface, which the field
+        /// follows from now on.
+        async fn keyboard_enter_new_surface(&mut self) {
+            self.surface = self.s.surface().await;
+            self.keyboard_enter().await;
+        }
+
         /// The host's keyboard focus enters the surface again.
         async fn keyboard_enter(&mut self) {
             let surface = self.surface.id;
@@ -2629,6 +2636,12 @@ mod tests {
         fn owner(&mut self, key: u32) -> Option<GuestKeyOwner> {
             let keyboard = HostId(self.keyboard.host);
             self.s.ctx().guest_key_owner(keyboard, key)
+        }
+
+        /// The proxy's state of the text input, for state no peer sees.
+        fn state(&mut self) -> &TextInputState {
+            let ti = self.ti;
+            &self.s.ctx().text_inputs[&ti]
         }
 
         /// The host gives the held Backspace to its input method, which
@@ -2747,8 +2760,7 @@ mod tests {
         // The focus enters another surface, where the guest enables the
         // field while the barrier drains: its state reaches the host first,
         // without an activation.
-        f.surface = f.s.surface().await;
-        f.keyboard_enter().await;
+        f.keyboard_enter_new_surface().await;
         f.s.guest([
             v3::enable(f.ti),
             v3::set_surrounding_text(f.ti, "new", 3, 3).unwrap(),
@@ -3006,8 +3018,7 @@ mod tests {
         // disables it.
         for serial in [3, 4] {
             f.keyboard_leave().await;
-            f.surface = f.s.surface().await;
-            f.keyboard_enter().await;
+            f.keyboard_enter_new_surface().await;
             f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
             assert_eq!(f.s.host_received(), f.reset(serial, Reset::default()));
         }
@@ -3772,6 +3783,27 @@ mod tests {
                     DONE,
                 ],
             ),
+            (
+                "a confirm keeps the edits for the next commit",
+                |f| {
+                    vec![
+                        f.preedit("가", ""),
+                        v1::delete_surrounding_text(f.host, -3, 3),
+                        f.confirm(),
+                        f.commit("나"),
+                    ]
+                },
+                vec![
+                    preedit("가"),
+                    DONE,
+                    no_preedit(),
+                    commit("가"),
+                    DONE,
+                    delete(3, 0),
+                    commit("나"),
+                    DONE,
+                ],
+            ),
         ];
         for (case, events, expected) in cases {
             let mut f = Field::enabled().await;
@@ -4136,6 +4168,159 @@ mod tests {
         };
         f.s.host([f.peek(backspace), f.confirm()]).await;
         assert_eq!(f.s.guest_received(), f.recovered(backspace, 15));
+    }
+
+    /// A text input destroyed while its deactivation drains sends nothing
+    /// more: its host's late events reach no one, and the proxy's drain
+    /// callback ends without reaching the guest, its host ID free for
+    /// another object only after the host's `delete_id`.
+    #[tokio::test]
+    async fn a_text_input_destroyed_while_draining_ends_its_barrier_unseen() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+        f.s.guest([v3::destroy(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        let deleted = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        f.s.host([f.preedit("stale", ""), f.commit("stale")]).await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.drain(callback).await;
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert!(![f.host, f.host_ext].contains(&callback));
+        f.s.host([wl_display::evt::delete_id(WL_DISPLAY_ID, callback)])
+            .await;
+        assert_eq!(f.s.guest_received(), []);
+        let ti = f.s.new_id();
+        f.create_text_input(ti).await;
+        assert_eq!(f.host, callback);
+    }
+
+    /// A focus change drains the old generation: the input method's
+    /// composition, commit and confirmation sent while it drains reach no
+    /// one, while the guest's enable on the new surface waits for the
+    /// drain and then composes.
+    #[tokio::test]
+    async fn a_focus_change_drops_the_old_composition_and_held_key() {
+        let mut f = Field::typing().await;
+        let space = Stroke {
+            key: SPACE,
+            state: PRESSED,
+            serial: 700,
+            time: 1_000,
+        };
+        f.s.host([f.peek(space), f.preedit("가", ""), f.commit("가 ")])
+            .await;
+        let expected = [preedit("가"), DONE, no_preedit(), commit("가 "), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        f.s.host([f.confirm()]).await;
+        assert_eq!(f.s.guest_received(), f.recovered(space, 1));
+
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+        f.keyboard_enter_new_surface().await;
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(
+            f.s.host_received(),
+            [
+                f.surrounding_text("", 0, 0),
+                f.no_cursor_rectangle(),
+                f.commit_state(2)
+            ]
+        );
+
+        f.s.host([
+            f.preedit("오래된 조합", ""),
+            f.commit("오래된 확정"),
+            f.confirm(),
+        ])
+        .await;
+        assert_eq!(f.s.guest_received(), []);
+
+        f.drain(callback).await;
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        let mut expected = vec![f.activate()];
+        expected.extend(f.content_type((0, 0), false));
+        expected.push(f.commit_state(2));
+        assert_eq!(f.s.host_received(), expected);
+        f.s.host([f.preedit("새 조합", "")]).await;
+        let expected = [preedit("새 조합"), V3::Done { serial: 2 }];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+    }
+
+    /// A text input recreated under the ID of one whose deactivation
+    /// drains is activated at once, and the old drain neither reconciles
+    /// nor reaches it, nor moves it off its own host object.
+    #[tokio::test]
+    async fn a_text_input_recreated_under_its_id_ignores_the_old_barrier() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, f.disable_requests(callback, 2));
+        f.s.guest([v3::destroy(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.ext(Ext::Destroy {})]);
+        let deleted = wl_display::Event::DeleteId { id: f.ti };
+        assert_eq!(f.s.guest_received(), [(WL_DISPLAY_ID, deleted.into())]);
+
+        let old_host = f.host;
+        f.create_text_input(f.ti).await;
+        assert_ne!(f.host, old_host);
+        f.s.guest([v3::enable(f.ti), v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), f.enable_requests(1));
+
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+        assert_eq!(f.s.guest_received(), []);
+        f.s.host([f.preedit("새 객체", "")]).await;
+        let expected = [preedit("새 객체"), DONE];
+        assert_eq!(f.s.guest_received(), f.events(expected));
+        // The replacement keeps its own host text input, which its disable
+        // deactivates.
+        f.s.guest([v3::disable(f.ti), v3::commit(f.ti)]).await;
+        let host = f.s.host_received();
+        assert_eq!(host, f.disable_requests(barrier(&host), 2));
+    }
+
+    /// An enable or a disable the guest has not committed when the focus
+    /// leaves dies with that focus: its commit after the next enter
+    /// activates nothing.
+    #[tokio::test]
+    async fn an_uncommitted_enable_or_disable_dies_with_its_focus() {
+        let mut f = Field::enabled().await;
+        f.s.guest([v3::disable(f.ti)]).await;
+        assert_eq!(f.s.host_received(), []);
+        f.keyboard_leave().await;
+        let host = f.s.host_received();
+        let callback = barrier(&host);
+        assert_eq!(host, [f.deactivate(), sync(callback)]);
+        f.keyboard_enter_new_surface().await;
+        f.drain(callback).await;
+        assert_eq!(f.s.host_received(), []);
+        // No peer sees whether the proxy still waits on its own callback.
+        assert_eq!(f.s.ctx().internal_callbacks.get(HostId(callback)), None);
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(2)]);
+
+        f.s.guest([v3::enable(f.ti)]).await;
+        f.keyboard_leave().await;
+        assert_eq!(f.s.host_received(), []);
+        f.keyboard_enter_new_surface().await;
+        // No peer sees that the enter dropped the pending enable before
+        // the commit below shows it.
+        assert_eq!(f.state().pending.enabled, None);
+        f.s.guest([v3::commit(f.ti)]).await;
+        assert_eq!(f.s.host_received(), [f.commit_state(3)]);
     }
 
     /// A release delayed past a wrapped serial's next press ends only its
