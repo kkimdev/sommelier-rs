@@ -467,7 +467,10 @@ impl Exo {
                 self.pressed.insert(keymap::keycode(key).0, false);
                 false
             } else {
-                self.release(key)
+                let Some(consumed) = self.release(key) else {
+                    return;
+                };
+                consumed
             };
             self.key_events(key, time, state, consumed);
             return;
@@ -512,8 +515,9 @@ impl Exo {
                 assert_eq!(key.id, id, "the engine answers in order");
                 let PendingKey { key: k, time, .. } = key;
                 if !key.pressed {
-                    let consumed = self.release(k);
-                    self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
+                    if let Some(consumed) = self.release(k) {
+                        self.key_events(k, time, wl_keyboard::KEY_STATE_RELEASED, consumed);
+                    }
                     return Answer::Normal;
                 }
                 let code = keymap::keycode(k).0;
@@ -1032,11 +1036,13 @@ impl Exo {
         }
     }
 
-    /// The release of `key`: whether the input method consumed its press.
-    fn release(&mut self, key: Key) -> bool {
-        let code = keymap::keycode(key).0;
-        self.pressed.remove(&code).unwrap_or(false)
+    /// The release of `key`: whether the input method consumed its press,
+    /// or `None` if Exo tracked no such press, whose release
+    /// `Keyboard::OnKeyEvent` ignores.
+    fn release(&mut self, key: Key) -> Option<bool> {
+        self.pressed.remove(&keymap::keycode(key).0)
     }
+
     /// `wl_keyboard.modifiers` with `depressed`, if they changed.
     fn set_modifiers(&mut self, depressed: u32) {
         if depressed == self.modifiers {
@@ -1711,6 +1717,29 @@ mod tests {
         ];
         assert_eq!(events(&mut exo), raw);
         assert!(exo.in_engine.is_empty());
+    }
+
+    #[test]
+    fn a_release_whose_press_exo_never_tracked_sends_nothing() {
+        // `Keyboard::OnKeyEvent` ignores it, with no input method to hand
+        // it to, with a Latin layout, and through the engine.
+        let mut exo = exo();
+        exo.key(NOW, k('r'), UP);
+        assert_eq!(events(&mut exo), []);
+        let mut exo = active(V10);
+        exo.latin = true;
+        exo.key(NOW, k('r'), UP);
+        assert_eq!(events(&mut exo), []);
+        let mut exo = active(V10);
+        exo.latin = false;
+        exo.key(NOW, k('r'), UP);
+        exo.take_engine();
+        let done = EngineOut::Done {
+            id: 0,
+            handled: false,
+        };
+        assert_eq!(exo.answer(&done), Answer::Normal);
+        assert_eq!(events(&mut exo), []);
     }
 
     #[test]
